@@ -322,6 +322,22 @@ impl<F: IsField> Table<F> {
         Ok(())
     }
 
+    /// Advise the kernel to drop mmap pages from the page cache.
+    /// Call after reading spilled data into pool buffers to free ~37GB of
+    /// cached pages that would otherwise persist under memory pressure.
+    #[cfg(feature = "disk-spill")]
+    pub fn advise_drop_cache(&self) {
+        if let Some(ref backing) = self.mmap_backing {
+            unsafe {
+                libc::madvise(
+                    backing.mmap.as_ptr() as *mut libc::c_void,
+                    backing.mmap.len(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
     /// Given a step size, converts the given table into a `Frame`.
     /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
     pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {

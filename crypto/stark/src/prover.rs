@@ -549,6 +549,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "disk-spill")]
+        trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
@@ -592,6 +594,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "disk-spill")]
+        trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);

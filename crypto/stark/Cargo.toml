@@ -29,6 +29,7 @@ rayon = { version = "1.8.0", optional = true }
 # Disk-spill: mmap LDE data to reduce heap memory during proving
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
+libc = { version = "0.2", optional = true }
 
 # wasm
 wasm-bindgen = { version = "0.2", optional = true }
@@ -52,7 +53,7 @@ instruments = []                                                     # This enab
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
-disk-spill = ["dep:memmap2", "dep:tempfile", "crypto/disk-spill"]
+disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"

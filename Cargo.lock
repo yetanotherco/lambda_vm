@@ -3560,6 +3560,7 @@ dependencies = [
  "env_logger",
  "hex",
  "itertools 0.11.0",
+ "libc",
  "log",
  "math",
  "memmap2",
