@@ -1611,12 +1611,16 @@ pub trait IsStarkProver<
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
         }
 
-        // Allocate K independent LDE column buffer pool sets for parallel table processing.
-        // Buffers start empty and grow on demand — this avoids reserving
-        // max_main_cols × max_lde_size × K upfront, which can exceed available RAM
-        // when the largest table is much bigger than the rest.
+        // Number of tables to process concurrently.
+        // disk-spill: Phase A/C use k_commit=1 (one pool at a time, since each
+        // table's LDE already saturates all cores via column-parallel FFT).
+        // Rounds 2-4 use the full k (no pools needed, reads from mmap).
         let k = table_parallelism().min(num_airs).max(1);
-        let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
+        #[cfg(feature = "disk-spill")]
+        let k_commit = 1_usize;
+        #[cfg(not(feature = "disk-spill"))]
+        let k_commit = k;
+        let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
                 main: (0..max_main_cols).map(|_| Vec::new()).collect(),
                 aux: (0..max_aux_cols).map(|_| Vec::new()).collect(),
@@ -1644,8 +1648,8 @@ pub trait IsStarkProver<
         let mut spilled_ldes: Vec<Option<LDETraceTable<Field, FieldExtension>>> =
             (0..num_airs).map(|_| None).collect();
 
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
+        for chunk_start in (0..num_airs).step_by(k_commit) {
+            let chunk_end = (chunk_start + k_commit).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
 
             #[cfg(feature = "parallel")]
@@ -1832,8 +1836,8 @@ pub trait IsStarkProver<
             Option<Commitment>,
         )> = Vec::with_capacity(num_airs);
 
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
+        for chunk_start in (0..num_airs).step_by(k_commit) {
+            let chunk_end = (chunk_start + k_commit).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
 
             #[cfg(feature = "parallel")]
