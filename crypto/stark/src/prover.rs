@@ -1612,15 +1612,14 @@ pub trait IsStarkProver<
         }
 
         // Allocate K independent LDE column buffer pool sets for parallel table processing.
+        // Buffers start empty and grow on demand — this avoids reserving
+        // max_main_cols × max_lde_size × K upfront, which can exceed available RAM
+        // when the largest table is much bigger than the rest.
         let k = table_parallelism().min(num_airs).max(1);
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
             .map(|_| PoolSet {
-                main: (0..max_main_cols)
-                    .map(|_| Vec::with_capacity(max_lde_size))
-                    .collect(),
-                aux: (0..max_aux_cols)
-                    .map(|_| Vec::with_capacity(max_lde_size))
-                    .collect(),
+                main: (0..max_main_cols).map(|_| Vec::new()).collect(),
+                aux: (0..max_aux_cols).map(|_| Vec::new()).collect(),
             })
             .collect();
 
