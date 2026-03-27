@@ -1635,9 +1635,20 @@ pub trait IsStarkProver<
         let k_commit = 1_usize;
         #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
+        // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
+        // coset_lde_full_expand can resize in-place without reallocation spikes.
+        // With k_commit>1 (no disk-spill), start empty and grow on demand.
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
-                main: (0..max_main_cols).map(|_| Vec::new()).collect(),
+                main: (0..max_main_cols)
+                    .map(|_| {
+                        if k_commit == 1 {
+                            Vec::with_capacity(max_lde_size)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect(),
                 aux: (0..max_aux_cols).map(|_| Vec::new()).collect(),
             })
             .collect();
@@ -1696,12 +1707,13 @@ pub trait IsStarkProver<
                         Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)?
                     };
 
-                    // Spill LDE from pool to mmap while pool is still filled,
-                    // then free pool buffers to reduce peak memory.
+                    // Spill LDE from pool to mmap while pool is still filled.
+                    // Pool buffers keep their capacity for reuse by the next table,
+                    // avoiding resize reallocation spikes in coset_lde_full_expand.
                     #[cfg(feature = "disk-spill")]
                     let spilled = {
                         let num_main_cols = trace.num_main_columns;
-                        let s = LDETraceTable::spill_main_from_pool(
+                        LDETraceTable::spill_main_from_pool(
                             &pool.main,
                             num_main_cols,
                             air.step_size(),
@@ -1711,11 +1723,7 @@ pub trait IsStarkProver<
                             ProvingError::WrongParameter(format!(
                                 "disk-spill main LDE table {idx}: {e}"
                             ))
-                        })?;
-                        for buf in pool.main.iter_mut() {
-                            *buf = Vec::new();
-                        }
-                        s
+                        })?
                     };
 
                     #[cfg(feature = "disk-spill")]
