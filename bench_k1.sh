@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-ELF="executor/program_artifacts/asm/fib_iterative_2M.elf"
+ELF="executor/program_artifacts/asm/fib_iterative_8M.elf"
 PR_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 WORKTREE_PATH="/tmp/lambda_vm_main_bench_$$"
 
@@ -17,7 +17,7 @@ if [ ! -f "$ELF" ]; then
     echo ">>> Compiling ELF..."
     mkdir -p executor/program_artifacts/asm
     clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
-        executor/programs/asm/fib_iterative_2M.s -o "$ELF"
+        executor/programs/asm/fib_iterative_8M.s -o "$ELF"
 fi
 
 cleanup() {
@@ -27,7 +27,7 @@ trap cleanup EXIT
 
 echo "======================================================="
 echo "  k=1 bench: $PR_BRANCH vs main"
-echo "  Program: fib_iterative_2M"
+echo "  Program: fib_iterative_8M"
 echo "======================================================="
 echo ""
 

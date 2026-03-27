@@ -41,7 +41,7 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_dummy_air, create_mul_air, create_page_air, create_register_air,
+    create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air, create_register_air,
     create_shift_air,
 };
 
@@ -324,7 +324,7 @@ impl VmAirs {
             .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
-            .map(|i| create_memw_aligned_dummy_air(proof_options).with_name(&format!("MEMW_A_DUMMY[{}]", i)))
+            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
@@ -502,7 +502,7 @@ pub fn prove_with_options(
         let memw_rows: usize = traces.memws.iter().map(|t| t.num_rows()).sum();
         let memw_a_rows: usize = traces.memw_aligneds.iter().map(|t| t.num_rows()).sum();
         eprintln!("MEMW   chunks={}, rows={}", traces.memws.len(), memw_rows);
-        eprintln!("MEMW_A_DUMMY chunks={}, rows={}", traces.memw_aligneds.len(), memw_a_rows);
+        eprintln!("MEMW_A chunks={}, rows={}", traces.memw_aligneds.len(), memw_a_rows);
     }
 
     #[cfg(feature = "instruments")]
