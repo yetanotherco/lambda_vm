@@ -57,7 +57,7 @@ The #sha256 chip leverages #nr_variables variables, spanning #nr_columns columns
 The first responsibility of the chip is to read the current state and message chunk from memory,
 passed as arguments through pointers.
 Since the memory ranges could overlap, we read the chunk first, before reading and writing the state at the next timestamp.
-The state is passed in argument `A0 = x10`, and the chunk as `A1 = x11`.
+The addresses containing the state and the current chunk are passed in as arguments `A0 = x10` and `A1 = x11`, respectively.
 Note that following the SHA256 spec, this state and the chunks are read and written as big-endian.
 #render_constraint_table(sha256chip, config, groups: "memory")
 
