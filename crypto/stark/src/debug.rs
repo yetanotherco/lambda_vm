@@ -96,6 +96,7 @@ pub fn validate_trace<
             .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
             .collect();
 
+    // Pre-compute LogUp alpha powers once for all steps.
     let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
         if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
             compute_alpha_powers(
@@ -106,6 +107,7 @@ pub fn validate_trace<
             Vec::new()
         };
 
+    // Compute logup_table_offset = table_contribution / trace_length
     let logup_table_offset = match bus_public_inputs {
         Some(bpi) => {
             let n_inv = FieldElement::<Field>::from(trace_length as u64)
