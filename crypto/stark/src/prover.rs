@@ -896,11 +896,17 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let Some((composition_poly_merkle_tree, composition_poly_root)) =
+        let Some((mut composition_poly_merkle_tree, composition_poly_root)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
+        #[cfg(feature = "disk-spill")]
+        composition_poly_merkle_tree
+            .spill_nodes_to_disk()
+            .map_err(|e| {
+                ProvingError::WrongParameter(format!("disk-spill composition Merkle tree: {e}"))
+            })?;
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
