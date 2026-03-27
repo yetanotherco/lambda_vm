@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Compares prove time (TABLE_PARALLELISM=1) between current branch and main.
-# Prints row counts for MEMW and MEMW_A, prove time, and speedup.
+# Prints instruments timing breakdown for both branches, row counts, and speedup.
 #
 # Usage: ./bench_k1.sh
 #
-# Requirements: cargo, jemalloc-stats feature, clang for ELF compilation.
+# Requirements: cargo, jemalloc-stats+instruments features, clang for ELF compilation.
 
 set -euo pipefail
 
@@ -34,13 +34,17 @@ echo ""
 # ── Step 1: Build and run PR branch ──────────────────────
 
 echo ">>> Building PR branch ($PR_BRANCH)..."
-cargo build --release -p cli --features jemalloc-stats 2>&1 | tail -2
+cargo build --release -p cli --features "jemalloc-stats,instruments" 2>&1 | tail -2
 
 echo ">>> Running PR branch (TABLE_PARALLELISM=1)..."
 PR_OUTPUT=$(TABLE_PARALLELISM=1 ./target/release/cli prove "$ELF" \
     -o /tmp/proof_pr_$$.bin --time 2>&1)
 rm -f /tmp/proof_pr_$$.bin
-echo "$PR_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap"
+
+echo ""
+echo "--- PR branch instruments ---"
+echo "$PR_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW_A|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL"
+echo ""
 
 PR_TIME=$(echo "$PR_OUTPUT"   | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')
 PR_HEAP=$(echo "$PR_OUTPUT"   | grep -o 'Peak heap: [0-9]*'     | awk '{print $3}')
@@ -48,7 +52,6 @@ PR_MEMW_ROWS=$(echo "$PR_OUTPUT"   | grep '^MEMW '  | grep -o 'rows=[0-9]*'   | 
 PR_MEMWA_ROWS=$(echo "$PR_OUTPUT"  | grep '^MEMW_A' | grep -o 'rows=[0-9]*'   | cut -d= -f2)
 PR_MEMW_CHUNKS=$(echo "$PR_OUTPUT" | grep '^MEMW '  | grep -o 'chunks=[0-9]*' | cut -d= -f2)
 PR_MEMWA_CHUNKS=$(echo "$PR_OUTPUT"| grep '^MEMW_A' | grep -o 'chunks=[0-9]*' | cut -d= -f2)
-echo ""
 
 # ── Step 2: Build and run main in a worktree ─────────────
 
@@ -73,7 +76,7 @@ NR == line {
 ' "$MAIN_LIB" > "${MAIN_LIB}.tmp" && mv "${MAIN_LIB}.tmp" "$MAIN_LIB"
 
 echo ">>> Building main..."
-(cd "$WORKTREE_PATH" && cargo build --release -p cli --features jemalloc-stats 2>&1 | tail -2)
+(cd "$WORKTREE_PATH" && cargo build --release -p cli --features "jemalloc-stats,instruments" 2>&1 | tail -2)
 
 # Copy ELF into worktree if needed
 mkdir -p "$WORKTREE_PATH/executor/program_artifacts/asm"
@@ -82,16 +85,19 @@ cp "$ELF" "$WORKTREE_PATH/executor/program_artifacts/asm/"
 echo ">>> Running main (TABLE_PARALLELISM=1)..."
 MAIN_OUTPUT=$(cd "$WORKTREE_PATH" && \
     TABLE_PARALLELISM=1 ./target/release/cli prove \
-    executor/program_artifacts/asm/fib_iterative_2M.elf \
+    executor/program_artifacts/asm/fib_iterative_8M.elf \
     -o /tmp/proof_main_$$.bin --time 2>&1)
 rm -f /tmp/proof_main_$$.bin
-echo "$MAIN_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap"
+
+echo ""
+echo "--- main instruments ---"
+echo "$MAIN_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW_A|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL"
+echo ""
 
 MAIN_TIME=$(echo "$MAIN_OUTPUT"      | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')
 MAIN_HEAP=$(echo "$MAIN_OUTPUT"      | grep -o 'Peak heap: [0-9]*'     | awk '{print $3}')
 MAIN_MEMW_ROWS=$(echo "$MAIN_OUTPUT" | grep '^MEMW '  | grep -o 'rows=[0-9]*'   | cut -d= -f2)
 MAIN_MEMW_CHUNKS=$(echo "$MAIN_OUTPUT"| grep '^MEMW ' | grep -o 'chunks=[0-9]*' | cut -d= -f2)
-echo ""
 
 # ── Step 3: Print comparison ─────────────────────────────
 
