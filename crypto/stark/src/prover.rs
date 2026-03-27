@@ -1750,6 +1750,16 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
 
+        // Free main pool buffers after Phase A — they are not needed for Phase C
+        // (aux uses its own buffers) and their retained capacity from the largest
+        // table can be tens of GB.
+        #[cfg(feature = "disk-spill")]
+        for pool in pool_sets.iter_mut() {
+            for buf in pool.main.iter_mut() {
+                *buf = Vec::new();
+            }
+        }
+
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
@@ -1940,6 +1950,11 @@ pub trait IsStarkProver<
                 &mut debug_pool.aux,
             );
         }
+
+        // Free pool buffers — the disk-spill Rounds 2-4 path reads from
+        // spilled LDEs (mmap), so pool buffers are no longer needed.
+        #[cfg(feature = "disk-spill")]
+        drop(pool_sets);
 
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
