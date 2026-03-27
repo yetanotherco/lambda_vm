@@ -1771,6 +1771,9 @@ pub trait IsStarkProver<
 
         }
 
+        #[cfg(feature = "instruments")]
+        let main_commits_elapsed = phase_start.elapsed();
+
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
