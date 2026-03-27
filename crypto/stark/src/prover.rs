@@ -1660,7 +1660,7 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    if air.is_preprocessed() {
+                    let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
                         Self::commit_preprocessed_trace(
                             *trace,
                             domain,
@@ -1668,41 +1668,56 @@ pub trait IsStarkProver<
                             air.num_precomputed_columns(),
                             twiddles,
                             &mut pool.main,
-                        )
+                        )?
                     } else {
-                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)
-                    }
+                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)?
+                    };
+
+                    // Spill LDE from pool to mmap while pool is still filled,
+                    // then free pool buffers to reduce peak memory.
+                    #[cfg(feature = "disk-spill")]
+                    let spilled = {
+                        let num_main_cols = trace.num_main_columns;
+                        let s = LDETraceTable::spill_main_from_pool(
+                            &pool.main,
+                            num_main_cols,
+                            air.step_size(),
+                            domain.blowup_factor,
+                        )
+                        .map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "disk-spill main LDE table {idx}: {e}"
+                            ))
+                        })?;
+                        for buf in pool.main.iter_mut() {
+                            *buf = Vec::new();
+                        }
+                        s
+                    };
+
+                    #[cfg(feature = "disk-spill")]
+                    return Ok((tree, root, pre_tree, pre_root, n_pre, spilled));
+                    #[cfg(not(feature = "disk-spill"))]
+                    Ok((tree, root, pre_tree, pre_root, n_pre))
                 })
                 .collect();
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
             #[allow(unused_variables, unused_mut)]
             for (j, result) in chunk_results.into_iter().enumerate() {
+                #[cfg(feature = "disk-spill")]
+                let (tree, root, pre_tree, pre_root, n_pre, spilled) = result?;
+                #[cfg(not(feature = "disk-spill"))]
                 let (tree, root, pre_tree, pre_root, n_pre) = result?;
+
                 if let Some(ref pre_r) = pre_root {
                     transcript.append_bytes(pre_r);
                 }
                 transcript.append_bytes(&root);
 
-                // Spill the main LDE columns from the pool to a temp-file mmap before
-                // the pool is overwritten by the next chunk. Also spill Merkle tree nodes
-                // to disk — they remain accessible through mmap for Rounds 2-4 openings.
                 #[cfg(feature = "disk-spill")]
                 {
                     let idx = chunk_start + j;
-                    let (air, trace, _) = &air_trace_pairs[idx];
-                    let num_main_cols = trace.num_main_columns;
-                    let spilled = LDETraceTable::spill_main_from_pool(
-                        &pool_sets[j].main,
-                        num_main_cols,
-                        air.step_size(),
-                        domains[idx].blowup_factor,
-                    )
-                    .map_err(|e| {
-                        ProvingError::WrongParameter(format!(
-                            "disk-spill main LDE table {idx}: {e}"
-                        ))
-                    })?;
                     spilled_ldes[idx] = Some(spilled);
                 }
 
@@ -1745,19 +1760,7 @@ pub trait IsStarkProver<
                     num_precomputed_cols: n_pre,
                 });
             }
-        }
 
-        #[cfg(feature = "instruments")]
-        let main_commits_elapsed = phase_start.elapsed();
-
-        // Free main pool buffers after Phase A — they are not needed for Phase C
-        // (aux uses its own buffers) and their retained capacity from the largest
-        // table can be tens of GB.
-        #[cfg(feature = "disk-spill")]
-        for pool in pool_sets.iter_mut() {
-            for buf in pool.main.iter_mut() {
-                *buf = Vec::new();
-            }
         }
 
         // =====================================================================
