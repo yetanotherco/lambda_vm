@@ -13,16 +13,10 @@ desc = "The state of the hash function."
 pad = 0
 
 [[variables.input]]
-name = "h_base_addr"
-type = "DWordWL"
-desc = "The starting address of `h`."
-pad = 0
-
-[[variables.input]]
 name = "h_addr"
-type = ["DWordHL", 3]
-desc = "The addresses of the next doublewords of `h`: $#`h_base_addr` + 8 dot (i + 1)$"
-pad = ["arr", 8, 16, 24]
+type = ["DWordHL", 4]
+desc = "The addresses of the doublewords of `h`"
+pad = ["arr", 0, 8, 16, 24]
 
 [[variables.input]]
 name = "m"
@@ -31,16 +25,10 @@ desc = "The input chunk."
 pad = 0
 
 [[variables.input]]
-name = "m_base_addr"
-type = "DWordWL"
-desc = "The starting address of `m`."
-pad = 0
-
-[[variables.input]]
 name = "m_addr"
-type = ["DWordHL", 7]
-desc = "The addresses of the next doublewords of `m`: $#`m_base_addr` + 8 dot (i + 1)$"
-pad = ["arr", 8, 16, 24, 32, 40, 48, 56]
+type = ["DWordHL", 8]
+desc = "The addresses of the doublewords of `m`"
+pad = ["arr", 0, 8, 16, 24, 32, 40, 48, 56]
 
 [[variables.output]]
 name = "out"
@@ -74,22 +62,15 @@ iters = [["i", 0, 6], ["j", 0, 3]]
 [[constraints.memory]]
 kind = "template"
 tag = "ADD"
-input = ["m_base_addr", ["cast", ["*", 8, ["+", "i", 1]], "DWordWL"]]
+input = [["cast", ["idx", "m_addr", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
 output = ["cast", ["idx", "m_addr", "i"], "DWordWL"]
-iter = ["i", 0, 6]
+iter = ["i", 1, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", "m_base_addr", 0], ["idx", "m_base_addr", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "m_base_addr", 0], ["idx", "m_base_addr", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
-
-[[constraints.memory]]
-kind = "interaction"
-tag = "MEMW"
-input = [0, "m_base_addr", ["arr", ["idx", "m", 3], ["idx", "m", 2], ["idx", "m", 1], ["idx", "m", 0], ["idx", "m", 7], ["idx", "m", 6], ["idx", "m", 5], ["idx", "m", 4]], "timestamp", 0, 0, 1]
-output = ["arr", ["idx", "m", 3], ["idx", "m", 2], ["idx", "m", 1], ["idx", "m", 0], ["idx", "m", 7], ["idx", "m", 6], ["idx", "m", 5], ["idx", "m", 4]]
+input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 
 [[constraints.memory]]
@@ -115,13 +96,13 @@ output = ["arr",
     ["idx", "m", ["+", ["*", 8, "i"], 5]],
     ["idx", "m", ["+", ["*", 8, "i"], 4]]]
 multiplicity = "μ"
-iter = ["i", 0, 6]
+iter = ["i", 0, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "h_base_addr", 0], ["idx", "h_base_addr", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "h_base_addr", 0], ["idx", "h_base_addr", 1], 0, 0, 0, 0, 0, 0]
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 
 [[constraints.memory]]
@@ -129,44 +110,14 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "h_addr", "i"], "j"]]
 multiplicity = "μ"
-iters = [["i", 0, 2], ["j", 0, 3]]
+iters = [["i", 0, 3], ["j", 0, 3]]
 
 [[constraints.memory]]
 kind = "template"
 tag = "ADD"
-input = ["h_base_addr", ["*", 8, ["cast", ["+", "i", 1], "DWordWL"]]]
+input = [["cast", ["idx", "h_addr", 0], "DWordWL"], ["*", 8, ["cast", ["+", "i", 1], "DWordWL"]]]
 output = ["cast", ["idx", "h_addr", "i"], "DWordWL"]
-iter = ["i", 0, 2]
-
-[[constraints.memory]]
-kind = "interaction"
-tag = "MEMW"
-input = [
-  0,
-  "h_base_addr",
-  ["arr",
-      ["idx", "out", 3],
-      ["idx", "out", 2],
-      ["idx", "out", 1],
-      ["idx", "out", 0],
-      ["idx", "out", 7],
-      ["idx", "out", 6],
-      ["idx", "out", 5],
-      ["idx", "out", 4]],
-  ["+", "timestamp", ["cast", 1, "DWordWL"]],
-  0, 0, 1
-]
-output = ["arr",
-  ["idx", "h", 3],
-  ["idx", "h", 2],
-  ["idx", "h", 1],
-  ["idx", "h", 0],
-  ["idx", "h", 7],
-  ["idx", "h", 6],
-  ["idx", "h", 5],
-  ["idx", "h", 4],
-]
-multiplicity = "μ"
+iter = ["i", 1, 3]
 
 [[constraints.memory]]
 kind = "interaction"
@@ -175,28 +126,28 @@ input = [
   0,
   ["cast", ["idx", "h_addr", "i"], "DWordWL"],
   ["arr",
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 3]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 2]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 1]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 0]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 7]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 6]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 5]],
-      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 4]]],
+      ["idx", "out", ["+", ["*", "i", 8], 3]],
+      ["idx", "out", ["+", ["*", "i", 8], 2]],
+      ["idx", "out", ["+", ["*", "i", 8], 1]],
+      ["idx", "out", ["+", ["*", "i", 8], 0]],
+      ["idx", "out", ["+", ["*", "i", 8], 7]],
+      ["idx", "out", ["+", ["*", "i", 8], 6]],
+      ["idx", "out", ["+", ["*", "i", 8], 5]],
+      ["idx", "out", ["+", ["*", "i", 8], 4]]],
   ["+", "timestamp", ["cast", 1, "DWordWL"]],
   0, 0, 1
 ]
 output = ["arr",
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 3]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 2]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 1]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 0]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 7]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 6]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 5]],
-  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 4]],
+  ["idx", "h", ["+", ["*", "i", 8], 3]],
+  ["idx", "h", ["+", ["*", "i", 8], 2]],
+  ["idx", "h", ["+", ["*", "i", 8], 1]],
+  ["idx", "h", ["+", ["*", "i", 8], 0]],
+  ["idx", "h", ["+", ["*", "i", 8], 7]],
+  ["idx", "h", ["+", ["*", "i", 8], 6]],
+  ["idx", "h", ["+", ["*", "i", 8], 5]],
+  ["idx", "h", ["+", ["*", "i", 8], 4]],
 ]
-iter = ["i", 0, 2]
+iter = ["i", 0, 3]
 multiplicity = "μ"
 
 [[constraint_groups]]
