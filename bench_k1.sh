@@ -43,7 +43,7 @@ rm -f /tmp/proof_pr_$$.bin
 
 echo ""
 echo "--- PR branch instruments ---"
-echo "$PR_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW_A|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL"
+echo "$PR_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL|others"
 echo ""
 
 PR_TIME=$(echo "$PR_OUTPUT"   | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')
@@ -91,7 +91,7 @@ rm -f /tmp/proof_main_$$.bin
 
 echo ""
 echo "--- main instruments ---"
-echo "$MAIN_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW_A|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL"
+echo "$MAIN_OUTPUT" | grep -E "^MEMW|Proving time|Peak heap|=== PROVER|Phase|─+|Execute|Trace|AIR|Pre-pass|Round|Aux|expand|commit|Rounds|MEMW|LT |CPU|BRANCH|sub-op|R[1-4] |Total F|Total M|TOTAL|others"
 echo ""
 
 MAIN_TIME=$(echo "$MAIN_OUTPUT"      | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')
