@@ -303,16 +303,20 @@ where
             file.set_len(total_bytes as u64)?;
             {
                 let mut writer = std::io::BufWriter::new(&file);
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes)
-                };
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes) };
                 writer.write_all(bytes)?;
                 writer.flush()?;
             }
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             let len = part.len();
             drop(part);
-            mmaps.push(Round2EvalMmap { mmap, _file: file, len, elem_size });
+            mmaps.push(Round2EvalMmap {
+                mmap,
+                _file: file,
+                len,
+                elem_size,
+            });
         }
 
         self.eval_mmaps = Some(mmaps);
@@ -1351,8 +1355,12 @@ pub trait IsStarkProver<
             .flat_map(|j| {
                 let part_len = round_2_result.composition_eval_len(j) as u64;
                 vec![
-                    round_2_result.get_composition_eval(j, reverse_index(index * 2, part_len)).clone(),
-                    round_2_result.get_composition_eval(j, reverse_index(index * 2 + 1, part_len)).clone(),
+                    round_2_result
+                        .get_composition_eval(j, reverse_index(index * 2, part_len))
+                        .clone(),
+                    round_2_result
+                        .get_composition_eval(j, reverse_index(index * 2 + 1, part_len))
+                        .clone(),
                 ]
             })
             .collect();
@@ -1510,10 +1518,7 @@ pub trait IsStarkProver<
                     )
                 });
 
-            let composition_openings = Self::open_composition_poly(
-                round_2_result,
-                *index,
-            );
+            let composition_openings = Self::open_composition_poly(round_2_result, *index);
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
                 Self::open_trace_polys_aux(
@@ -1568,6 +1573,12 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
+        #[cfg(feature = "instruments")]
+        let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("entry") {
+            heap_snaps.push(s);
+        }
 
         let num_airs = air_trace_pairs.len();
 
@@ -1633,6 +1644,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after pool alloc") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1768,11 +1783,14 @@ pub trait IsStarkProver<
                     num_precomputed_cols: n_pre,
                 });
             }
-
         }
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after main commits") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1819,6 +1837,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after aux build") {
+            heap_snaps.push(s);
+        }
 
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork and pool set.
@@ -1951,6 +1973,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after aux commit") {
+            heap_snaps.push(s);
+        }
 
         #[cfg(feature = "debug-checks")]
         {
@@ -2217,6 +2243,9 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
+            if let Some(s) = crate::instruments::snap("after rounds 2-4") {
+                heap_snaps.push(s);
+            }
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
@@ -2227,6 +2256,7 @@ pub trait IsStarkProver<
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
+                heap_snapshots: heap_snaps,
             });
         }
 

@@ -1,6 +1,29 @@
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Heap reader callback: set by the binary (CLI) to provide jemalloc reads
+// without coupling this crate to jemalloc.
+// ---------------------------------------------------------------------------
+
+static HEAP_READER: OnceLock<fn() -> usize> = OnceLock::new();
+
+/// Register a function that returns the current heap allocated bytes.
+/// Call this once from the binary before proving starts.
+pub fn set_heap_reader(f: fn() -> usize) {
+    let _ = HEAP_READER.set(f);
+}
+
+/// Read current heap in bytes, or `None` if no reader was registered.
+pub fn heap_bytes() -> Option<usize> {
+    HEAP_READER.get().map(|f| f())
+}
+
+fn heap_mb() -> Option<usize> {
+    heap_bytes().map(|b| b / (1024 * 1024))
+}
 
 /// Sub-operation timing breakdown for a single table in Rounds 2-4.
 #[derive(Clone, Debug, Default)]
@@ -38,6 +61,9 @@ pub struct Round1SubOps {
     pub aux_merkle: Duration,
 }
 
+/// Heap snapshot: (label, allocated_mb) at a phase boundary.
+pub type HeapSnapshot = (&'static str, usize);
+
 /// Timing data collected inside `multi_prove`.
 pub struct MultiProveTiming {
     pub prepass: Duration,
@@ -49,6 +75,20 @@ pub struct MultiProveTiming {
     pub round1_sub: Round1SubOps,
     /// (name, rows, duration, sub_ops) per table for rounds 2-4.
     pub table_timings: Vec<(String, usize, Duration, TableSubOps)>,
+    /// Heap snapshots at phase boundaries (empty if no heap reader set).
+    pub heap_snapshots: Vec<HeapSnapshot>,
+}
+
+/// Heap snapshots taken in `prove_with_options` (before multi_prove).
+pub struct ProveHeapProfile {
+    pub after_execute: Option<usize>,
+    pub after_trace_build: Option<usize>,
+    pub after_air: Option<usize>,
+}
+
+/// Take a heap snapshot, returning `(label, mb)` or `None`.
+pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
+    heap_mb().map(|mb| (label, mb))
 }
 
 /// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.

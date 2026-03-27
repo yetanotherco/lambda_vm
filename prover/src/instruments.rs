@@ -57,6 +57,8 @@ pub fn print_report(
     trace_build: Duration,
     air_construction: Duration,
     total: Duration,
+    heap_before: Option<usize>,
+    heap_profile: &stark::instruments::ProveHeapProfile,
 ) {
     let mp = stark::instruments::take();
 
@@ -69,7 +71,7 @@ pub fn print_report(
     row_top("Trace build", trace_build, total);
     row_top("AIR construction", air_construction, total);
 
-    if let Some(mp) = mp {
+    if let Some(ref mp) = mp {
         let round1 = mp.main_commits + mp.aux_build + mp.aux_commit;
 
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
@@ -214,4 +216,40 @@ pub fn print_report(
     eprintln!("  {}", "─".repeat(58));
     eprintln!("  {:<36} {:>7.2}s", "TOTAL", total.as_secs_f64());
     eprintln!();
+
+    // Heap profile
+    let mb = |b: usize| b / (1024 * 1024);
+    let has_heap = heap_before.is_some();
+    if has_heap {
+        eprintln!("=== HEAP PROFILE (MB) ===");
+        eprintln!("  {:<36} {:>8} {:>8}", "Phase", "Heap", "Delta");
+        eprintln!("  {}", "─".repeat(56));
+
+        let mut prev = heap_before.unwrap();
+        let mut print_row = |label: &str, val: Option<usize>| {
+            if let Some(v) = val {
+                let cur = mb(v);
+                let delta = mb(v) as isize - mb(prev) as isize;
+                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                prev = v;
+            }
+        };
+
+        print_row("After execute", heap_profile.after_execute);
+        print_row("After trace build", heap_profile.after_trace_build);
+        print_row("After AIR construction", heap_profile.after_air);
+
+        if let Some(ref mp_data) = mp {
+            for (label, snap_mb) in &mp_data.heap_snapshots {
+                let snap_bytes = snap_mb * (1024 * 1024);
+                let cur = *snap_mb;
+                let delta = cur as isize - mb(prev) as isize;
+                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                prev = snap_bytes;
+            }
+        }
+
+        eprintln!("  {}", "─".repeat(56));
+        eprintln!();
+    }
 }

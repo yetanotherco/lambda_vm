@@ -76,10 +76,7 @@ where
         {
             let mut writer = std::io::BufWriter::new(&file);
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.evaluation.as_ptr() as *const u8,
-                    total_bytes,
-                )
+                std::slice::from_raw_parts(self.evaluation.as_ptr() as *const u8, total_bytes)
             };
             writer.write_all(bytes)?;
             writer.flush()?;

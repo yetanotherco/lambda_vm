@@ -277,6 +277,12 @@ fn cmd_prove(
         eprintln!("Disk-spill: enabled");
     }
 
+    #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
+    stark::instruments::set_heap_reader(|| {
+        tikv_jemalloc_ctl::epoch::advance().ok();
+        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+    });
+
     let max_rows_config = match max_rows {
         Some(mr) => {
             eprintln!("Max rows per chunk: {mr}");
