@@ -153,13 +153,13 @@ def = ["+", ["cast", "a_and_b", "Word"], ["cast", "c_and_a_xor_b", "Word"]]
 [[variables.virtual]]
 name = "temp1"
 type = "BaseField"
-desc = "temp1 value"
+desc = "`temp1` value"
 def = ["+", "h", "S1", "ch", "kval", "wval"]
 
 [[variables.virtual]]
 name = "temp2"
 type = "BaseField"
-desc = "temp2 value"
+desc = "`temp2` value"
 def = ["+", "S0", "maj"]
 
 [[variables.multiplicity]]
