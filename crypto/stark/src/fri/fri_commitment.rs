@@ -15,6 +15,17 @@ where
     pub merkle_tree: MerkleTree<B>,
     pub coset_offset: FieldElement<F>,
     pub domain_size: usize,
+    #[cfg(feature = "disk-spill")]
+    eval_mmap: Option<EvalMmapBacking>,
+}
+
+#[cfg(feature = "disk-spill")]
+#[derive(Clone)]
+struct EvalMmapBacking {
+    mmap: std::sync::Arc<memmap2::Mmap>,
+    _file: std::sync::Arc<std::fs::File>,
+    _len: usize,
+    elem_size: usize,
 }
 
 impl<F, B> FriLayer<F, B>
@@ -34,6 +45,54 @@ where
             merkle_tree,
             coset_offset,
             domain_size,
+            #[cfg(feature = "disk-spill")]
+            eval_mmap: None,
         }
+    }
+
+    #[inline]
+    pub fn get_evaluation(&self, index: usize) -> &FieldElement<F> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.eval_mmap {
+            let offset = index * backing.elem_size;
+            return unsafe { &*(backing.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
+        }
+        &self.evaluation[index]
+    }
+
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_evaluation_to_disk(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        if self.evaluation.is_empty() || self.eval_mmap.is_some() {
+            return Ok(());
+        }
+
+        let elem_size = std::mem::size_of::<FieldElement<F>>();
+        let total_bytes = self.evaluation.len() * elem_size;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes as u64)?;
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.evaluation.as_ptr() as *const u8,
+                    total_bytes,
+                )
+            };
+            writer.write_all(bytes)?;
+            writer.flush()?;
+        }
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let len = self.evaluation.len();
+        self.evaluation = Vec::new();
+        self.eval_mmap = Some(EvalMmapBacking {
+            mmap: std::sync::Arc::new(mmap),
+            _file: std::sync::Arc::new(file),
+            _len: len,
+            elem_size,
+        });
+        Ok(())
     }
 }

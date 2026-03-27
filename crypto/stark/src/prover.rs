@@ -242,6 +242,82 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
+    #[cfg(feature = "disk-spill")]
+    eval_mmaps: Option<Vec<Round2EvalMmap>>,
+}
+
+#[cfg(feature = "disk-spill")]
+struct Round2EvalMmap {
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+    len: usize,
+    elem_size: usize,
+}
+
+impl<F> Round2<F>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    pub fn num_composition_parts(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref mmaps) = self.eval_mmaps {
+            return mmaps.len();
+        }
+        self.lde_composition_poly_evaluations.len()
+    }
+
+    #[inline]
+    pub fn get_composition_eval(&self, part: usize, index: usize) -> &FieldElement<F> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref mmaps) = self.eval_mmaps {
+            let m = &mmaps[part];
+            let offset = index * m.elem_size;
+            return unsafe { &*(m.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
+        }
+        &self.lde_composition_poly_evaluations[part][index]
+    }
+
+    pub fn composition_eval_len(&self, part: usize) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref mmaps) = self.eval_mmaps {
+            return mmaps[part].len;
+        }
+        self.lde_composition_poly_evaluations[part].len()
+    }
+
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_evaluations_to_disk(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        if self.lde_composition_poly_evaluations.is_empty() || self.eval_mmaps.is_some() {
+            return Ok(());
+        }
+
+        let elem_size = std::mem::size_of::<FieldElement<F>>();
+        let mut mmaps = Vec::with_capacity(self.lde_composition_poly_evaluations.len());
+
+        for part in self.lde_composition_poly_evaluations.drain(..) {
+            let total_bytes = part.len() * elem_size;
+            let file = tempfile::tempfile()?;
+            file.set_len(total_bytes as u64)?;
+            {
+                let mut writer = std::io::BufWriter::new(&file);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes)
+                };
+                writer.write_all(bytes)?;
+                writer.flush()?;
+            }
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let len = part.len();
+            drop(part);
+            mmaps.push(Round2EvalMmap { mmap, _file: file, len, elem_size });
+        }
+
+        self.eval_mmaps = Some(mmaps);
+        Ok(())
+    }
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -917,6 +993,8 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
+            #[cfg(feature = "disk-spill")]
+            eval_mmaps: None,
         })
     }
 
@@ -932,7 +1010,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.num_composition_parts();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -999,7 +1077,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_2_result: &mut Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -1013,7 +1091,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let n_terms_composition_poly = round_2_result.num_composition_parts();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
 
@@ -1048,6 +1126,13 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
+
+        // Spill composition poly evaluations to disk after the dense read above.
+        // They are only needed sparsely in open_composition_poly (~30 queries).
+        #[cfg(feature = "disk-spill")]
+        round_2_result
+            .spill_evaluations_to_disk()
+            .expect("disk-spill composition poly evaluations");
 
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
@@ -1153,7 +1238,7 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.num_composition_parts();
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -1211,7 +1296,7 @@ pub trait IsStarkProver<
             // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_val = round_2_result.get_composition_eval(j, row_idx);
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
@@ -1245,24 +1330,25 @@ pub trait IsStarkProver<
     /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
     /// element.
     fn open_composition_poly(
-        composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
-        lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
+        round_2_result: &Round2<FieldExtension>,
         index: usize,
     ) -> PolynomialOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let proof = composition_poly_merkle_tree
+        let proof = round_2_result
+            .composition_poly_merkle_tree
             .get_proof_by_pos(index)
             .unwrap();
 
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
-            .iter()
-            .flat_map(|part| {
+        let num_parts = round_2_result.num_composition_parts();
+        let lde_composition_poly_parts_evaluation: Vec<_> = (0..num_parts)
+            .flat_map(|j| {
+                let part_len = round_2_result.composition_eval_len(j) as u64;
                 vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
+                    round_2_result.get_composition_eval(j, reverse_index(index * 2, part_len)).clone(),
+                    round_2_result.get_composition_eval(j, reverse_index(index * 2 + 1, part_len)).clone(),
                 ]
             })
             .collect();
@@ -1421,8 +1507,7 @@ pub trait IsStarkProver<
                 });
 
             let composition_openings = Self::open_composition_poly(
-                &round_2_result.composition_poly_merkle_tree,
-                &round_2_result.lde_composition_poly_evaluations,
+                round_2_result,
                 *index,
             );
 
@@ -2003,7 +2088,7 @@ pub trait IsStarkProver<
             coefficients.drain(..num_transition_constraints).collect();
         let boundary_coefficients = coefficients;
 
-        let round_2_result = Self::round_2_compute_composition_polynomial(
+        let mut round_2_result = Self::round_2_compute_composition_polynomial(
             air,
             pub_inputs,
             domain,
@@ -2061,7 +2146,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &round_2_result,
+            &mut round_2_result,
             &round_3_result,
             &z,
             transcript,
