@@ -1495,10 +1495,10 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                &alpha_powers,
+                alpha_powers,
                 alpha_offset,
                 &mut linear_combination,
-                &shifts,
+                shifts,
             );
             alpha_offset += consumed;
         }
@@ -1548,6 +1548,7 @@ where
 ///
 /// Uses a single batch inversion for both fingerprint vectors (2*N elements).
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 fn compute_logup_batched_term_column<F, E>(
     interaction_a: &BusInteraction,
     interaction_b: &BusInteraction,
@@ -1568,59 +1569,68 @@ where
     let negate_b = !interaction_b.is_sender;
 
     // Helper to get multiplicities for an interaction, borrowing when possible
-    let compute_multiplicities =
-        |interaction: &BusInteraction| -> Cow<'_, [FieldElement<F>]> {
+    let compute_multiplicities = |interaction: &BusInteraction| -> Cow<'_, [FieldElement<F>]> {
         match &interaction.multiplicity {
             Multiplicity::One => Cow::Owned(vec![FieldElement::one(); trace_len]),
             Multiplicity::Column(col) => Cow::Borrowed(&main_segment_cols[*col]),
-            Multiplicity::Sum(col_a, col_b) => Cow::Owned(main_segment_cols[*col_a]
-                .iter()
-                .zip(main_segment_cols[*col_b].iter())
-                .map(|(a, b)| a + b)
-                .collect()),
-            Multiplicity::Negated(col) => Cow::Owned(main_segment_cols[*col]
-                .iter()
-                .map(|elem| FieldElement::<F>::one() - elem)
-                .collect()),
-            Multiplicity::Diff(col_a, col_b) => Cow::Owned(main_segment_cols[*col_a]
-                .iter()
-                .zip(main_segment_cols[*col_b].iter())
-                .map(|(a, b)| a - b)
-                .collect()),
-            Multiplicity::Sum3(col_a, col_b, col_c) => Cow::Owned((0..trace_len)
-                .map(|row| {
-                    &main_segment_cols[*col_a][row]
-                        + &main_segment_cols[*col_b][row]
-                        + &main_segment_cols[*col_c][row]
-                })
-                .collect()),
-            Multiplicity::Linear(terms) => Cow::Owned((0..trace_len)
-                .map(|row| {
-                    let mut result = FieldElement::<F>::zero();
-                    for term in terms {
-                        match *term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                result += FieldElement::<F>::from(value);
+            Multiplicity::Sum(col_a, col_b) => Cow::Owned(
+                main_segment_cols[*col_a]
+                    .iter()
+                    .zip(main_segment_cols[*col_b].iter())
+                    .map(|(a, b)| a + b)
+                    .collect(),
+            ),
+            Multiplicity::Negated(col) => Cow::Owned(
+                main_segment_cols[*col]
+                    .iter()
+                    .map(|elem| FieldElement::<F>::one() - elem)
+                    .collect(),
+            ),
+            Multiplicity::Diff(col_a, col_b) => Cow::Owned(
+                main_segment_cols[*col_a]
+                    .iter()
+                    .zip(main_segment_cols[*col_b].iter())
+                    .map(|(a, b)| a - b)
+                    .collect(),
+            ),
+            Multiplicity::Sum3(col_a, col_b, col_c) => Cow::Owned(
+                (0..trace_len)
+                    .map(|row| {
+                        &main_segment_cols[*col_a][row]
+                            + &main_segment_cols[*col_b][row]
+                            + &main_segment_cols[*col_c][row]
+                    })
+                    .collect(),
+            ),
+            Multiplicity::Linear(terms) => Cow::Owned(
+                (0..trace_len)
+                    .map(|row| {
+                        let mut result = FieldElement::<F>::zero();
+                        for term in terms {
+                            match *term {
+                                LinearTerm::Column {
+                                    coefficient,
+                                    column,
+                                } => {
+                                    let coeff = FieldElement::<F>::from(coefficient);
+                                    result += &main_segment_cols[column][row] * coeff;
+                                }
+                                LinearTerm::ColumnUnsigned {
+                                    coefficient,
+                                    column,
+                                } => {
+                                    let coeff = FieldElement::<F>::from(coefficient);
+                                    result += &main_segment_cols[column][row] * coeff;
+                                }
+                                LinearTerm::Constant(value) => {
+                                    result += FieldElement::<F>::from(value);
+                                }
                             }
                         }
-                    }
-                    result
-                })
-                .collect()),
+                        result
+                    })
+                    .collect(),
+            ),
         }
     };
 
