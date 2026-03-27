@@ -3,7 +3,6 @@ use std::ops::Div;
 use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
 use crate::traits::TransitionEvaluationContext;
-use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
@@ -95,12 +94,15 @@ where
             return one_poly;
         }
         let period = self.period();
+        let decrement = trace_primitive_root.pow(trace_length - period);
+        let mut current = decrement.clone();
         // FIXME: CHECK IF WE NEED TO CHANGE THE NEW MONOMIAL'S ARGUMENTS TO trace_root^(offset * trace_length / period) INSTEAD OF ONE!!!!
-        (1..=self.end_exemptions())
-            .map(|exemption| trace_primitive_root.pow(trace_length - exemption * period))
-            .fold(one_poly, |acc, offset| {
-                acc * (Polynomial::new_monomial(FieldElement::<F>::one(), 1) - offset)
-            })
+        (0..self.end_exemptions()).fold(one_poly, |acc, _| {
+            let next =
+                acc * (Polynomial::new_monomial(FieldElement::<F>::one(), 1) - current.clone());
+            current = &current * &decrement;
+            next
+        })
     }
 
     /// Compute evaluations of the constraints zerofier over a LDE domain.
@@ -129,25 +131,29 @@ where
             // without the end exemptions, repeat their values after `blowup_factor * exemptions_period` iterations,
             // so we only need to compute those.
             let last_exponent = blowup_factor * exemptions_period;
+            let numerator_power = trace_length / exemptions_period;
+            let denominator_power = trace_length / self.period();
+            let offset_exponent =
+                trace_length * self.periodic_exemptions_offset().unwrap() / exemptions_period;
+            let numerator_offset = trace_primitive_root.pow(offset_exponent);
+            let denominator_offset = trace_primitive_root.pow(self.offset() * denominator_power);
+            let numerator_step = lde_root.pow(numerator_power);
+            let denominator_step = lde_root.pow(denominator_power);
+            let mut numerator_eval = coset_offset.pow(numerator_power);
+            let mut denominator_eval = coset_offset.pow(denominator_power);
 
-            let evaluations: Vec<_> = (0..last_exponent)
-                .map(|exponent| {
-                    let x = lde_root.pow(exponent);
-                    let offset_times_x = coset_offset * &x;
-                    let offset_exponent = trace_length * self.periodic_exemptions_offset().unwrap()
-                        / exemptions_period;
+            let mut evaluations = Vec::with_capacity(last_exponent);
+            for _ in 0..last_exponent {
+                let numerator = &numerator_eval - &numerator_offset;
+                let denominator = &denominator_eval - &denominator_offset;
 
-                    let numerator = offset_times_x.pow(trace_length / exemptions_period)
-                        - trace_primitive_root.pow(offset_exponent);
-                    let denominator = offset_times_x.pow(trace_length / self.period())
-                        - trace_primitive_root.pow(self.offset() * trace_length / self.period());
-
-                    // The denominator is guaranteed to be non-zero because the sets of powers of `offset_times_x`
-                    // and `trace_primitive_root` are disjoint, provided that the offset is neither an element of the
-                    // interpolation domain nor part of a subgroup with order less than n.
-                    unsafe { numerator.div(denominator).unwrap_unchecked() }
-                })
-                .collect();
+                // The denominator is guaranteed to be non-zero because the sets of powers of `offset_times_x`
+                // and `trace_primitive_root` are disjoint, provided that the offset is neither an element of the
+                // interpolation domain nor part of a subgroup with order less than n.
+                evaluations.push(unsafe { numerator.div(denominator).unwrap_unchecked() });
+                numerator_eval = &numerator_eval * &numerator_step;
+                denominator_eval = &denominator_eval * &denominator_step;
+            }
 
             // FIXME: Instead of computing this evaluations for each constraint, they can be computed
             // once for every constraint with the same end exemptions (combination of end_exemptions()
@@ -174,14 +180,16 @@ where
         // useless divisions.
         } else {
             let last_exponent = blowup_factor * self.period();
+            let denominator_power = trace_length / self.period();
+            let denominator_offset = trace_primitive_root.pow(self.offset() * denominator_power);
+            let denominator_step = lde_root.pow(denominator_power);
+            let mut denominator_eval = coset_offset.pow(denominator_power);
 
-            let mut evaluations = (0..last_exponent)
-                .map(|exponent| {
-                    let x = lde_root.pow(exponent);
-                    (coset_offset * &x).pow(trace_length / self.period())
-                        - trace_primitive_root.pow(self.offset() * trace_length / self.period())
-                })
-                .collect_vec();
+            let mut evaluations = Vec::with_capacity(last_exponent);
+            for _ in 0..last_exponent {
+                evaluations.push(&denominator_eval - &denominator_offset);
+                denominator_eval = &denominator_eval * &denominator_step;
+            }
 
             FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
 

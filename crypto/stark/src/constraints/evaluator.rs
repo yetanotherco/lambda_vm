@@ -16,6 +16,7 @@ use rayon::{
     prelude::{IntoParallelIterator, ParallelIterator},
 };
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 pub struct ConstraintEvaluator<
@@ -225,16 +226,21 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
+        let mut boundary_step_points =
+            HashMap::with_capacity(boundary_constraints.constraints.len());
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
             boundary_constraints
                 .constraints
                 .iter()
                 .map(|bc| {
-                    let point = &domain.trace_primitive_root.pow(bc.step as u64);
+                    let point = boundary_step_points
+                        .entry(bc.step)
+                        .or_insert_with(|| domain.trace_primitive_root.pow(bc.step as u64))
+                        .clone();
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v - point)
+                        .map(|v| v - &point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals
