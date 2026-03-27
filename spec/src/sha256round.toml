@@ -3,7 +3,7 @@ name = "SHA256ROUND"
 [[variables.input]]
 name = "timestamp"
 type = "DWordWL"
-desc = "The timestamp/identifier for this execution of the "
+desc = "The timestamp/identifier for this execution of the round function"
 pad = 0
 
 [[variables.input]]

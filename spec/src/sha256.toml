@@ -54,6 +54,13 @@ name = "memory"
 
 [[constraints.memory]]
 kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], 0, 0, 0, 0, 0, 0]
+multiplicity = "μ"
+
+[[constraints.memory]]
+kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "m_addr", "i"], "j"]]
 multiplicity = "μ"
@@ -65,13 +72,6 @@ tag = "ADD"
 input = [["cast", ["idx", "m_addr", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
 output = ["cast", ["idx", "m_addr", "i"], "DWordWL"]
 iter = ["i", 1, 7]
-
-[[constraints.memory]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
 
 [[constraints.memory]]
 kind = "interaction"
@@ -255,6 +255,11 @@ iter = ["i", 0, 7]
 
 [[constraint_groups]]
 name = "lookup"
+
+[[constraints.lookup]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
 
 [[constraints.lookup]]
 kind = "interaction"
