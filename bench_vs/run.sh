@@ -107,7 +107,11 @@ run_one() {
         LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
-        LAMBDA_OUTPUT=$("$CLI" prove "$LAMBDA_ELF" -o "$TMP_DIR/lambda_proof.bin" --time 2>/dev/null)
+        LAMBDA_OUTPUT=$("$CLI" prove "$LAMBDA_ELF" -o "$TMP_DIR/lambda_proof.bin" --time 2>"$TMP_DIR/lambda_err.txt")
+        if [ $? -ne 0 ]; then
+            echo -e "  ${RED}[Lambda VM] FAILED:${NC}"
+            cat "$TMP_DIR/lambda_err.txt"
+        fi
         lambda_time=$(echo "$LAMBDA_OUTPUT" | grep -o 'Proving time: [0-9.]*s' | grep -o '[0-9.]*')
         echo -e "  Lambda VM: ${BOLD}${lambda_time}s${NC}"
     fi

@@ -16,7 +16,7 @@ fn halt(code: u64) -> ! {
         core::arch::asm!(
             "ecall",
             in("a0") code,
-            in("a7") 5u64,
+            in("a7") 93u64,
             options(noreturn),
         );
     }
