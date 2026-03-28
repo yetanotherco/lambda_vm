@@ -5,7 +5,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
 type StarkField = GoldilocksField;
 type Felt = FieldElement<GoldilocksField>;
@@ -33,10 +33,6 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
 
     fn periodic_exemptions_offset(&self) -> Option<usize> {
         Some(15)
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -89,10 +85,6 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 
     fn constraint_idx(&self) -> usize {
         1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn period(&self) -> usize {

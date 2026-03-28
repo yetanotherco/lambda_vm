@@ -5,8 +5,8 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::{
-    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+use math::field::{
+    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 
 use crate::constraints::transition::TransitionConstraint;
@@ -119,7 +119,12 @@ fn test_multiplicity_one() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::One should work for matching sender/receiver"
     );
 }
@@ -224,7 +229,12 @@ fn test_multiplicity_sum() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::Sum should work for matching sender/receiver"
     );
 }
@@ -327,7 +337,12 @@ fn test_multiplicity_negated() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::Negated should work for skipping flagged rows"
     );
 }

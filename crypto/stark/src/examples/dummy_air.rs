@@ -10,10 +10,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{
-    element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
-    traits::IsFFTField,
-};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField};
 
 type StarkField = GoldilocksField;
 
@@ -101,10 +98,6 @@ where
 
     fn constraint_idx(&self) -> usize {
         1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(

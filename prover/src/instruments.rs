@@ -5,7 +5,7 @@ fn fmt_rows(rows: usize) -> String {
     if rows >= 1_000_000 {
         format!("{:.1}M", rows as f64 / 1_000_000.0)
     } else if rows >= 1_000 {
-        format!("{}K", rows / 1_000)
+        format!("{}K", (rows + 500) / 1_000)
     } else {
         format!("{rows}")
     }
@@ -56,17 +56,13 @@ pub fn print_report(
     execute: Duration,
     trace_build: Duration,
     air_construction: Duration,
-    _prove: Duration,
     total: Duration,
 ) {
     let mp = stark::instruments::take();
 
     eprintln!();
     eprintln!("=== PROVER TIMING ===");
-    eprintln!(
-        "  {:<36} {:>8}  {:>5}",
-        "Phase", "Wall", "%",
-    );
+    eprintln!("  {:<36} {:>8}  {:>5}", "Phase", "Wall", "%",);
     eprintln!("  {}", "─".repeat(58));
 
     row_top("Execute", execute, total);
@@ -125,11 +121,7 @@ pub fn print_report(
                 } else {
                     name.clone()
                 };
-                let label = format!(
-                    "    {:<18} {:>6}",
-                    display_name,
-                    fmt_rows(t.total_rows),
-                );
+                let label = format!("    {:<18} {:>6}", display_name, fmt_rows(t.total_rows),);
                 row_sub(&label, t.total_dur, total);
             } else {
                 others_dur += t.total_dur;
@@ -163,9 +155,15 @@ pub fn print_report(
             total_queries += t.sub_ops.queries;
         }
 
-        let sub_ops_sum = total_trace_lde + total_constraints + total_comp_decompose
-            + total_comp_commit + total_ood + total_deep_comp + total_deep_extend
-            + total_fri_commit + total_queries;
+        let sub_ops_sum = total_trace_lde
+            + total_constraints
+            + total_comp_decompose
+            + total_comp_commit
+            + total_ood
+            + total_deep_comp
+            + total_deep_extend
+            + total_fri_commit
+            + total_queries;
         if sub_ops_sum > Duration::ZERO {
             let mut sub_ops: Vec<(&str, Duration)> = vec![
                 ("R1  expand_pool_to_lde", total_trace_lde),
@@ -189,13 +187,28 @@ pub fn print_report(
         }
 
         // Cross-round totals: all FFT work and all Merkle work
-        let total_fft = mp.round1_sub.main_lde + mp.round1_sub.aux_lde
-            + total_trace_lde + total_comp_decompose + total_deep_extend;
-        let total_merkle = mp.round1_sub.main_merkle + mp.round1_sub.aux_merkle
-            + total_comp_commit + total_fri_commit;
+        let total_fft = mp.round1_sub.main_lde
+            + mp.round1_sub.aux_lde
+            + total_trace_lde
+            + total_comp_decompose
+            + total_deep_extend;
+        let total_merkle = mp.round1_sub.main_merkle
+            + mp.round1_sub.aux_merkle
+            + total_comp_commit
+            + total_fri_commit;
         eprintln!();
-        eprintln!("  {:<36} {:>7.2}s  {:>5.1}%", "Total FFT", total_fft.as_secs_f64(), pct(total_fft, total));
-        eprintln!("  {:<36} {:>7.2}s  {:>5.1}%", "Total Merkle", total_merkle.as_secs_f64(), pct(total_merkle, total));
+        eprintln!(
+            "  {:<36} {:>7.2}s  {:>5.1}%",
+            "Total FFT",
+            total_fft.as_secs_f64(),
+            pct(total_fft, total)
+        );
+        eprintln!(
+            "  {:<36} {:>7.2}s  {:>5.1}%",
+            "Total Merkle",
+            total_merkle.as_secs_f64(),
+            pct(total_merkle, total)
+        );
     }
 
     eprintln!("  {}", "─".repeat(58));

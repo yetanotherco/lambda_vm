@@ -17,8 +17,8 @@
 
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GoldilocksBaseField;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+use math::field::goldilocks::GoldilocksField as GoldilocksBaseField;
 
 /// Base field type: Goldilocks prime field (p = 2^64 - 2^32 + 1)
 pub type GoldilocksField = GoldilocksBaseField;
@@ -69,10 +69,8 @@ pub enum BusId {
     // =========================================================================
     // Shift helpers (BITWISE table provides)
     // =========================================================================
-    /// Halfword shift left: HWSL[X, Z] -> (X << Z) & 0xFFFF
+    /// Halfword shift left: HWSL[X, Z] -> [(X << Z) & 0xFFFF, X >> (16 - Z)]
     Hwsl,
-    /// Halfword shift left carry: HWSLC[X, Z] -> X >> (16 - Z)
-    Hwslc,
 
     // =========================================================================
     // Arithmetic operations (separate tables)
@@ -104,8 +102,13 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode,
-    /// System call handling
+    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
     Ecall,
+    /// COMMIT self-referencing recursive bus (row N → row N+1)
+    CommitNextByte,
+    /// COMMIT output bus: verifier computes the receiver contribution externally
+    /// from `VmProof.public_output` using the shared LogUp challenges
+    Commit,
 }
 
 impl BusId {
@@ -122,7 +125,6 @@ impl BusId {
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
             BusId::Hwsl => "Hwsl",
-            BusId::Hwslc => "Hwslc",
             BusId::Lt => "Lt",
             BusId::Mul => "Mul",
             BusId::Shift => "Shift",
@@ -133,6 +135,8 @@ impl BusId {
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
             BusId::Dvrm => "Dvrm",
+            BusId::CommitNextByte => "CommitNextByte",
+            BusId::Commit => "Commit",
         }
     }
 }
@@ -152,9 +156,9 @@ impl TryFrom<u64> for BusId {
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
             9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Hwslc),
-            11 => Ok(BusId::Lt),
-            12 => Ok(BusId::Mul),
+            10 => Ok(BusId::Lt),
+            11 => Ok(BusId::Mul),
+            12 => Ok(BusId::Dvrm),
             13 => Ok(BusId::Shift),
             14 => Ok(BusId::Memw),
             15 => Ok(BusId::Load),
@@ -162,6 +166,8 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
+            20 => Ok(BusId::CommitNextByte),
+            21 => Ok(BusId::Commit),
             other => Err(other),
         }
     }
@@ -440,8 +446,10 @@ impl DecodeEntry {
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
-        // Note: Register flags exclude x0 and x255 (virtual PC) to match CPU trace
-        let read_reg1_physical = self.read_register1 && self.rs1 != 0 && self.rs1 != 255;
+        // x0 is hardwired to zero and never physically read.
+        // x255 is the register where the pc is stored (per spec decode.md),
+        // so read_register1=1 for rs1=255.
+        let read_reg1_physical = self.read_register1 && self.rs1 != 0;
         let read_reg2_physical = self.read_register2 && self.rs2 != 0;
         let write_reg_physical = self.write_register && self.rd != 0;
         packed |= (read_reg1_physical as u64) << bits::READ_REG1;
@@ -506,7 +514,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -518,7 +526,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithW {
@@ -536,7 +544,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImmW { dst, src, imm, op } => {
@@ -549,7 +557,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::JumpAndLink { dst, offset } => {
@@ -686,21 +694,16 @@ impl DecodeEntry {
             }
 
             Instruction::EcallEbreak => {
-                // ECALL is handled specially: the executor Log returns src1_val=0, src2_val=0,
-                // dst_val=0 for Halt syscalls (regardless of actual register values).
-                // To avoid corrupting register state in the trace builder, we don't set
-                // read_register or write_register flags. The HALT table handles termination.
                 entry.op_ecall = true;
-                // Set register indices for reference, but don't mark them as read/written
                 entry.rs1 = 17; // a7 (syscall number)
-                entry.rs2 = 10; // a0 (arg)
-                entry.rd = 10; // a0 (result)
-                // Note: read_register1, read_register2, write_register remain false
+                entry.read_register1 = true; // M1 reads a7 → rv1 = syscall number
+                // rs2 and rd default to 0 per spec; read_register2 and write_register remain false.
+                // HALT/COMMIT chips access registers via direct MEMW interactions.
             }
 
             Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default)
+                // Per spec, FENCE is a no-op interpreted as ADDI x0, x0, 0.
+                entry.op_add = true;
             }
         }
 
@@ -708,7 +711,7 @@ impl DecodeEntry {
     }
 
     /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(entry: &mut Self, arith_op: ArithOp, is_word: bool) {
+    fn set_arith_op(entry: &mut Self, arith_op: ArithOp) {
         match arith_op {
             ArithOp::Add => {
                 entry.op_add = true;
@@ -742,9 +745,7 @@ impl DecodeEntry {
             ArithOp::Mul => {
                 entry.op_mul = true;
                 entry.mp_selector = true;
-                if !is_word {
-                    entry.signed = true;
-                }
+                entry.signed = true;
             }
             ArithOp::MulHigh => {
                 entry.op_mul = true;

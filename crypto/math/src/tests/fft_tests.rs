@@ -46,7 +46,6 @@ mod fft_helpers_test {
 
 #[cfg(test)]
 mod fft_polynomial_tests {
-    #[cfg(not(feature = "cuda"))]
     use crate::field::traits::IsField;
 
     use crate::fft::cpu::roots_of_unity::{
@@ -54,7 +53,7 @@ mod fft_polynomial_tests {
     };
     use crate::fft::polynomial::compose_fft;
     use crate::field::element::FieldElement;
-    use crate::field::test_fields::u64_test_field::{U64TestField, U64TestFieldExtension};
+    use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
     use proptest::{collection, prelude::*};
@@ -133,7 +132,6 @@ mod fft_polynomial_tests {
         (poly, new_poly)
     }
 
-    #[cfg(not(feature = "cuda"))]
     mod u64_field_tests {
         use super::*;
         use crate::field::test_fields::u64_test_field::U64TestField;
@@ -259,8 +257,9 @@ mod fft_polynomial_tests {
 
     #[test]
     fn test_fft_with_values_in_field_extension_over_domain_in_prime_field() {
-        type TF = U64TestField;
-        type TL = U64TestFieldExtension;
+        use crate::field::goldilocks::GoldilocksField;
+        type TF = GoldilocksField;
+        type TL = Degree2GoldilocksExtensionField;
 
         let a = FieldElement::<TL>::from(&[FieldElement::one(), FieldElement::one()]);
         let b = FieldElement::<TL>::from(&[-FieldElement::from(2), FieldElement::from(17)]);

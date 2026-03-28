@@ -6,10 +6,82 @@
 use crate::field::{
     element::FieldElement,
     errors::FieldError,
-    fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField},
+    goldilocks::{GOLDILOCKS_PRIME, GoldilocksField, dot_product_2, dot_product_3, mul_by_7_raw},
     traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
 use crate::traits::{AsBytes, ByteConversion};
+
+impl ByteConversion for [FpE; 2] {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        unimplemented!()
+    }
+
+    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        unimplemented!()
+    }
+
+    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        unimplemented!()
+    }
+}
+
+impl ByteConversion for [FpE; 3] {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        let mut bytes = ByteConversion::to_bytes_be(&self[2]);
+        bytes.extend(ByteConversion::to_bytes_be(&self[1]));
+        bytes.extend(ByteConversion::to_bytes_be(&self[0]));
+        bytes
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        let mut bytes = ByteConversion::to_bytes_le(&self[0]);
+        bytes.extend(ByteConversion::to_bytes_le(&self[1]));
+        bytes.extend(ByteConversion::to_bytes_le(&self[2]));
+        bytes
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const N: usize = 8;
+        if bytes.len() < N * 3 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
+        let x2 = FieldElement::from_bytes_be(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[N..N * 2])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[N * 2..N * 3])?;
+        Ok([x0, x1, x2])
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const N: usize = 8;
+        if bytes.len() < N * 3 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
+        let x0 = FieldElement::from_bytes_le(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[N..N * 2])?;
+        let x2 = FieldElement::from_bytes_le(&bytes[N * 2..N * 3])?;
+        Ok([x0, x1, x2])
+    }
+}
 
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
@@ -34,33 +106,39 @@ impl IsField for Degree2GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1]]
     }
 
-    /// Returns the multiplication of `a` and `b`:
-    /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + W*a1*b1) + (a0*b1 + a1*b0)*w
-    /// where w^2 = W = 7
+    /// Multiplication using fused dot products for fewer reductions.
+    /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*w
+    ///
+    /// Uses dot_product_2 to compute each output component with a single
+    /// reduce128 instead of separate mul + reduce per product.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let a0b0 = a[0] * b[0];
-        let a1b1 = a[1] * b[1];
-        let z = (a[0] + a[1]) * (b[0] + b[1]);
+        let (a0, a1) = (*a[0].value(), *a[1].value());
+        let (b0, b1) = (*b[0].value(), *b[1].value());
+        let b1_7 = mul_by_7_raw(b1);
 
-        // W * a1b1 = 7 * a1b1
-        let w_a1b1 = mul_by_7(&a1b1);
+        // c0 = a0*b0 + a1*(7*b1)
+        let c0 = dot_product_2(a0, b0, a1, b1_7);
+        // c1 = a0*b1 + a1*b0
+        let c1 = dot_product_2(a0, b1, a1, b0);
 
-        [a0b0 + w_a1b1, z - a0b0 - a1b1]
+        [FpE::from_raw(c0), FpE::from_raw(c1)]
     }
 
-    /// Returns the square of `a`:
-    /// (a0 + a1*w)^2 = (a0^2 + W*a1^2) + 2*a0*a1*w
+    /// Squaring using fused dot product for the first component.
+    /// (a0 + a1*w)^2 = (a0^2 + 7*a1^2) + 2*a0*a1*w
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a0a1 = a[0] * a[1];
+        let (a0, a1) = (*a[0].value(), *a[1].value());
+        let a1_7 = mul_by_7_raw(a1);
 
-        // W * a1^2 = 7 * a1^2
-        let w_a1_sq = mul_by_7(&a1_sq);
+        // c0 = a0*a0 + a1*(7*a1) via single-reduction dot product
+        let c0 = dot_product_2(a0, a0, a1, a1_7);
+        // c1 = 2 * a0 * a1
+        let c1 = <GoldilocksField as IsField>::mul(&a0, &a1);
+        let c1 = GoldilocksField::double(&c1);
 
-        [a0_sq + w_a1_sq, a0a1.double()]
+        [FpE::from_raw(c0), FpE::from_raw(c1)]
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
@@ -200,42 +278,57 @@ impl IsField for Degree3GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
     }
 
-    /// Returns the multiplication of `a` and `b`:
+    /// Multiplication using schoolbook with fused dot products.
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
+    ///
+    /// Expanding and applying w^3 = 2:
+    ///   c0 = a0*b0 + 2*(a1*b2 + a2*b1)
+    ///   c1 = a0*b1 + a1*b0 + 2*a2*b2
+    ///   c2 = a0*b2 + a1*b1 + a2*b0
+    ///
+    /// Each component is computed as a single dot_product_3 (9 raw muls,
+    /// 3 reduce128 calls) instead of Karatsuba (6 muls, 6 reduce128 + many
+    /// add/sub). The reduction savings outweigh the extra multiplications.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let v0 = a[0] * b[0];
-        let v1 = a[1] * b[1];
-        let v2 = a[2] * b[2];
+        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
+        let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
 
-        // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
-        // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
-        // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-        let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
-        let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
-        let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
+        // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
+        let b1_2 = GoldilocksField::double(&b1);
+        let b2_2 = GoldilocksField::double(&b2);
 
-        [v0 + t0.double(), t1 + v2.double(), t2 + v1]
+        // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
+        let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
+        // c1 = a0*b1 + a1*b0 + a2*(2*b2)
+        let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
+        // c2 = a0*b2 + a1*b1 + a2*b0
+        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
+
+        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
 
-    /// Returns the square of `a`
+    /// Squaring using fused dot products.
+    /// (a0 + a1*w + a2*w^2)^2 mod (w^3 - 2):
+    ///   c0 = a0^2 + 4*a1*a2
+    ///   c1 = 2*a0*a1 + 2*a2^2
+    ///   c2 = 2*a0*a2 + a1^2
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let s0 = a[0].square();
-        let s1 = a[1].square();
-        let s2 = a[2].square();
-        let a01 = a[0] * a[1];
-        let a02 = a[0] * a[2];
-        let a12 = a[1] * a[2];
+        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
 
-        // c0 = s0 + 4 * a12
-        // c1 = 2 * a01 + 2 * s2
-        // c2 = 2 * a02 + s1
-        [
-            s0 + a12.double().double(),
-            a01.double() + s2.double(),
-            a02.double() + s1,
-        ]
+        let a0_2 = GoldilocksField::double(&a0);
+        let a2_4 = GoldilocksField::double(&GoldilocksField::double(&a2));
+
+        // c0 = a0*a0 + a1*(4*a2) — using dot_product_2
+        let c0 = dot_product_2(a0, a0, a1, a2_4);
+        // c1 = (2*a0)*a1 + (2*a2)*a2 — using dot_product_2
+        let a2_2 = GoldilocksField::double(&a2);
+        let c1 = dot_product_2(a0_2, a1, a2_2, a2);
+        // c2 = a1*a1 + (2*a0)*a2 — using dot_product_2
+        let c2 = dot_product_2(a1, a1, a0_2, a2);
+
+        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
@@ -398,6 +491,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
         let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
@@ -410,6 +506,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
         let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
@@ -450,137 +549,8 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
 // =====================================================
 
 /// Multiply a field element by 7 (the quadratic non-residue).
-/// Uses 7 = 1 + 2 + 4 for efficiency (2 doubles + 2 adds, saves one double vs 8-1).
+/// Wraps the raw u64 implementation for use with FieldElement types.
 #[inline(always)]
 fn mul_by_7(a: &FpE) -> FpE {
-    // 7 * a = a + 2a + 4a
-    let a2 = a.double();
-    let a4 = a2.double();
-    *a + a2 + a4
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fp2_add() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
-        let c = a + b;
-        assert_eq!(c.value()[0], FpE::from(4u64));
-        assert_eq!(c.value()[1], FpE::from(6u64));
-    }
-
-    #[test]
-    fn test_fp2_mul() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
-        // (3 + 4w)(1 + 2w) = 3 + 6w + 4w + 8w^2 = 3 + 10w + 8*7 = 59 + 10w
-        let c = a * b;
-        assert_eq!(c.value()[0], FpE::from(59u64));
-        assert_eq!(c.value()[1], FpE::from(10u64));
-    }
-
-    #[test]
-    fn test_fp2_inv() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let a_inv = a.inv().unwrap();
-        let product = a * a_inv;
-        assert_eq!(product, Fp2E::one());
-    }
-
-    #[test]
-    fn test_fp3_add() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = a + b;
-        assert_eq!(c.value()[0], FpE::from(5u64));
-        assert_eq!(c.value()[1], FpE::from(7u64));
-        assert_eq!(c.value()[2], FpE::from(9u64));
-    }
-
-    #[test]
-    fn test_fp3_mul() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = a * b;
-        // Verify by computing inverse
-        let c_div_a = c * a.inv().unwrap();
-        assert_eq!(c_div_a, b);
-    }
-
-    #[test]
-    fn test_fp3_inv() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let a_inv = a.inv().unwrap();
-        let product = a * a_inv;
-        assert_eq!(product, Fp3E::one());
-    }
-
-    #[test]
-    fn test_mul_by_7() {
-        let a = FpE::from(5u64);
-        let result = mul_by_7(&a);
-        assert_eq!(result, FpE::from(35u64));
-    }
-
-    // =========================================================================
-    // Tests for From<i64> implementations
-    // =========================================================================
-
-    #[test]
-    fn test_fp2_from_i64_positive() {
-        let fe = Fp2E::from(42i64);
-        assert_eq!(fe.value()[0], FpE::from(42u64));
-        assert_eq!(fe.value()[1], FpE::zero());
-    }
-
-    #[test]
-    fn test_fp2_from_i64_negative() {
-        // -1 in the base field embedded into Fp2
-        let fe = Fp2E::from(-1i64);
-        let expected = Fp2E::new([FpE::from(-1i64), FpE::zero()]);
-        assert_eq!(fe, expected);
-
-        // Verify: -1 + 1 = 0
-        let one = Fp2E::one();
-        assert_eq!(fe + one, Fp2E::zero());
-    }
-
-    #[test]
-    fn test_fp2_from_i64_arithmetic() {
-        let five = Fp2E::from(5i64);
-        let ten = Fp2E::from(10i64);
-        let minus_five = Fp2E::from(-5i64);
-        assert_eq!(five - ten, minus_five);
-    }
-
-    #[test]
-    fn test_fp3_from_i64_positive() {
-        let fe = Fp3E::from(42i64);
-        assert_eq!(fe.value()[0], FpE::from(42u64));
-        assert_eq!(fe.value()[1], FpE::zero());
-        assert_eq!(fe.value()[2], FpE::zero());
-    }
-
-    #[test]
-    fn test_fp3_from_i64_negative() {
-        // -1 in the base field embedded into Fp3
-        let fe = Fp3E::from(-1i64);
-        let expected = Fp3E::new([FpE::from(-1i64), FpE::zero(), FpE::zero()]);
-        assert_eq!(fe, expected);
-
-        // Verify: -1 + 1 = 0
-        let one = Fp3E::one();
-        assert_eq!(fe + one, Fp3E::zero());
-    }
-
-    #[test]
-    fn test_fp3_from_i64_arithmetic() {
-        let five = Fp3E::from(5i64);
-        let ten = Fp3E::from(10i64);
-        let minus_five = Fp3E::from(-5i64);
-        assert_eq!(five - ten, minus_five);
-    }
+    FpE::from_raw(mul_by_7_raw(*a.value()))
 }

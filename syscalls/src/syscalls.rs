@@ -9,9 +9,9 @@ const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
 enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    Commit = 3,
     GetPrivateInputs = 4,
-    Halt = 5,
+    Commit = 64,
+    Halt = 93,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -68,8 +68,9 @@ pub fn commit(slice: &[u8]) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") slice.as_ptr(),
-            in("a1") slice.len(),
+            in("a0") 1usize,
+            in("a1") slice.as_ptr(),
+            in("a2") slice.len(),
             in("a7") SyscallNumbers::Commit as usize,
         )
     }
@@ -108,6 +109,7 @@ pub fn sys_halt() -> ! {
     unsafe {
         asm!(
             "ecall",
+            in("a0") 0usize, // exit_code = 0 (enforced by HALT read on x10)
             in("a7") SyscallNumbers::Halt as usize,
         );
     }

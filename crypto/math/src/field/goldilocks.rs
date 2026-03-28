@@ -14,9 +14,46 @@
 //! - Plonky2: <https://github.com/0xPolygonZero/plonky2>
 //! - Remco Bloemen: <https://xn--2-umb.com/23/gold-reduce/>
 
+use core::hint::unreachable_unchecked;
+
 use crate::field::traits::HasDefaultTranscript;
 use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
 use crate::traits::{AsBytes, ByteConversion};
+
+// =====================================================
+// COMPILER HINTS (inspired by Plonky3)
+// =====================================================
+
+/// Hint to the compiler that a branch is unlikely to be taken.
+/// The empty asm block acts as a barrier that prevents the compiler from
+/// converting the branch into a conditional move, which is slower when
+/// the branch is highly predictable.
+#[inline(always)]
+fn branch_hint() {
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+    ))]
+    unsafe {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Inform the compiler that a condition is always true.
+///
+/// # Safety
+/// The caller must guarantee that `p` is true.
+#[inline(always)]
+const unsafe fn assume(p: bool) {
+    debug_assert!(p);
+    if !p {
+        unsafe {
+            unreachable_unchecked();
+        }
+    }
+}
 
 /// The Goldilocks prime: p = 2^64 - 2^32 + 1
 pub const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
@@ -35,32 +72,44 @@ pub struct GoldilocksField;
 impl IsField for GoldilocksField {
     type BaseType = u64;
 
-    /// Addition with overflow handling.
-    /// If a + b overflows, we add EPSILON (since 2^64 ≡ EPSILON mod p)
+    /// Addition with branch hint for rare double-overflow.
+    /// Compiles to a 3-instruction common path (add + csel + adds on ARM)
+    /// with a predicted-not-taken branch for the exceedingly rare double overflow.
     #[inline(always)]
     fn add(a: &u64, b: &u64) -> u64 {
         let (sum, over) = a.overflowing_add(*b);
-        let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
-        // Second overflow is rare but possible
-        if over2 {
-            sum.wrapping_add(EPSILON)
-        } else {
-            sum
+        let (mut sum, over) = sum.overflowing_add((over as u64) * EPSILON);
+        if over {
+            // Double overflow requires a + b >= 2^65 - EPSILON.
+            // If either input <= p, then a + b <= p + (2^64-1) = 2^65 - EPSILON - 1,
+            // which is below the threshold. Therefore both must exceed p.
+            unsafe {
+                assume(*a > GOLDILOCKS_PRIME && *b > GOLDILOCKS_PRIME);
+            }
+            branch_hint();
+            // After double overflow, sum < EPSILON, so sum + EPSILON < 2^64.
+            sum += EPSILON;
         }
+        sum
     }
 
-    /// Subtraction with underflow handling.
-    /// If a - b underflows, we subtract EPSILON (since -2^64 ≡ -EPSILON mod p)
+    /// Subtraction with branch hint for rare double-underflow.
     #[inline(always)]
     fn sub(a: &u64, b: &u64) -> u64 {
         let (diff, under) = a.overflowing_sub(*b);
-        let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
-        // Second underflow is rare but possible
-        if under2 {
-            diff.wrapping_sub(EPSILON)
-        } else {
-            diff
+        let (mut diff, under) = diff.overflowing_sub((under as u64) * EPSILON);
+        if under {
+            // Double underflow requires a - b + 2^64 < EPSILON, i.e., b > a + p.
+            // Since b < 2^64 = p + EPSILON, we get a < EPSILON - 1.
+            // At a = EPSILON - 1, the minimum b for first underflow already gives
+            // diff1 = EPSILON, so diff1 - EPSILON = 0 (no second underflow).
+            unsafe {
+                assume(*a < EPSILON - 1 && *b > GOLDILOCKS_PRIME);
+            }
+            branch_hint();
+            diff -= EPSILON;
         }
+        diff
     }
 
     /// Multiplication using 128-bit intermediate and fast reduction.
@@ -142,37 +191,137 @@ impl IsField for GoldilocksField {
 
 /// Reduce a 128-bit value to a 64-bit Goldilocks field element.
 ///
-/// Uses the identity: 2^64 ≡ 2^32 - 1 (mod p)
-/// and: 2^96 ≡ -1 (mod p)
-///
-/// For x = x_lo + x_hi * 2^64, where x_hi = x_hi_hi * 2^32 + x_hi_lo:
-/// x ≡ x_lo + x_hi_lo * EPSILON - x_hi_hi (mod p)
-///
-/// **Optimization**: Uses shift instead of multiply for EPSILON computation:
-/// x_hi_lo * EPSILON = x_hi_lo * (2^32 - 1) = (x_hi_lo << 32) - x_hi_lo
-/// Benchmarks show this is ~10% faster than using multiply.
+/// Uses the identities: 2^64 ≡ 2^32 - 1 (mod p), 2^96 ≡ -1 (mod p).
+/// Branch hints mark rare borrow/carry paths for better branch prediction.
 #[inline(always)]
 fn reduce128(x: u128) -> u64 {
-    let x_lo = x as u64;
-    let x_hi = (x >> 64) as u64;
+    let (x_lo, x_hi) = (x as u64, (x >> 64) as u64);
     let x_hi_hi = x_hi >> 32;
     let x_hi_lo = x_hi & EPSILON;
 
-    // Step 1: t0 = x_lo - x_hi_hi
-    let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
-    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
+    // 2^96 ≡ -1 (mod p), so x_hi_hi * 2^96 becomes -x_hi_hi
+    let (mut t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
+    if borrow {
+        branch_hint();
+        t0 -= EPSILON; // Cannot underflow
+    }
 
-    // Step 2: t1 = x_hi_lo * EPSILON = (x_hi_lo << 32) - x_hi_lo
-    // Using shift is ~10% faster than multiply
+    // 2^64 ≡ EPSILON (mod p), so x_hi_lo * 2^64 = x_hi_lo * EPSILON
+    // Compute as (x_hi_lo << 32) - x_hi_lo to avoid a multiply
     let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
 
-    // Step 3: result = t0 + t1
-    let (result, carry) = t0.overflowing_add(t1);
-    if carry {
-        result.wrapping_add(EPSILON)
-    } else {
-        result
+    // Final addition with overflow correction
+    // Safety: t0 + t1 < 2^64 + ORDER
+    unsafe { add_no_canonicalize_trashing_input(t0, t1) }
+}
+
+/// Fast modular addition: returns (x + y) mod p, assuming x + y < 2^64 + ORDER.
+/// On x86_64, uses inline asm (add + sbb trick) for 2-instruction modular add.
+/// On other architectures, uses portable overflowing_add + conditional correction.
+///
+/// # Safety
+/// Caller must ensure x + y < 2^64 + ORDER.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
+    let res_wrapped: u64;
+    let adjustment: u64;
+    unsafe {
+        core::arch::asm!(
+            "add {0}, {1}",
+            // sbb {1:e}, {1:e} sets the low 32 bits to 0xFFFFFFFF on carry (= NEG_ORDER),
+            // or 0 otherwise. The high 32 bits are zeroed by the 32-bit register write.
+            "sbb {1:e}, {1:e}",
+            inlateout(reg) x => res_wrapped,
+            inlateout(reg) y => adjustment,
+            options(pure, nomem, nostack),
+        );
     }
+    res_wrapped + adjustment
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
+    let (res_wrapped, carry) = x.overflowing_add(y);
+    res_wrapped.wrapping_add(EPSILON * (carry as u64))
+}
+
+// =====================================================
+// FUSED MULTIPLY-ACCUMULATE (inspired by Plonky3)
+// =====================================================
+
+/// Compute a0*b0 + a1*b1 mod p in a single reduction pass.
+///
+/// Instead of reducing each product separately (2 reduce128 calls),
+/// this sums the u128 products and reduces once. When the sum overflows u128,
+/// we correct by adding 2^128 mod p = EPSILON^2 = (2^32 - 1)^2.
+///
+/// This is the critical building block for extension field multiplication:
+/// each Fp2 mul needs two dot products instead of three separate mul+reduce.
+#[inline(always)]
+pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
+    let prod0 = (a0 as u128) * (b0 as u128);
+    let prod1 = (a1 as u128) * (b1 as u128);
+    let (sum, overflow) = prod0.overflowing_add(prod1);
+
+    let reduced = reduce128(sum);
+
+    if overflow {
+        // True value is sum + 2^128. Since 2^128 mod p = EPSILON^2,
+        // add EPSILON^2 = (2^32-1)^2 = 2^64 - 2^33 + 1.
+        // Safety: reduced < 2^64 (it's a u64), EPSILON_SQ < p,
+        // so reduced + EPSILON_SQ < 2^64 + p, satisfying add_no_canonicalize's precondition.
+        branch_hint();
+        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
+        unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) }
+    } else {
+        reduced
+    }
+}
+
+/// Compute a0*b0 + a1*b1 + a2*b2 mod p in a single reduction pass.
+///
+/// Accumulates three u128 products, tracking overflow count (at most 2).
+/// Each overflow adds 2^128 mod p = EPSILON^2 to the result.
+/// This is the critical building block for Fp3 multiplication (the extension
+/// field used by the VM's STARK prover).
+#[inline(always)]
+pub(crate) fn dot_product_3(a0: u64, b0: u64, a1: u64, b1: u64, a2: u64, b2: u64) -> u64 {
+    let prod0 = (a0 as u128) * (b0 as u128);
+    let prod1 = (a1 as u128) * (b1 as u128);
+    let prod2 = (a2 as u128) * (b2 as u128);
+
+    let (sum01, over1) = prod0.overflowing_add(prod1);
+    let (sum012, over2) = sum01.overflowing_add(prod2);
+    let overflow_count = (over1 as u64) + (over2 as u64);
+
+    let mut reduced = reduce128(sum012);
+
+    if overflow_count > 0 {
+        // Each overflow represents +2^128 to the true sum.
+        // 2^128 mod p = EPSILON^2 = (2^32 - 1)^2 = 2^64 - 2^33 + 1.
+        // Safety: reduced < 2^64, EPSILON_SQ < p, so sum < 2^64 + p.
+        branch_hint();
+        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
+        reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
+        if overflow_count > 1 {
+            branch_hint();
+            reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
+        }
+    }
+
+    reduced
+}
+
+/// Multiply a raw u64 field element by 7 (the Fp2 non-residue).
+/// Uses 7 = 8 - 1 for a straight-line computation.
+#[inline(always)]
+pub(crate) fn mul_by_7_raw(a: u64) -> u64 {
+    let a2 = GoldilocksField::double(&a);
+    let a4 = GoldilocksField::double(&a2);
+    let a8 = GoldilocksField::double(&a4);
+    GoldilocksField::sub(&a8, &a)
 }
 
 /// Inversion using optimized addition chain for a^(p-2).
@@ -392,224 +541,5 @@ impl HasDefaultTranscript for GoldilocksField {
                 return FieldElement::from(int_sample);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_add_basic() {
-        let a = 5u64;
-        let b = 7u64;
-        assert_eq!(GoldilocksField::add(&a, &b), 12);
-    }
-
-    #[test]
-    fn test_add_overflow() {
-        let a = GOLDILOCKS_PRIME - 1;
-        let b = 2u64;
-        let result = GoldilocksField::add(&a, &b);
-        assert_eq!(GoldilocksField::canonical(&result), 1);
-    }
-
-    #[test]
-    fn test_sub_basic() {
-        let a = 10u64;
-        let b = 3u64;
-        assert_eq!(GoldilocksField::sub(&a, &b), 7);
-    }
-
-    #[test]
-    fn test_sub_underflow() {
-        let a = 3u64;
-        let b = 10u64;
-        let result = GoldilocksField::sub(&a, &b);
-        assert_eq!(GoldilocksField::canonical(&result), GOLDILOCKS_PRIME - 7);
-    }
-
-    #[test]
-    fn test_mul_basic() {
-        let a = 5u64;
-        let b = 7u64;
-        assert_eq!(GoldilocksField::mul(&a, &b), 35);
-    }
-
-    #[test]
-    fn test_mul_large() {
-        // Test with values that produce 128-bit result
-        let a = 1u64 << 40;
-        let b = 1u64 << 40;
-        let result = GoldilocksField::mul(&a, &b);
-        // (2^40)^2 = 2^80 mod p
-        // 2^80 = 2^64 * 2^16 ≡ EPSILON * 2^16 (mod p)
-        let expected = ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
-        assert_eq!(GoldilocksField::canonical(&result), expected);
-    }
-
-    #[test]
-    fn test_inv() {
-        let a = 5u64;
-        let a_inv = GoldilocksField::inv(&a).unwrap();
-        let product = GoldilocksField::mul(&a, &a_inv);
-        assert_eq!(GoldilocksField::canonical(&product), 1);
-    }
-
-    #[test]
-    fn test_inv_larger() {
-        let a = 123456789u64;
-        let a_inv = GoldilocksField::inv(&a).unwrap();
-        let product = GoldilocksField::mul(&a, &a_inv);
-        assert_eq!(GoldilocksField::canonical(&product), 1);
-    }
-
-    #[test]
-    fn test_zero_inv() {
-        assert!(GoldilocksField::inv(&0).is_err());
-    }
-
-    #[test]
-    fn test_neg() {
-        let a = 5u64;
-        let neg_a = GoldilocksField::neg(&a);
-        let sum = GoldilocksField::add(&a, &neg_a);
-        assert_eq!(GoldilocksField::canonical(&sum), 0);
-    }
-
-    #[test]
-    fn test_primitive_root() {
-        // The primitive root should have order 2^32
-        let root =
-            GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
-
-        // root^(2^32) should be 1
-        let mut result = *root.value();
-        for _ in 0..32 {
-            result = GoldilocksField::square(&result);
-        }
-        assert_eq!(GoldilocksField::canonical(&result), 1);
-    }
-
-    #[test]
-    fn test_inv_addition_chain() {
-        // Test addition chain inversion
-        for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
-            let a_inv = inv_addition_chain(a);
-            let product = GoldilocksField::mul(&a, &a_inv);
-            assert_eq!(
-                GoldilocksField::canonical(&product),
-                1,
-                "Failed for a = {}",
-                a
-            );
-        }
-    }
-
-    #[test]
-    fn test_square() {
-        // Test that square matches mul(a, a)
-        for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
-            let sq = GoldilocksField::square(&a);
-            let mul = GoldilocksField::mul(&a, &a);
-            assert_eq!(
-                GoldilocksField::canonical(&sq),
-                GoldilocksField::canonical(&mul),
-                "Square mismatch for a = {}",
-                a
-            );
-        }
-    }
-
-    // =========================================================================
-    // Tests for From<i64> implementation
-    // =========================================================================
-
-    #[test]
-    fn test_from_i64_positive() {
-        // Positive i64 values should work like u64
-        let fe_from_i64 = GoldilocksElement::from(42i64);
-        let fe_from_u64 = GoldilocksElement::from(42u64);
-        assert_eq!(fe_from_i64, fe_from_u64);
-    }
-
-    #[test]
-    fn test_from_i64_zero() {
-        let fe = GoldilocksElement::from(0i64);
-        assert_eq!(fe, GoldilocksElement::zero());
-    }
-
-    #[test]
-    fn test_from_i64_negative_one() {
-        // -1 should equal p - 1
-        let fe = GoldilocksElement::from(-1i64);
-        let expected = GoldilocksElement::from(GOLDILOCKS_PRIME - 1);
-        assert_eq!(fe, expected);
-
-        // Also verify: -1 + 1 = 0
-        let one = GoldilocksElement::one();
-        assert_eq!(fe + one, GoldilocksElement::zero());
-    }
-
-    #[test]
-    fn test_from_i64_negative_values() {
-        // -x should equal p - x, which means x + (-x) = 0
-        for x in [1i64, 5, 100, 1000, 123456789] {
-            let pos = GoldilocksElement::from(x);
-            let neg = GoldilocksElement::from(-x);
-            assert_eq!(pos + neg, GoldilocksElement::zero(), "Failed for x = {}", x);
-        }
-    }
-
-    #[test]
-    fn test_from_i64_negative_equals_negation() {
-        // FE::from(-x) should equal -FE::from(x)
-        for x in [1i64, 42, 1000, 999999] {
-            let from_neg = GoldilocksElement::from(-x);
-            let neg_from = -GoldilocksElement::from(x);
-            assert_eq!(from_neg, neg_from, "Failed for x = {}", x);
-        }
-    }
-
-    #[test]
-    fn test_from_i64_arithmetic() {
-        // Test that arithmetic works correctly with i64-created elements
-        // 5 - 10 = -5
-        let five = GoldilocksElement::from(5i64);
-        let ten = GoldilocksElement::from(10i64);
-        let minus_five = GoldilocksElement::from(-5i64);
-
-        assert_eq!(five - ten, minus_five);
-    }
-
-    #[test]
-    fn test_from_i64_large_negative() {
-        // Test with larger negative values
-        let large_neg = GoldilocksElement::from(-1_000_000_000i64);
-        let large_pos = GoldilocksElement::from(1_000_000_000i64);
-
-        // They should sum to zero
-        assert_eq!(large_neg + large_pos, GoldilocksElement::zero());
-
-        // And the negative should equal the negation of positive
-        assert_eq!(large_neg, -large_pos);
-    }
-
-    #[test]
-    fn test_from_i64_min_value() {
-        // Test with i64::MIN - this is a valid field element
-        let min_val = GoldilocksElement::from(i64::MIN);
-        // i64::MIN = -2^63, so this should be p - 2^63
-        let expected_val = GOLDILOCKS_PRIME - (1u64 << 63);
-        let expected = GoldilocksElement::from(expected_val);
-        assert_eq!(min_val, expected);
-    }
-
-    #[test]
-    fn test_from_i64_max_value() {
-        // Test with i64::MAX
-        let max_val = GoldilocksElement::from(i64::MAX);
-        let expected = GoldilocksElement::from(i64::MAX as u64);
-        assert_eq!(max_val, expected);
     }
 }

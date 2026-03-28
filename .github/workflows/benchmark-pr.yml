@@ -30,12 +30,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROGRAM: executor/programs/asm/fib_iterative_2M.s
-  ELF: executor/program_artifacts/asm/fib_iterative_2M.elf
+  PROGRAM: executor/programs/asm/fib_iterative_8M.s
+  ELF: executor/program_artifacts/asm/fib_iterative_8M.elf
   BENCH_RUNS_PR: 3
-  BENCH_RUNS_BASELINE: 5
-  GROWTH_PROGRAMS: "fib_iterative_250k fib_iterative_500k fib_iterative_1M fib_iterative_2M"
-  GROWTH_STEPS: "250000 500000 1000000 2000000"
+  BENCH_RUNS_BASELINE: 3
+  GROWTH_PROGRAMS: "fib_iterative_1M fib_iterative_2M fib_iterative_4M fib_iterative_8M"
+  GROWTH_STEPS: "1000000 2000000 4000000 8000000"
 
 jobs:
   benchmark:
@@ -79,6 +79,13 @@ jobs:
       - name: Compile benchmark ELFs
         run: |
           mkdir -p executor/program_artifacts/asm
+          # Compile main benchmark ELF
+          MAIN_SRC="$PROGRAM"
+          MAIN_OUT="$ELF"
+          if [ ! -f "$MAIN_OUT" ] && [ -f "$MAIN_SRC" ]; then
+            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+              "$MAIN_SRC" -o "$MAIN_OUT"
+          fi
           for prog in $GROWTH_PROGRAMS; do
             SRC="executor/programs/asm/${prog}.s"
             OUT="executor/program_artifacts/asm/${prog}.elf"
@@ -100,6 +107,16 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Growth benchmarks: run on /bench-growth, push to main, or workflow_dispatch
+          # Skip on plain /bench to keep it fast
+          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-growth'; then
+            echo "run_growth=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run_growth=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_growth=false" >> "$GITHUB_OUTPUT"
+          fi
+
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             CUSTOM_N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench[[:space:]]*\([0-9]\+\).*|\1|p')
             RUNS=${CUSTOM_N:-$BENCH_RUNS_PR}
@@ -116,13 +133,34 @@ jobs:
           fi
 
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-          echo "Using $RUNS benchmark iterations"
+
+          # Parse TABLE_PARALLELISM:
+          # /bench-growth always uses k=1 (for reproducible comparisons)
+          # /bench accepts k=N parameter
+          TABLE_K=""
+          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-growth'; then
+            TABLE_K="1"
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
+          fi
+          echo "table_parallelism=${TABLE_K:-}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$TABLE_K" ]; then
+            echo "Using $RUNS iterations, TABLE_PARALLELISM=$TABLE_K"
+          else
+            echo "Using $RUNS iterations, TABLE_PARALLELISM=default"
+          fi
 
       - name: Benchmark PR
         id: pr
         env:
           RUNS: ${{ steps.config.outputs.runs }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         run: |
+          if [ -n "$TABLE_PARALLELISM" ]; then
+            export TABLE_PARALLELISM
+            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
+          fi
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
@@ -184,33 +222,37 @@ jobs:
 
       - name: Memory growth (PR)
         id: pr-growth
+        if: steps.config.outputs.run_growth == 'true'
         env:
-          PR_HEAP: ${{ steps.pr.outputs.peak_mb }}
-          PR_TIME: ${{ steps.pr.outputs.time_s }}
+          TABLE_PARALLELISM: "1"
         run: |
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
+          SAMPLES=2
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
-            if [ "$prog" = "fib_iterative_2M" ]; then
-              H="${PR_HEAP}"
-              T="${PR_TIME}"
-            else
-              echo "--- Growth: $prog ---"
+            SAMPLE_HEAPS=""
+            SAMPLE_TIMES=""
+            for s in $(seq 1 $SAMPLES); do
+              echo "--- Growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
               ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
-                | tee /tmp/growth_${prog}.txt
+                | tee /tmp/growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
-              T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}.txt | awk '{print $3}')
-              H=$(grep -o 'Peak heap: [0-9]*' /tmp/growth_${prog}.txt | awk '{print $3}')
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}_${s}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/growth_${prog}_${s}.txt | awk '{print $3}')
               if [ -z "$T" ] || [ -z "$H" ]; then
-                echo "::error::Failed to parse growth metrics for $prog"
+                echo "::error::Failed to parse growth metrics for $prog sample $s"
                 exit 1
               fi
-            fi
+              SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
+              SAMPLE_TIMES="$SAMPLE_TIMES $T"
+            done
+            H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
+            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
             GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
@@ -301,7 +343,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUNS: ${{ steps.config.outputs.runs }}
+          RUN_GROWTH: ${{ steps.config.outputs.run_growth }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         run: |
+          if [ -n "$TABLE_PARALLELISM" ]; then
+            export TABLE_PARALLELISM
+            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
+          fi
           # Save current HEAD
           PR_SHA=$(git rev-parse HEAD)
 
@@ -361,30 +409,38 @@ jobs:
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
-          # --- Growth benchmarks (250k, 500k, 1M + reuse 2M median) ---
+          # --- Growth benchmarks (TABLE_PARALLELISM=1, 2 samples each) ---
+          # Only run if /bench-growth, push, or workflow_dispatch
+          if [ "$RUN_GROWTH" != "true" ]; then
+            echo "Skipping growth benchmarks (use /bench-growth to enable)"
+          else
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
+          SAMPLES=2
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
-            if [ "$prog" = "fib_iterative_2M" ]; then
-              H="$HEAP_MEDIAN"
-              T="$TIME_MEDIAN"
-            else
-              echo "--- Baseline growth: $prog ---"
-              ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
-                | tee /tmp/baseline_growth_${prog}.txt
+            SAMPLE_HEAPS=""
+            SAMPLE_TIMES=""
+            for s in $(seq 1 $SAMPLES); do
+              echo "--- Baseline growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
+              TABLE_PARALLELISM=1 ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+                | tee /tmp/baseline_growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
-              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
-              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
               if [ -z "$T" ] || [ -z "$H" ]; then
-                echo "::error::Failed to parse baseline growth metrics for $prog"
+                echo "::error::Failed to parse baseline growth metrics for $prog sample $s"
                 exit 1
               fi
-            fi
+              SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
+              SAMPLE_TIMES="$SAMPLE_TIMES $T"
+            done
+            H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
+            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
             GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
@@ -416,6 +472,7 @@ jobs:
           echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
+          fi  # end run_growth check
 
           # Restore PR checkout
           git checkout "$PR_SHA"
@@ -613,7 +670,8 @@ jobs:
 
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
-            let body = `## Benchmark — fib_iterative_2M${nLabel}\n\n`;
+            let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
+            body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -667,10 +725,11 @@ jobs:
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              const labels = ['250k', '500k', '1M', '2M'];
-              const programs = ['fib_iterative_250k', 'fib_iterative_500k', 'fib_iterative_1M', 'fib_iterative_2M'];
+              const labels = ['1M', '2M', '4M', '8M'];
+              const programs = ['fib_iterative_1M', 'fib_iterative_2M', 'fib_iterative_4M', 'fib_iterative_8M'];
 
               body += `\n## Memory Growth\n\n`;
+              body += `<sub>Measured with \`TABLE_PARALLELISM=1\` (sequential) · best of 2 samples per point</sub>\n\n`;
 
               if (baseHeaps && baseHeaps.length === 4 && baseHeaps[0]) {
                 body += `| Program | Steps | main (MB) | PR (MB) | Δ |\n`;
@@ -732,6 +791,7 @@ jobs:
             // Find existing comment (check both old and new markers for transition)
             const existing = comments.find(c =>
               c.user.type === 'Bot' && (
+                c.body.includes('Benchmark — fib_iterative_8M') ||
                 c.body.includes('Benchmark — fib_iterative_2M') ||
                 c.body.includes('Benchmark — fib_iterative_372k')
               )

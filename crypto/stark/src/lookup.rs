@@ -32,6 +32,35 @@ pub const SHIFT_16: u64 = 65536;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
+/// Precomputed field element shift constants for packing operations.
+///
+/// Avoids repeated `FieldElement::from()` conversions in hot loops.
+/// Create once before a loop and pass by reference.
+pub struct PackingShifts<F: IsField> {
+    pub shift_8: FieldElement<F>,
+    pub shift_16: FieldElement<F>,
+    pub shift_24: FieldElement<F>,
+}
+
+impl<F: IsField> Default for PackingShifts<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: IsField> PackingShifts<F> {
+    pub fn new() -> Self {
+        let shift_8 = FieldElement::<F>::from(SHIFT_8);
+        let shift_16 = FieldElement::<F>::from(SHIFT_16);
+        let shift_24 = &shift_8 * &shift_16;
+        Self {
+            shift_8,
+            shift_16,
+            shift_24,
+        }
+    }
+}
+
 /// Computes powers of alpha incrementally: [1, α, α², α³, ...]
 ///
 /// This is more efficient than calling `alpha.pow(i)` for each i,
@@ -225,15 +254,121 @@ impl Packing {
             .collect()
     }
 
-    /// Accumulates the fingerprint contribution of this packing into `acc`.
+    /// Accumulates the fingerprint contribution of this packing into `acc`,
+    /// using `get_col` to access column data by index.
     ///
     /// Computes: `acc += Σ combined_element_i * alpha_powers[alpha_offset + i]`
     /// where `combined_element_i` are the bus elements produced by this packing.
     ///
     /// Returns the number of alpha powers consumed (= num_bus_elements()).
     ///
-    /// This avoids allocating intermediate Vecs for the combined elements.
-    /// `main_cols` are column-major: `main_cols[col][row]`.
+    /// This is the single canonical implementation of packing arithmetic for
+    /// fingerprint accumulation. Both column-major (`main_cols[col][row]`) and
+    /// TableView callers delegate here with an appropriate closure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_fingerprint_with<'a, F, E>(
+        &self,
+        start_col: usize,
+        get_col: impl Fn(usize) -> &'a FieldElement<F>,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E> + 'a,
+        E: IsField,
+    {
+        debug_assert!(
+            alpha_powers.len() >= alpha_offset + self.num_bus_elements(),
+            "alpha_powers too short: len={}, need={}",
+            alpha_powers.len(),
+            alpha_offset + self.num_bus_elements()
+        );
+
+        match self {
+            Packing::Direct => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word2L => {
+                let combined = get_col(start_col) + get_col(start_col + 1) * &shifts.shift_16;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word4L => {
+                let combined = get_col(start_col)
+                    + get_col(start_col + 1) * &shifts.shift_8
+                    + get_col(start_col + 2) * &shifts.shift_16
+                    + get_col(start_col + 3) * &shifts.shift_24;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            // 2× Direct
+            Packing::DWordWL => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                *acc += get_col(start_col + 1) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            // Direct + Word2L
+            Packing::DWordHHW => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                let w = get_col(start_col + 1) + get_col(start_col + 2) * &shifts.shift_16;
+                *acc += &w * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            // Word2L + Direct
+            Packing::DWordWHH => {
+                let w = get_col(start_col) + get_col(start_col + 1) * &shifts.shift_16;
+                *acc += &w * &alpha_powers[alpha_offset];
+                *acc += get_col(start_col + 2) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            // 2× Word2L
+            Packing::DWordHL => {
+                let w0 = get_col(start_col) + get_col(start_col + 1) * &shifts.shift_16;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = get_col(start_col + 2) + get_col(start_col + 3) * &shifts.shift_16;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            // 2× Word4L
+            Packing::DWordBL => {
+                let w0 = get_col(start_col)
+                    + get_col(start_col + 1) * &shifts.shift_8
+                    + get_col(start_col + 2) * &shifts.shift_16
+                    + get_col(start_col + 3) * &shifts.shift_24;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = get_col(start_col + 4)
+                    + get_col(start_col + 5) * &shifts.shift_8
+                    + get_col(start_col + 6) * &shifts.shift_16
+                    + get_col(start_col + 7) * &shifts.shift_24;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            // 4× Word2L
+            Packing::QuadHL => {
+                for i in 0..4 {
+                    let c = start_col + i * 2;
+                    let w = get_col(c) + get_col(c + 1) * &shifts.shift_16;
+                    *acc += &w * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+            // 4× Direct
+            Packing::QuadWL => {
+                for i in 0..4 {
+                    *acc += get_col(start_col + i) * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+        }
+    }
+
+    /// Accumulates fingerprint from column-major trace data.
+    ///
+    /// Delegates to `accumulate_fingerprint_with` using `main_cols[col][row]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn accumulate_fingerprint<F, E>(
         &self,
         main_cols: &[Vec<FieldElement<F>>],
@@ -242,103 +377,20 @@ impl Packing {
         alpha_powers: &[FieldElement<E>],
         alpha_offset: usize,
         acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
     ) -> usize
     where
         F: IsField + IsSubFieldOf<E>,
         E: IsField,
     {
-        match self {
-            Packing::Direct => {
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                1
-            }
-            Packing::Word2L => {
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let combined =
-                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &combined * &alpha_powers[alpha_offset];
-                1
-            }
-            Packing::Word4L => {
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
-                let combined = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
-                *acc += &combined * &alpha_powers[alpha_offset];
-                1
-            }
-            // Compound packings: decompose into primitives.
-            // No recursion through generic closures — all reference main_cols directly.
-            Packing::DWordWL => {
-                // 2× Direct
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                *acc += &main_cols[start_col + 1][row] * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordHHW => {
-                // Direct + Word2L
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col + 1][row] + &main_cols[start_col + 2][row] * &shift_16;
-                *acc += &w * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordWHH => {
-                // Word2L + Direct
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &w * &alpha_powers[alpha_offset];
-                *acc += &main_cols[start_col + 2][row] * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordHL => {
-                // 2× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w0 = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 =
-                    &main_cols[start_col + 2][row] + &main_cols[start_col + 3][row] * &shift_16;
-                *acc += &w1 * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordBL => {
-                // 2× Word4L
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
-                let w0 = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
-                *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 = &main_cols[start_col + 4][row]
-                    + &main_cols[start_col + 5][row] * &shift_8
-                    + &main_cols[start_col + 6][row] * &shift_16
-                    + &main_cols[start_col + 7][row] * &shift_24;
-                *acc += &w1 * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::QuadHL => {
-                // 4× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                for i in 0..4 {
-                    let c = start_col + i * 2;
-                    let w = &main_cols[c][row] + &main_cols[c + 1][row] * &shift_16;
-                    *acc += &w * &alpha_powers[alpha_offset + i];
-                }
-                4
-            }
-            Packing::QuadWL => {
-                // 4× Direct
-                for i in 0..4 {
-                    *acc += &main_cols[start_col + i][row] * &alpha_powers[alpha_offset + i];
-                }
-                4
-            }
-        }
+        self.accumulate_fingerprint_with(
+            start_col,
+            |col| &main_cols[col][row],
+            alpha_powers,
+            alpha_offset,
+            acc,
+            shifts,
+        )
     }
 
     /// Combines column values into bus elements using powers of 2.
@@ -571,6 +623,7 @@ impl BusValue {
         alpha_powers: &[FieldElement<E>],
         alpha_offset: usize,
         acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
     ) -> usize
     where
         F: IsField + IsSubFieldOf<E>,
@@ -587,6 +640,7 @@ impl BusValue {
                 alpha_powers,
                 alpha_offset,
                 acc,
+                shifts,
             ),
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<F>::zero();
@@ -663,6 +717,66 @@ impl BusValue {
                     }
                 }
                 vec![result]
+            }
+        }
+    }
+
+    /// Accumulates fingerprint from a `TableView` step (constraint evaluation path).
+    ///
+    /// Equivalent to `combine_from` + multiply by alpha powers, but avoids
+    /// the intermediate `Vec<FieldElement>` allocation per call.
+    /// Packed variants delegate to `Packing::accumulate_fingerprint_with`.
+    pub fn accumulate_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
+        &self,
+        step: &TableView<A, B>,
+        alpha_powers: &[FieldElement<B>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<B>,
+        shifts: &PackingShifts<A>,
+    ) -> usize {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => packing.accumulate_fingerprint_with(
+                *start_column,
+                |col| step.get_main_evaluation_element(0, col),
+                alpha_powers,
+                alpha_offset,
+                acc,
+                shifts,
+            ),
+            BusValue::Linear(terms) => {
+                debug_assert!(
+                    alpha_powers.len() > alpha_offset,
+                    "alpha_powers too short: len={}, need={}",
+                    alpha_powers.len(),
+                    alpha_offset + 1
+                );
+                let mut result = FieldElement::<A>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<A>::from(*value);
+                        }
+                    }
+                }
+                *acc += result * &alpha_powers[alpha_offset];
+                1
             }
         }
     }
@@ -1074,6 +1188,12 @@ pub enum Multiplicity {
     /// Useful for "all rows except those marked by this flag".
     Negated(usize),
 
+    /// Difference of two columns: `col_a - col_b`.
+    Diff(usize, usize),
+
+    /// Sum of three columns: `col_a + col_b + col_c`.
+    Sum3(usize, usize, usize),
+
     /// Arbitrary linear combination of columns and constants.
     /// Supports signed coefficients for subtraction.
     /// Example: `μ - read2 - read4 - read8` can be expressed as:
@@ -1186,7 +1306,7 @@ impl BusInteraction {
 /// Each table has exactly one BusPublicInputs, representing the total
 /// contribution of all its LogUp terms (L = Σ all terms across all rows).
 /// The sign (sender vs receiver) is already baked into the values,
-/// so the bus balance check is: Σ table_contribution across all tables = 0.
+/// so the bus balance check is: Σ table_contribution across all tables = expected_bus_balance.
 ///
 /// For the circular constraint, `table_contribution / N` is the per-row offset
 /// that makes the accumulated column wrap to zero at row N-1.
@@ -1279,6 +1399,24 @@ where
                 .collect();
             &multiplicities_owned
         }
+        Multiplicity::Diff(col_a, col_b) => {
+            multiplicities_owned = main_segment_cols[col_a]
+                .iter()
+                .zip(main_segment_cols[col_b].iter())
+                .map(|(a, b)| a - b)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Sum3(col_a, col_b, col_c) => {
+            multiplicities_owned = (0..trace_len)
+                .map(|row| {
+                    &main_segment_cols[col_a][row]
+                        + &main_segment_cols[col_b][row]
+                        + &main_segment_cols[col_c][row]
+                })
+                .collect();
+            &multiplicities_owned
+        }
         Multiplicity::Linear(ref terms) => {
             multiplicities_owned = (0..trace_len)
                 .map(|row| {
@@ -1319,12 +1457,7 @@ where
     let num_bus_elements = table_interaction.num_bus_elements();
     let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
-    // Sign: +1 for senders, -1 for receivers
-    let sign = if table_interaction.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
+    let negate = !table_interaction.is_sender;
 
     // Batch inversion: collect all fingerprints, invert once, then multiply back.
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
@@ -1333,6 +1466,7 @@ where
     // Zero-allocation inner loop: accumulate the linear combination directly
     // into the fingerprint without collecting bus elements into intermediate Vecs.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+    let shifts = PackingShifts::<F>::new();
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
     for row in 0..trace_len {
         // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
@@ -1345,6 +1479,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut linear_combination,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1376,11 +1511,15 @@ where
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute terms: term[i] = sign * multiplicity[i] * fingerprint_inv[i]
+    // Compute terms: term[i] = ±(multiplicity[i] * fingerprint_inv[i])
+    // Use conditional negation instead of E×E sign multiplication
     multiplicities
         .iter()
         .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+        .map(|(multiplicity, fingerprint_inv)| {
+            let term = multiplicity * fingerprint_inv;
+            if negate { -term } else { term }
+        })
         .collect()
 }
 
@@ -1410,16 +1549,8 @@ where
         .max(interaction_b.num_bus_elements());
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
-    let sign_a = if interaction_a.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
-    let sign_b = if interaction_b.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
+    let negate_a = !interaction_a.is_sender;
+    let negate_b = !interaction_b.is_sender;
 
     // Helper to compute multiplicities for an interaction
     let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
@@ -1434,6 +1565,18 @@ where
             Multiplicity::Negated(col) => main_segment_cols[*col]
                 .iter()
                 .map(|elem| FieldElement::<F>::one() - elem)
+                .collect(),
+            Multiplicity::Diff(col_a, col_b) => main_segment_cols[*col_a]
+                .iter()
+                .zip(main_segment_cols[*col_b].iter())
+                .map(|(a, b)| a - b)
+                .collect(),
+            Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
+                .map(|row| {
+                    &main_segment_cols[*col_a][row]
+                        + &main_segment_cols[*col_b][row]
+                        + &main_segment_cols[*col_c][row]
+                })
                 .collect(),
             Multiplicity::Linear(terms) => (0..trace_len)
                 .map(|row| {
@@ -1472,6 +1615,7 @@ where
     // (zero-allocation inner loop: F×E multiplication instead of to_extension())
     let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
     let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+    let shifts = PackingShifts::<F>::new();
 
     // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
@@ -1486,6 +1630,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut lc_a,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1501,6 +1646,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut lc_b,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1511,13 +1657,17 @@ where
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute batched terms: term[i] = sign_a * m_a[i] * fp_a_inv[i] + sign_b * m_b[i] * fp_b_inv[i]
+    // Compute batched terms: term[i] = m_a[i] / fp_a[i] ± m_b[i] / fp_b[i]
+    // Use conditional negation instead of E×E sign multiplication
     (0..trace_len)
         .map(|row| {
             let fp_a_inv = &all_fingerprints[row];
             let fp_b_inv = &all_fingerprints[trace_len + row];
-            &multiplicities_a[row] * &sign_a * fp_a_inv
-                + &multiplicities_b[row] * &sign_b * fp_b_inv
+            let term_a = &multiplicities_a[row] * fp_a_inv;
+            let term_b = &multiplicities_b[row] * fp_b_inv;
+            let term_a = if negate_a { -term_a } else { term_a };
+            let term_b = if negate_b { -term_b } else { term_b };
+            term_a + term_b
         })
         .collect()
 }
@@ -1641,6 +1791,15 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
         Multiplicity::Negated(col) => {
             FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
         }
+        Multiplicity::Diff(col_a, col_b) => {
+            step.get_main_evaluation_element(0, *col_a)
+                - step.get_main_evaluation_element(0, *col_b)
+        }
+        Multiplicity::Sum3(col_a, col_b, col_c) => {
+            step.get_main_evaluation_element(0, *col_a)
+                + step.get_main_evaluation_element(0, *col_b)
+                + step.get_main_evaluation_element(0, *col_c)
+        }
         Multiplicity::Linear(terms) => {
             let mut result = FieldElement::<A>::zero();
             for term in terms {
@@ -1677,19 +1836,20 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     interaction: &BusInteraction,
     z: &FieldElement<B>,
     alpha_powers: &[FieldElement<B>],
+    shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
-    let bus_id_ext: FieldElement<B> = FieldElement::from(interaction.bus_id);
-    let mut linear_combination = &bus_id_ext * &alpha_powers[0];
+    let bus_id_f: FieldElement<A> = FieldElement::from(interaction.bus_id);
+    let mut linear_combination = bus_id_f * &alpha_powers[0];
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        let combined: Vec<FieldElement<A>> =
-            bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
-        for v in combined {
-            linear_combination += v * &alpha_powers[alpha_idx];
-            alpha_idx += 1;
-        }
+        alpha_idx += bv.accumulate_fingerprint_from_step(
+            step,
+            alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+            shifts,
+        );
     }
-
     z - &linear_combination
 }
 
@@ -1736,10 +1896,6 @@ where
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
@@ -1752,6 +1908,7 @@ where
             interaction_b: &BusInteraction,
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
+            shifts: &PackingShifts<A>,
         ) -> FieldElement<B> {
             let c = step.get_aux_evaluation_element(0, term_column_idx);
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
@@ -1759,22 +1916,24 @@ where
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
 
-            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers);
-            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers);
-
-            let sign_a: FieldElement<B> = if interaction_a.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
-            let sign_b: FieldElement<B> = if interaction_b.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
+            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, shifts);
+            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, shifts);
 
             // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            c * &fp_a * &fp_b - m_a * sign_a * &fp_b - m_b * sign_b * &fp_a
+            // Use conditional negation instead of E×E sign multiplication
+            let term_a = m_a * &fp_b;
+            let term_a = if interaction_a.is_sender {
+                term_a
+            } else {
+                -term_a
+            };
+            let term_b = m_b * &fp_a;
+            let term_b = if interaction_b.is_sender {
+                term_b
+            } else {
+                -term_b
+            };
+            c * &fp_a * &fp_b - term_a - term_b
         }
 
         let res = match evaluation_context {
@@ -1782,6 +1941,7 @@ where
                 frame,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_batched_term_constraint(
                 frame.get_evaluation_step(0),
@@ -1790,11 +1950,13 @@ where
                 &self.interaction_b,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
             TransitionEvaluationContext::Verifier {
                 frame,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_batched_term_constraint(
                 frame.get_evaluation_step(0),
@@ -1803,6 +1965,7 @@ where
                 &self.interaction_b,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
         };
 
@@ -1860,10 +2023,6 @@ where
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0 // Circular constraint applies to all rows including last→first wrap
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
@@ -1879,6 +2038,7 @@ where
             absorbed: &[BusInteraction],
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
+            shifts: &PackingShifts<A>,
         ) -> FieldElement<B> {
             // Accumulated column values
             let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
@@ -1896,12 +2056,19 @@ where
 
             // Clear denominators of absorbed interactions
             debug_assert!(matches!(absorbed.len(), 1 | 2));
+            // Use conditional negation instead of E×E sign multiplication where possible
             match absorbed.len() {
                 1 => {
                     // (delta) · f - sign · m = 0
+                    // sign multiply also promotes m from base field A to extension B
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[0],
+                        z,
+                        alpha_powers,
+                        shifts,
+                    );
                     let sign: FieldElement<B> = if absorbed[0].is_sender {
                         FieldElement::one()
                     } else {
@@ -1911,23 +2078,28 @@ where
                 }
                 2 => {
                     // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
+                    // m_i * f_j naturally promotes A→B, then conditionally negate
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 =
-                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
-                    let sign1: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    let sign2: FieldElement<B> = if absorbed[1].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f1 * &f2 - m1 * sign1 * &f2 - m2 * sign2 * &f1
+                    let f1 = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[0],
+                        z,
+                        alpha_powers,
+                        shifts,
+                    );
+                    let f2 = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[1],
+                        z,
+                        alpha_powers,
+                        shifts,
+                    );
+                    let term1 = m1 * &f2;
+                    let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+                    let term2 = m2 * &f1;
+                    let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+                    delta * &f1 * &f2 - term1 - term2
                 }
                 _ => unreachable!("absorbed must contain 1 or 2 interactions"),
             }
@@ -1939,6 +2111,7 @@ where
                 logup_table_offset,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
@@ -1949,12 +2122,14 @@ where
                 &self.absorbed,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
             TransitionEvaluationContext::Verifier {
                 frame,
                 logup_table_offset,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
@@ -1965,6 +2140,7 @@ where
                 &self.absorbed,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
         };
 

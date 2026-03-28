@@ -4,7 +4,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
 
 /// Input for fuzzing field operations
@@ -173,5 +173,39 @@ fuzz_target!(|input: FuzzInput| {
         canonicalize(double_native),
         mod_add(a_native, a_native),
         a_native
+    );
+
+    // Test with raw (non-canonical) inputs to exercise double-overflow/underflow paths.
+    // These paths require inputs >= p and are not reached with canonical inputs above.
+    let a_raw = input.a;
+    let b_raw = input.b;
+    let a_canon = a_raw % GOLDILOCKS_PRIME;
+    let b_canon = b_raw % GOLDILOCKS_PRIME;
+
+    let sum_raw = GoldilocksField::add(&a_raw, &b_raw);
+    assert_eq!(
+        canonicalize(sum_raw),
+        mod_add(a_canon, b_canon),
+        "Non-canonical add mismatch: a={:#x}, b={:#x}",
+        a_raw,
+        b_raw
+    );
+
+    let diff_raw = GoldilocksField::sub(&a_raw, &b_raw);
+    assert_eq!(
+        canonicalize(diff_raw),
+        mod_sub(a_canon, b_canon),
+        "Non-canonical sub mismatch: a={:#x}, b={:#x}",
+        a_raw,
+        b_raw
+    );
+
+    let prod_raw = GoldilocksField::mul(&a_raw, &b_raw);
+    assert_eq!(
+        canonicalize(prod_raw),
+        mod_mul(a_canon, b_canon),
+        "Non-canonical mul mismatch: a={:#x}, b={:#x}",
+        a_raw,
+        b_raw
     );
 });

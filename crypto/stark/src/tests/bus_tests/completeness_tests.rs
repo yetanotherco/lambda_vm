@@ -4,8 +4,8 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::{
-    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+use math::field::{
+    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 
 use crate::examples::multi_table_lookup::{
@@ -131,6 +131,7 @@ fn test_multi_table_proof() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -193,6 +194,7 @@ fn test_all_padding() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -255,6 +257,7 @@ fn test_single_operation() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -317,6 +320,7 @@ fn test_duplicate_operations() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -384,6 +388,7 @@ fn test_serialization_roundtrip() {
         &airs,
         &deserialized,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -523,5 +528,6 @@ fn test_bus_value_features() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }

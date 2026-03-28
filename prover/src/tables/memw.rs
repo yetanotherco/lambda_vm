@@ -1,32 +1,30 @@
-//! MEMW (Memory Write/Read) table.
+//! MEMW (Memory Write/Read) table — unaligned / split-timestamp path.
 //!
-//! This table handles memory and register read/write operations with timestamp-based
-//! consistency checking.
+//! This table handles memory and register read/write operations where bytes may
+//! have different old_timestamps or the access is unaligned.
 //!
-//! ## Inputs
+//! ## Column layout (49 columns)
+//!
 //! - `is_register`: Bit (1 = register access, 0 = memory access)
-//! - `base_address`: DWordWL (64-bit address)
+//! - `base_address`: DWordWL (64-bit address, 2 cols)
 //! - `value[8]`: BaseField[8] (8 bytes to write)
-//! - `timestamp`: DWordWL (64-bit timestamp)
+//! - `timestamp`: DWordWL (64-bit timestamp, 2 cols)
 //! - `write2/4/8`: Bit (access width flags)
-//!
-//! ## Output
 //! - `old[8]`: BaseField[8] (previous values at address)
-//!
-//! ## Auxiliary
-//! - `address_add[7]`: DWordHL[7] (base_address + 1..7)
-//! - `old_timestamp[8]`: DWordWL[8] (previous timestamps)
+//! - `add_limb_overflow[7]`: Bit[7] (carry flags for base_address + i)
+//! - `old_timestamp[8]`: DWordWL[8] (previous timestamps, 16 cols)
+//! - `mu_read`, `mu_write`: multiplicity columns
 //!
 //! ## Virtual (computed inline)
+//! - `address_add[i]` = (base_address_0 + i+1 - 2^32 * overflow[i], base_address_1 + overflow[i])
 //! - `w2`: write2 + write4 + write8 (writing at least 2 bytes)
 //! - `w4`: write4 + write8 (writing at least 4 bytes)
 //! - `μ_sum`: μ_read + μ_write
 //!
-//! ## Bus Interactions
-//! - Receiver: MEMW (from CPU for LOAD/STORE operations)
-//! - Sender: IS_HALFWORD (range checks for address_add)
-//! - Sender: LT (timestamp ordering checks)
-//! - Sender/Receiver: Memory bus (internal read/write consistency)
+//! ## Bus Interactions (26)
+//! - 8 LT timestamp checks (old_timestamp[i] < timestamp)
+//! - 16 Memory bus tokens (read old + write new, per byte)
+//! - 2 MEMW output interactions (read + write, from CPU)
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -37,14 +35,14 @@ use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::constraints::templates::{AddConstraint, AddOperand};
+use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW table chunk.
 /// If operations exceed this, the trace is split into multiple tables.
 pub const MAX_ROWS: usize = super::max_rows::MEMW;
 
 // =========================================================================
-// Column indices for MEMW table
+// Column indices for MEMW table (49 columns)
 // =========================================================================
 
 /// Column definitions for the MEMW table.
@@ -74,31 +72,21 @@ pub mod cols {
     pub const OLD: [usize; 8] = [16, 17, 18, 19, 20, 21, 22, 23];
 
     // Auxiliary columns
-    /// address_add[7]: each is DWordHL (4 halfwords = 4 columns)
-    /// Total: 7 * 4 = 28 columns
-    pub const ADDRESS_ADD_START: usize = 24;
-    // address_add[i] uses columns ADDRESS_ADD_START + i*4 .. ADDRESS_ADD_START + i*4 + 4
+    /// add_limb_overflow[7]: Bit columns indicating carry when adding i+1 to base_address_0
+    pub const ADD_LIMB_OVERFLOW: [usize; 7] = [24, 25, 26, 27, 28, 29, 30];
 
     /// old_timestamp[8]: each is DWordWL (2 words = 2 columns)
     /// Total: 8 * 2 = 16 columns
-    pub const OLD_TIMESTAMP_START: usize = 52; // 24 + 28
-    // old_timestamp[i] uses columns OLD_TIMESTAMP_START + i*2 .. OLD_TIMESTAMP_START + i*2 + 2
+    pub const OLD_TIMESTAMP_START: usize = 31;
 
     // Multiplicity columns
     /// μ_read: Whether we are performing a read
-    pub const MU_READ: usize = 68; // 52 + 16
+    pub const MU_READ: usize = 47;
     /// μ_write: Whether we are performing a write
-    pub const MU_WRITE: usize = 69;
+    pub const MU_WRITE: usize = 48;
 
     /// Total number of columns
-    /// Note: w2, w4, μ_sum are now computed inline via Multiplicity::Linear/Sum
-    pub const NUM_COLUMNS: usize = 70;
-
-    /// Helper to get address_add[i] column indices (4 halfwords each)
-    pub fn address_add(i: usize) -> [usize; 4] {
-        let base = ADDRESS_ADD_START + i * 4;
-        [base, base + 1, base + 2, base + 3]
-    }
+    pub const NUM_COLUMNS: usize = 49;
 
     /// Helper to get old_timestamp[i] column indices (2 words each)
     pub fn old_timestamp(i: usize) -> [usize; 2] {
@@ -163,25 +151,12 @@ impl MemwOperation {
 
     /// Convert access width to the spec's flag representation (write2, write4, write8).
     ///
-    /// The spec uses three flags to encode access width:
-    /// - `write2`: set if accessing 2+ bytes (width >= 2)
-    /// - `write4`: set if accessing 4+ bytes (width >= 4)
-    /// - `write8`: set if accessing 8 bytes (width == 8)
-    ///
-    /// This encoding allows computing "at least N bytes" predicates:
-    /// - w2 (at least 2) = write2 + write4 + write8
-    /// - w4 (at least 4) = write4 + write8
-    ///
     /// | Width | write2 | write4 | write8 |
     /// |-------|--------|--------|--------|
     /// |   1   |   0    |   0    |   0    |
     /// |   2   |   1    |   0    |   0    |
     /// |   4   |   0    |   1    |   0    |
     /// |   8   |   0    |   0    |   1    |
-    ///
-    /// Note: These are "exactly N" semantics per spec, not cumulative.
-    /// Virtual columns w2 = write2 + write4 + write8 and w4 = write4 + write8
-    /// compute "at least N" from these.
     pub fn write_flags(&self) -> (bool, bool, bool) {
         match self.width {
             1 => (false, false, false),
@@ -190,86 +165,6 @@ impl MemwOperation {
             8 => (false, false, true),
             _ => (false, false, false),
         }
-    }
-
-    /// Collect LT operations for timestamp ordering and overflow checking.
-    ///
-    /// Per spec constraints #7-10 and R1-R3:
-    /// - #7: old_timestamp[0] < timestamp (for all accesses)
-    /// - #8: old_timestamp[1] < timestamp (for width >= 2)
-    /// - #9: old_timestamp[2,3] < timestamp (for width >= 4)
-    /// - #10: old_timestamp[4..7] < timestamp (for width == 8)
-    /// - R1: base_address < base_address + 1 (overflow check for width >= 2)
-    /// - R2: base_address < base_address + 3 (overflow check for width >= 4)
-    /// - R3: base_address < base_address + 7 (overflow check for width == 8)
-    pub fn collect_lt_lookups(&self) -> Vec<super::lt::LtOperation> {
-        use super::lt::LtOperation;
-
-        let mut ops = Vec::new();
-
-        // Constraint 7: old_timestamp[0] < timestamp (always, for any access)
-        ops.push(LtOperation::new(
-            self.old_timestamp[0],
-            self.timestamp,
-            false,
-        ));
-
-        // Constraint 8: old_timestamp[1] < timestamp (for width >= 2)
-        if self.width >= 2 {
-            ops.push(LtOperation::new(
-                self.old_timestamp[1],
-                self.timestamp,
-                false,
-            ));
-        }
-
-        // Constraint 9: old_timestamp[2,3] < timestamp (for width >= 4)
-        if self.width >= 4 {
-            ops.push(LtOperation::new(
-                self.old_timestamp[2],
-                self.timestamp,
-                false,
-            ));
-            ops.push(LtOperation::new(
-                self.old_timestamp[3],
-                self.timestamp,
-                false,
-            ));
-        }
-
-        // Constraint 10: old_timestamp[4..7] < timestamp (for width == 8)
-        if self.width == 8 {
-            for i in 4..8 {
-                ops.push(LtOperation::new(
-                    self.old_timestamp[i],
-                    self.timestamp,
-                    false,
-                ));
-            }
-        }
-
-        // Overflow checks R1-R3: base_address < base_address + offset
-        // Always generate the LT operation - if overflow occurred, LT will return 0
-        // and the constraint (expecting result=1) will fail, rejecting the proof.
-        // R1: for width == 2, check base_address < base_address + 1
-        if self.width == 2 {
-            let addr_plus_1 = self.base_address.wrapping_add(1);
-            ops.push(LtOperation::new(self.base_address, addr_plus_1, false));
-        }
-
-        // R2: for width == 4, check base_address < base_address + 3
-        if self.width == 4 {
-            let addr_plus_3 = self.base_address.wrapping_add(3);
-            ops.push(LtOperation::new(self.base_address, addr_plus_3, false));
-        }
-
-        // R3: for width == 8, check base_address < base_address + 7
-        if self.width == 8 {
-            let addr_plus_7 = self.base_address.wrapping_add(7);
-            ops.push(LtOperation::new(self.base_address, addr_plus_7, false));
-        }
-
-        ops
     }
 }
 
@@ -287,7 +182,8 @@ pub fn generate_memw_trace(
         data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
 
         // base_address as DWordWL (2 words)
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
+        let base_addr_lo = op.base_address & 0xFFFF_FFFF;
+        data[base + cols::BASE_ADDRESS_0] = FE::from(base_addr_lo);
         data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
 
         // value[8]
@@ -310,14 +206,11 @@ pub fn generate_memw_trace(
             data[base + cols::OLD[i]] = FE::from(op.old[i]);
         }
 
-        // Auxiliary: address_add[7] - each as DWordHL (4 halfwords)
+        // Auxiliary: add_limb_overflow[7]
+        // overflow[i] = 1 if (base_address_lo + i+1) >= 2^32
         for i in 0..7 {
-            let addr = op.base_address.wrapping_add(i as u64 + 1);
-            let cols_i = cols::address_add(i);
-            data[base + cols_i[0]] = FE::from(addr & 0xFFFF);
-            data[base + cols_i[1]] = FE::from((addr >> 16) & 0xFFFF);
-            data[base + cols_i[2]] = FE::from((addr >> 32) & 0xFFFF);
-            data[base + cols_i[3]] = FE::from((addr >> 48) & 0xFFFF);
+            let overflows = base_addr_lo + (i as u64 + 1) >= (1u64 << 32);
+            data[base + cols::ADD_LIMB_OVERFLOW[i]] = FE::from(overflows as u64);
         }
 
         // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
@@ -330,81 +223,42 @@ pub fn generate_memw_trace(
         // Multiplicity
         data[base + cols::MU_READ] = FE::from(op.is_read as u64);
         data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
-        // Note: w2, w4, μ_sum are computed inline via Multiplicity::Linear/Sum
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
 // =========================================================================
-// Bus interactions
+// Bus interactions (26 total)
 // =========================================================================
 
 /// Creates all bus interactions for the MEMW table.
 ///
-/// The MEMW table:
-/// - **Receives** MEMW lookups from CPU (for LOAD/STORE operations)
-/// - **Sends** IS_HALFWORD lookups for address_add range checks
-/// - **Sends** LT lookups for timestamp ordering (old_timestamp < timestamp)
+/// 26 interactions:
+/// - 8 LT timestamp ordering checks
+/// - 16 Memory bus tokens (read old + write new per byte)
+/// - 2 MEMW output interactions (read + write from CPU)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
+    let mut interactions = Vec::with_capacity(26);
 
     // -------------------------------------------------------------------------
-    // IS_HALFWORD range checks for address_add[i][j]
+    // Memory bus interactions (16 total)
     // -------------------------------------------------------------------------
-    // -------------------------------------------------------------------------
-    // IsHalfword range checks for address_add columns
-    // -------------------------------------------------------------------------
-    // Each address_add[i] is 4 halfwords (DWordHL packing), need to range check all.
-    // Only check when row is active (μ_read + μ_write > 0).
-    for i in 0..7 {
-        let cols_i = cols::address_add(i);
-        for &col in &cols_i {
-            interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
-                // Only range check when row is active
-                Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-                vec![BusValue::Packed {
-                    start_column: col,
-                    packing: Packing::Direct,
-                }],
-            ));
-        }
-    }
+    // address_add[i] is VIRTUAL:
+    //   lo = base_address_0 + (i+1) - 2^32 * add_limb_overflow[i]
+    //   hi = base_address_1 + add_limb_overflow[i]
+    //
+    // Safety: `hi` is at most `base_address_1 + 1`. This never reaches 2^32
+    // because the CPU table splits addresses into (lo, hi) with both halves
+    // in [0, 2^32), and the Memw bus ties MEMW's base_address to the CPU's
+    // value. MEMW only receives accesses where base_address_1 <= 0xFFFF_FFFE
+    // (addresses near u64::MAX are rejected by the executor before proving).
+    // Consequently, `add_limb_overflow[i]` is implicitly correct: a wrong
+    // carry bit produces a memory token at a wrong address that has no
+    // matching PAGE/REGISTER token, causing multiset imbalance and an
+    // invalid proof.
 
-    // -------------------------------------------------------------------------
-    // Memory bus interactions (M1-M8 from spec)
-    // -------------------------------------------------------------------------
-    // DISABLED: Memory bus requires initialization and finalization:
-    // - Initialization: For each address accessed, an initial row at timestamp=0
-    //   with the starting value must exist so the first read has a matching write.
-    // - Finalization: Final values must be consumed to balance the bus.
-    // Without these, the bus won't balance.
-    // -------------------------------------------------------------------------
-    // These ensure read/write consistency:
-    // - Read old value at old_timestamp (+multiplicity)
-    // - Write new value at current timestamp (-multiplicity)
-    //
-    // Memory bus format: memory[is_register, address, timestamp_lo, timestamp_hi, value]
-    //
-    // Register tokens (is_register=1) are balanced by the REGISTER table.
-    // Memory tokens (is_register=0) are balanced by PAGE tables.
-
-    // -------------------------------------------------------------------------
-    // Memory bus interactions per spec CM16-CM23
-    // -------------------------------------------------------------------------
-    // Token format: memory[is_register, address_lo, address_hi, ts_lo, ts_hi, value]
-    //
-    // For registers (is_register=1): value is a Word (32-bit), address is Word-indexed
-    // For memory (is_register=0): value is a Byte (8-bit), address is byte-indexed
-    //
-    // Multiplicities per spec:
-    // - CM16/17 (index 0): μ_sum
-    // - CM18/19 (index 1): w2 = write2 + write4 + write8
-    // - CM20/21 (indices 2-3): w4 = write4 + write8
-    // - CM22/23 (indices 4-7): write8
-
-    // CM16: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
+    // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -436,7 +290,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM17: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // CM9: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -468,35 +322,35 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Helper: address_add[0] = base_address + 1, stored as DWordHL (4 halfwords)
-    // Use Word2L to combine each pair of halfwords into a word
-    let addr_add_0_lo = BusValue::Packed {
-        start_column: cols::address_add(0)[0],
-        packing: Packing::Word2L,
-    };
-    let addr_add_0_hi = BusValue::Packed {
-        start_column: cols::address_add(0)[2],
-        packing: Packing::Word2L,
-    };
+    // CM10/11: byte 1, multiplicity w2 = write2 + write4 + write8
+    // address_add[0] is virtual: lo = base_address_0 + 1 - 2^32 * overflow[0]
+    //                            hi = base_address_1 + overflow[0]
+    let addr_add_0_lo = BusValue::linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BASE_ADDRESS_0,
+        },
+        LinearTerm::Constant(1),
+        LinearTerm::Column {
+            coefficient: -(1i64 << 32),
+            column: cols::ADD_LIMB_OVERFLOW[0],
+        },
+    ]);
+    let addr_add_0_hi = BusValue::linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BASE_ADDRESS_1,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::ADD_LIMB_OVERFLOW[0],
+        },
+    ]);
 
-    // CM18: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
-    // w2 = write2 + write4 + write8
+    // CM10: send old token for byte 1
     interactions.push(BusInteraction::sender(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -519,23 +373,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM19: memory[is_register, address_add[0], timestamp, value[1]] with -w2
+    // CM11: receive new token for byte 1
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -558,30 +399,35 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM20/21: indices 2-3 with multiplicity w4 = write4 + write8
+    // CM12/13: bytes 2-3 with multiplicity w4 = write4 + write8
     for i in 2..=3 {
-        let addr_add_lo = BusValue::Packed {
-            start_column: cols::address_add(i - 1)[0],
-            packing: Packing::Word2L,
-        };
-        let addr_add_hi = BusValue::Packed {
-            start_column: cols::address_add(i - 1)[2],
-            packing: Packing::Word2L,
-        };
+        let overflow_col = cols::ADD_LIMB_OVERFLOW[i - 1];
+        let addr_add_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BASE_ADDRESS_0,
+            },
+            LinearTerm::Constant(i as i64),
+            LinearTerm::Column {
+                coefficient: -(1i64 << 32),
+                column: overflow_col,
+            },
+        ]);
+        let addr_add_hi = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BASE_ADDRESS_1,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: overflow_col,
+            },
+        ]);
 
-        // CM22.i: send old token
+        // send old token
         interactions.push(BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::Linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE4,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE8,
-                },
-            ]),
+            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
@@ -604,19 +450,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
 
-        // CM23.i: receive new token
+        // receive new token
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
-            Multiplicity::Linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE4,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE8,
-                },
-            ]),
+            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
@@ -640,18 +477,32 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // CM22/23: indices 4-7 with multiplicity write8
+    // CM14/15: bytes 4-7 with multiplicity write8
     for i in 4..=7 {
-        let addr_add_lo = BusValue::Packed {
-            start_column: cols::address_add(i - 1)[0],
-            packing: Packing::Word2L,
-        };
-        let addr_add_hi = BusValue::Packed {
-            start_column: cols::address_add(i - 1)[2],
-            packing: Packing::Word2L,
-        };
+        let overflow_col = cols::ADD_LIMB_OVERFLOW[i - 1];
+        let addr_add_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BASE_ADDRESS_0,
+            },
+            LinearTerm::Constant(i as i64),
+            LinearTerm::Column {
+                coefficient: -(1i64 << 32),
+                column: overflow_col,
+            },
+        ]);
+        let addr_add_hi = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BASE_ADDRESS_1,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: overflow_col,
+            },
+        ]);
 
-        // CM22.i: send old token
+        // send old token
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
@@ -677,7 +528,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
 
-        // CM23.i: receive new token
+        // receive new token
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
@@ -705,17 +556,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // CO24: Read receiver (unified for register and memory operations)
+    // CO16: Read receiver (from CPU)
     // -------------------------------------------------------------------------
-    // OLD and VALUE are 8 individual BaseField elements (Direct packing).
-    // For registers: [lo32_word, hi32_word, 0, 0, 0, 0, 0, 0]
-    // For memory: [byte0, byte1, ..., byte7]
-    // Both match sender format since bus compares field elements directly.
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
         Multiplicity::Column(cols::MU_READ),
         vec![
-            // old[8] - output for reads (words)
+            // old[8]
             BusValue::Packed {
                 start_column: cols::OLD[0],
                 packing: Packing::Direct,
@@ -753,7 +600,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
             },
-            // base_address (DWordWL = 2 words)
+            // base_address
             BusValue::Packed {
                 start_column: cols::BASE_ADDRESS_0,
                 packing: Packing::Direct,
@@ -762,7 +609,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8] - direct reads (words)
+            // value[8]
             BusValue::Packed {
                 start_column: cols::VALUE[0],
                 packing: Packing::Direct,
@@ -795,7 +642,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::VALUE[7],
                 packing: Packing::Direct,
             },
-            // timestamp (DWordWL = 2 words)
+            // timestamp
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::Direct,
@@ -821,12 +668,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // CO25: Write receiver (unified for register and memory operations)
+    // CO17: Write receiver (from CPU)
     // -------------------------------------------------------------------------
-    // VALUE is 8 individual BaseField elements (Direct packing).
-    // For registers: [lo32_word, hi32_word, 0, 0, 0, 0, 0, 0]
-    // For memory: [byte0, byte1, ..., byte7]
-    // Both match sender format since bus compares field elements directly.
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
         Multiplicity::Column(cols::MU_WRITE),
@@ -836,7 +679,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
             },
-            // base_address (DWordWL = 2 words)
+            // base_address
             BusValue::Packed {
                 start_column: cols::BASE_ADDRESS_0,
                 packing: Packing::Direct,
@@ -845,7 +688,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8] - direct reads (words)
+            // value[8]
             BusValue::Packed {
                 start_column: cols::VALUE[0],
                 packing: Packing::Direct,
@@ -878,7 +721,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::VALUE[7],
                 packing: Packing::Direct,
             },
-            // timestamp (DWordWL = 2 words)
+            // timestamp
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::Direct,
@@ -904,51 +747,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT interactions for timestamp ordering (constraints 7-10)
+    // LT interactions for timestamp ordering (MEMW-C4 through C7)
     // -------------------------------------------------------------------------
-    // Verify old_timestamp[i] < timestamp for each accessed byte.
-    // LT bus uses 2 elements per 64-bit operand: [lo32, hi32]
-    // Both old_timestamp and timestamp are DWordWL, so use Packing::DWordWL.
 
-    // Constraint 7: LT[1; old_timestamp[0], timestamp] with μ_sum
+    // MEMW-C4: LT[1; old_timestamp[0], timestamp] with μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
-            // lhs = old_timestamp[0] as DWordWL (2 elements: [lo32, hi32])
             BusValue::Packed {
                 start_column: cols::old_timestamp(0)[0],
                 packing: Packing::DWordWL,
             },
-            // rhs = timestamp as DWordWL (2 elements: [lo32, hi32])
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            // signed = 0 (unsigned comparison)
             BusValue::constant(0),
-            // lt = 1 (expected result: old_timestamp < timestamp)
             BusValue::constant(1),
         ],
     ));
 
-    // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
+    // MEMW-C5: LT[1; old_timestamp[1], timestamp] with w2
     interactions.push(BusInteraction::sender(
         BusId::Lt,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::old_timestamp(1)[0],
@@ -963,7 +786,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Constraint 9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
+    // MEMW-C6: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
     for i in 2..4 {
         interactions.push(BusInteraction::sender(
             BusId::Lt,
@@ -983,7 +806,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // Constraint 10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
+    // MEMW-C7: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
     for i in 4..8 {
         interactions.push(BusInteraction::sender(
             BusId::Lt,
@@ -1002,69 +825,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
     }
-
-    // -------------------------------------------------------------------------
-    // LT interactions for overflow checking (constraints R1-R3)
-    // -------------------------------------------------------------------------
-    // Verify base_address < address_add[i] (no overflow when adding offset).
-    // base_address is DWordWL, address_add[i] is DWordHL (cast to DWordWL).
-    // Both packings produce 2 elements [lo32, hi32].
-
-    // R1: LT[1; base_address, address_add[0]] with write2
-    // This checks for no overflow when accessing byte 1 (width == 2)
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE2),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0), // unsigned
-            BusValue::constant(1), // lt = 1
-        ],
-    ));
-
-    // R2: LT[1; base_address, address_add[2]] with write4
-    // This checks for no overflow when accessing byte 3 (width == 4)
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE4),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(2)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0),
-            BusValue::constant(1),
-        ],
-    ));
-
-    // R3: LT[1; base_address, address_add[6]] with write8
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE8),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(6)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0),
-            BusValue::constant(1),
-        ],
-    ));
 
     interactions
 }
@@ -1097,7 +857,7 @@ where
 }
 
 // =========================================================================
-// Constraints
+// Constraints (9 total: 2 custom + 7 IS_BIT)
 // =========================================================================
 
 /// MEMW table constraint kinds.
@@ -1132,12 +892,10 @@ impl MemwConstraint {
 
         match self.kind {
             MemwConstraintKind::MuSumIsBit => {
-                // IS_BIT<μ_sum>: μ_sum * (1 - μ_sum) = 0
                 let mu_sum = compute_mu_sum(step);
                 &mu_sum * (&one - &mu_sum)
             }
             MemwConstraintKind::W2ImpliesMuSum => {
-                // w2 * (1 - μ_sum) = 0
                 let w2 = compute_w2(step);
                 let mu_sum = compute_mu_sum(step);
                 &w2 * (&one - &mu_sum)
@@ -1156,10 +914,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -1191,6 +945,11 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 }
 
 /// Creates all constraints for the MEMW table.
+///
+/// 9 constraints total:
+/// - IS_BIT<μ_sum> (1)
+/// - w2 => μ_sum (1)
+/// - IS_BIT for add_limb_overflow[0..6] (7)
 pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
         Vec::new();
@@ -1211,29 +970,10 @@ pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, Goldil
     )));
     idx += 1;
 
-    // ADD constraints for address_add[0..6]
-    // Each ADD constraint verifies: address_add[i] = base_address + (i+1)
-    // Multiplicities per spec:
-    //   C3: address_add[0] with w2 (write2 + write4 + write8)
-    //   C4: address_add[1..2] with w4 (write4 + write8)
-    //   C5: address_add[3..6] with write8
-    for i in 0..7 {
-        let lhs = AddOperand::dword(cols::BASE_ADDRESS_0);
-        let rhs = AddOperand::constant((i + 1) as i64);
-        let sum = AddOperand::from_dword_hl(cols::address_add(i)[0]);
-
-        // Select multiplicity based on which address_add we're constraining
-        let condition = match i {
-            0 => vec![cols::WRITE2, cols::WRITE4, cols::WRITE8], // w2
-            1 | 2 => vec![cols::WRITE4, cols::WRITE8],           // w4
-            _ => vec![cols::WRITE8],                             // write8 (i = 3..6)
-        };
-
-        // ADD constraint produces 2 constraints (carry_0, carry_1)
-        let (c0, c1) = AddConstraint::new_pair(condition, lhs, rhs, sum, idx);
-        constraints.push(Box::new(c0));
-        constraints.push(Box::new(c1));
-        idx += 2;
+    // IS_BIT for add_limb_overflow[0..6]
+    for &col in &cols::ADD_LIMB_OVERFLOW {
+        constraints.push(Box::new(IsBitConstraint::unconditional(col, idx)));
+        idx += 1;
     }
 
     constraints
@@ -1259,17 +999,60 @@ mod tests {
 
     #[test]
     fn test_write_flags() {
-        // "Exactly N" semantics per spec
         let op1 = MemwOperation::new(false, 0, [0; 8], 0, 1, false);
-        assert_eq!(op1.write_flags(), (false, false, false)); // no flags for 1 byte
+        assert_eq!(op1.write_flags(), (false, false, false));
 
         let op2 = MemwOperation::new(false, 0, [0; 8], 0, 2, false);
-        assert_eq!(op2.write_flags(), (true, false, false)); // write2 only
+        assert_eq!(op2.write_flags(), (true, false, false));
 
         let op4 = MemwOperation::new(false, 0, [0; 8], 0, 4, false);
-        assert_eq!(op4.write_flags(), (false, true, false)); // write4 only
+        assert_eq!(op4.write_flags(), (false, true, false));
 
         let op8 = MemwOperation::new(false, 0, [0; 8], 0, 8, false);
-        assert_eq!(op8.write_flags(), (false, false, true)); // write8 only
+        assert_eq!(op8.write_flags(), (false, false, true));
+    }
+
+    #[test]
+    fn test_add_limb_overflow() {
+        // Address 0xFFFF_FFFF should overflow when adding 1
+        let op =
+            MemwOperation::new(false, 0xFFFF_FFFF, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
+        let trace = generate_memw_trace(&[op]);
+
+        // All 7 overflow flags should be 1 since 0xFFFF_FFFF + i >= 2^32 for i >= 1
+        for i in 0..7 {
+            let val = trace.get_main(0, cols::ADD_LIMB_OVERFLOW[i]);
+            assert_eq!(*val, FE::one(), "overflow[{i}] should be 1");
+        }
+
+        // Address 0x0000_0000 should not overflow
+        let op2 =
+            MemwOperation::new(false, 0x0000_0000, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
+        let trace2 = generate_memw_trace(&[op2]);
+        for i in 0..7 {
+            let val = trace2.get_main(0, cols::ADD_LIMB_OVERFLOW[i]);
+            assert_eq!(*val, FE::zero(), "overflow[{i}] should be 0");
+        }
+
+        // Address 0xFFFF_FFFE with width=8 exercises mixed per-byte carry bits:
+        // overflow[0]=0 (0xFFFF_FFFE+1 = 0xFFFF_FFFF < 2^32)
+        // overflow[1..6]=1 (0xFFFF_FFFE+2..8 >= 2^32)
+        let op3 =
+            MemwOperation::new(false, 0xFFFF_FFFE, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
+        let trace3 = generate_memw_trace(&[op3]);
+        let val0 = trace3.get_main(0, cols::ADD_LIMB_OVERFLOW[0]);
+        assert_eq!(
+            *val0,
+            FE::zero(),
+            "overflow[0] should be 0 for base 0xFFFF_FFFE"
+        );
+        for i in 1..7 {
+            let val = trace3.get_main(0, cols::ADD_LIMB_OVERFLOW[i]);
+            assert_eq!(
+                *val,
+                FE::one(),
+                "overflow[{i}] should be 1 for base 0xFFFF_FFFE"
+            );
+        }
     }
 }
