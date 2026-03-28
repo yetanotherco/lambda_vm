@@ -142,18 +142,27 @@ where
             let mut numerator_eval = coset_offset.pow(numerator_power);
             let mut denominator_eval = coset_offset.pow(denominator_power);
 
-            let mut evaluations = Vec::with_capacity(last_exponent);
+            let mut numerators = Vec::with_capacity(last_exponent);
+            let mut denominators = Vec::with_capacity(last_exponent);
             for _ in 0..last_exponent {
-                let numerator = &numerator_eval - &numerator_offset;
-                let denominator = &denominator_eval - &denominator_offset;
-
-                // The denominator is guaranteed to be non-zero because the sets of powers of `offset_times_x`
-                // and `trace_primitive_root` are disjoint, provided that the offset is neither an element of the
-                // interpolation domain nor part of a subgroup with order less than n.
-                evaluations.push(unsafe { numerator.div(denominator).unwrap_unchecked() });
+                numerators.push(&numerator_eval - &numerator_offset);
+                denominators.push(&denominator_eval - &denominator_offset);
                 numerator_eval = &numerator_eval * &numerator_step;
                 denominator_eval = &denominator_eval * &denominator_step;
             }
+
+            // Batch inversion: O(3N) muls + 1 inversion instead of N individual inversions
+            // (each ~72 muls for Goldilocks Fermat chain). Denominators are guaranteed non-zero
+            // because the sets of powers of `offset_times_x` and `trace_primitive_root` are
+            // disjoint, provided that the offset is neither an element of the interpolation
+            // domain nor part of a subgroup with order less than n.
+            FieldElement::inplace_batch_inverse(&mut denominators).unwrap();
+
+            let evaluations: Vec<_> = numerators
+                .iter()
+                .zip(denominators.iter())
+                .map(|(num, denom_inv)| num * denom_inv)
+                .collect();
 
             // FIXME: Instead of computing this evaluations for each constraint, they can be computed
             // once for every constraint with the same end exemptions (combination of end_exemptions()
