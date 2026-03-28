@@ -162,6 +162,11 @@ where
         self.main_table.spill_to_disk()
     }
 
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()> {
+        self.aux_table.spill_to_disk()
+    }
+
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,

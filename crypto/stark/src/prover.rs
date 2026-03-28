@@ -1836,7 +1836,12 @@ pub trait IsStarkProver<
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
             .map(|(air, trace, _)| {
                 if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                    let result = air.build_auxiliary_trace(*trace, &lookup_challenges);
+                    #[cfg(feature = "disk-spill")]
+                    trace
+                        .spill_aux_to_disk()
+                        .expect("disk-spill aux trace after build");
+                    result
                 } else {
                     None
                 }
