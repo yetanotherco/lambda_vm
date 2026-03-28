@@ -1896,10 +1896,6 @@ where
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
@@ -2025,10 +2021,6 @@ where
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0 // Circular constraint applies to all rows including last→first wrap
     }
 
     fn evaluate(

@@ -78,7 +78,11 @@ where
     /// the constraint evaluation at the end of the trace. For example, for a fibonacci
     /// computation that has to use the result 2 following steps, this method is defined
     /// to return the value 2.
-    fn end_exemptions(&self) -> usize;
+    ///
+    /// Default value is 0, meaning the constraint applies to all rows including the last.
+    fn end_exemptions(&self) -> usize {
+        0
+    }
 
     /// Method for calculating the end exemptions polynomial.
     ///
