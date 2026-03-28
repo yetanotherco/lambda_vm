@@ -209,10 +209,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -275,10 +271,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -356,10 +348,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -443,10 +431,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -521,10 +505,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -616,10 +596,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -755,10 +731,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -852,10 +824,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -939,10 +907,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -1005,10 +969,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
@@ -1079,10 +1039,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -1150,10 +1106,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
