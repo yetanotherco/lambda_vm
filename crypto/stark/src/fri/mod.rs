@@ -54,23 +54,29 @@ where
             .chunks_exact(2)
             .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
             .collect();
-        let mut merkle_tree = FriLayerMerkleTree::build(&leaves)
+        let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         #[cfg(feature = "disk-spill")]
-        merkle_tree
-            .spill_nodes_to_disk()
-            .expect("disk-spill FRI layer Merkle tree");
-        let mut layer = FriLayer::new(
+        let merkle_tree = {
+            let mut t = merkle_tree;
+            t.spill_nodes_to_disk()
+                .expect("disk-spill FRI layer Merkle tree");
+            t
+        };
+        let layer = FriLayer::new(
             &evals,
             merkle_tree,
             current_coset_offset.clone().to_extension(),
             current_domain_size,
         );
         #[cfg(feature = "disk-spill")]
-        layer
-            .spill_evaluation_to_disk()
-            .expect("disk-spill FRI layer evaluation");
+        let layer = {
+            let mut l = layer;
+            l.spill_evaluation_to_disk()
+                .expect("disk-spill FRI layer evaluation");
+            l
+        };
         fri_layer_list.push(layer);
 
         // >>>> Send commitment: [pₖ]
