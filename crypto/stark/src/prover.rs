@@ -700,6 +700,10 @@ pub trait IsStarkProver<
         let num_leaves = num_rows / 2;
         debug_assert!(
             num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index to be correct"
+        );
+        debug_assert!(
+            num_rows.is_power_of_two(),
             "num_rows must be a power of two for reverse_index"
         );
 
