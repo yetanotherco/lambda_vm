@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 #[cfg(feature = "debug-checks")]
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -1023,18 +1022,6 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
-        // Precompute alpha powers and packing shifts once for the whole table
-        let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-        let max_bus_elements = self
-            .auxiliary_trace_build_data
-            .interactions
-            .iter()
-            .map(|i| i.num_bus_elements())
-            .max()
-            .unwrap_or(0);
-        let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
-        let shifts = PackingShifts::<F>::new();
-
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
@@ -1049,8 +1036,6 @@ where
                     &main_segment_cols,
                     trace_len,
                     challenges,
-                    &alpha_powers,
-                    &shifts,
                     table_name,
                 )
             })
@@ -1064,8 +1049,6 @@ where
                     &main_segment_cols,
                     trace_len,
                     challenges,
-                    &alpha_powers,
-                    &shifts,
                     table_name,
                 )
             })
@@ -1079,8 +1062,6 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
-                &alpha_powers,
-                &shifts,
                 table_name,
             )
         } else {
@@ -1089,8 +1070,6 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
-                &alpha_powers,
-                &shifts,
                 table_name,
             )
         };
@@ -1109,8 +1088,6 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
-                &alpha_powers,
-                &shifts,
                 table_name,
             );
 
@@ -1393,8 +1370,6 @@ fn compute_logup_term_column<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
-    alpha_powers: &[FieldElement<E>],
-    shifts: &PackingShifts<F>,
     #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
@@ -1476,6 +1451,11 @@ where
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+
+    // Precompute powers of alpha for all bus elements (using incremental multiplication)
+    let num_bus_elements = table_interaction.num_bus_elements();
+    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     let negate = !table_interaction.is_sender;
 
@@ -1486,6 +1466,7 @@ where
     // Zero-allocation inner loop: accumulate the linear combination directly
     // into the fingerprint without collecting bus elements into intermediate Vecs.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+    let shifts = PackingShifts::<F>::new();
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
     for row in 0..trace_len {
         // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
@@ -1495,10 +1476,10 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                alpha_powers,
+                &alpha_powers,
                 alpha_offset,
                 &mut linear_combination,
-                shifts,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1548,15 +1529,12 @@ where
 ///
 /// Uses a single batch inversion for both fingerprint vectors (2*N elements).
 #[allow(clippy::needless_range_loop)]
-#[allow(clippy::too_many_arguments)]
 fn compute_logup_batched_term_column<F, E>(
     interaction_a: &BusInteraction,
     interaction_b: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
-    alpha_powers: &[FieldElement<E>],
-    shifts: &PackingShifts<F>,
     #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
@@ -1564,73 +1542,69 @@ where
     E: IsField + Send + Sync,
 {
     let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+
+    let max_bus_elements = interaction_a
+        .num_bus_elements()
+        .max(interaction_b.num_bus_elements());
+    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
     let negate_a = !interaction_a.is_sender;
     let negate_b = !interaction_b.is_sender;
 
-    // Helper to get multiplicities for an interaction, borrowing when possible
-    let compute_multiplicities = |interaction: &BusInteraction| -> Cow<'_, [FieldElement<F>]> {
+    // Helper to compute multiplicities for an interaction
+    let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
         match &interaction.multiplicity {
-            Multiplicity::One => Cow::Owned(vec![FieldElement::one(); trace_len]),
-            Multiplicity::Column(col) => Cow::Borrowed(&main_segment_cols[*col]),
-            Multiplicity::Sum(col_a, col_b) => Cow::Owned(
-                main_segment_cols[*col_a]
-                    .iter()
-                    .zip(main_segment_cols[*col_b].iter())
-                    .map(|(a, b)| a + b)
-                    .collect(),
-            ),
-            Multiplicity::Negated(col) => Cow::Owned(
-                main_segment_cols[*col]
-                    .iter()
-                    .map(|elem| FieldElement::<F>::one() - elem)
-                    .collect(),
-            ),
-            Multiplicity::Diff(col_a, col_b) => Cow::Owned(
-                main_segment_cols[*col_a]
-                    .iter()
-                    .zip(main_segment_cols[*col_b].iter())
-                    .map(|(a, b)| a - b)
-                    .collect(),
-            ),
-            Multiplicity::Sum3(col_a, col_b, col_c) => Cow::Owned(
-                (0..trace_len)
-                    .map(|row| {
-                        &main_segment_cols[*col_a][row]
-                            + &main_segment_cols[*col_b][row]
-                            + &main_segment_cols[*col_c][row]
-                    })
-                    .collect(),
-            ),
-            Multiplicity::Linear(terms) => Cow::Owned(
-                (0..trace_len)
-                    .map(|row| {
-                        let mut result = FieldElement::<F>::zero();
-                        for term in terms {
-                            match *term {
-                                LinearTerm::Column {
-                                    coefficient,
-                                    column,
-                                } => {
-                                    let coeff = FieldElement::<F>::from(coefficient);
-                                    result += &main_segment_cols[column][row] * coeff;
-                                }
-                                LinearTerm::ColumnUnsigned {
-                                    coefficient,
-                                    column,
-                                } => {
-                                    let coeff = FieldElement::<F>::from(coefficient);
-                                    result += &main_segment_cols[column][row] * coeff;
-                                }
-                                LinearTerm::Constant(value) => {
-                                    result += FieldElement::<F>::from(value);
-                                }
+            Multiplicity::One => vec![FieldElement::one(); trace_len],
+            Multiplicity::Column(col) => main_segment_cols[*col].clone(),
+            Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
+                .iter()
+                .zip(main_segment_cols[*col_b].iter())
+                .map(|(a, b)| a + b)
+                .collect(),
+            Multiplicity::Negated(col) => main_segment_cols[*col]
+                .iter()
+                .map(|elem| FieldElement::<F>::one() - elem)
+                .collect(),
+            Multiplicity::Diff(col_a, col_b) => main_segment_cols[*col_a]
+                .iter()
+                .zip(main_segment_cols[*col_b].iter())
+                .map(|(a, b)| a - b)
+                .collect(),
+            Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
+                .map(|row| {
+                    &main_segment_cols[*col_a][row]
+                        + &main_segment_cols[*col_b][row]
+                        + &main_segment_cols[*col_c][row]
+                })
+                .collect(),
+            Multiplicity::Linear(terms) => (0..trace_len)
+                .map(|row| {
+                    let mut result = FieldElement::<F>::zero();
+                    for term in terms {
+                        match *term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                result += FieldElement::<F>::from(value);
                             }
                         }
-                        result
-                    })
-                    .collect(),
-            ),
+                    }
+                    result
+                })
+                .collect(),
         }
     };
 
@@ -1641,9 +1615,9 @@ where
     // (zero-allocation inner loop: F×E multiplication instead of to_extension())
     let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
     let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+    let shifts = PackingShifts::<F>::new();
 
-    // Interleave both fingerprint vectors [fp_a_0, fp_b_0, fp_a_1, fp_b_1, ...]
-    // for better cache locality (both interactions read the same main_segment_cols rows)
+    // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
 
     for row in 0..trace_len {
@@ -1653,32 +1627,33 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                alpha_powers,
+                &alpha_powers,
                 alpha_offset,
                 &mut lc_a,
-                shifts,
+                &shifts,
             );
             alpha_offset += consumed;
         }
         all_fingerprints.push(z - &lc_a);
-
+    }
+    for row in 0..trace_len {
         let mut lc_b = &bus_id_b * &alpha_powers[0];
         let mut alpha_offset = 1;
         for bv in &interaction_b.values {
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                alpha_powers,
+                &alpha_powers,
                 alpha_offset,
                 &mut lc_b,
-                shifts,
+                &shifts,
             );
             alpha_offset += consumed;
         }
         all_fingerprints.push(z - &lc_b);
     }
 
-    // Single batch inversion for all 2*N interleaved fingerprints
+    // Single batch inversion for all 2*N fingerprints
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
@@ -1686,8 +1661,8 @@ where
     // Use conditional negation instead of E×E sign multiplication
     (0..trace_len)
         .map(|row| {
-            let fp_a_inv = &all_fingerprints[2 * row];
-            let fp_b_inv = &all_fingerprints[2 * row + 1];
+            let fp_a_inv = &all_fingerprints[row];
+            let fp_b_inv = &all_fingerprints[trace_len + row];
             let term_a = &multiplicities_a[row] * fp_a_inv;
             let term_b = &multiplicities_b[row] * fp_b_inv;
             let term_a = if negate_a { -term_a } else { term_a };
@@ -1756,8 +1731,6 @@ fn compute_debug_bus_sums_batched<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
-    alpha_powers: &[FieldElement<E>],
-    shifts: &PackingShifts<F>,
     table_name: &str,
 ) -> (
     HashMap<u64, FieldElement<E>>,
@@ -1779,8 +1752,6 @@ where
             main_segment_cols,
             trace_len,
             challenges,
-            alpha_powers,
-            shifts,
             table_name,
         );
         let col_sum: FieldElement<E> = individual_terms
