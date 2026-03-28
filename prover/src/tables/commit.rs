@@ -245,26 +245,8 @@ pub fn generate_commit_trace(
 /// - **Sends** to Memw for register/memory accesses (×5, mult varies)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     // Reusable multiplicity expressions
-    let mu_minus_end = Multiplicity::Linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU,
-        },
-        LinearTerm::Column {
-            coefficient: -1,
-            column: cols::END,
-        },
-    ]);
-    let mu_minus_first = Multiplicity::Linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU,
-        },
-        LinearTerm::Column {
-            coefficient: -1,
-            column: cols::FIRST,
-        },
-    ]);
+    let mu_minus_end = Multiplicity::Diff(cols::MU, cols::END);
+    let mu_minus_first = Multiplicity::Diff(cols::MU, cols::FIRST);
 
     vec![
         // 1. Receive ECALL from CPU (mult = first)
@@ -861,10 +843,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstr
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
