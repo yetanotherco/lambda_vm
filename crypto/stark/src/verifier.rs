@@ -25,7 +25,6 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
@@ -259,7 +258,7 @@ pub trait IsStarkVerifier<
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
-        let mut boundary_step_points = HashMap::with_capacity(number_of_b_constraints);
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
 
         #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
@@ -269,10 +268,14 @@ pub trait IsStarkVerifier<
             .map(|index| {
                 let step = boundary_constraints.constraints[index].step;
                 let is_aux = boundary_constraints.constraints[index].is_aux;
-                let point = boundary_step_points
-                    .entry(step)
-                    .or_insert_with(|| domain.trace_primitive_root.pow(step as u64))
-                    .clone();
+                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
+                    Some((_, p)) => p.clone(),
+                    None => {
+                        let p = domain.trace_primitive_root.pow(step as u64);
+                        boundary_step_points.push((step, p.clone()));
+                        p
+                    }
+                };
                 let column_idx = boundary_constraints.constraints[index].col;
                 let trace_evaluation = if is_aux {
                     let column_idx = air.trace_layout().0 + column_idx;
