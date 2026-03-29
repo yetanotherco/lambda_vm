@@ -41,7 +41,8 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_mul_air, create_page_air, create_register_air, create_shift_air,
+    create_memw_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -71,6 +72,7 @@ pub struct TableCounts {
     pub dvrm: usize,
     pub shift: usize,
     pub branch: usize,
+    pub memw_register: usize,
 }
 
 impl TableCounts {
@@ -80,7 +82,15 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
+        self.cpu
+            + self.lt
+            + self.memw
+            + self.load
+            + self.mul
+            + self.dvrm
+            + self.shift
+            + self.branch
+            + self.memw_register
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -97,6 +107,7 @@ impl TableCounts {
             ("dvrm", self.dvrm),
             ("shift", self.shift),
             ("branch", self.branch),
+            ("memw_register", self.memw_register),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -183,6 +194,7 @@ pub(crate) struct VmAirs {
     pub commit: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
+    pub memw_registers: Vec<VmAir>,
 }
 
 impl VmAirs {
@@ -221,6 +233,13 @@ impl VmAirs {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self
+            .memw_registers
+            .iter()
+            .zip(traces.memw_registers.iter_mut())
+        {
             pairs.push((air, trace, &()));
         }
 
@@ -262,6 +281,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.pages {
+            refs.push(air);
+        }
+        for air in &self.memw_registers {
             refs.push(air);
         }
 
@@ -333,6 +355,11 @@ impl VmAirs {
                 )
             })
             .collect();
+        let memw_registers: Vec<_> = (0..table_counts.memw_register)
+            .map(|i| {
+                create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i))
+            })
+            .collect();
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -352,6 +379,7 @@ impl VmAirs {
             commit,
             register,
             pages,
+            memw_registers,
         }
     }
 }

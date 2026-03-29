@@ -43,6 +43,7 @@ use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
+use super::memw_register;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -769,6 +770,59 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 }
 
 // =============================================================================
+// Routing predicates (MEMW_R and MEMW_A fast paths)
+// =============================================================================
+
+/// An operation routes to MEMW_R if:
+/// 1. It's a register access (is_register = true)
+/// 2. timestamp[1] == old_timestamp[1] (upper limbs match)
+/// 3. timestamp[0] > old_timestamp[0] (lower limb ordering)
+/// 4. timestamp[0] - old_timestamp[0] <= 0xFFFF (delta fits in halfword)
+fn is_register_op(op: &MemwOperation) -> bool {
+    if !op.is_register {
+        return false;
+    }
+    let ts = op.timestamp;
+    let old_ts = op.old_timestamp[0]; // registers always width-2, old_ts[0] = old_ts[1]
+    let ts_lo = ts & 0xFFFF_FFFF;
+    let old_ts_lo = old_ts & 0xFFFF_FFFF;
+    let ts_hi = ts >> 32;
+    let old_ts_hi = old_ts >> 32;
+    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0xFFFF
+}
+
+/// An operation routes to MEMW_A (aligned fast path) if all its accessed bytes
+/// share the same old_timestamp (i.e., `old_timestamp[0..width]` are equal).
+#[allow(dead_code)]
+fn is_aligned_op(op: &MemwOperation) -> bool {
+    let width = op.width as usize;
+    if width == 0 {
+        return false;
+    }
+    let base_ts = op.old_timestamp[0];
+    op.old_timestamp[1..width].iter().all(|&ts| ts == base_ts)
+}
+
+/// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
+///
+/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
+/// in a halfword (proving the timestamp delta is in range [1, 0xFFFF]).
+fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+    ops.iter()
+        .map(|op| {
+            let ts_lo = op.timestamp & 0xFFFF_FFFF;
+            let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
+            let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
+            BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (diff_minus_1 & 0xFF) as u8,
+                (diff_minus_1 >> 8) as u8,
+            )
+        })
+        .collect()
+}
+
+// =============================================================================
 // Phase 3: MEMW → LT
 // =============================================================================
 
@@ -1491,6 +1545,9 @@ pub struct Traces {
 
     /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
+    pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1518,6 +1575,7 @@ impl Traces {
             dvrm: self.dvrms.len(),
             shift: self.shifts.len(),
             branch: self.branches.len(),
+            memw_register: self.memw_registers.len(),
         }
     }
 
@@ -1736,6 +1794,11 @@ impl Traces {
             mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
         }
 
+        // Route MEMW_R (register fast-path) before Phase 3.
+        // Extract register ops first, then remaining ops stay in memw_ops.
+        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_register_op);
+
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
@@ -1751,6 +1814,8 @@ impl Traces {
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -1782,6 +1847,11 @@ impl Traces {
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_registers = chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
+        );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
@@ -1852,6 +1922,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_registers,
             loads,
             decode,
             muls,
@@ -1960,6 +2031,11 @@ impl Traces {
             mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
         }
 
+        // Route MEMW_R (register fast-path) before Phase 3.
+        // Extract register ops first, then remaining ops stay in memw_ops.
+        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_register_op);
+
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
@@ -1973,6 +2049,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -2003,6 +2081,11 @@ impl Traces {
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_registers = chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
+        );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
@@ -2059,6 +2142,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_registers,
             loads,
             decode,
             muls,

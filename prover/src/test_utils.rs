@@ -50,6 +50,10 @@ use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, co
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
+use crate::tables::memw_register::{
+    bus_interactions as memw_register_bus_interactions, cols as memw_register_cols,
+    constraints as memw_register_constraints,
+};
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::register::{
@@ -746,4 +750,26 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
+}
+
+/// Create MEMW_R AIR with constraints and bus interactions.
+///
+/// MEMW_R is the register-only fast path for memory accesses.
+/// Registers are always width-2 (DWordWL), always aligned, and share
+/// the upper timestamp limb with the current timestamp.
+pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_register_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_register_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_register_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("MEMW_R")
 }
