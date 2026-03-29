@@ -3,7 +3,6 @@
 use crate::tables::bitwise;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
-use crate::tables::memw;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
@@ -354,8 +353,11 @@ fn test_mixed_instructions() {
 
 #[test]
 fn test_memw_generated_from_register_ops() {
-    // Test that MEMW operations are generated for register reads/writes
-    // ADD x1, x2, x3 reads x2 (M1), x3 (M3), writes x1 (M5)
+    // Test that register ops route to MEMW_R (memw_registers), not the main
+    // MEMW table (memws).
+    // ADD x1, x2, x3 reads x2 (M1), x3 (M3), writes x1 (M5) → all register
+    // ops that satisfy the MEMW_R fast-path criteria (is_register=true,
+    // timestamp delta fits in a halfword, same upper limb).
     let mut logs = vec![
         make_add_log(0x1000, 100, 200, 300), // x2=100, x3=200, x1=300
         make_add_log(0x1004, 0, 0, 0),
@@ -393,29 +395,39 @@ fn test_memw_generated_from_register_ops() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // MEMW table should have register operations
-    // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1)
+    // Register ops should route to MEMW_R (memw_registers), not to memws.
+    // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1).
     assert!(
-        traces.memws[0].main_table.height >= 3,
-        "MEMW should have at least 3 rows for register ops"
+        !traces.memw_registers.is_empty(),
+        "memw_registers should be non-empty: register ops should route to MEMW_R"
+    );
+    assert!(
+        traces.memw_registers[0].main_table.height >= 3,
+        "MEMW_R should have at least 3 rows for register ops (reads x2, x3 + write x1)"
     );
 
-    // Find the register write to x1 (address = 2 * 1 = 2, is_register = 1)
+    // Find the register write to x1 in MEMW_R.
+    // MEMW_R columns: ADDRESS = register_index (x1 → index 1),
+    //                 MU_WRITE = 1 for writes, VAL_0 = value low 32 bits.
+    use crate::tables::memw_register::cols as memwr_cols;
     let mut found_write = false;
-    for row_idx in 0..traces.memws[0].main_table.height {
-        let row = traces.memws[0].main_table.get_row(row_idx);
-        // Check for register write: is_register=1, address=2 (x1), mu_write=1
-        if row[memw::cols::IS_REGISTER] == FE::one()
-            && row[memw::cols::BASE_ADDRESS_0] == FE::from(2u64)
-            && row[memw::cols::MU_WRITE] == FE::one()
-        {
-            // Check value is 300 (lo32=300, hi32=0)
-            assert_eq!(row[memw::cols::VALUE[0]], FE::from(300u64));
+    for row_idx in 0..traces.memw_registers[0].main_table.height {
+        let row = traces.memw_registers[0].main_table.get_row(row_idx);
+        // ADDRESS = 1 (x1), MU_WRITE = 1, VAL_0 = 300
+        if row[memwr_cols::ADDRESS] == FE::from(1u64) && row[memwr_cols::MU_WRITE] == FE::one() {
+            assert_eq!(
+                row[memwr_cols::VAL_0],
+                FE::from(300u64),
+                "Write value for x1 should be 300"
+            );
             found_write = true;
             break;
         }
     }
-    assert!(found_write, "Register write to x1 not found in MEMW table");
+    assert!(
+        found_write,
+        "Register write to x1 (ADDRESS=1, MU_WRITE=1, VAL_0=300) not found in MEMW_R"
+    );
 }
 
 // =============================================================================

@@ -1625,6 +1625,31 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     );
 }
 
+/// Verify that register ops are routed to MEMW_R (memw_registers) and that a
+/// full prove/verify roundtrip succeeds for a program that exercises register
+/// reads and writes.
+///
+/// Uses `test_add_8` which contains ADD instructions that read src registers
+/// and write a destination register — the canonical MEMW_R workload.
+#[test]
+fn test_prove_verify_with_memw_register() {
+    let (elf, logs, instructions) = run_asm_elf("test_add_8");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    // Register ops must go to MEMW_R, not to MEMW.
+    assert!(
+        !traces.memw_registers.is_empty(),
+        "register ops should route to MEMW_R: memw_registers must be non-empty"
+    );
+
+    // Full prove + verify roundtrip.
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "prove/verify should succeed when MEMW_R handles register ops"
+    );
+}
+
 /// Verify rejects table_counts with all zeros.
 #[test]
 fn test_verify_rejects_zero_table_counts() {
@@ -1650,6 +1675,7 @@ fn test_verify_rejects_zero_table_counts() {
             dvrm: 0,
             shift: 0,
             branch: 0,
+            memw_register: 0,
         },
         ..vm_proof
     };
@@ -1716,6 +1742,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         dvrm: 0,
         shift: 0,
         branch: 0,
+        memw_register: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 

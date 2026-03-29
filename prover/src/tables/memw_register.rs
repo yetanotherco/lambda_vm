@@ -425,15 +425,17 @@ mod tests {
     #[test]
     fn test_memw_register_trace_generation() {
         // Create a simple register op (reg x1 = address 1, so base_address = 2)
-        let ops = vec![MemwOperation::new(
-            true, // is_register
-            2,    // base_address = 2 * register_index (reg x1)
-            [42, 7, 0, 0, 0, 0, 0, 0],
-            100,
-            2, // width = 2 words (registers are DWordWL)
-            true,
-        )
-        .with_old([10, 3, 0, 0, 0, 0, 0, 0], [50, 0, 0, 0, 0, 0, 0, 0])];
+        let ops = vec![
+            MemwOperation::new(
+                true, // is_register
+                2,    // base_address = 2 * register_index (reg x1)
+                [42, 7, 0, 0, 0, 0, 0, 0],
+                100,
+                2, // width = 2 words (registers are DWordWL)
+                true,
+            )
+            .with_old([10, 3, 0, 0, 0, 0, 0, 0], [50, 0, 0, 0, 0, 0, 0, 0]),
+        ];
 
         let trace = generate_memw_register_trace(&ops);
         assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);

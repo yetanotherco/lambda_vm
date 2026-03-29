@@ -356,9 +356,7 @@ impl VmAirs {
             })
             .collect();
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
-            .map(|i| {
-                create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i))
-            })
+            .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
             .collect();
 
         #[cfg(feature = "debug-checks")]
