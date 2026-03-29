@@ -30,6 +30,7 @@ pub mod halt;
 pub mod load;
 pub mod lt;
 pub mod memw;
+pub mod memw_register;
 pub mod mul;
 pub mod page;
 pub mod register;
