@@ -34,6 +34,7 @@ suffix_to_steps() {
         160k) echo 160000 ;; 250k) echo 250000 ;; 372k) echo 372000 ;;
         500k) echo 500000 ;; 1M) echo 1000000 ;; 1200k) echo 1200000 ;;
         2M) echo 2000000 ;; 4M) echo 4000000 ;; 8M) echo 8000000 ;;
+        16M) echo 16000000 ;; 32M) echo 32000000 ;; 64M) echo 64000000 ;; 128M) echo 128000000 ;;
         *) echo "Unknown: $1" >&2; exit 1 ;;
     esac
 }
