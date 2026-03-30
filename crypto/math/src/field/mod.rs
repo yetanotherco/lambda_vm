@@ -5,9 +5,9 @@ pub mod errors;
 pub mod extensions;
 /// Implementation of particular cases of fields.
 pub mod fields;
+/// PackedField trait for SIMD-vectorized field arithmetic.
+pub mod packed;
 /// Field for test purposes.
 pub mod test_fields;
 /// Common behaviour for field elements.
 pub mod traits;
-/// PackedField trait for SIMD-vectorized field arithmetic.
-pub mod packed;

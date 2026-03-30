@@ -53,7 +53,12 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync + 'static,
+    Field: IsSubFieldOf<FieldExtension>
+        + IsFFTField
+        + math::field::packed::HasPacking
+        + Send
+        + Sync
+        + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > {
@@ -61,7 +66,12 @@ pub struct Prover<
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync + 'static,
+    Field: IsSubFieldOf<FieldExtension>
+        + IsFFTField
+        + math::field::packed::HasPacking
+        + Send
+        + Sync
+        + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
@@ -268,7 +278,12 @@ where
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
 pub trait IsStarkProver<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync + 'static,
+    Field: IsSubFieldOf<FieldExtension>
+        + IsFFTField
+        + math::field::packed::HasPacking
+        + Send
+        + Sync
+        + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >

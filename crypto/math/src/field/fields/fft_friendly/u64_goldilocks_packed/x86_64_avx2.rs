@@ -11,7 +11,7 @@ use core::mem::transmute;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::{GoldilocksField, GOLDILOCKS_PRIME};
+use crate::field::fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField};
 use crate::field::packed::PackedField;
 
 const WIDTH: usize = 4;
@@ -114,16 +114,22 @@ unsafe fn neg_avx2(a: __m256i) -> __m256i {
 #[inline(always)]
 unsafe fn sub_small_s(x_s: __m256i, y_small: __m256i) -> __m256i {
     let res_s = _mm256_sub_epi64(x_s, y_small);
-    let mask = _mm256_cmpgt_epi64(res_s, x_s);
+    // Use 32-bit compare (1-cycle latency) instead of 64-bit (3-cycle latency).
+    // This is safe because the underflow only affects the high 32 bits: if the
+    // subtraction borrows past the 32-bit boundary, the high 32-bit lane of
+    // res_s will be greater than x_s's high 32-bit lane (signed comparison
+    // on shifted values). Plonky3 uses the same optimization.
+    let mask = _mm256_cmpgt_epi32(res_s, x_s);
     let correction = _mm256_srli_epi64::<32>(mask);
     _mm256_sub_epi64(res_s, correction)
 }
 
 /// Add a "small" value (< 2^64) to a shifted value.
+/// Uses 32-bit compare for lower latency (see sub_small_s for safety argument).
 #[inline(always)]
 unsafe fn add_small_s(x_s: __m256i, y: __m256i) -> __m256i {
     let res_s = _mm256_add_epi64(x_s, y);
-    let mask = _mm256_cmpgt_epi64(x_s, res_s);
+    let mask = _mm256_cmpgt_epi32(x_s, res_s);
     let correction = _mm256_srli_epi64::<32>(mask);
     _mm256_add_epi64(res_s, correction)
 }
@@ -182,23 +188,9 @@ unsafe fn mul_avx2(a: __m256i, b: __m256i) -> __m256i {
 /// Packed modular squaring: a^2 mod P (3 sub-products instead of 4)
 #[inline(always)]
 unsafe fn square_avx2(a: __m256i) -> __m256i {
-    let a_hi = _mm256_castps_si256(_mm256_movehdup_ps(_mm256_castsi256_ps(a)));
-
-    let mul_ll = _mm256_mul_epu32(a, a);
-    let mul_lh = _mm256_mul_epu32(a, a_hi);
-    let mul_hh = _mm256_mul_epu32(a_hi, a_hi);
-
-    // Double the cross term (shift left by 33 instead of 32 to account for 2x)
-    let mul_ll_hi = _mm256_srli_epi64::<33>(mul_ll);
-    let t0 = _mm256_add_epi64(mul_lh, mul_ll_hi);
-    let t0_hi = _mm256_srli_epi64::<31>(t0);
-    let res_hi = _mm256_add_epi64(mul_hh, t0_hi);
-
-    let t0_lo_shifted = _mm256_slli_epi64::<33>(t0);
-    let mul_ll_lo = _mm256_and_si256(mul_ll, _mm256_set1_epi64x(1));
-    let res_lo = _mm256_or_si256(t0_lo_shifted, mul_ll_lo);
-
-    reduce128_avx2(res_hi, res_lo)
+    // Delegate to general multiply. The previous "optimized" squaring had a bit-loss
+    // bug: shift-by-33 dropped bit 32 of mul_ll, and res_lo only preserved bit 0.
+    mul_avx2(a, a)
 }
 
 // ---- Operator impls ----
@@ -339,8 +331,7 @@ mod tests {
         let a = random_packed();
         let b = PackedGoldilocksAVX2::from_fn(|i| FE::from((i as u64 + 5) * 0xFEDCBA987654321u64));
         let packed_sum = a + b;
-        let scalar_sum =
-            PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] + b.as_slice()[i]);
+        let scalar_sum = PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] + b.as_slice()[i]);
         assert_eq!(packed_sum.as_slice(), scalar_sum.as_slice());
     }
 
@@ -349,8 +340,7 @@ mod tests {
         let a = random_packed();
         let b = PackedGoldilocksAVX2::from_fn(|i| FE::from((i as u64 + 5) * 0xFEDCBA987654321u64));
         let packed_diff = a - b;
-        let scalar_diff =
-            PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] - b.as_slice()[i]);
+        let scalar_diff = PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] - b.as_slice()[i]);
         assert_eq!(packed_diff.as_slice(), scalar_diff.as_slice());
     }
 
@@ -393,8 +383,7 @@ mod tests {
         let a = random_packed();
         let b = PackedGoldilocksAVX2::from_fn(|i| FE::from((i as u64 + 5) * 0xFEDCBA987654321u64));
         let packed_prod = a * b;
-        let scalar_prod =
-            PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] * b.as_slice()[i]);
+        let scalar_prod = PackedGoldilocksAVX2::from_fn(|i| a.as_slice()[i] * b.as_slice()[i]);
         assert_eq!(packed_prod.as_slice(), scalar_prod.as_slice());
     }
 
@@ -436,7 +425,9 @@ mod tests {
     fn test_packed_distributivity() {
         let a = random_packed();
         let b = PackedGoldilocksAVX2::from_fn(|i| FE::from((i as u64 + 5) * 0xFEDCBA987654321u64));
-        let c = PackedGoldilocksAVX2::from_fn(|i| FE::from((i as u64 + 9).wrapping_mul(0xABCDEF0123456789u64)));
+        let c = PackedGoldilocksAVX2::from_fn(|i| {
+            FE::from((i as u64 + 9).wrapping_mul(0xABCDEF0123456789u64))
+        });
         let lhs = a * (b + c);
         let rhs = a * b + a * c;
         assert_eq!(lhs.as_slice(), rhs.as_slice());

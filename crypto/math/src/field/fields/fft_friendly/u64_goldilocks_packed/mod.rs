@@ -6,8 +6,8 @@
 //! - NEON (AArch64): WIDTH=2
 //! - Scalar fallback: WIDTH=1
 
-mod scalar;
 pub mod fp3;
+mod scalar;
 
 #[cfg(all(
     target_arch = "x86_64",

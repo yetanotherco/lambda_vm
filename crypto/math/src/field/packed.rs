@@ -51,9 +51,7 @@ pub unsafe trait PackedField:
         let n_packed = buf.len() / Self::WIDTH;
         let packed_len = n_packed * Self::WIDTH;
         let (head, tail) = buf.split_at(packed_len);
-        let packed = unsafe {
-            core::slice::from_raw_parts(head.as_ptr() as *const Self, n_packed)
-        };
+        let packed = unsafe { core::slice::from_raw_parts(head.as_ptr() as *const Self, n_packed) };
         (packed, tail)
     }
 
@@ -63,9 +61,8 @@ pub unsafe trait PackedField:
         let n_packed = buf.len() / Self::WIDTH;
         let packed_len = n_packed * Self::WIDTH;
         let (head, tail) = buf.split_at_mut(packed_len);
-        let packed = unsafe {
-            core::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut Self, n_packed)
-        };
+        let packed =
+            unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut Self, n_packed) };
         (packed, tail)
     }
 

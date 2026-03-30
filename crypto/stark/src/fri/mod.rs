@@ -19,7 +19,10 @@ use self::fri_functions::{
 /// FRI commit phase from pre-computed bit-reversed evaluations.
 /// skipping the initial FFT. Use this when the caller already has the evaluation
 /// vector (e.g. from a fused LDE pipeline).
-pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E> + 'static, E: IsField + 'static>(
+pub fn commit_phase_from_evaluations<
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,

@@ -7,7 +7,7 @@ use math::{
         fields::fft_friendly::{
             extensions_goldilocks::Degree3GoldilocksExtensionField,
             u64_goldilocks::GoldilocksField,
-            u64_goldilocks_packed::{fp3::PackedFp3, PackedGoldilocks},
+            u64_goldilocks_packed::{PackedGoldilocks, fp3::PackedFp3},
         },
         packed::PackedField,
         traits::{IsFFTField, IsField, IsSubFieldOf},
@@ -364,17 +364,17 @@ pub trait AIR: Send + Sync {
                 for sub_row in 0..rows_per_step {
                     let step_row_idx =
                         (initial_step_row + sub_row * blowup_factor) % lde_domain_size;
-                    for col in 0..lde_main_cols.len() {
-                        step.data[sub_row][col] = lde_main_cols[col][step_row_idx].clone();
+                    for (col, lde_col) in lde_main_cols.iter().enumerate() {
+                        step.data[sub_row][col] = lde_col[step_row_idx];
                     }
-                    for col in 0..lde_aux_cols.len() {
-                        step.aux_data[sub_row][col] = lde_aux_cols[col][step_row_idx].clone();
+                    for (col, lde_col) in lde_aux_cols.iter().enumerate() {
+                        step.aux_data[sub_row][col] = lde_col[step_row_idx];
                     }
                 }
             }
 
             for (k, col) in lde_periodic_cols.iter().enumerate() {
-                periodic_buf[k] = col[i].clone();
+                periodic_buf[k] = col[i];
             }
 
             // SAFETY: This method is only called from the Goldilocks packed path,

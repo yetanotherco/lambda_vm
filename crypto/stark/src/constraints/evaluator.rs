@@ -79,13 +79,13 @@ where
 
         #[cfg(feature = "parallel")]
         {
-            use std::any::TypeId;
-            use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
             use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext;
+            use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
             use math::field::fields::fft_friendly::u64_goldilocks_packed::{
                 PackedGoldilocks, fp3::PackedFp3,
             };
             use math::field::packed::PackedField;
+            use std::any::TypeId;
 
             let is_goldilocks = TypeId::of::<FieldExtension>() == TypeId::of::<D3Ext>()
                 && TypeId::of::<Field>() == TypeId::of::<GF>();
@@ -115,15 +115,13 @@ where
                 let lde_periodic_gf: &[Vec<FieldElement<GF>>] = unsafe {
                     &*(lde_periodic_columns as *const _ as *const [Vec<FieldElement<GF>>])
                 };
-                let rap_challenges_d3: &[FieldElement<D3Ext>] = unsafe {
-                    &*(rap_challenges as *const _ as *const [FieldElement<D3Ext>])
-                };
+                let rap_challenges_d3: &[FieldElement<D3Ext>] =
+                    unsafe { &*(rap_challenges as *const _ as *const [FieldElement<D3Ext>]) };
                 let logup_alpha_d3: &[FieldElement<D3Ext>] = unsafe {
                     &*(&logup_alpha_powers as *const _ as *const Vec<FieldElement<D3Ext>>)
                 };
-                let logup_offset_d3: &FieldElement<D3Ext> = unsafe {
-                    &*(logup_table_offset as *const _ as *const FieldElement<D3Ext>)
-                };
+                let logup_offset_d3: &FieldElement<D3Ext> =
+                    unsafe { &*(logup_table_offset as *const _ as *const FieldElement<D3Ext>) };
 
                 // Pre-broadcast coefficients (computed once, reused for all chunks)
                 let packed_betas: Vec<PackedFp3<PackedGoldilocks>> = transition_coefficients
@@ -144,7 +142,10 @@ where
                                 vec![FieldElement::<D3Ext>::zero(); num_transition],
                                 vec![FieldElement::<GF>::zero(); num_periodic],
                                 Frame::<GF, D3Ext>::preallocate(
-                                    num_offsets, rows_per_step, num_main_cols, num_aux_cols,
+                                    num_offsets,
+                                    rows_per_step,
+                                    num_main_cols,
+                                    num_aux_cols,
                                 ),
                                 vec![PackedFp3::<PackedGoldilocks>::zero(); num_transition],
                             )
@@ -152,7 +153,6 @@ where
                         |(transition_buf, periodic_buf, frame, packed_evals),
                          (chunk_idx, chunk)| {
                             let base = chunk_idx * width;
-                            let chunk_len = chunk.len();
 
                             // Reset packed evals
                             for pe in packed_evals.iter_mut() {
@@ -183,18 +183,18 @@ where
                             if is_uniform {
                                 let packed_z = PackedGoldilocks::from_fn(|j| {
                                     if base + j < lde_size {
-                                        as_base(zerofier_data.get_uniform(base + j)).clone()
+                                        *as_base(zerofier_data.get_uniform(base + j))
                                     } else {
                                         FieldElement::<GF>::one()
                                     }
                                 });
                                 let mut packed_sum = PackedFp3::zero();
                                 for c in 0..num_transition {
-                                    packed_sum = packed_sum + packed_evals[c] * packed_betas[c];
+                                    packed_sum += packed_evals[c] * packed_betas[c];
                                 }
                                 let packed_result = packed_sum.mul_scalar(packed_z);
-                                for j in 0..chunk_len {
-                                    chunk[j] = from_ext(packed_result.get_lane(j)) + &chunk[j];
+                                for (j, slot) in chunk.iter_mut().enumerate() {
+                                    *slot = from_ext(packed_result.get_lane(j)) + &*slot;
                                 }
                             } else {
                                 let packed_zerofiers: Vec<PackedGoldilocks> = zerofier_data
@@ -203,7 +203,7 @@ where
                                     .map(|group| {
                                         PackedGoldilocks::from_fn(|j| {
                                             if base + j < lde_size {
-                                                as_base(&group[(base + j) % group.len()]).clone()
+                                                *as_base(&group[(base + j) % group.len()])
                                             } else {
                                                 FieldElement::<GF>::one()
                                             }
@@ -215,10 +215,10 @@ where
                                     let packed_z =
                                         packed_zerofiers[zerofier_data.constraint_to_group[c]];
                                     let z_eval = packed_evals[c].mul_scalar(packed_z);
-                                    packed_acc = packed_acc + z_eval * packed_betas[c];
+                                    packed_acc += z_eval * packed_betas[c];
                                 }
-                                for j in 0..chunk_len {
-                                    chunk[j] = from_ext(packed_acc.get_lane(j)) + &chunk[j];
+                                for (j, slot) in chunk.iter_mut().enumerate() {
+                                    *slot = from_ext(packed_acc.get_lane(j)) + &*slot;
                                 }
                             }
                         },

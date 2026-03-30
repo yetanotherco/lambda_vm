@@ -58,20 +58,17 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E> + 'static, E: IsField + 'sta
     // Packed fast path for Goldilocks + D3 extension
     #[cfg(feature = "parallel")]
     {
-        use std::any::TypeId;
         use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext;
         use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
+        use std::any::TypeId;
 
-        if TypeId::of::<E>() == TypeId::of::<D3Ext>()
-            && TypeId::of::<F>() == TypeId::of::<GF>()
-        {
+        if TypeId::of::<E>() == TypeId::of::<D3Ext>() && TypeId::of::<F>() == TypeId::of::<GF>() {
             // SAFETY: TypeId check guarantees type identity, FieldElement is repr(transparent)
             let evals_d3: &mut Vec<FieldElement<D3Ext>> = unsafe {
                 &mut *(evals as *mut Vec<FieldElement<E>> as *mut Vec<FieldElement<D3Ext>>)
             };
-            let zeta_d3: &FieldElement<D3Ext> = unsafe {
-                &*(zeta as *const FieldElement<E> as *const FieldElement<D3Ext>)
-            };
+            let zeta_d3: &FieldElement<D3Ext> =
+                unsafe { &*(zeta as *const FieldElement<E> as *const FieldElement<D3Ext>) };
             let tw_gf: &[FieldElement<GF>] = unsafe {
                 &*(inv_twiddles as *const [FieldElement<F>] as *const [FieldElement<GF>])
             };
@@ -112,7 +109,7 @@ fn fold_evaluations_packed(
     >],
 ) {
     use math::field::fields::fft_friendly::u64_goldilocks_packed::{
-        fp3::PackedFp3, PackedGoldilocks,
+        PackedGoldilocks, fp3::PackedFp3,
     };
     use math::field::packed::PackedField;
 
@@ -129,17 +126,17 @@ fn fold_evaluations_packed(
         // Gather WIDTH lo values from stride-2 positions
         let lo = PackedFp3::from_fn(|i| {
             let v = evals[2 * (j + i)].value();
-            [v[0].clone(), v[1].clone(), v[2].clone()]
+            [v[0], v[1], v[2]]
         });
 
         // Gather WIDTH hi values from stride-2 positions
         let hi = PackedFp3::from_fn(|i| {
             let v = evals[2 * (j + i) + 1].value();
-            [v[0].clone(), v[1].clone(), v[2].clone()]
+            [v[0], v[1], v[2]]
         });
 
         // Load WIDTH contiguous base-field twiddles
-        let tw = PackedGoldilocks::from_fn(|i| inv_twiddles[j + i].clone());
+        let tw = PackedGoldilocks::from_fn(|i| inv_twiddles[j + i]);
 
         // fold: sum + tw * (zeta * diff)
         let sum = lo + hi;

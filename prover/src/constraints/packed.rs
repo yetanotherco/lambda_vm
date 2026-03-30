@@ -24,12 +24,7 @@ fn bcast(val: u64) -> PackedGoldilocks {
 
 // Helper: load a column at base_row
 #[inline(always)]
-fn load(
-    cols: &[Vec<FieldElement<GF>>],
-    col: usize,
-    row: usize,
-    n: usize,
-) -> PackedGoldilocks {
+fn load(cols: &[Vec<FieldElement<GF>>], col: usize, row: usize, n: usize) -> PackedGoldilocks {
     load_main_packed(&cols[col], row, n)
 }
 
@@ -198,15 +193,16 @@ pub fn evaluate_dvrm_packed(
     let abs_d_1 = load(lde_main_cols, cols::ABS_D_1, base_row, n);
 
     // Helper: build extended QuadWL representation
-    let build_ext_quad = |halves: &[PackedGoldilocks; 4], sign: PackedGoldilocks| -> [PackedGoldilocks; 4] {
-        let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
-        [
-            halves[0] + halves[1] * shift_16,
-            halves[2] + halves[3] * shift_16,
-            ext_word,
-            ext_word,
-        ]
-    };
+    let build_ext_quad =
+        |halves: &[PackedGoldilocks; 4], sign: PackedGoldilocks| -> [PackedGoldilocks; 4] {
+            let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
+            [
+                halves[0] + halves[1] * shift_16,
+                halves[2] + halves[3] * shift_16,
+                ext_word,
+                ext_word,
+            ]
+        };
 
     let mut idx = 0;
 
@@ -281,8 +277,8 @@ pub fn evaluate_dvrm_packed(
     idx += 1;
 
     // Constraints 15-18: DivByZeroQ(0..4): div_by_zero * (q[i] - 65535) = 0
-    for i in 0..4 {
-        results[idx] = div_by_zero * (q_cols[i] - sign_fill);
+    for q_col in &q_cols {
+        results[idx] = div_by_zero * (*q_col - sign_fill);
         idx += 1;
     }
     debug_assert_eq!(idx, 19);
@@ -348,7 +344,7 @@ pub fn evaluate_memw_packed(
         let cond = match i {
             0 => write2 + write4 + write8, // w2
             1 | 2 => write4 + write8,      // w4
-            _ => write8,                    // write8 for i=3..6
+            _ => write8,                   // write8 for i=3..6
         };
 
         // carry_0 = (lhs_lo + rhs_lo - sum_lo) * inv_2_32

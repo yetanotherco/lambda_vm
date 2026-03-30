@@ -801,11 +801,11 @@ mod tests {
     #[cfg(feature = "parallel")]
     mod packed_tests {
         use super::*;
-        use crate::fft::cpu::bowers_fft::{
-            LayerTwiddles, bowers_fft_opt_fused, bowers_fft_opt_fused_packed,
-            bowers_ifft_opt, bowers_ifft_opt_packed,
-        };
         use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+        use crate::fft::cpu::bowers_fft::{
+            LayerTwiddles, bowers_fft_opt_fused, bowers_fft_opt_fused_packed, bowers_ifft_opt,
+            bowers_ifft_opt_packed,
+        };
         use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
         use crate::field::fields::fft_friendly::u64_goldilocks_packed::PackedGoldilocks;
 
@@ -934,7 +934,11 @@ mod tests {
                 )
                 .unwrap();
 
-                assert_eq!(scalar_buf, packed_buf, "Coset LDE mismatch at order {}", order);
+                assert_eq!(
+                    scalar_buf, packed_buf,
+                    "Coset LDE mismatch at order {}",
+                    order
+                );
             }
         }
 
@@ -982,7 +986,11 @@ mod tests {
                 )
                 .unwrap();
 
-                assert_eq!(scalar_buf, packed_buf, "Blowup-4 mismatch at order {}", order);
+                assert_eq!(
+                    scalar_buf, packed_buf,
+                    "Blowup-4 mismatch at order {}",
+                    order
+                );
             }
         }
     }

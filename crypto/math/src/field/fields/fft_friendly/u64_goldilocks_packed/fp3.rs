@@ -47,9 +47,10 @@ impl<P: PackedField<Scalar = GoldilocksField>> PackedFp3<P> {
     /// Construct from a closure that returns (c0, c1, c2) per lane.
     pub fn from_fn(mut f: impl FnMut(usize) -> [FieldElement<GoldilocksField>; 3]) -> Self {
         // Call f once per lane, collecting into arrays
-        let mut c0s = [FieldElement::zero(); 8]; // max WIDTH
-        let mut c1s = [FieldElement::zero(); 8];
-        let mut c2s = [FieldElement::zero(); 8];
+        assert!(P::WIDTH <= 16, "PackedFp3::from_fn supports WIDTH up to 16");
+        let mut c0s = [FieldElement::zero(); 16];
+        let mut c1s = [FieldElement::zero(); 16];
+        let mut c2s = [FieldElement::zero(); 16];
         for i in 0..P::WIDTH {
             let [a, b, c] = f(i);
             c0s[i] = a;
@@ -68,9 +69,9 @@ impl<P: PackedField<Scalar = GoldilocksField>> PackedFp3<P> {
     pub fn broadcast(val: &FieldElement<Degree3GoldilocksExtensionField>) -> Self {
         let components = val.value();
         Self {
-            c0: P::broadcast(components[0].clone()),
-            c1: P::broadcast(components[1].clone()),
-            c2: P::broadcast(components[2].clone()),
+            c0: P::broadcast(components[0]),
+            c1: P::broadcast(components[1]),
+            c2: P::broadcast(components[2]),
         }
     }
 
@@ -78,18 +79,18 @@ impl<P: PackedField<Scalar = GoldilocksField>> PackedFp3<P> {
     #[inline(always)]
     pub fn set_lane(&mut self, lane: usize, val: &FieldElement<Degree3GoldilocksExtensionField>) {
         let components = val.value();
-        self.c0.as_slice_mut()[lane] = components[0].clone();
-        self.c1.as_slice_mut()[lane] = components[1].clone();
-        self.c2.as_slice_mut()[lane] = components[2].clone();
+        self.c0.as_slice_mut()[lane] = components[0];
+        self.c1.as_slice_mut()[lane] = components[1];
+        self.c2.as_slice_mut()[lane] = components[2];
     }
 
     /// Extract a single lane as a scalar Fp3.
     #[inline(always)]
     pub fn get_lane(&self, lane: usize) -> FieldElement<Degree3GoldilocksExtensionField> {
         FieldElement::from_raw([
-            self.c0.as_slice()[lane].clone(),
-            self.c1.as_slice()[lane].clone(),
-            self.c2.as_slice()[lane].clone(),
+            self.c0.as_slice()[lane],
+            self.c1.as_slice()[lane],
+            self.c2.as_slice()[lane],
         ])
     }
 
@@ -218,10 +219,7 @@ mod tests {
         }
     }
 
-    fn to_scalar_fp3(
-        p: &PackedFp3<PackedGoldilocks>,
-        lane: usize,
-    ) -> [FE; 3] {
+    fn to_scalar_fp3(p: &PackedFp3<PackedGoldilocks>, lane: usize) -> [FE; 3] {
         [
             p.c0.as_slice()[lane],
             p.c1.as_slice()[lane],
@@ -286,9 +284,21 @@ mod tests {
         let result = ext.mul_scalar(scalar);
         for i in 0..PackedGoldilocks::WIDTH {
             let s = scalar.as_slice()[i];
-            assert_eq!(result.c0.as_slice()[i], s * ext.c0.as_slice()[i], "c0 lane {i}");
-            assert_eq!(result.c1.as_slice()[i], s * ext.c1.as_slice()[i], "c1 lane {i}");
-            assert_eq!(result.c2.as_slice()[i], s * ext.c2.as_slice()[i], "c2 lane {i}");
+            assert_eq!(
+                result.c0.as_slice()[i],
+                s * ext.c0.as_slice()[i],
+                "c0 lane {i}"
+            );
+            assert_eq!(
+                result.c1.as_slice()[i],
+                s * ext.c1.as_slice()[i],
+                "c1 lane {i}"
+            );
+            assert_eq!(
+                result.c2.as_slice()[i],
+                s * ext.c2.as_slice()[i],
+                "c2 lane {i}"
+            );
         }
     }
 

@@ -8,7 +8,7 @@ use core::mem::transmute;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::{GoldilocksField, GOLDILOCKS_PRIME};
+use crate::field::fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField};
 use crate::field::packed::PackedField;
 
 const WIDTH: usize = 2;
@@ -63,10 +63,10 @@ unsafe fn shift(x: uint64x2_t) -> uint64x2_t {
 #[inline(always)]
 unsafe fn canonicalize_s(x_s: uint64x2_t) -> uint64x2_t {
     // mask = all-ones if P > x (signed compare in shifted domain)
-    let mask: uint64x2_t = transmute(vcgtq_s64(
-        transmute(SHIFTED_FIELD_ORDER),
-        transmute(x_s),
-    ));
+    let mask: uint64x2_t = vcgtq_s64(
+        transmute::<uint64x2_t, int64x2_t>(SHIFTED_FIELD_ORDER),
+        transmute::<uint64x2_t, int64x2_t>(x_s),
+    );
     // wrapback = EPSILON if x >= P, else 0
     let wrapback = vbicq_u64(EPSILON_VEC, mask);
     vaddq_u64(x_s, wrapback)
@@ -75,7 +75,10 @@ unsafe fn canonicalize_s(x_s: uint64x2_t) -> uint64x2_t {
 #[inline(always)]
 unsafe fn add_no_double_overflow_s(x: uint64x2_t, y_s: uint64x2_t) -> uint64x2_t {
     let res_s = vaddq_u64(x, y_s);
-    let mask: uint64x2_t = transmute(vcgtq_s64(transmute(y_s), transmute(res_s)));
+    let mask: uint64x2_t = vcgtq_s64(
+        transmute::<uint64x2_t, int64x2_t>(y_s),
+        transmute::<uint64x2_t, int64x2_t>(res_s),
+    );
     let correction = vshrq_n_u64::<32>(mask);
     vaddq_u64(res_s, correction)
 }
@@ -93,7 +96,10 @@ unsafe fn add_neon(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
 unsafe fn sub_neon(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
     let a_s = shift(a);
     let b_s = canonicalize_s(shift(b));
-    let mask: uint64x2_t = transmute(vcgtq_s64(transmute(b_s), transmute(a_s)));
+    let mask: uint64x2_t = vcgtq_s64(
+        transmute::<uint64x2_t, int64x2_t>(b_s),
+        transmute::<uint64x2_t, int64x2_t>(a_s),
+    );
     let correction = vshrq_n_u64::<32>(mask);
     let res = vsubq_u64(a_s, b_s);
     // No shift here: (a XOR S) - (b XOR S) = a - b (shifts cancel in subtraction)
@@ -107,74 +113,84 @@ unsafe fn neg_neon(a: uint64x2_t) -> uint64x2_t {
     sub_neon(FIELD_ORDER_VEC, a_canon)
 }
 
-// ---- Multiply helpers ----
-
-#[inline(always)]
-unsafe fn sub_small_s(x_s: uint64x2_t, y_small: uint64x2_t) -> uint64x2_t {
-    let res_s = vsubq_u64(x_s, y_small);
-    let mask: uint64x2_t = transmute(vcgtq_s64(transmute(res_s), transmute(x_s)));
-    let correction = vshrq_n_u64::<32>(mask);
-    vsubq_u64(res_s, correction)
-}
-
-#[inline(always)]
-unsafe fn add_small_s(x_s: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
-    let res_s = vaddq_u64(x_s, y);
-    let mask: uint64x2_t = transmute(vcgtq_s64(transmute(x_s), transmute(res_s)));
-    let correction = vshrq_n_u64::<32>(mask);
-    vaddq_u64(res_s, correction)
-}
-
-/// Reduce 128-bit (hi, lo) to Goldilocks element.
-/// x mod P = lo - hi_hi + hi_lo * EPSILON
-#[inline(always)]
-unsafe fn reduce128_neon(hi: uint64x2_t, lo: uint64x2_t) -> uint64x2_t {
-    let lo_s = shift(lo);
-    let hi_hi = vshrq_n_u64::<32>(hi);
-    let lo1_s = sub_small_s(lo_s, hi_hi);
-    // hi_lo * EPSILON = hi_lo * (2^32 - 1) = (hi_lo << 32) - hi_lo
-    // hi_lo < 2^32, so hi_lo << 32 < 2^64 (no overflow)
-    let hi_lo = vandq_u64(hi, EPSILON_VEC);
-    let t1 = vsubq_u64(vshlq_n_u64::<32>(hi_lo), hi_lo);
-    let lo2_s = add_small_s(lo1_s, t1);
-    shift(lo2_s)
-}
-
-/// NEON multiply using inline assembly for native 64x64->128 bit multiply.
-/// AArch64 has `mul` (low 64) and `umulh` (high 64) which together give 128-bit result.
+/// Interleaved dual-lane multiply + reduce in a single asm block.
+/// Both lanes' mul and reduce are interleaved for maximum ILP on AArch64.
+/// Uses native carry flags (subs/csetm/adds/csetm) instead of NEON compare+mask.
+/// Adapted from Plonky3's mul_reduce_dual_asm.
 #[inline(always)]
 unsafe fn mul_neon(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-    // Extract lanes
     let a0 = vgetq_lane_u64::<0>(a);
     let a1 = vgetq_lane_u64::<1>(a);
     let b0 = vgetq_lane_u64::<0>(b);
     let b1 = vgetq_lane_u64::<1>(b);
 
-    let lo0: u64;
-    let hi0: u64;
-    let lo1: u64;
-    let hi1: u64;
+    let result0: u64;
+    let result1: u64;
 
-    // Native 64x64->128 multiply using inline assembly
     core::arch::asm!(
-        "mul {lo0}, {a0}, {b0}",
+        // Compute both 128-bit products (interleaved for ILP)
+        "mul   {lo0}, {a0}, {b0}",
+        "mul   {lo1}, {a1}, {b1}",
         "umulh {hi0}, {a0}, {b0}",
-        "mul {lo1}, {a1}, {b1}",
         "umulh {hi1}, {a1}, {b1}",
+
+        // hi_hi = hi >> 32
+        "lsr   {hi_hi0}, {hi0}, #32",
+        "lsr   {hi_hi1}, {hi1}, #32",
+
+        // tmp = lo - hi_hi (with borrow via carry flag)
+        "subs  {tmp0}, {lo0}, {hi_hi0}",
+        "csetm {adj0:w}, cc",
+        "subs  {tmp1}, {lo1}, {hi_hi1}",
+        "csetm {adj1:w}, cc",
+        "sub   {tmp0}, {tmp0}, {adj0}",
+        "sub   {tmp1}, {tmp1}, {adj1}",
+
+        // hi_lo = hi & EPSILON
+        "and   {hi_lo0}, {hi0}, {epsilon}",
+        "and   {hi_lo1}, {hi1}, {epsilon}",
+
+        // hi_lo_eps = (hi_lo << 32) - hi_lo  (avoids multiply by EPSILON)
+        "lsl   {t0}, {hi_lo0}, #32",
+        "lsl   {t1}, {hi_lo1}, #32",
+        "sub   {hle0}, {t0}, {hi_lo0}",
+        "sub   {hle1}, {t1}, {hi_lo1}",
+
+        // result = tmp + hi_lo_eps (with overflow via carry flag)
+        "adds  {result0}, {tmp0}, {hle0}",
+        "csetm {adj0:w}, cs",
+        "adds  {result1}, {tmp1}, {hle1}",
+        "csetm {adj1:w}, cs",
+        "add   {result0}, {result0}, {adj0}",
+        "add   {result1}, {result1}, {adj1}",
+
         a0 = in(reg) a0,
         b0 = in(reg) b0,
         a1 = in(reg) a1,
         b1 = in(reg) b1,
-        lo0 = out(reg) lo0,
-        hi0 = out(reg) hi0,
-        lo1 = out(reg) lo1,
-        hi1 = out(reg) hi1,
+        epsilon = in(reg) EPSILON,
+        lo0 = out(reg) _,
+        lo1 = out(reg) _,
+        hi0 = out(reg) _,
+        hi1 = out(reg) _,
+        hi_hi0 = out(reg) _,
+        hi_hi1 = out(reg) _,
+        tmp0 = out(reg) _,
+        tmp1 = out(reg) _,
+        hi_lo0 = out(reg) _,
+        hi_lo1 = out(reg) _,
+        t0 = out(reg) _,
+        t1 = out(reg) _,
+        hle0 = out(reg) _,
+        hle1 = out(reg) _,
+        adj0 = out(reg) _,
+        adj1 = out(reg) _,
+        result0 = out(reg) result0,
+        result1 = out(reg) result1,
         options(pure, nomem, nostack),
     );
 
-    let lo_vec = vcombine_u64(vcreate_u64(lo0), vcreate_u64(lo1));
-    let hi_vec = vcombine_u64(vcreate_u64(hi0), vcreate_u64(hi1));
-    reduce128_neon(hi_vec, lo_vec)
+    vcombine_u64(vcreate_u64(result0), vcreate_u64(result1))
 }
 
 /// NEON square using inline assembly.
@@ -399,7 +415,9 @@ mod tests {
     fn test_packed_distributivity() {
         let a = random_packed();
         let b = PackedGoldilocksNeon::from_fn(|i| FE::from((i as u64 + 5) * 0xFEDCBA987654321u64));
-        let c = PackedGoldilocksNeon::from_fn(|i| FE::from((i as u64 + 9).wrapping_mul(0xABCDEF0123456789u64)));
+        let c = PackedGoldilocksNeon::from_fn(|i| {
+            FE::from((i as u64 + 9).wrapping_mul(0xABCDEF0123456789u64))
+        });
         let lhs = a * (b + c);
         let rhs = a * b + a * c;
         assert_eq!(lhs.as_slice(), rhs.as_slice());
