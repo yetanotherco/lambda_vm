@@ -753,6 +753,13 @@ pub trait IsStarkProver<
 
         trace.main_table.advise_drop_cache();
 
+        #[cfg(feature = "instruments")]
+        if let Some((_, mb)) = crate::instruments::snap("Phase A: after chunked LDE write") {
+            eprintln!(
+                "  [heap] Phase A after LDE write ({num_cols} cols, lde_size={lde_size}): {mb} MB"
+            );
+        }
+
         // Mmap the complete file and commit from mmap
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| ProvingError::WrongParameter(format!("disk-spill chunked mmap: {e}")))?;
@@ -765,6 +772,11 @@ pub trait IsStarkProver<
         .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(std::time::Duration::ZERO, t_sub.elapsed());
+
+        #[cfg(feature = "instruments")]
+        if let Some((_, mb)) = crate::instruments::snap("Phase A: after Merkle commit") {
+            eprintln!("  [heap] Phase A after Merkle commit ({num_cols} cols): {mb} MB");
+        }
 
         // Build mmap-backed LDETraceTable
         let aux_elem_size = std::mem::size_of::<FieldElement<FieldExtension>>();
@@ -2226,12 +2238,21 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
+                        if let Some((_, mb)) = crate::instruments::snap("Phase C: before aux Merkle") {
+                            let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+                            eprintln!("  [heap] Phase C before aux Merkle ({num_aux_cols} cols, lde={lde_size}): {mb} MB");
+                        }
+                        #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         let (tree, root) =
                             Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
                                 .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                        #[cfg(feature = "instruments")]
+                        if let Some((_, mb)) = crate::instruments::snap("Phase C: after aux Merkle") {
+                            eprintln!("  [heap] Phase C after aux Merkle: {mb} MB");
+                        }
                         Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
                         Ok((None, None))
