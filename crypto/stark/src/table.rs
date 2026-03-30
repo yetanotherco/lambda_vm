@@ -238,6 +238,39 @@ impl<F: IsField> Table<F> {
         });
     }
 
+    /// Extract a range of columns `[col_start..col_end)` into pre-allocated output buffers.
+    ///
+    /// Fills `output[0..range_len]` with columns `col_start..col_end`.
+    /// When `output` buffers have sufficient capacity, no heap allocation occurs.
+    #[cfg(feature = "disk-spill")]
+    pub fn extract_columns_range_into(
+        &self,
+        col_start: usize,
+        col_end: usize,
+        output: &mut [Vec<FieldElement<F>>],
+    ) {
+        let range_len = col_end - col_start;
+        debug_assert!(
+            output.len() >= range_len,
+            "output has {} buffers but need {}",
+            output.len(),
+            range_len
+        );
+        let height = self.height;
+        #[cfg(feature = "parallel")]
+        let iter = output[..range_len].par_iter_mut().enumerate();
+        #[cfg(not(feature = "parallel"))]
+        let iter = output[..range_len].iter_mut().enumerate();
+        iter.for_each(|(i, buf)| {
+            let col_idx = col_start + i;
+            buf.clear();
+            buf.reserve(height.saturating_sub(buf.capacity()));
+            for row_idx in 0..height {
+                buf.push(self.get(row_idx, col_idx).clone());
+            }
+        });
+    }
+
     /// Given row and column indexes, returns the stored field element in that position of the table.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {

@@ -434,6 +434,51 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
+    /// Build Merkle commitment from mmap-backed LDE columns (column-major layout).
+    ///
+    /// Reads columns `[col_start..col_end)` from the mmap. Each column occupies
+    /// `num_rows * elem_size` contiguous bytes, starting at `col * num_rows * elem_size`.
+    /// Produces the same hash as `commit_columns_bit_reversed` on equivalent in-memory data.
+    #[cfg(feature = "disk-spill")]
+    fn commit_columns_bit_reversed_mmap<E>(
+        mmap: &memmap2::Mmap,
+        col_start: usize,
+        col_end: usize,
+        num_rows: usize,
+        elem_size: usize,
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send + Clone,
+        E: IsField,
+    {
+        let num_cols = col_end - col_start;
+        if num_cols == 0 || num_rows == 0 {
+            return None;
+        }
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let br_idx = reverse_index(row_idx, num_rows as u64);
+                let row: Vec<FieldElement<E>> = (col_start..col_end)
+                    .map(|col_idx| {
+                        let offset = (col_idx * num_rows + br_idx) * elem_size;
+                        unsafe { &*(mmap.as_ptr().add(offset) as *const FieldElement<E>) }.clone()
+                    })
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
@@ -630,6 +675,252 @@ pub trait IsStarkProver<
             Some(precomputed_tree),
             Some(precomputed_root),
             num_precomputed_cols,
+        ))
+    }
+
+    /// Chunked LDE commit: expand columns in chunks, write each chunk to a temp file,
+    /// then mmap the file and build the Merkle tree from mmap.
+    ///
+    /// Pool only needs `chunk_size` buffers instead of `num_cols`, reducing peak memory
+    /// from `O(num_cols * lde_size)` to `O(chunk_size * lde_size)`.
+    #[cfg(feature = "disk-spill")]
+    #[allow(clippy::type_complexity)]
+    fn commit_main_trace_chunked(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        pool: &mut [Vec<FieldElement<Field>>],
+        chunk_size: usize,
+    ) -> Result<
+        (
+            BatchedMerkleTree<Field>,
+            Commitment,
+            Option<BatchedMerkleTree<Field>>,
+            Option<Commitment>,
+            usize,
+            LDETraceTable<Field, FieldExtension>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        use std::io::Write;
+
+        let num_cols = trace.num_main_columns;
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let elem_size = std::mem::size_of::<FieldElement<Field>>();
+        let total_bytes = (num_cols * lde_size * elem_size) as u64;
+
+        let file = tempfile::tempfile().map_err(|e| {
+            ProvingError::WrongParameter(format!("disk-spill chunked tempfile: {e}"))
+        })?;
+        file.set_len(total_bytes).map_err(|e| {
+            ProvingError::WrongParameter(format!("disk-spill chunked set_len: {e}"))
+        })?;
+
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            for col_start in (0..num_cols).step_by(chunk_size) {
+                let col_end = (col_start + chunk_size).min(num_cols);
+                let chunk_len = col_end - col_start;
+
+                trace
+                    .main_table
+                    .extract_columns_range_into(col_start, col_end, pool);
+                #[cfg(feature = "instruments")]
+                let t_sub = Instant::now();
+                Self::expand_pool_to_lde::<Field>(pool, chunk_len, domain, twiddles);
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
+
+                // Write this chunk's LDE columns to the temp file
+                for buf in &pool[..chunk_len] {
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * elem_size)
+                    };
+                    writer.write_all(bytes).map_err(|e| {
+                        ProvingError::WrongParameter(format!("disk-spill chunked write: {e}"))
+                    })?;
+                }
+            }
+            writer.flush().map_err(|e| {
+                ProvingError::WrongParameter(format!("disk-spill chunked flush: {e}"))
+            })?;
+        }
+
+        trace.main_table.advise_drop_cache();
+
+        // Mmap the complete file and commit from mmap
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| ProvingError::WrongParameter(format!("disk-spill chunked mmap: {e}")))?;
+
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+        let (tree, root) = Self::commit_columns_bit_reversed_mmap::<Field>(
+            &mmap, 0, num_cols, lde_size, elem_size,
+        )
+        .ok_or(ProvingError::EmptyCommitment)?;
+        #[cfg(feature = "instruments")]
+        crate::instruments::accum_r1_main(std::time::Duration::ZERO, t_sub.elapsed());
+
+        // Build mmap-backed LDETraceTable
+        let aux_elem_size = std::mem::size_of::<FieldElement<FieldExtension>>();
+        let spilled = LDETraceTable::from_columns(
+            Vec::new(),
+            Vec::new(),
+            trace.step_size,
+            domain.blowup_factor,
+        );
+        // Attach mmap backing directly
+        let spilled = {
+            use crate::trace::MmapBacking;
+            let mut s = spilled;
+            s.mmap_backing = Some(MmapBacking {
+                main_mmap: mmap,
+                _main_file: file,
+                aux_mmap: None,
+                _aux_file: None,
+                num_rows: lde_size,
+                num_main_cols: num_cols,
+                num_aux_cols: 0,
+                main_elem_size: elem_size,
+                aux_elem_size,
+            });
+            s
+        };
+
+        Ok((tree, root, None, None, 0, spilled))
+    }
+
+    /// Chunked LDE commit for preprocessed traces.
+    ///
+    /// Same as `commit_main_trace_chunked` but produces two Merkle trees:
+    /// one for precomputed columns `[0..num_precomputed)` and one for the rest.
+    #[cfg(feature = "disk-spill")]
+    #[allow(clippy::type_complexity)]
+    fn commit_preprocessed_trace_chunked(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        precomputed_commitment: Commitment,
+        num_precomputed_cols: usize,
+        twiddles: &LdeTwiddles<Field>,
+        pool: &mut [Vec<FieldElement<Field>>],
+        chunk_size: usize,
+    ) -> Result<
+        (
+            BatchedMerkleTree<Field>,
+            Commitment,
+            Option<BatchedMerkleTree<Field>>,
+            Option<Commitment>,
+            usize,
+            LDETraceTable<Field, FieldExtension>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        use std::io::Write;
+
+        let num_cols = trace.num_main_columns;
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let elem_size = std::mem::size_of::<FieldElement<Field>>();
+        let total_bytes = (num_cols * lde_size * elem_size) as u64;
+
+        let file = tempfile::tempfile().map_err(|e| {
+            ProvingError::WrongParameter(format!("disk-spill chunked tempfile: {e}"))
+        })?;
+        file.set_len(total_bytes).map_err(|e| {
+            ProvingError::WrongParameter(format!("disk-spill chunked set_len: {e}"))
+        })?;
+
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            for col_start in (0..num_cols).step_by(chunk_size) {
+                let col_end = (col_start + chunk_size).min(num_cols);
+                let chunk_len = col_end - col_start;
+
+                trace
+                    .main_table
+                    .extract_columns_range_into(col_start, col_end, pool);
+                Self::expand_pool_to_lde::<Field>(pool, chunk_len, domain, twiddles);
+
+                for buf in &pool[..chunk_len] {
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * elem_size)
+                    };
+                    writer.write_all(bytes).map_err(|e| {
+                        ProvingError::WrongParameter(format!("disk-spill chunked write: {e}"))
+                    })?;
+                }
+            }
+            writer.flush().map_err(|e| {
+                ProvingError::WrongParameter(format!("disk-spill chunked flush: {e}"))
+            })?;
+        }
+
+        trace.main_table.advise_drop_cache();
+
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| ProvingError::WrongParameter(format!("disk-spill chunked mmap: {e}")))?;
+
+        // Two separate Merkle trees: precomputed and multiplicity
+        let (precomputed_tree, precomputed_root) = Self::commit_columns_bit_reversed_mmap::<Field>(
+            &mmap,
+            0,
+            num_precomputed_cols,
+            lde_size,
+            elem_size,
+        )
+        .ok_or(ProvingError::EmptyCommitment)?;
+
+        let (mult_tree, mult_root) = Self::commit_columns_bit_reversed_mmap::<Field>(
+            &mmap,
+            num_precomputed_cols,
+            num_cols,
+            lde_size,
+            elem_size,
+        )
+        .ok_or(ProvingError::EmptyCommitment)?;
+
+        debug_assert_eq!(
+            precomputed_root, precomputed_commitment,
+            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+        );
+
+        let aux_elem_size = std::mem::size_of::<FieldElement<FieldExtension>>();
+        let spilled = {
+            use crate::trace::MmapBacking;
+            let mut s = LDETraceTable::from_columns(
+                Vec::new(),
+                Vec::new(),
+                trace.step_size,
+                domain.blowup_factor,
+            );
+            s.mmap_backing = Some(MmapBacking {
+                main_mmap: mmap,
+                _main_file: file,
+                aux_mmap: None,
+                _aux_file: None,
+                num_rows: lde_size,
+                num_main_cols: num_cols,
+                num_aux_cols: 0,
+                main_elem_size: elem_size,
+                aux_elem_size,
+            });
+            s
+        };
+
+        Ok((
+            mult_tree,
+            mult_root,
+            Some(precomputed_tree),
+            Some(precomputed_root),
+            num_precomputed_cols,
+            spilled,
         ))
     }
 
@@ -1639,10 +1930,23 @@ pub trait IsStarkProver<
         let k_commit = k;
         // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
         // coset_lde_full_expand can resize in-place without reallocation spikes.
+        // Chunked LDE: only allocate chunk_size main buffers instead of max_main_cols.
         // With k_commit>1 (no disk-spill), start empty and grow on demand.
+        #[cfg(feature = "disk-spill")]
+        let lde_chunk_size: usize = std::env::var("LDE_CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        #[cfg(not(feature = "disk-spill"))]
+        let lde_chunk_size: usize = max_main_cols;
+        let pool_main_cols = if k_commit == 1 {
+            lde_chunk_size.min(max_main_cols)
+        } else {
+            max_main_cols
+        };
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
-                main: (0..max_main_cols)
+                main: (0..pool_main_cols)
                     .map(|_| {
                         if k_commit == 1 {
                             Vec::with_capacity(max_lde_size)
@@ -1696,42 +2000,50 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
-                        Self::commit_preprocessed_trace(
-                            *trace,
-                            domain,
-                            air.precomputed_commitment(),
-                            air.num_precomputed_columns(),
-                            twiddles,
-                            &mut pool.main,
-                        )?
-                    } else {
-                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)?
-                    };
-
-                    // Spill LDE from pool to mmap while pool is still filled.
-                    // Pool buffers keep their capacity for reuse by the next table,
-                    // avoiding resize reallocation spikes in coset_lde_full_expand.
+                    // disk-spill: chunked LDE — expand columns in small chunks,
+                    // write each to temp file, commit from mmap. Pool only needs
+                    // chunk_size buffers instead of all columns.
                     #[cfg(feature = "disk-spill")]
-                    let spilled = {
-                        let num_main_cols = trace.num_main_columns;
-                        LDETraceTable::spill_main_from_pool(
-                            &pool.main,
-                            num_main_cols,
-                            air.step_size(),
-                            domain.blowup_factor,
-                        )
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!(
-                                "disk-spill main LDE table {idx}: {e}"
-                            ))
-                        })?
-                    };
+                    {
+                        let (tree, root, pre_tree, pre_root, n_pre, spilled) =
+                            if air.is_preprocessed() {
+                                Self::commit_preprocessed_trace_chunked(
+                                    *trace,
+                                    domain,
+                                    air.precomputed_commitment(),
+                                    air.num_precomputed_columns(),
+                                    twiddles,
+                                    &mut pool.main,
+                                    lde_chunk_size,
+                                )?
+                            } else {
+                                Self::commit_main_trace_chunked(
+                                    *trace,
+                                    domain,
+                                    twiddles,
+                                    &mut pool.main,
+                                    lde_chunk_size,
+                                )?
+                            };
+                        Ok((tree, root, pre_tree, pre_root, n_pre, spilled))
+                    }
 
-                    #[cfg(feature = "disk-spill")]
-                    return Ok((tree, root, pre_tree, pre_root, n_pre, spilled));
                     #[cfg(not(feature = "disk-spill"))]
-                    Ok((tree, root, pre_tree, pre_root, n_pre))
+                    {
+                        let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
+                            Self::commit_preprocessed_trace(
+                                *trace,
+                                domain,
+                                air.precomputed_commitment(),
+                                air.num_precomputed_columns(),
+                                twiddles,
+                                &mut pool.main,
+                            )?
+                        } else {
+                            Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)?
+                        };
+                        Ok((tree, root, pre_tree, pre_root, n_pre))
+                    }
                 })
                 .collect();
 

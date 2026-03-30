@@ -238,15 +238,15 @@ where
 /// which is valid because `FieldElement<F>` is `#[repr(transparent)]`.
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapBacking {
-    main_mmap: memmap2::Mmap,
-    _main_file: std::fs::File,
-    aux_mmap: Option<memmap2::Mmap>,
-    _aux_file: Option<std::fs::File>,
-    num_rows: usize,
-    num_main_cols: usize,
-    num_aux_cols: usize,
-    main_elem_size: usize,
-    aux_elem_size: usize,
+    pub(crate) main_mmap: memmap2::Mmap,
+    pub(crate) _main_file: std::fs::File,
+    pub(crate) aux_mmap: Option<memmap2::Mmap>,
+    pub(crate) _aux_file: Option<std::fs::File>,
+    pub(crate) num_rows: usize,
+    pub(crate) num_main_cols: usize,
+    pub(crate) num_aux_cols: usize,
+    pub(crate) main_elem_size: usize,
+    pub(crate) aux_elem_size: usize,
 }
 
 impl<F, E> LDETraceTable<F, E>
