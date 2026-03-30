@@ -2153,15 +2153,17 @@ pub trait IsStarkProver<
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
         //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
+        // Pass 1: Build auxiliary traces.
+        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks).
+        // disk-spill: sequential to avoid all tables' aux data in heap simultaneously
+        // (~200 aux cols * trace_height * 24 bytes can exceed available RAM).
+        // non-disk-spill: parallel over tables for high-core-count machines.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", not(feature = "disk-spill")))]
         let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(any(not(feature = "parallel"), feature = "disk-spill"))]
         let aux_iter = air_trace_pairs.iter_mut();
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
             .map(|(air, trace, _)| {
