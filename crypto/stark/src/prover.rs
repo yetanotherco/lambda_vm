@@ -205,6 +205,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
+#[cfg(not(feature = "disk-spill"))]
 fn table_parallelism() -> usize {
     #[cfg(feature = "parallel")]
     {
@@ -1922,11 +1923,14 @@ pub trait IsStarkProver<
         // Number of tables to process concurrently.
         // disk-spill: Phase A/C use k_commit=1 (one pool at a time, since each
         // table's LDE already saturates all cores via column-parallel FFT).
-        // Rounds 2-4 use the full k (no pools needed, reads from mmap).
-        let k = table_parallelism().min(num_airs).max(1);
+        // disk-spill: k=1 everywhere — each table's internal parallelism
+        // (par_iter on rows, FFT, Merkle) saturates all cores for large programs,
+        // and k=1 avoids the peak memory spike from overlapping round 2-4 allocations.
+        // Non-disk-spill: full parallelism across tables.
         #[cfg(feature = "disk-spill")]
-        let k_commit = 1_usize;
+        let k = 1_usize;
         #[cfg(not(feature = "disk-spill"))]
+        let k = table_parallelism().min(num_airs).max(1);
         let k_commit = k;
         // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
         // coset_lde_full_expand can resize in-place without reallocation spikes.
