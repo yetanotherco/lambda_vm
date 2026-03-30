@@ -774,16 +774,19 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 // =============================================================================
 
 /// An operation routes to MEMW_R if:
-/// 1. It's a register access (is_register = true)
+/// 1. It's a 2-word register access (is_register = true, width = 2)
 /// 2. timestamp[1] == old_timestamp[1] (upper limbs match)
 /// 3. timestamp[0] > old_timestamp[0] (lower limb ordering)
 /// 4. timestamp[0] - old_timestamp[0] <= 0xFFFF (delta fits in halfword)
+///
+/// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
+/// dynamic write flags. MEMW_R hardcodes write2=1.
 fn is_register_op(op: &MemwOperation) -> bool {
-    if !op.is_register {
+    if !op.is_register || op.width != 2 {
         return false;
     }
     let ts = op.timestamp;
-    let old_ts = op.old_timestamp[0]; // registers always width-2, old_ts[0] = old_ts[1]
+    let old_ts = op.old_timestamp[0]; // width-2 register ops have old_ts[0] == old_ts[1]
     let ts_lo = ts & 0xFFFF_FFFF;
     let old_ts_lo = old_ts & 0xFFFF_FFFF;
     let ts_hi = ts >> 32;
