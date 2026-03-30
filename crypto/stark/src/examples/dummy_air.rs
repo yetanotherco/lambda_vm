@@ -100,10 +100,6 @@ where
         1
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,

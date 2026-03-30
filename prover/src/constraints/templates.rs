@@ -113,10 +113,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -519,10 +515,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn evaluate(
