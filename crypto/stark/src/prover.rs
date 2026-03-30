@@ -2323,6 +2323,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "disk-spill")]
         drop(pool_sets);
 
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after pool drop") {
+            heap_snaps.push(s);
+        }
+
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
         // =====================================================================
@@ -2437,7 +2442,7 @@ pub trait IsStarkProver<
                         {
                             let sub_ops =
                                 crate::instruments::take_round_sub_ops().unwrap_or_default();
-                            return Ok((
+                            Ok((
                                 proof,
                                 (
                                     air.name().to_string(),
@@ -2445,7 +2450,7 @@ pub trait IsStarkProver<
                                     table_start.elapsed(),
                                     sub_ops,
                                 ),
-                            ));
+                            ))
                         }
                         #[cfg(not(feature = "instruments"))]
                         Ok(proof)
@@ -2662,6 +2667,11 @@ pub trait IsStarkProver<
             &boundary_coefficients,
         )?;
 
+        #[cfg(feature = "instruments")]
+        if let Some((_, mb)) = crate::instruments::snap("after round 2") {
+            eprintln!("  [heap] after round 2: {mb} MB");
+        }
+
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
 
@@ -2716,6 +2726,11 @@ pub trait IsStarkProver<
             &z,
             transcript,
         );
+
+        #[cfg(feature = "instruments")]
+        if let Some((_, mb)) = crate::instruments::snap("after round 4") {
+            eprintln!("  [heap] after round 4: {mb} MB");
+        }
 
         #[cfg(feature = "instruments")]
         {
