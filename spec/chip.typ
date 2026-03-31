@@ -14,12 +14,15 @@
   .map(pair => pair.at(1))
   .flatten()
   .map(var => {
-    let (label, factor) = if type(var.type) == array {
-      (var.type.at(0), var.type.at(1))
-    } else {
-      (var.type, 1)
+    let (factor, var_type) = (1, var.type)
+    while type(var_type) == array {
+      assert(var_type.len() == 2, message: "invalid var (sub)type length: " + repr(var.type))
+      assert(type(var_type.at(1)) == int, message: "invalid var (sub)type length: " + repr(var.type))
+      factor *= var_type.at(1)
+      var_type = var_type.at(0)
     }
-    config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor
+    
+    config.variables.types.filter(type => type.label == var_type).first().subtypes.len() * factor
   })
   .sum()
 }

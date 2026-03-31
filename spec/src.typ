@@ -104,14 +104,13 @@
   let all_vars = chip.variables.values().flatten()
   let all_labels = config.variables.types.map(type => type.label);
   for var in all_vars {
-    let type_label = if type(var.type) == array {
-      var.type.at(0)
-    } else {
-      var.type
+    let type_label = var.type
+    while type(type_label) == array {
+      assert(type_label.len() == 2 and type(type_label.at(1)) == int, message: "invalid type: " + repr(var.type))
+      type_label = type_label.at(0)
     }
-
     // Check that all variable types are valid
-    assert(type_label in all_labels, message: "found invalid var type:" + repr(var.type))
+    assert(type_label in all_labels, message: "found invalid var type: " + repr(var.type))
   }
 }
 
