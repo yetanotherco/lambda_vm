@@ -320,15 +320,8 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    let evaluation_points = frame_offsets
-        .iter()
-        .flat_map(|offset| {
-            let exponents_range_start = offset * step_size;
-            let exponents_range_end = (offset + 1) * step_size;
-            (exponents_range_start..exponents_range_end).collect_vec()
-        })
-        .map(|exponent| primitive_root.pow(exponent) * x)
-        .collect_vec();
+    let evaluation_points =
+        compute_frame_evaluation_points(x, frame_offsets, primitive_root, step_size);
 
     let main_evaluations = evaluation_points
         .iter()
@@ -411,15 +404,8 @@ where
         .expect("coset_offset_pow_n is non-zero");
 
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
-    let evaluation_points: Vec<FieldElement<E>> = frame_offsets
-        .iter()
-        .flat_map(|offset| {
-            let start = offset * step_size;
-            let end = (offset + 1) * step_size;
-            (start..end).collect_vec()
-        })
-        .map(|exponent| &domain.trace_primitive_root.pow(exponent) * z)
-        .collect_vec();
+    let evaluation_points =
+        compute_frame_evaluation_points(z, frame_offsets, &domain.trace_primitive_root, step_size);
 
     // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
@@ -515,4 +501,26 @@ where
                 .collect()
         })
         .collect()
+}
+
+fn compute_frame_evaluation_points<F, E>(
+    x: &FieldElement<E>,
+    frame_offsets: &[usize],
+    primitive_root: &FieldElement<F>,
+    step_size: usize,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mut evaluation_points = Vec::with_capacity(frame_offsets.len() * step_size);
+    for &offset in frame_offsets {
+        let start_exponent = offset * step_size;
+        let mut current = primitive_root.pow(start_exponent) * x;
+        for _ in 0..step_size {
+            evaluation_points.push(current.clone());
+            current = primitive_root * &current;
+        }
+    }
+    evaluation_points
 }
