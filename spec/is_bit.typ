@@ -8,7 +8,6 @@
 #show: book-page(chip.name)
 
 #set_nr_interactions(chip)
-#let nr_interactions = get_nr_interactions(chip)
 
 #let is_bit = raw(chip.name)
 
