@@ -8,6 +8,7 @@
 #show: book-page(chip.name)
 
 #set_nr_interactions(chip)
+#set_nr_interactions(chip, name: "SUB")
 #let nr_interactions = get_nr_interactions(chip)
 
 #let add = raw(chip.name)

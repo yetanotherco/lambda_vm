@@ -44,7 +44,16 @@
   .product(default: 1)
 }
 
-#let set_nr_interactions(chip) = {
+// Compute the number of interactions performed by `chip` and
+// store it as metadata under the `<interaction_count>` label
+// with tag `chip.name`. This tag is overwritten by `name` when specified.
+#let set_nr_interactions(chip, name: none) = {
+  let chip-name = if name != none {
+      name 
+    } else {
+      chip.name    
+    }
+
   let constraints = chip
     .constraints
     .values()
@@ -73,7 +82,9 @@
 
     let total-nr-interactions = nr-direct-interactions + nr-indirect-interactions
 
-    [#metadata((chip.name: total-nr-interactions)) <interaction_count>]
+    let entry = (:)
+    entry.insert(chip-name, total-nr-interactions)
+    [#metadata(entry) <interaction_count>]
   }
 }
 
