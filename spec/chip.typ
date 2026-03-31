@@ -24,6 +24,26 @@
   .sum()
 }
 
+// Given a constraint, compute the number of interactions it induces
+#let get_interaction_count(constraint) = {
+  let iters = if "iters" in constraint {
+    constraint.iters
+  } else if "iter" in constraint {
+    (constraint.iter,)
+  } else {
+    ()
+  }
+
+  iters.map(i => {
+    assert(
+      i.len() == 3 and type(i.at(1)) == int and type(i.at(2)) == int,
+      message: "contains invalid iter: " + repr(i),
+    )
+    i.at(2) - i.at(1) + 1
+  })
+  .product(default: 1)
+}
+
 #let set_nr_interactions(chip) = {
   let constraints = chip
     .constraints
@@ -33,10 +53,7 @@
   // nr. of direct interactions
   let nr-direct-interactions = constraints
     .filter(c=>c.kind == "interaction")
-    .map(c => {
-      let x = c.at("iter", default: (0, 0, 0))
-      x.at(2) - x.at(1) + 1
-    })
+    .map(get_interaction_count)
     .sum(default: 0)
   
   let template-constraints = constraints.filter(c=>c.kind == "template")
@@ -47,10 +64,9 @@
     // nr. of indirect interactions through templates
     let nr-indirect-interactions = template-constraints
       .map(c => {
-        let x = c.at("iter", default: (0, 0, 0))
-        let iter-size = x.at(2) - x.at(1) + 1
-
+        let iter-size = get_interaction_count(c)
         let template-interactions = lookup-table.at(c.tag, default: 0)
+
         iter-size * template-interactions 
       })
       .sum(default: 0)
