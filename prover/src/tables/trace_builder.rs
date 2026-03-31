@@ -1861,40 +1861,53 @@ impl Traces {
         // disk-spill: spill memw_ops to disk first to free ~83 GB at 128M scale,
         // then generate MEMW traces + LT-from-MEMW in chunks from the mmap.
         // non-disk-spill: original in-memory path.
+        // disk-spill: spill memw_ops to disk, then process MEMW traces, LT traces,
+        // and LT bitwise ops all inline per chunk. This avoids the 83 GB memw_ops
+        // heap AND the 73 GB lt_from_memw accumulation.
+        //
+        // Create the bitwise table early so we can update multiplicities per chunk.
         #[cfg(feature = "disk-spill")]
-        let (memws, memw_lt_ops) = {
+        let mut bitwise_table = bitwise::generate_bitwise_trace();
+
+        #[cfg(feature = "disk-spill")]
+        let (memws, memw_lts) = {
             eprintln!("[phase] Spilling memw_ops to disk...");
             let spilled_memw = SpilledVec::spill(memw_ops)
                 .map_err(|e| Error::Prover(format!("disk-spill memw_ops: {e}")))?;
             let memw_slice = spilled_memw.as_slice();
 
-            // Generate MEMW traces + collect LT ops in chunks to avoid
-            // holding all MEMW LT ops (up to 73 GB) in memory at once.
             let mut memws = Vec::new();
-            let mut memw_lt_ops = Vec::new();
+            let mut memw_lts = Vec::new();
             let chunks: Vec<&[MemwOperation]> = if memw_slice.is_empty() {
                 vec![&[][..]]
             } else {
                 memw_slice.chunks(max_rows.memw).collect()
             };
             for chunk in &chunks {
-                // Generate MEMW trace for this chunk + spill
+                // MEMW trace → spill
                 let mut t = memw::generate_memw_trace(chunk);
                 t.main_table
                     .spill_to_disk()
                     .map_err(|e| Error::Prover(format!("disk-spill memw trace: {e}")))?;
                 memws.push(t);
 
-                // Collect LT ops from this chunk (timestamp ordering checks)
-                memw_lt_ops.extend(collect_lt_from_memw(chunk));
+                // LT ops from this chunk → LT bitwise → LT traces → spill
+                let chunk_lt = collect_lt_from_memw(chunk);
+                let chunk_lt_bitwise = collect_bitwise_from_lt(&chunk_lt);
+                bitwise::update_multiplicities(&mut bitwise_table, &chunk_lt_bitwise);
+                drop(chunk_lt_bitwise);
+                for lt_chunk in chunk_lt.chunks(max_rows.lt) {
+                    let mut lt_t = lt::generate_lt_trace(lt_chunk);
+                    lt_t.main_table
+                        .spill_to_disk()
+                        .map_err(|e| Error::Prover(format!("disk-spill memw-lt trace: {e}")))?;
+                    memw_lts.push(lt_t);
+                }
             }
-            // spilled_memw drops here, freeing the mmap + temp file
-            (memws, memw_lt_ops)
+            (memws, memw_lts)
         };
         #[cfg(not(feature = "disk-spill"))]
-        let memw_lt_ops = collect_lt_from_memw(&memw_ops);
-
-        lt_ops.extend(memw_lt_ops);
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
 
         // =====================================================================
         // PHASE 4+5: Interleaved bitwise flush, trace generation, and drops
@@ -1919,6 +1932,8 @@ impl Traces {
         }
 
         // --- Generate bitwise table (empty multiplicities first) ---
+        // disk-spill: already created above (needed for per-chunk LT bitwise updates).
+        #[cfg(not(feature = "disk-spill"))]
         let mut bitwise_table = bitwise::generate_bitwise_trace();
 
         // --- Flush: CPU ops + commit + page + padding bitwise ---
@@ -2000,12 +2015,16 @@ impl Traces {
         drop(memw_ops);
 
         // --- Flush LT bitwise + generate LT traces + drop lt_ops ---
+        // disk-spill: lt_ops only has CPU/DVRM LT ops (MEMW LT was processed inline above).
+        // Combine with memw_lts at the end.
         let lt_bitwise = collect_bitwise_from_lt(&lt_ops);
         bitwise::update_multiplicities(&mut bitwise_table, &lt_bitwise);
         drop(lt_bitwise);
 
-        let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let mut lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         drop(lt_ops);
+        #[cfg(feature = "disk-spill")]
+        lts.extend(memw_lts);
 
         // --- Flush remaining bitwise (mul, dvrm, branch, shift) ---
         let mul_bitwise = collect_bitwise_from_mul(&mul_ops);
