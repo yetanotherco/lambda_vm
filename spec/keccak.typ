@@ -46,7 +46,7 @@ Lastly, the input state is pushed to the Keccak-round function, while the output
 
 The table can be padded to the next power of two with the following value assignments:
 
-// #render_chip_padding_table(chip, config)
+#render_chip_padding_table(chip, config)
 
 = Round chip
 #let round_chip = load_chip("src/keccak_round.toml", config)
