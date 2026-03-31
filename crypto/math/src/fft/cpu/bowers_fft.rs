@@ -29,8 +29,6 @@
 //! Based on Plonky3's implementation and academic literature on FFT optimization.
 
 #[cfg(feature = "alloc")]
-use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-#[cfg(feature = "alloc")]
 use crate::fft::errors::FFTError;
 #[cfg(feature = "alloc")]
 use crate::field::{
@@ -52,98 +50,6 @@ const MAX_FFT_ORDER: u64 = 31;
 // =====================================================
 // STRUCTURE OF ARRAYS (SoA) FFT
 // =====================================================
-
-/// Matrix representation for batch FFT with Structure of Arrays layout
-///
-/// SoA layout stores multiple polynomials contiguously:
-/// ```text
-/// [poly0[0], poly0[1], ..., poly0[n-1], poly1[0], poly1[1], ..., poly1[n-1], ...]
-/// ```
-///
-/// This layout provides better cache utilization when processing multiple
-/// polynomials simultaneously.
-#[cfg(feature = "alloc")]
-pub struct FftMatrix<E: IsField> {
-    /// Flat storage for all polynomial coefficients
-    pub data: Vec<FieldElement<E>>,
-    /// Number of columns (polynomial length)
-    pub width: usize,
-    /// Number of rows (number of polynomials)
-    pub height: usize,
-}
-
-#[cfg(feature = "alloc")]
-impl<E: IsField> FftMatrix<E> {
-    /// Create a new FFT matrix from a list of polynomials
-    ///
-    /// # Panics
-    /// Panics if polynomials have different lengths.
-    pub fn from_polynomials(polys: Vec<Vec<FieldElement<E>>>) -> Self {
-        if polys.is_empty() {
-            return Self {
-                data: Vec::new(),
-                width: 0,
-                height: 0,
-            };
-        }
-
-        let height = polys.len();
-        let width = polys[0].len();
-
-        // Flatten in row-major order (SoA layout)
-        let mut data = Vec::with_capacity(height * width);
-        for poly in polys {
-            assert_eq!(poly.len(), width, "All polynomials must have same length");
-            data.extend(poly);
-        }
-
-        Self {
-            data,
-            width,
-            height,
-        }
-    }
-
-    /// Get a mutable slice for polynomial at index `row`
-    ///
-    /// # Panics
-    /// Panics if `row >= self.height`.
-    pub fn row_mut(&mut self, row: usize) -> &mut [FieldElement<E>] {
-        assert!(
-            row < self.height,
-            "Row index out of bounds: {} >= {}",
-            row,
-            self.height
-        );
-        let start = row.checked_mul(self.width).expect("Row index overflow");
-        let end = start + self.width;
-        &mut self.data[start..end]
-    }
-
-    /// Get an immutable slice for polynomial at index `row`
-    ///
-    /// # Panics
-    /// Panics if `row >= self.height`.
-    pub fn row(&self, row: usize) -> &[FieldElement<E>] {
-        assert!(
-            row < self.height,
-            "Row index out of bounds: {} >= {}",
-            row,
-            self.height
-        );
-        let start = row.checked_mul(self.width).expect("Row index overflow");
-        let end = start + self.width;
-        &self.data[start..end]
-    }
-
-    /// Convert back to list of polynomials
-    pub fn to_polynomials(self) -> Vec<Vec<FieldElement<E>>> {
-        self.data
-            .chunks(self.width)
-            .map(|chunk| chunk.to_vec())
-            .collect()
-    }
-}
 
 // =====================================================
 // PARALLEL BOWERS FFT
@@ -1181,32 +1087,6 @@ where
                 input[i1] = diff_w;
             }
         }
-    }
-
-    Ok(())
-}
-
-/// Batch FFT using optimized Bowers algorithm with LayerTwiddles
-///
-/// # Errors
-/// Returns `FFTError::InputError` if polynomial width is not a power of two.
-#[cfg(feature = "alloc")]
-pub fn bowers_batch_fft_opt<F, E>(
-    matrix: &mut FftMatrix<E>,
-    layer_twiddles: &LayerTwiddles<F>,
-) -> Result<(), FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
-{
-    if matrix.height == 0 || matrix.width <= 1 {
-        return Ok(());
-    }
-
-    for row in 0..matrix.height {
-        let poly = matrix.row_mut(row);
-        bowers_fft_opt_fused(poly, layer_twiddles)?;
-        in_place_bit_reverse_permute(poly);
     }
 
     Ok(())
