@@ -1,7 +1,7 @@
 use super::field::element::FieldElement;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
-use core::{fmt::Display, ops, slice};
+use core::{fmt::Display, ops};
 /// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
 /// as a vector of coefficients `[c_0, c_1, ... , c_n]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,62 +35,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Creates the null polynomial
     pub fn zero() -> Self {
         Self::new(&[])
-    }
-
-    /// Returns a polynomial that interpolates the points with x coordinates and y coordinates given by
-    /// `xs` and `ys`.
-    /// `xs` and `ys` must be the same length, and `xs` values should be unique. If not, panics.
-    /// In short, it finds P(x) such that P(xs[i]) = ys[i]
-    pub fn interpolate(
-        xs: &[FieldElement<F>],
-        ys: &[FieldElement<F>],
-    ) -> Result<Self, InterpolateError> {
-        // TODO: try to use the type system to avoid this assert
-        if xs.len() != ys.len() {
-            return Err(InterpolateError::UnequalLengths(xs.len(), ys.len()));
-        }
-        if xs.is_empty() {
-            return Ok(Polynomial::new(&[]));
-        }
-
-        let mut denominators = Vec::with_capacity(xs.len() * (xs.len() - 1) / 2);
-        let mut indexes = Vec::with_capacity(xs.len());
-
-        let mut idx = 0;
-
-        for (i, xi) in xs.iter().enumerate().skip(1) {
-            indexes.push(idx);
-            for xj in xs.iter().take(i) {
-                if xi == xj {
-                    return Err(InterpolateError::NonUniqueXs);
-                }
-                denominators.push(xi - xj);
-                idx += 1;
-            }
-        }
-
-        FieldElement::inplace_batch_inverse(&mut denominators).unwrap();
-
-        let mut result = Polynomial::zero();
-
-        for (i, y) in ys.iter().enumerate() {
-            let mut y_term = Polynomial::new(slice::from_ref(y));
-            for (j, x) in xs.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let denominator = if i > j {
-                    denominators[indexes[i - 1] + j].clone()
-                } else {
-                    -&denominators[indexes[j - 1] + i]
-                };
-                let denominator_poly = Polynomial::new(&[denominator]);
-                let numerator = Polynomial::new(&[-x, FieldElement::one()]);
-                y_term = y_term.mul_with_ref(&(numerator * denominator_poly));
-            }
-            result = result + y_term;
-        }
-        Ok(result)
     }
 
     /// Evaluates a polynomial P(t) at a point x, using Horner's algorithm
@@ -138,16 +82,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Returns the length of the vector of coefficients
     pub fn coeff_len(&self) -> usize {
         self.coefficients().len()
-    }
-
-    /// Computes quotient with `x - b` in place.
-    pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
-        let mut c = FieldElement::zero();
-        for coeff in self.coefficients.iter_mut().rev() {
-            *coeff = &*coeff + b * &c;
-            core::mem::swap(coeff, &mut c);
-        }
-        self.coefficients.pop();
     }
 
     /// Computes quotient and remainder of polynomial division.
@@ -801,52 +735,6 @@ where
     denoms
 }
 
-/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
-/// using the barycentric interpolation formula.
-///
-/// Formula: f(z) = (z^N - g^N) / N * sum_{i=0}^{N-1} [ (g*w^i) * f(g*w^i) / (z - g*w^i) ] / g^N
-///
-/// This variant takes base-field evaluations (main trace columns) and returns an
-/// extension-field result.
-///
-/// # Arguments
-/// * `z_pow_n` - z^N where N = coset_points.len()
-/// * `coset_offset_pow_n` - g^N where g = coset_offset
-/// * `n_inv` - 1/N in the extension field
-/// * `coset_points` - the coset {g*w^0, g*w^1, ..., g*w^{N-1}}
-/// * `evaluations` - f(g*w^i) for each coset point (base field)
-/// * `inv_denoms` - precomputed 1/(z - g*w^i)
-#[cfg(feature = "alloc")]
-pub fn interpolate_coset_eval<F, E>(
-    z_pow_n: &FieldElement<E>,
-    coset_offset_pow_n: &FieldElement<E>,
-    n_inv: &FieldElement<E>,
-    coset_points: &[FieldElement<F>],
-    evaluations: &[FieldElement<F>],
-    inv_denoms: &[FieldElement<E>],
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    debug_assert_eq!(coset_points.len(), evaluations.len());
-    debug_assert_eq!(coset_points.len(), inv_denoms.len());
-
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            acc + (point * eval) * inv_d
-        });
-
-    let vanishing = z_pow_n - coset_offset_pow_n;
-    let g_n_inv = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero");
-    vanishing * n_inv * &sum * &g_n_inv
-}
-
 /// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///
 /// Use this when evaluating multiple columns at the same coset — the inverse is
@@ -888,44 +776,6 @@ where
     &scalar * &(vanishing * &sum) // F × E → E
 }
 
-/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
-/// using the barycentric interpolation formula.
-///
-/// This variant takes extension-field evaluations (aux trace / composition poly columns)
-/// but keeps coset points in the base field to avoid unnecessary extension-field arithmetic.
-/// The `point * eval` computation uses mixed F×E multiplication (cheaper than E×E).
-#[cfg(feature = "alloc")]
-pub fn interpolate_coset_eval_ext<F, E>(
-    z_pow_n: &FieldElement<E>,
-    coset_offset_pow_n: &FieldElement<E>,
-    n_inv: &FieldElement<E>,
-    coset_points: &[FieldElement<F>],
-    evaluations: &[FieldElement<E>],
-    inv_denoms: &[FieldElement<E>],
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    debug_assert_eq!(coset_points.len(), evaluations.len());
-    debug_assert_eq!(coset_points.len(), inv_denoms.len());
-
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            let numerator = point * eval;
-            acc + numerator * inv_d
-        });
-
-    let vanishing = z_pow_n - coset_offset_pow_n;
-    let g_n_inv = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero");
-    vanishing * n_inv * &sum * &g_n_inv
-}
-
 /// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///
 /// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F.
@@ -960,4 +810,72 @@ where
     let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
     let scalar = n_inv * g_n_inv; // F * F → F
     &scalar * &(vanishing * &sum) // F × E → E
+}
+
+#[cfg(test)]
+impl<F: IsField> Polynomial<FieldElement<F>> {
+    /// Returns a polynomial that interpolates the points with x coordinates and y coordinates given by
+    /// `xs` and `ys`.
+    pub fn interpolate(
+        xs: &[FieldElement<F>],
+        ys: &[FieldElement<F>],
+    ) -> Result<Self, InterpolateError> {
+        use core::slice;
+
+        if xs.len() != ys.len() {
+            return Err(InterpolateError::UnequalLengths(xs.len(), ys.len()));
+        }
+        if xs.is_empty() {
+            return Ok(Polynomial::new(&[]));
+        }
+
+        let mut denominators = Vec::with_capacity(xs.len() * (xs.len() - 1) / 2);
+        let mut indexes = Vec::with_capacity(xs.len());
+
+        let mut idx = 0;
+
+        for (i, xi) in xs.iter().enumerate().skip(1) {
+            indexes.push(idx);
+            for xj in xs.iter().take(i) {
+                if xi == xj {
+                    return Err(InterpolateError::NonUniqueXs);
+                }
+                denominators.push(xi - xj);
+                idx += 1;
+            }
+        }
+
+        FieldElement::inplace_batch_inverse(&mut denominators).unwrap();
+
+        let mut result = Polynomial::zero();
+
+        for (i, y) in ys.iter().enumerate() {
+            let mut y_term = Polynomial::new(slice::from_ref(y));
+            for (j, x) in xs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let denominator = if i > j {
+                    denominators[indexes[i - 1] + j].clone()
+                } else {
+                    -&denominators[indexes[j - 1] + i]
+                };
+                let denominator_poly = Polynomial::new(&[denominator]);
+                let numerator = Polynomial::new(&[-x, FieldElement::one()]);
+                y_term = y_term.mul_with_ref(&(numerator * denominator_poly));
+            }
+            result = result + y_term;
+        }
+        Ok(result)
+    }
+
+    /// Computes quotient with `x - b` in place.
+    pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
+        let mut c = FieldElement::zero();
+        for coeff in self.coefficients.iter_mut().rev() {
+            *coeff = &*coeff + b * &c;
+            core::mem::swap(coeff, &mut c);
+        }
+        self.coefficients.pop();
+    }
 }

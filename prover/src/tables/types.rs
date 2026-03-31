@@ -223,28 +223,6 @@ pub const NEG_INV_2_112: u64 = 18446462594437939201;
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
 
 // =========================================================================
-// Column index helpers
-// =========================================================================
-
-/// Helper to define column ranges for different 64-bit representations.
-pub mod columns {
-    /// A DWordWL (64-bit as 2 words) spans 2 columns
-    pub const DWORD_WL_SIZE: usize = 2;
-
-    /// A DWordHL (64-bit as 4 halves) spans 4 columns
-    pub const DWORD_HL_SIZE: usize = 4;
-
-    /// A DWordBL (64-bit as 8 bytes) spans 8 columns
-    pub const DWORD_BL_SIZE: usize = 8;
-
-    /// A DWordHHW (64-bit as Word, Half, Half) spans 3 columns
-    pub const DWORD_HHW_SIZE: usize = 3;
-
-    /// A QuadWL (128-bit as 4 words) spans 4 columns
-    pub const QUAD_WL_SIZE: usize = 4;
-}
-
-// =========================================================================
 // packed_decode bit positions (shared between CPU and DECODE tables)
 // =========================================================================
 

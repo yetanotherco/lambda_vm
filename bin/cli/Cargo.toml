@@ -7,7 +7,6 @@ edition = "2024"
 executor = { path = "../../executor" }
 prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
-crypto = { path = "../../crypto/crypto" }
 clap = { version = "4.3.10", features = ["derive"] }
 bincode = "1"
 tikv-jemallocator = "0.6"
