@@ -457,6 +457,7 @@ pub fn prove_with_options(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
+    eprintln!("[phase] Execute...");
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -474,14 +475,18 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
+    eprintln!("[phase] Trace build...");
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
     drop(result);
 
     #[cfg(feature = "disk-spill")]
-    traces
-        .spill_all_main_to_disk()
-        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    {
+        eprintln!("[phase] Spilling traces to disk...");
+        traces
+            .spill_all_main_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    }
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -508,6 +513,7 @@ pub fn prove_with_options(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
+    eprintln!("[phase] Proving...");
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
