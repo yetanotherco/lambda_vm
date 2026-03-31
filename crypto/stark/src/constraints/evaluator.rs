@@ -225,16 +225,24 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
             boundary_constraints
                 .constraints
                 .iter()
                 .map(|bc| {
-                    let point = &domain.trace_primitive_root.pow(bc.step as u64);
+                    let point = match boundary_step_points.iter().find(|(s, _)| *s == bc.step) {
+                        Some((_, p)) => p.clone(),
+                        None => {
+                            let p = domain.trace_primitive_root.pow(bc.step as u64);
+                            boundary_step_points.push((bc.step, p.clone()));
+                            p
+                        }
+                    };
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v - point)
+                        .map(|v| v - &point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals
