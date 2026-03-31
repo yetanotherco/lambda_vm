@@ -101,6 +101,10 @@ enum Commands {
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
 
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+
         /// Generate flamegraph folded stacks to file
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
@@ -115,6 +119,10 @@ enum Commands {
         /// Output path for the proof bundle
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
+
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
 
         /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
         #[arg(long)]
@@ -149,13 +157,18 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Execute { elf, flamegraph } => cmd_execute(elf, flamegraph),
+        Commands::Execute {
+            elf,
+            private_input,
+            flamegraph,
+        } => cmd_execute(elf, private_input, flamegraph),
         Commands::Prove {
             elf,
             output,
+            private_input,
             blowup,
             time,
-        } => cmd_prove(elf, output, blowup, time),
+        } => cmd_prove(elf, output, private_input, blowup, time),
         Commands::Verify {
             proof,
             elf,
@@ -165,7 +178,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode {
+fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
+    match path {
+        Some(path) => {
+            eprintln!("Reading private input file...");
+            std::fs::read(path).map_err(|e| format!("Failed to read private input file: {e}"))
+        }
+        None => Ok(vec![]),
+    }
+}
+
+fn cmd_execute(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    flamegraph_path: Option<PathBuf>,
+) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -182,7 +209,15 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
         }
     };
 
-    let mut executor = match Executor::new(&program, vec![]) {
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut executor = match Executor::new(&program, private_inputs) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Failed to create executor: {:?}", e);
@@ -249,12 +284,26 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
+fn cmd_prove(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    blowup: Option<u8>,
+    time: bool,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
@@ -276,11 +325,16 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
                 "Generating proof (blowup={b}, queries={})...",
                 opts.fri_number_of_queries
             );
-            prover::prove_with_options(&elf_data, &opts, &Default::default())
+            prover::prove_with_options_and_inputs(
+                &elf_data,
+                &private_inputs,
+                &opts,
+                &Default::default(),
+            )
         }
         None => {
             eprintln!("Generating proof...");
-            prover::prove(&elf_data)
+            prover::prove_with_inputs(&elf_data, &private_inputs)
         }
     };
     let prove_elapsed = start.elapsed();
