@@ -6,6 +6,16 @@
 #let config = load_config()
 #let signatures = load_signatures(config)
 
+// Render a type
+#let render_type(typ) = {
+  let res = ``
+  while type(typ) == array {
+    res += `[` + raw(str(typ.at(1))) + `]`
+    typ = typ.at(0)
+  }
+  raw(typ) + res
+}
+
 // Render a signature
 #let render_signature(sig) = {
   let (lb, rb) = if sig.kind == "interaction" {
@@ -19,21 +29,11 @@
     raw(cond) + ` => `
   } else {``}
 
-  let input_str = sig.input.map(elt => {
-    if type(elt) == array {
-      raw(elt.at(0)) + `[` + raw(str(elt.at(1))) + `]`
-    } else {
-      raw(elt)
-    }
-  }).join(`, `)
+  let input_str = sig.input.map(render_type).join(`, `)
 
   let output = sig.at("output", default: none)
   let output_str = if output != none {
-    if type(output) == array {
-      raw(output.at(0)) + `[` + raw(str(output.at(1))) + `]`
-    } else {
-      raw(output)
-    } + `; `
+    render_type(output) + `; `
   } else {``}
 
   return [#cond_str#raw(sig.tag)#lb#output_str#input_str#rb]
@@ -44,12 +44,13 @@
   let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
 
   return vars.map(v => {
-    let (label, factor) = if type(v) == array {
-      (v.at(0), v.at(1))
-    } else {
-      (v, 1)
+    let factor = 1
+    while type(v) == array {
+      factor *= v.at(1)
+      v = v.at(0)
     }
-    config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor
+    let lbl = v
+    config.variables.types.filter(type => type.label == lbl).first().subtypes.len() * factor
   })
   .sum()
 }

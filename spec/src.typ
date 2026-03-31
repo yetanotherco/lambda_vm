@@ -40,10 +40,11 @@
 
   // Verify that `var` is a valid variable.
   let verify_variable(var) = {
-    if type(var) == array {
-        assert(var.at(0) in var_labels, message: "Invalid var type: " + repr(var))
+    while type(var) == array {
         assert(type(var.at(1)) == int, message: "Invalid var type: " + repr(var))
-    } else if type(var) == str {
+        var = var.at(0)
+    }
+    if type(var) == str {
       assert(var in var_labels, message: "Invalid var type: " + repr(var))
     } else {
       assert(false, message: "Invalid var type: " + repr(var))
