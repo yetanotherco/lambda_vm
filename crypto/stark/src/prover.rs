@@ -1629,18 +1629,12 @@ pub trait IsStarkProver<
         }
 
         // Number of tables to process concurrently.
-        // disk-spill: Phase A/C use a reduced k_commit (default 4) to limit
-        // concurrent pool memory while retaining some parallelism.
-        // Override with COMMIT_PARALLELISM env var (1 = minimum memory, k = maximum speed).
+        // disk-spill: Phase A/C use k_commit=1 (one pool at a time, since each
+        // table's LDE already saturates all cores via column-parallel FFT).
         // Rounds 2-4 use the full k (no pools needed, reads from mmap).
         let k = table_parallelism().min(num_airs).max(1);
         #[cfg(feature = "disk-spill")]
-        let k_commit = std::env::var("COMMIT_PARALLELISM")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4_usize)
-            .min(k)
-            .max(1);
+        let k_commit = 1_usize;
         #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
         // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
