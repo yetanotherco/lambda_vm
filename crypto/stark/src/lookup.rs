@@ -19,7 +19,7 @@ use math::field::{
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -1358,6 +1358,41 @@ where
 {
 }
 
+/// Minimum rows per Rayon task when parallelizing LogUp fingerprint scans (amortizes join overhead).
+#[cfg(feature = "parallel")]
+const LOGUP_FP_PAR_MIN_LEN: usize = 1024;
+
+/// Fingerprint value `z - (bus_id·α⁰ + Σ v_i·α^i)` for one trace row (shared by term + batched builders).
+#[inline]
+fn logup_row_fingerprint<F, E>(
+    row: usize,
+    interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    alpha_powers: &[FieldElement<E>],
+    z: &FieldElement<E>,
+    bus_id_f: &FieldElement<F>,
+    shifts: &PackingShifts<F>,
+) -> FieldElement<E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField,
+    E: IsField,
+{
+    let mut linear_combination = bus_id_f * &alpha_powers[0];
+    let mut alpha_offset = 1usize;
+    for bv in &interaction.values {
+        let consumed = bv.accumulate_fingerprint(
+            main_segment_cols,
+            row,
+            alpha_powers,
+            alpha_offset,
+            &mut linear_combination,
+            shifts,
+        );
+        alpha_offset += consumed;
+    }
+    z - &linear_combination
+}
+
 /// Computes a term column for a table interaction without writing to the trace.
 ///
 /// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
@@ -1467,46 +1502,62 @@ where
     // into the fingerprint without collecting bus elements into intermediate Vecs.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
     let shifts = PackingShifts::<F>::new();
-    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
-        // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
-        let mut linear_combination = &bus_id_f * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &table_interaction.values {
-            let consumed = bv.accumulate_fingerprint(
+
+    // Per-row fingerprints are independent; parallelize when `parallel` is on. With `debug-checks`,
+    // keep a sequential scan so `log_interaction` stays ordered and thread-safe.
+    #[cfg(all(feature = "parallel", not(feature = "debug-checks")))]
+    let mut fingerprints: Vec<FieldElement<E>> = (0..trace_len)
+        .into_par_iter()
+        .with_min_len(LOGUP_FP_PAR_MIN_LEN)
+        .map(|row| {
+            logup_row_fingerprint(
+                row,
+                table_interaction,
                 main_segment_cols,
-                row,
                 &alpha_powers,
-                alpha_offset,
-                &mut linear_combination,
+                z,
+                &bus_id_f,
                 &shifts,
-            );
-            alpha_offset += consumed;
-        }
+            )
+        })
+        .collect();
 
-        fingerprints.push(z - &linear_combination);
-
-        #[cfg(feature = "debug-checks")]
-        {
-            // Reconstruct base_elements for debug logging
-            let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
-            base_elements.extend(
-                table_interaction
-                    .values
-                    .iter()
-                    .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
-            );
-            crate::bus_debug::log_interaction(
-                _table_name,
+    #[cfg(not(all(feature = "parallel", not(feature = "debug-checks"))))]
+    let mut fingerprints: Vec<FieldElement<E>> = {
+        let mut fingerprints = Vec::with_capacity(trace_len);
+        for row in 0..trace_len {
+            fingerprints.push(logup_row_fingerprint(
                 row,
-                table_interaction.bus_id,
-                table_interaction.is_sender,
-                &multiplicities[row].canonical(),
-                &base_elements,
-                fingerprints.last().unwrap(),
-            );
+                table_interaction,
+                main_segment_cols,
+                &alpha_powers,
+                z,
+                &bus_id_f,
+                &shifts,
+            ));
+
+            #[cfg(feature = "debug-checks")]
+            {
+                let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
+                base_elements.extend(
+                    table_interaction
+                        .values
+                        .iter()
+                        .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
+                );
+                crate::bus_debug::log_interaction(
+                    _table_name,
+                    row,
+                    table_interaction.bus_id,
+                    table_interaction.is_sender,
+                    &multiplicities[row].canonical(),
+                    &base_elements,
+                    fingerprints.last().unwrap(),
+                );
+            }
         }
-    }
+        fingerprints
+    };
 
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
@@ -1617,41 +1668,77 @@ where
     let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
     let shifts = PackingShifts::<F>::new();
 
-    // Concatenate both fingerprint vectors for a single batch inversion
-    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
+    // Two independent per-row scans; run them in parallel (each scan also parallelizes rows).
+    #[cfg(feature = "parallel")]
+    let mut all_fingerprints: Vec<FieldElement<E>> = {
+        let (fp_a, fp_b) = rayon::join(
+            || {
+                (0..trace_len)
+                    .into_par_iter()
+                    .with_min_len(LOGUP_FP_PAR_MIN_LEN)
+                    .map(|row| {
+                        logup_row_fingerprint(
+                            row,
+                            interaction_a,
+                            main_segment_cols,
+                            &alpha_powers,
+                            z,
+                            &bus_id_a,
+                            &shifts,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                (0..trace_len)
+                    .into_par_iter()
+                    .with_min_len(LOGUP_FP_PAR_MIN_LEN)
+                    .map(|row| {
+                        logup_row_fingerprint(
+                            row,
+                            interaction_b,
+                            main_segment_cols,
+                            &alpha_powers,
+                            z,
+                            &bus_id_b,
+                            &shifts,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let mut out = fp_a;
+        out.extend(fp_b);
+        out
+    };
 
-    for row in 0..trace_len {
-        let mut lc_a = &bus_id_a * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_a.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
+    #[cfg(not(feature = "parallel"))]
+    let mut all_fingerprints: Vec<FieldElement<E>> = {
+        let mut v = Vec::with_capacity(2 * trace_len);
+        for row in 0..trace_len {
+            v.push(logup_row_fingerprint(
                 row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_a,
-                &shifts,
-            );
-            alpha_offset += consumed;
-        }
-        all_fingerprints.push(z - &lc_a);
-    }
-    for row in 0..trace_len {
-        let mut lc_b = &bus_id_b * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_b.values {
-            let consumed = bv.accumulate_fingerprint(
+                interaction_a,
                 main_segment_cols,
-                row,
                 &alpha_powers,
-                alpha_offset,
-                &mut lc_b,
+                z,
+                &bus_id_a,
                 &shifts,
-            );
-            alpha_offset += consumed;
+            ));
         }
-        all_fingerprints.push(z - &lc_b);
-    }
+        for row in 0..trace_len {
+            v.push(logup_row_fingerprint(
+                row,
+                interaction_b,
+                main_segment_cols,
+                &alpha_powers,
+                z,
+                &bus_id_b,
+                &shifts,
+            ));
+        }
+        v
+    };
 
     // Single batch inversion for all 2*N fingerprints
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
