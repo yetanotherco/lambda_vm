@@ -318,6 +318,118 @@ fn collect_cpu_ops(
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops)
 #[allow(clippy::type_complexity)]
+/// Collect all sub-operations from CPU ops.
+///
+/// disk-spill: memw_ops are written to a temp file incrementally (via `SpilledVecWriter`)
+/// instead of accumulating in a Vec, avoiding the ~83 GB heap peak at 128M steps.
+/// Returns a `SpilledVec<MemwOperation>` that reads back via mmap.
+///
+/// non-disk-spill: memw_ops are collected in a Vec as before.
+#[cfg(feature = "disk-spill")]
+fn collect_ops_from_cpu(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> Result<
+    (
+        SpilledVec<MemwOperation>,
+        Vec<LoadOperation>,
+        Vec<LtOperation>,
+        Vec<ShiftOperation>,
+        Vec<BitwiseOperation>,
+        Vec<CommitOperation>,
+    ),
+    std::io::Error,
+> {
+    let mut memw_writer = SpilledVecWriter::new()?;
+    let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
+    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
+    let mut commit_ops = Vec::new();
+    let mut current_commit_index = 0u32;
+    let mut commit_ecall_count = 0u32;
+
+    for op in cpu_ops {
+        if op.decode.op_load {
+            let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
+            memw_writer.push(memw_op)?;
+            load_ops.push(load_op);
+            bitwise_ops.extend(lookups);
+        } else if op.decode.op_store {
+            let memw_op = collect_store_op_from_cpu(op, memory_state);
+            memw_writer.push(memw_op)?;
+        }
+
+        let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
+        for memw_op in reg_memw_ops {
+            memw_writer.push(memw_op)?;
+        }
+
+        if op.ecall_commit {
+            commit_ops.extend(expand_commit_operations_for_ecall(
+                op,
+                memory_state,
+                current_commit_index as u64,
+            ));
+            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
+            for memw_op in reg_commit_ops {
+                memw_writer.push(memw_op)?;
+            }
+            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            current_commit_index = current_commit_index
+                .checked_add(count)
+                .expect("commit index exceeds u32 range");
+            debug_assert_eq!(
+                current_commit_index,
+                register_state.read_index().0,
+                "commit index drift: current_commit_index and register_state.index_register must stay in sync"
+            );
+            commit_ecall_count += 1;
+        }
+
+        if op.decode.op_slt || op.decode.op_blt {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
+        }
+
+        if op.decode.op_shift {
+            let input = op.compute_arg1();
+            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
+            let direction = op.decode.mp_selector;
+            let signed = op.decode.signed;
+            let word_instr = op.decode.word_instr;
+            shift_ops.push(ShiftOperation::new(
+                input,
+                shift_amount,
+                direction,
+                signed,
+                word_instr,
+            ));
+        }
+
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
+
+    debug_assert_eq!(
+        commit_ops.len(),
+        current_commit_index as usize + commit_ecall_count as usize,
+        "commit_ops count should match accumulated commit index plus end rows"
+    );
+
+    let spilled_memw = memw_writer.finish()?;
+    Ok((
+        spilled_memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+    ))
+}
+
+#[cfg(not(feature = "disk-spill"))]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -340,9 +452,6 @@ fn collect_ops_from_cpu(
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
-        // --- MEMW and LOAD (require state tracking, order matters) ---
-
-        // Collect memory operations for Load/Store instructions
         if op.decode.op_load {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
@@ -353,11 +462,9 @@ fn collect_ops_from_cpu(
             memw_ops.push(memw_op);
         }
 
-        // Collect register operations (M1, M3, M5)
         let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
         memw_ops.extend(reg_memw_ops);
 
-        // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
             commit_ops.extend(expand_commit_operations_for_ecall(
                 op,
@@ -378,20 +485,16 @@ fn collect_ops_from_cpu(
             commit_ecall_count += 1;
         }
 
-        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
-
-        // Collect LT operations from SLT/BLT instructions
         if op.decode.op_slt || op.decode.op_blt {
             let arg1 = op.compute_arg1();
             let arg2 = op.compute_arg2();
             lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
         }
 
-        // Collect SHIFT operations
         if op.decode.op_shift {
             let input = op.compute_arg1();
             let shift_amount = (op.compute_arg2() & 0xFF) as u8;
-            let direction = op.decode.mp_selector; // 0=left, 1=right
+            let direction = op.decode.mp_selector;
             let signed = op.decode.signed;
             let word_instr = op.decode.word_instr;
             shift_ops.push(ShiftOperation::new(
@@ -403,11 +506,9 @@ fn collect_ops_from_cpu(
             ));
         }
 
-        // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    // Each ecall generates count+1 operations (count real rows + 1 end row)
     debug_assert_eq!(
         commit_ops.len(),
         current_commit_index as usize + commit_ecall_count as usize,
@@ -1508,37 +1609,69 @@ struct SpilledVec<T> {
 
 #[cfg(feature = "disk-spill")]
 impl<T> SpilledVec<T> {
-    fn spill(vec: Vec<T>) -> std::io::Result<Self> {
-        use std::io::Write;
-
-        let len = vec.len();
-        let elem_size = std::mem::size_of::<T>();
-        let total_bytes = len * elem_size;
-
-        let file = tempfile::tempfile()?;
-        file.set_len(total_bytes as u64)?;
-        {
-            let mut writer = std::io::BufWriter::new(&file);
-            let bytes =
-                unsafe { std::slice::from_raw_parts(vec.as_ptr() as *const u8, total_bytes) };
-            writer.write_all(bytes)?;
-            writer.flush()?;
-        }
-        drop(vec);
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Ok(Self {
-            mmap,
-            _file: file,
-            len,
-            _marker: std::marker::PhantomData,
-        })
-    }
-
     fn as_slice(&self) -> &[T] {
         if self.len == 0 {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(self.mmap.as_ptr() as *const T, self.len) }
+    }
+}
+
+/// Streaming writer that appends elements to a temp file, then finalizes as a `SpilledVec`.
+///
+/// Elements are buffered in memory and flushed to disk periodically.
+/// At 128M steps, this avoids the 83 GB memw_ops heap peak by writing
+/// to disk as ops are collected instead of accumulating in a Vec.
+#[cfg(feature = "disk-spill")]
+struct SpilledVecWriter<T> {
+    writer: std::io::BufWriter<std::fs::File>,
+    file_for_mmap: std::fs::File,
+    len: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+#[cfg(feature = "disk-spill")]
+impl<T> SpilledVecWriter<T> {
+    fn new() -> std::io::Result<Self> {
+        let file = tempfile::tempfile()?;
+        // Dup the fd so we can write via BufWriter and later mmap via the original fd.
+        let file_for_mmap = file.try_clone()?;
+        let writer = std::io::BufWriter::new(file);
+        Ok(Self {
+            writer,
+            file_for_mmap,
+            len: 0,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn push(&mut self, val: T) -> std::io::Result<()> {
+        use std::io::Write;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&val as *const T as *const u8, std::mem::size_of::<T>())
+        };
+        self.writer.write_all(bytes)?;
+        self.len += 1;
+        std::mem::forget(val);
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<SpilledVec<T>> {
+        use std::io::Write;
+        self.writer.flush()?;
+        drop(self.writer);
+        if self.len == 0 {
+            // Write 1 byte so the file isn't empty (mmap requires non-zero length).
+            use std::io::Write;
+            (&self.file_for_mmap).write_all(&[0])?;
+        }
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&self.file_for_mmap)? };
+        Ok(SpilledVec {
+            mmap,
+            _file: self.file_for_mmap,
+            len: self.len,
+            _marker: std::marker::PhantomData,
+        })
     }
 }
 
@@ -1785,13 +1918,24 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
+        // disk-spill: memw_ops spilled to disk during collection (SpilledVec).
+        // non-disk-spill: memw_ops collected in a Vec as before.
+        #[cfg(feature = "disk-spill")]
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)
+                .map_err(|e| Error::Prover(format!("disk-spill collect_ops: {e}")))?;
+        #[cfg(not(feature = "disk-spill"))]
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
         let halt_memw_ops = collect_halt_ops(&mut register_state);
-        memw_ops.extend(halt_memw_ops);
+        #[cfg(not(feature = "disk-spill"))]
+        {
+            memw_ops.extend(halt_memw_ops.clone());
+        }
+        // disk-spill: halt_memw_ops (tiny, ~33 entries) processed in the MEMW chunk loop.
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -1871,10 +2015,8 @@ impl Traces {
 
         #[cfg(feature = "disk-spill")]
         let (memws, memw_lts) = {
-            eprintln!("[phase] Spilling memw_ops to disk...");
-            let spilled_memw = SpilledVec::spill(memw_ops)
-                .map_err(|e| Error::Prover(format!("disk-spill memw_ops: {e}")))?;
-            let memw_slice = spilled_memw.as_slice();
+            // memw_ops is already a SpilledVec (written to disk during collection).
+            let memw_slice = memw_ops.as_slice();
 
             let mut memws = Vec::new();
             let mut memw_lts = Vec::new();
@@ -1884,14 +2026,12 @@ impl Traces {
                 memw_slice.chunks(max_rows.memw).collect()
             };
             for chunk in &chunks {
-                // MEMW trace → spill
                 let mut t = memw::generate_memw_trace(chunk);
                 t.main_table
                     .spill_to_disk()
                     .map_err(|e| Error::Prover(format!("disk-spill memw trace: {e}")))?;
                 memws.push(t);
 
-                // LT ops from this chunk → LT bitwise → LT traces → spill
                 let chunk_lt = collect_lt_from_memw(chunk);
                 let chunk_lt_bitwise = collect_bitwise_from_lt(&chunk_lt);
                 bitwise::update_multiplicities(&mut bitwise_table, &chunk_lt_bitwise);
@@ -1904,6 +2044,26 @@ impl Traces {
                     memw_lts.push(lt_t);
                 }
             }
+            // Also process halt MEMW ops (tiny, ~33 entries)
+            {
+                let mut t = memw::generate_memw_trace(&halt_memw_ops);
+                t.main_table
+                    .spill_to_disk()
+                    .map_err(|e| Error::Prover(format!("disk-spill halt-memw trace: {e}")))?;
+                memws.push(t);
+
+                let halt_lt = collect_lt_from_memw(&halt_memw_ops);
+                let halt_lt_bitwise = collect_bitwise_from_lt(&halt_lt);
+                bitwise::update_multiplicities(&mut bitwise_table, &halt_lt_bitwise);
+                for lt_chunk in halt_lt.chunks(max_rows.lt) {
+                    let mut lt_t = lt::generate_lt_trace(lt_chunk);
+                    lt_t.main_table
+                        .spill_to_disk()
+                        .map_err(|e| Error::Prover(format!("disk-spill halt-lt trace: {e}")))?;
+                    memw_lts.push(lt_t);
+                }
+            }
+            drop(memw_ops); // drop the SpilledVec (releases mmap + temp file)
             (memws, memw_lts)
         };
         #[cfg(not(feature = "disk-spill"))]
@@ -2121,13 +2281,29 @@ impl Traces {
         // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
+        #[cfg(feature = "disk-spill")]
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)
+                .map_err(|e| Error::Prover(format!("disk-spill collect_ops: {e}")))?;
+        #[cfg(not(feature = "disk-spill"))]
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
-        // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
         let halt_memw_ops = collect_halt_ops(&mut register_state);
-        memw_ops.extend(halt_memw_ops);
+        // Unify memw_ops into a slice for both disk-spill (SpilledVec) and non-disk-spill (Vec).
+        #[cfg(feature = "disk-spill")]
+        let memw_combined = {
+            let mut v = Vec::from(memw_ops.as_slice());
+            v.extend(halt_memw_ops);
+            v
+        };
+        #[cfg(not(feature = "disk-spill"))]
+        let memw_combined = {
+            memw_ops.extend(halt_memw_ops);
+            memw_ops
+        };
+        let memw_ops = &memw_combined[..];
 
         // Collect MUL operations from CPU ops where op_mul = true
         let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
@@ -2194,7 +2370,7 @@ impl Traces {
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw(memw_ops));
 
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
@@ -2233,7 +2409,7 @@ impl Traces {
         let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memws = chunk_and_generate(memw_ops, max_rows.memw, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
