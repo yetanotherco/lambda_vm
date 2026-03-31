@@ -1493,6 +1493,55 @@ pub struct Traces {
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
+/// A Vec<T> spilled to a temp file, accessed via mmap as &[T].
+///
+/// Used to offload large op vectors (e.g. memw_ops at 128M steps ≈ 83 GB)
+/// to disk, freeing heap while retaining random access via mmap.
+/// T must be a plain-old-data type (no pointers, no Drop).
+#[cfg(feature = "disk-spill")]
+struct SpilledVec<T> {
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+    len: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+#[cfg(feature = "disk-spill")]
+impl<T> SpilledVec<T> {
+    fn spill(vec: Vec<T>) -> std::io::Result<Self> {
+        use std::io::Write;
+
+        let len = vec.len();
+        let elem_size = std::mem::size_of::<T>();
+        let total_bytes = len * elem_size;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes as u64)?;
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            let bytes =
+                unsafe { std::slice::from_raw_parts(vec.as_ptr() as *const u8, total_bytes) };
+            writer.write_all(bytes)?;
+            writer.flush()?;
+        }
+        drop(vec);
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Ok(Self {
+            mmap,
+            _file: file,
+            len,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn as_slice(&self) -> &[T] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr() as *const T, self.len) }
+    }
+}
+
 /// Chunk raw ops and generate one trace table per chunk.
 fn chunk_and_generate<T>(
     ops: &[T],
@@ -1809,7 +1858,43 @@ impl Traces {
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        // disk-spill: spill memw_ops to disk first to free ~83 GB at 128M scale,
+        // then generate MEMW traces + LT-from-MEMW in chunks from the mmap.
+        // non-disk-spill: original in-memory path.
+        #[cfg(feature = "disk-spill")]
+        let (memws, memw_lt_ops) = {
+            eprintln!("[phase] Spilling memw_ops to disk...");
+            let spilled_memw = SpilledVec::spill(memw_ops)
+                .map_err(|e| Error::Prover(format!("disk-spill memw_ops: {e}")))?;
+            let memw_slice = spilled_memw.as_slice();
+
+            // Generate MEMW traces + collect LT ops in chunks to avoid
+            // holding all MEMW LT ops (up to 73 GB) in memory at once.
+            let mut memws = Vec::new();
+            let mut memw_lt_ops = Vec::new();
+            let chunks: Vec<&[MemwOperation]> = if memw_slice.is_empty() {
+                vec![&[][..]]
+            } else {
+                memw_slice.chunks(max_rows.memw).collect()
+            };
+            for chunk in &chunks {
+                // Generate MEMW trace for this chunk + spill
+                let mut t = memw::generate_memw_trace(chunk);
+                t.main_table
+                    .spill_to_disk()
+                    .map_err(|e| Error::Prover(format!("disk-spill memw trace: {e}")))?;
+                memws.push(t);
+
+                // Collect LT ops from this chunk (timestamp ordering checks)
+                memw_lt_ops.extend(collect_lt_from_memw(chunk));
+            }
+            // spilled_memw drops here, freeing the mmap + temp file
+            (memws, memw_lt_ops)
+        };
+        #[cfg(not(feature = "disk-spill"))]
+        let memw_lt_ops = collect_lt_from_memw(&memw_ops);
+
+        lt_ops.extend(memw_lt_ops);
 
         // =====================================================================
         // PHASE 4+5: Interleaved bitwise flush, trace generation, and drops
@@ -1908,8 +1993,10 @@ impl Traces {
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
-        // --- Generate MEMW traces + drop memw_ops ---
+        // --- Generate MEMW traces (disk-spill: already done above) ---
+        #[cfg(not(feature = "disk-spill"))]
         let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        #[cfg(not(feature = "disk-spill"))]
         drop(memw_ops);
 
         // --- Flush LT bitwise + generate LT traces + drop lt_ops ---
