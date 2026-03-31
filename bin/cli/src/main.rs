@@ -283,6 +283,7 @@ fn cmd_prove(
             prover::MaxRowsConfig {
                 cpu: mr,
                 memw: mr,
+                memw_aligned: mr,
                 dvrm: mr,
                 mul: mr,
                 lt: mr,

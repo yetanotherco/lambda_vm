@@ -35,10 +35,6 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
         Some(15)
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<StarkField, StarkField>,
@@ -89,10 +85,6 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 
     fn constraint_idx(&self) -> usize {
         1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
     }
 
     fn period(&self) -> usize {

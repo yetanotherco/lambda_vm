@@ -13,14 +13,10 @@ math = { path = "../math", features = [
     "lambdaworks-serde-binary",
 ] }
 crypto = { path = "../crypto", features = ["std", "serde"] }
-rand = "0.8.5"
 thiserror = "1.0.38"
 log = "0.4.17"
-bincode = { version = "2.0.1", features = ["serde"] }
 sha3 = "0.10.8"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-num-integer = "0.1.45"
 itertools = "0.11.0"
 
 # Parallelization crates
@@ -37,16 +33,12 @@ web-sys = { version = "0.3.64", features = ['console'], optional = true }
 serde_cbor = { version = "0.11.1" }
 
 [dev-dependencies]
-hex = "0.4.3"
 criterion = { version = "0.4", default-features = false }
 env_logger = "*"
 test-log = { version = "0.2.11", features = ["log"] }
-assert_matches = "1.5.0"
-rstest = "0.17.0"
-rand = "0.8.5"
-wasm-bindgen-test = "0.3.0"
 
 [features]
+test-utils = []
 test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
@@ -54,8 +46,6 @@ parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "crypto/disk-spill"]
 
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
-proptest = "1.2.0"
 
 [package.metadata.wasm-pack.profile.dev]
 # Should `wasm-opt` be used to further optimize the wasm binary generated after
@@ -81,7 +71,9 @@ omit-default-module-path = false
 [[bench]]
 name = "prover_benchmark"
 harness = false
+required-features = ["test-utils"]
 
 [[bench]]
 name = "profile_prover"
 harness = false
+required-features = ["test-utils"]

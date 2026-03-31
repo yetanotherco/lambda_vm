@@ -181,19 +181,6 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
-    /// Given a slice of field elements representing a row, appends it to
-    /// the end of the table.
-    pub fn append_row(&mut self, row: &[FieldElement<F>]) {
-        debug_assert_eq!(row.len(), self.width);
-        self.data.extend_from_slice(row);
-        self.height += 1
-    }
-
-    /// Returns a reference to the last row of the table
-    pub fn last_row(&self) -> &[FieldElement<F>] {
-        self.get_row(self.height - 1)
-    }
-
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
