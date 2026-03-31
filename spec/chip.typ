@@ -74,7 +74,11 @@
     let nr-indirect-interactions = template-constraints
       .map(c => {
         let iter-size = get_interaction_count(c)
-        let template-interactions = lookup-table.at(c.tag, default: 0)
+        assert(
+          c.tag in lookup-table, 
+          message: "cannot find interaction_count for " + repr(c)
+        )
+        let template-interactions = lookup-table.at(c.tag)
 
         iter-size * template-interactions 
       })
@@ -90,7 +94,9 @@
 
 #let get_nr_interactions(chip) = {
   context {
-    query(<interaction_count>).map(c=>c.value).sum().at(chip.name)
+    let lut = query(<interaction_count>).map(c=>c.value).sum(default: (:))
+    assert(chip.name in lut, message: "no interaction_count specified for " + repr(chip.name))
+    lut.at(chip.name)
   }
 }
 
