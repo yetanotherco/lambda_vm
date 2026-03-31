@@ -247,18 +247,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Memory bus interactions (16 total)
     // -------------------------------------------------------------------------
     // address_add[i] is VIRTUAL:
-    //   lo = base_address_0 + (i+1) - 2^32 * add_limb_overflow[i]
-    //   hi = base_address_1 + add_limb_overflow[i]
+    //   lo = base_address_0 + (i+1) - 2^32 * carry[i]
+    //   hi = base_address_1 + carry[i]
     //
     // Safety: `hi` is at most `base_address_1 + 1`. This never reaches 2^32
     // because the CPU table splits addresses into (lo, hi) with both halves
     // in [0, 2^32), and the Memw bus ties MEMW's base_address to the CPU's
     // value. MEMW only receives accesses where base_address_1 <= 0xFFFF_FFFE
     // (addresses near u64::MAX are rejected by the executor before proving).
-    // Consequently, `add_limb_overflow[i]` is implicitly correct: a wrong
-    // carry bit produces a memory token at a wrong address that has no
-    // matching PAGE/REGISTER token, causing multiset imbalance and an
-    // invalid proof.
+    // Consequently, `carry[i]` is implicitly correct: a wrong carry bit
+    // produces a memory token at a wrong address that has no matching
+    // PAGE/REGISTER token, causing multiset imbalance and an invalid proof.
 
     // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
@@ -325,8 +324,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // CM10/11: byte 1, multiplicity w2 = write2 + write4 + write8
-    // address_add[0] is virtual: lo = base_address_0 + 1 - 2^32 * overflow[0]
-    //                            hi = base_address_1 + overflow[0]
+    // address_add[0] is virtual: lo = base_address_0 + 1 - 2^32 * carry[0]
+    //                            hi = base_address_1 + carry[0]
     let addr_add_0_lo = BusValue::linear(vec![
         LinearTerm::Column {
             coefficient: 1,
@@ -859,7 +858,7 @@ where
 }
 
 // =========================================================================
-// Constraints (9 total: 2 custom + 7 IS_BIT)
+// Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
 // =========================================================================
 
 /// MEMW table constraint kinds.
@@ -1028,30 +1027,30 @@ mod tests {
     }
 
     #[test]
-    fn test_add_limb_overflow() {
-        // Address 0xFFFF_FFFF should overflow when adding 1
+    fn test_carry_flags() {
+        // Address 0xFFFF_FFFF should carry when adding 1
         let op =
             MemwOperation::new(false, 0xFFFF_FFFF, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
         let trace = generate_memw_trace(&[op]);
 
-        // All 7 overflow flags should be 1 since 0xFFFF_FFFF + i >= 2^32 for i >= 1
+        // All 7 carry flags should be 1 since 0xFFFF_FFFF + i >= 2^32 for i >= 1
         for i in 0..7 {
             let val = trace.get_main(0, cols::CARRY[i]);
-            assert_eq!(*val, FE::one(), "overflow[{i}] should be 1");
+            assert_eq!(*val, FE::one(), "carry[{i}] should be 1");
         }
 
-        // Address 0x0000_0000 should not overflow
+        // Address 0x0000_0000 should not carry
         let op2 =
             MemwOperation::new(false, 0x0000_0000, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
         let trace2 = generate_memw_trace(&[op2]);
         for i in 0..7 {
             let val = trace2.get_main(0, cols::CARRY[i]);
-            assert_eq!(*val, FE::zero(), "overflow[{i}] should be 0");
+            assert_eq!(*val, FE::zero(), "carry[{i}] should be 0");
         }
 
         // Address 0xFFFF_FFFE with width=8 exercises mixed per-byte carry bits:
-        // overflow[0]=0 (0xFFFF_FFFE+1 = 0xFFFF_FFFF < 2^32)
-        // overflow[1..6]=1 (0xFFFF_FFFE+2..8 >= 2^32)
+        // carry[0]=0 (0xFFFF_FFFE+1 = 0xFFFF_FFFF < 2^32)
+        // carry[1..6]=1 (0xFFFF_FFFE+2..8 >= 2^32)
         let op3 =
             MemwOperation::new(false, 0xFFFF_FFFE, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
         let trace3 = generate_memw_trace(&[op3]);
@@ -1059,14 +1058,14 @@ mod tests {
         assert_eq!(
             *val0,
             FE::zero(),
-            "overflow[0] should be 0 for base 0xFFFF_FFFE"
+            "carry[0] should be 0 for base 0xFFFF_FFFE"
         );
         for i in 1..7 {
             let val = trace3.get_main(0, cols::CARRY[i]);
             assert_eq!(
                 *val,
                 FE::one(),
-                "overflow[{i}] should be 1 for base 0xFFFF_FFFE"
+                "carry[{i}] should be 1 for base 0xFFFF_FFFE"
             );
         }
     }

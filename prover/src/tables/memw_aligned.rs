@@ -19,7 +19,7 @@
 //! - `mu_read`, `mu_write`: multiplicity columns
 //!
 //! ## Bus Interactions (20)
-//! - 1 IS_HALF[base_address[0] + mask] (alignment check)
+//! - 1 IS_HALF[base_address[0] + mask] (range check: address span fits in 16 bits)
 //! - 1 LT[old_timestamp, timestamp, 0] → 1
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
@@ -153,9 +153,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_HALF[base_address[0] + write2 + 3*write4 + 7*write8] with μ_sum
-    // Checks alignment: adding the access size to the low half doesn't overflow
-    // the 16-bit range. Since base_address[0] is assumed IS_HALF and mask ≤ 7,
-    // this ensures base_address[0] + mask < 2^16.
+    // Range check: ensures base_address[0] + mask fits in 16 bits, so the
+    // byte-address span of the access doesn't overflow the low-half field element.
+    // Alignment itself is the caller's (CPU's) responsibility — see Assumptions above.
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::IsHalfword,
