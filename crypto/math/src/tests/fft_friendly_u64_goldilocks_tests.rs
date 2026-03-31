@@ -5,6 +5,8 @@ use crate::field::goldilocks::{
 use crate::field::traits::{IsFFTField, IsField, IsPrimeField};
 use crate::traits::ByteConversion;
 
+const EPSILON: u64 = 0xFFFF_FFFF;
+
 type F = GoldilocksField;
 type FE = FieldElement<F>;
 
@@ -419,5 +421,167 @@ mod fft_tests {
             let (poly, new_poly) = gen_fft_interpolate_and_evaluate(poly);
             prop_assert_eq!(poly, new_poly);
         }
+    }
+}
+
+// =====================================================
+// NON-CANONICAL / EDGE-CASE TESTS
+// =====================================================
+//
+// These test the double-overflow and double-underflow paths in add/sub,
+// which are only reachable with non-canonical inputs (values >= p).
+
+/// Reference modular add using u128 to avoid overflow.
+/// Canonicalizes inputs first so non-canonical u64 values work correctly.
+fn ref_add(a: u64, b: u64) -> u64 {
+    let a = (a % GOLDILOCKS_PRIME) as u128;
+    let b = (b % GOLDILOCKS_PRIME) as u128;
+    ((a + b) % GOLDILOCKS_PRIME as u128) as u64
+}
+
+/// Reference modular sub using u128 to avoid underflow.
+/// Canonicalizes inputs first so non-canonical u64 values work correctly.
+fn ref_sub(a: u64, b: u64) -> u64 {
+    let a = (a % GOLDILOCKS_PRIME) as u128;
+    let b = (b % GOLDILOCKS_PRIME) as u128;
+    let p = GOLDILOCKS_PRIME as u128;
+    ((a + p - b) % p) as u64
+}
+
+#[test]
+fn add_double_overflow_both_max() {
+    // a = b = u64::MAX, the most extreme double-overflow case.
+    let a = u64::MAX;
+    let b = u64::MAX;
+    let result = F::add(&a, &b);
+    assert_eq!(F::canonical(&result), ref_add(a, b));
+}
+
+#[test]
+fn add_double_overflow_threshold() {
+    // Double overflow fires when a + b >= 2^65 - EPSILON.
+    // Minimum case: a = p + 1, b = u64::MAX.
+    let a = GOLDILOCKS_PRIME + 1;
+    let b = u64::MAX;
+    let result = F::add(&a, &b);
+    assert_eq!(F::canonical(&result), ref_add(a, b));
+}
+
+#[test]
+fn add_no_double_overflow_at_boundary() {
+    // a = p, b = u64::MAX should NOT trigger double overflow
+    // (a + b = 2^65 - EPSILON - 1, one below the threshold).
+    let a = GOLDILOCKS_PRIME;
+    let b = u64::MAX;
+    let result = F::add(&a, &b);
+    assert_eq!(F::canonical(&result), ref_add(a, b));
+}
+
+#[test]
+fn add_non_canonical_symmetric() {
+    // Both inputs just above p.
+    for offset in 1..=EPSILON {
+        let a = GOLDILOCKS_PRIME + offset;
+        let b = GOLDILOCKS_PRIME + offset;
+        let result = F::add(&a, &b);
+        assert_eq!(
+            F::canonical(&result),
+            ref_add(a, b),
+            "failed for offset={}",
+            offset
+        );
+        // Only test a few representative values, not all 2^32-1.
+        if offset > 16 {
+            break;
+        }
+    }
+}
+
+#[test]
+fn sub_double_underflow_extreme() {
+    // a = 0, b = u64::MAX: maximum underflow.
+    let a = 0u64;
+    let b = u64::MAX;
+    let result = F::sub(&a, &b);
+    assert_eq!(F::canonical(&result), ref_sub(a, b));
+}
+
+#[test]
+fn sub_double_underflow_small_a_large_b() {
+    // a just below EPSILON - 1, b well above p.
+    let a = EPSILON - 2; // 2^32 - 3
+    let b = u64::MAX;
+    let result = F::sub(&a, &b);
+    assert_eq!(F::canonical(&result), ref_sub(a, b));
+}
+
+#[test]
+fn sub_no_double_underflow_at_boundary() {
+    // a = EPSILON - 1 = 2^32 - 2, b = u64::MAX.
+    // diff1 = EPSILON, diff1 - EPSILON = 0 (no second underflow).
+    let a = EPSILON - 1;
+    let b = u64::MAX;
+    let result = F::sub(&a, &b);
+    assert_eq!(F::canonical(&result), ref_sub(a, b));
+}
+
+#[test]
+fn sub_non_canonical_b() {
+    // b values just above p, a = 0.
+    for offset in 1..=16u64 {
+        let a = 0u64;
+        let b = GOLDILOCKS_PRIME + offset;
+        let result = F::sub(&a, &b);
+        assert_eq!(
+            F::canonical(&result),
+            ref_sub(a, b),
+            "failed for b = p + {}",
+            offset
+        );
+    }
+}
+
+#[test]
+fn add_sub_roundtrip_non_canonical() {
+    // For non-canonical inputs, (a + b) - b should equal a (mod p).
+    let test_cases: Vec<(u64, u64)> = vec![
+        (u64::MAX, u64::MAX),
+        (u64::MAX, GOLDILOCKS_PRIME + 1),
+        (u64::MAX - 1, GOLDILOCKS_PRIME + 1),
+        (0, u64::MAX),
+        (1, u64::MAX - 1),
+    ];
+    for (a, b) in test_cases {
+        let sum = F::add(&a, &b);
+        let back = F::sub(&sum, &b);
+        assert_eq!(
+            F::canonical(&back),
+            F::canonical(&a),
+            "roundtrip failed for a={:#x}, b={:#x}",
+            a,
+            b
+        );
+    }
+}
+
+#[test]
+fn mul_non_canonical_inputs() {
+    // Multiplication should produce correct results even with non-canonical inputs.
+    let test_cases: Vec<(u64, u64)> = vec![
+        (u64::MAX, u64::MAX),
+        (GOLDILOCKS_PRIME, GOLDILOCKS_PRIME),
+        (GOLDILOCKS_PRIME + 1, u64::MAX),
+        (u64::MAX - 1, 2),
+    ];
+    let ref_mul = |a: u64, b: u64| ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
+    for (a, b) in test_cases {
+        let result = F::mul(&a, &b);
+        assert_eq!(
+            F::canonical(&result),
+            ref_mul(a, b),
+            "mul failed for a={:#x}, b={:#x}",
+            a,
+            b
+        );
     }
 }
