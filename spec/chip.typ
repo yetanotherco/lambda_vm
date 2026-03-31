@@ -293,7 +293,7 @@
   } else if type(groups) == str {
     groups = (groups,)
   }
-  assert(groups.all(group => group in all_groups), message: "unknown group")
+  assert(groups.all(group => group in all_groups), message: "unknown group: " + repr(groups))
   let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
   // Find the group definition in the constraint_groups
