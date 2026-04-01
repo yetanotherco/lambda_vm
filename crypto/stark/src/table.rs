@@ -30,12 +30,6 @@ impl Clone for TableMmapBacking {
     }
 }
 
-#[cfg(feature = "disk-spill")]
-impl Default for TableMmapBacking {
-    fn default() -> Self {
-        panic!("TableMmapBacking has no default — use None")
-    }
-}
 
 #[cfg(feature = "disk-spill")]
 impl std::fmt::Debug for TableMmapBacking {
