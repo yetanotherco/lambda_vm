@@ -153,10 +153,8 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
-    /// Spill the main trace data to disk via mmap.
-    /// After this call, `main_table.data` is freed but all accessors
-    /// (`get_main`, `columns_main`, `extract_columns_main_into`) continue
-    /// to work transparently through mmap.
+    /// Write main trace data to a temp file and free the in-memory vector.
+    /// Accessors read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
         self.main_table.spill_to_disk()
