@@ -12,49 +12,54 @@ type = "BaseField"
 desc = "index of the permutation round"
 
 [[variables.input]]
-name = "A"
+name = "start"
 type = [[["Byte", 8], 5], 5]
 desc = "state at the start of executing the permutation"
 
 [[variables.auxiliary]]
 name = "Cxz"
 type = [[["Byte", 8], 4], 5]
-desc = "$:= xor_(i=0)^(y+1) #`A[x,i,z]`$"
+desc = "$xor_(i=0)^(y+2) #`start[x,i,z]`$"
 
 [[variables.auxiliary]]
-name = "Cxz_sub_1"
+name = "Cxz_left"
 type = [["Byte", 8], 5]
-desc = "$:= #`Cxz[x,` 3 #`,` (#`z`-1) mod 5 #`]`$"
+desc = "the left-rotated component of `rotated_Cxz`"
+
+[[variables.auxiliary]]
+name = "Cxz_right"
+type = [["Byte", 8], 5]
+desc = "the right-rotated component of `rotated_Cxz`"
 
 [[variables.auxiliary]]
 name = "Dxz"
 type = [["Byte", 8], 5]
-desc = "$:= #`Cxz[x,y,z]` xor #`Cxz[` (#`x` +1) mod 5, #`y`, (#`z`-1) mod 5 #`]`$"
+desc = "$#`Cxz[x,y,z]` xor #`rotated_Cxz[`\\(#`x` +1) mod 5#`,y,z]`$"
 
 [[variables.auxiliary]]
-name = "A'"
+name = "theta"
 type = [[["Byte", 8], 5], 5]
-desc = "$θ(#`A`)$"
+desc = "$theta(#`start`)$, the state after applying $theta$."
 
 [[variables.auxiliary]]
 name = "rot_left"
 type = [[["Byte", 8], 5], 5]
-desc = "todo"
+desc = "the left-rotated component of $#`theta[x,y]` <<< #`rnc`$"
 
 [[variables.auxiliary]]
 name = "rot_right"
 type = [[["Byte", 8], 5], 5]
-desc = "todo"
+desc = "the right-rotated component of $#`theta[x,y]` <<< #`rnc`$"
 
 [[variables.auxiliary]]
 name = "chi_ANDs"
 type = [[["Byte", 8], 5], 5]
-desc = "todo"
+desc = "$(#`pi[`\\(x+1) mod 5#`,y,z]` xor 255) times.o #`pi[`\\(x + 2) mod 5#`,y,z]`$"
 
 [[variables.auxiliary]]
 name = "chi"
 type = [[["Byte", 8], 5], 5]
-desc = "$χ(#`theta`)$ = θ(#`A`)"
+desc = "$(chi compose pi compose rho compose theta)(#`start`)$; the state after applying $chi$"
 
 [[variables.auxiliary]]
 name = "rc"
@@ -64,7 +69,13 @@ desc = "round constants"
 [[variables.auxiliary]]
 name = "iota"
 type = ["Byte", 8]
-desc = "state after applying `ɩ`."
+desc = "state update following from step $iota$."
+
+[[variables.virtual]]
+name = "rotated_Cxz"
+type = [["Byte", 8], 5]
+desc = "$#`Cxz[x,`3#`,z]` <<< 1$"
+def = {iters=[["x", 0, 4], ["z", 0, 7]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], ["mod", ["-", "z", 1], 8]]]}
 
 [[variables.virtual]]
 name = "out"
@@ -72,15 +83,15 @@ type = [[["Byte", 8], 5], 5]
 desc = "state at the end of executing the permutation"
 def = {polys=[
     {iters=[["x", 0], ["y", 0], ["z", 0, 7]], poly=["idx", "iota","z"]},
-    {iters=[["x", 1, 5], ["y", 0], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
-    {iters=[["x", 0], ["y", 1, 5], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
-    {iters=[["x", 1, 5], ["y", 1, 5], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]}
+    {iters=[["x", 1, 4], ["y", 0], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
+    {iters=[["x", 0], ["y", 1, 4], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
+    {iters=[["x", 1, 4], ["y", 1, 4], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]}
 ]}
 
 [[variables.virtual]]
 name = "rho"
 type = [[["Byte", 8], 5], 5]
-desc = "state after applying `ρ`"
+desc = "$(rho compose theta)(#`start`)$; the state state after applying $rho$"
 def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
     "+", 
     ["*", 
@@ -120,7 +131,7 @@ def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
 [[variables.virtual]]
 name = "pi"
 type = [[["Byte", 8], 5], 5]
-desc = "state after applying `π`"
+desc = "$(pi compose rho compose theta)(#`start`)$; the state after applying $pi$"
 def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=["idx", ["idx", ["idx", "rho", ["mod", ["+", "x", ["*", 3, "y"]], 5]], "x"], "z"]}
 
 [[variables.constant]]
@@ -150,7 +161,7 @@ name = "io"
 [[constraints.io]]
 kind = "interaction"
 tag = "KECCAK"
-input = ["timestamp", "round", "A"]
+input = ["timestamp", "round", "start"]
 multiplicity = ["-", "μ"]
 
 [[constraints.io]]
@@ -159,13 +170,20 @@ tag = "KECCAK"
 input = ["timestamp", ["+", "round", 1], "out"]
 multiplicity = "μ"
 
+[[constraints.io]]
+kind = "interaction"
+tag = "KECCAK_RC"
+input = ["round"]
+output = "rc"
+multiplicity = ["-", "μ"]
+
 [[constraint_groups]]
 name = "theta"
 
 [[constraints.theta]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "A", "x"], 0], "z"], ["idx", ["idx", ["idx", "A", "x"], 1], "z"]]
+input = [["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["idx", ["idx", ["idx", "start", "x"], 1], "z"]]
 output = ["idx", ["idx", ["idx", "Cxz", "x"], 0], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -173,38 +191,50 @@ multiplicity = "μ"
 [[constraints.theta]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["idx", ["idx", "A", "x"], "y"], "z"]]
+input = [["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"]]
 output = ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 1]], "z"]
 iters = [["x", 0, 4], ["y", 2, 4], ["z", 0, 7]]
 multiplicity = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
-tag = "ROT"
-input = [["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordWL"], 1]
-output = ["cast", ["idx", "Cxz_rot", "x"], "DWordWL"]
-iter = ["x", 0, 4]
+tag = "HWSL"
+input = [["idx", ["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordHL"], "z"], 1]
+output = ["arr", ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"], ["idx", ["cast", ["idx", "Cxz_right", "x"], "DWordHL"], "z"]]
+iters = [["x", 0, 4], ["z", 0, 3]]
+multiplicity = "μ"
+
+# Note: these IS_BYTE checks are necessary.
+# Without them, it is possible to prove 0 <<< S evaluates to -1 by setting
+# Cxz_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
+# Cxz_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
+[[constraints.theta]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", ["idx", "Cxz_left", "x"], "z"]]
+iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
 tag = "IS_BYTE"
-input = [["idx", ["idx", "Cxz_rot", "x"], "z"]]
+input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "Cxz", "x"], 3], "z"], ["idx", ["idx", "Cxz_rot", "x"], "z"]]
+input = [["idx", ["idx", ["idx", "Cxz", ["mod", ["-", "x", 1], 5]], 3], "z"], ["idx", ["idx", "rotated_Cxz", ["mod", ["+", "x", 1], 5]], "z"]]
 output = ["idx", ["idx", "Dxz", "x"], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
+ref = "keccak:c:Dxz"
 
 [[constraints.theta]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "A", "x"], "y"], "z"], ["idx", ["idx", "Dxz", "x"], "z"]]
+input = [["idx", ["idx", ["idx", "start", "x"], "y"], "z"], ["idx", ["idx", "Dxz", "x"], "z"]]
 output = ["idx", ["idx", ["idx", "theta", "x"], "y"], "z"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -212,6 +242,18 @@ multiplicity = "μ"
 [[constraint_groups]]
 name = "rho"
 
+[[constraints.rho]]
+kind = "interaction"
+tag = "HWSL"
+input = [["idx", ["cast", ["idx", ["idx", "theta", "x"], "y"], "DWordHL"], "z"], ["idx", ["idx", "rnc", "x"], "y"]]
+output = ["arr", ["idx", ["cast", ["idx", ["idx", "rot_left", "x"], "y"], "DWordHL"], "z"], ["idx", ["cast", ["idx", ["idx", "rot_right", "x"], "y"], "DWordHL"], "z"]]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
+multiplicity = "μ"
+
+# Note: these IS_BYTE checks are necessary.
+# Without them, it is possible to prove 0 <<< S evaluates to -1 by setting
+# rot_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
+# rot_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
 [[constraints.rho]]
 kind = "interaction"
 tag = "IS_BYTE"
@@ -224,14 +266,6 @@ kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
-
-[[constraints.rho]]
-kind = "interaction"
-tag = "HWSL"
-input = [["idx", ["cast", ["idx", ["idx", "theta", "x"], "y"], "DWordHL"], "z"], ["idx", ["idx", "rc", "x"], "y"]]
-output = ["arr", ["idx", ["cast", ["idx", ["idx", "rot_left", "x"], "y"], "DWordHL"], "z"], ["idx", ["cast", ["idx", ["idx", "rot_right", "x"], "y"], "DWordHL"], "z"]]
-iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
 
 [[constraint_groups]]
@@ -248,7 +282,7 @@ multiplicity = "μ"
 [[constraints.chi]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "rho", "x"], "y"], "z"], ["idx",["idx",["idx", "chi_ANDs", "x"], "y"], "z"]]
+input = [["idx", ["idx", ["idx", "pi", "x"], "y"], "z"], ["idx",["idx",["idx", "chi_ANDs", "x"], "y"], "z"]]
 output = ["idx", ["idx", ["idx", "chi", "x"], "y"], "z"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -259,7 +293,7 @@ name = "iota"
 [[constraints.iota]]
 kind = "interaction"
 tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "chi", 0], 0], "z"], ["idx","rc", "z"]]
+input = [["idx", ["idx", ["idx", "chi", 0], 0], "z"], ["idx","rc","z"]]
 output = ["idx", "iota", "z"]
 iter = ["z", 0, 7]
 multiplicity = "μ"
