@@ -94,3 +94,15 @@ Lastly, the round chip contributes the following interactions to the lookup:
 == Optimizations
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
 - $#`rc[2]` = #`rc[4]` = #`rc[5]` = #`rc[6]` = 0$. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the $iota$-step. This saves 8 columns and 4 `XOR_BYTE` interactions.
+
+= Round constant lookup
+#let rc_chip = load_chip("src/keccak_rc.toml", config)
+#let keccak_rc = raw(rc_chip.name)
+
+== Columns
+#let nr_variables = total_nr_variables(rc_chip)
+#let nr_columns = total_nr_instantiated_columns(rc_chip, config)
+
+We provide the round constants through a short precomputed lookup table: #keccak_rc.
+#render_chip_variable_table(rc_chip, config)
+#render_constraint_table(rc_chip, config)
