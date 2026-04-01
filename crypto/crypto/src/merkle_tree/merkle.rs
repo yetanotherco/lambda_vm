@@ -116,10 +116,8 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
-                // SAFETY: B::Node is Copy (required by spill_nodes_to_disk's where clause).
-                // The mmap contains node_count × node_size contiguous bytes written from
-                // identical Node values on the same machine. The mmap base is page-aligned
-                // and node_size divides into page size for all concrete Node types ([u8; 32/64]).
+                // SAFETY: The mmap contains node_count × node_size contiguous bytes
+                // written from identical Node values. B::Node is [u8; N] (align 1).
                 let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
