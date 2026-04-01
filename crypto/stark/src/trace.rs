@@ -381,12 +381,8 @@ where
         self.lde_step_size * step
     }
 
-    /// Write pool column data to a temp file, mmap it, and return an mmap-backed
-    /// LDETraceTable. The pool buffers are NOT consumed — they keep their capacity
-    /// for reuse by the next chunk.
-    ///
-    /// This is used during Phase A to snapshot the main LDE columns from the pool
-    /// before the pool is overwritten by the next chunk.
+    /// Write pool column data to a temp file and return an mmap-backed
+    /// LDETraceTable. Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_from_pool(
         main_pool: &[Vec<FieldElement<F>>],
