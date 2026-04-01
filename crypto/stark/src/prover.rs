@@ -1114,7 +1114,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &mut Round2<FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -2347,7 +2347,7 @@ pub trait IsStarkProver<
             coefficients.drain(..num_transition_constraints).collect();
         let boundary_coefficients = coefficients;
 
-        let mut round_2_result = Self::round_2_compute_composition_polynomial(
+        let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
             pub_inputs,
             domain,
@@ -2405,7 +2405,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &mut round_2_result,
+            &round_2_result,
             &round_3_result,
             &z,
             transcript,
