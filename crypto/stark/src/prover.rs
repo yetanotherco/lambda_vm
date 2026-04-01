@@ -2114,6 +2114,7 @@ pub trait IsStarkProver<
                             domain,
                         )?;
 
+                        // Collect per-table sub-op timing via TLS.
                         #[cfg(feature = "instruments")]
                         {
                             let sub_ops =
