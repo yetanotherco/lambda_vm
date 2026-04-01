@@ -57,13 +57,12 @@ where
         let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
-        let layer = FriLayer::new(
+        fri_layer_list.push(FriLayer::new(
             &evals,
             merkle_tree,
             current_coset_offset.clone().to_extension(),
             current_domain_size,
-        );
-        fri_layer_list.push(layer);
+        ));
 
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&root);
