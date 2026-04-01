@@ -313,10 +313,8 @@ where
                 backing.num_main_cols
             );
             let offset = (col * backing.num_rows + row) * backing.main_elem_size;
-            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
-            // The mmap is page-aligned and elements are contiguously packed at
-            // multiples of main_elem_size, so alignment is satisfied.
-            // The data was written from identical types on the same machine.
+            // SAFETY: spill_main_from_pool writes columns contiguously to this
+            // mmap. FieldElement<F> is #[repr(transparent)] over F::BaseType.
             return unsafe { &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.main_columns[col][row]
@@ -338,7 +336,7 @@ where
                 .as_ref()
                 .expect("aux mmap must exist when accessing aux columns");
             let offset = (col * backing.num_rows + row) * backing.aux_elem_size;
-            // SAFETY: Same as get_main — repr(transparent) + page-aligned mmap.
+            // SAFETY: same layout as get_main, see comment there.
             return unsafe { &*(aux_mmap.as_ptr().add(offset) as *const FieldElement<E>) };
         }
         &self.aux_columns[col][row]
