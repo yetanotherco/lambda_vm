@@ -1635,8 +1635,8 @@ pub trait IsStarkProver<
         }
 
         // Spill all main trace tables to mmap before allocating pool buffers.
-        // This frees the heap-allocated main trace data (~120 cols × N rows × 8 bytes each),
-        // making room for the LDE pool buffers which are much larger (blowup_factor × N).
+        // This frees the heap-allocated trace data, making room for the LDE pool
+        // buffers which are much larger (blowup_factor × trace size).
         #[cfg(feature = "disk-spill")]
         for (_, trace, _) in air_trace_pairs.iter_mut() {
             trace
