@@ -43,6 +43,7 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
@@ -50,22 +51,6 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
-}
-
-impl<B: IsMerkleTreeBackend> Clone for MerkleTree<B> {
-    fn clone(&self) -> Self {
-        #[cfg(feature = "disk-spill")]
-        assert!(
-            self.mmap_backing.is_none(),
-            "cannot clone a spilled MerkleTree: nodes are on disk, not in memory"
-        );
-        Self {
-            root: self.root.clone(),
-            nodes: self.nodes.clone(),
-            #[cfg(feature = "disk-spill")]
-            mmap_backing: None,
-        }
-    }
 }
 
 const ROOT: usize = 0;
