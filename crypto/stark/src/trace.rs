@@ -336,7 +336,8 @@ where
                 .as_ref()
                 .expect("aux mmap must exist when accessing aux columns");
             let offset = (col * backing.num_rows + row) * backing.aux_elem_size;
-            // SAFETY: same layout as get_main, see comment there.
+            // SAFETY: add_aux_from_pool writes columns contiguously to this
+            // mmap. FieldElement<E> is #[repr(transparent)] over E::BaseType.
             return unsafe { &*(aux_mmap.as_ptr().add(offset) as *const FieldElement<E>) };
         }
         &self.aux_columns[col][row]
