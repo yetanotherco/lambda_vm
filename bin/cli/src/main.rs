@@ -262,6 +262,12 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
 
+    #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
+    stark::instruments::set_heap_reader(|| {
+        tikv_jemalloc_ctl::epoch::advance().ok();
+        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+    });
+
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
