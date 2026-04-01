@@ -451,13 +451,8 @@ where
         Ok(())
     }
 
-    /// Write borrowed pool columns to a temp file and mmap them.
-    /// Does NOT consume the pool — columns keep their capacity.
-    ///
-    /// Note: the concrete element types are `FieldElement<Goldilocks>` (8 bytes,
-    /// `#[repr(transparent)]` over `u64`) and `FieldElement<Degree3Extension>`
-    /// (24 bytes, `#[repr(transparent)]` over `[u64; 3]`). Neither has padding,
-    /// so the raw byte round-trip is well-defined.
+    /// Write pool columns to a temp file and return the mmap + file handle.
+    /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     fn write_pool_columns_to_mmap<T>(
         columns: &[Vec<T>],
