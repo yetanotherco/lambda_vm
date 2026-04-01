@@ -24,9 +24,8 @@ impl std::error::Error for Error {}
 
 /// File-backed mmap storage for Merkle tree nodes.
 ///
-/// After `spill_nodes_to_disk()`, the heap `Vec<B::Node>` is freed and all
-/// node access goes through this mmap. The OS manages page eviction under
-/// memory pressure — file-backed pages are evictable without swap.
+/// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
+/// node access goes through this mmap instead.
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
