@@ -29,6 +29,8 @@ impl std::error::Error for Error {}
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
     node_count: usize,
     node_size: usize,
