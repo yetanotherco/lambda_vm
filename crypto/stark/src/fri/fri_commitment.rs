@@ -19,6 +19,9 @@ where
     eval_mmap: Option<EvalMmapBacking>,
 }
 
+/// File-backed mmap storage for FRI layer evaluations.
+/// After `spill_evaluation_to_disk()`, the in-memory evaluation vector is freed
+/// and element access goes through this mmap instead.
 #[cfg(feature = "disk-spill")]
 #[derive(Clone)]
 struct EvalMmapBacking {
