@@ -82,12 +82,16 @@ where
         file.set_len(total_bytes as u64)?;
         {
             let mut writer = std::io::BufWriter::new(&file);
+            // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
+            // can be viewed as a contiguous byte slice.
             let bytes = unsafe {
                 std::slice::from_raw_parts(self.evaluation.as_ptr() as *const u8, total_bytes)
             };
             writer.write_all(bytes)?;
             writer.flush()?;
         }
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         self.evaluation = Vec::new();
         self.eval_mmap = Some(EvalMmapBacking {
