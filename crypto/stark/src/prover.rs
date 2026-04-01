@@ -1646,17 +1646,15 @@ pub trait IsStarkProver<
         }
 
         // Number of tables to process concurrently.
-        // disk-spill: Phase A/C use k_commit=1 (one pool at a time, since each
-        // table's LDE already saturates all cores via column-parallel FFT).
-        // Rounds 2-4 use the full k (no pools needed, reads from mmap).
+        // disk-spill: Phase A/C commit one table at a time to limit pool memory.
+        // Rounds 2-4 use full parallelism (no pools, reads from mmap).
         let k = table_parallelism().min(num_airs).max(1);
         #[cfg(feature = "disk-spill")]
         let k_commit = 1_usize;
         #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
-        // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
-        // coset_lde_full_expand can resize in-place without reallocation spikes.
-        // With k_commit>1 (no disk-spill), start empty and grow on demand.
+        // k_commit=1: pre-allocate pool to max_lde_size to avoid reallocation.
+        // k_commit>1: start empty and grow on demand.
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
                 main: (0..max_main_cols)
