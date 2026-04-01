@@ -278,6 +278,8 @@ where
         if let Some(ref mmaps) = self.eval_mmaps {
             let m = &mmaps[part];
             let offset = index * m.elem_size;
+            // SAFETY: spill_evaluations_to_disk writes the evaluations as contiguous
+            // bytes to this mmap. FieldElement<F> is #[repr(transparent)].
             return unsafe { &*(m.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.lde_composition_poly_evaluations[part][index]
