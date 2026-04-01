@@ -1684,9 +1684,8 @@ pub trait IsStarkProver<
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
-        // Spilled LDE trace tables: one per AIR, populated during Phase A (main) and Phase C (aux).
-        // In Rounds 2-4 these replace the reconstruct_round1 flow — LDE data is read from mmap
-        // instead of being recomputed from the trace.
+        // One mmap-backed LDE table per AIR. Filled during Phase A (main) and
+        // Phase C (aux), then read from mmap in Rounds 2-4.
         #[cfg(feature = "disk-spill")]
         let mut spilled_ldes: Vec<Option<LDETraceTable<Field, FieldExtension>>> =
             (0..num_airs).map(|_| None).collect();
