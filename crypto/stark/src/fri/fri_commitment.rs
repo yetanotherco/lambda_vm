@@ -23,8 +23,9 @@ where
 #[derive(Clone)]
 struct EvalMmapBacking {
     mmap: std::sync::Arc<memmap2::Mmap>,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::sync::Arc<std::fs::File>,
-    _len: usize,
     elem_size: usize,
 }
 
@@ -82,12 +83,10 @@ where
             writer.flush()?;
         }
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        let len = self.evaluation.len();
         self.evaluation = Vec::new();
         self.eval_mmap = Some(EvalMmapBacking {
             mmap: std::sync::Arc::new(mmap),
             _file: std::sync::Arc::new(file),
-            _len: len,
             elem_size,
         });
         Ok(())
