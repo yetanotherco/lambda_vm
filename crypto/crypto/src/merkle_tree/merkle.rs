@@ -294,8 +294,8 @@ where
         file.set_len(total_bytes as u64)?;
         {
             let mut writer = std::io::BufWriter::new(&file);
-            // SAFETY: B::Node is [u8; N] (alignment 1, no padding). The Vec
-            // is contiguous so the cast to a byte slice is valid.
+            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+            // the contiguous Vec to a byte slice is valid.
             let bytes = unsafe {
                 core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
             };
