@@ -131,8 +131,9 @@ impl<F: IsField> Table<F> {
                 backing.height
             );
             let offset = row_idx * backing.width * backing.elem_size;
-            // SAFETY: Row-major layout means width elements are contiguous.
-            // Same repr(transparent) + page-aligned guarantees as get().
+            // SAFETY: spill_to_disk writes the table in row-major layout, so
+            // width elements at this offset are contiguous. FieldElement<F>
+            // is #[repr(transparent)].
             return unsafe {
                 std::slice::from_raw_parts(
                     backing.mmap.as_ptr().add(offset) as *const FieldElement<F>,
