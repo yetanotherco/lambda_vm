@@ -2146,7 +2146,7 @@ pub trait IsStarkProver<
             }
         }
 
-        // ----- non-disk-spill path: reconstruct LDE from trace (original flow) -----
+        // ----- non-disk-spill path: recompute LDE from trace -----
         #[cfg(not(feature = "disk-spill"))]
         {
             for chunk_start in (0..num_airs).step_by(k) {
