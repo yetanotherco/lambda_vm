@@ -59,6 +59,9 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.eval_mmap {
             let offset = index * backing.elem_size;
+            // SAFETY: spill_evaluation_to_disk writes self.evaluation as contiguous
+            // bytes to this mmap. FieldElement<F> is #[repr(transparent)] over its
+            // base type, so the byte layout matches the original elements.
             return unsafe { &*(backing.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.evaluation[index]
