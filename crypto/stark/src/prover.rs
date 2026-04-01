@@ -246,9 +246,14 @@ where
     eval_mmaps: Option<Vec<Round2EvalMmap>>,
 }
 
+/// File-backed mmap storage for a single composition polynomial part's LDE evaluations.
+/// After `spill_evaluations_to_disk()`, elements are read from the mmap instead of
+/// the in-memory vector.
 #[cfg(feature = "disk-spill")]
 struct Round2EvalMmap {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
     len: usize,
     elem_size: usize,
