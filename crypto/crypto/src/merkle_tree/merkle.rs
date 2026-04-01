@@ -267,16 +267,8 @@ where
         auth_path_set.into_iter().rev().collect()
     }
 
-    /// Write tree nodes to a temp file, mmap it read-only, and free the heap Vec.
-    ///
-    /// After this call, all node access methods read from the mmap transparently.
-    /// The OS can evict mmap pages under memory pressure since they're file-backed.
-    ///
-    /// Requires `B::Node: Copy` to ensure nodes have a trivial byte representation
-    /// suitable for raw serialization and mmap casting.
-    ///
-    /// Note: the concrete `Node` type is `[u8; 32]` (Keccak hash), which has no
-    /// padding bytes. The raw byte round-trip is therefore well-defined.
+    /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
+    /// Node access methods read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
