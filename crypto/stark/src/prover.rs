@@ -1672,8 +1672,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after pool alloc") {}
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1810,13 +1808,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after main commits") {}
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
-
         let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
@@ -1863,8 +1858,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux build") {}
 
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork and pool set.
@@ -1997,8 +1990,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux commit") {}
 
         #[cfg(feature = "debug-checks")]
         {
@@ -2265,7 +2256,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
-            if let Some(s) = crate::instruments::snap("after rounds 2-4") {}
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
