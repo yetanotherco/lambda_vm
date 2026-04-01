@@ -283,10 +283,8 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
             prover::prove_with_options(&elf_data, &opts, &Default::default())
         }
         None => {
-            let opts =
-                GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
             eprintln!("Generating proof...");
-            prover::prove_with_options(&elf_data, &opts, &Default::default())
+            prover::prove(&elf_data)
         }
     };
     let prove_elapsed = start.elapsed();
