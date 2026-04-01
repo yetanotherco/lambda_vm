@@ -14,9 +14,14 @@ use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
+    /// Number of columns per row.
     width: usize,
+    /// Number of rows.
     height: usize,
+    /// Size in bytes of a single element.
     elem_size: usize,
 }
 
