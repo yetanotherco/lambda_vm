@@ -303,7 +303,8 @@ where
             writer.flush()?;
         }
 
-        // SAFETY: We own the file exclusively; it won't be modified externally.
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         // Free the heap allocation
