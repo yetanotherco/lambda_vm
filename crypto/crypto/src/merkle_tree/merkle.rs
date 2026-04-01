@@ -116,8 +116,8 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
-                // SAFETY: The mmap contains node_count × node_size contiguous bytes
-                // written from identical Node values. B::Node is [u8; N] (align 1).
+                // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
+                // to this mmap and asserts align_of::<B::Node>() == 1 at compile time.
                 let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
@@ -282,6 +282,12 @@ where
     where
         B::Node: Copy,
     {
+        const {
+            assert!(
+                align_of::<B::Node>() == 1,
+                "B::Node must have alignment 1 for mmap safety"
+            )
+        }
         use std::io::Write;
 
         if self.nodes.is_empty() {
