@@ -2011,12 +2011,8 @@ pub trait IsStarkProver<
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Each worker gets its
-        // own pool set and transcript fork. Pool sets are reused across chunks.
-        //
-        // disk-spill path: LDE data is read from mmap-backed spilled_ldes instead
-        // of being recomputed via reconstruct_round1. This avoids the peak memory
-        // spike of holding both the trace and its LDE in RAM simultaneously.
+        // disk-spill: reads LDE data from mmap (spilled_ldes).
+        // non-disk-spill: recomputes LDE from the trace (reconstruct_round1).
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
