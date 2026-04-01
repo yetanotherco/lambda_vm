@@ -173,7 +173,6 @@ impl<F: IsField> Table<F> {
         let iter = output[..self.width].par_iter_mut().enumerate();
         #[cfg(not(feature = "parallel"))]
         let iter = output[..self.width].iter_mut().enumerate();
-        // Use get() which transparently reads from mmap or data Vec
         iter.for_each(|(col_idx, buf)| {
             buf.clear();
             buf.reserve(self.height.saturating_sub(buf.capacity()));
