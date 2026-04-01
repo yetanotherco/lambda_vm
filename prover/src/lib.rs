@@ -508,6 +508,7 @@ pub fn prove_with_options(
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
 
+    // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
