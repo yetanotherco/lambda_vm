@@ -249,7 +249,8 @@ impl<F: IsField> Table<F> {
             writer.flush()?;
         }
 
-        // SAFETY: We own the file exclusively.
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         self.mmap_backing = Some(TableMmapBacking {
