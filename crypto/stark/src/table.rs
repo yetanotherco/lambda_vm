@@ -126,38 +126,6 @@ impl<F: IsField> Table<F> {
         Self::new(data, width)
     }
 
-    /// Creates a Table instance by borrowing column data without consuming it.
-    ///
-    /// Same transpose logic as [`from_columns`], but the column Vecs are NOT consumed —
-    /// the caller retains them. This is used for LDE buffer reuse where the pool
-    /// retains the column buffers for the next table.
-    pub fn from_columns_borrowed(columns: &[Vec<FieldElement<F>>]) -> Self {
-        if columns.is_empty() {
-            return Self::new(Vec::new(), 0);
-        }
-        let height = columns[0].len();
-
-        debug_assert!(columns.iter().all(|c| c.len() == height));
-
-        let width = columns.len();
-        let mut data = Vec::with_capacity(width * height);
-
-        for row_idx in 0..height {
-            for column in columns.iter() {
-                data.push(column[row_idx].clone());
-            }
-        }
-
-        Self::new(data, width)
-    }
-
-    /// Returns a vector of vectors of field elements representing the table rows
-    pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
-        (0..self.height)
-            .map(|row_idx| self.get_row(row_idx).to_vec())
-            .collect()
-    }
-
     /// Given a row index, returns a reference to that row as a slice of field elements.
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         #[cfg(feature = "disk-spill")]
@@ -181,19 +149,6 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
-    /// Given a slice of field elements representing a row, appends it to
-    /// the end of the table.
-    pub fn append_row(&mut self, row: &[FieldElement<F>]) {
-        debug_assert_eq!(row.len(), self.width);
-        self.data.extend_from_slice(row);
-        self.height += 1
-    }
-
-    /// Returns a reference to the last row of the table
-    pub fn last_row(&self) -> &[FieldElement<F>] {
-        self.get_row(self.height - 1)
-    }
-
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -203,12 +158,6 @@ impl<F: IsField> Table<F> {
                     .map(|row_idx| self.get(row_idx, col_idx).clone())
                     .collect()
             })
-            .collect()
-    }
-
-    pub fn get_column(&self, col_idx: usize) -> Vec<FieldElement<F>> {
-        (0..self.height)
-            .map(|row_idx| self.get(row_idx, col_idx).clone())
             .collect()
     }
 

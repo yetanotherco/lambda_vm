@@ -10,7 +10,6 @@ edition = "2024"
 math = { path = "../math", features = ["alloc"] }
 digest = "0.10.7"
 sha3 = { version = "0.10.8", default-features = false }
-sha2 = { version = "0.10", default-features = false }
 # Optional
 serde = { version = "1.0", default-features = false, features = [
     "derive",
@@ -23,15 +22,15 @@ memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
-criterion = "0.4"
-iai-callgrind = "0.3.1"
+math = { path = "../math", features = ["test-utils"] }
 rand = "0.8.5"
 rand_chacha = "0.3.1"
+sha2 = { version = "0.10", default-features = false }
 
 [features]
 default = ["asm", "std"]
 asm = ["sha3/asm"]
-std = ["math/std", "sha2/std", "sha3/std", "serde?/std"]
+std = ["math/std", "sha3/std", "serde?/std"]
 serde = ["dep:serde"]
 parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile"]

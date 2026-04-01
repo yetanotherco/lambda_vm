@@ -277,8 +277,7 @@ mod fft_polynomial_tests {
 #[cfg(test)]
 mod roots_of_unity_tests {
     use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::get_twiddles;
-    use crate::fft::errors::FFTError;
+    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
     use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::field::traits::RootsConfig;
     use proptest::prelude::*;
@@ -288,18 +287,18 @@ mod roots_of_unity_tests {
     proptest! {
         #[test]
         fn test_gen_twiddles_bit_reversed_validity(n in 1..8_u64) {
-            let twiddles = get_twiddles::<F>(n, RootsConfig::Natural).unwrap();
-            let mut twiddles_to_reorder = get_twiddles(n, RootsConfig::BitReverse).unwrap();
-            in_place_bit_reverse_permute(&mut twiddles_to_reorder); // so now should be naturally ordered
-
+            let count = (1 << n) / 2;
+            let twiddles = get_powers_of_primitive_root::<F>(n, count, RootsConfig::Natural).unwrap();
+            let mut twiddles_to_reorder = get_powers_of_primitive_root::<F>(n, count, RootsConfig::BitReverse).unwrap();
+            in_place_bit_reverse_permute(&mut twiddles_to_reorder);
             prop_assert_eq!(twiddles, twiddles_to_reorder);
         }
     }
 
     #[test]
-    fn gen_twiddles_with_order_greater_than_63_should_fail() {
-        let twiddles = get_twiddles::<F>(64, RootsConfig::Natural);
-
-        assert!(matches!(twiddles, Err(FFTError::OrderError(_))));
+    fn gen_twiddles_with_order_greater_than_field_adicity_should_fail() {
+        // U64TestField has TWO_ADICITY = 32, so order 33 should fail
+        let result = get_powers_of_primitive_root::<F>(33, 1, RootsConfig::Natural);
+        assert!(result.is_err());
     }
 }

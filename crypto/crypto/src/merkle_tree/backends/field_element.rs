@@ -1,5 +1,4 @@
 use crate::hash::poseidon::Poseidon;
-
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 use core::marker::PhantomData;
 use digest::{Digest, Output};

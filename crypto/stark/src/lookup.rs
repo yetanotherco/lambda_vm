@@ -93,10 +93,6 @@ pub(crate) fn compute_alpha_powers<E: IsField>(
 // These challenges MUST be shared across all AIRs in a multi-table proof for the
 // LogUp bus to balance correctly (sum of all fingerprints equals zero).
 
-/// Index of the `z` challenge in the LogUp challenges vector.
-/// Used as the evaluation point in fingerprint computation.
-pub const LOGUP_CHALLENGE_Z: usize = 0;
-
 /// Index of the `alpha` (α) challenge in the LogUp challenges vector.
 /// Used as the base for linear combination of row values.
 pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
@@ -426,14 +422,14 @@ impl Packing {
 
             Packing::Word2L => {
                 // h₀ + 2¹⁶·h₁
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                let shift_16 = FieldElement::<E>::from(65536u64);
                 vec![&columns[0] + &columns[1] * &shift_16]
             }
 
             Packing::Word4L => {
                 // b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
-                let shift_8 = FieldElement::<E>::from(SHIFT_8);
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                let shift_8 = FieldElement::<E>::from(256u64);
+                let shift_16 = FieldElement::<E>::from(65536u64);
                 let shift_24 = &shift_8 * &shift_16;
                 vec![
                     &columns[0]
@@ -1450,7 +1446,7 @@ where
     };
 
     // LogUp challenges (must be shared across all tables for bus to balance)
-    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let z = &challenges[0];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
     // Precompute powers of alpha for all bus elements (using incremental multiplication)
@@ -1541,7 +1537,7 @@ where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let z = &challenges[0];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
     let max_bus_elements = interaction_a
@@ -1896,10 +1892,6 @@ where
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
@@ -1915,7 +1907,7 @@ where
             shifts: &PackingShifts<A>,
         ) -> FieldElement<B> {
             let c = step.get_aux_evaluation_element(0, term_column_idx);
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+            let z = &rap_challenges[0];
 
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
@@ -2027,10 +2019,6 @@ where
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0 // Circular constraint applies to all rows including last→first wrap
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
@@ -2060,7 +2048,7 @@ where
             // delta = acc_next - acc_curr - terms_sum + L/N
             let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
 
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+            let z = &rap_challenges[0];
 
             // Clear denominators of absorbed interactions
             debug_assert!(matches!(absorbed.len(), 1 | 2));
