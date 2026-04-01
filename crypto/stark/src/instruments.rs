@@ -13,14 +13,10 @@ pub fn heap_bytes() -> Option<usize> {
     HEAP_READER.get().map(|f| f())
 }
 
-fn heap_mb() -> Option<usize> {
-    heap_bytes().map(|b| b / (1024 * 1024))
-}
-
 pub type HeapSnapshot = (&'static str, usize);
 
 pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
-    heap_mb().map(|mb| (label, mb))
+    heap_bytes().map(|b| (label, b))
 }
 
 pub struct ProveHeapProfile {

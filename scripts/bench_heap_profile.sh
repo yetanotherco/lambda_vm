@@ -49,7 +49,7 @@ fi
 CLI="$ROOT_DIR/target/release/cli"
 
 # Phase labels we parse from stderr (order matters)
-PHASES="execute trace_build air pool_alloc main_commits aux_build aux_commit rounds_2_4"
+PHASES="execute trace_build air pool_alloc main_commits aux_build aux_commit"
 
 for size in $PROGRAMS; do
     ELF="$ELF_DIR/fib_iterative_${size}.elf"
@@ -63,7 +63,7 @@ for size in $PROGRAMS; do
     rm -f "$TMP_DIR/proof.bin"
 
     # Parse absolute heap values (second-to-last column) from HEAP PROFILE section
-    HEAP_VALS=$(awk '/^=== HEAP PROFILE/,/^──/{
+    HEAP_VALS=$(awk '/^=== HEAP PROFILE/,/^  ─/{
         if (/After execute/)       printf "execute=%s\n", $(NF-1)
         if (/After trace build/)   printf "trace_build=%s\n", $(NF-1)
         if (/After AIR/)           printf "air=%s\n", $(NF-1)
@@ -71,7 +71,6 @@ for size in $PROGRAMS; do
         if (/after main commits/)  printf "main_commits=%s\n", $(NF-1)
         if (/after aux build/)     printf "aux_build=%s\n", $(NF-1)
         if (/after aux commit/)    printf "aux_commit=%s\n", $(NF-1)
-        if (/after rounds 2-4/)    printf "rounds_2_4=%s\n", $(NF-1)
     }' "$STDERR")
 
     PEAK=$(grep -o 'Peak heap: [0-9]*' "$STDOUT" | awk '{print $3}')
@@ -104,7 +103,6 @@ for phase in $PHASES; do
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
         aux_commit)   label="Aux commit" ;;
-        rounds_2_4)   label="Rounds 2-4" ;;
     esac
 
     printf "  %-22s" "$label"
@@ -155,7 +153,6 @@ for phase in $PHASES; do
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
         aux_commit)   label="Aux commit" ;;
-        rounds_2_4)   label="Rounds 2-4" ;;
     esac
 
     # Collect (steps_M, delta) pairs
@@ -169,7 +166,6 @@ for phase in $PHASES; do
         main_commits) prev_phase_key="pool_alloc" ;;
         aux_build)    prev_phase_key="main_commits" ;;
         aux_commit)   prev_phase_key="aux_build" ;;
-        rounds_2_4)   prev_phase_key="aux_commit" ;;
     esac
 
     for size in $PROGRAMS; do

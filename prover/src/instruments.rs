@@ -232,12 +232,11 @@ pub fn print_report(
         print_row("After trace build", heap_profile.after_trace_build);
         print_row("After AIR construction", heap_profile.after_air);
         if let Some(ref mp_data) = mp {
-            for (label, snap_mb) in &mp_data.heap_snapshots {
-                let snap_bytes = snap_mb * (1024 * 1024);
-                let cur = *snap_mb;
+            for (label, bytes) in &mp_data.heap_snapshots {
+                let cur = mb(*bytes);
                 let delta = cur as isize - mb(prev) as isize;
                 eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
-                prev = snap_bytes;
+                prev = *bytes;
             }
         }
         eprintln!("  {}", "─".repeat(56));
