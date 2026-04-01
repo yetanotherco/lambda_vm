@@ -278,9 +278,8 @@ impl<F: IsField> Table<F> {
     #[cfg(feature = "disk-spill")]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
-            // SAFETY: the pointer and length come from a valid mmap.
-            // MADV_DONTNEED is advisory — it cannot cause UB, only
-            // tells the kernel these pages can be reclaimed.
+            // SAFETY: pointer and length are from a valid mmap.
+            // MADV_DONTNEED is advisory and cannot cause UB.
             unsafe {
                 libc::madvise(
                     backing.mmap.as_ptr() as *mut libc::c_void,
