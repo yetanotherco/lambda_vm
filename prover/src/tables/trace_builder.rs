@@ -1941,7 +1941,7 @@ impl Traces {
         bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
         drop(bitwise_ops);
 
-        // --- Extract halt timestamp (needs cpu_ops) ---
+        // Extract halt timestamp from the last ECALL instruction
         let halt_op = cpu_ops
             .iter()
             .rev()
