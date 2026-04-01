@@ -2247,7 +2247,7 @@ pub trait IsStarkProver<
                     proofs.push(result?);
                 }
             }
-        } // end #[cfg(not(feature = "disk-spill"))]
+        }
 
         #[cfg(feature = "instruments")]
         {
