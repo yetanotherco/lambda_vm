@@ -20,8 +20,9 @@ pub(crate) struct TableMmapBacking {
     elem_size: usize,
 }
 
-// Manual trait impls so Table<F> can keep its derive macros.
-// Spilled tables should not be cloned during proving.
+// Table<F> derives Clone, which requires all fields to implement Clone.
+// TableMmapBacking implements Clone to satisfy this, but panics because
+// mmap-backed data cannot be cloned.
 #[cfg(feature = "disk-spill")]
 impl Clone for TableMmapBacking {
     fn clone(&self) -> Self {
