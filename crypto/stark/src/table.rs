@@ -273,11 +273,14 @@ impl<F: IsField> Table<F> {
     }
 
     /// Advise the kernel to drop mmap pages from the page cache.
-    /// Call after reading spilled data into pool buffers to free ~37GB of
-    /// cached pages that would otherwise persist under memory pressure.
+    /// Call after reading spilled data into pool buffers so the same
+    /// data doesn't occupy RAM in both places.
     #[cfg(feature = "disk-spill")]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
+            // SAFETY: the pointer and length come from a valid mmap.
+            // MADV_DONTNEED is advisory — it cannot cause UB, only
+            // tells the kernel these pages can be reclaimed.
             unsafe {
                 libc::madvise(
                     backing.mmap.as_ptr() as *mut libc::c_void,
