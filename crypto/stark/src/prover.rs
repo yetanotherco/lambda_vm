@@ -564,6 +564,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        // Data is now in the pool buffers. Evict the mmap pages from the OS
+        // page cache so the same data doesn't occupy RAM in both places.
         #[cfg(feature = "disk-spill")]
         trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
@@ -609,6 +611,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        // Data is now in the pool buffers. Evict the mmap pages from the OS
+        // page cache so the same data doesn't occupy RAM in both places.
         #[cfg(feature = "disk-spill")]
         trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
