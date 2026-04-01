@@ -473,7 +473,7 @@ where
         {
             let mut writer = std::io::BufWriter::new(&file);
             for col in columns {
-                // SAFETY: FieldElement<F/E> is #[repr(transparent)] over BaseType,
+                // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
