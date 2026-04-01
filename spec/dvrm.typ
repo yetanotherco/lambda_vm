@@ -4,8 +4,7 @@
   render_chip_column_table,
   total_nr_variables,
   total_nr_instantiated_columns,
-  set_nr_interactions,
-  get_nr_interactions,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_padding_table,
   render_chip_assumptions
@@ -23,8 +22,7 @@ The #dvrm chip provides division and remainder functionality, both signed and un
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
-#set_nr_interactions(chip)
-#let nr_interactions = get_nr_interactions(chip)
+#let nr_interactions = compute_nr_interactions(chip)
 
 The #dvrm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)

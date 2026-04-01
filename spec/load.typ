@@ -5,8 +5,7 @@
   render_chip_column_table,
   render_chip_padding_table,
   render_constraint_table,
-  set_nr_interactions,
-  get_nr_interactions,
+  compute_nr_interactions,
   total_nr_instantiated_columns,
   total_nr_variables,
 )
@@ -23,8 +22,7 @@ It delegates low-level memory handling to the `MEMW` chip (@memw).
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
-#set_nr_interactions(chip)
-#let nr_interactions = get_nr_interactions(chip)
+#let nr_interactions = compute_nr_interactions(chip)
 
 The #load chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)

@@ -92,7 +92,8 @@
   }
 }
 
-#let get_nr_interactions(chip) = {
+#let compute_nr_interactions(chip) = {
+  set_nr_interactions(chip)
   context {
     let lut = query(<interaction_count>).map(c=>c.value).sum(default: (:))
     assert(chip.name in lut, message: "no interaction_count specified for " + repr(chip.name))

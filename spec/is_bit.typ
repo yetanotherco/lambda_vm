@@ -1,6 +1,6 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_constraint_table, set_nr_interactions, get_nr_interactions,
+#import "/chip.typ": render_chip_column_table, render_constraint_table, set_nr_interactions
 
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)

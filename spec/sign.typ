@@ -1,13 +1,13 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table,   render_chip_assumptions, render_constraint_table, set_nr_interactions, get_nr_interactions,
+#import "/chip.typ": render_chip_column_table, total_nr_variables, render_chip_assumptions, render_constraint_table, compute_nr_interactions,
 
 #let config = load_config()
 #let chip = load_chip("src/sign.toml", config)
 #show: book-page(chip.name)
 
-#set_nr_interactions(chip)
-#let nr_interactions = get_nr_interactions(chip)
+#let nr_variables = total_nr_variables(chip)
+#let nr_interactions = compute_nr_interactions(chip)
 
 #let sign = raw(chip.name)
 
