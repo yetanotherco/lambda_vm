@@ -985,14 +985,8 @@ pub trait IsStarkProver<
         else {
             return Err(ProvingError::EmptyCommitment);
         };
-        #[cfg(feature = "disk-spill")]
-        let composition_poly_merkle_tree = {
-            let mut t = composition_poly_merkle_tree;
-            t.spill_nodes_to_disk().map_err(|e| {
-                ProvingError::WrongParameter(format!("disk-spill composition Merkle tree: {e}"))
-            })?;
-            t
-        };
+        // Note: composition Merkle tree kept in RAM (spilling adds I/O overhead
+        // for only ~30 sparse queries; memory is freed after Rounds 2-4).
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -1137,12 +1131,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // Spill composition poly evaluations to disk after the dense read above.
-        // They are only needed sparsely in open_composition_poly (~30 queries).
-        #[cfg(feature = "disk-spill")]
-        round_2_result
-            .spill_evaluations_to_disk()
-            .expect("disk-spill composition poly evaluations");
+        // Note: composition poly evaluations kept in RAM (only ~30 sparse queries
+        // remain; spilling adds I/O overhead that outweighs memory savings).
 
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
