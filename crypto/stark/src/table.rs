@@ -35,7 +35,6 @@ impl Clone for TableMmapBacking {
     }
 }
 
-
 #[cfg(feature = "disk-spill")]
 impl std::fmt::Debug for TableMmapBacking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
