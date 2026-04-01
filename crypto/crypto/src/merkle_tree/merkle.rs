@@ -57,7 +57,7 @@ impl<B: IsMerkleTreeBackend> Clone for MerkleTree<B> {
         #[cfg(feature = "disk-spill")]
         assert!(
             self.mmap_backing.is_none(),
-            "cannot clone a spilled MerkleTree — nodes have been freed; use Arc instead"
+            "cannot clone a spilled MerkleTree: nodes are on disk, not in memory"
         );
         Self {
             root: self.root.clone(),
