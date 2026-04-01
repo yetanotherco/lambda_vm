@@ -223,22 +223,16 @@ where
     pub(crate) mmap_backing: Option<MmapBacking>,
 }
 
-/// File-backed mmap storage for LDE column data.
-///
-/// Columns are stored in separate files for main and aux (since they may be
-/// spilled at different times during Phase A and Phase B of proving).
-/// Each file has column-major layout:
-/// ```text
-/// [col_0][col_1]...[col_N]
-/// ```
-/// Each column occupies `num_rows * elem_size` contiguous bytes.
-/// Elements are stored as their native in-memory representation,
-/// which is valid because `FieldElement<F>` is `#[repr(transparent)]`.
+/// File-backed mmap storage for LDE column data (column-major layout).
+/// Main and aux columns are in separate files since they are spilled
+/// at different times (Phase A and Phase C).
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapBacking {
     main_mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing main_mmap.
     _main_file: std::fs::File,
     aux_mmap: Option<memmap2::Mmap>,
+    /// Owns the file descriptor backing aux_mmap.
     _aux_file: Option<std::fs::File>,
     num_rows: usize,
     num_main_cols: usize,
