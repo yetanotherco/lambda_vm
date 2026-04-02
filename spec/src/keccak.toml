@@ -84,7 +84,7 @@ input = [0, ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"], ["idx"
 output = ["idx", ["idx", "input_state", "x"], "y"]
 iters = [["x", 0, 4], ["y", 0, 4]]
 multiplicity = "μ"
-ref = "keccack:c:load_store_state"
+ref = "keccak:c:load_store_state"
 
 [[constraint_groups]]
 name = "round"

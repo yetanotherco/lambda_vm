@@ -266,9 +266,11 @@ class ModExpr:
 
         if isinstance(modulus, list) or not modulus.is_const():
             reporter.error(f"Invalid non-constant modulus: {self.modulus!r}")
+            return Range.const(1)
         modulus = modulus.get_const()
         if modulus <= 0:
-            reporter.error(f"Invalid zero non-positive modulus: {self.modulus!r}")
+            reporter.error(f"Invalid non-positive modulus: {self.modulus!r}")
+            return Range(1)
 
         if elt.is_const():
             elt = elt.get_const()

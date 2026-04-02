@@ -39,7 +39,7 @@ The chip therefore contributes the following interaction to the lookup-argument:
 
 The address containing the state to be permuted is passed in as argument `A0 = x10`.
 The following constraints describe that this address is read into `addr` (@keccak:c:read_addr), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr).
-The state is then read into `input_state`, while the `output_state` is written back to the indicated address (@keccack:c:load_store_state).
+The state is then read into `input_state`, while the `output_state` is written back to the indicated address (@keccak:c:load_store_state).
 #render_constraint_table(chip, config, groups: "mem")
 
 Lastly, the input state is pushed to the Keccak-round function, while the output after 24 rounds is taken off the bus:

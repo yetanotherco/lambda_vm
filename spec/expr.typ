@@ -9,7 +9,7 @@
     assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
     typ = typ.at(0)
   }
-  assert(type(typ.at(0)) == str, message: "Array types need to have a regular type as base")
+  assert(type(typ) == str, message: "Array types need to have a regular type as base")
 }
 
 // Render a type to code
@@ -60,7 +60,7 @@
   "cast": 3, // cast
   "mul": 4,  // *
   "div": 5,  // /
-  "mod": 6,  // %
+  "mod": 6,  // mod
   "sum": 7,  // Σ
   "not": 8,  // not
   "sub": 9,  // -
