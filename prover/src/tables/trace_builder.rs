@@ -905,7 +905,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// 2. Both words share the same old_timestamp (atomic register write)
 /// 3. timestamp[1] == old_timestamp[1] (upper limbs match)
 /// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
-/// 5. timestamp[0] - old_timestamp[0] <= 0xFFFF (delta fits in halfword)
+/// 5. timestamp[0] - old_timestamp[0] <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
 ///
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
@@ -923,13 +923,13 @@ fn is_register_op(op: &MemwOperation) -> bool {
     let old_ts_lo = old_ts & 0xFFFF_FFFF;
     let ts_hi = ts >> 32;
     let old_ts_hi = old_ts >> 32;
-    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0xFFFF
+    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
 }
 
 /// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
 ///
 /// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
-/// in a halfword (proving the timestamp delta is in range [1, 0xFFFF]).
+/// in a halfword (proving the timestamp delta is in range [1, 2^16]).
 fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     ops.iter()
         .map(|op| {
