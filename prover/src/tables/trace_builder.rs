@@ -431,6 +431,7 @@ fn collect_ops_from_cpu(
 }
 
 #[cfg(not(feature = "disk-spill"))]
+#[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -2288,13 +2289,15 @@ impl Traces {
         );
         drop(memw_aligned_ops);
 
-        // --- Flush LT bitwise + generate LT traces + drop lt_ops ---
         // disk-spill: lt_ops only has CPU/DVRM LT ops (MEMW LT was processed inline above).
-        // Combine with memw_lts at the end.
-        let lt_bitwise = collect_bitwise_from_lt(&lt_ops);
-        bitwise::update_multiplicities(&mut bitwise_table, &lt_bitwise);
-        drop(lt_bitwise);
+        // Flush LT bitwise into the bitwise table here (non-disk-spill does it later).
+        #[cfg(feature = "disk-spill")]
+        {
+            let lt_bitwise = collect_bitwise_from_lt(&lt_ops);
+            bitwise::update_multiplicities(&mut bitwise_table, &lt_bitwise);
+        }
 
+        #[allow(unused_mut)]
         let mut lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         drop(lt_ops);
         #[cfg(feature = "disk-spill")]
