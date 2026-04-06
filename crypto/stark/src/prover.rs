@@ -247,9 +247,14 @@ where
     eval_mmaps: Option<Vec<Round2EvalMmap>>,
 }
 
+/// File-backed mmap storage for a single composition polynomial part's LDE evaluations.
+/// After `spill_evaluations_to_disk()`, elements are read from the mmap instead of
+/// the in-memory vector.
 #[cfg(feature = "disk-spill")]
 struct Round2EvalMmap {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
     len: usize,
     elem_size: usize,
@@ -274,6 +279,8 @@ where
         if let Some(ref mmaps) = self.eval_mmaps {
             let m = &mmaps[part];
             let offset = index * m.elem_size;
+            // SAFETY: spill_evaluations_to_disk writes the evaluations as contiguous
+            // bytes to this mmap. FieldElement<F> is #[repr(transparent)].
             return unsafe { &*(m.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.lde_composition_poly_evaluations[part][index]
@@ -304,11 +311,15 @@ where
             file.set_len(total_bytes as u64)?;
             {
                 let mut writer = std::io::BufWriter::new(&file);
+                // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
+                // can be viewed as a contiguous byte slice.
                 let bytes =
                     unsafe { std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes) };
                 writer.write_all(bytes)?;
                 writer.flush()?;
             }
+            // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+            // so no other process can open or modify it.
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             let len = part.len();
             drop(part);
@@ -599,6 +610,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        // Data is now in the pool buffers. Evict the mmap pages from the OS
+        // page cache so the same data doesn't occupy RAM in both places.
         #[cfg(feature = "disk-spill")]
         trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
@@ -644,6 +657,8 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        // Data is now in the pool buffers. Evict the mmap pages from the OS
+        // page cache so the same data doesn't occupy RAM in both places.
         #[cfg(feature = "disk-spill")]
         trace.main_table.advise_drop_cache();
         #[cfg(feature = "instruments")]
@@ -1065,30 +1080,50 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let num_parts = lde_composition_poly_parts_evaluations.len();
+        if num_parts == 0 {
+            return None;
+        }
         let num_rows = lde_composition_poly_parts_evaluations[0].len();
-
-        // Transpose columns → rows with pre-allocated capacity.
-        let mut rows: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let mut row = Vec::with_capacity(num_parts);
-            for part in lde_composition_poly_parts_evaluations.iter() {
-                row.push(part[i].clone());
-            }
-            rows.push(row);
+        if num_rows == 0 {
+            return None;
         }
 
-        in_place_bit_reverse_permute(&mut rows);
+        let num_leaves = num_rows / 2;
+        debug_assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index to be correct"
+        );
+        debug_assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index"
+        );
 
-        // Merge consecutive pairs: [row0, row1] → row0 ++ row1.
-        // Drain pairs from the original vec to avoid cloning.
-        let mut merged: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows / 2);
-        let mut iter = rows.into_iter();
-        while let (Some(mut first), Some(second)) = (iter.next(), iter.next()) {
-            first.extend(second);
-            merged.push(first);
-        }
+        // Skip the transpose + merge by computing leaf data inline.
+        // Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
+        // Build the merged leaf data and hash in one pass.
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_leaves).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_leaves;
 
-        Self::batch_commit_extension(&merged)
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|leaf_idx| {
+                let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+                let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+                let mut leaf = Vec::with_capacity(2 * num_parts);
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    leaf.push(part[br_0].clone());
+                }
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    leaf.push(part[br_1].clone());
+                }
+                BatchedMerkleTreeBackend::<FieldExtension>::hash_data(&leaf)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
@@ -1277,14 +1312,6 @@ pub trait IsStarkProver<
         else {
             return Err(ProvingError::EmptyCommitment);
         };
-        #[cfg(feature = "disk-spill")]
-        let composition_poly_merkle_tree = {
-            let mut t = composition_poly_merkle_tree;
-            t.spill_nodes_to_disk().map_err(|e| {
-                ProvingError::WrongParameter(format!("disk-spill composition Merkle tree: {e}"))
-            })?;
-            t
-        };
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -1379,7 +1406,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &mut Round2<FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -1428,13 +1455,6 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
-
-        // Spill composition poly evaluations to disk after the dense read above.
-        // They are only needed sparsely in open_composition_poly (~30 queries).
-        #[cfg(feature = "disk-spill")]
-        round_2_result
-            .spill_evaluations_to_disk()
-            .expect("disk-spill composition poly evaluations");
 
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
@@ -1551,9 +1571,12 @@ pub trait IsStarkProver<
         };
 
         // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points
-        let z_shifted: Vec<FieldElement<FieldExtension>> = (0..num_eval_points)
-            .map(|k| primitive_root.pow(k) * z)
-            .collect();
+        let mut z_shifted = Vec::with_capacity(num_eval_points);
+        let mut current_z = z.clone();
+        for _ in 0..num_eval_points {
+            z_shifted.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
 
         // Number of main and aux columns in the LDE trace
         let num_main_cols = lde_trace.num_main_cols();
@@ -1867,12 +1890,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
-        #[cfg(feature = "instruments")]
-        let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("entry") {
-            heap_snaps.push(s);
-        }
 
         let num_airs = air_trace_pairs.len();
 
@@ -1910,8 +1927,8 @@ pub trait IsStarkProver<
         }
 
         // Spill all main trace tables to mmap before allocating pool buffers.
-        // This frees the heap-allocated main trace data (~120 cols × N rows × 8 bytes each),
-        // making room for the LDE pool buffers which are much larger (blowup_factor × N).
+        // This frees the heap-allocated trace data, making room for the LDE pool
+        // buffers which are much larger (blowup_factor × trace size).
         #[cfg(feature = "disk-spill")]
         for (_, trace, _) in air_trace_pairs.iter_mut() {
             trace
@@ -1921,8 +1938,6 @@ pub trait IsStarkProver<
         }
 
         // Number of tables to process concurrently.
-        // disk-spill: Phase A/C use k_commit=1 (one pool at a time, since each
-        // table's LDE already saturates all cores via column-parallel FFT).
         // disk-spill: k=1 everywhere — each table's internal parallelism
         // (par_iter on rows, FFT, Merkle) saturates all cores for large programs,
         // and k=1 avoids the peak memory spike from overlapping round 2-4 allocations.
@@ -1965,10 +1980,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after pool alloc") {
-            heap_snaps.push(s);
-        }
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1981,9 +1992,8 @@ pub trait IsStarkProver<
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
-        // Spilled LDE trace tables: one per AIR, populated during Phase A (main) and Phase C (aux).
-        // In Rounds 2-4 these replace the reconstruct_round1 flow — LDE data is read from mmap
-        // instead of being recomputed from the trace.
+        // One mmap-backed LDE table per AIR. Filled during Phase A (main) and
+        // Phase C (aux), then read from mmap in Rounds 2-4.
         #[cfg(feature = "disk-spill")]
         let mut spilled_ldes: Vec<Option<LDETraceTable<Field, FieldExtension>>> =
             (0..num_airs).map(|_| None).collect();
@@ -2113,15 +2123,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after main commits") {
-            heap_snaps.push(s);
-        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
-
         let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
@@ -2170,10 +2175,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux build") {
-            heap_snaps.push(s);
-        }
 
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork and pool set.
@@ -2306,10 +2307,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux commit") {
-            heap_snaps.push(s);
-        }
 
         #[cfg(feature = "debug-checks")]
         {
@@ -2337,12 +2334,8 @@ pub trait IsStarkProver<
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Each worker gets its
-        // own pool set and transcript fork. Pool sets are reused across chunks.
-        //
-        // disk-spill path: LDE data is read from mmap-backed spilled_ldes instead
-        // of being recomputed via reconstruct_round1. This avoids the peak memory
-        // spike of holding both the trace and its LDE in RAM simultaneously.
+        // disk-spill: reads LDE data from mmap (spilled_ldes).
+        // non-disk-spill: recomputes LDE from the trace (reconstruct_round1).
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
@@ -2444,6 +2437,7 @@ pub trait IsStarkProver<
                             domain,
                         )?;
 
+                        // Collect per-table sub-op timing via TLS.
                         #[cfg(feature = "instruments")]
                         {
                             let sub_ops =
@@ -2476,7 +2470,7 @@ pub trait IsStarkProver<
             }
         }
 
-        // ----- non-disk-spill path: reconstruct LDE from trace (original flow) -----
+        // ----- non-disk-spill path: recompute LDE from trace -----
         #[cfg(not(feature = "disk-spill"))]
         {
             for chunk_start in (0..num_airs).step_by(k) {
@@ -2577,13 +2571,10 @@ pub trait IsStarkProver<
                     proofs.push(result?);
                 }
             }
-        } // end #[cfg(not(feature = "disk-spill"))]
+        }
 
         #[cfg(feature = "instruments")]
         {
-            if let Some(s) = crate::instruments::snap("after rounds 2-4") {
-                heap_snaps.push(s);
-            }
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
@@ -2594,7 +2585,6 @@ pub trait IsStarkProver<
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
-                heap_snapshots: heap_snaps,
             });
         }
 
@@ -2664,7 +2654,7 @@ pub trait IsStarkProver<
             coefficients.drain(..num_transition_constraints).collect();
         let boundary_coefficients = coefficients;
 
-        let mut round_2_result = Self::round_2_compute_composition_polynomial(
+        let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
             pub_inputs,
             domain,
@@ -2722,7 +2712,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &mut round_2_result,
+            &round_2_result,
             &round_3_result,
             &z,
             transcript,

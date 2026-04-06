@@ -10,9 +10,9 @@
 //! ```text
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
-//! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW → LT ops (timestamp ordering)
-//! PHASE 4: LT → Bitwise lookups
+//! PHASE 2: CPU ops → MEMW, MEMW_A, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
+//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering)
+//! PHASE 4: LT, MEMW_A → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -43,6 +43,7 @@ use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
+use super::memw_aligned;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -928,6 +929,73 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
     lt_ops
 }
 
+/// Collects LT operations from MEMW_A for timestamp ordering.
+///
+/// Each aligned operation has a single old_timestamp < timestamp check.
+fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
+    // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
+    // Alignment guarantees addr + (width-1) never wraps: the largest width-N
+    // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
+    memw_aligned_ops
+        .iter()
+        .map(|op| LtOperation::new(op.old_timestamp[0], op.timestamp, false))
+        .collect()
+}
+
+/// Checks whether a MEMW operation qualifies for the aligned fast path (MEMW_A).
+///
+/// An operation is aligned if:
+/// 1. For width > 1: base_address is aligned to width (low bits are zero)
+/// 2. All accessed bytes share the same old_timestamp
+fn is_aligned_op(op: &MemwOperation) -> bool {
+    let low = (op.base_address & 0xFFFF_FFFF) as u32;
+    let width = op.width as u32;
+
+    // Check alignment (trivially true for width=1)
+    if width > 1 && (low & (width - 1)) != 0 {
+        return false;
+    }
+
+    // Check uniform old_timestamp
+    for i in 1..op.width as usize {
+        if op.old_timestamp[i] != op.old_timestamp[0] {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Collects bitwise lookups from MEMW_A operations.
+///
+/// Per operation:
+/// - 1 AND_BYTE for alignment check (low[0] & mask == 0)
+///
+/// IS_HALFWORD[base_address_mid] and IS_BYTE[base_address_low[1]] are
+/// assumptions (MEMW_A-A2, MEMW_A-A3.i) — the caller's (CPU's) responsibility.
+fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        let low_0 = (op.base_address & 0xFF) as u8;
+        let mask: u8 = match op.width {
+            2 => 1,
+            4 => 3,
+            8 => 7,
+            _ => 0,
+        };
+
+        // AND_BYTE[low_0, mask] → expects result 0
+        bitwise_ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AndByte,
+            low_0,
+            mask,
+        ));
+    }
+
+    bitwise_ops
+}
+
 // =============================================================================
 // Phase 4: All → Bitwise lookups
 // =============================================================================
@@ -1560,6 +1628,9 @@ pub struct Traces {
     /// MEMW memory/register read/write traces (split into chunks of max_rows::MEMW)
     pub memws: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// MEMW_A aligned memory/register read/write traces (split into chunks of max_rows::MEMW_A)
+    pub memw_aligneds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// LOAD memory load with extension traces (split into chunks of max_rows::LOAD)
     pub loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1717,6 +1788,7 @@ impl Traces {
             cpu: self.cpus.len(),
             lt: self.lts.len(),
             memw: self.memws.len(),
+            memw_aligned: self.memw_aligneds.len(),
             load: self.loads.len(),
             mul: self.muls.len(),
             dvrm: self.dvrms.len(),
@@ -1937,6 +2009,24 @@ impl Traces {
         }
         // disk-spill: halt_memw_ops (tiny, ~33 entries) processed in the MEMW chunk loop.
 
+        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        // disk-spill: collect aligned ops from SpilledVec; non-aligned stay in SpilledVec
+        // for chunk-by-chunk processing. Halt aligned ops included here too.
+        #[cfg(feature = "disk-spill")]
+        let memw_aligned_ops: Vec<MemwOperation> = {
+            let mut aligned: Vec<MemwOperation> = memw_ops
+                .as_slice()
+                .iter()
+                .filter(|op| is_aligned_op(op))
+                .cloned()
+                .collect();
+            aligned.extend(halt_memw_ops.iter().filter(|op| is_aligned_op(op)).cloned());
+            aligned
+        };
+        #[cfg(not(feature = "disk-spill"))]
+        let (memw_aligned_ops, memw_ops): (Vec<MemwOperation>, Vec<MemwOperation>) =
+            memw_ops.into_iter().partition(is_aligned_op);
+
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
             .iter()
@@ -2026,13 +2116,19 @@ impl Traces {
                 memw_slice.chunks(max_rows.memw).collect()
             };
             for chunk in &chunks {
-                let mut t = memw::generate_memw_trace(chunk);
+                // Filter out aligned ops (they go to MEMW_A table separately)
+                let non_aligned: Vec<MemwOperation> = chunk
+                    .iter()
+                    .filter(|op| !is_aligned_op(op))
+                    .cloned()
+                    .collect();
+                let mut t = memw::generate_memw_trace(&non_aligned);
                 t.main_table
                     .spill_to_disk()
                     .map_err(|e| Error::Prover(format!("disk-spill memw trace: {e}")))?;
                 memws.push(t);
 
-                let chunk_lt = collect_lt_from_memw(chunk);
+                let chunk_lt = collect_lt_from_memw(&non_aligned);
                 let chunk_lt_bitwise = collect_bitwise_from_lt(&chunk_lt);
                 bitwise::update_multiplicities(&mut bitwise_table, &chunk_lt_bitwise);
                 drop(chunk_lt_bitwise);
@@ -2046,13 +2142,18 @@ impl Traces {
             }
             // Also process halt MEMW ops (tiny, ~33 entries)
             {
-                let mut t = memw::generate_memw_trace(&halt_memw_ops);
+                let halt_non_aligned: Vec<MemwOperation> = halt_memw_ops
+                    .iter()
+                    .filter(|op| !is_aligned_op(op))
+                    .cloned()
+                    .collect();
+                let mut t = memw::generate_memw_trace(&halt_non_aligned);
                 t.main_table
                     .spill_to_disk()
                     .map_err(|e| Error::Prover(format!("disk-spill halt-memw trace: {e}")))?;
                 memws.push(t);
 
-                let halt_lt = collect_lt_from_memw(&halt_memw_ops);
+                let halt_lt = collect_lt_from_memw(&halt_non_aligned);
                 let halt_lt_bitwise = collect_bitwise_from_lt(&halt_lt);
                 bitwise::update_multiplicities(&mut bitwise_table, &halt_lt_bitwise);
                 for lt_chunk in halt_lt.chunks(max_rows.lt) {
@@ -2068,6 +2169,7 @@ impl Traces {
         };
         #[cfg(not(feature = "disk-spill"))]
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
 
         // =====================================================================
         // PHASE 4+5: Interleaved bitwise flush, trace generation, and drops
@@ -2096,9 +2198,14 @@ impl Traces {
         #[cfg(not(feature = "disk-spill"))]
         let mut bitwise_table = bitwise::generate_bitwise_trace();
 
-        // --- Flush: CPU ops + commit + page + padding bitwise ---
-        // bitwise_ops was populated during Phase 2 (CPU, LOAD, COMMIT lookups)
-        // plus page IS_BYTE and padding IS_BYTE — flush all of them now.
+        // --- Collect all bitwise lookups ---
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         let public_output_bytes: Vec<u8> = commit_ops
@@ -2119,7 +2226,7 @@ impl Traces {
         bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
         drop(bitwise_ops);
 
-        // --- Extract halt timestamp (needs cpu_ops) ---
+        // Extract halt timestamp from the last ECALL instruction
         let halt_op = cpu_ops
             .iter()
             .rev()
@@ -2174,6 +2281,13 @@ impl Traces {
         #[cfg(not(feature = "disk-spill"))]
         drop(memw_ops);
 
+        let memw_aligneds = gen_traces!(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace
+        );
+        drop(memw_aligned_ops);
+
         // --- Flush LT bitwise + generate LT traces + drop lt_ops ---
         // disk-spill: lt_ops only has CPU/DVRM LT ops (MEMW LT was processed inline above).
         // Combine with memw_lts at the end.
@@ -2185,25 +2299,6 @@ impl Traces {
         drop(lt_ops);
         #[cfg(feature = "disk-spill")]
         lts.extend(memw_lts);
-
-        // --- Flush remaining bitwise (mul, dvrm, branch, shift) ---
-        let mul_bitwise = collect_bitwise_from_mul(&mul_ops);
-        bitwise::update_multiplicities(&mut bitwise_table, &mul_bitwise);
-        drop(mul_bitwise);
-
-        let dvrm_bitwise = collect_bitwise_from_dvrm(&dvrm_ops);
-        bitwise::update_multiplicities(&mut bitwise_table, &dvrm_bitwise);
-        drop(dvrm_bitwise);
-
-        let branch_bitwise = collect_bitwise_from_branch(&branch_ops);
-        bitwise::update_multiplicities(&mut bitwise_table, &branch_bitwise);
-        drop(branch_bitwise);
-
-        let shift_bitwise = shift::collect_bitwise_from_shift(&shift_ops);
-        bitwise::update_multiplicities(&mut bitwise_table, &shift_bitwise);
-        drop(shift_bitwise);
-
-        // --- Generate remaining traces (CPU, LOAD, SHIFT, MUL, DVRM, BRANCH) ---
 
         // Update DECODE multiplicities
         // Each CPU operation looks up the DECODE table once
@@ -2243,6 +2338,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,
@@ -2303,7 +2399,9 @@ impl Traces {
             memw_ops.extend(halt_memw_ops);
             memw_ops
         };
-        let memw_ops = &memw_combined[..];
+        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        let (memw_aligned_ops, memw_ops): (Vec<MemwOperation>, Vec<MemwOperation>) =
+            memw_combined.into_iter().partition(is_aligned_op);
 
         // Collect MUL operations from CPU ops where op_mul = true
         let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
@@ -2370,7 +2468,8 @@ impl Traces {
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(memw_ops));
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
 
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
@@ -2380,6 +2479,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -2409,7 +2509,12 @@ impl Traces {
         let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+        );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
@@ -2466,6 +2571,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,

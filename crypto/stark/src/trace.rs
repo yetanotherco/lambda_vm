@@ -153,10 +153,8 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
-    /// Spill the main trace data to disk via mmap.
-    /// After this call, `main_table.data` is freed but all accessors
-    /// (`get_main`, `columns_main`, `extract_columns_main_into`) continue
-    /// to work transparently through mmap.
+    /// Write main trace data to a temp file and free the in-memory vector.
+    /// Accessors read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
         self.main_table.spill_to_disk()
@@ -225,17 +223,9 @@ where
     pub(crate) mmap_backing: Option<MmapBacking>,
 }
 
-/// File-backed mmap storage for LDE column data.
-///
-/// Columns are stored in separate files for main and aux (since they may be
-/// spilled at different times during Phase A and Phase B of proving).
-/// Each file has column-major layout:
-/// ```text
-/// [col_0][col_1]...[col_N]
-/// ```
-/// Each column occupies `num_rows * elem_size` contiguous bytes.
-/// Elements are stored as their native in-memory representation,
-/// which is valid because `FieldElement<F>` is `#[repr(transparent)]`.
+/// File-backed mmap storage for LDE column data (column-major layout).
+/// Main and aux columns are in separate files since they are spilled
+/// at different times (Phase A and Phase C).
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapBacking {
     pub(crate) main_mmap: memmap2::Mmap,
@@ -321,10 +311,8 @@ where
                 backing.num_main_cols
             );
             let offset = (col * backing.num_rows + row) * backing.main_elem_size;
-            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
-            // The mmap is page-aligned and elements are contiguously packed at
-            // multiples of main_elem_size, so alignment is satisfied.
-            // The data was written from identical types on the same machine.
+            // SAFETY: spill_main_from_pool writes columns contiguously to this
+            // mmap. FieldElement<F> is #[repr(transparent)] over F::BaseType.
             return unsafe { &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.main_columns[col][row]
@@ -346,7 +334,8 @@ where
                 .as_ref()
                 .expect("aux mmap must exist when accessing aux columns");
             let offset = (col * backing.num_rows + row) * backing.aux_elem_size;
-            // SAFETY: Same as get_main — repr(transparent) + page-aligned mmap.
+            // SAFETY: add_aux_from_pool writes columns contiguously to this
+            // mmap. FieldElement<E> is #[repr(transparent)] over E::BaseType.
             return unsafe { &*(aux_mmap.as_ptr().add(offset) as *const FieldElement<E>) };
         }
         &self.aux_columns[col][row]
@@ -390,12 +379,8 @@ where
         self.lde_step_size * step
     }
 
-    /// Write pool column data to a temp file, mmap it, and return an mmap-backed
-    /// LDETraceTable. The pool buffers are NOT consumed — they keep their capacity
-    /// for reuse by the next chunk.
-    ///
-    /// This is used during Phase A to snapshot the main LDE columns from the pool
-    /// before the pool is overwritten by the next chunk.
+    /// Write pool column data to a temp file and return an mmap-backed
+    /// LDETraceTable. Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_from_pool(
         main_pool: &[Vec<FieldElement<F>>],
@@ -464,13 +449,8 @@ where
         Ok(())
     }
 
-    /// Write borrowed pool columns to a temp file and mmap them.
-    /// Does NOT consume the pool — columns keep their capacity.
-    ///
-    /// Note: the concrete element types are `FieldElement<Goldilocks>` (8 bytes,
-    /// `#[repr(transparent)]` over `u64`) and `FieldElement<Degree3Extension>`
-    /// (24 bytes, `#[repr(transparent)]` over `[u64; 3]`). Neither has padding,
-    /// so the raw byte round-trip is well-defined.
+    /// Write pool columns to a temp file and return the mmap + file handle.
+    /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     fn write_pool_columns_to_mmap<T>(
         columns: &[Vec<T>],
@@ -491,7 +471,7 @@ where
         {
             let mut writer = std::io::BufWriter::new(&file);
             for col in columns {
-                // SAFETY: FieldElement<F/E> is #[repr(transparent)] over BaseType,
+                // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
@@ -500,7 +480,8 @@ where
             }
             writer.flush()?;
         }
-        // SAFETY: We own the file exclusively.
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         Ok((mmap, file))
     }
@@ -524,15 +505,8 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    let evaluation_points = frame_offsets
-        .iter()
-        .flat_map(|offset| {
-            let exponents_range_start = offset * step_size;
-            let exponents_range_end = (offset + 1) * step_size;
-            (exponents_range_start..exponents_range_end).collect_vec()
-        })
-        .map(|exponent| primitive_root.pow(exponent) * x)
-        .collect_vec();
+    let evaluation_points =
+        compute_frame_evaluation_points(x, frame_offsets, primitive_root, step_size);
 
     let main_evaluations = evaluation_points
         .iter()
@@ -615,15 +589,8 @@ where
         .expect("coset_offset_pow_n is non-zero");
 
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
-    let evaluation_points: Vec<FieldElement<E>> = frame_offsets
-        .iter()
-        .flat_map(|offset| {
-            let start = offset * step_size;
-            let end = (offset + 1) * step_size;
-            (start..end).collect_vec()
-        })
-        .map(|exponent| &domain.trace_primitive_root.pow(exponent) * z)
-        .collect_vec();
+    let evaluation_points =
+        compute_frame_evaluation_points(z, frame_offsets, &domain.trace_primitive_root, step_size);
 
     // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
@@ -816,4 +783,26 @@ where
                 .collect()
         })
         .collect()
+}
+
+fn compute_frame_evaluation_points<F, E>(
+    x: &FieldElement<E>,
+    frame_offsets: &[usize],
+    primitive_root: &FieldElement<F>,
+    step_size: usize,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mut evaluation_points = Vec::with_capacity(frame_offsets.len() * step_size);
+    for &offset in frame_offsets {
+        let start_exponent = offset * step_size;
+        let mut current = primitive_root.pow(start_exponent) * x;
+        for _ in 0..step_size {
+            evaluation_points.push(current.clone());
+            current = primitive_root * &current;
+        }
+    }
+    evaluation_points
 }

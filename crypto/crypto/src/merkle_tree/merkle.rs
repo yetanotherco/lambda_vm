@@ -24,12 +24,13 @@ impl std::error::Error for Error {}
 
 /// File-backed mmap storage for Merkle tree nodes.
 ///
-/// After `spill_nodes_to_disk()`, the heap `Vec<B::Node>` is freed and all
-/// node access goes through this mmap. The OS manages page eviction under
-/// memory pressure — file-backed pages are evictable without swap.
+/// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
+/// node access goes through this mmap instead.
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
     node_count: usize,
     node_size: usize,
@@ -44,6 +45,7 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
@@ -51,22 +53,6 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
-}
-
-impl<B: IsMerkleTreeBackend> Clone for MerkleTree<B> {
-    fn clone(&self) -> Self {
-        #[cfg(feature = "disk-spill")]
-        assert!(
-            self.mmap_backing.is_none(),
-            "cannot clone a spilled MerkleTree — nodes have been freed; use Arc instead"
-        );
-        Self {
-            root: self.root.clone(),
-            nodes: self.nodes.clone(),
-            #[cfg(feature = "disk-spill")]
-            mmap_backing: None,
-        }
-    }
 }
 
 const ROOT: usize = 0;
@@ -132,10 +118,8 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
-                // SAFETY: B::Node is Copy (required by spill_nodes_to_disk's where clause).
-                // The mmap contains node_count × node_size contiguous bytes written from
-                // identical Node values on the same machine. The mmap base is page-aligned
-                // and node_size divides into page size for all concrete Node types ([u8; 32/64]).
+                // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
+                // to this mmap and asserts align_of::<B::Node>() == 1 at compile time.
                 let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
@@ -285,21 +269,19 @@ where
         auth_path_set.into_iter().rev().collect()
     }
 
-    /// Write tree nodes to a temp file, mmap it read-only, and free the heap Vec.
-    ///
-    /// After this call, all node access methods read from the mmap transparently.
-    /// The OS can evict mmap pages under memory pressure since they're file-backed.
-    ///
-    /// Requires `B::Node: Copy` to ensure nodes have a trivial byte representation
-    /// suitable for raw serialization and mmap casting.
-    ///
-    /// Note: the concrete `Node` type is `[u8; 32]` (Keccak hash), which has no
-    /// padding bytes. The raw byte round-trip is therefore well-defined.
+    /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
+    /// Node access methods read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
         B::Node: Copy,
     {
+        const {
+            assert!(
+                align_of::<B::Node>() == 1,
+                "B::Node must have alignment 1 for mmap safety"
+            )
+        }
         use std::io::Write;
 
         if self.nodes.is_empty() {
@@ -314,8 +296,8 @@ where
         file.set_len(total_bytes as u64)?;
         {
             let mut writer = std::io::BufWriter::new(&file);
-            // SAFETY: B::Node is Copy, so its in-memory representation is a
-            // valid byte sequence. The Vec is contiguous.
+            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+            // the contiguous Vec to a byte slice is valid.
             let bytes = unsafe {
                 core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
             };
@@ -323,7 +305,8 @@ where
             writer.flush()?;
         }
 
-        // SAFETY: We own the file exclusively; it won't be modified externally.
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         // Free the heap allocation

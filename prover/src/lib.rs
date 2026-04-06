@@ -17,8 +17,8 @@ mod debug_report;
 pub mod instruments;
 pub mod tables;
 pub mod test_utils;
+#[cfg(test)]
 pub mod tests;
-pub mod utils;
 
 use std::fmt;
 
@@ -41,7 +41,8 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_mul_air, create_page_air, create_register_air, create_shift_air,
+    create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air, create_register_air,
+    create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -66,6 +67,7 @@ pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
     pub memw: usize,
+    pub memw_aligned: usize,
     pub load: usize,
     pub mul: usize,
     pub dvrm: usize,
@@ -80,7 +82,15 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
+        self.cpu
+            + self.lt
+            + self.memw
+            + self.memw_aligned
+            + self.load
+            + self.mul
+            + self.dvrm
+            + self.shift
+            + self.branch
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -92,6 +102,7 @@ impl TableCounts {
             ("cpu", self.cpu),
             ("lt", self.lt),
             ("memw", self.memw),
+            ("memw_aligned", self.memw_aligned),
             ("load", self.load),
             ("mul", self.mul),
             ("dvrm", self.dvrm),
@@ -174,6 +185,7 @@ pub(crate) struct VmAirs {
     pub lts: Vec<VmAir>,
     pub shifts: Vec<VmAir>,
     pub memws: Vec<VmAir>,
+    pub memw_aligneds: Vec<VmAir>,
     pub loads: Vec<VmAir>,
     pub decode: VmAir,
     pub muls: Vec<VmAir>,
@@ -206,6 +218,13 @@ impl VmAirs {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self
+            .memw_aligneds
+            .iter()
+            .zip(traces.memw_aligneds.iter_mut())
+        {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) {
@@ -247,6 +266,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.memws {
+            refs.push(air);
+        }
+        for air in &self.memw_aligneds {
             refs.push(air);
         }
         for air in &self.loads {
@@ -301,6 +323,9 @@ impl VmAirs {
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
             .collect();
+        let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
+            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
+            .collect();
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
@@ -343,6 +368,7 @@ impl VmAirs {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,
@@ -450,8 +476,6 @@ pub fn prove_with_options(
 ) -> Result<VmProof, Error> {
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
-    #[cfg(feature = "instruments")]
-    let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
@@ -466,8 +490,6 @@ pub fn prove_with_options(
 
     #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
-    #[cfg(feature = "instruments")]
-    let heap_after_execute = stark::instruments::heap_bytes();
 
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
@@ -490,9 +512,8 @@ pub fn prove_with_options(
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
-    #[cfg(feature = "instruments")]
-    let heap_after_trace = stark::instruments::heap_bytes();
 
+    // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
@@ -507,8 +528,6 @@ pub fn prove_with_options(
 
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
-    #[cfg(feature = "instruments")]
-    let heap_after_air = stark::instruments::heap_bytes();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
@@ -522,18 +541,11 @@ pub fn prove_with_options(
 
     #[cfg(feature = "instruments")]
     {
-        let heap_profile = stark::instruments::ProveHeapProfile {
-            after_execute: heap_after_execute,
-            after_trace_build: heap_after_trace,
-            after_air: heap_after_air,
-        };
         instruments::print_report(
             execute_elapsed,
             trace_build_elapsed,
             air_elapsed,
             total_start.elapsed(),
-            heap_before,
-            &heap_profile,
         );
     }
 

@@ -123,10 +123,6 @@ enum Commands {
         /// Print timing breakdown
         #[arg(long)]
         time: bool,
-
-        /// Maximum rows per table chunk (power of 2). Smaller = less memory, more chunks.
-        #[arg(long)]
-        max_rows: Option<usize>,
     },
 
     /// Verify a proof bundle
@@ -159,8 +155,7 @@ fn main() -> ExitCode {
             output,
             blowup,
             time,
-            max_rows,
-        } => cmd_prove(elf, output, blowup, time, max_rows),
+        } => cmd_prove(elf, output, blowup, time),
         Commands::Verify {
             proof,
             elf,
@@ -254,13 +249,7 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(
-    elf_path: PathBuf,
-    output_path: PathBuf,
-    blowup: Option<u8>,
-    time: bool,
-    max_rows: Option<usize>,
-) -> ExitCode {
+fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -277,29 +266,6 @@ fn cmd_prove(
         eprintln!("Disk-spill: enabled");
     }
 
-    #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
-    stark::instruments::set_heap_reader(|| {
-        tikv_jemalloc_ctl::epoch::advance().ok();
-        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
-    });
-
-    let max_rows_config = match max_rows {
-        Some(mr) => {
-            eprintln!("Max rows per chunk: {mr}");
-            prover::MaxRowsConfig {
-                cpu: mr,
-                memw: mr,
-                dvrm: mr,
-                mul: mr,
-                lt: mr,
-                shift: mr,
-                load: mr,
-                branch: mr,
-            }
-        }
-        None => prover::MaxRowsConfig::default(),
-    };
-
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
@@ -314,13 +280,11 @@ fn cmd_prove(
                 "Generating proof (blowup={b}, queries={})...",
                 opts.fri_number_of_queries
             );
-            prover::prove_with_options(&elf_data, &opts, &max_rows_config)
+            prover::prove_with_options(&elf_data, &opts, &Default::default())
         }
         None => {
-            let opts =
-                GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
             eprintln!("Generating proof...");
-            prover::prove_with_options(&elf_data, &opts, &max_rows_config)
+            prover::prove(&elf_data)
         }
     };
     let prove_elapsed = start.elapsed();

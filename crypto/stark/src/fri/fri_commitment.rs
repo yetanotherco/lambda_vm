@@ -4,7 +4,7 @@ use math::{
     traits::AsBytes,
 };
 
-#[derive(Clone)]
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 pub struct FriLayer<F, B>
 where
     F: IsField,
@@ -19,12 +19,16 @@ where
     eval_mmap: Option<EvalMmapBacking>,
 }
 
+/// File-backed mmap storage for FRI layer evaluations.
+/// After `spill_evaluation_to_disk()`, the in-memory evaluation vector is freed
+/// and element access goes through this mmap instead.
 #[cfg(feature = "disk-spill")]
 #[derive(Clone)]
 struct EvalMmapBacking {
     mmap: std::sync::Arc<memmap2::Mmap>,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::sync::Arc<std::fs::File>,
-    _len: usize,
     elem_size: usize,
 }
 
@@ -55,6 +59,9 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.eval_mmap {
             let offset = index * backing.elem_size;
+            // SAFETY: spill_evaluation_to_disk writes self.evaluation as contiguous
+            // bytes to this mmap. FieldElement<F> is #[repr(transparent)] over its
+            // base type, so the byte layout matches the original elements.
             return unsafe { &*(backing.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.evaluation[index]
@@ -75,19 +82,21 @@ where
         file.set_len(total_bytes as u64)?;
         {
             let mut writer = std::io::BufWriter::new(&file);
+            // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
+            // can be viewed as a contiguous byte slice.
             let bytes = unsafe {
                 std::slice::from_raw_parts(self.evaluation.as_ptr() as *const u8, total_bytes)
             };
             writer.write_all(bytes)?;
             writer.flush()?;
         }
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        let len = self.evaluation.len();
         self.evaluation = Vec::new();
         self.eval_mmap = Some(EvalMmapBacking {
             mmap: std::sync::Arc::new(mmap),
             _file: std::sync::Arc::new(file),
-            _len: len,
             elem_size,
         });
         Ok(())

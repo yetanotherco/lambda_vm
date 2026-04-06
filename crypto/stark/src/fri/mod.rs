@@ -57,27 +57,12 @@ where
         let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
-        #[cfg(feature = "disk-spill")]
-        let merkle_tree = {
-            let mut t = merkle_tree;
-            t.spill_nodes_to_disk()
-                .expect("disk-spill FRI layer Merkle tree");
-            t
-        };
-        let layer = FriLayer::new(
+        fri_layer_list.push(FriLayer::new(
             &evals,
             merkle_tree,
             current_coset_offset.clone().to_extension(),
             current_domain_size,
-        );
-        #[cfg(feature = "disk-spill")]
-        let layer = {
-            let mut l = layer;
-            l.spill_evaluation_to_disk()
-                .expect("disk-spill FRI layer evaluation");
-            l
-        };
-        fri_layer_list.push(layer);
+        ));
 
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&root);

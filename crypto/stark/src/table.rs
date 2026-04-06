@@ -14,25 +14,24 @@ use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
     _file: std::fs::File,
+    /// Number of columns per row.
     width: usize,
+    /// Number of rows.
     height: usize,
+    /// Size in bytes of a single element.
     elem_size: usize,
 }
 
-// Manual trait impls so Table<F> can keep its derive macros.
-// Spilled tables should not be cloned during proving.
+// Table<F> derives Clone, which requires all fields to implement Clone.
+// TableMmapBacking implements Clone to satisfy this, but panics because
+// mmap-backed data cannot be cloned.
 #[cfg(feature = "disk-spill")]
 impl Clone for TableMmapBacking {
     fn clone(&self) -> Self {
         panic!("TableMmapBacking cannot be cloned — spilled tables should not be cloned")
-    }
-}
-
-#[cfg(feature = "disk-spill")]
-impl Default for TableMmapBacking {
-    fn default() -> Self {
-        panic!("TableMmapBacking has no default — use None")
     }
 }
 
@@ -126,38 +125,6 @@ impl<F: IsField> Table<F> {
         Self::new(data, width)
     }
 
-    /// Creates a Table instance by borrowing column data without consuming it.
-    ///
-    /// Same transpose logic as [`from_columns`], but the column Vecs are NOT consumed —
-    /// the caller retains them. This is used for LDE buffer reuse where the pool
-    /// retains the column buffers for the next table.
-    pub fn from_columns_borrowed(columns: &[Vec<FieldElement<F>>]) -> Self {
-        if columns.is_empty() {
-            return Self::new(Vec::new(), 0);
-        }
-        let height = columns[0].len();
-
-        debug_assert!(columns.iter().all(|c| c.len() == height));
-
-        let width = columns.len();
-        let mut data = Vec::with_capacity(width * height);
-
-        for row_idx in 0..height {
-            for column in columns.iter() {
-                data.push(column[row_idx].clone());
-            }
-        }
-
-        Self::new(data, width)
-    }
-
-    /// Returns a vector of vectors of field elements representing the table rows
-    pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
-        (0..self.height)
-            .map(|row_idx| self.get_row(row_idx).to_vec())
-            .collect()
-    }
-
     /// Given a row index, returns a reference to that row as a slice of field elements.
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         #[cfg(feature = "disk-spill")]
@@ -168,8 +135,9 @@ impl<F: IsField> Table<F> {
                 backing.height
             );
             let offset = row_idx * backing.width * backing.elem_size;
-            // SAFETY: Row-major layout means width elements are contiguous.
-            // Same repr(transparent) + page-aligned guarantees as get().
+            // SAFETY: spill_to_disk writes the table in row-major layout, so
+            // width elements at this offset are contiguous. FieldElement<F>
+            // is #[repr(transparent)].
             return unsafe {
                 std::slice::from_raw_parts(
                     backing.mmap.as_ptr().add(offset) as *const FieldElement<F>,
@@ -181,19 +149,6 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
-    /// Given a slice of field elements representing a row, appends it to
-    /// the end of the table.
-    pub fn append_row(&mut self, row: &[FieldElement<F>]) {
-        debug_assert_eq!(row.len(), self.width);
-        self.data.extend_from_slice(row);
-        self.height += 1
-    }
-
-    /// Returns a reference to the last row of the table
-    pub fn last_row(&self) -> &[FieldElement<F>] {
-        self.get_row(self.height - 1)
-    }
-
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -203,12 +158,6 @@ impl<F: IsField> Table<F> {
                     .map(|row_idx| self.get(row_idx, col_idx).clone())
                     .collect()
             })
-            .collect()
-    }
-
-    pub fn get_column(&self, col_idx: usize) -> Vec<FieldElement<F>> {
-        (0..self.height)
-            .map(|row_idx| self.get(row_idx, col_idx).clone())
             .collect()
     }
 
@@ -228,7 +177,6 @@ impl<F: IsField> Table<F> {
         let iter = output[..self.width].par_iter_mut().enumerate();
         #[cfg(not(feature = "parallel"))]
         let iter = output[..self.width].iter_mut().enumerate();
-        // Use get() which transparently reads from mmap or data Vec
         iter.for_each(|(col_idx, buf)| {
             buf.clear();
             buf.reserve(self.height.saturating_sub(buf.capacity()));
@@ -338,7 +286,8 @@ impl<F: IsField> Table<F> {
             writer.flush()?;
         }
 
-        // SAFETY: We own the file exclusively.
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         self.mmap_backing = Some(TableMmapBacking {
@@ -356,11 +305,13 @@ impl<F: IsField> Table<F> {
     }
 
     /// Advise the kernel to drop mmap pages from the page cache.
-    /// Call after reading spilled data into pool buffers to free ~37GB of
-    /// cached pages that would otherwise persist under memory pressure.
+    /// Call after reading spilled data into pool buffers so the same
+    /// data doesn't occupy RAM in both places.
     #[cfg(feature = "disk-spill")]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
+            // SAFETY: pointer and length are from a valid mmap.
+            // MADV_DONTNEED is advisory and cannot cause UB.
             unsafe {
                 libc::madvise(
                     backing.mmap.as_ptr() as *mut libc::c_void,
