@@ -2592,6 +2592,11 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after rounds 2-4") {
+            heap_snaps.push(s);
+        }
+
+        #[cfg(feature = "instruments")]
         {
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.

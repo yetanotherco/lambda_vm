@@ -49,7 +49,7 @@ fi
 CLI="$ROOT_DIR/target/release/cli"
 
 # Phase labels we parse from stderr (order matters)
-PHASES="execute trace_build air pool_alloc main_commits aux_build aux_commit"
+PHASES="execute trace_build air pool_alloc main_commits aux_build aux_commit pool_drop rounds_2_4"
 
 for size in $PROGRAMS; do
     ELF="$ELF_DIR/fib_iterative_${size}.elf"
@@ -71,6 +71,8 @@ for size in $PROGRAMS; do
         if (/after main commits/)  printf "main_commits=%s\n", $(NF-1)
         if (/after aux build/)     printf "aux_build=%s\n", $(NF-1)
         if (/after aux commit/)    printf "aux_commit=%s\n", $(NF-1)
+        if (/after pool drop/)    printf "pool_drop=%s\n", $(NF-1)
+        if (/after rounds 2-4/)   printf "rounds_2_4=%s\n", $(NF-1)
     }' "$STDERR")
 
     PEAK=$(grep -o 'Peak heap: [0-9]*' "$STDOUT" | awk '{print $3}')
@@ -103,6 +105,8 @@ for phase in $PHASES; do
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
         aux_commit)   label="Aux commit" ;;
+        pool_drop)    label="Pool drop" ;;
+        rounds_2_4)   label="Rounds 2-4" ;;
     esac
 
     printf "  %-22s" "$label"
@@ -153,6 +157,8 @@ for phase in $PHASES; do
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
         aux_commit)   label="Aux commit" ;;
+        pool_drop)    label="Pool drop" ;;
+        rounds_2_4)   label="Rounds 2-4" ;;
     esac
 
     # Collect (steps_M, delta) pairs
@@ -166,6 +172,8 @@ for phase in $PHASES; do
         main_commits) prev_phase_key="pool_alloc" ;;
         aux_build)    prev_phase_key="main_commits" ;;
         aux_commit)   prev_phase_key="aux_build" ;;
+        pool_drop)    prev_phase_key="aux_commit" ;;
+        rounds_2_4)   prev_phase_key="pool_drop" ;;
     esac
 
     for size in $PROGRAMS; do
