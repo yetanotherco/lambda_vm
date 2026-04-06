@@ -308,7 +308,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // CO25: MEMW write receiver (from CPU M5/STORE sender)
+    // CO25: MEMW write receiver (from CPU M5 sender — register write to rd)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
