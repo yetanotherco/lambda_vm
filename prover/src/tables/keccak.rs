@@ -57,13 +57,13 @@ pub mod cols {
     /// Index into input_state[x][y][byte]
     #[inline]
     pub const fn input_state(x: usize, y: usize, byte: usize) -> usize {
-        INPUT_STATE + (x * 5 + y) * 8 + byte
+        INPUT_STATE + (x + 5 * y) * 8 + byte
     }
 
     /// Index into output_state[x][y][byte]
     #[inline]
     pub const fn output_state(x: usize, y: usize, byte: usize) -> usize {
-        OUTPUT_STATE + (x * 5 + y) * 8 + byte
+        OUTPUT_STATE + (x + 5 * y) * 8 + byte
     }
 
     /// Index into state_ptr[lane_idx][halfword] (DWordHL = 4 halfwords)

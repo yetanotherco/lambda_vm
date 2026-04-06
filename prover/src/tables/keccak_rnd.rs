@@ -101,7 +101,7 @@ pub mod cols {
     /// Index into start[x][y][byte] (200 bytes, row-major: y varies fastest)
     #[inline]
     pub const fn start(x: usize, y: usize, byte: usize) -> usize {
-        START + (x * 5 + y) * 8 + byte
+        START + (x + 5 * y) * 8 + byte
     }
 
     /// Index into Cxz[x][stage][byte] (160 bytes)
@@ -131,31 +131,31 @@ pub mod cols {
     /// Index into theta[x][y][byte]
     #[inline]
     pub const fn theta(x: usize, y: usize, byte: usize) -> usize {
-        THETA + (x * 5 + y) * 8 + byte
+        THETA + (x + 5 * y) * 8 + byte
     }
 
     /// Index into rot_left[x][y][byte]
     #[inline]
     pub const fn rot_left(x: usize, y: usize, byte: usize) -> usize {
-        ROT_LEFT + (x * 5 + y) * 8 + byte
+        ROT_LEFT + (x + 5 * y) * 8 + byte
     }
 
     /// Index into rot_right[x][y][byte]
     #[inline]
     pub const fn rot_right(x: usize, y: usize, byte: usize) -> usize {
-        ROT_RIGHT + (x * 5 + y) * 8 + byte
+        ROT_RIGHT + (x + 5 * y) * 8 + byte
     }
 
     /// Index into pi[x][y][byte]
     #[inline]
     pub const fn pi(x: usize, y: usize, byte: usize) -> usize {
-        PI + (x * 5 + y) * 8 + byte
+        PI + (x + 5 * y) * 8 + byte
     }
 
     /// Index into chi_ands[x][y][byte]
     #[inline]
     pub const fn chi_ands(x: usize, y: usize, byte: usize) -> usize {
-        CHI_ANDS + (x * 5 + y) * 8 + byte
+        CHI_ANDS + (x + 5 * y) * 8 + byte
     }
 
     /// Index into chi[x][y][byte]
@@ -179,13 +179,13 @@ pub mod cols {
     /// Index into rnc[x][y]
     #[inline]
     pub const fn rnc(x: usize, y: usize) -> usize {
-        RNC + x * 5 + y
+        RNC + x + 5 * y
     }
 
     /// Index into rbc[x][y][bit]
     #[inline]
     pub const fn rbc(x: usize, y: usize, bit: usize) -> usize {
-        RBC + (x * 5 + y) * 2 + bit
+        RBC + (x + 5 * y) * 2 + bit
     }
 }
 
@@ -285,7 +285,10 @@ pub fn generate_keccak_rnd_trace(
                 c_bytes[x] = cxz[x][3];
             }
 
-            // Rotate C left by 1 bit using HWSL on each column's halfwords
+            // Rotate C left by 1 bit using HWSL decomposition.
+            // HWSL shifts each halfword independently. The carry from halfword k
+            // propagates to halfword (k+1)%4, which is a 2-byte offset:
+            //   rotated_Cxz[z] = Cxz_left[z] + Cxz_right[(z-2) mod 8]
             let mut cxz_left_bytes = [[0u8; 8]; 5];
             let mut cxz_right_bytes = [[0u8; 8]; 5];
             let mut rotated_c = [[0u8; 8]; 5];
@@ -304,8 +307,9 @@ pub fn generate_keccak_rnd_trace(
                     data[base + cols::cxz_right(x, hw * 2)] = FE::from(cxz_right_bytes[x][hw * 2] as u64);
                     data[base + cols::cxz_right(x, hw * 2 + 1)] = FE::from(cxz_right_bytes[x][hw * 2 + 1] as u64);
                 }
+                // Reconstruct: left[z] + right[(z-2) mod 8]
                 for b in 0..8 {
-                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(cxz_right_bytes[x][(b + 7) % 8]);
+                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(cxz_right_bytes[x][(b + 6) % 8]);
                 }
             }
 
@@ -641,7 +645,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     BusValue::Packed { start_column: cols::cxz((x + 4) % 5, 3, b), packing: Packing::Direct },
                     BusValue::linear(vec![
                         LinearTerm::Column { coefficient: 1, column: cols::cxz_left((x + 1) % 5, b) },
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz_right((x + 1) % 5, (b + 7) % 8) },
+                        LinearTerm::Column { coefficient: 1, column: cols::cxz_right((x + 1) % 5, (b + 6) % 8) },
                     ]),
                     BusValue::Packed { start_column: cols::dxz(x, b), packing: Packing::Direct },
                 ],
