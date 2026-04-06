@@ -328,11 +328,10 @@ fn test_bus_interactions_count() {
     // - 1 DVRM (division/remainder)
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (shared bus for HALT and COMMIT, mult = ECALL - ECALL_KECCAK)
-    // - 1 EcallKeccak (CPU → KECCAK core, mult = ECALL_KECCAK)
+    // - 1 ECALL (shared bus for HALT, COMMIT, and KECCAK, mult = ECALL)
     // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 69
-    assert_eq!(interactions.len(), 69);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 68
+    assert_eq!(interactions.len(), 68);
 }
 
 #[test]

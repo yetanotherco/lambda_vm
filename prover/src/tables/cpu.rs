@@ -2019,21 +2019,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ECALL interaction for HALT and COMMIT (excludes keccak)
+    // ECALL interaction (shared bus for HALT, COMMIT, and KECCAK)
     // -------------------------------------------------------------------------
-    // multiplicity = ECALL - ECALL_KECCAK
+    // multiplicity = ECALL (all ECALLs, each receiver matches on syscall number)
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ECALL,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::ECALL_KECCAK,
-            },
-        ]),
+        Multiplicity::Column(cols::ECALL),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
@@ -2054,44 +2045,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // cast(rv1, DWordWL)[1] = rv1_hi32 = RV1_2
             BusValue::Packed {
                 start_column: cols::RV1_2,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // EcallKeccak interaction (CPU → KECCAK core chip)
-    // -------------------------------------------------------------------------
-    // multiplicity = ECALL_KECCAK
-    // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32, state_addr_lo32, state_addr_hi32]
-    interactions.push(BusInteraction::sender(
-        BusId::EcallKeccak,
-        Multiplicity::Column(cols::ECALL_KECCAK),
-        vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0), // timestamp_hi = 0
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RV1_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV1_1,
-                },
-            ]),
-            BusValue::Packed {
-                start_column: cols::RV1_2,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::KECCAK_STATE_ADDR_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::KECCAK_STATE_ADDR_1,
                 packing: Packing::Direct,
             },
         ],

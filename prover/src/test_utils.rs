@@ -773,9 +773,11 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("REGISTER")
 }
 
-/// Create KECCAK core AIR with bus interactions (no transition constraints yet).
+/// Create KECCAK core AIR with ADD constraints and bus interactions.
 pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let (constraints, _) = crate::tables::keccak::create_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| c as _).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: keccak_bus_interactions(),
@@ -791,9 +793,11 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("KECCAK")
 }
 
-/// Create KECCAK_RND AIR with bus interactions (pi constraints TODO).
+/// Create KECCAK_RND AIR with pi constraints and bus interactions.
 pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let (constraints, _) = crate::tables::keccak_rnd::create_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| c as _).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: keccak_rnd_bus_interactions(),

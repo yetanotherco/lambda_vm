@@ -27,7 +27,12 @@
 //! | mu             |    1 | Multiplicity (1 for real, 0 for padding)      |
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+use math::field::element::FieldElement;
+use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::transition::TransitionConstraint;
+use stark::traits::TransitionEvaluationContext;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -771,4 +776,207 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     interactions
+}
+
+// =========================================================================
+// Constraints: Pi verification (200 degree-3 polynomial constraints)
+// =========================================================================
+
+/// Constraint verifying pi[x][y][z] = rho[(x+3y)%5][x][z].
+///
+/// rho is reconstructed from rot_left/rot_right using the rbc mux:
+///   rho[z] = (1-b0)(1-b1)(L[z]+R[(z-2)%8]) + b0(1-b1)(L[(z-2)%8]+R[(z-4)%8])
+///          + (1-b0)b1(L[(z-4)%8]+R[(z-6)%8]) + b0*b1(L[(z-6)%8]+R[z])
+///
+/// where (L,R) = (rot_left, rot_right) at the source lane, and
+/// b0 = rbc[src_x][src_y][0], b1 = rbc[src_x][src_y][1].
+pub struct PiConstraint {
+    constraint_idx: usize,
+    /// Destination coordinates in pi
+    x: usize,
+    y: usize,
+    z: usize,
+    /// Source coordinates: (sx, sy) = ((x + 3y) % 5, x)
+    sx: usize,
+    sy: usize,
+}
+
+impl PiConstraint {
+    pub fn new(constraint_idx: usize, x: usize, y: usize, z: usize) -> Self {
+        let sx = (x + 3 * y) % 5;
+        let sy = x;
+        Self {
+            constraint_idx,
+            x,
+            y,
+            z,
+            sx,
+            sy,
+        }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let one = FieldElement::<F>::one();
+        let z = self.z;
+
+        // Source lane rbc bits
+        let b0 = step
+            .get_main_evaluation_element(0, cols::rbc(self.sx, self.sy, 0))
+            .clone();
+        let b1 = step
+            .get_main_evaluation_element(0, cols::rbc(self.sx, self.sy, 1))
+            .clone();
+
+        let not_b0 = &one - &b0;
+        let not_b1 = &one - &b1;
+
+        // Helper to get rot_left/rot_right at source lane with byte index
+        let l = |byte_idx: usize| {
+            step.get_main_evaluation_element(0, cols::rot_left(self.sx, self.sy, byte_idx))
+                .clone()
+        };
+        let r = |byte_idx: usize| {
+            step.get_main_evaluation_element(0, cols::rot_right(self.sx, self.sy, byte_idx))
+                .clone()
+        };
+
+        // Corrected offsets: (z-2k) mod 8 for rbc case k
+        let case0 = &not_b0 * &not_b1 * (l(z) + r((z + 6) % 8));
+        let case1 = &b0 * &not_b1 * (l((z + 6) % 8) + r((z + 4) % 8));
+        let case2 = &not_b0 * &b1 * (l((z + 4) % 8) + r((z + 2) % 8));
+        let case3 = &b0 * &b1 * (l((z + 2) % 8) + r(z));
+
+        let expected = case0 + case1 + case2 + case3;
+
+        let pi_val = step
+            .get_main_evaluation_element(0, cols::pi(self.x, self.y, self.z))
+            .clone();
+
+        // pi - expected = 0 (degree 3: b0 * b1 * column)
+        // No mu guard needed: on padding rows all columns are zero,
+        // so expected=0 and pi=0, satisfying the constraint.
+        pi_val - expected
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PiConstraint {
+    fn degree(&self) -> usize {
+        // b0 * b1 * (L + R) has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+/// Create all pi verification constraints (200 total: 5×5×8).
+pub fn create_constraints(
+    constraint_idx_start: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    usize,
+) {
+    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+        Vec::with_capacity(200);
+    let mut idx = constraint_idx_start;
+
+    for x in 0..5 {
+        for y in 0..5 {
+            for z in 0..8 {
+                constraints.push(Box::new(PiConstraint::new(idx, x, y, z)));
+                idx += 1;
+            }
+        }
+    }
+
+    (constraints, idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    #[test]
+    fn test_pi_constraint_values() {
+        let input = [0u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let op = KeccakRoundOperation { timestamp: 42, input, output };
+        let trace = generate_keccak_rnd_trace(&[op]);
+
+        // Check pi constraint on round 0
+        for x in 0..5 {
+            for y in 0..5 {
+                let sx = (x + 3 * y) % 5;
+                let sy = x;
+                let rho_offset = KECCAK_RHO[sx][sy] as usize;
+                let rbc_val = rho_offset / 16;
+                let b0 = (rbc_val & 1) as u64;
+                let b1 = ((rbc_val >> 1) & 1) as u64;
+
+                for z in 0..8 {
+                    let base = 0 * cols::NUM_COLUMNS;
+                    let pi_val = &trace.main_table.data[base + cols::pi(x, y, z)];
+
+                    // Reconstruct expected from rot_left/rot_right
+                    let l = |bz: usize| &trace.main_table.data[base + cols::rot_left(sx, sy, bz)];
+                    let r = |bz: usize| &trace.main_table.data[base + cols::rot_right(sx, sy, bz)];
+
+                    let expected = if b0 == 0 && b1 == 0 {
+                        l(z) + r((z + 6) % 8)
+                    } else if b0 == 1 && b1 == 0 {
+                        l((z + 6) % 8) + r((z + 4) % 8)
+                    } else if b0 == 0 && b1 == 1 {
+                        l((z + 4) % 8) + r((z + 2) % 8)
+                    } else {
+                        l((z + 2) % 8) + r(z)
+                    };
+
+                    assert_eq!(
+                        pi_val, &expected,
+                        "Pi mismatch at ({x},{y},{z}): src=({sx},{sy}), rbc=({b0},{b1}), rho_offset={rho_offset}, pi={pi_val:?}, expected={expected:?}"
+                    );
+                }
+            }
+        }
+        println!("All pi constraints verified for round 0 ✓");
+    }
 }

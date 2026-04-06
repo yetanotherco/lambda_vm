@@ -16,9 +16,11 @@
 //! | mu             |    1 | Multiplicity flag                              |
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use crate::constraints::templates::{AddConstraint, AddOperand};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -157,9 +159,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
     let mut interactions = Vec::with_capacity(160);
 
-    // 1. EcallKeccak receiver: [ts_lo, ts_hi, syscall_lo32, syscall_hi32, addr_lo32, addr_hi32]
+    // 1. ECALL receiver (shared bus, per spec keccak:c:output)
+    // Format: [ts_lo, ts_hi, syscall_lo32, syscall_hi32]
+    // Syscall number: lo32 = 2^32-2, hi32 = 2^32-1
     interactions.push(BusInteraction::receiver(
-        BusId::EcallKeccak,
+        BusId::Ecall,
         Multiplicity::Column(cols::MU),
         vec![
             BusValue::Packed {
@@ -172,21 +176,53 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::constant(syscall_lo),
             BusValue::constant(syscall_hi),
-            // state_addr as DWordWL from DWordBL bytes
-            BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::addr(0) },
-                LinearTerm::Column { coefficient: 256, column: cols::addr(1) },
-                LinearTerm::Column { coefficient: 65536, column: cols::addr(2) },
-                LinearTerm::Column { coefficient: 16777216, column: cols::addr(3) },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::addr(4) },
-                LinearTerm::Column { coefficient: 256, column: cols::addr(5) },
-                LinearTerm::Column { coefficient: 65536, column: cols::addr(6) },
-                LinearTerm::Column { coefficient: 16777216, column: cols::addr(7) },
-            ]),
         ],
     ));
+
+    // 2. MEMW read_addr: read register x10 to bind addr (per spec keccak:c:read_addr)
+    // Format: [old[8], is_register=1, base_addr=[20,0], value[8], ts, ts_hi, write2=1, write4=0, write8=0]
+    // For register read: old = value = addr as WL + 6 zeros
+    {
+        // addr as DWordWL from DWordBL bytes: lo32 = sum(addr[0..4] * 256^i), hi32 = sum(addr[4..8] * 256^i)
+        let addr_lo = BusValue::linear(vec![
+            LinearTerm::Column { coefficient: 1, column: cols::addr(0) },
+            LinearTerm::Column { coefficient: 256, column: cols::addr(1) },
+            LinearTerm::Column { coefficient: 65536, column: cols::addr(2) },
+            LinearTerm::Column { coefficient: 16777216, column: cols::addr(3) },
+        ]);
+        let addr_hi = BusValue::linear(vec![
+            LinearTerm::Column { coefficient: 1, column: cols::addr(4) },
+            LinearTerm::Column { coefficient: 256, column: cols::addr(5) },
+            LinearTerm::Column { coefficient: 65536, column: cols::addr(6) },
+            LinearTerm::Column { coefficient: 16777216, column: cols::addr(7) },
+        ]);
+        let mut values = Vec::with_capacity(24);
+        // old[0..7] = addr as WL + 6 zeros
+        values.push(addr_lo.clone());
+        values.push(addr_hi.clone());
+        for _ in 2..8 { values.push(BusValue::constant(0)); }
+        // is_register = 1
+        values.push(BusValue::constant(1));
+        // base_address = 2*10 = 20 (register x10)
+        values.push(BusValue::constant(20));
+        values.push(BusValue::constant(0));
+        // value[0..7] = same as old (read)
+        values.push(addr_lo);
+        values.push(addr_hi);
+        for _ in 2..8 { values.push(BusValue::constant(0)); }
+        // timestamp
+        values.push(BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct });
+        values.push(BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct });
+        // write2=1, write4=0, write8=0 (register access)
+        values.push(BusValue::constant(1));
+        values.push(BusValue::constant(0));
+        values.push(BusValue::constant(0));
+        interactions.push(BusInteraction::sender(
+            BusId::Memw,
+            Multiplicity::Column(cols::MU),
+            values,
+        ));
+    }
 
     // 2. Keccak bus: send (timestamp, 0, input_state[200])
     {
@@ -313,4 +349,45 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     interactions
+}
+
+// =========================================================================
+// Constraints
+// =========================================================================
+
+/// Create constraints for the KECCAK core chip.
+///
+/// Per spec (keccak:c:state_ptr): ADD template for each lane:
+///   state_ptr[lane] = addr + 8 * lane_idx
+///
+/// 25 lane pointers × 2 constraints per ADD = 50 constraints total.
+/// Conditional on mu (only real rows).
+pub fn create_constraints(
+    constraint_idx_start: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    usize,
+) {
+    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+        Vec::with_capacity(50);
+    let mut idx = constraint_idx_start;
+
+    // state_ptr[lane] = addr + 8*lane_idx
+    // addr is DWordBL (8 bytes), state_ptr is DWordHL (4 halfwords)
+    // ADD: lhs = addr (DWordBL→DWordWL), rhs = 8*lane_idx (constant), sum = state_ptr (DWordHL→DWordWL)
+    for lane_idx in 0..25 {
+        let offset = (lane_idx * 8) as i64;
+        let (c0, c1) = AddConstraint::new_pair(
+            vec![cols::MU], // conditional on mu
+            AddOperand::from_dword_bl(cols::ADDR),
+            AddOperand::constant(offset),
+            AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
+            idx,
+        );
+        constraints.push(Box::new(c0));
+        constraints.push(Box::new(c1));
+        idx += 2;
+    }
+
+    (constraints, idx)
 }

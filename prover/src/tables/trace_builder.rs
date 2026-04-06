@@ -399,9 +399,9 @@ fn collect_ops_from_cpu(
             }
             let mut output = input;
             executor::vm::instruction::execution::keccak_f1600(&mut output);
-            // collect_keccak_memw_ops handles memory_state updates for reads and writes
+            // collect_keccak_memw_ops handles memory_state + register_state updates
             let keccak_memw_ops =
-                collect_keccak_memw_ops(op, &input, &output, memory_state);
+                collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
             memw_ops.extend(keccak_memw_ops);
             keccak_ops.push(KeccakOperation {
                 timestamp: op.timestamp,
@@ -816,12 +816,25 @@ fn collect_keccak_memw_ops(
     input: &[u64; 25],
     output: &[u64; 25],
     memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
     let state_addr = op.keccak_state_addr;
-    let mut memw_ops = Vec::with_capacity(25);
+    let mut memw_ops = Vec::with_capacity(26); // 1 register read + 25 lane ops
 
-    // Per spec: single combined read+write MEMW per lane at `timestamp`.
+    // Per spec (keccak:c:read_addr): read register x10 to get state_addr
+    {
+        let reg_value = pack_register_value(state_addr);
+        let reg_addr = 2 * 10u64; // x10 → address 20
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, state_addr, ts);
+    }
+
+    // Per spec (keccak:c:load_store_state): single combined read+write MEMW per lane.
     // input = [0, state_ptr, output_state, timestamp, 0, 0, 1], output = input_state
     // The MEMW table sees: old=input_state, value=output_state, is_read=true.
     for (lane_idx, (&in_lane, &out_lane)) in input.iter().zip(output.iter()).enumerate() {
