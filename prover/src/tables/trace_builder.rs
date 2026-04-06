@@ -40,6 +40,9 @@ use super::cpu::{self, CpuOperation};
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
 use super::halt;
+use super::keccak::{self, KeccakOperation};
+use super::keccak_rc;
+use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -317,7 +320,7 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops)
+/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -330,6 +333,7 @@ fn collect_ops_from_cpu(
     Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
+    Vec<KeccakOperation>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -337,6 +341,7 @@ fn collect_ops_from_cpu(
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
+    let mut keccak_ops = Vec::new();
     let mut current_commit_index = 0u32;
     let mut commit_ecall_count = 0u32;
 
@@ -377,6 +382,40 @@ fn collect_ops_from_cpu(
                 "commit index drift: current_commit_index and register_state.index_register must stay in sync"
             );
             commit_ecall_count += 1;
+        }
+
+        // Collect KeccakPermute ECALL operations
+        if op.ecall_keccak {
+            let state_addr = op.keccak_state_addr;
+            let mut input = [0u64; 25];
+            for (i, lane) in input.iter_mut().enumerate() {
+                let addr = state_addr.wrapping_add(i as u64 * 8);
+                let mut val = 0u64;
+                for b in 0..8 {
+                    let (byte_val, _ts) = memory_state.read_byte(addr + b as u64);
+                    val |= (byte_val as u64) << (b * 8);
+                }
+                *lane = val;
+            }
+            let mut output = input;
+            executor::vm::instruction::execution::keccak_f1600(&mut output);
+            // Update memory state with output
+            for (i, &lane) in output.iter().enumerate() {
+                let addr = state_addr.wrapping_add(i as u64 * 8);
+                for b in 0..8 {
+                    let byte_val = ((lane >> (b * 8)) & 0xFF) as u8;
+                    memory_state.write_byte(addr + b as u64, byte_val, op.timestamp + 1);
+                }
+            }
+            let keccak_memw_ops =
+                collect_keccak_memw_ops(op, &input, &output, register_state);
+            memw_ops.extend(keccak_memw_ops);
+            keccak_ops.push(KeccakOperation {
+                timestamp: op.timestamp,
+                state_addr,
+                input,
+                output,
+            });
         }
 
         // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
@@ -422,6 +461,7 @@ fn collect_ops_from_cpu(
         shift_ops,
         bitwise_ops,
         commit_ops,
+        keccak_ops,
     )
 }
 
@@ -774,6 +814,59 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 // =============================================================================
 
 /// Collects LT operations from MEMW for timestamp ordering.
+/// Collect MEMW operations for a KeccakPermute ECALL.
+///
+/// Generates 25 read operations (input lanes at timestamp) and 25 write
+/// operations (output lanes at timestamp+1). Each operation is 8 bytes wide.
+fn collect_keccak_memw_ops(
+    op: &CpuOperation,
+    input: &[u64; 25],
+    output: &[u64; 25],
+    register_state: &mut RegisterState,
+) -> Vec<MemwOperation> {
+    let ts = op.timestamp;
+    let state_addr = op.keccak_state_addr;
+    let mut memw_ops = Vec::with_capacity(53); // 25 reads + 25 writes + 3 register ops
+
+    // Register reads for the ECALL: x10 (state_addr), x17 (syscall number)
+    // x10 read at ts
+    {
+        let reg_value = pack_register_value(state_addr);
+        let reg_addr = 2 * 10u64;
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, state_addr, ts);
+    }
+
+    // 25 lane reads at timestamp
+    for (lane_idx, &lane_val) in input.iter().enumerate() {
+        let lane_addr = state_addr.wrapping_add(lane_idx as u64 * 8);
+        let mut value_bytes = [0u64; 8];
+        for (b, byte) in value_bytes.iter_mut().enumerate() {
+            *byte = (lane_val >> (b * 8)) & 0xFF;
+        }
+        let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
+            .with_old(value_bytes, [0; 8]);
+        memw_ops.push(memw_op);
+    }
+
+    // 25 lane writes at timestamp+1
+    for (lane_idx, &lane_val) in output.iter().enumerate() {
+        let lane_addr = state_addr.wrapping_add(lane_idx as u64 * 8);
+        let mut value_bytes = [0u64; 8];
+        for (b, byte) in value_bytes.iter_mut().enumerate() {
+            *byte = (lane_val >> (b * 8)) & 0xFF;
+        }
+        let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts + 1, 8, false);
+        memw_ops.push(memw_op);
+    }
+
+    memw_ops
+}
+
 ///
 /// From spec memw.md:
 /// - MEMW-C4 through MEMW-C7: old_timestamp[i] < timestamp (based on width)
@@ -1439,6 +1532,196 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 /// Generates PAGE tables for memory initialization and finalization.
 ///
 /// Derives all page bases from `memory_state.cells.keys()` — this includes
+/// Collect BITWISE lookups generated by the keccak chips.
+///
+/// The keccak round chip sends XOR_BYTE, AND_BYTE, HWSL, and IS_BYTE
+/// interactions; the keccak core chip sends IS_HALF interactions.
+/// All of these must be registered so the BITWISE table's multiplicities are correct.
+#[allow(clippy::needless_range_loop)]
+fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+
+    let mut ops = Vec::new();
+
+    for kop in keccak_ops {
+        let state_addr = kop.state_addr;
+
+        // IS_HALF for state_ptr halfwords (100 per call)
+        for lane_idx in 0..25 {
+            let ptr = state_addr.wrapping_add(lane_idx as u64 * 8);
+            for shift in [0, 16, 32, 48] {
+                let half = ((ptr >> shift) & 0xFFFF) as u16;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    ((half >> 8) & 0xFF) as u8,
+                ));
+            }
+        }
+
+        // Replay keccak round computation to extract bitwise lookups
+        let mut state = kop.input;
+        for round in 0..24 {
+            // --- theta: Cxz chain XOR_BYTE (160) ---
+            let mut cxz = [[[0u8; 8]; 4]; 5];
+            for x in 0..5 {
+                for b in 0..8 {
+                    let v0 = ((state[x] >> (b * 8)) & 0xFF) as u8;
+                    let v1 = ((state[x + 5] >> (b * 8)) & 0xFF) as u8;
+                    cxz[x][0][b] = v0 ^ v1;
+                    ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, v0, v1));
+                }
+                for stage in 1..4usize {
+                    let y = stage + 1;
+                    for b in 0..8 {
+                        let prev = cxz[x][stage - 1][b];
+                        let sv = ((state[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
+                        cxz[x][stage][b] = prev ^ sv;
+                        ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, prev, sv));
+                    }
+                }
+            }
+
+            // theta: HWSL for rotated C (20) + IS_BYTE (80)
+            let mut rotated_c = [[0u8; 8]; 5];
+            for x in 0..5 {
+                let c = cxz[x][3];
+                for hw in 0..4 {
+                    let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
+                    let shifted = halfword << 1; // u16 wraps
+                    let carry = if halfword >> 15 == 1 { 1u16 } else { 0 };
+                    ops.push(BitwiseOperation::new(BitwiseOperationType::Hwsl,
+                        (halfword & 0xFF) as u8,
+                        ((halfword >> 8) & 0xFF) as u8,
+                        1,
+                    ));
+                    // IS_BYTE for cxz_left bytes
+                    ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, (shifted & 0xFF) as u8));
+                    ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, ((shifted >> 8) & 0xFF) as u8));
+                    // IS_BYTE for cxz_right bytes
+                    ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, (carry & 0xFF) as u8));
+                    ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, ((carry >> 8) & 0xFF) as u8));
+                }
+                // Reconstruct rotated_c
+                let mut left_bytes = [0u8; 8];
+                let mut right_bytes = [0u8; 8];
+                for hw in 0..4 {
+                    let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
+                    let shifted = halfword << 1;
+                    let carry = if halfword >> 15 == 1 { 1u16 } else { 0 };
+                    left_bytes[hw * 2] = (shifted & 0xFF) as u8;
+                    left_bytes[hw * 2 + 1] = ((shifted >> 8) & 0xFF) as u8;
+                    right_bytes[hw * 2] = (carry & 0xFF) as u8;
+                    right_bytes[hw * 2 + 1] = ((carry >> 8) & 0xFF) as u8;
+                }
+                for b in 0..8 {
+                    rotated_c[x][b] = left_bytes[b].wrapping_add(right_bytes[(b + 7) % 8]);
+                }
+            }
+
+            // theta: Dxz XOR_BYTE (40)
+            let mut d_bytes = [[0u8; 8]; 5];
+            for x in 0..5 {
+                for b in 0..8 {
+                    let a = cxz[(x + 4) % 5][3][b];
+                    let rb = rotated_c[(x + 1) % 5][b];
+                    d_bytes[x][b] = a ^ rb;
+                    ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, a, rb));
+                }
+            }
+
+            // theta final: XOR_BYTE (200)
+            let mut theta_lanes = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    let lane = state[x + 5 * y];
+                    let mut d_lane = 0u64;
+                    for b in 0..8 {
+                        d_lane |= (d_bytes[x][b] as u64) << (b * 8);
+                    }
+                    theta_lanes[x + 5 * y] = lane ^ d_lane;
+                    for b in 0..8 {
+                        let s = ((lane >> (b * 8)) & 0xFF) as u8;
+                        ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, s, d_bytes[x][b]));
+                    }
+                }
+            }
+
+            // rho: HWSL (100) + IS_BYTE (400)
+            for x in 0..5 {
+                for y in 0..5 {
+                    let rho_offset = KECCAK_RHO[x][y] as usize;
+                    let rnc_val = (rho_offset % 16) as u8;
+                    let theta_lane = theta_lanes[x + 5 * y];
+                    for hw in 0..4 {
+                        let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
+                        let (shifted, carry) = if rnc_val == 0 {
+                            (halfword, 0u16)
+                        } else {
+                            (halfword << rnc_val, halfword >> (16 - rnc_val))
+                        };
+                        ops.push(BitwiseOperation::new(BitwiseOperationType::Hwsl,
+                            (halfword & 0xFF) as u8,
+                            ((halfword >> 8) & 0xFF) as u8,
+                            rnc_val,
+                        ));
+                        // IS_BYTE for rot_left
+                        ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, (shifted & 0xFF) as u8));
+                        ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, ((shifted >> 8) & 0xFF) as u8));
+                        // IS_BYTE for rot_right
+                        ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, (carry & 0xFF) as u8));
+                        ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, ((carry >> 8) & 0xFF) as u8));
+                    }
+                }
+            }
+
+            // pi: compute pi_lanes
+            let mut pi_lanes = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+                    let dst_x = y;
+                    let dst_y = (2 * x + 3 * y) % 5;
+                    pi_lanes[dst_x + 5 * dst_y] = rotated;
+                }
+            }
+
+            // chi: AND_BYTE (200) + XOR_BYTE (200)
+            let mut chi_lanes = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
+                    let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
+                    let and_val = not_next & next2;
+                    chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
+                    for b in 0..8 {
+                        let not_byte = ((not_next >> (b * 8)) & 0xFF) as u8;
+                        let n2_byte = ((next2 >> (b * 8)) & 0xFF) as u8;
+                        ops.push(BitwiseOperation::byte_op(BitwiseOperationType::AndByte, not_byte, n2_byte));
+                        let pi_byte = ((pi_lanes[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
+                        let and_byte = ((and_val >> (b * 8)) & 0xFF) as u8;
+                        ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, pi_byte, and_byte));
+                    }
+                }
+            }
+
+            // iota: XOR_BYTE (8)
+            let rc_val = KECCAK_RC[round];
+            for b in 0..8 {
+                let chi_byte = ((chi_lanes[0] >> (b * 8)) & 0xFF) as u8;
+                let rc_byte = ((rc_val >> (b * 8)) & 0xFF) as u8;
+                ops.push(BitwiseOperation::byte_op(BitwiseOperationType::XorByte, chi_byte, rc_byte));
+            }
+
+            // Update state
+            chi_lanes[0] ^= rc_val;
+            state = chi_lanes;
+        }
+    }
+
+    ops
+}
+
 /// every address accessed during execution (ELF init + runtime stores/loads).
 /// ELF pages get their init data from the binary; all others are zero-init.
 fn generate_page_tables(
@@ -1562,6 +1845,15 @@ pub struct Traces {
 
     /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// KECCAK core table (one row per keccak permutation call)
+    pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// KECCAK_RND round table (24 rows per keccak call)
+    pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// KECCAK_RC precomputed round constant table (32 rows)
+    pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1738,7 +2030,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -1837,6 +2129,7 @@ impl Traces {
             .collect();
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+        bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
@@ -1896,6 +2189,21 @@ impl Traces {
         // Generate remaining traces in parallel (page, register, halt, commit).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let commit_trace = commit::generate_commit_trace(&commit_ops);
+
+        // Generate keccak traces
+        let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect();
+        let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
+        let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
+        let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+
         let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
@@ -1947,6 +2255,9 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            keccak: keccak_trace,
+            keccak_rnd: keccak_rnd_trace,
+            keccak_rc: keccak_rc_trace,
         })
     }
 
@@ -1974,7 +2285,7 @@ impl Traces {
         // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -2071,6 +2382,7 @@ impl Traces {
             .collect();
         // COMMIT table sends IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+        bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
         let num_padding_rows: usize = cpu_ops
@@ -2125,6 +2437,20 @@ impl Traces {
 
         let commit_trace = commit::generate_commit_trace(&commit_ops);
 
+        // Generate keccak traces
+        let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect();
+        let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
+        let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
+        let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+
         // Generate remaining traces in parallel (register, halt).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let (register_trace, halt_trace);
@@ -2166,6 +2492,9 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            keccak: keccak_trace,
+            keccak_rnd: keccak_rnd_trace,
+            keccak_rc: keccak_rc_trace,
         })
     }
 

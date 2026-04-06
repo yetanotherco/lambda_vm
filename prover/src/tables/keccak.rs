@@ -255,11 +255,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 5. MEMW interactions for 25 lane reads (on mu) + 25 lane writes (on mu)
-    // Format: [old[8], is_register, address[DWordHL=2], value[8], ts[2], w2, w4, w8]
+    // Read format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
+    // Write format: [is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 16
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
         let y = lane_idx / 5;
-        let addr_start = cols::state_ptr(lane_idx, 0);
+
+        // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
+        let addr_lo = BusValue::linear(vec![
+            LinearTerm::Column { coefficient: 1, column: cols::state_ptr(lane_idx, 0) },
+            LinearTerm::Column { coefficient: 65536, column: cols::state_ptr(lane_idx, 1) },
+        ]);
+        let addr_hi = BusValue::linear(vec![
+            LinearTerm::Column { coefficient: 1, column: cols::state_ptr(lane_idx, 2) },
+            LinearTerm::Column { coefficient: 65536, column: cols::state_ptr(lane_idx, 3) },
+        ]);
 
         // Read: old = input, value = input (read doesn't change)
         let mut read_values = Vec::with_capacity(24);
@@ -272,11 +282,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
         // is_register = 0
         read_values.push(BusValue::constant(0));
-        // address as DWordHL (2 bus elements packed from 4 halfword columns)
-        read_values.push(BusValue::Packed {
-            start_column: addr_start,
-            packing: Packing::DWordHL,
-        });
+        // address as DWordWL
+        read_values.push(addr_lo.clone());
+        read_values.push(addr_hi.clone());
         // value[0..8] = same as old (read)
         for b in 0..8 {
             read_values.push(BusValue::Packed {
@@ -308,11 +316,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         let mut write_values = Vec::with_capacity(16);
         // is_register = 0
         write_values.push(BusValue::constant(0));
-        // address as DWordHL
-        write_values.push(BusValue::Packed {
-            start_column: addr_start,
-            packing: Packing::DWordHL,
-        });
+        // address as DWordWL
+        write_values.push(addr_lo);
+        write_values.push(addr_hi);
         // value[0..8] = output bytes
         for b in 0..8 {
             write_values.push(BusValue::Packed {

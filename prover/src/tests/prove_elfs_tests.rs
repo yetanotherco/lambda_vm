@@ -717,6 +717,36 @@ fn test_prove_elfs_all_instructions_64() {
 }
 
 #[test]
+fn test_prove_elfs_keccak() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, logs, instructions) = run_asm_elf("test_keccak");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    println!(
+        "keccak (fast): CPU {} rows, KECCAK {} rows, KECCAK_RND {} rows, KECCAK_RC {} rows, MEMW {} tables ({} rows), BITWISE {} rows",
+        traces.cpus[0].main_table.height,
+        traces.keccak.main_table.height,
+        traces.keccak_rnd.main_table.height,
+        traces.keccak_rc.main_table.height,
+        traces.memws.len(),
+        traces.memws[0].main_table.height,
+        traces.bitwise.main_table.height,
+    );
+    println!(
+        "Bus interaction counts: KECCAK core={}, KECCAK_RND={}, KECCAK_RC={}",
+        crate::tables::keccak::bus_interactions().len(),
+        crate::tables::keccak_rnd::bus_interactions().len(),
+        crate::tables::keccak_rc::bus_interactions().len(),
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak prove/verify failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
@@ -1763,7 +1793,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 5);
+    assert_eq!(verifier_air_refs.len(), 8);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
