@@ -57,6 +57,8 @@ pub fn print_report(
     trace_build: Duration,
     air_construction: Duration,
     total: Duration,
+    heap_before: Option<usize>,
+    heap_profile: &stark::instruments::ProveHeapProfile,
 ) {
     let mp = stark::instruments::take();
 
@@ -69,7 +71,7 @@ pub fn print_report(
     row_top("Trace build", trace_build, total);
     row_top("AIR construction", air_construction, total);
 
-    if let Some(mp) = mp {
+    if let Some(ref mp) = mp {
         let round1 = mp.main_commits + mp.aux_build + mp.aux_commit;
 
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
@@ -177,10 +179,7 @@ pub fn print_report(
                 ("R4  queries & openings", total_queries),
             ];
             sub_ops.sort_by(|a, b| b.1.cmp(&a.1));
-            eprintln!(
-                "  {}",
-                "    \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}",
-            );
+            eprintln!("      \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}",);
             for (label, dur) in &sub_ops {
                 row_sub(&format!("    {label}"), *dur, total);
             }
@@ -214,4 +213,33 @@ pub fn print_report(
     eprintln!("  {}", "─".repeat(58));
     eprintln!("  {:<36} {:>7.2}s", "TOTAL", total.as_secs_f64());
     eprintln!();
+
+    let mb = |b: usize| b / (1024 * 1024);
+    if let Some(before) = heap_before {
+        eprintln!("=== HEAP PROFILE (MB) ===");
+        eprintln!("  {:<36} {:>8} {:>8}", "Phase", "Heap", "Delta");
+        eprintln!("  {}", "─".repeat(56));
+        let mut prev = before;
+        let mut print_row = |label: &str, val: Option<usize>| {
+            if let Some(v) = val {
+                let cur = mb(v);
+                let delta = mb(v) as isize - mb(prev) as isize;
+                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                prev = v;
+            }
+        };
+        print_row("After execute", heap_profile.after_execute);
+        print_row("After trace build", heap_profile.after_trace_build);
+        print_row("After AIR construction", heap_profile.after_air);
+        if let Some(ref mp_data) = mp {
+            for (label, bytes) in &mp_data.heap_snapshots {
+                let cur = mb(*bytes);
+                let delta = cur as isize - mb(prev) as isize;
+                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                prev = *bytes;
+            }
+        }
+        eprintln!("  {}", "─".repeat(56));
+        eprintln!();
+    }
 }
