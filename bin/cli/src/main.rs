@@ -30,6 +30,19 @@ mod heap_tracker {
 
     use tikv_jemalloc_ctl::{epoch, stats};
 
+    /// Phase peak: reset at each phase boundary, polled alongside the global peak.
+    static PHASE_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn phase_peak() -> usize {
+        PHASE_PEAK.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_phase_peak() {
+        epoch::advance().ok();
+        let current = stats::allocated::read().unwrap_or(0);
+        PHASE_PEAK.store(current, Ordering::Relaxed);
+    }
+
     pub struct HeapTracker {
         stop: Arc<AtomicBool>,
         peak: Arc<AtomicUsize>,
@@ -45,17 +58,17 @@ mod heap_tracker {
 
             let handle = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    // Refresh jemalloc's cached stats
                     epoch::advance().ok();
                     if let Ok(allocated) = stats::allocated::read() {
                         peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                        PHASE_PEAK.fetch_max(allocated, Ordering::Relaxed);
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                // One final sample after stop signal
                 epoch::advance().ok();
                 if let Ok(allocated) = stats::allocated::read() {
                     peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                    PHASE_PEAK.fetch_max(allocated, Ordering::Relaxed);
                 }
             });
 
@@ -267,10 +280,16 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     }
 
     #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
-    stark::instruments::set_heap_reader(|| {
-        tikv_jemalloc_ctl::epoch::advance().ok();
-        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
-    });
+    {
+        stark::instruments::set_heap_reader(|| {
+            tikv_jemalloc_ctl::epoch::advance().ok();
+            tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+        });
+        stark::instruments::set_peak_tracker(
+            heap_tracker::phase_peak,
+            heap_tracker::reset_phase_peak,
+        );
+    }
 
     let start = Instant::now();
     let proof = match blowup {

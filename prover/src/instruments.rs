@@ -217,29 +217,40 @@ pub fn print_report(
     let mb = |b: usize| b / (1024 * 1024);
     if let Some(before) = heap_before {
         eprintln!("=== HEAP PROFILE (MB) ===");
-        eprintln!("  {:<36} {:>8} {:>8}", "Phase", "Heap", "Delta");
-        eprintln!("  {}", "─".repeat(56));
+        eprintln!(
+            "  {:<36} {:>8} {:>8} {:>8}",
+            "Phase", "Heap", "Delta", "Peak"
+        );
+        eprintln!("  {}", "─".repeat(64));
         let mut prev = before;
-        let mut print_row = |label: &str, val: Option<usize>| {
+        let mut print_row = |label: &str, val: Option<usize>, peak: Option<usize>| {
             if let Some(v) = val {
                 let cur = mb(v);
-                let delta = mb(v) as isize - mb(prev) as isize;
-                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                let delta = cur as isize - mb(prev) as isize;
+                let peak_str = match peak {
+                    Some(p) => format!("{:>8}", mb(p)),
+                    None => format!("{:>8}", ""),
+                };
+                eprintln!("  {:<36} {:>7} {:>+8} {}", label, cur, delta, peak_str);
                 prev = v;
             }
         };
-        print_row("After execute", heap_profile.after_execute);
-        print_row("After trace build", heap_profile.after_trace_build);
-        print_row("After AIR construction", heap_profile.after_air);
+        print_row("After execute", heap_profile.after_execute, None);
+        print_row("After trace build", heap_profile.after_trace_build, None);
+        print_row("After AIR construction", heap_profile.after_air, None);
         if let Some(ref mp_data) = mp {
-            for (label, bytes) in &mp_data.heap_snapshots {
+            for (label, bytes, peak) in &mp_data.heap_snapshots {
                 let cur = mb(*bytes);
                 let delta = cur as isize - mb(prev) as isize;
-                eprintln!("  {:<36} {:>7} {:>+8}", label, cur, delta);
+                let peak_str = match peak {
+                    Some(p) => format!("{:>8}", mb(*p)),
+                    None => format!("{:>8}", ""),
+                };
+                eprintln!("  {:<36} {:>7} {:>+8} {}", label, cur, delta, peak_str);
                 prev = *bytes;
             }
         }
-        eprintln!("  {}", "─".repeat(56));
+        eprintln!("  {}", "─".repeat(64));
         eprintln!();
     }
 }

@@ -4,19 +4,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 static HEAP_READER: OnceLock<fn() -> usize> = OnceLock::new();
+static PEAK_READER: OnceLock<fn() -> usize> = OnceLock::new();
+static PEAK_RESETTER: OnceLock<fn()> = OnceLock::new();
 
 pub fn set_heap_reader(f: fn() -> usize) {
     let _ = HEAP_READER.set(f);
+}
+
+/// Register functions to read and reset the per-phase peak heap tracker.
+pub fn set_peak_tracker(read: fn() -> usize, reset: fn()) {
+    let _ = PEAK_READER.set(read);
+    let _ = PEAK_RESETTER.set(reset);
 }
 
 pub fn heap_bytes() -> Option<usize> {
     HEAP_READER.get().map(|f| f())
 }
 
-pub type HeapSnapshot = (&'static str, usize);
+/// Read the peak heap since the last reset, then reset for the next phase.
+pub fn phase_peak_bytes() -> Option<usize> {
+    let peak = PEAK_READER.get().map(|f| f());
+    if let Some(reset) = PEAK_RESETTER.get() {
+        reset();
+    }
+    peak
+}
+
+/// (label, current_heap, peak_within_phase)
+pub type HeapSnapshot = (&'static str, usize, Option<usize>);
 
 pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
-    heap_bytes().map(|b| (label, b))
+    let cur = heap_bytes()?;
+    let peak = phase_peak_bytes();
+    Some((label, cur, peak))
 }
 
 pub struct ProveHeapProfile {
