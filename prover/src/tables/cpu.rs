@@ -232,8 +232,16 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 73;
 
+    /// ECALL_KECCAK: 1 when the ECALL is a KeccakPermute syscall, 0 otherwise
+    pub const ECALL_KECCAK: usize = 74;
+
+    /// Keccak state address (DWordWL: lo32 and hi32).
+    /// Non-zero only for KeccakPermute ECALLs.
+    pub const KECCAK_STATE_ADDR_0: usize = 75;
+    pub const KECCAK_STATE_ADDR_1: usize = 76;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 74;
+    pub const NUM_COLUMNS: usize = 77;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -298,6 +306,12 @@ pub struct CpuOperation {
 
     /// For Commit ECALLs: byte count from x12
     pub commit_count: u64,
+
+    /// Whether this ECALL is a KeccakPermute syscall
+    pub ecall_keccak: bool,
+
+    /// For KeccakPermute ECALLs: state address from x10
+    pub keccak_state_addr: u64,
 }
 
 impl CpuOperation {
@@ -638,6 +652,9 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        let ecall_keccak = decode.op_ecall
+            && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
@@ -660,6 +677,8 @@ impl CpuOperation {
             ecall_commit,
             commit_buf_addr,
             commit_count,
+            ecall_keccak,
+            keccak_state_addr,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -799,6 +818,11 @@ pub fn generate_cpu_trace(
         data[base + cols::MUL] = FE::from(d.op_mul as u64);
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
+        data[base + cols::ECALL_KECCAK] = FE::from(op.ecall_keccak as u64);
+        data[base + cols::KECCAK_STATE_ADDR_0] =
+            FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
+        data[base + cols::KECCAK_STATE_ADDR_1] =
+            FE::from(op.keccak_state_addr >> 32);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
@@ -1995,15 +2019,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ECALL interaction (single shared bus for HALT and COMMIT)
+    // ECALL interaction for HALT and COMMIT (excludes keccak)
     // -------------------------------------------------------------------------
-    // Sends to both HALT and COMMIT tables. Each receiver pattern-matches on
-    // the syscall number in the payload.
-    // multiplicity = ECALL
-    // rv1 = value of a7 register (syscall number).
+    // multiplicity = ECALL - ECALL_KECCAK
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Column(cols::ECALL),
+        Multiplicity::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ECALL,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::ECALL_KECCAK,
+            },
+        ]),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
@@ -2024,6 +2054,44 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // cast(rv1, DWordWL)[1] = rv1_hi32 = RV1_2
             BusValue::Packed {
                 start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // EcallKeccak interaction (CPU → KECCAK core chip)
+    // -------------------------------------------------------------------------
+    // multiplicity = ECALL_KECCAK
+    // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32, state_addr_lo32, state_addr_hi32]
+    interactions.push(BusInteraction::sender(
+        BusId::EcallKeccak,
+        Multiplicity::Column(cols::ECALL_KECCAK),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // timestamp_hi = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_1,
                 packing: Packing::Direct,
             },
         ],
