@@ -49,7 +49,7 @@ fi
 CLI="$ROOT_DIR/target/release/cli"
 
 # Phase labels we parse from stderr (order matters)
-PHASES="execute trace_build air pool_alloc main_commits aux_build aux_commit pool_drop rounds_2_4"
+PHASES="execute trace_build air twiddles trace_spill pool_alloc main_commits aux_build aux_commit pool_drop rounds_2_4"
 
 for size in $PROGRAMS; do
     ELF="$ELF_DIR/fib_iterative_${size}.elf"
@@ -70,6 +70,8 @@ for size in $PROGRAMS; do
         if (/after pool alloc/)    printf "pool_alloc=%s\n", $(NF-1)
         if (/after main commits/)  printf "main_commits=%s\n", $(NF-1)
         if (/after aux build/)     printf "aux_build=%s\n", $(NF-1)
+        if (/after twiddles/)      printf "twiddles=%s\n", $(NF-1)
+        if (/after trace spill/)  printf "trace_spill=%s\n", $(NF-1)
         if (/after aux commit/)    printf "aux_commit=%s\n", $(NF-1)
         if (/after pool drop/)    printf "pool_drop=%s\n", $(NF-1)
         if (/after rounds 2-4/)   printf "rounds_2_4=%s\n", $(NF-1)
@@ -101,6 +103,8 @@ for phase in $PHASES; do
         execute)      label="Execute" ;;
         trace_build)  label="Trace build" ;;
         air)          label="AIR construction" ;;
+        twiddles)     label="Twiddles" ;;
+        trace_spill)  label="Trace spill" ;;
         pool_alloc)   label="Pool allocation" ;;
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
@@ -153,6 +157,8 @@ for phase in $PHASES; do
         execute)      label="Execute" ;;
         trace_build)  label="Trace build" ;;
         air)          label="AIR construction" ;;
+        twiddles)     label="Twiddles" ;;
+        trace_spill)  label="Trace spill" ;;
         pool_alloc)   label="Pool allocation" ;;
         main_commits) label="Main commits" ;;
         aux_build)    label="Aux build" ;;
@@ -168,7 +174,9 @@ for phase in $PHASES; do
         execute)      prev_phase_key="" ;;
         trace_build)  prev_phase_key="execute" ;;
         air)          prev_phase_key="trace_build" ;;
-        pool_alloc)   prev_phase_key="air" ;;
+        twiddles)     prev_phase_key="air" ;;
+        trace_spill)  prev_phase_key="twiddles" ;;
+        pool_alloc)   prev_phase_key="trace_spill" ;;
         main_commits) prev_phase_key="pool_alloc" ;;
         aux_build)    prev_phase_key="main_commits" ;;
         aux_commit)   prev_phase_key="aux_build" ;;

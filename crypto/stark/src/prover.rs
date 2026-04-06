@@ -1928,6 +1928,11 @@ pub trait IsStarkProver<
             twiddle_caches.push(twiddles);
         }
 
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after twiddles") {
+            heap_snaps.push(s);
+        }
+
         // Spill all main trace tables to mmap before allocating pool buffers.
         // This frees the heap-allocated trace data, making room for the LDE pool
         // buffers which are much larger (blowup_factor × trace size).
@@ -1937,6 +1942,11 @@ pub trait IsStarkProver<
                 .main_table
                 .spill_to_disk()
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
+        }
+
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("after trace spill") {
+            heap_snaps.push(s);
         }
 
         // Number of tables to process concurrently.
