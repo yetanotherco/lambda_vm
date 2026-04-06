@@ -5,6 +5,16 @@
 //! all memory-specific columns (address decomposition, alignment mask, width
 //! flags, per-byte old_timestamps).
 //!
+//! ## Timestamp ordering: IS_HALF instead of LT
+//!
+//! The general MEMW table proves `old_timestamp < timestamp` by routing through
+//! the LT table, which requires extra LT trace rows and bus interactions.
+//! MEMW_R instead checks `IS_HALF[timestamp[0] - old_timestamp[0] - 1]`,
+//! which proves the delta is in `[1, 2^16]` in a single lookup. This is safe
+//! because registers are accessed very frequently — their timestamp deltas are
+//! almost always small — and the routing predicate (`is_register_op`) enforces
+//! the delta fits before admitting an op into this table.
+//!
 //! ## Column layout (10 columns)
 //!
 //! - `ADDRESS`:          Byte  (register index 0-31)
@@ -96,7 +106,11 @@ pub fn generate_memw_register_trace(
             "register base_address must be even (got {})",
             op.base_address
         );
-        debug_assert_eq!(
+        // Both register words must have been last accessed at the same timestamp.
+        // MEMW_R stores a single old_timestamp_lo and shares TIMESTAMP_1 as the
+        // upper limb, so if the two words differ, the wrong token would be sent
+        // to the memory bus. The routing predicate enforces this before dispatch.
+        assert_eq!(
             op.old_timestamp[0], op.old_timestamp[1],
             "register words must share old_timestamp ({} != {})",
             op.old_timestamp[0], op.old_timestamp[1]
@@ -466,5 +480,41 @@ mod tests {
         // Multiplicity: is_read = true => MU_READ=1, MU_WRITE=0
         assert_eq!(*trace.get_main(0, cols::MU_READ), FE::from(1u64));
         assert_eq!(*trace.get_main(0, cols::MU_WRITE), FE::from(0u64));
+    }
+
+    #[test]
+    fn test_memw_register_trace_generation_write_op() {
+        // Write op: is_read = false => MU_WRITE=1, MU_READ=0
+        let ops = vec![
+            MemwOperation::new(
+                true, // is_register
+                4,    // base_address = 2 * register_index (reg x2)
+                [99, 55, 0, 0, 0, 0, 0, 0],
+                200,
+                2,     // width = 2 words
+                false, // is_read = false (write)
+            )
+            .with_old([11, 22, 0, 0, 0, 0, 0, 0], [180, 180, 0, 0, 0, 0, 0, 0]),
+        ];
+
+        let trace = generate_memw_register_trace(&ops);
+
+        // ADDRESS = base_address / 2 = 4 / 2 = 2
+        assert_eq!(*trace.get_main(0, cols::ADDRESS), FE::from(2u64));
+
+        // Values
+        assert_eq!(*trace.get_main(0, cols::VAL_0), FE::from(99u64));
+        assert_eq!(*trace.get_main(0, cols::VAL_1), FE::from(55u64));
+
+        // Old values
+        assert_eq!(*trace.get_main(0, cols::OLD_0), FE::from(11u64));
+        assert_eq!(*trace.get_main(0, cols::OLD_1), FE::from(22u64));
+
+        // Old timestamp lo
+        assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP_LO), FE::from(180u64));
+
+        // Multiplicity: is_read = false => MU_WRITE=1, MU_READ=0
+        assert_eq!(*trace.get_main(0, cols::MU_READ), FE::from(0u64));
+        assert_eq!(*trace.get_main(0, cols::MU_WRITE), FE::from(1u64));
     }
 }

@@ -2292,3 +2292,54 @@ impl Traces {
         Self::from_logs_trimmed(logs, instructions, max_rows)
     }
 }
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
+        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
+            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn test_is_register_op_delta_at_boundary_routes_in() {
+        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
+        let op = make_register_op(0x10000, 0);
+        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_above_boundary_falls_back() {
+        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
+        let op = make_register_op(0x10001, 0);
+        assert!(
+            !is_register_op(&op),
+            "delta = 2^16 + 1 should fall back to MEMW_A"
+        );
+    }
+
+    #[test]
+    fn test_is_register_op_delta_one_routes_in() {
+        // delta = 1: minimum allowed value
+        let op = make_register_op(1, 0);
+        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_zero_falls_back() {
+        // delta = 0: ts[0] not strictly greater than old_ts[0]
+        let op = make_register_op(5, 5);
+        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_upper_limb_mismatch_falls_back() {
+        // ts_hi != old_ts_hi: shared upper limb assumption violated
+        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
+        assert!(
+            !is_register_op(&op),
+            "different upper limbs should fall back to MEMW_A"
+        );
+    }
+}

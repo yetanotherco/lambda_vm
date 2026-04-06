@@ -480,10 +480,18 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
         "Register ops should route to MEMW_R"
     );
 
+    // Register ops use IS_HALF for timestamp ordering instead of LT.
+    // Verify the bitwise table has at least one IS_HALF entry with non-zero
+    // multiplicity, proving that MEMW_R's IS_HALF lookups were emitted.
+    let has_is_half_entry = (0..traces.bitwise.main_table.height)
+        .any(|i| traces.bitwise.main_table.get_row(i)[bitwise::cols::MU_IS_HALF] != FE::zero());
+    assert!(
+        has_is_half_entry,
+        "MEMW_R register ops should produce IS_HALF bitwise entries"
+    );
+
     // The LT table should still have ops from non-register MEMW accesses
     // (e.g. PC next-pc write is a non-register memory op that needs LT).
-    // Just verify the LT table is non-empty — the exact contents depend on
-    // which non-register MEMW ops exist in this trace.
     let total_lt_rows: usize = traces.lts.iter().map(|t| t.main_table.height).sum();
     assert!(
         total_lt_rows > 0,
