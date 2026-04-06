@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# disk-spill creates many temp files for spilled traces/LDEs
+ulimit -n 65536 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="/tmp/bench_prove"

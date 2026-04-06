@@ -1650,7 +1650,7 @@ pub trait IsStarkProver<
         // Rounds 2-4 use full parallelism (no pools, reads from mmap).
         let k = table_parallelism().min(num_airs).max(1);
         #[cfg(feature = "disk-spill")]
-        let k_commit = 1_usize;
+        let k_commit = 4_usize.min(k);
         #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
         // k_commit=1: pre-allocate pool to max_lde_size to avoid reallocation.
