@@ -720,9 +720,11 @@ fn test_prove_elfs_all_instructions_64() {
 fn test_prove_elfs_keccak() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, logs, instructions) = run_asm_elf("test_keccak");
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
+    // RAM (stack memory), which requires PAGE tables for Memory bus balance.
     let mut traces =
-        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+        Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
     println!(
         "keccak (fast): CPU {} rows, KECCAK {} rows, KECCAK_RND {} rows, KECCAK_RC {} rows, MEMW {} tables ({} rows), BITWISE {} rows",

@@ -819,48 +819,34 @@ fn collect_keccak_memw_ops(
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
     let state_addr = op.keccak_state_addr;
-    let mut memw_ops = Vec::with_capacity(50); // 25 reads + 25 writes
+    let mut memw_ops = Vec::with_capacity(25);
 
-    // 25 lane reads at timestamp
-    for (lane_idx, &lane_val) in input.iter().enumerate() {
+    // Per spec: single combined read+write MEMW per lane at `timestamp`.
+    // input = [0, state_ptr, output_state, timestamp, 0, 0, 1], output = input_state
+    // The MEMW table sees: old=input_state, value=output_state, is_read=true.
+    for (lane_idx, (&in_lane, &out_lane)) in input.iter().zip(output.iter()).enumerate() {
         let lane_addr = state_addr.wrapping_add(lane_idx as u64 * 8);
-        let mut value_bytes = [0u64; 8];
+
+        let mut old_bytes = [0u64; 8];
         let mut old_timestamps = [0u64; 8];
-        for (b, byte) in value_bytes.iter_mut().enumerate() {
-            *byte = (lane_val >> (b * 8)) & 0xFF;
+        for b in 0..8 {
+            old_bytes[b] = (in_lane >> (b * 8)) & 0xFF;
             let (_old_val, old_ts) = memory_state.read_byte(lane_addr + b as u64);
             old_timestamps[b] = old_ts;
         }
-        let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
-            .with_old(value_bytes, old_timestamps);
-        memw_ops.push(memw_op);
-        // Update memory state timestamps (reads update the timestamp)
-        for b in 0..8 {
-            memory_state.write_byte(lane_addr + b as u64, value_bytes[b] as u8, ts);
-        }
-    }
 
-    // 25 lane writes at timestamp+1
-    // The reads above happened at ts, so old_timestamp for the write is ts.
-    for (lane_idx, &lane_val) in output.iter().enumerate() {
-        let lane_addr = state_addr.wrapping_add(lane_idx as u64 * 8);
         let mut value_bytes = [0u64; 8];
-        // old_timestamps = ts for all 8 bytes (the read just happened at ts)
-        let old_timestamps = [ts; 8];
         for (b, byte) in value_bytes.iter_mut().enumerate() {
-            *byte = (lane_val >> (b * 8)) & 0xFF;
+            *byte = (out_lane >> (b * 8)) & 0xFF;
         }
-        // old = input (the value before the write)
-        let mut old_bytes = [0u64; 8];
-        for (b, byte) in old_bytes.iter_mut().enumerate() {
-            *byte = (input[lane_idx] >> (b * 8)) & 0xFF;
-        }
-        let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts + 1, 8, false)
+
+        let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
             .with_old(old_bytes, old_timestamps);
         memw_ops.push(memw_op);
+
         // Update memory state
-        for b in 0..8 {
-            memory_state.write_byte(lane_addr + b as u64, value_bytes[b] as u8, ts + 1);
+        for (b, &val) in value_bytes.iter().enumerate() {
+            memory_state.write_byte(lane_addr + b as u64, val as u8, ts);
         }
     }
 

@@ -254,9 +254,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // 5. MEMW interactions for 25 lane reads (on mu) + 25 lane writes (on mu)
-    // Read format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
-    // Write format: [is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 16
+    // 5. MEMW interactions: 25 combined read+write per lane (per spec)
+    // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
+    // old = input_state (read), value = output_state (write)
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
         let y = lane_idx / 5;
@@ -271,79 +271,44 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             LinearTerm::Column { coefficient: 65536, column: cols::state_ptr(lane_idx, 3) },
         ]);
 
-        // Read: old = input, value = input (read doesn't change)
-        let mut read_values = Vec::with_capacity(24);
-        // old[0..8] = input bytes
+        let mut values = Vec::with_capacity(24);
+        // old[0..8] = input_state bytes (the value being read)
         for b in 0..8 {
-            read_values.push(BusValue::Packed {
+            values.push(BusValue::Packed {
                 start_column: cols::input_state(x, y, b),
                 packing: Packing::Direct,
             });
         }
         // is_register = 0
-        read_values.push(BusValue::constant(0));
+        values.push(BusValue::constant(0));
         // address as DWordWL
-        read_values.push(addr_lo.clone());
-        read_values.push(addr_hi.clone());
-        // value[0..8] = same as old (read)
+        values.push(addr_lo);
+        values.push(addr_hi);
+        // value[0..8] = output_state bytes (the value being written)
         for b in 0..8 {
-            read_values.push(BusValue::Packed {
-                start_column: cols::input_state(x, y, b),
-                packing: Packing::Direct,
-            });
-        }
-        // timestamp
-        read_values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_0,
-            packing: Packing::Direct,
-        });
-        read_values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_1,
-            packing: Packing::Direct,
-        });
-        // write2=0, write4=0, write8=1
-        read_values.push(BusValue::constant(0));
-        read_values.push(BusValue::constant(0));
-        read_values.push(BusValue::constant(1));
-
-        interactions.push(BusInteraction::sender(
-            BusId::Memw,
-            Multiplicity::Column(cols::MU),
-            read_values,
-        ));
-
-        // Write: new value = output, timestamp = ts + 1
-        let mut write_values = Vec::with_capacity(16);
-        // is_register = 0
-        write_values.push(BusValue::constant(0));
-        // address as DWordWL
-        write_values.push(addr_lo);
-        write_values.push(addr_hi);
-        // value[0..8] = output bytes
-        for b in 0..8 {
-            write_values.push(BusValue::Packed {
+            values.push(BusValue::Packed {
                 start_column: cols::output_state(x, y, b),
                 packing: Packing::Direct,
             });
         }
-        // timestamp + 1
-        write_values.push(BusValue::linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP_0 },
-            LinearTerm::Constant(1),
-        ]));
-        write_values.push(BusValue::Packed {
+        // timestamp
+        values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_0,
+            packing: Packing::Direct,
+        });
+        values.push(BusValue::Packed {
             start_column: cols::TIMESTAMP_1,
             packing: Packing::Direct,
         });
         // write2=0, write4=0, write8=1
-        write_values.push(BusValue::constant(0));
-        write_values.push(BusValue::constant(0));
-        write_values.push(BusValue::constant(1));
+        values.push(BusValue::constant(0));
+        values.push(BusValue::constant(0));
+        values.push(BusValue::constant(1));
 
         interactions.push(BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::MU),
-            write_values,
+            values,
         ));
     }
 
