@@ -309,7 +309,7 @@ where
             let file = tempfile::tempfile()?;
             file.set_len(total_bytes as u64)?;
             {
-                let mut writer = std::io::BufWriter::new(&file);
+                let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
                 // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
                 // can be viewed as a contiguous byte slice.
                 let bytes =
@@ -1738,18 +1738,47 @@ pub trait IsStarkProver<
                         })?
                     };
 
+                    // Spill Merkle tree nodes to disk inside the parallel closure
+                    // so multiple tables' trees are written concurrently.
                     #[cfg(feature = "disk-spill")]
-                    return Ok((tree, root, pre_tree, pre_root, n_pre, spilled));
+                    {
+                        let mut main_tree = Arc::new(tree);
+                        Arc::get_mut(&mut main_tree)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill main Merkle tree: {e}"
+                                ))
+                            })?;
+
+                        let precomputed_tree = pre_tree
+                            .map(|t| {
+                                let mut arc = Arc::new(t);
+                                Arc::get_mut(&mut arc)
+                                    .expect("sole Arc owner")
+                                    .spill_nodes_to_disk()
+                                    .map_err(|e| {
+                                        ProvingError::WrongParameter(format!(
+                                            "disk-spill precomputed Merkle tree: {e}"
+                                        ))
+                                    })?;
+                                Ok(arc)
+                            })
+                            .transpose()?;
+
+                        Ok((main_tree, root, precomputed_tree, pre_root, n_pre, spilled))
+                    }
                     #[cfg(not(feature = "disk-spill"))]
                     Ok((tree, root, pre_tree, pre_root, n_pre))
                 })
                 .collect();
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
-            #[allow(unused_variables, unused_mut)]
+            #[allow(unused_variables)]
             for (j, result) in chunk_results.into_iter().enumerate() {
                 #[cfg(feature = "disk-spill")]
-                let (tree, root, pre_tree, pre_root, n_pre, spilled) = result?;
+                let (main_tree, root, precomputed_tree, pre_root, n_pre, spilled) = result?;
                 #[cfg(not(feature = "disk-spill"))]
                 let (tree, root, pre_tree, pre_root, n_pre) = result?;
 
@@ -1764,36 +1793,10 @@ pub trait IsStarkProver<
                     spilled_ldes[idx] = Some(spilled);
                 }
 
-                #[allow(unused_mut)]
-                let mut main_tree = Arc::new(tree);
-                #[cfg(feature = "disk-spill")]
-                {
-                    Arc::get_mut(&mut main_tree)
-                        .expect("sole Arc owner")
-                        .spill_nodes_to_disk()
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!(
-                                "disk-spill main Merkle tree: {e}"
-                            ))
-                        })?;
-                }
-
-                let precomputed_tree = pre_tree.map(|t| {
-                    let mut arc = Arc::new(t);
-                    #[cfg(feature = "disk-spill")]
-                    {
-                        Arc::get_mut(&mut arc)
-                            .expect("sole Arc owner")
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill precomputed Merkle tree: {e}"
-                                ))
-                            })
-                            .unwrap();
-                    }
-                    arc
-                });
+                #[cfg(not(feature = "disk-spill"))]
+                let main_tree = Arc::new(tree);
+                #[cfg(not(feature = "disk-spill"))]
+                let precomputed_tree = pre_tree.map(Arc::new);
 
                 main_commits.push(MainCommitData {
                     main_tree,
@@ -1917,7 +1920,20 @@ pub trait IsStarkProver<
                                 .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
-                        Ok((Some(Arc::new(tree)), Some(root)))
+
+                        #[allow(unused_mut)]
+                        let mut aux_tree = Arc::new(tree);
+                        #[cfg(feature = "disk-spill")]
+                        Arc::get_mut(&mut aux_tree)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill aux Merkle tree: {e}"
+                                ))
+                            })?;
+
+                        Ok((Some(aux_tree), Some(root)))
                     } else {
                         Ok((None, None))
                     }
@@ -1925,15 +1941,13 @@ pub trait IsStarkProver<
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
-            #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                #[allow(unused_mut)]
-                let (mut aux_tree, aux_root) = result?;
+                let (aux_tree, aux_root) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
 
-                // Spill aux LDE columns from pool and aux Merkle tree nodes to disk.
+                // Spill aux LDE columns from pool to disk.
                 #[cfg(feature = "disk-spill")]
                 {
                     let idx = chunk_start + j;
@@ -1949,16 +1963,6 @@ pub trait IsStarkProver<
                                     ))
                                 })?;
                         }
-                    }
-                    if let Some(ref mut tree_arc) = aux_tree {
-                        Arc::get_mut(tree_arc)
-                            .expect("sole Arc owner")
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill aux Merkle tree {idx}: {e}"
-                                ))
-                            })?;
                     }
                 }
 
