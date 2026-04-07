@@ -1178,9 +1178,12 @@ pub trait IsStarkProver<
         };
 
         // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points
-        let z_shifted: Vec<FieldElement<FieldExtension>> = (0..num_eval_points)
-            .map(|k| primitive_root.pow(k) * z)
-            .collect();
+        let mut z_shifted = Vec::with_capacity(num_eval_points);
+        let mut current_z = z.clone();
+        for _ in 0..num_eval_points {
+            z_shifted.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
 
         // Number of main and aux columns in the LDE trace
         let num_main_cols = lde_trace.num_main_cols();

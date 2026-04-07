@@ -1,7 +1,4 @@
-use crate::{
-    errors::DeserializationError,
-    field::{element::FieldElement, traits::IsField},
-};
+use crate::errors::DeserializationError;
 
 use crate::errors::ByteConversionError;
 /// A trait for converting an element to and from its byte representation and
@@ -94,8 +91,4 @@ pub trait Deserializable {
     fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>
     where
         Self: Sized;
-}
-
-pub trait IsRandomFieldElementGenerator<F: IsField> {
-    fn generate(&self) -> FieldElement<F>;
 }

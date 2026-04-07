@@ -3,7 +3,7 @@
 use crate::tables::bitwise;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
-use crate::tables::memw;
+use crate::tables::memw_aligned;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
@@ -393,29 +393,44 @@ fn test_memw_generated_from_register_ops() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // MEMW table should have register operations
+    // MEMW_A table should have register operations (register ops are always aligned)
     // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1)
     assert!(
-        traces.memws[0].main_table.height >= 3,
-        "MEMW should have at least 3 rows for register ops"
+        !traces.memw_aligneds.is_empty(),
+        "MEMW_A should have at least one chunk for register ops"
+    );
+    assert!(
+        traces.memw_aligneds[0].main_table.height >= 3,
+        "MEMW_A should have at least 3 rows for register ops"
     );
 
-    // Find the register write to x1 (address = 2 * 1 = 2, is_register = 1)
+    // Find the register write to x1 in MEMW_A
+    // Register address for x1 = 2*1 = 2, decomposed: high=0, mid=0, low=[2,0]
     let mut found_write = false;
-    for row_idx in 0..traces.memws[0].main_table.height {
-        let row = traces.memws[0].main_table.get_row(row_idx);
-        // Check for register write: is_register=1, address=2 (x1), mu_write=1
-        if row[memw::cols::IS_REGISTER] == FE::one()
-            && row[memw::cols::BASE_ADDRESS_0] == FE::from(2u64)
-            && row[memw::cols::MU_WRITE] == FE::one()
-        {
-            // Check value is 300 (lo32=300, hi32=0)
-            assert_eq!(row[memw::cols::VALUE[0]], FE::from(300u64));
-            found_write = true;
+    for chunk in &traces.memw_aligneds {
+        for row_idx in 0..chunk.main_table.height {
+            let row = chunk.main_table.get_row(row_idx);
+            // Check for register write: is_register=1, base_address_low[0]=2, mu_write=1
+            if row[memw_aligned::cols::IS_REGISTER] == FE::one()
+                && row[memw_aligned::cols::BASE_ADDRESS_LOW[0]] == FE::from(2u64)
+                && row[memw_aligned::cols::BASE_ADDRESS_MID] == FE::zero()
+                && row[memw_aligned::cols::BASE_ADDRESS_HIGH] == FE::zero()
+                && row[memw_aligned::cols::MU_WRITE] == FE::one()
+            {
+                // Check value is 300 (lo32 word for register DWordWL packing)
+                assert_eq!(row[memw_aligned::cols::VALUE[0]], FE::from(300u64));
+                found_write = true;
+                break;
+            }
+        }
+        if found_write {
             break;
         }
     }
-    assert!(found_write, "Register write to x1 not found in MEMW table");
+    assert!(
+        found_write,
+        "Register write to x1 not found in MEMW_A table"
+    );
 }
 
 // =============================================================================
