@@ -935,6 +935,10 @@ fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOpera
         .map(|op| {
             let ts_lo = op.timestamp & 0xFFFF_FFFF;
             let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
+            debug_assert!(
+                ts_lo > old_ts_lo,
+                "ts_lo must exceed old_ts_lo (enforced by is_register_op)"
+            );
             let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
             BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,

@@ -110,7 +110,7 @@ pub fn generate_memw_register_trace(
         // MEMW_R stores a single old_timestamp_lo and shares TIMESTAMP_1 as the
         // upper limb, so if the two words differ, the wrong token would be sent
         // to the memory bus. The routing predicate enforces this before dispatch.
-        assert_eq!(
+        debug_assert_eq!(
             op.old_timestamp[0], op.old_timestamp[1],
             "register words must share old_timestamp ({} != {})",
             op.old_timestamp[0], op.old_timestamp[1]
