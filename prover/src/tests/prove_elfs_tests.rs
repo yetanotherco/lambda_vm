@@ -618,6 +618,47 @@ fn test_prove_elfs_test_sb_sh_8() {
     );
 }
 
+/// Exercises the MEMW_A (aligned fast path) table.
+/// lw_sw stores a word (4 bytes) at aligned address 20 and loads it back,
+/// routing both operations through MEMW_A instead of the unaligned MEMW table.
+#[test]
+fn test_prove_elfs_lw_sw() {
+    let (elf, logs, _instructions) = run_asm_elf("lw_sw");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    assert!(
+        !traces.memw_aligneds.is_empty(),
+        "lw_sw should produce MEMW_A rows for aligned word accesses"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "lw_sw failed"
+    );
+}
+
+/// Exercises both MEMW and MEMW_A in the same program.
+///
+/// Two separate `sb` instructions write to adjacent bytes (sp+0 and sp+1) at
+/// different timestamps. The subsequent `lh` read spans both bytes and sees
+/// mismatched old_timestamps, routing to MEMW. Register ops and the aligned
+/// `sw`/`lw` pair route to MEMW_A.
+#[test]
+fn test_prove_elfs_test_memw_split_ts() {
+    let (elf, logs, _instructions) = run_asm_elf("test_memw_split_ts");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    assert!(
+        !traces.memws.is_empty(),
+        "test_memw_split_ts should produce MEMW rows (split old_timestamps from sb+sb+lh)"
+    );
+    assert!(
+        !traces.memw_aligneds.is_empty(),
+        "test_memw_split_ts should produce MEMW_A rows (register ops and aligned sw/lw)"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_memw_split_ts failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_all_branches_16() {
     // Initialize logger to see debug constraint validation output
@@ -1645,6 +1686,7 @@ fn test_verify_rejects_zero_table_counts() {
             cpu: 0,
             lt: 0,
             memw: 0,
+            memw_aligned: 0,
             load: 0,
             mul: 0,
             dvrm: 0,
@@ -1711,6 +1753,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         cpu: 0,
         lt: 0,
         memw: 0,
+        memw_aligned: 0,
         load: 0,
         mul: 0,
         dvrm: 0,
