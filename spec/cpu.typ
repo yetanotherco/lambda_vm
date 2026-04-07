@@ -19,7 +19,7 @@
 The #cpu chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
 It bases its decisions on the entry of the `DECODE` table (@decode) corresponding the the current program counter (PC).
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)

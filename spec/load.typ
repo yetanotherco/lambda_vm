@@ -19,7 +19,7 @@
 The #load chip provides functionality to read values from memory and sign-extend them where appropriate.
 It delegates low-level memory handling to the `MEMW` chip (@memw).
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)

@@ -26,7 +26,7 @@ $
 ) 
 $
 where
-$ 
+$
 #`s` := cases(
   #`shift` mod 32 "if" #`word_instr` = 1,
   #`shift` mod 64 "if" #`word_instr` = 0,
@@ -34,7 +34,7 @@ $
 $
 Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)

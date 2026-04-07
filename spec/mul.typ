@@ -20,7 +20,7 @@
 The #mul chip constrains multiplication, both signed and unsigned,
 as well as providing access to the low and high halfs of the multiplication result.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)

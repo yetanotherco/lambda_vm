@@ -19,7 +19,7 @@
 The #bitwise chips deal with precomputed lookup tables for bitwise boolean operations
 and convenience functionalities over small domains.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_precomputed = ("input", "output").map(c => chip.variables.at(c)).flatten().len()

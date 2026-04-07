@@ -22,7 +22,7 @@ in chunks of 1, 2, 4 or 8 values.
 It introduces the old value and last-accessed timestamps of memory addresses internally,
 in order to satisfy the design of the memory argument (@memory).
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_memw_interactions = compute_nr_interactions(chip)
@@ -119,7 +119,7 @@ If either of these rules does not apply to your access, you should fall back to 
 
 Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide $2 dot #`address`$ in the lookup. 
 
-== Columns
+== Variables
 #let nr_variables = total_nr_variables(register_chip)
 #let nr_columns = total_nr_instantiated_columns(register_chip, config)
 #let nr_memw_r_interactions = compute_nr_interactions(register_chip)
