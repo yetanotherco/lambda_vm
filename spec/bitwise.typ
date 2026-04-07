@@ -35,7 +35,7 @@ As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
 This chip adds the following interactions to the lookup:
 #render_constraint_table(chip, config)
 
-= Areas of Optimization
+= Notes/Optimizations
 The following ideas may prove to be optimizations for the #bitwise chip:
 + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. 
   When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`.

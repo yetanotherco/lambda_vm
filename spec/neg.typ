@@ -61,7 +61,7 @@ $
 when `cond` is set.
 When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
-= Note
+#par(strong("Note"))
 It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
 thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`.
 The input value `x` is still assumed to be range-checked, however.
