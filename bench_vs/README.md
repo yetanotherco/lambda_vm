@@ -29,6 +29,9 @@ Compares proving time for an identical u64 wrapping Fibonacci computation.
 # Custom series
 ./bench_vs/run.sh -n 1000 50000
 
+# Approximate workload steps (converted with 5 steps/iteration)
+./bench_vs/run.sh --steps 1000000 2000000 4000000 8000000
+
 # Run only one prover
 ./bench_vs/run.sh --lambda-only
 ./bench_vs/run.sh --sp1-only
@@ -42,18 +45,21 @@ Only **proving time** is compared (wall-clock, no recursion/compression on eithe
 - **Lambda VM**: Generates RISC-V assembly at runtime, assembles to ELF, proves via the CLI.
 - **SP1 v6**: Compiles a Rust guest program to RISC-V, proves via `sp1-sdk` core mode.
 
+The linear projection uses a common axis for both provers: target workload steps.
+When you pass `--steps`, that target is explicit. When you pass `-n`, the script
+approximates workload as `steps ~= 5 * n`. `SP1 cycles` are still reported, but
+only as telemetry and not as the regression axis.
+
 ## Output
 
 ```
 === Summary ===
 Program: Fibonacci (u64 wrapping)
 
-  n           Lambda VM       SP1 v6     Ratio
-  ---         ---------       ------     -----
-  1000          13.3s         12.4s      0.9x
-  10000         22.4s         12.9s      0.6x
-  100000       116.4s         14.7s      0.1x
-  300000          ...           ...       ...
+  Target steps  Iterations     Lambda VM        SP1 v6    SP1 cycles     Ratio
+  ------------  ----------     ---------        ------    ----------     -----
+  1000000       200000            ...s           ...s       1004794       ...
+  2000000       400000            ...s           ...s       2004794       ...
 
 Green ratio = Lambda VM faster, Red = SP1 faster
 ```
