@@ -39,7 +39,9 @@
       ("bitwise.typ", [BITWISE chips], <bitwise>),
     )),
     ("ECALLS", (
-      ("ecall.typ", [ECALL chips], <ecall>),
+      ("about_ecalls.typ", [About ECALL], <ecall>),
+      ("halt.typ", [HALT chip], <halt>),
+      ("commit.typ", [COMMIT chip], <commit>),
     ))
   )
 )
