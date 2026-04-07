@@ -15,7 +15,7 @@
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are $1$, and $0$ otherwise.
 
 = Variables
-The #sign template operates on three variables and introduces #nr_interactions interaction(s):
+The #sign template operates on #nr_variables variables and introduces #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions

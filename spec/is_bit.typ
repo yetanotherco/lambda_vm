@@ -1,6 +1,6 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_constraint_table, set_nr_interactions
+#import "/chip.typ": render_chip_column_table, render_constraint_table, set_nr_interactions, total_nr_variables
 
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)
@@ -8,6 +8,7 @@
 #show: book-page(chip.name)
 
 #set_nr_interactions(chip)
+#let nr_variables = total_nr_variables(chip)
 
 #let is_bit = raw(chip.name)
 
@@ -15,7 +16,7 @@
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
 
 = Variables
-The #is_bit template operates on two variables: `cond` and `X`:
+The #is_bit template operates on #nr_variables variables:
 #render_chip_column_table(chip, config)
 
 = Constraints
