@@ -498,6 +498,8 @@ pub fn prove_with_options(
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_phase_peak();
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).

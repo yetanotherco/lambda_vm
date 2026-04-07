@@ -1798,6 +1798,19 @@ impl Traces {
         }
     }
 
+    #[cfg(feature = "instruments")]
+    fn trace_build_snap(label: &str) {
+        if let Some(heap) = stark::instruments::heap_bytes() {
+            let peak = stark::instruments::phase_peak_bytes();
+            eprintln!(
+                "  [trace-build] {:<28} heap={:>6}MB  peak={:>6}MB",
+                label,
+                heap / (1024 * 1024),
+                peak.unwrap_or(0) / (1024 * 1024),
+            );
+        }
+    }
+
     /// Spill all trace table main columns to disk.
     ///
     /// Frees RAM by memory-mapping the main trace data for every table.
@@ -1984,6 +1997,9 @@ impl Traces {
         // =====================================================================
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after cpu_ops");
+
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
         // =====================================================================
@@ -2089,6 +2105,9 @@ impl Traces {
             mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
             mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
         }
+
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after all ops collected");
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
@@ -2227,6 +2246,9 @@ impl Traces {
         bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
         drop(bitwise_ops);
 
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after bitwise drop");
+
         // Extract halt timestamp from the last ECALL instruction
         let halt_op = cpu_ops
             .iter()
@@ -2319,6 +2341,9 @@ impl Traces {
 
         let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         drop(cpu_ops);
+
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after cpu trace gen");
 
         let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
         drop(load_ops);
