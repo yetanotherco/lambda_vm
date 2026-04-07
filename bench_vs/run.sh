@@ -74,10 +74,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --report-dir)
+            if [[ $# -lt 2 ]]; then echo "--report-dir requires an argument"; exit 1; fi
             REPORT_DIR=$2
             shift 2
             ;;
         --target-steps)
+            if [[ $# -lt 2 ]]; then echo "--target-steps requires an argument"; exit 1; fi
             TARGET_STEPS=$2
             shift 2
             ;;
