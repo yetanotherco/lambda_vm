@@ -2547,73 +2547,48 @@ impl Traces {
 }
 
 #[cfg(test)]
-mod keccak_debug_tests {
-    use super::*;
-    use executor::vm::instruction::execution::keccak_f1600;
-
-    #[test]
-    fn test_keccak_bitwise_ops_count() {
-        let mut input = [0u64; 25];
-        let mut output = input;
-        keccak_f1600(&mut output);
-        let kop = KeccakOperation { timestamp: 42, state_addr: 0x1000, input, output };
-        let ops = collect_bitwise_from_keccak(&[kop]);
-
-        let xor_count = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::XorByte).count();
-        let and_count = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::AndByte).count();
-        let is_byte_count = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::IsByte).count();
-        let hwsl_count = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::Hwsl).count();
-        let is_half_count = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::IsHalf).count();
-
-        println!("Bitwise ops from 1 keccak call:");
-        println!("  XorByte:  {} (expected: 24 * 608 = {})", xor_count, 24 * 608);
-        println!("  AndByte:  {} (expected: 24 * 200 = {})", and_count, 24 * 200);
-        println!("  IsByte:   {} (expected: 24 * 480 = {})", is_byte_count, 24 * 480);
-        println!("  Hwsl:     {} (expected: 24 * 120 = {})", hwsl_count, 24 * 120);
-        println!("  IsHalf:   {} (expected: 100)", is_half_count);
-        println!("  Total:    {}", ops.len());
-    }
-}
-
-#[cfg(test)]
-mod keccak_trace_debug_tests {
+mod keccak_tests {
     use super::*;
     use executor::vm::instruction::execution::keccak_f1600;
     use crate::tables::keccak_rnd::cols as rnd_cols;
     use crate::tables::keccak::cols as core_cols;
     use crate::tables::types::FE;
 
-    #[test]
-    fn test_keccak_bus_values_match() {
+    fn make_keccak_ops() -> (KeccakOperation, KeccakRoundOperation) {
         let input = [0u64; 25];
         let mut output = input;
         keccak_f1600(&mut output);
-
         let kop = KeccakOperation { timestamp: 42, state_addr: 0x1000, input, output };
         let rop = KeccakRoundOperation { timestamp: 42, input, output };
+        (kop, rop)
+    }
 
-        let core_trace = keccak::generate_keccak_trace(&[kop]);
+    #[test]
+    fn test_keccak_bitwise_ops_count() {
+        let (kop, _) = make_keccak_ops();
+        let ops = collect_bitwise_from_keccak(&[kop]);
+
+        let xor = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::XorByte).count();
+        let and = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::AndByte).count();
+        let is_byte = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::IsByte).count();
+        let hwsl = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::Hwsl).count();
+        let is_half = ops.iter().filter(|o| o.lookup_type == BitwiseOperationType::IsHalf).count();
+
+        assert_eq!(xor, 24 * 608, "XorByte count");
+        assert_eq!(and, 24 * 200, "AndByte count");
+        assert_eq!(is_byte, 24 * 480, "IsByte count");
+        assert_eq!(hwsl, 24 * 120, "Hwsl count");
+        assert_eq!(is_half, 100, "IsHalf count");
+        assert_eq!(ops.len(), 100 + 24 * 1408, "Total bitwise ops");
+    }
+
+    #[test]
+    fn test_keccak_round_trace_matches_f1600() {
+        let (_, rop) = make_keccak_ops();
         let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
 
-        // Check: round 0, start bytes match core input_state bytes
-        let core_base = 0 * core_cols::NUM_COLUMNS;
-        let rnd_base = 0 * rnd_cols::NUM_COLUMNS; // round 0
-
-        for x in 0..5 {
-            for y in 0..5 {
-                for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_base + core_cols::input_state(x, y, b)];
-                    let rnd_val = &rnd_trace.main_table.data[rnd_base + rnd_cols::start(x, y, b)];
-                    assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
-                }
-            }
-        }
-        println!("Round 0 start == core input_state ✓");
-
-        // Check: each round's output matches keccak_f1600 round-by-round
-        let mut ref_state = input;
+        let mut ref_state = [0u64; 25];
         for round in 0..24 {
-            // Apply one round of keccak_f1600
             let rc = executor::vm::instruction::execution::KECCAK_RC[round];
             let mut c = [0u64; 5];
             for x in 0..5 { c[x] = ref_state[x] ^ ref_state[x+5] ^ ref_state[x+10] ^ ref_state[x+15] ^ ref_state[x+20]; }
@@ -2625,44 +2600,78 @@ mod keccak_trace_debug_tests {
             for x in 0..5 { for y in 0..5 { ref_state[x+5*y] = b[x+5*y] ^ (!b[(x+1)%5+5*y] & b[(x+2)%5+5*y]); } }
             ref_state[0] ^= rc;
 
-            // Compare with round chip's output (iota for lane 0, chi for rest)
-            let rnd_base_r = round * rnd_cols::NUM_COLUMNS;
+            let base = round * rnd_cols::NUM_COLUMNS;
             for lane in 0..25 {
-                let x = lane % 5; // This is how keccak indexes: lane = x + 5*y
+                let x = lane % 5;
                 let y = lane / 5;
                 for byte_idx in 0..8 {
-                    let expected = ((ref_state[lane] >> (byte_idx * 8)) & 0xFF) as u64;
-                    let trace_col = if x == 0 && y == 0 {
-                        rnd_cols::iota(byte_idx)
-                    } else {
-                        rnd_cols::chi(x, y, byte_idx)
-                    };
-                    let expected_fe = FE::from(expected);
-                    let trace_fe = &rnd_trace.main_table.data[rnd_base_r + trace_col];
-                    if &expected_fe != trace_fe {
-                        panic!("Round {round} lane ({x},{y}) byte {byte_idx}: expected {expected_fe:?}, trace {trace_fe:?}");
-                    }
+                    let expected = FE::from(((ref_state[lane] >> (byte_idx * 8)) & 0xFF) as u64);
+                    let col = if x == 0 && y == 0 { rnd_cols::iota(byte_idx) } else { rnd_cols::chi(x, y, byte_idx) };
+                    let trace_val = &rnd_trace.main_table.data[base + col];
+                    assert_eq!(&expected, trace_val, "Round {round} lane ({x},{y}) byte {byte_idx}");
                 }
             }
         }
-        println!("All 24 rounds match keccak_f1600 ✓");
+    }
 
-        // Check: round 23 out matches core output_state
+    #[test]
+    fn test_keccak_core_round_state_consistency() {
+        let (kop, rop) = make_keccak_ops();
+        let core_trace = keccak::generate_keccak_trace(&[kop]);
+        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
+
+        // Round 0 start == core input_state
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
+                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
+                    assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
+                }
+            }
+        }
+
+        // Round 23 out == core output_state
         let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
         for x in 0..5 {
             for y in 0..5 {
                 for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_base + core_cols::output_state(x, y, b)];
-                    // out[0][0] = iota, out[x][y] = chi for rest
+                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
                     let rnd_val = if x == 0 && y == 0 {
                         &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
                     } else {
                         &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
                     };
-                    assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b}): core={core_val:?} rnd={rnd_val:?}");
+                    assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
                 }
             }
         }
-        println!("Round 23 out == core output_state ✓");
+    }
+
+    #[test]
+    fn test_keccak_bus_interaction_counts() {
+        assert_eq!(keccak::bus_interactions().len(), 129,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 Keccak send + 1 Keccak recv");
+        assert_eq!(keccak_rnd::bus_interactions().len(), 1411,
+            "KECCAK_RND: 3 IO + 500 theta + 500 rho + 400 chi + 8 iota");
+        assert_eq!(keccak_rc::bus_interactions().len(), 1,
+            "KECCAK_RC: 1 receiver");
+    }
+
+    #[test]
+    fn test_keccak_column_counts() {
+        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(rnd_cols::NUM_COLUMNS, 1775, "KECCAK_RND columns");
+        assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
+    }
+
+    #[test]
+    fn test_keccak_constraint_counts() {
+        let (core_constraints, _) = keccak::create_constraints(0);
+        assert_eq!(core_constraints.len(), 50, "KECCAK core: 25 ADD pairs");
+
+        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
+        assert_eq!(rnd_constraints.len(), 275, "KECCAK_RND: 200 pi + 50 IS_BIT rbc + 25 rnc equality");
     }
 }
+

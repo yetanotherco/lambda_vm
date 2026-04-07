@@ -726,22 +726,6 @@ fn test_prove_elfs_keccak() {
     let mut traces =
         Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
-    println!(
-        "keccak (fast): CPU {} rows, KECCAK {} rows, KECCAK_RND {} rows, KECCAK_RC {} rows, MEMW {} tables ({} rows), BITWISE {} rows",
-        traces.cpus[0].main_table.height,
-        traces.keccak.main_table.height,
-        traces.keccak_rnd.main_table.height,
-        traces.keccak_rc.main_table.height,
-        traces.memws.len(),
-        traces.memws[0].main_table.height,
-        traces.bitwise.main_table.height,
-    );
-    println!(
-        "Bus interaction counts: KECCAK core={}, KECCAK_RND={}, KECCAK_RC={}",
-        crate::tables::keccak::bus_interactions().len(),
-        crate::tables::keccak_rnd::bus_interactions().len(),
-        crate::tables::keccak_rc::bus_interactions().len(),
-    );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "keccak prove/verify failed"
