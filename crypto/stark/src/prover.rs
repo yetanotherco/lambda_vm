@@ -1645,13 +1645,8 @@ pub trait IsStarkProver<
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
         }
 
-        // Number of tables to process concurrently.
-        // disk-spill: Phase A/C commit one table at a time to limit pool memory.
-        // Rounds 2-4 use full parallelism (no pools, reads from mmap).
+        // Number of tables to process concurrently (Phase A/C commits and Rounds 2-4).
         let k = table_parallelism().min(num_airs).max(1);
-        #[cfg(feature = "disk-spill")]
-        let k_commit = 4_usize.min(k);
-        #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
         // k_commit=1: pre-allocate pool to max_lde_size to avoid reallocation.
         // k_commit>1: start empty and grow on demand.
@@ -1946,27 +1941,46 @@ pub trait IsStarkProver<
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-
-                // Spill aux LDE columns from pool to disk.
-                #[cfg(feature = "disk-spill")]
-                {
-                    let idx = chunk_start + j;
-                    let (air, trace, _) = &air_trace_pairs[idx];
-                    if air.has_aux_trace() {
-                        let num_aux_cols = trace.num_aux_columns;
-                        if let Some(ref mut spilled) = spilled_ldes[idx] {
-                            spilled
-                                .add_aux_from_pool(&pool_sets[j].aux, num_aux_cols)
-                                .map_err(|e| {
-                                    ProvingError::WrongParameter(format!(
-                                        "disk-spill aux LDE table {idx}: {e}"
-                                    ))
-                                })?;
-                        }
-                    }
-                }
-
                 aux_results.push((aux_tree, aux_root));
+            }
+
+            // Parallel: spill aux LDE columns from pool to disk.
+            // Pool data is still valid (next chunk hasn't overwritten it yet).
+            #[cfg(feature = "disk-spill")]
+            {
+                let spilled_chunk = &mut spilled_ldes[chunk_start..chunk_end];
+                let pool_chunk = &pool_sets[..chunk_size];
+
+                #[cfg(feature = "parallel")]
+                let spill_iter = spilled_chunk
+                    .par_iter_mut()
+                    .zip(pool_chunk.par_iter())
+                    .enumerate();
+                #[cfg(not(feature = "parallel"))]
+                let spill_iter = spilled_chunk.iter_mut().zip(pool_chunk.iter()).enumerate();
+
+                let spill_results: Vec<Result<(), ProvingError>> = spill_iter
+                    .map(|(j, (spilled_opt, pool))| {
+                        let idx = chunk_start + j;
+                        let (air, trace, _) = &air_trace_pairs[idx];
+                        if air.has_aux_trace() {
+                            let num_aux_cols = trace.num_aux_columns;
+                            if let Some(spilled) = spilled_opt {
+                                spilled.add_aux_from_pool(&pool.aux, num_aux_cols).map_err(
+                                    |e| {
+                                        ProvingError::WrongParameter(format!(
+                                            "disk-spill aux LDE table {idx}: {e}"
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .collect();
+                for result in spill_results {
+                    result?;
+                }
             }
         }
 
