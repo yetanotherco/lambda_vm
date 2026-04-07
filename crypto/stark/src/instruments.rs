@@ -30,6 +30,14 @@ pub fn phase_peak_bytes() -> Option<usize> {
     peak
 }
 
+/// Reset the phase peak tracker without reading. Call at phase boundaries
+/// to avoid contamination from prior phases.
+pub fn reset_phase_peak() {
+    if let Some(reset) = PEAK_RESETTER.get() {
+        reset();
+    }
+}
+
 /// (label, current_heap, peak_within_phase)
 pub type HeapSnapshot = (&'static str, usize, Option<usize>);
 

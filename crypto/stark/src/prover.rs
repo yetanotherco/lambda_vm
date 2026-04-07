@@ -1891,6 +1891,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
         #[cfg(feature = "instruments")]
+        crate::instruments::reset_phase_peak();
+        #[cfg(feature = "instruments")]
         let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
 
         let num_airs = air_trace_pairs.len();
