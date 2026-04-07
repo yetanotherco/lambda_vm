@@ -9,7 +9,7 @@
   version: "0.2",
   summary: (
     ("PROOF SYSTEM", (
-        ("logup.typ", [LogUp argument], <logup>),
+        ("logup.typ", [`LogUp` argument], <logup>),
         ("memory.typ", [Memory argument], <memory>),
     )),
     ("OVERVIEW", (
@@ -17,31 +17,31 @@
         ("signatures.typ", [Signatures], <signatures>),
     )),
     ("TEMPLATES", (
-      ("is_bit.typ", [IS_BIT template], <isbit>),
-      ("sign.typ", [SIGN template], <sign>),
-      ("add.typ", [ADD/SUB template], <add>),
-      ("neg.typ", [NEG template], <neg>),
+      ("is_bit.typ", [`IS_BIT` template], <isbit>),
+      ("sign.typ", [`SIGN` template], <sign>),
+      ("add.typ", [`ADD`/`SUB` template], <add>),
+      ("neg.typ", [`NEG` template], <neg>),
     )),
     ("MEMORY", (
-      ("memw.typ", [MEMW chip], <memw>),
+      ("memw.typ", [`MEMW` chip], <memw>),
     )),
     ("CPU", (
-      ("decode.typ", [DECODE table], <decode>),
-      ("cpu.typ", [CPU chip], <cpu>),
+      ("decode.typ", [`DECODE` table], <decode>),
+      ("cpu.typ", [`CPU` chip], <cpu>),
     )),
     ("ALU", (
-      ("shift.typ", [SHIFT chip], <shift>),
-      ("branch.typ", [BRANCH chip], <branch>),
-      ("lt.typ", [LT chip], <lt>),
-      ("mul.typ", [MUL chip], <mul>),
-      ("dvrm.typ", [DVRM chip], <dvrm>),
-      ("load.typ", [LOAD chip], <load>),
-      ("bitwise.typ", [BITWISE chips], <bitwise>),
+      ("shift.typ", [`SHIFT` chip], <shift>),
+      ("branch.typ", [`BRANCH` chip], <branch>),
+      ("lt.typ", [`LT` chip], <lt>),
+      ("mul.typ", [`MUL` chip], <mul>),
+      ("dvrm.typ", [`DVRM` chip], <dvrm>),
+      ("load.typ", [`LOAD` chip], <load>),
+      ("bitwise.typ", [`BITWISE` chips], <bitwise>),
     )),
     ("ECALLS", (
-      ("about_ecalls.typ", [About ECALL], <ecall>),
-      ("halt.typ", [HALT chip], <halt>),
-      ("commit.typ", [COMMIT chip], <commit>),
+      ("about_ecalls.typ", [About `ECALL`], <ecall>),
+      ("halt.typ", [`HALT` chip], <halt>),
+      ("commit.typ", [`COMMIT` chip], <commit>),
     ))
   )
 )
