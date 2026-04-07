@@ -1689,6 +1689,14 @@ impl<T> SpilledVec<T> {
     }
 }
 
+#[cfg(feature = "disk-spill")]
+impl<T> std::ops::Deref for SpilledVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
 /// Streaming writer that appends elements to a temp file, then finalizes as a `SpilledVec`.
 ///
 /// Elements are buffered in memory and flushed to disk periodically.
@@ -2030,15 +2038,22 @@ impl Traces {
         // disk-spill: collect aligned ops from SpilledVec; non-aligned stay in SpilledVec
         // for chunk-by-chunk processing. Halt aligned ops included here too.
         #[cfg(feature = "disk-spill")]
-        let memw_aligned_ops: Vec<MemwOperation> = {
-            let mut aligned: Vec<MemwOperation> = memw_ops
-                .as_slice()
-                .iter()
-                .filter(|op| is_aligned_op(op))
-                .cloned()
-                .collect();
-            aligned.extend(halt_memw_ops.iter().filter(|op| is_aligned_op(op)).cloned());
-            aligned
+        let memw_aligned_ops: SpilledVec<MemwOperation> = {
+            let mut writer = SpilledVecWriter::new()
+                .map_err(|e| Error::Prover(format!("disk-spill memw_aligned writer: {e}")))?;
+            for op in memw_ops.as_slice().iter().filter(|op| is_aligned_op(op)) {
+                writer
+                    .push(op.clone())
+                    .map_err(|e| Error::Prover(format!("disk-spill memw_aligned: {e}")))?;
+            }
+            for op in halt_memw_ops.iter().filter(|op| is_aligned_op(op)) {
+                writer
+                    .push(op.clone())
+                    .map_err(|e| Error::Prover(format!("disk-spill memw_aligned: {e}")))?;
+            }
+            writer
+                .finish()
+                .map_err(|e| Error::Prover(format!("disk-spill memw_aligned finish: {e}")))?
         };
         #[cfg(not(feature = "disk-spill"))]
         let (memw_aligned_ops, memw_ops): (Vec<MemwOperation>, Vec<MemwOperation>) =
