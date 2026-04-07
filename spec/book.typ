@@ -45,13 +45,14 @@
     ))
   )
 )
+#let meta_sections = meta.summary.map(m => m.at(1)).sum()
 #book-meta(
   title: meta.title,
   authors: meta.authors,
   summary: prefix-chapter("front.typ", meta.title) 
     + meta.summary.map(
       ((title, sections)) => {
-        chapter("", title) + sections.map(((ch, title, _ref)) => chapter(ch, title)).join()
+        heading(depth: 1, title) + sections.map(((ch, title, _ref)) => chapter(ch, title)).join()
       }
     ).join()
 )
@@ -114,11 +115,11 @@
 #let xref(rf) = {
   assert(is-shiroa, message: "xref should only be used when compiling for shiroa")
   let lbl = rf.target
-  let found = meta.summary.find(((_, _, tag)) => str(lbl).starts-with(str(tag)))
+  let found = meta_sections.find(((_, _, tag)) => str(lbl).starts-with(str(tag)))
   context if found != none and found.at(0) != _toplevel.final() {
     let (ch, title, ref) = found
     if ref == lbl {
-      cross-link("/" + ch, [Chapter #(meta.summary.position(x => x == found) + 1)])
+      cross-link("/" + ch, [Chapter #(meta_sections.position(x => x == found) + 1)])
     } else {
       // Because shiroa does weird url escaping
       let shiroa-label = label(str(lbl).replace(":", "%3A"))
@@ -155,8 +156,7 @@
     file = lower(file) + ".typ"
   }
 
-  let sections = meta.summary.map(((_, sections)) => sections.map(((file, _, _)) => file)).flatten()
-  assert(sections.find(f => f == file) != none, message: "Couldn't resolve typst source file " + file)
+  assert(meta_sections.find(s => s.at(0) == file) != none, message: "Couldn't resolve typst source file " + file)
 
   if is-shiroa {
     (body) => {
@@ -169,7 +169,7 @@
         }
       })
       let cond() = _toplevel.final() == file
-      project.with(..args, title: context meta.summary.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
+      project.with(..args, title: context meta_sections.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
         #show ref: it => context if _toplevel.final() == file {
           xref(it)
         }
