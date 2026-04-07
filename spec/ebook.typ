@@ -12,9 +12,16 @@
 #show heading: set heading(numbering: "1.1")
 #show raw.where(block: true): set block(fill: luma(230))
 
-#meta.summary.map(((ch, title, ref)) => [
+#meta.summary.map(((ch_title, sections)) => (
+  [
+   #pagebreak(weak: true)
+   #heading(supplement: [Chapter], level: 1, ch_title)
+  ]
+  +
+  sections.map(((sec, sec_title, ref)) => [
   #pagebreak(weak: true)
-  #heading(supplement: [Chapter], level: 1, title)#ref
-  #set heading(offset: 1)
-  #include ch
+    #heading(supplement: [Section], level: 2, sec_title)#ref
+    #set heading(offset: 2)
+    #include sec
 ]).join()
+)).join()

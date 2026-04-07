@@ -8,31 +8,50 @@
   authors: ("3MI Labs", "Aligned"),
   version: "0.2",
   summary: (
-    ("logup.typ", [LogUp argument], <logup>),
-    ("memory.typ", [Memory argument], <memory>),
-    ("variables.typ", [Variables], <vars>),
-    ("signatures.typ", [Signatures], <signatures>),
-    ("is_bit.typ", [IS_BIT template], <isbit>),
-    ("sign.typ", [SIGN template], <sign>),
-    ("add.typ", [ADD/SUB template], <add>),
-    ("neg.typ", [NEG template], <neg>),
-    ("decode.typ", [DECODE table], <decode>),
-    ("cpu.typ", [CPU chip], <cpu>),
-    ("shift.typ", [SHIFT chip], <shift>),
-    ("branch.typ", [BRANCH chip], <branch>),
-    ("memw.typ", [MEMW chip], <memw>),
-    ("lt.typ", [LT chip], <lt>),
-    ("mul.typ", [MUL chip], <mul>),
-    ("dvrm.typ", [DVRM chip], <dvrm>),
-    ("load.typ", [LOAD chip], <load>),
-    ("ecall.typ", [ECALL chips], <ecall>),
-    ("bitwise.typ", [BITWISE chips], <bitwise>),
+    ("PROOF SYSTEM", (
+        ("logup.typ", [LogUp argument], <logup>),
+        ("memory.typ", [Memory argument], <memory>),
+    )),
+    ("OVERVIEW", (
+        ("variables.typ", [Variables], <vars>),
+        ("signatures.typ", [Signatures], <signatures>),
+    )),
+    ("TEMPLATES", (
+      ("is_bit.typ", [IS_BIT template], <isbit>),
+      ("sign.typ", [SIGN template], <sign>),
+      ("add.typ", [ADD/SUB template], <add>),
+      ("neg.typ", [NEG template], <neg>),
+    )),
+    ("MEMORY", (
+      ("memw.typ", [MEMW chip], <memw>),
+    )),
+    ("CPU", (
+      ("decode.typ", [DECODE table], <decode>),
+      ("cpu.typ", [CPU chip], <cpu>),
+    )),
+    ("ALU", (
+      ("shift.typ", [SHIFT chip], <shift>),
+      ("branch.typ", [BRANCH chip], <branch>),
+      ("lt.typ", [LT chip], <lt>),
+      ("mul.typ", [MUL chip], <mul>),
+      ("dvrm.typ", [DVRM chip], <dvrm>),
+      ("load.typ", [LOAD chip], <load>),
+      ("bitwise.typ", [BITWISE chips], <bitwise>),
+    )),
+    ("ECALLS", (
+      ("ecall.typ", [ECALL chips], <ecall>),
+    ))
   )
 )
 #book-meta(
   title: meta.title,
   authors: meta.authors,
-  summary: prefix-chapter("front.typ", meta.title) + meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
+  summary: prefix-chapter("front.typ", meta.title) 
+    + meta.summary.map(
+      ((title, sections)) => {
+        chapter("", title) + sections.map(((ch, title, _ref)) => chapter(ch, title)).join()
+      }
+    ).join()
 )
 
 #let common-formatting(body) = {
@@ -130,12 +149,13 @@
 }
 
 #let book-page(file, ..args) = {
-  let file = if file.ends-with(".typ") {
-    file
-  } else {
-    lower(file) + ".typ"
+  if not file.ends-with(".typ") {
+    file = lower(file) + ".typ"
   }
-  assert(meta.summary.find(((f, _, _)) => f == file) != none, message: "Couldn't resolve typst source file " + file)
+
+  let sections = meta.summary.map(((_, sections)) => sections.map(((file, _, _)) => file)).flatten()
+  assert(sections.find(f => f == file) != none, message: "Couldn't resolve typst source file " + file)
+
   if is-shiroa {
     (body) => {
       show: common-formatting
