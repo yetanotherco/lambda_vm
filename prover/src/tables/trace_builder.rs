@@ -2126,6 +2126,7 @@ impl Traces {
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // Snapshot moved below to capture MEMW chunk processing.
         // =====================================================================
         // disk-spill: spill memw_ops to disk first to free ~83 GB at 128M scale,
         // then generate MEMW traces + LT-from-MEMW in chunks from the mmap.
@@ -2205,6 +2206,9 @@ impl Traces {
         #[cfg(not(feature = "disk-spill"))]
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
         lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after MEMW+LT traces");
 
         // =====================================================================
         // PHASE 4+5: Interleaved bitwise flush, trace generation, and drops
@@ -2325,6 +2329,9 @@ impl Traces {
             memw_aligned::generate_memw_aligned_trace
         );
         drop(memw_aligned_ops);
+
+        #[cfg(feature = "instruments")]
+        Self::trace_build_snap("after MEMW_A trace gen");
 
         // disk-spill: lt_ops only has CPU/DVRM LT ops (MEMW LT was processed inline above).
         // Flush LT bitwise into the bitwise table here (non-disk-spill does it later).
