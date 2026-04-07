@@ -1830,56 +1830,30 @@ pub trait IsStarkProver<
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
         //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
 
-        // Pass 1: Build aux traces.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks).
-        // disk-spill: build in chunks of k_commit to cap peak memory from
-        // columns_main() clones that live during the build.
+        // Pass 1: Build aux traces in parallel.
+        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
+        // but outer parallelism over 12 tables also helps on high-core-count machines.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        #[cfg(not(feature = "disk-spill"))]
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = {
-            #[cfg(feature = "parallel")]
-            let aux_iter = air_trace_pairs.par_iter_mut();
-            #[cfg(not(feature = "parallel"))]
-            let aux_iter = air_trace_pairs.iter_mut();
-            aux_iter
-                .map(|(air, trace, _)| {
-                    if air.has_aux_trace() {
-                        air.build_auxiliary_trace(*trace, &lookup_challenges)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        #[cfg(feature = "disk-spill")]
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = {
-            let mut results = Vec::with_capacity(num_airs);
-            for chunk in air_trace_pairs.chunks_mut(k_commit) {
-                #[cfg(feature = "parallel")]
-                let iter = chunk.par_iter_mut();
-                #[cfg(not(feature = "parallel"))]
-                let iter = chunk.iter_mut();
-                let chunk_results: Vec<_> = iter
-                    .map(|(air, trace, _)| {
-                        if air.has_aux_trace() {
-                            let result =
-                                air.build_auxiliary_trace(*trace, &lookup_challenges);
-                            trace
-                                .spill_aux_to_disk()
-                                .expect("disk-spill aux trace after build");
-                            result
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                results.extend(chunk_results);
-            }
-            results
-        };
+        #[cfg(feature = "parallel")]
+        let aux_iter = air_trace_pairs.par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = air_trace_pairs.iter_mut();
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+            .map(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    let result = air.build_auxiliary_trace(*trace, &lookup_challenges);
+                    #[cfg(feature = "disk-spill")]
+                    trace
+                        .spill_aux_to_disk()
+                        .expect("disk-spill aux trace after build");
+                    result
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
