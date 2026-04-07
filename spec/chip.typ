@@ -142,7 +142,7 @@
         ([#raw(var.name)], [$:=$], [#expr_to_math(var.pad)],)
       }
     },
-  ), caption: [Overview of padding values for #chip.name chip.])
+  ))
 }
 
 /// Generates a table listing `chip`'s variables.
@@ -235,7 +235,7 @@
       }
       (table.cell(colspan: 4, []), )
     },
-  ), caption: [Variable overview of #chip.name chip.])
+  ))
 }
 
 #let cref(obj, body) = {
@@ -278,7 +278,7 @@
     ..for assumption in chip.assumptions {
       ([#tag(assumption)], [#iters(assumption)], [#eval(assumption.desc, mode: "markup")])
     },
-  ), caption: [Assumption overview of #chip.name chip.])
+  ))
 }
 
 /// Generates a table listing all interactions initiated by `chip`'s.
@@ -389,5 +389,5 @@
         }
       }
     }
-  ), caption: [Constraint overview of #chip.name chip.])
+  ))
 }

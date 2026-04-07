@@ -93,9 +93,7 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
     ..lines.flatten(),
     table.hline(stroke: 1.5pt),
     table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]),
-    ),  
-    caption: [Decoding table]
-  )
+  ))
 }
 
 #let decoding = (
