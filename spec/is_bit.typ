@@ -1,6 +1,6 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_constraint_table, set_nr_interactions, total_nr_variables
+#import "/chip.typ": render_chip_variable_table, render_constraint_table, set_nr_interactions, total_nr_variables
 
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)
@@ -17,7 +17,7 @@ Barring exceptional cases, this template is used to assert that a variable of ty
 
 = Variables
 The #is_bit template operates on #nr_variables variables:
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 = Constraints
 It takes only one constraint to enforce that `X` must be either $0$ or $1$ whenever $#`cond` eq.not 0$:

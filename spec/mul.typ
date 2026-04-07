@@ -1,7 +1,7 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   compute_nr_interactions,
@@ -26,7 +26,7 @@ as well as providing access to the low and high halfs of the multiplication resu
 #let nr_interactions = compute_nr_interactions(chip)
 
 The #mul chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 #let stackrel(top, bottom) = {
  $mat(delim: #none, top; bottom)$

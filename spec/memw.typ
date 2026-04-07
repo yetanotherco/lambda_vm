@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   compute_nr_interactions,
@@ -28,7 +28,7 @@ in order to satisfy the design of the memory argument (@memory).
 #let nr_memw_interactions = compute_nr_interactions(chip)
 
 The #memw chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_interactions interaction(s):
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 
@@ -91,7 +91,7 @@ Further logic remains essentially the same, so we briefly present the relevant t
 #let nr_columns = total_nr_instantiated_columns(alignedchip, config)
 
 The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns; it leverages #nr_aligned_interactions interactions.
-#render_chip_column_table(alignedchip, config)
+#render_chip_variable_table(alignedchip, config)
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
 
@@ -125,7 +125,7 @@ Note moreover that this chip does not guard against misaligned register access f
 #let nr_memw_r_interactions = compute_nr_interactions(register_chip)
 
 The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_r_interactions interactions:
-#render_chip_column_table(register_chip, config)
+#render_chip_variable_table(register_chip, config)
 
 == Assumptions
 The following range checks are assumed to be performed/enforced outside of this chip:

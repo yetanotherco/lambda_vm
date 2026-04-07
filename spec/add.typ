@@ -1,6 +1,6 @@
 #import "/book.typ": book-page, et
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table, set_nr_interactions, compute_nr_interactions,
+#import "/chip.typ": render_chip_variable_table, render_chip_assumptions, render_constraint_table, set_nr_interactions, compute_nr_interactions,
 
 #let config = load_config()
 #let chip = load_chip("src/add.toml", config)
@@ -23,7 +23,7 @@ It constrains that $#`diff` equiv #`lhs` - #`rhs` (mod 2^64)$ when the expressio
 
 = Variables
 This template introduces #nr_interactions interaction(s).
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 #render_chip_assumptions(chip, config)

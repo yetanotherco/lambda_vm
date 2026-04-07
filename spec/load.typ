@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   render_chip_padding_table,
   render_constraint_table,
   compute_nr_interactions,
@@ -25,7 +25,7 @@ It delegates low-level memory handling to the `MEMW` chip (@memw).
 #let nr_interactions = compute_nr_interactions(chip)
 
 The #load chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 #render_chip_assumptions(chip, config)
