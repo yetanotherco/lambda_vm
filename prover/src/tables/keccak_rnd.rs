@@ -30,10 +30,10 @@ use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::traits::TransitionEvaluationContext;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
+use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -50,9 +50,6 @@ pub mod cols {
     pub const START: usize = 3;
 
     // Cxz[5][4][8] = 160 bytes — partial XOR chain for column parities
-    // Cxz[x][stage][byte]: stage 0 = XOR(start[x,0], start[x,1]),
-    //                      stage k = XOR(Cxz[x,k-1], start[x,k+1])
-    // Final parity C[x] = Cxz[x][3]
     pub const CXZ: usize = START + 200; // 203
 
     // Cxz_left[5][8] = 40 bytes — left shift component of rotated C
@@ -61,22 +58,22 @@ pub mod cols {
     // Cxz_right[5][8] = 40 bytes — right shift component of rotated C
     pub const CXZ_RIGHT: usize = CXZ_LEFT + 40; // 403
 
-    // Dxz[5][8] = 40 bytes — D[x] = C[(x-1)%5] XOR rotated_C[(x+1)%5]
+    // Dxz[5][8] = 40 bytes
     pub const DXZ: usize = CXZ_RIGHT + 40; // 443
 
     // theta[5][5][8] = 200 bytes — state after θ
     pub const THETA: usize = DXZ + 40; // 483
 
-    // rot_left[5][5][8] = 200 bytes — left half of ρ rotation
+    // rot_left[5][5][8] = 200 bytes
     pub const ROT_LEFT: usize = THETA + 200; // 683
 
-    // rot_right[5][5][8] = 200 bytes — right half of ρ rotation
+    // rot_right[5][5][8] = 200 bytes
     pub const ROT_RIGHT: usize = ROT_LEFT + 200; // 883
 
     // pi[5][5][8] = 200 bytes — state after π∘ρ (materialized virtual)
     pub const PI: usize = ROT_RIGHT + 200; // 1083
 
-    // chi_ands[5][5][8] = 200 bytes — AND results for χ
+    // chi_ands[5][5][8] = 200 bytes
     pub const CHI_ANDS: usize = PI + 200; // 1283
 
     // chi[5][5][8] = 200 bytes — state after χ
@@ -88,10 +85,10 @@ pub mod cols {
     // iota[8] — χ[0][0] ⊕ rc
     pub const IOTA: usize = RC + 8; // 1691
 
-    // rnc[5][5] — ρ rotation nibble (offset mod 16, used as HWSL shift amount)
+    // rnc[5][5] — ρ rotation nibble constant (spec: [[variables.constant]])
     pub const RNC: usize = IOTA + 8; // 1699
 
-    // rbc[5][5][2] — ρ rotation byte count (2 bits per lane)
+    // rbc[5][5][2] — ρ rotation byte count bits (spec: [[variables.constant]])
     pub const RBC: usize = RNC + 25; // 1724
 
     // mu — multiplicity flag
@@ -907,22 +904,125 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PiConstraint
 }
 
 /// Create all pi verification constraints (200 total: 5×5×8).
+/// Constraint: mu * (rnc[x][y] - CONSTANT) = 0
+///
+/// Forces rnc to equal the compile-time rotation nibble on active rows.
+/// Per spec: rnc is [[variables.constant]].
+pub struct RncConstantConstraint {
+    constraint_idx: usize,
+    col: usize,
+    expected: u64,
+}
+
+impl RncConstantConstraint {
+    pub fn new(constraint_idx: usize, x: usize, y: usize) -> Self {
+        let rho_offset = KECCAK_RHO[x][y] as u64;
+        Self {
+            constraint_idx,
+            col: cols::rnc(x, y),
+            expected: rho_offset % 16,
+        }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+        let rnc = step.get_main_evaluation_element(0, self.col).clone();
+        let expected = FieldElement::<F>::from(self.expected);
+        mu * (rnc - expected)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RncConstantConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let v = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = v.to_extension();
+            }
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let v = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = v;
+            }
+        }
+    }
+}
+
+/// Create all keccak round constraints:
+/// - 200 pi verification (degree-3)
+/// - 50 IS_BIT for rbc (degree-2, per spec: rbc type is Bit)
+/// - 25 rnc equality (degree-2, per spec: rnc is constant)
+/// Total: 275 constraints
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
     Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
+    use crate::constraints::templates::IsBitConstraint;
+
     let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
-        Vec::with_capacity(200);
+        Vec::with_capacity(275);
     let mut idx = constraint_idx_start;
 
+    // 200 pi verification constraints (degree-3)
     for x in 0..5 {
         for y in 0..5 {
             for z in 0..8 {
                 constraints.push(Box::new(PiConstraint::new(idx, x, y, z)));
                 idx += 1;
             }
+        }
+    }
+
+    // 50 IS_BIT constraints for rbc[x][y][bit] (degree-2, unconditional)
+    // Safe on padding: rbc=0 on padding rows, 0*(1-0)=0 ✓
+    for x in 0..5 {
+        for y in 0..5 {
+            for bit in 0..2 {
+                constraints.push(Box::new(IsBitConstraint::unconditional(
+                    cols::rbc(x, y, bit),
+                    idx,
+                )));
+                idx += 1;
+            }
+        }
+    }
+
+    // 25 rnc equality constraints: mu * (rnc[x][y] - KECCAK_RHO[x][y] % 16) = 0
+    for x in 0..5 {
+        for y in 0..5 {
+            constraints.push(Box::new(RncConstantConstraint::new(idx, x, y)));
+            idx += 1;
         }
     }
 
