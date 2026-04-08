@@ -46,6 +46,7 @@ impl std::fmt::Debug for TableMmapBacking {
     }
 }
 
+/// NOTE: compares all mmap bytes, O(n) in table size. Only used by Table's PartialEq derive.
 #[cfg(feature = "disk-spill")]
 impl PartialEq for TableMmapBacking {
     fn eq(&self, other: &Self) -> bool {

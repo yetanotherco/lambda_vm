@@ -405,16 +405,16 @@ fn test_memw_generated_from_register_ops() {
     );
 
     // Find the register write to x1 in MEMW_A
-    // Register address for x1 = 2*1 = 2, decomposed: high=0, mid=0, low=[2,0]
+    // Register address for x1 = 2*1 = 2, decomposed: base_address[0]=2, base_address[1]=0, base_address[2]=0
     let mut found_write = false;
     for chunk in &traces.memw_aligneds {
         for row_idx in 0..chunk.main_table.height {
             let row = chunk.main_table.get_row(row_idx);
-            // Check for register write: is_register=1, base_address_low[0]=2, mu_write=1
+            // Check for register write: is_register=1, base_address[0]=2, mu_write=1
             if row[memw_aligned::cols::IS_REGISTER] == FE::one()
-                && row[memw_aligned::cols::BASE_ADDRESS_LOW[0]] == FE::from(2u64)
-                && row[memw_aligned::cols::BASE_ADDRESS_MID] == FE::zero()
-                && row[memw_aligned::cols::BASE_ADDRESS_HIGH] == FE::zero()
+                && row[memw_aligned::cols::BASE_ADDRESS[0]] == FE::from(2u64)
+                && row[memw_aligned::cols::BASE_ADDRESS[1]] == FE::zero()
+                && row[memw_aligned::cols::BASE_ADDRESS[2]] == FE::zero()
                 && row[memw_aligned::cols::MU_WRITE] == FE::one()
             {
                 // Check value is 300 (lo32 word for register DWordWL packing)

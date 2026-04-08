@@ -242,98 +242,6 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
-    #[cfg(feature = "disk-spill")]
-    eval_mmaps: Option<Vec<Round2EvalMmap>>,
-}
-
-/// File-backed mmap storage for a single composition polynomial part's LDE evaluations.
-/// After `spill_evaluations_to_disk()`, elements are read from the mmap instead of
-/// the in-memory vector.
-#[cfg(feature = "disk-spill")]
-struct Round2EvalMmap {
-    mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing the mmap. Dropping it would close
-    /// the descriptor and invalidate the mmap.
-    _file: std::fs::File,
-    len: usize,
-    elem_size: usize,
-}
-
-impl<F> Round2<F>
-where
-    F: IsField,
-    FieldElement<F>: AsBytes,
-{
-    pub fn num_composition_parts(&self) -> usize {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            return mmaps.len();
-        }
-        self.lde_composition_poly_evaluations.len()
-    }
-
-    #[inline]
-    pub fn get_composition_eval(&self, part: usize, index: usize) -> &FieldElement<F> {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            let m = &mmaps[part];
-            let offset = index * m.elem_size;
-            // SAFETY: spill_evaluations_to_disk writes the evaluations as contiguous
-            // bytes to this mmap. FieldElement<F> is #[repr(transparent)].
-            return unsafe { &*(m.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
-        }
-        &self.lde_composition_poly_evaluations[part][index]
-    }
-
-    pub fn composition_eval_len(&self, part: usize) -> usize {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            return mmaps[part].len;
-        }
-        self.lde_composition_poly_evaluations[part].len()
-    }
-
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_evaluations_to_disk(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
-
-        if self.lde_composition_poly_evaluations.is_empty() || self.eval_mmaps.is_some() {
-            return Ok(());
-        }
-
-        let elem_size = std::mem::size_of::<FieldElement<F>>();
-        let mut mmaps = Vec::with_capacity(self.lde_composition_poly_evaluations.len());
-
-        for part in self.lde_composition_poly_evaluations.drain(..) {
-            let total_bytes = part.len() * elem_size;
-            let file = tempfile::tempfile()?;
-            file.set_len(total_bytes as u64)?;
-            {
-                let mut writer =
-                    std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
-                // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
-                // can be viewed as a contiguous byte slice.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes) };
-                writer.write_all(bytes)?;
-                writer.flush()?;
-            }
-            // SAFETY: tempfile() creates an anonymous file with no filesystem path,
-            // so no other process can open or modify it.
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-            let len = part.len();
-            drop(part);
-            mmaps.push(Round2EvalMmap {
-                mmap,
-                _file: file,
-                len,
-                elem_size,
-            });
-        }
-
-        self.eval_mmaps = Some(mmaps);
-        Ok(())
-    }
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -649,6 +557,53 @@ pub trait IsStarkProver<
         ))
     }
 
+    /// Build a Round1 from a pre-built LDETraceTable and stored metadata.
+    /// Reuses Merkle trees from Phase A/C via Arc (pointer copy, no deep clone).
+    fn round1_from_lde(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: LDETraceTable<Field, FieldExtension>,
+        metadata: &Round1Metadata<Field, FieldExtension>,
+    ) -> Round1<Field, FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let main = Round1CommitmentData::<Field> {
+            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
+            lde_trace_merkle_root: metadata.main_merkle_root,
+            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
+            precomputed_merkle_root: metadata.precomputed_merkle_root,
+            num_precomputed_cols: metadata.num_precomputed_cols,
+        };
+
+        let aux = if air.has_aux_trace() {
+            Some(Round1CommitmentData::<FieldExtension> {
+                lde_trace_merkle_tree: Arc::clone(
+                    metadata
+                        .aux_merkle_tree
+                        .as_ref()
+                        .expect("aux tree must exist when has_trace_interaction"),
+                ),
+                lde_trace_merkle_root: metadata
+                    .aux_merkle_root
+                    .expect("aux root must exist when has_trace_interaction"),
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            })
+        } else {
+            None
+        };
+
+        Round1 {
+            lde_trace,
+            main,
+            aux,
+            rap_challenges: metadata.rap_challenges.clone(),
+            bus_public_inputs: metadata.bus_public_inputs.clone(),
+        }
+    }
+
     /// Reconstruct a full Round1 struct by recomputing LDE evaluations and using
     /// the stored Merkle trees from metadata. Uses pool buffers to avoid allocation.
     ///
@@ -672,38 +627,14 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
-        // Use stored Merkle trees from Phase A/C via Arc (pointer copy, no deep clone)
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-            lde_trace_merkle_root: metadata.main_merkle_root,
-            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
-            precomputed_merkle_root: metadata.precomputed_merkle_root,
-            num_precomputed_cols: metadata.num_precomputed_cols,
-        };
-
-        // Recompute aux LDE into pool buffers, use stored aux Merkle tree
-        let (aux, num_aux_cols) = if air.has_aux_trace() {
+        // Recompute aux LDE into pool buffers
+        let num_aux_cols = if air.has_aux_trace() {
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
-            // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
-            let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    metadata
-                        .aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_trace_interaction"),
-                ),
-                lde_trace_merkle_root: metadata
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_trace_interaction"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            };
-            (Some(aux_commitment), n_aux)
+            n_aux
         } else {
-            (None, 0)
+            0
         };
 
         // Take column Vecs from pool (zero-copy move) instead of cloning.
@@ -719,13 +650,7 @@ pub trait IsStarkProver<
         let lde_trace =
             LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), domain.blowup_factor);
 
-        Ok(Round1 {
-            lde_trace,
-            main,
-            aux,
-            rap_challenges: metadata.rap_challenges.clone(),
-            bus_public_inputs: metadata.bus_public_inputs.clone(),
-        })
+        Ok(Self::round1_from_lde(air, lde_trace, metadata))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
@@ -1031,8 +956,6 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
-            #[cfg(feature = "disk-spill")]
-            eval_mmaps: None,
         })
     }
 
@@ -1048,7 +971,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -1129,7 +1052,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.num_composition_parts();
+        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
 
@@ -1269,7 +1192,7 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -1330,7 +1253,7 @@ pub trait IsStarkProver<
             // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
-                let h_j_val = round_2_result.get_composition_eval(j, row_idx);
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
@@ -1376,17 +1299,13 @@ pub trait IsStarkProver<
             .get_proof_by_pos(index)
             .unwrap();
 
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let lde_composition_poly_parts_evaluation: Vec<_> = (0..num_parts)
             .flat_map(|j| {
-                let part_len = round_2_result.composition_eval_len(j) as u64;
+                let part = &round_2_result.lde_composition_poly_evaluations[j];
                 vec![
-                    round_2_result
-                        .get_composition_eval(j, reverse_index(index * 2, part_len))
-                        .clone(),
-                    round_2_result
-                        .get_composition_eval(j, reverse_index(index * 2 + 1, part_len))
-                        .clone(),
+                    part[reverse_index(index * 2, part.len() as u64)].clone(),
+                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
                 ]
             })
             .collect();
@@ -2111,43 +2030,7 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let table_start = Instant::now();
 
-                        let main = Round1CommitmentData::<Field> {
-                            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                            lde_trace_merkle_root: metadata.main_merkle_root,
-                            precomputed_merkle_tree: metadata
-                                .precomputed_merkle_tree
-                                .as_ref()
-                                .map(Arc::clone),
-                            precomputed_merkle_root: metadata.precomputed_merkle_root,
-                            num_precomputed_cols: metadata.num_precomputed_cols,
-                        };
-
-                        let aux = if air.has_aux_trace() {
-                            Some(Round1CommitmentData::<FieldExtension> {
-                                lde_trace_merkle_tree: Arc::clone(
-                                    metadata
-                                        .aux_merkle_tree
-                                        .as_ref()
-                                        .expect("aux tree must exist when has_aux_trace"),
-                                ),
-                                lde_trace_merkle_root: metadata
-                                    .aux_merkle_root
-                                    .expect("aux root must exist when has_aux_trace"),
-                                precomputed_merkle_tree: None,
-                                precomputed_merkle_root: None,
-                                num_precomputed_cols: 0,
-                            })
-                        } else {
-                            None
-                        };
-
-                        let round_1_result = Round1 {
-                            lde_trace,
-                            main,
-                            aux,
-                            rap_challenges: metadata.rap_challenges.clone(),
-                            bus_public_inputs: metadata.bus_public_inputs.clone(),
-                        };
+                        let round_1_result = Self::round1_from_lde(*air, lde_trace, metadata);
 
                         if let Some(ref bpi) = round_1_result.bus_public_inputs {
                             table_transcript.append_field_element(&bpi.table_contribution);
