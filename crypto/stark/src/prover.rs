@@ -1645,8 +1645,14 @@ pub trait IsStarkProver<
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
         }
 
-        // Number of tables to process concurrently (Phase A/C commits and Rounds 2-4).
+        // Number of tables to process concurrently.
+        // disk-spill: cap Phase A/C concurrency to limit pool memory (each set
+        // can grow to max_main_cols × max_lde_size elements).
+        // Rounds 2-4 use full parallelism (no pools, reads from mmap).
         let k = table_parallelism().min(num_airs).max(1);
+        #[cfg(feature = "disk-spill")]
+        let k_commit = 8_usize.min(k);
+        #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
         // k_commit=1: pre-allocate pool to max_lde_size to avoid reallocation.
         // k_commit>1: start empty and grow on demand.
