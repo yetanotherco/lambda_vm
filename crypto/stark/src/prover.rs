@@ -1665,8 +1665,8 @@ pub trait IsStarkProver<
         let k_commit = 8_usize.min(k);
         #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
-        // k_commit=1: pre-allocate pool to max_lde_size to avoid reallocation.
-        // k_commit>1: start empty and grow on demand.
+        // k_commit=1: pre-allocate each column to max_lde_size to avoid reallocation.
+        // k_commit>1: start empty, grow on demand.
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
                 main: (0..max_main_cols)
@@ -1756,7 +1756,11 @@ pub trait IsStarkProver<
                     {
                         let mut main_tree = Arc::new(tree);
                         Arc::get_mut(&mut main_tree)
-                            .expect("sole Arc owner")
+                            .ok_or_else(|| {
+                                ProvingError::WrongParameter(
+                                    "disk-spill: not sole Arc owner".into(),
+                                )
+                            })?
                             .spill_nodes_to_disk()
                             .map_err(|e| {
                                 ProvingError::WrongParameter(format!(
@@ -1768,7 +1772,11 @@ pub trait IsStarkProver<
                             .map(|t| {
                                 let mut arc = Arc::new(t);
                                 Arc::get_mut(&mut arc)
-                                    .expect("sole Arc owner")
+                                    .ok_or_else(|| {
+                                        ProvingError::WrongParameter(
+                                            "disk-spill: not sole Arc owner".into(),
+                                        )
+                                    })?
                                     .spill_nodes_to_disk()
                                     .map_err(|e| {
                                         ProvingError::WrongParameter(format!(
@@ -1946,7 +1954,11 @@ pub trait IsStarkProver<
                         let mut aux_tree = Arc::new(tree);
                         #[cfg(feature = "disk-spill")]
                         Arc::get_mut(&mut aux_tree)
-                            .expect("sole Arc owner")
+                            .ok_or_else(|| {
+                                ProvingError::WrongParameter(
+                                    "disk-spill: not sole Arc owner".into(),
+                                )
+                            })?
                             .spill_nodes_to_disk()
                             .map_err(|e| {
                                 ProvingError::WrongParameter(format!(
