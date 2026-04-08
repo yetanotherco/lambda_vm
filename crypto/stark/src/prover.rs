@@ -246,6 +246,42 @@ fn shard_parallelism() -> usize {
     }
 }
 
+/// Partition tables into `num_partitions` groups using greedy LPT scheduling.
+/// Each table's cost is estimated as `rows * (main_cols + aux_cols)`.
+/// Returns `Vec<Vec<usize>>` — each inner Vec is a list of original table indices.
+fn partition_tables_by_cost<Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync, FieldExtension: IsField + Send + Sync, PI>(
+    air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
+    num_partitions: usize,
+) -> Vec<Vec<usize>> {
+    let num_airs = air_trace_pairs.len();
+    let costs: Vec<usize> = air_trace_pairs
+        .iter()
+        .map(|(air, trace, _)| {
+            trace.num_rows() * (trace.num_main_columns + air.num_auxiliary_rap_columns())
+        })
+        .collect();
+
+    // Sort indices by cost descending (LPT heuristic)
+    let mut sorted_indices: Vec<usize> = (0..num_airs).collect();
+    sorted_indices.sort_by(|a, b| costs[*b].cmp(&costs[*a]));
+
+    // Greedy: assign each table to the least-loaded partition
+    let mut partitions: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    let mut loads = vec![0usize; num_partitions];
+
+    for idx in sorted_indices {
+        let min_partition = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, load)| **load)
+            .unwrap()
+            .0;
+        partitions[min_partition].push(idx);
+        loads[min_partition] += costs[idx];
+    }
+    partitions
+}
+
 /// A set of LDE column buffer pools for one concurrent table slot.
 struct PoolSet<F: IsField, E: IsField> {
     main: Vec<Vec<FieldElement<F>>>,
