@@ -471,8 +471,7 @@ where
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes)?;
         {
-            let mut writer =
-                std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
+            let mut writer = std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
             for col in columns {
                 // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.

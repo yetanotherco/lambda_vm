@@ -1918,13 +1918,13 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
                         if let Some(spilled) = spilled_opt {
-                            spilled.add_aux_from_pool(&pool.aux, num_aux_cols).map_err(
-                                |e| {
+                            spilled
+                                .add_aux_from_pool(&pool.aux, num_aux_cols)
+                                .map_err(|e| {
                                     ProvingError::WrongParameter(format!(
                                         "disk-spill aux LDE table {idx}: {e}"
                                     ))
-                                },
-                            )?;
+                                })?;
                         }
                     }
                     Ok(())

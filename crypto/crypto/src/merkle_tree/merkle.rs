@@ -295,8 +295,7 @@ where
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes as u64)?;
         {
-            let mut writer =
-                std::io::BufWriter::with_capacity(crate::SPILL_BUF_CAPACITY, &file);
+            let mut writer = std::io::BufWriter::with_capacity(crate::SPILL_BUF_CAPACITY, &file);
             // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
             // the contiguous Vec to a byte slice is valid.
             let bytes = unsafe {
