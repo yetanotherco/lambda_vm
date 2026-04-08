@@ -381,7 +381,7 @@ mod soundness_tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::constraints::transition::TransitionConstraint;
     use stark::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, LinearTerm, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
     };
     use stark::proof::options::ProofOptions;
@@ -421,7 +421,7 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::AndByte,
+                BusId::BitwiseByte,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
                     BusValue::Packed {
@@ -436,6 +436,7 @@ mod soundness_tests {
                         start_column: sender_cols::AND_RESULT,
                         packing: Packing::Direct,
                     },
+                    BusValue::Linear(vec![LinearTerm::Constant(0)]),
                 ],
             )],
         };
@@ -472,7 +473,7 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::AndByte,
+                BusId::BitwiseByte,
                 Multiplicity::Column(receiver_cols::MU_AND),
                 vec![
                     BusValue::Packed {
@@ -487,6 +488,7 @@ mod soundness_tests {
                         start_column: receiver_cols::AND,
                         packing: Packing::Direct,
                     },
+                    BusValue::Linear(vec![LinearTerm::Constant(0)]),
                 ],
             )],
         };

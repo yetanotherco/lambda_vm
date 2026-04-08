@@ -11,7 +11,7 @@ use math::field::element::FieldElement;
 
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, LinearTerm, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
 };
 use stark::proof::options::ProofOptions;
@@ -59,7 +59,7 @@ fn new_sender_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
-            BusId::AndByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(sender_cols::AND),
             vec![
                 BusValue::Packed {
@@ -74,6 +74,7 @@ fn new_sender_air(
                     start_column: sender_cols::AND_RESULT,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(0)]),
             ],
         )],
     };
@@ -94,7 +95,7 @@ fn new_receiver_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            BusId::AndByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(receiver_cols::MU_AND),
             vec![
                 BusValue::Packed {
@@ -109,6 +110,7 @@ fn new_receiver_air(
                     start_column: receiver_cols::AND,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(0)]),
             ],
         )],
     };
