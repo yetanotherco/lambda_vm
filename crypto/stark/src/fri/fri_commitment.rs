@@ -36,9 +36,4 @@ where
             domain_size,
         }
     }
-
-    #[inline]
-    pub fn get_evaluation(&self, index: usize) -> &FieldElement<F> {
-        &self.evaluation[index]
-    }
 }
