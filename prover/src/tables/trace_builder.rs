@@ -970,27 +970,34 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 /// Collects bitwise lookups from MEMW_A operations.
 ///
 /// Per operation:
-/// - 1 AND_BYTE for alignment check (low[0] & mask == 0)
+/// - 1 IS_HALF for alignment check: IS_HALF[base_address[0] + mask]
 ///
-/// IS_HALFWORD[base_address_mid] and IS_BYTE[base_address_low[1]] are
-/// assumptions (MEMW_A-A2, MEMW_A-A3.i) — the caller's (CPU's) responsibility.
+/// IS_HALF[base_address[i]] for i ∈ [0, 1] and IS_WORD[base_address[2]] are
+/// assumptions — the caller's (CPU's) responsibility.
 fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
-        let low_0 = (op.base_address & 0xFF) as u8;
-        let mask: u8 = match op.width {
+        let low_half = (op.base_address & 0xFFFF) as u32;
+        let mask: u32 = match op.width {
             2 => 1,
             4 => 3,
             8 => 7,
             _ => 0,
         };
 
-        // AND_BYTE[low_0, mask] → expects result 0
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
-            low_0,
-            mask,
+        // IS_HALF[base_address[0] + mask]
+        let value = low_half + mask;
+        debug_assert!(
+            value <= 0xFFFF,
+            "misaligned: base_address[0] + mask overflows halfword"
+        );
+        let x = (value & 0xFF) as u8;
+        let y = ((value >> 8) & 0xFF) as u8;
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            x,
+            y,
         ));
     }
 
