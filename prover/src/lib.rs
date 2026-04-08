@@ -500,9 +500,6 @@ pub fn prove_with_options(
 
     drop(result);
 
-    // disk-spill: main traces are spilled to disk inside multi_prove
-    // (parallel, before pool allocation) rather than here.
-
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
 
