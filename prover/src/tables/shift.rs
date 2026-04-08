@@ -391,9 +391,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
+    // SHIFT-C1: BITWISE_BYTE[shift, 15, bit_shift, op_type=0(AND)] → bit_shift | left (= μ - direction)
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::BitwiseByte,
         Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
             BusValue::Packed {
@@ -405,16 +405,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BIT_SHIFT,
                 packing: Packing::Direct,
             },
+            BusValue::Linear(vec![LinearTerm::Constant(0)]),
         ],
     ));
 
-    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
+    // SHIFT-C2: BITWISE_BYTE[256 - zbs * 16 - shift, 15, bit_shift, op_type=0(AND)] → bit_shift | right (= direction)
     // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
     // [0,255].
     // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
     // 256 - 16 - shift ∈ [0,255].
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::BitwiseByte,
         Multiplicity::Column(cols::DIRECTION),
         vec![
             BusValue::linear(vec![
@@ -433,6 +434,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BIT_SHIFT,
                 packing: Packing::Direct,
             },
+            BusValue::Linear(vec![LinearTerm::Constant(0)]),
         ],
     ));
 
@@ -514,11 +516,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
+    // SHIFT-C11: BITWISE_BYTE[encoded_limb; shift, mask, op_type=0(AND)] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
     // mask = 48 - 32 * word_instr
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::BitwiseByte,
         Multiplicity::Column(cols::MU),
         vec![
             // first input: shift
@@ -553,6 +555,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::LIMB_SHIFT_RAW_2,
                 },
             ]),
+            // op_type = 0 (AND)
+            BusValue::Linear(vec![LinearTerm::Constant(0)]),
         ],
     ));
 
