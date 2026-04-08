@@ -1638,11 +1638,22 @@ pub trait IsStarkProver<
         // This frees the heap-allocated trace data, making room for the LDE pool
         // buffers which are much larger (blowup_factor × trace size).
         #[cfg(feature = "disk-spill")]
-        for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace
-                .main_table
-                .spill_to_disk()
-                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
+        {
+            #[cfg(feature = "parallel")]
+            let spill_iter = air_trace_pairs.par_iter_mut();
+            #[cfg(not(feature = "parallel"))]
+            let spill_iter = air_trace_pairs.iter_mut();
+
+            let spill_results: Vec<Result<(), ProvingError>> = spill_iter
+                .map(|(_, trace, _)| {
+                    trace.main_table.spill_to_disk().map_err(|e| {
+                        ProvingError::WrongParameter(format!("disk-spill early main: {e}"))
+                    })
+                })
+                .collect();
+            for result in spill_results {
+                result?;
+            }
         }
 
         // Number of tables to process concurrently.
@@ -1866,6 +1877,15 @@ pub trait IsStarkProver<
         // Each table gets its own transcript fork and pool set.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+
+        // Free main pool buffers — Phase C only uses aux pools.
+        // This reclaims main LDE capacity so aux pools have more headroom.
+        #[cfg(feature = "disk-spill")]
+        for pool in &mut pool_sets {
+            for v in &mut pool.main {
+                *v = Vec::new();
+            }
+        }
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
