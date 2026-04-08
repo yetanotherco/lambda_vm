@@ -145,12 +145,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
 
     // -------------------------------------------------------------------------
-    // AND_BYTE[base_address_low[0], mask] → 0 with μ_sum
+    // BITWISE_BYTE[base_address_low[0], mask, 0, op_type=0(AND)] with μ_sum
     // mask = write2*1 + write4*3 + write8*7
     // This implicitly range-checks low[0] to [0, 256) AND checks alignment.
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::BitwiseByte,
         mu_sum.clone(),
         vec![
             // x = base_address_low[0]
@@ -175,6 +175,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ]),
             // result = 0 (alignment constraint: low bits must be 0)
             BusValue::constant(0),
+            // op_type = 0 (AND)
+            BusValue::Linear(vec![LinearTerm::Constant(0)]),
         ],
     ));
 
