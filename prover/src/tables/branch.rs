@@ -245,10 +245,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]
+        // BITWISE_BYTE[unmasked_low_byte, 254, next_pc_low[0], op_type=0(AND)]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         BusInteraction::sender(
-            BusId::AndByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
@@ -260,6 +260,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::NEXT_PC_LOW_0,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(0)]),
             ],
         ),
         // IS_HALFWORD[next_pc_high[0]]
