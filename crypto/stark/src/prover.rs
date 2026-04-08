@@ -244,25 +244,6 @@ where
     pub(crate) composition_poly_root: Commitment,
 }
 
-impl<F> Round2<F>
-where
-    F: IsField,
-    FieldElement<F>: AsBytes,
-{
-    pub fn num_composition_parts(&self) -> usize {
-        self.lde_composition_poly_evaluations.len()
-    }
-
-    #[inline]
-    pub fn get_composition_eval(&self, part: usize, index: usize) -> &FieldElement<F> {
-        &self.lde_composition_poly_evaluations[part][index]
-    }
-
-    pub fn composition_eval_len(&self, part: usize) -> usize {
-        self.lde_composition_poly_evaluations[part].len()
-    }
-}
-
 /// A container for the results of the third round of the STARK Prove protocol.
 pub struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main ans auxiliary, at the out-of-domain challenge.
@@ -990,7 +971,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -1071,7 +1052,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.num_composition_parts();
+        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
 
@@ -1211,7 +1192,7 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -1272,7 +1253,7 @@ pub trait IsStarkProver<
             // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
-                let h_j_val = round_2_result.get_composition_eval(j, row_idx);
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
@@ -1318,17 +1299,13 @@ pub trait IsStarkProver<
             .get_proof_by_pos(index)
             .unwrap();
 
-        let num_parts = round_2_result.num_composition_parts();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let lde_composition_poly_parts_evaluation: Vec<_> = (0..num_parts)
             .flat_map(|j| {
-                let part_len = round_2_result.composition_eval_len(j) as u64;
+                let part = &round_2_result.lde_composition_poly_evaluations[j];
                 vec![
-                    round_2_result
-                        .get_composition_eval(j, reverse_index(index * 2, part_len))
-                        .clone(),
-                    round_2_result
-                        .get_composition_eval(j, reverse_index(index * 2 + 1, part_len))
-                        .clone(),
+                    part[reverse_index(index * 2, part.len() as u64)].clone(),
+                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
                 ]
             })
             .collect();
