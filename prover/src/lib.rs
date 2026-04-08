@@ -500,10 +500,8 @@ pub fn prove_with_options(
 
     drop(result);
 
-    #[cfg(feature = "disk-spill")]
-    traces
-        .spill_all_main_to_disk()
-        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    // disk-spill: main traces are spilled to disk inside multi_prove
+    // (parallel, before pool allocation) rather than here.
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
