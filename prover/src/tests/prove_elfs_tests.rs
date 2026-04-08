@@ -1876,9 +1876,13 @@ fn test_verify_rejects_inflated_table_counts() {
 #[ignore = "Requires ~64GB RAM: proves an empty Ethereum block (11M instructions)"]
 fn test_prove_ethrex_empty_block() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let elf_bytes = std::fs::read("../executor/program_artifacts/rust/ethrex.elf")
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("Failed to get workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
         .expect("Failed to read ethrex ELF");
-    let input = std::fs::read("../executor/tests/ethrex_empty_block.bin")
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin"))
         .expect("Failed to read empty block fixture");
     let vm_proof = crate::prove_with_input(&elf_bytes, input).expect("Proving failed");
     assert!(
