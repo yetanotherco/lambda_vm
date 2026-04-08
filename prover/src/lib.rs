@@ -511,6 +511,13 @@ pub fn prove_with_options(
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
+    drop(result);
+
+    #[cfg(feature = "disk-spill")]
+    traces
+        .spill_all_main_to_disk()
+        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
 

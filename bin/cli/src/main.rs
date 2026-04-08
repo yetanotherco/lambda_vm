@@ -262,6 +262,10 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
 
+    if cfg!(feature = "disk-spill") {
+        eprintln!("Disk-spill: enabled");
+    }
+
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
