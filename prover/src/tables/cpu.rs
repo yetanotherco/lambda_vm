@@ -42,7 +42,7 @@
 //! - STORE ADD: for STORE (res = arg1 + imm, separate from main ADD)
 //! - SUB: for SUB, BEQ operations
 //! - LT: for SLT, BLT operations
-//! - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
+//! - BITWISE_BYTE: for bitwise operations (×8, merged AND/OR/XOR with op_type discriminant)
 //! - SHIFT: for shift operations
 //! - MUL: for multiplication
 //! - DIVREM: for division/remainder
@@ -941,7 +941,7 @@ fn linear_term(bit: u32, column: usize) -> LinearTerm {
 ///
 /// The CPU table sends to:
 /// - DECODE: instruction fetch (every row)
-/// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
+/// - BITWISE_BYTE: for bitwise operations (×8, merged AND/OR/XOR with op_type discriminant)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -1024,12 +1024,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // BITWISE_BYTE interactions (×8, merged AND/OR/XOR)
     // -------------------------------------------------------------------------
+    // AND, OR, XOR are mutually exclusive per CPU cycle (enforced by DECODE).
+    // Merged into a single bus with op_type discriminant:
+    //   op_type = 0*AND + 1*OR + 2*XOR
+    //   multiplicity = AND + OR + XOR (at most 1)
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
-            BusId::AndByte,
-            Multiplicity::Column(cols::AND),
+            BusId::BitwiseByte,
+            Multiplicity::Sum3(cols::AND, cols::OR, cols::XOR),
             vec![
                 BusValue::Packed {
                     start_column: cols::ARG1[i],
@@ -1043,54 +1047,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::RES[i],
                     packing: Packing::Direct,
                 },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::OrByte,
-            Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
+                BusValue::Linear(vec![
+                    LinearTerm::Column { coefficient: 1, column: cols::OR },
+                    LinearTerm::Column { coefficient: 2, column: cols::XOR },
+                ]),
             ],
         ));
     }
