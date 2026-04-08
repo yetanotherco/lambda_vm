@@ -249,6 +249,7 @@ fn shard_parallelism() -> usize {
 /// Partition tables into `num_partitions` groups using greedy LPT scheduling.
 /// Each table's cost is estimated as `rows * (main_cols + aux_cols)`.
 /// Returns `Vec<Vec<usize>>` — each inner Vec is a list of original table indices.
+#[cfg(feature = "parallel")]
 fn partition_tables_by_cost<Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync, FieldExtension: IsField + Send + Sync, PI>(
     air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
     num_partitions: usize,
@@ -287,6 +288,31 @@ struct PoolSet<F: IsField, E: IsField> {
     main: Vec<Vec<FieldElement<F>>>,
     aux: Vec<Vec<FieldElement<E>>>,
 }
+
+/// Wrapper for raw pointers that is `Send + Sync`.
+///
+/// Used for disjoint mutable access to elements of a `Vec` from multiple threads,
+/// where each thread accesses a distinct index (guaranteed by partition logic).
+#[cfg(feature = "parallel")]
+struct SendPtr<T> {
+    ptr: *mut T,
+}
+#[cfg(feature = "parallel")]
+impl<T> SendPtr<T> {
+    /// Get a mutable reference to the element at `idx`.
+    ///
+    /// # Safety
+    /// The caller must ensure no other thread accesses the same index concurrently.
+    unsafe fn get_mut(&self, idx: usize) -> &mut T {
+        unsafe { &mut *self.ptr.add(idx) }
+    }
+}
+// SAFETY: The caller guarantees disjoint access — no two threads dereference the
+// same index. The raw pointer itself is just an address; sending it is safe.
+#[cfg(feature = "parallel")]
+unsafe impl<T> Send for SendPtr<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T> Sync for SendPtr<T> {}
 
 /// A container for the results of the second round of the STARK Prove protocol.
 pub struct Round2<F>
@@ -1827,11 +1853,17 @@ pub trait IsStarkProver<
             );
         }
 
+        // Phase A/C pool buffers no longer needed — Rounds 2-4 allocates its own.
+        drop(pool_sets);
+
         // =====================================================================
-        // Rounds 2-4: Parallel per-table proving in chunks of K
+        // Rounds 2-4: Isolated-pool parallel proving
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Each worker gets its
-        // own pool set and transcript fork. Pool sets are reused across chunks.
+        // Partition tables into S groups. Each group runs on an isolated Rayon
+        // ThreadPool with cores/S threads, eliminating cross-table contention.
+        // Pool buffers are reused sequentially within each partition.
+        // Output order is deterministic: proofs are sorted by original table
+        // index after collection, matching the verifier's expected AIR order.
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
@@ -1843,105 +1875,249 @@ pub trait IsStarkProver<
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
-        let mut proofs = Vec::with_capacity(num_airs);
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
-            let chunk_size = chunk_end - chunk_start;
+        let s = shard_parallelism().min(num_airs).max(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let threads_per_pool = (cores / s).max(1);
 
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+        #[cfg(feature = "parallel")]
+        let partitions = partition_tables_by_cost(&air_trace_pairs, s);
 
-            #[cfg(feature = "parallel")]
-            let iter = pool_sets[..chunk_size]
-                .par_iter_mut()
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = pool_sets[..chunk_size]
-                .iter_mut()
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
+        info!(
+            "Rounds 2-4: {} tables across {} partitions ({} threads/pool)",
+            num_airs, s, threads_per_pool
+        );
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, (pool, table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let metadata = &metadatas[idx];
-                    let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+        // Allocate S pool sets (one per partition) for Rounds 2-4.
+        let mut r24_pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..s)
+            .map(|_| PoolSet {
+                main: (0..max_main_cols)
+                    .map(|_| Vec::with_capacity(max_lde_size))
+                    .collect(),
+                aux: (0..max_aux_cols)
+                    .map(|_| Vec::with_capacity(max_lde_size))
+                    .collect(),
+            })
+            .collect();
 
-                    #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
+        #[cfg(feature = "parallel")]
+        let proofs = {
+            // Raw pointer for disjoint mutable access to transcript elements.
+            // SAFETY: partition_tables_by_cost guarantees each table index appears
+            // in exactly one partition, so no two threads access the same element.
+            let transcripts_ptr = SendPtr { ptr: table_transcripts.as_mut_ptr() };
 
-                    #[cfg(feature = "instruments")]
-                    let lde_start = Instant::now();
-                    let round_1_result = Self::reconstruct_round1(
-                        *air,
-                        *trace,
-                        domain,
-                        metadata,
-                        twiddles,
-                        &mut pool.main,
-                        &mut pool.aux,
-                    )?;
-                    #[cfg(feature = "instruments")]
-                    let lde_dur = lde_start.elapsed();
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &round_1_result,
-                        table_transcript,
-                        domain,
-                    )?;
-
-                    // Collect per-table sub-op timing via TLS.
-                    // Both the store (inside prove_rounds_2_to_4) and this take run on the
-                    // same rayon worker thread, so sub-ops are valid in both sequential and
-                    // parallel mode.
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let mut sub_ops =
-                            crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        sub_ops.trace_lde += lde_dur;
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    // Return column Vecs to pool (zero-copy move back)
-                    let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
-                    for (slot, col) in pool.main.iter_mut().zip(main_cols) {
-                        *slot = col;
-                    }
-                    for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
-                        *slot = col;
-                    }
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
+            // Create S isolated Rayon thread pools
+            let pools: Vec<rayon::ThreadPool> = (0..s)
+                .map(|_| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads_per_pool)
+                        .build()
+                        .expect("failed to create isolated Rayon thread pool")
                 })
                 .collect();
 
-            for result in chunk_results {
+            let partition_results: Vec<Vec<_>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = partitions
+                        .into_iter()
+                        .zip(r24_pool_sets.iter_mut())
+                        .zip(pools.iter())
+                        .map(|((partition, pool_set), pool)| {
+                            let air_trace_pairs = &air_trace_pairs;
+                            let metadatas = &metadatas;
+                            let domains = &domains;
+                            let twiddle_caches = &twiddle_caches;
+                            let t_ptr = SendPtr { ptr: transcripts_ptr.ptr };
+
+                            scope.spawn(move || {
+                                pool.install(|| {
+                                    let mut results = Vec::with_capacity(partition.len());
+                                    for &idx in &partition {
+                                        let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                                        let metadata = &metadatas[idx];
+                                        let domain = &domains[idx];
+                                        let twiddles = &twiddle_caches[idx];
+
+                                        #[cfg(feature = "instruments")]
+                                        let table_start = Instant::now();
+                                        #[cfg(feature = "instruments")]
+                                        let lde_start = Instant::now();
+
+                                        let round_1_result = match Self::reconstruct_round1(
+                                            *air,
+                                            *trace,
+                                            domain,
+                                            metadata,
+                                            twiddles,
+                                            &mut pool_set.main,
+                                            &mut pool_set.aux,
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                results.push(Err(e));
+                                                continue;
+                                            }
+                                        };
+
+                                        #[cfg(feature = "instruments")]
+                                        let lde_dur = lde_start.elapsed();
+
+                                        // SAFETY: partitions have disjoint indices
+                                        let table_transcript = unsafe {
+                                            t_ptr.get_mut(idx)
+                                        };
+
+                                        if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                                            table_transcript
+                                                .append_field_element(&bpi.table_contribution);
+                                        }
+
+                                        let proof = match Self::prove_rounds_2_to_4(
+                                            *air,
+                                            *pub_inputs,
+                                            &round_1_result,
+                                            table_transcript,
+                                            domain,
+                                        ) {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                results.push(Err(e));
+                                                continue;
+                                            }
+                                        };
+
+                                        #[cfg(feature = "instruments")]
+                                        let timing = {
+                                            let mut sub_ops = crate::instruments::take_round_sub_ops()
+                                                .unwrap_or_default();
+                                            sub_ops.trace_lde += lde_dur;
+                                            (
+                                                idx,
+                                                air.name().to_string(),
+                                                trace.num_rows(),
+                                                table_start.elapsed(),
+                                                sub_ops,
+                                            )
+                                        };
+
+                                        // Return column Vecs to pool
+                                        let (main_cols, aux_cols) =
+                                            round_1_result.lde_trace.into_columns();
+                                        for (slot, col) in pool_set.main.iter_mut().zip(main_cols) {
+                                            *slot = col;
+                                        }
+                                        for (slot, col) in pool_set.aux.iter_mut().zip(aux_cols) {
+                                            *slot = col;
+                                        }
+
+                                        #[cfg(feature = "instruments")]
+                                        results.push(Ok((idx, proof, timing)));
+                                        #[cfg(not(feature = "instruments"))]
+                                        results.push(Ok((idx, proof)));
+                                    }
+                                    results
+                                })
+                            })
+                        })
+                        .collect();
+
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            // Flatten and sort by original table index (deterministic output order)
+            let mut indexed_proofs: Vec<(usize, StarkProof<Field, FieldExtension, PI>)> =
+                Vec::with_capacity(num_airs);
+
+            #[cfg(feature = "instruments")]
+            let mut indexed_timings: Vec<(
+                usize,
+                (String, usize, std::time::Duration, crate::instruments::TableSubOps),
+            )> = Vec::with_capacity(num_airs);
+
+            for partition_result in partition_results {
+                for result in partition_result {
+                    #[cfg(feature = "instruments")]
+                    {
+                        let (idx, proof, timing) = result?;
+                        indexed_proofs.push((idx, proof));
+                        indexed_timings.push((timing.0, (timing.1, timing.2, timing.3, timing.4)));
+                    }
+                    #[cfg(not(feature = "instruments"))]
+                    {
+                        let (idx, proof) = result?;
+                        indexed_proofs.push((idx, proof));
+                    }
+                }
+            }
+
+            indexed_proofs.sort_by_key(|(idx, _)| *idx);
+            #[cfg(feature = "instruments")]
+            {
+                indexed_timings.sort_by_key(|(idx, _)| *idx);
+                table_timings.extend(indexed_timings.into_iter().map(|(_, t)| t));
+            }
+            indexed_proofs.into_iter().map(|(_, p)| p).collect::<Vec<_>>()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let proofs = {
+            let mut proofs = Vec::with_capacity(num_airs);
+
+            for idx in 0..num_airs {
+                let pool_set = &mut r24_pool_sets[0];
+                let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                let metadata = &metadatas[idx];
+                let domain = &domains[idx];
+                let twiddles = &twiddle_caches[idx];
+
+                #[cfg(feature = "instruments")]
+                let table_start = Instant::now();
+                #[cfg(feature = "instruments")]
+                let lde_start = Instant::now();
+
+                let round_1_result = Self::reconstruct_round1(
+                    *air, *trace, domain, metadata, twiddles,
+                    &mut pool_set.main, &mut pool_set.aux,
+                )?;
+
+                #[cfg(feature = "instruments")]
+                let lde_dur = lde_start.elapsed();
+
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    table_transcripts[idx].append_field_element(&bpi.table_contribution);
+                }
+
+                let proof = Self::prove_rounds_2_to_4(
+                    *air, *pub_inputs, &round_1_result,
+                    &mut table_transcripts[idx], domain,
+                )?;
+
                 #[cfg(feature = "instruments")]
                 {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
-                    table_timings.push(timing);
+                    let mut sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    sub_ops.trace_lde += lde_dur;
+                    table_timings.push((
+                        air.name().to_string(),
+                        trace.num_rows(),
+                        table_start.elapsed(),
+                        sub_ops,
+                    ));
                 }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
+
+                let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+                for (slot, col) in pool_set.main.iter_mut().zip(main_cols) {
+                    *slot = col;
+                }
+                for (slot, col) in pool_set.aux.iter_mut().zip(aux_cols) {
+                    *slot = col;
+                }
+
+                proofs.push(proof);
             }
-        }
+            proofs
+        };
 
         #[cfg(feature = "instruments")]
         {
