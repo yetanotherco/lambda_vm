@@ -310,7 +310,7 @@ where
             let file = tempfile::tempfile()?;
             file.set_len(total_bytes as u64)?;
             {
-                let mut writer = std::io::BufWriter::new(&file);
+                let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
                 // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
                 // can be viewed as a contiguous byte slice.
                 let bytes =
@@ -737,7 +737,7 @@ pub trait IsStarkProver<
         })?;
 
         {
-            let mut writer = std::io::BufWriter::new(&file);
+            let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
             for col_start in (0..num_cols).step_by(chunk_size) {
                 let col_end = (col_start + chunk_size).min(num_cols);
                 let chunk_len = col_end - col_start;
@@ -854,7 +854,7 @@ pub trait IsStarkProver<
         })?;
 
         {
-            let mut writer = std::io::BufWriter::new(&file);
+            let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
             for col_start in (0..num_cols).step_by(chunk_size) {
                 let col_end = (col_start + chunk_size).min(num_cols);
                 let chunk_len = col_end - col_start;
@@ -1952,31 +1952,36 @@ pub trait IsStarkProver<
         }
 
         // Number of tables to process concurrently.
-        // disk-spill: k=1 everywhere — each table's internal parallelism
-        // (par_iter on rows, FFT, Merkle) saturates all cores for large programs,
-        // and k=1 avoids the peak memory spike from overlapping round 2-4 allocations.
+        // disk-spill: defaults to 1 (safe for large programs), configurable via
+        // TABLE_PARALLELISM (rounds 2-4) and COMMIT_PARALLELISM (commit phases).
         // Non-disk-spill: full parallelism across tables.
         #[cfg(feature = "disk-spill")]
-        let k = 1_usize;
+        let k: usize = std::env::var("TABLE_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
         #[cfg(not(feature = "disk-spill"))]
         let k = table_parallelism().min(num_airs).max(1);
+        #[cfg(feature = "disk-spill")]
+        let k_commit: usize = std::env::var("COMMIT_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        #[cfg(not(feature = "disk-spill"))]
         let k_commit = k;
-        // With k_commit=1 (disk-spill), pre-allocate to max_lde_size so
-        // coset_lde_full_expand can resize in-place without reallocation spikes.
-        // Chunked LDE: only allocate chunk_size main buffers instead of max_main_cols.
-        // With k_commit>1 (no disk-spill), start empty and grow on demand.
         #[cfg(feature = "disk-spill")]
         let lde_chunk_size: usize = std::env::var("LDE_CHUNK_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
+        // disk-spill: chunked LDE only needs lde_chunk_size pool buffers per table.
+        // Pre-allocate to max_lde_size when k_commit=1 (single pool set reused
+        // across all tables). With k_commit>1, grow on demand to avoid allocating
+        // k_commit * max_lde_size upfront.
+        #[cfg(feature = "disk-spill")]
+        let pool_main_cols = lde_chunk_size.min(max_main_cols);
         #[cfg(not(feature = "disk-spill"))]
-        let lde_chunk_size: usize = max_main_cols;
-        let pool_main_cols = if k_commit == 1 {
-            lde_chunk_size.min(max_main_cols)
-        } else {
-            max_main_cols
-        };
+        let pool_main_cols = max_main_cols;
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k_commit)
             .map(|_| PoolSet {
                 main: (0..pool_main_cols)
@@ -2037,7 +2042,7 @@ pub trait IsStarkProver<
                     // chunk_size buffers instead of all columns.
                     #[cfg(feature = "disk-spill")]
                     {
-                        let (tree, root, pre_tree, pre_root, n_pre, spilled) =
+                        let (mut tree, root, mut pre_tree, pre_root, n_pre, spilled) =
                             if air.is_preprocessed() {
                                 Self::commit_preprocessed_trace_chunked(
                                     *trace,
@@ -2057,6 +2062,18 @@ pub trait IsStarkProver<
                                     lde_chunk_size,
                                 )?
                             };
+                        tree.spill_nodes_to_disk().map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "disk-spill main Merkle tree: {e}"
+                            ))
+                        })?;
+                        if let Some(ref mut pt) = pre_tree {
+                            pt.spill_nodes_to_disk().map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill precomputed Merkle tree: {e}"
+                                ))
+                            })?;
+                        }
                         Ok((tree, root, pre_tree, pre_root, n_pre, spilled))
                     }
 
@@ -2080,7 +2097,7 @@ pub trait IsStarkProver<
                 .collect();
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
-            #[allow(unused_variables, unused_mut)]
+            #[allow(unused_variables)]
             for (j, result) in chunk_results.into_iter().enumerate() {
                 #[cfg(feature = "disk-spill")]
                 let (tree, root, pre_tree, pre_root, n_pre, spilled) = result?;
@@ -2098,36 +2115,8 @@ pub trait IsStarkProver<
                     spilled_ldes[idx] = Some(spilled);
                 }
 
-                #[allow(unused_mut)]
-                let mut main_tree = Arc::new(tree);
-                #[cfg(feature = "disk-spill")]
-                {
-                    Arc::get_mut(&mut main_tree)
-                        .expect("sole Arc owner")
-                        .spill_nodes_to_disk()
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!(
-                                "disk-spill main Merkle tree: {e}"
-                            ))
-                        })?;
-                }
-
-                let precomputed_tree = pre_tree.map(|t| {
-                    let mut arc = Arc::new(t);
-                    #[cfg(feature = "disk-spill")]
-                    {
-                        Arc::get_mut(&mut arc)
-                            .expect("sole Arc owner")
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill precomputed Merkle tree: {e}"
-                                ))
-                            })
-                            .unwrap();
-                    }
-                    arc
-                });
+                let main_tree = Arc::new(tree);
+                let precomputed_tree = pre_tree.map(Arc::new);
 
                 main_commits.push(MainCommitData {
                     main_tree,
@@ -2261,6 +2250,20 @@ pub trait IsStarkProver<
                                 .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                        #[cfg(feature = "disk-spill")]
+                        {
+                            let mut arc = Arc::new(tree);
+                            Arc::get_mut(&mut arc)
+                                .expect("sole Arc owner")
+                                .spill_nodes_to_disk()
+                                .map_err(|e| {
+                                    ProvingError::WrongParameter(format!(
+                                        "disk-spill aux Merkle tree: {e}"
+                                    ))
+                                })?;
+                            Ok((Some(arc), Some(root)))
+                        }
+                        #[cfg(not(feature = "disk-spill"))]
                         Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
                         Ok((None, None))
@@ -2269,44 +2272,50 @@ pub trait IsStarkProver<
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
-            #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                #[allow(unused_mut)]
-                let (mut aux_tree, aux_root) = result?;
+                let (aux_tree, aux_root) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-
-                // Spill aux LDE columns from pool and aux Merkle tree nodes to disk.
-                #[cfg(feature = "disk-spill")]
-                {
-                    let idx = chunk_start + j;
-                    let (air, trace, _) = &air_trace_pairs[idx];
-                    if air.has_aux_trace() {
-                        let num_aux_cols = trace.num_aux_columns;
-                        if let Some(ref mut spilled) = spilled_ldes[idx] {
-                            spilled
-                                .add_aux_from_pool(&pool_sets[j].aux, num_aux_cols)
-                                .map_err(|e| {
-                                    ProvingError::WrongParameter(format!(
-                                        "disk-spill aux LDE table {idx}: {e}"
-                                    ))
-                                })?;
-                        }
-                    }
-                    if let Some(ref mut tree_arc) = aux_tree {
-                        Arc::get_mut(tree_arc)
-                            .expect("sole Arc owner")
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill aux Merkle tree {idx}: {e}"
-                                ))
-                            })?;
-                    }
-                }
-
                 aux_results.push((aux_tree, aux_root));
+            }
+
+            // Parallel: spill aux LDE columns from pool to disk.
+            #[cfg(feature = "disk-spill")]
+            {
+                let spilled_chunk = &mut spilled_ldes[chunk_start..chunk_end];
+                let pool_chunk = &pool_sets[..chunk_size];
+                let air_chunk = &air_trace_pairs[chunk_start..chunk_end];
+                #[cfg(feature = "parallel")]
+                let iter = spilled_chunk
+                    .par_iter_mut()
+                    .zip(pool_chunk.par_iter())
+                    .zip(air_chunk.par_iter());
+                #[cfg(not(feature = "parallel"))]
+                let iter = spilled_chunk
+                    .iter_mut()
+                    .zip(pool_chunk.iter())
+                    .zip(air_chunk.iter());
+                let spill_results: Vec<Result<(), ProvingError>> = iter
+                    .map(|((spilled_opt, pool), (air, trace, _))| {
+                        if air.has_aux_trace() {
+                            let num_aux_cols = trace.num_aux_columns;
+                            if let Some(spilled) = spilled_opt {
+                                spilled.add_aux_from_pool(&pool.aux, num_aux_cols).map_err(
+                                    |e| {
+                                        ProvingError::WrongParameter(format!(
+                                            "disk-spill aux LDE: {e}"
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .collect();
+                for r in spill_results {
+                    r?;
+                }
             }
         }
 

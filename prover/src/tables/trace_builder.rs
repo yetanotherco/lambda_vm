@@ -1716,7 +1716,7 @@ impl<T> SpilledVecWriter<T> {
         let file = tempfile::tempfile()?;
         // Dup the fd so we can write via BufWriter and later mmap via the original fd.
         let file_for_mmap = file.try_clone()?;
-        let writer = std::io::BufWriter::new(file);
+        let writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, file);
         Ok(Self {
             writer,
             file_for_mmap,
