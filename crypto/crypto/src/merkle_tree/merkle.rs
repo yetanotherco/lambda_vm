@@ -295,6 +295,7 @@ where
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes as u64)?;
         {
+            // Override default 8 KB buffer to reduce write syscall overhead for large spills
             let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
             // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
             // the contiguous Vec to a byte slice is valid.

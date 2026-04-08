@@ -244,6 +244,7 @@ impl<F: IsField> Table<F> {
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes as u64)?;
         {
+            // Override default 8 KB buffer to reduce write syscall overhead for large spills
             let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The Vec has the same byte layout as a contiguous array.
