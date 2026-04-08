@@ -224,6 +224,28 @@ fn table_parallelism() -> usize {
     }
 }
 
+/// Number of isolated thread pools for Rounds 2-4 in `multi_prove`.
+/// Default: num_cores / 8 (each pool gets ~8 threads for effective intra-table parallelism).
+/// Override with `SHARD_PARALLELISM` env var.
+fn shard_parallelism() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        std::env::var("SHARD_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                (cores / 8).max(1)
+            })
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
+
 /// A set of LDE column buffer pools for one concurrent table slot.
 struct PoolSet<F: IsField, E: IsField> {
     main: Vec<Vec<FieldElement<F>>>,
