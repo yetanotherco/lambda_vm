@@ -1974,19 +1974,13 @@ pub trait IsStarkProver<
                                                 .append_field_element(&bpi.table_contribution);
                                         }
 
-                                        let proof = match Self::prove_rounds_2_to_4(
+                                        let proof_result = Self::prove_rounds_2_to_4(
                                             *air,
                                             *pub_inputs,
                                             &round_1_result,
                                             table_transcript,
                                             domain,
-                                        ) {
-                                            Ok(p) => p,
-                                            Err(e) => {
-                                                results.push(Err(e));
-                                                continue;
-                                            }
-                                        };
+                                        );
 
                                         #[cfg(feature = "instruments")]
                                         let timing = {
@@ -2002,7 +1996,8 @@ pub trait IsStarkProver<
                                             )
                                         };
 
-                                        // Return column Vecs to pool
+                                        // Always return column Vecs to pool, even on error,
+                                        // so subsequent tables in this partition get valid buffers.
                                         let (main_cols, aux_cols) =
                                             round_1_result.lde_trace.into_columns();
                                         for (slot, col) in pool_set.main.iter_mut().zip(main_cols) {
@@ -2011,6 +2006,14 @@ pub trait IsStarkProver<
                                         for (slot, col) in pool_set.aux.iter_mut().zip(aux_cols) {
                                             *slot = col;
                                         }
+
+                                        let proof = match proof_result {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                results.push(Err(e));
+                                                continue;
+                                            }
+                                        };
 
                                         #[cfg(feature = "instruments")]
                                         results.push(Ok((idx, proof, timing)));
