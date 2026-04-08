@@ -831,54 +831,101 @@ pub fn prove_sharded_with_options(
         register_state = new_reg;
     }
 
-    // Phase 3: Prove each segment (sequentially for now, parallel later)
-    let mut segment_proofs: Vec<SegmentProof> = Vec::with_capacity(num_segments);
+    // Phase 3: Prove each segment in parallel.
+    // Each segment is an independent STARK proof with its own transcript.
+    let segment_proofs: Vec<Result<SegmentProof, Error>> = {
+        // Collect all data needed per segment into a vec of tuples
+        let segment_data: Vec<_> = segment_traces
+            .into_iter()
+            .enumerate()
+            .map(|(seg_idx, traces)| {
+                let reg_commitment = segment_initial_reg_states[seg_idx].as_ref().map(|state| {
+                    register::preprocessed_commitment_from_state(
+                        proof_options,
+                        state,
+                        program.entry_point,
+                    )
+                });
+                let is_last = seg_idx == num_segments - 1;
+                (seg_idx, traces, reg_commitment, is_last)
+            })
+            .collect();
 
-    for (seg_idx, mut traces) in segment_traces.into_iter().enumerate() {
-        let table_counts = traces.table_counts();
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            segment_data
+                .into_par_iter()
+                .map(|(seg_idx, mut traces, reg_commitment, is_last)| {
+                    let table_counts = traces.table_counts();
+                    let airs = VmAirs::new_with_overrides(
+                        &program,
+                        proof_options,
+                        false,
+                        &traces.page_configs,
+                        &table_counts,
+                        reg_commitment,
+                        is_last,
+                        true,
+                    );
+                    let runtime_page_ranges = traces.runtime_page_ranges();
+                    let proof = Prover::multi_prove(
+                        airs.air_trace_pairs(&mut traces),
+                        &mut DefaultTranscript::<E>::new(&[]),
+                    )
+                    .map_err(|e| Error::Prover(format!("Segment {seg_idx}: {e:?}")))?;
+                    Ok(SegmentProof {
+                        proof,
+                        runtime_page_ranges,
+                        table_counts,
+                        public_output: segment_public_outputs[seg_idx].clone(),
+                        page_configs: traces.page_configs,
+                        register_commitment: reg_commitment,
+                        is_last_segment: is_last,
+                    })
+                })
+                .collect()
+        }
 
-        // For non-first segments, compute REGISTER preprocessed commitment from
-        // the segment's initial state (not ELF defaults).
-        let reg_commitment = segment_initial_reg_states[seg_idx].as_ref().map(|state| {
-            register::preprocessed_commitment_from_state(proof_options, state, program.entry_point)
-        });
+        #[cfg(not(feature = "parallel"))]
+        {
+            segment_data
+                .into_iter()
+                .map(|(seg_idx, mut traces, reg_commitment, is_last)| {
+                    let table_counts = traces.table_counts();
+                    let airs = VmAirs::new_with_overrides(
+                        &program,
+                        proof_options,
+                        false,
+                        &traces.page_configs,
+                        &table_counts,
+                        reg_commitment,
+                        is_last,
+                        true,
+                    );
+                    let runtime_page_ranges = traces.runtime_page_ranges();
+                    let proof = Prover::multi_prove(
+                        airs.air_trace_pairs(&mut traces),
+                        &mut DefaultTranscript::<E>::new(&[]),
+                    )
+                    .map_err(|e| Error::Prover(format!("Segment {seg_idx}: {e:?}")))?;
+                    Ok(SegmentProof {
+                        proof,
+                        runtime_page_ranges,
+                        table_counts,
+                        public_output: segment_public_outputs[seg_idx].clone(),
+                        page_configs: traces.page_configs,
+                        register_commitment: reg_commitment,
+                        is_last_segment: is_last,
+                    })
+                })
+                .collect()
+        }
+    };
 
-        let is_last = seg_idx == num_segments - 1;
-        let airs = VmAirs::new_with_overrides(
-            &program,
-            proof_options,
-            false,
-            &traces.page_configs,
-            &table_counts,
-            reg_commitment,
-            is_last, // include_halt: only for last segment
-            true,    // include_commit: always (handles empty ops with zero mults)
-        );
-
-        let runtime_page_ranges = traces.runtime_page_ranges();
-
-        let proof = Prover::multi_prove(
-            airs.air_trace_pairs(&mut traces),
-            &mut DefaultTranscript::<E>::new(&[]),
-        )
-        .map_err(|e| Error::Prover(format!("Segment {seg_idx}: {e:?}")))?;
-
-        segment_proofs.push(SegmentProof {
-            proof,
-            runtime_page_ranges,
-            table_counts,
-            public_output: segment_public_outputs[seg_idx].clone(),
-            page_configs: traces.page_configs,
-            register_commitment: segment_initial_reg_states[seg_idx].as_ref().map(|state| {
-                register::preprocessed_commitment_from_state(
-                    proof_options,
-                    state,
-                    program.entry_point,
-                )
-            }),
-            is_last_segment: is_last,
-        });
-    }
+    // Collect results, propagate errors
+    let segment_proofs: Vec<SegmentProof> =
+        segment_proofs.into_iter().collect::<Result<Vec<_>, _>>()?;
 
     let combined_output: Vec<u8> = segment_public_outputs.into_iter().flatten().collect();
 
