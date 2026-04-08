@@ -1875,7 +1875,7 @@ pub trait IsStarkProver<
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
-        let s = shard_parallelism().min(num_airs).max(1);
+        let s = shard_parallelism().min(num_airs / 2).max(1);
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
