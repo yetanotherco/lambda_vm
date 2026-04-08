@@ -648,6 +648,53 @@ pub trait IsStarkProver<
         ))
     }
 
+    /// Build a Round1 from a pre-built LDETraceTable and stored metadata.
+    /// Reuses Merkle trees from Phase A/C via Arc (pointer copy, no deep clone).
+    fn round1_from_lde(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: LDETraceTable<Field, FieldExtension>,
+        metadata: &Round1Metadata<Field, FieldExtension>,
+    ) -> Round1<Field, FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let main = Round1CommitmentData::<Field> {
+            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
+            lde_trace_merkle_root: metadata.main_merkle_root,
+            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
+            precomputed_merkle_root: metadata.precomputed_merkle_root,
+            num_precomputed_cols: metadata.num_precomputed_cols,
+        };
+
+        let aux = if air.has_aux_trace() {
+            Some(Round1CommitmentData::<FieldExtension> {
+                lde_trace_merkle_tree: Arc::clone(
+                    metadata
+                        .aux_merkle_tree
+                        .as_ref()
+                        .expect("aux tree must exist when has_trace_interaction"),
+                ),
+                lde_trace_merkle_root: metadata
+                    .aux_merkle_root
+                    .expect("aux root must exist when has_trace_interaction"),
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            })
+        } else {
+            None
+        };
+
+        Round1 {
+            lde_trace,
+            main,
+            aux,
+            rap_challenges: metadata.rap_challenges.clone(),
+            bus_public_inputs: metadata.bus_public_inputs.clone(),
+        }
+    }
+
     /// Reconstruct a full Round1 struct by recomputing LDE evaluations and using
     /// the stored Merkle trees from metadata. Uses pool buffers to avoid allocation.
     ///
@@ -671,38 +718,14 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
-        // Use stored Merkle trees from Phase A/C via Arc (pointer copy, no deep clone)
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-            lde_trace_merkle_root: metadata.main_merkle_root,
-            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
-            precomputed_merkle_root: metadata.precomputed_merkle_root,
-            num_precomputed_cols: metadata.num_precomputed_cols,
-        };
-
-        // Recompute aux LDE into pool buffers, use stored aux Merkle tree
-        let (aux, num_aux_cols) = if air.has_aux_trace() {
+        // Recompute aux LDE into pool buffers
+        let num_aux_cols = if air.has_aux_trace() {
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
-            // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
-            let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    metadata
-                        .aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_trace_interaction"),
-                ),
-                lde_trace_merkle_root: metadata
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_trace_interaction"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            };
-            (Some(aux_commitment), n_aux)
+            n_aux
         } else {
-            (None, 0)
+            0
         };
 
         // Take column Vecs from pool (zero-copy move) instead of cloning.
@@ -718,13 +741,7 @@ pub trait IsStarkProver<
         let lde_trace =
             LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), domain.blowup_factor);
 
-        Ok(Round1 {
-            lde_trace,
-            main,
-            aux,
-            rap_challenges: metadata.rap_challenges.clone(),
-            bus_public_inputs: metadata.bus_public_inputs.clone(),
-        })
+        Ok(Self::round1_from_lde(air, lde_trace, metadata))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
@@ -2064,43 +2081,8 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let table_start = Instant::now();
 
-                        let main = Round1CommitmentData::<Field> {
-                            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                            lde_trace_merkle_root: metadata.main_merkle_root,
-                            precomputed_merkle_tree: metadata
-                                .precomputed_merkle_tree
-                                .as_ref()
-                                .map(Arc::clone),
-                            precomputed_merkle_root: metadata.precomputed_merkle_root,
-                            num_precomputed_cols: metadata.num_precomputed_cols,
-                        };
-
-                        let aux = if air.has_aux_trace() {
-                            Some(Round1CommitmentData::<FieldExtension> {
-                                lde_trace_merkle_tree: Arc::clone(
-                                    metadata
-                                        .aux_merkle_tree
-                                        .as_ref()
-                                        .expect("aux tree must exist when has_aux_trace"),
-                                ),
-                                lde_trace_merkle_root: metadata
-                                    .aux_merkle_root
-                                    .expect("aux root must exist when has_aux_trace"),
-                                precomputed_merkle_tree: None,
-                                precomputed_merkle_root: None,
-                                num_precomputed_cols: 0,
-                            })
-                        } else {
-                            None
-                        };
-
-                        let round_1_result = Round1 {
-                            lde_trace,
-                            main,
-                            aux,
-                            rap_challenges: metadata.rap_challenges.clone(),
-                            bus_public_inputs: metadata.bus_public_inputs.clone(),
-                        };
+                        let round_1_result =
+                            Self::round1_from_lde(*air, lde_trace, metadata);
 
                         if let Some(ref bpi) = round_1_result.bus_public_inputs {
                             table_transcript.append_field_element(&bpi.table_contribution);
