@@ -242,21 +242,6 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
-    #[cfg(feature = "disk-spill")]
-    eval_mmaps: Option<Vec<Round2EvalMmap>>,
-}
-
-/// File-backed mmap storage for a single composition polynomial part's LDE evaluations.
-/// After `spill_evaluations_to_disk()`, elements are read from the mmap instead of
-/// the in-memory vector.
-#[cfg(feature = "disk-spill")]
-struct Round2EvalMmap {
-    mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing the mmap. Dropping it would close
-    /// the descriptor and invalidate the mmap.
-    _file: std::fs::File,
-    len: usize,
-    elem_size: usize,
 }
 
 impl<F> Round2<F>
@@ -265,73 +250,16 @@ where
     FieldElement<F>: AsBytes,
 {
     pub fn num_composition_parts(&self) -> usize {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            return mmaps.len();
-        }
         self.lde_composition_poly_evaluations.len()
     }
 
     #[inline]
     pub fn get_composition_eval(&self, part: usize, index: usize) -> &FieldElement<F> {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            let m = &mmaps[part];
-            let offset = index * m.elem_size;
-            // SAFETY: spill_evaluations_to_disk writes the evaluations as contiguous
-            // bytes to this mmap. FieldElement<F> is #[repr(transparent)].
-            return unsafe { &*(m.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
-        }
         &self.lde_composition_poly_evaluations[part][index]
     }
 
     pub fn composition_eval_len(&self, part: usize) -> usize {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref mmaps) = self.eval_mmaps {
-            return mmaps[part].len;
-        }
         self.lde_composition_poly_evaluations[part].len()
-    }
-
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_evaluations_to_disk(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
-
-        if self.lde_composition_poly_evaluations.is_empty() || self.eval_mmaps.is_some() {
-            return Ok(());
-        }
-
-        let elem_size = std::mem::size_of::<FieldElement<F>>();
-        let mut mmaps = Vec::with_capacity(self.lde_composition_poly_evaluations.len());
-
-        for part in self.lde_composition_poly_evaluations.drain(..) {
-            let total_bytes = part.len() * elem_size;
-            let file = tempfile::tempfile()?;
-            file.set_len(total_bytes as u64)?;
-            {
-                let mut writer = std::io::BufWriter::new(&file);
-                // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
-                // can be viewed as a contiguous byte slice.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(part.as_ptr() as *const u8, total_bytes) };
-                writer.write_all(bytes)?;
-                writer.flush()?;
-            }
-            // SAFETY: tempfile() creates an anonymous file with no filesystem path,
-            // so no other process can open or modify it.
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-            let len = part.len();
-            drop(part);
-            mmaps.push(Round2EvalMmap {
-                mmap,
-                _file: file,
-                len,
-                elem_size,
-            });
-        }
-
-        self.eval_mmaps = Some(mmaps);
-        Ok(())
     }
 }
 
@@ -1047,8 +975,6 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
-            #[cfg(feature = "disk-spill")]
-            eval_mmaps: None,
         })
     }
 
@@ -1795,10 +1721,10 @@ pub trait IsStarkProver<
                         })?;
                 }
 
-                let precomputed_tree = pre_tree.map(|t| {
-                    let mut arc = Arc::new(t);
-                    #[cfg(feature = "disk-spill")]
-                    {
+                let precomputed_tree = match pre_tree {
+                    Some(t) => {
+                        let mut arc = Arc::new(t);
+                        #[cfg(feature = "disk-spill")]
                         Arc::get_mut(&mut arc)
                             .expect("sole Arc owner")
                             .spill_nodes_to_disk()
@@ -1806,11 +1732,11 @@ pub trait IsStarkProver<
                                 ProvingError::WrongParameter(format!(
                                     "disk-spill precomputed Merkle tree: {e}"
                                 ))
-                            })
-                            .unwrap();
+                            })?;
+                        Some(arc)
                     }
-                    arc
-                });
+                    None => None,
+                };
 
                 main_commits.push(MainCommitData {
                     main_tree,
@@ -2081,8 +2007,7 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let table_start = Instant::now();
 
-                        let round_1_result =
-                            Self::round1_from_lde(*air, lde_trace, metadata);
+                        let round_1_result = Self::round1_from_lde(*air, lde_trace, metadata);
 
                         if let Some(ref bpi) = round_1_result.bus_public_inputs {
                             table_transcript.append_field_element(&bpi.table_contribution);
