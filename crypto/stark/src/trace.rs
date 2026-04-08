@@ -471,8 +471,8 @@ where
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes)?;
         {
-            // Override default 8 KB buffer to reduce write syscall overhead for large spills
-            let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
+            let mut writer =
+                std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
             for col in columns {
                 // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.

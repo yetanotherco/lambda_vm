@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # disk-spill creates many temp files for spilled traces/LDEs
-ulimit -n 65536 2>/dev/null || true
+ulimit -n 65536 2>/dev/null || echo "Warning: could not raise file descriptor limit"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

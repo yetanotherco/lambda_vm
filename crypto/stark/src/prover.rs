@@ -309,8 +309,8 @@ where
             let file = tempfile::tempfile()?;
             file.set_len(total_bytes as u64)?;
             {
-                // Override default 8 KB buffer to reduce write syscall overhead for large spills
-                let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &file);
+                let mut writer =
+                    std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
                 // SAFETY: FieldElement<F> is #[repr(transparent)], so the Vec
                 // can be viewed as a contiguous byte slice.
                 let bytes =
@@ -1645,16 +1645,11 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "parallel"))]
             let spill_iter = air_trace_pairs.iter_mut();
 
-            let spill_results: Vec<Result<(), ProvingError>> = spill_iter
-                .map(|(_, trace, _)| {
-                    trace.main_table.spill_to_disk().map_err(|e| {
-                        ProvingError::WrongParameter(format!("disk-spill early main: {e}"))
-                    })
+            spill_iter.try_for_each(|(_, trace, _)| {
+                trace.main_table.spill_to_disk().map_err(|e| {
+                    ProvingError::WrongParameter(format!("disk-spill early main: {e}"))
                 })
-                .collect();
-            for result in spill_results {
-                result?;
-            }
+            })?;
         }
 
         // Number of tables to process concurrently.
@@ -1998,28 +1993,23 @@ pub trait IsStarkProver<
                 #[cfg(not(feature = "parallel"))]
                 let spill_iter = spilled_chunk.iter_mut().zip(pool_chunk.iter()).enumerate();
 
-                let spill_results: Vec<Result<(), ProvingError>> = spill_iter
-                    .map(|(j, (spilled_opt, pool))| {
-                        let idx = chunk_start + j;
-                        let (air, trace, _) = &air_trace_pairs[idx];
-                        if air.has_aux_trace() {
-                            let num_aux_cols = trace.num_aux_columns;
-                            if let Some(spilled) = spilled_opt {
-                                spilled.add_aux_from_pool(&pool.aux, num_aux_cols).map_err(
-                                    |e| {
-                                        ProvingError::WrongParameter(format!(
-                                            "disk-spill aux LDE table {idx}: {e}"
-                                        ))
-                                    },
-                                )?;
-                            }
+                spill_iter.try_for_each(|(j, (spilled_opt, pool))| {
+                    let idx = chunk_start + j;
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    if air.has_aux_trace() {
+                        let num_aux_cols = trace.num_aux_columns;
+                        if let Some(spilled) = spilled_opt {
+                            spilled.add_aux_from_pool(&pool.aux, num_aux_cols).map_err(
+                                |e| {
+                                    ProvingError::WrongParameter(format!(
+                                        "disk-spill aux LDE table {idx}: {e}"
+                                    ))
+                                },
+                            )?;
                         }
-                        Ok(())
-                    })
-                    .collect();
-                for result in spill_results {
-                    result?;
-                }
+                    }
+                    Ok(())
+                })?;
             }
         }
 
