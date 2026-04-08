@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
@@ -546,9 +546,9 @@ impl BitwiseOperation {
 /// in the spec corresponds to receiving lookups from other tables).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // AND_BYTE[X, Y] -> AND
+        // BITWISE_BYTE[X, Y, AND, op_type=0] -> AND  (merged bus, op_type discriminant)
         BusInteraction::receiver(
-            BusId::AndByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(cols::MU_AND),
             vec![
                 BusValue::Packed {
@@ -563,11 +563,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::AND,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(0)]),
             ],
         ),
-        // OR_BYTE[X, Y] -> OR
+        // BITWISE_BYTE[X, Y, OR, op_type=1]
         BusInteraction::receiver(
-            BusId::OrByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(cols::MU_OR),
             vec![
                 BusValue::Packed {
@@ -582,11 +583,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::OR,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(1)]),
             ],
         ),
-        // XOR_BYTE[X, Y] -> XOR
+        // BITWISE_BYTE[X, Y, XOR, op_type=2]
         BusInteraction::receiver(
-            BusId::XorByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(cols::MU_XOR),
             vec![
                 BusValue::Packed {
@@ -601,6 +603,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::XOR,
                     packing: Packing::Direct,
                 },
+                BusValue::Linear(vec![LinearTerm::Constant(2)]),
             ],
         ),
         // MSB8[X] -> MSB8
