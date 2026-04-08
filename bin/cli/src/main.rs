@@ -128,6 +128,11 @@ enum Commands {
         #[arg(long)]
         blowup: Option<u8>,
 
+        /// Segment size for sharded proving (number of instructions per segment).
+        /// If set, splits execution into segments and proves each independently.
+        #[arg(long)]
+        segment_size: Option<usize>,
+
         /// Print timing breakdown
         #[arg(long)]
         time: bool,
@@ -167,8 +172,9 @@ fn main() -> ExitCode {
             output,
             private_input,
             blowup,
+            segment_size,
             time,
-        } => cmd_prove(elf, output, private_input, blowup, time),
+        } => cmd_prove(elf, output, private_input, blowup, segment_size, time),
         Commands::Verify {
             proof,
             elf,
@@ -289,6 +295,7 @@ fn cmd_prove(
     output_path: PathBuf,
     private_input_path: Option<PathBuf>,
     blowup: Option<u8>,
+    segment_size: Option<usize>,
     time: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
@@ -312,6 +319,46 @@ fn cmd_prove(
     let tracker = heap_tracker::HeapTracker::start();
 
     let start = Instant::now();
+
+    // Sharded proving: if --segment-size is set, use prove_sharded
+    if let Some(seg_size) = segment_size {
+        eprintln!("Generating sharded proof (segment_size={seg_size})...");
+        let proof = prover::prove_sharded(&elf_data, &private_inputs, seg_size);
+        let prove_elapsed = start.elapsed();
+        let proof = match proof {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("Sharded proof generation failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if time {
+            println!(
+                "Proving time: {:.3}s ({} segments, {} total instructions)",
+                prove_elapsed.as_secs_f64(),
+                proof.segments.len(),
+                proof.total_instructions,
+            );
+        }
+
+        // Serialize sharded proof
+        let serialized = match bincode::serialize(&proof) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Failed to serialize proof: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::write(&output_path, serialized) {
+            eprintln!("Failed to write proof: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("Proof written to {}", output_path.display());
+        return ExitCode::SUCCESS;
+    }
+
+    // Non-sharded proving
     let proof = match blowup {
         Some(b) => {
             let opts = match GoldilocksCubicProofOptions::with_blowup(b) {

@@ -1924,8 +1924,7 @@ fn test_addiw_neg_immediate() {
 #[test]
 fn test_sharded_prove_verify_add() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("add");
-    let sharded_proof =
-        crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
+    let sharded_proof = crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
 
     assert!(
         sharded_proof.segments.len() >= 2,
@@ -1933,8 +1932,7 @@ fn test_sharded_prove_verify_add() {
         sharded_proof.segments.len()
     );
 
-    let result =
-        crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
+    let result = crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
     assert!(result, "sharded proof should verify");
 }
 
@@ -1952,8 +1950,7 @@ fn test_sharded_single_segment() {
         "Should have exactly 1 segment"
     );
 
-    let result =
-        crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
+    let result = crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
     assert!(result, "single-segment sharded proof should verify");
 }
 
@@ -1963,8 +1960,7 @@ fn test_sharded_matches_single_output() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("add");
 
     let single_proof = crate::prove(&elf_bytes).expect("single prove failed");
-    let sharded_proof =
-        crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
+    let sharded_proof = crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
 
     assert_eq!(
         single_proof.public_output, sharded_proof.public_output,

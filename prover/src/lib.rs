@@ -263,11 +263,8 @@ impl VmAirs {
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
-        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-            &self.bitwise,
-            &self.decode,
-            &self.register,
-        ];
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+            vec![&self.bitwise, &self.decode, &self.register];
         if let Some(ref halt) = self.halt {
             refs.push(halt);
         }
@@ -329,7 +326,16 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
     ) -> Self {
-        Self::new_with_overrides(elf, proof_options, minimal_bitwise, page_configs, table_counts, None, true, true)
+        Self::new_with_overrides(
+            elf,
+            proof_options,
+            minimal_bitwise,
+            page_configs,
+            table_counts,
+            None,
+            true,
+            true,
+        )
     }
 
     /// Create all VM AIR instances with optional overrides for sharded proving.
@@ -400,10 +406,8 @@ impl VmAirs {
         };
         let reg_commitment = register_commitment
             .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
-        let register = create_register_air(proof_options).with_preprocessed(
-            reg_commitment,
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register = create_register_air(proof_options)
+            .with_preprocessed(reg_commitment, register::NUM_PREPROCESSED_COLS);
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
@@ -785,7 +789,7 @@ pub fn prove_sharded_with_options(
     let num_segments = if total_instructions == 0 {
         1
     } else {
-        (total_instructions + segment_size - 1) / segment_size
+        total_instructions.div_ceil(segment_size)
     };
 
     let mut memory_state = MemoryState::from_elf(&program);
@@ -906,9 +910,9 @@ pub fn verify_sharded_with_options(
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     for (seg_idx, seg) in proof.segments.iter().enumerate() {
-        seg.table_counts.validate().map_err(|e| {
-            Error::Prover(format!("Segment {seg_idx} invalid table_counts: {e}"))
-        })?;
+        seg.table_counts
+            .validate()
+            .map_err(|e| Error::Prover(format!("Segment {seg_idx} invalid table_counts: {e}")))?;
 
         // Phase 1 (trusted executor): use page_configs, register_commitment,
         // and is_last_segment from the proof.
@@ -926,14 +930,11 @@ pub fn verify_sharded_with_options(
         let air_refs = airs.air_refs();
 
         // Compute expected bus balance from this segment's public output
-        let expected_bus_balance = match compute_expected_commit_bus_balance(
-            &air_refs,
-            &seg.proof,
-            &seg.public_output,
-        ) {
-            Some(balance) => balance,
-            None => return Ok(false),
-        };
+        let expected_bus_balance =
+            match compute_expected_commit_bus_balance(&air_refs, &seg.proof, &seg.public_output) {
+                Some(balance) => balance,
+                None => return Ok(false),
+            };
 
         let ok = Verifier::multi_verify(
             &air_refs,

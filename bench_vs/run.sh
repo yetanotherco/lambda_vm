@@ -23,6 +23,7 @@ REPORT_DIR=""
 NO_COLOR=false
 TARGET_STEPS="${TARGET_STEPS:-500000000}"
 APPROX_STEPS_PER_ITERATION=5
+SEGMENT_SIZE=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -83,12 +84,17 @@ while [[ $# -gt 0 ]]; do
             TARGET_STEPS=$2
             shift 2
             ;;
+        --segment-size)
+            if [[ $# -lt 2 ]]; then echo "--segment-size requires an argument"; exit 1; fi
+            SEGMENT_SIZE=$2
+            shift 2
+            ;;
         --no-color)
             NO_COLOR=true
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-steps N] [--no-color]"
+            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-steps N] [--segment-size N] [--no-color]"
             echo ""
             echo "  -n N1 N2 ...      Fibonacci iteration counts (space-separated)"
             echo "                    Default iteration series: ${DEFAULT_ITERATION_SERIES[*]}"
@@ -98,6 +104,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --sp1-only        Only run SP1 benchmark"
             echo "  --report-dir DIR  Write TSV, metrics, markdown summary, and raw outputs"
             echo "  --target-steps N  Projection target in workload steps (default: $TARGET_STEPS)"
+            echo "  --segment-size N  Enable sharded proving with N instructions per segment (Lambda VM only)"
             echo "  --no-color        Disable ANSI colors"
             exit 0
             ;;
@@ -361,7 +368,11 @@ run_one() {
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
         local lambda_output
-        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" --time 2>"$stderr_file"); then
+        local segment_flag=""
+        if [ -n "$SEGMENT_SIZE" ]; then
+            segment_flag="--segment-size $SEGMENT_SIZE"
+        fi
+        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" $segment_flag --time 2>"$stderr_file"); then
             echo -e "  ${RED}[Lambda VM] FAILED:${NC}"
             cat "$stderr_file"
             exit 1

@@ -98,11 +98,13 @@ impl MemoryState {
     }
 
     /// Create a memory state from an existing cell map (for segment continuation).
+    #[allow(dead_code)]
     pub(crate) fn from_cells(cells: HashMap<u64, MemoryCell>) -> Self {
         Self { cells }
     }
 
     /// Get a reference to the internal cell map (for passing state to next segment).
+    #[allow(dead_code)]
     pub(crate) fn into_cells(self) -> HashMap<u64, MemoryCell> {
         self.cells
     }
@@ -162,6 +164,7 @@ impl RegisterState {
     }
 
     /// Create a register state from existing values (for segment continuation).
+    #[allow(dead_code)]
     pub(crate) fn from_state(
         regs: [RegisterCell; 32],
         index_register: (u32, u64),
@@ -175,6 +178,7 @@ impl RegisterState {
     }
 
     /// Extract internal state for passing to next segment.
+    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> ([RegisterCell; 32], (u32, u64), RegisterCell) {
         (self.regs, self.index_register, self.pc_register)
     }
@@ -1664,30 +1668,32 @@ fn generate_page_tables_for_segment(
             data[base + page::cols::OFFSET] = FE::from(offset as u64);
 
             // Init value from initial state (or ELF, or 0)
-            let (init_value, init_timestamp) = if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
-                (val, ts)
-            } else {
-                // Never accessed before this segment — use ELF or zero
-                let v = if let Some(ref init_vals) = config.init_values {
-                    init_vals[offset]
+            let (init_value, init_timestamp) =
+                if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
+                    (val, ts)
                 } else {
-                    0
+                    // Never accessed before this segment — use ELF or zero
+                    let v = if let Some(ref init_vals) = config.init_values {
+                        init_vals[offset]
+                    } else {
+                        0
+                    };
+                    (v, 0)
                 };
-                (v, 0)
-            };
             data[base + page::cols::INIT] = FE::from(init_value as u64);
             data[base + page::cols::INIT_TIMESTAMP_LO] = FE::from(init_timestamp & 0xFFFF_FFFF);
             data[base + page::cols::INIT_TIMESTAMP_HI] = FE::from(init_timestamp >> 32);
 
             // Final state
-            let (fini_value, timestamp) = if let Some(&(val, ts)) = final_state.cells.get(&byte_addr) {
-                (val, ts)
-            } else if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
-                // Not touched in this segment — final = initial
-                (val, ts)
-            } else {
-                (init_value, 0)
-            };
+            let (fini_value, timestamp) =
+                if let Some(&(val, ts)) = final_state.cells.get(&byte_addr) {
+                    (val, ts)
+                } else if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
+                    // Not touched in this segment — final = initial
+                    (val, ts)
+                } else {
+                    (init_value, 0)
+                };
             data[base + page::cols::FINI] = FE::from(fini_value as u64);
             data[base + page::cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
             data[base + page::cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
@@ -2400,7 +2406,7 @@ impl Traces {
     /// Returns the traces plus the final memory/register state for passing to the
     /// next segment.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_segment(
+    pub(crate) fn from_segment(
         elf: &Elf,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
