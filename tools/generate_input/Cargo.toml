@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "generate-input"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", branch = "crypto-default-features" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", branch = "crypto-default-features" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", branch = "crypto-default-features" }
+guest-program = { git = "https://github.com/lambdaclass/ethrex.git", package = "guest_program", default-features = false, branch = "crypto-default-features" }
+rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
+tokio = { version = "1", features = ["full"] }

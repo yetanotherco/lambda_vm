@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "run-ethrex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+executor = { path = "../../executor" }

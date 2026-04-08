@@ -47,19 +47,23 @@ const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]
-pub struct Memory(U64HashMap<[u8; 4]>);
+pub struct Memory {
+    data: U64HashMap<[u8; 4]>,
+    /// Committed public output bytes, stored separately so std cleanup can't overwrite them.
+    committed_output: Vec<u8>,
+}
 
 impl Memory {
     pub fn load_byte(&self, address: u64) -> u8 {
         let aligned_address = address - address % 4;
-        let value = self.0.get(&aligned_address).cloned().unwrap_or_default();
+        let value = self.data.get(&aligned_address).cloned().unwrap_or_default();
         value[(address % 4) as usize]
     }
 
     pub fn store_byte(&mut self, address: u64, value: u8) {
         let aligned_address = address - address % 4;
         let entry = self
-            .0
+            .data
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         entry[(address % 4) as usize] = value;
@@ -69,7 +73,7 @@ impl Memory {
         if !address.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
-        let bytes = self.0.get(&address).cloned().unwrap_or_default();
+        let bytes = self.data.get(&address).cloned().unwrap_or_default();
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -78,7 +82,7 @@ impl Memory {
             return Err(MemoryError::UnalignedAccess);
         }
         let bytes = value.to_le_bytes();
-        self.0.insert(address, bytes);
+        self.data.insert(address, bytes);
         Ok(())
     }
 
@@ -87,8 +91,8 @@ impl Memory {
         if !address.is_multiple_of(8) {
             return Err(MemoryError::UnalignedAccess);
         }
-        let low_bytes = self.0.get(&address).cloned().unwrap_or_default();
-        let high_bytes = self.0.get(&(address + 4)).cloned().unwrap_or_default();
+        let low_bytes = self.data.get(&address).cloned().unwrap_or_default();
+        let high_bytes = self.data.get(&(address + 4)).cloned().unwrap_or_default();
         let low = u32::from_le_bytes(low_bytes) as u64;
         let high = u32::from_le_bytes(high_bytes) as u64;
         Ok(low | (high << 32))
@@ -101,8 +105,8 @@ impl Memory {
         }
         let low = (value & 0xFFFFFFFF) as u32;
         let high = (value >> 32) as u32;
-        self.0.insert(address, low.to_le_bytes());
-        self.0.insert(address + 4, high.to_le_bytes());
+        self.data.insert(address, low.to_le_bytes());
+        self.data.insert(address + 4, high.to_le_bytes());
         Ok(())
     }
 
@@ -114,7 +118,7 @@ impl Memory {
             );
         }
         let aligned_address = address - address % 4;
-        let bytes = self.0.get(&aligned_address).cloned().unwrap_or_default();
+        let bytes = self.data.get(&aligned_address).cloned().unwrap_or_default();
         let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
         Ok(u16::from_le_bytes(
             value.try_into().map_err(|_| MemoryError::LoadHalf)?,
@@ -127,7 +131,7 @@ impl Memory {
         }
         let aligned_address = address - address % 4;
         let entry = self
-            .0
+            .data
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         let bytes = value.to_le_bytes();
@@ -140,15 +144,17 @@ impl Memory {
         if length > MAX_PUBLIC_OUTPUT_COMMIT_SIZE {
             return Err(MemoryError::CommitSizeExceeded);
         }
+        // Store in the regular memory address space (for prover trace compatibility)
         self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
         let inputs = self.load_bytes(address, length);
         self.set_bytes_aligned(PUBLIC_OUTPUT_START_INDEX + 4, &inputs)?;
+        // Also store in the dedicated field so std runtime cleanup can't overwrite it
+        self.committed_output = inputs;
         Ok(())
     }
 
     pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
-        let size = self.load_word(PUBLIC_OUTPUT_START_INDEX)?;
-        Ok(self.load_bytes(PUBLIC_OUTPUT_START_INDEX + 4, size as u64))
+        Ok(self.committed_output.clone())
     }
 
     pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
@@ -172,7 +178,7 @@ impl Memory {
         let end = addr + len;
         while addr < end {
             let aligned = addr - (addr % 4);
-            let bytes = self.0.get(&aligned).cloned().unwrap_or_default();
+            let bytes = self.data.get(&aligned).cloned().unwrap_or_default();
             let offset = (addr % 4) as usize;
             let take = std::cmp::min(4 - offset, (end - addr) as usize);
             result.extend_from_slice(&bytes[offset..offset + take]);
@@ -190,7 +196,7 @@ impl Memory {
         for chunk in inputs.chunks(4) {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
-            self.0.insert(addr, bytes);
+            self.data.insert(addr, bytes);
             addr += 4;
         }
         Ok(())

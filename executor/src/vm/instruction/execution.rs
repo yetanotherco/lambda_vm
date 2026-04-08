@@ -10,6 +10,7 @@ const REGULAR_PC_UPDATE: u64 = 4;
 pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
+    Exit = 3,
     GetPrivateInputs = 4,
     Commit = 64,
     Halt = 93,
@@ -21,6 +22,7 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
+            3 => Ok(SyscallNumbers::Exit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
@@ -309,12 +311,11 @@ impl Instruction {
                         // x11 = buf_addr (buffer address in memory)
                         // x12 = count (number of bytes to write)
                         let fd = registers.read(10)?;
-                        if fd != 1 {
-                            return Err(ExecutionError::InvalidCommitFd(fd));
-                        }
                         let buf_addr = registers.read(11)?;
                         let count = registers.read(12)?;
-                        memory.commit_public_output(buf_addr, count)?;
+                        if fd == 1 {
+                            memory.commit_public_output(buf_addr, count)?;
+                        }
                         src2_val = buf_addr;
                         dst_val = count;
                     }
@@ -326,8 +327,8 @@ impl Instruction {
                             memory.store_byte(pointer + i as u64, *byte);
                         }
                     }
-                    SyscallNumbers::Halt => {
-                        // halt
+                    SyscallNumbers::Exit | SyscallNumbers::Halt => {
+                        // halt / exit
                         return Ok(Log {
                             current_pc: pc,
                             next_pc: 0,                   // We halt by setting pc to 0

@@ -801,7 +801,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
 fn test_verify_rejects_tampered_public_output() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let proof_options = ProofOptions::default_test_options();
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
         crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
@@ -1669,7 +1669,7 @@ fn test_verify_rejects_zero_table_counts() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     assert!(
@@ -1703,7 +1703,7 @@ fn test_verify_rejects_zero_cpu_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {
@@ -1724,7 +1724,7 @@ fn test_verify_rejects_zero_memw_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {
@@ -1799,7 +1799,7 @@ fn test_small_max_rows_splits_tables() {
     let proof_options = ProofOptions::default_test_options();
     let max_rows = crate::tables::MaxRowsConfig::small();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &max_rows)
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &max_rows)
         .expect("Prover should succeed with small max_rows");
 
     // With 2^5 max rows and 64+ instructions, tables should have multiple chunks.
@@ -1850,7 +1850,7 @@ fn test_verify_rejects_inflated_table_counts() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     // Inflate cpu count — total won't match proof.proofs.len()
@@ -1868,6 +1868,24 @@ fn test_verify_rejects_inflated_table_counts() {
         "Inflated table_counts should be rejected, got {:?}",
         result
     );
+}
+
+/// Prove and verify an empty Ethereum block via the ethrex guest program.
+/// Requires ~64GB RAM (11M instructions generate large multi-table traces).
+#[test]
+#[ignore = "Requires ~64GB RAM: proves an empty Ethereum block (11M instructions)"]
+fn test_prove_ethrex_empty_block() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = std::fs::read("../executor/program_artifacts/rust/ethrex.elf")
+        .expect("Failed to read ethrex ELF");
+    let input = std::fs::read("../executor/tests/ethrex_empty_block.bin")
+        .expect("Failed to read empty block fixture");
+    let vm_proof = crate::prove_with_input(&elf_bytes, input).expect("Proving failed");
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("Verification failed"),
+        "Empty block proof should verify"
+    );
+    assert_eq!(vm_proof.public_output.len(), 160, "L1 output should be 160 bytes (5 * 32)");
 }
 
 /// Regression test: addiw with negative immediate must verify.

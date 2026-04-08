@@ -463,6 +463,17 @@ pub(crate) fn compute_expected_commit_bus_balance(
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_options(
         elf_bytes,
+        vec![],
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &MaxRowsConfig::default(),
+    )
+}
+
+/// Prove an ELF binary execution with private input.
+pub fn prove_with_input(elf_bytes: &[u8], private_input: Vec<u8>) -> Result<VmProof, Error> {
+    prove_with_options(
+        elf_bytes,
+        private_input,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
@@ -471,6 +482,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
 /// Prove an ELF binary execution with custom proof options and max rows config.
 pub fn prove_with_options(
     elf_bytes: &[u8],
+    private_input: Vec<u8>,
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
@@ -482,7 +494,8 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
+    let executor =
+        Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
