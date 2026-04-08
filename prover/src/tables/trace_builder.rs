@@ -49,7 +49,7 @@ use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
-use super::types::{GoldilocksExtension, GoldilocksField};
+use super::types::{FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
 // =============================================================================
@@ -57,13 +57,13 @@ use crate::Error;
 // =============================================================================
 
 /// Memory cell state: (value_byte, last_write_timestamp)
-type MemoryCell = (u8, u64);
+pub(crate) type MemoryCell = (u8, u64);
 
 /// Register state: (value, last_write_timestamp)
-type RegisterCell = (u64, u64);
+pub(crate) type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
-struct MemoryState {
+pub(crate) struct MemoryState {
     /// Map from byte address to (value, timestamp)
     cells: HashMap<u64, MemoryCell>,
 }
@@ -80,7 +80,7 @@ impl MemoryState {
     /// Pre-populates all ELF bytes with timestamp=0 so that when MEMW first
     /// accesses an address, it gets the correct initial value for `old_value`.
     /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
-    fn from_elf(elf: &Elf) -> Self {
+    pub(crate) fn from_elf(elf: &Elf) -> Self {
         let mut cells = HashMap::new();
         for segment in &elf.data {
             for (i, &word) in segment.values.iter().enumerate() {
@@ -95,6 +95,16 @@ impl MemoryState {
             }
         }
         Self { cells }
+    }
+
+    /// Create a memory state from an existing cell map (for segment continuation).
+    pub(crate) fn from_cells(cells: HashMap<u64, MemoryCell>) -> Self {
+        Self { cells }
+    }
+
+    /// Get a reference to the internal cell map (for passing state to next segment).
+    pub(crate) fn into_cells(self) -> HashMap<u64, MemoryCell> {
+        self.cells
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
@@ -129,7 +139,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
-struct RegisterState {
+pub(crate) struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
     /// Synthetic x254 commit index register: (value, last_write_timestamp)
@@ -139,7 +149,7 @@ struct RegisterState {
 }
 
 impl RegisterState {
-    fn new(entry_point: u64) -> Self {
+    pub(crate) fn new(entry_point: u64) -> Self {
         let mut regs = [(0u64, 0u64); 32];
         // SP (x2) starts at STACK_TOP
         regs[2] = (page::STACK_TOP, 0);
@@ -149,6 +159,24 @@ impl RegisterState {
             // PC register (x255) starts at entry_point, timestamp 0
             pc_register: (entry_point, 0),
         }
+    }
+
+    /// Create a register state from existing values (for segment continuation).
+    pub(crate) fn from_state(
+        regs: [RegisterCell; 32],
+        index_register: (u32, u64),
+        pc_register: RegisterCell,
+    ) -> Self {
+        Self {
+            regs,
+            index_register,
+            pc_register,
+        }
+    }
+
+    /// Extract internal state for passing to next segment.
+    pub(crate) fn into_parts(self) -> ([RegisterCell; 32], (u32, u64), RegisterCell) {
+        (self.regs, self.index_register, self.pc_register)
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -188,7 +216,7 @@ impl RegisterState {
     ///
     /// Returns a map from register Word address to final (timestamp, value).
     /// Each register uses 2 Word addresses (reg_addr = 2 * reg_idx, then +0, +1).
-    fn to_final_state_map(&self) -> FinalRegisterStateMap {
+    pub(crate) fn to_final_state_map(&self) -> FinalRegisterStateMap {
         let mut map = FinalRegisterStateMap::new();
 
         for reg_idx in 0..32u8 {
@@ -286,13 +314,16 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
+    global_log_base: u64,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location (where old_timestamp=0).
+    // For sharded execution, global_log_base offsets timestamps to maintain
+    // global monotonicity across segments.
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = (global_log_base + i as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -1560,6 +1591,116 @@ fn generate_page_tables(
     (pages, page_configs)
 }
 
+/// Generate PAGE tables for a segment with per-byte initial timestamps.
+///
+/// Unlike `generate_page_tables`, this uses `initial_cells` for init values and
+/// init timestamps, and `final_state` (from memory_state after Phase 2) for
+/// fini values and final timestamps.
+fn generate_page_tables_for_segment(
+    elf: &Elf,
+    initial_cells: &HashMap<u64, MemoryCell>,
+    final_state: &MemoryState,
+) -> (
+    Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    Vec<PageConfig>,
+) {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+
+    // ELF page init data (for PageConfig and preprocessed commitment)
+    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
+                let page_data = elf_page_data
+                    .entry(page_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // All page bases from final memory state
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    for &addr in final_state.cells.keys() {
+        page_bases.insert(page::page_base_for_address(addr, page_size));
+    }
+    // Also include pages from initial state (might have pages not touched in this segment)
+    for &addr in initial_cells.keys() {
+        page_bases.insert(page::page_base_for_address(addr, page_size));
+    }
+
+    let mut pages = Vec::new();
+    let mut page_configs = Vec::new();
+
+    for &page_base in &page_bases {
+        // PageConfig init values come from initial_cells (the segment's starting state).
+        // This ensures the preprocessed commitment matches the trace's INIT column.
+        let mut init_data = vec![0u8; page_size];
+        for offset in 0..page_size {
+            let byte_addr = page_base + (offset as u64);
+            if let Some(&(val, _ts)) = initial_cells.get(&byte_addr) {
+                init_data[offset] = val;
+            } else if let Some(elf_data) = elf_page_data.get(&page_base) {
+                init_data[offset] = elf_data[offset];
+            }
+        }
+        let config = PageConfig::with_data(page_base, page_size, init_data);
+
+        // Generate trace with init timestamps from initial_cells
+        let num_rows = page_size;
+        let mut data = vec![FE::zero(); num_rows * page::cols::NUM_COLUMNS];
+
+        for offset in 0..page_size {
+            let byte_addr = page_base + (offset as u64);
+            let base = offset * page::cols::NUM_COLUMNS;
+
+            data[base + page::cols::OFFSET] = FE::from(offset as u64);
+
+            // Init value from initial state (or ELF, or 0)
+            let (init_value, init_timestamp) = if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
+                (val, ts)
+            } else {
+                // Never accessed before this segment — use ELF or zero
+                let v = if let Some(ref init_vals) = config.init_values {
+                    init_vals[offset]
+                } else {
+                    0
+                };
+                (v, 0)
+            };
+            data[base + page::cols::INIT] = FE::from(init_value as u64);
+            data[base + page::cols::INIT_TIMESTAMP_LO] = FE::from(init_timestamp & 0xFFFF_FFFF);
+            data[base + page::cols::INIT_TIMESTAMP_HI] = FE::from(init_timestamp >> 32);
+
+            // Final state
+            let (fini_value, timestamp) = if let Some(&(val, ts)) = final_state.cells.get(&byte_addr) {
+                (val, ts)
+            } else if let Some(&(val, ts)) = initial_cells.get(&byte_addr) {
+                // Not touched in this segment — final = initial
+                (val, ts)
+            } else {
+                (init_value, 0)
+            };
+            data[base + page::cols::FINI] = FE::from(fini_value as u64);
+            data[base + page::cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
+            data[base + page::cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+        }
+
+        let trace = TraceTable::new_main(data, page::cols::NUM_COLUMNS, 1);
+        pages.push(trace);
+        page_configs.push(config);
+    }
+
+    (pages, page_configs)
+}
+
 // =============================================================================
 // Trace Generation
 // =============================================================================
@@ -1787,7 +1928,7 @@ impl Traces {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &instructions, 0)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -2033,7 +2174,7 @@ impl Traces {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &instructions, 0)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -2246,6 +2387,228 @@ impl Traces {
             commit: commit_trace,
             memw_registers,
         })
+    }
+
+    /// Generates traces for a single execution segment (for sharded proving).
+    ///
+    /// Unlike `from_elf_and_logs`, this accepts initial memory/register state from a
+    /// previous segment instead of starting from ELF defaults. Timestamps are offset
+    /// by `global_log_base` to maintain global monotonicity across segments.
+    ///
+    /// HALT operations are only generated if `is_last_segment` is true.
+    ///
+    /// Returns the traces plus the final memory/register state for passing to the
+    /// next segment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_segment(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        mut memory_state: MemoryState,
+        mut register_state: RegisterState,
+        global_log_base: u64,
+        is_last_segment: bool,
+    ) -> Result<(Self, MemoryState, RegisterState), Error> {
+        // PHASE 0: ELF → DECODE + instructions
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+
+        // PHASE 1: Logs → CPU operations (with global timestamp offset)
+        let cpu_ops = collect_cpu_ops(logs, &instructions, global_log_base)?;
+
+        // Capture initial state BEFORE phase 2 modifies it (needed for PAGE/REGISTER init)
+        let initial_register_state = register_state.to_final_state_map();
+        let initial_memory_cells = memory_state.cells.clone();
+
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // HALT finalization only in the last segment
+        if is_last_segment {
+            let halt_memw_ops = collect_halt_ops(&mut register_state);
+            memw_ops.extend(halt_memw_ops);
+        }
+
+        // Route MEMW variants
+        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_register_op);
+        let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_aligned_op);
+
+        // Collect BRANCH operations
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm,
+                    op.compute_arg1(),
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
+        // Collect MUL operations
+        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
+
+        // Collect DVRM operations
+        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_divrem)
+            .map(|op| {
+                let n = op.compute_arg1();
+                let d = op.compute_arg2();
+                let signed = op.decode.signed;
+                let wants_remainder = op.decode.muldiv_selector;
+                (DvrmOperation::new(n, d, signed), wants_remainder)
+            })
+            .collect();
+
+        // LT from DVRM
+        for (op, _) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+        // MUL from DVRM
+        for (op, _) in &dvrm_ops {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            mul_ops.push((mul_op.clone(), false));
+            mul_ops.push((mul_op, true));
+        }
+
+        // PHASE 3: MEMW → LT
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+
+        // PHASE 4: All → Bitwise lookups
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+
+        let public_output_bytes: Vec<u8> = commit_ops
+            .iter()
+            .filter(|op| !op.end)
+            .map(|op| op.value)
+            .collect();
+        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
+        // PHASE 5: Generate final traces
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+        );
+        let memw_registers = chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
+        );
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        // DECODE multiplicities
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        let register_final_state = register_state.to_final_state_map();
+        let commit_trace = commit::generate_commit_trace(&commit_ops);
+
+        // HALT trace: only for last segment. Non-last segments get a dummy halt.
+        let halt_trace = if is_last_segment {
+            let halt_op = cpu_ops
+                .iter()
+                .rev()
+                .find(|op| op.decode.op_ecall)
+                .ok_or(Error::MissingHaltEcall)?;
+            halt::generate_halt_trace(halt_op.timestamp)
+        } else {
+            // Non-last segment: dummy halt with timestamp = last CPU timestamp + 4
+            let last_ts = cpu_ops.last().map_or(0, |op| op.timestamp);
+            halt::generate_halt_trace(last_ts + 4)
+        };
+
+        // PAGE tables: use initial_memory_cells for init values/timestamps,
+        // current memory_state for final values/timestamps
+        let (pages, page_configs) =
+            generate_page_tables_for_segment(elf, &initial_memory_cells, &memory_state);
+
+        // REGISTER trace: use initial state from segment boundary
+        let register_trace = register::generate_register_trace_from_state(
+            &initial_register_state,
+            &register_final_state,
+            elf.entry_point,
+        );
+
+        let traces = Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            page_configs,
+            register: register_trace,
+            public_output_bytes,
+            branches,
+            halt: halt_trace,
+            commit: commit_trace,
+            memw_registers,
+        };
+
+        Ok((traces, memory_state, register_state))
     }
 
     /// Generates all traces with a trimmed bitwise table (TEST ONLY).

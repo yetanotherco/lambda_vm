@@ -58,23 +58,29 @@ pub const NUM_PREPROCESSED_COLS: usize = 2;
 // =========================================================================
 
 pub mod cols {
-    /// offset: Row index / byte address within register space
+    /// offset: Row index / byte address within register space (preprocessed)
     pub const OFFSET: usize = 0;
 
-    /// init: Initial byte value (0 for all registers)
+    /// init: Initial value (preprocessed — from ELF for segment 0, from prev segment for N>0)
     pub const INIT: usize = 1;
 
-    /// fini: Final byte value after execution
-    pub const FINI: usize = 2;
+    /// init_timestamp[0]: Initial timestamp low word (main trace — 0 for segment 0)
+    pub const INIT_TIMESTAMP_LO: usize = 2;
+
+    /// init_timestamp[1]: Initial timestamp high word (main trace — 0 for segment 0)
+    pub const INIT_TIMESTAMP_HI: usize = 3;
+
+    /// fini: Final value after execution
+    pub const FINI: usize = 4;
 
     /// timestamp[0]: Final timestamp low word (0 if never accessed)
-    pub const TIMESTAMP_LO: usize = 3;
+    pub const TIMESTAMP_LO: usize = 5;
 
     /// timestamp[1]: Final timestamp high word
-    pub const TIMESTAMP_HI: usize = 4;
+    pub const TIMESTAMP_HI: usize = 6;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 7;
 }
 
 // =========================================================================
@@ -161,6 +167,10 @@ pub fn generate_register_trace(
         let init_value = init_value_for_address(word_addr, entry_point);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
+        // Init timestamp = 0 for segment 0 (registers start fresh)
+        data[base + cols::INIT_TIMESTAMP_LO] = FE::zero();
+        data[base + cols::INIT_TIMESTAMP_HI] = FE::zero();
+
         // Final state: if accessed use final, otherwise use initial
         let (timestamp, fini_value) = if let Some(state) = final_state.get(&word_addr) {
             (state.timestamp, state.value)
@@ -202,6 +212,7 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, entry_point: u64) 
         init_col[i] = FE::from(init_value_for_address(word_addr, entry_point) as u64);
     }
 
+    // Segment 0: OFFSET and INIT are preprocessed. INIT_TS is in main trace (all zeros).
     let columns = [offset_col, init_col];
 
     let polys: Vec<Polynomial<FE>> = columns
@@ -239,6 +250,104 @@ pub fn preprocessed_commitment(options: &ProofOptions, entry_point: u64) -> Comm
     compute_precomputed_commitment(options, entry_point)
 }
 
+/// Compute the preprocessed commitment for a non-first segment, where init values
+/// come from the previous segment's final register state instead of ELF defaults.
+pub fn preprocessed_commitment_from_state(
+    options: &ProofOptions,
+    initial_state: &FinalRegisterStateMap,
+    entry_point: u64,
+) -> Commitment {
+    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    let addr_list = register_word_address_list();
+
+    let mut offset_col = vec![FE::zero(); num_rows];
+    let mut init_col = vec![FE::zero(); num_rows];
+
+    for i in 0..NUM_REGISTER_ADDRESSES {
+        let word_addr = addr_list[i];
+        offset_col[i] = FE::from(word_addr);
+        // Use previous segment's final state as this segment's init.
+        // Fall back to ELF default if the register was never accessed in previous segments.
+        let init_value = if let Some(state) = initial_state.get(&word_addr) {
+            state.value
+        } else {
+            init_value_for_address(word_addr, entry_point)
+        };
+        init_col[i] = FE::from(init_value as u64);
+    }
+
+    let columns = [offset_col, init_col];
+
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for register column")
+        })
+        .collect();
+
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for register polynomial")
+        })
+        .collect();
+
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    let lde_rows = columns2rows(lde_columns);
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for register LDE");
+    tree.root
+}
+
+/// Generate a REGISTER trace for a non-first segment, where init values come
+/// from the previous segment's final state.
+pub fn generate_register_trace_from_state(
+    initial_state: &FinalRegisterStateMap,
+    final_state: &FinalRegisterStateMap,
+    entry_point: u64,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let addr_list = register_word_address_list();
+
+    for (row, &word_addr) in addr_list.iter().enumerate().take(NUM_REGISTER_ADDRESSES) {
+        let base = row * cols::NUM_COLUMNS;
+
+        data[base + cols::OFFSET] = FE::from(word_addr);
+
+        // Init from previous segment's final state (or ELF default)
+        let (init_value, init_timestamp) = if let Some(state) = initial_state.get(&word_addr) {
+            (state.value, state.timestamp)
+        } else {
+            (init_value_for_address(word_addr, entry_point), 0)
+        };
+        data[base + cols::INIT] = FE::from(init_value as u64);
+        data[base + cols::INIT_TIMESTAMP_LO] = FE::from(init_timestamp & 0xFFFF_FFFF);
+        data[base + cols::INIT_TIMESTAMP_HI] = FE::from(init_timestamp >> 32);
+
+        // Final state for this segment
+        let (timestamp, fini_value) = if let Some(state) = final_state.get(&word_addr) {
+            (state.timestamp, state.value)
+        } else {
+            // Never accessed in this segment: final = init (self-cancelling on bus)
+            (init_timestamp, init_value)
+        };
+
+        data[base + cols::FINI] = FE::from(fini_value as u64);
+        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
+        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================
@@ -261,8 +370,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(0);
 
     vec![
-        // REG-C1: memory[1, address, 0, init] - receive initial token
-        // Balances MEMW's first send on this address
+        // REG-C1: memory[1, address, init_ts, init] - receive initial token
+        // Balances MEMW's first send on this address.
+        // For segment 0: init_ts = 0. For segment N>0: init_ts from previous segment.
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -273,10 +383,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 address_lo.clone(),
                 // address_hi = 0
                 address_hi.clone(),
-                // timestamp_lo = 0 (initial)
-                BusValue::constant(0),
-                // timestamp_hi = 0
-                BusValue::constant(0),
+                // init_timestamp_lo
+                BusValue::Packed {
+                    start_column: cols::INIT_TIMESTAMP_LO,
+                    packing: Packing::Direct,
+                },
+                // init_timestamp_hi
+                BusValue::Packed {
+                    start_column: cols::INIT_TIMESTAMP_HI,
+                    packing: Packing::Direct,
+                },
                 // value = init
                 BusValue::Packed {
                     start_column: cols::INIT,

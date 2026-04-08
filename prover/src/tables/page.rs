@@ -66,20 +66,26 @@ pub mod cols {
     /// offset: Row index (0, 1, ..., page_size-1) - preprocessed
     pub const OFFSET: usize = 0;
 
-    /// init: Initial byte value (from ELF or 0)
+    /// init: Initial byte value (from ELF or 0) - preprocessed
     pub const INIT: usize = 1;
 
+    /// init_timestamp[0]: Initial timestamp low word (main — 0 for segment 0)
+    pub const INIT_TIMESTAMP_LO: usize = 2;
+
+    /// init_timestamp[1]: Initial timestamp high word (main — 0 for segment 0)
+    pub const INIT_TIMESTAMP_HI: usize = 3;
+
     /// fini: Final byte value after execution
-    pub const FINI: usize = 2;
+    pub const FINI: usize = 4;
 
     /// timestamp[0]: Final timestamp low word (0 if never accessed)
-    pub const TIMESTAMP_LO: usize = 3;
+    pub const TIMESTAMP_LO: usize = 5;
 
     /// timestamp[1]: Final timestamp high word
-    pub const TIMESTAMP_HI: usize = 4;
+    pub const TIMESTAMP_HI: usize = 6;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 7;
 }
 
 /// Number of preprocessed columns (OFFSET, INIT for ELF pages).
@@ -103,7 +109,7 @@ pub struct FinalByteState {
 pub type FinalStateMap = HashMap<u64, FinalByteState>;
 
 /// Configuration for a single PAGE table instance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PageConfig {
     /// Base address of this page (must be page-aligned).
     pub page_base: u64,
@@ -184,6 +190,10 @@ pub fn generate_page_trace(
             0 // Zero-initialized
         };
         data[base + cols::INIT] = FE::from(init_value as u64);
+
+        // Init timestamp = 0 for segment 0 (memory starts fresh from ELF)
+        data[base + cols::INIT_TIMESTAMP_LO] = FE::zero();
+        data[base + cols::INIT_TIMESTAMP_HI] = FE::zero();
 
         // Final state: if accessed use final, otherwise use initial
         let (timestamp, fini_value) = if let Some(state) = final_state.get(&byte_addr) {
@@ -340,7 +350,8 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // PAGE-C3: memory[0, address, 0, init] - receive initial token
+        // PAGE-C3: memory[0, address, init_ts, init] - receive initial token
+        // For segment 0: init_ts = 0. For segment N>0: init_ts from previous segment.
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -351,10 +362,16 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                 address_lo.clone(),
                 // address_hi = page_base_hi
                 address_hi.clone(),
-                // timestamp_lo = 0 (initial)
-                BusValue::constant(0),
-                // timestamp_hi = 0
-                BusValue::constant(0),
+                // init_timestamp_lo
+                BusValue::Packed {
+                    start_column: cols::INIT_TIMESTAMP_LO,
+                    packing: Packing::Direct,
+                },
+                // init_timestamp_hi
+                BusValue::Packed {
+                    start_column: cols::INIT_TIMESTAMP_HI,
+                    packing: Packing::Direct,
+                },
                 // value = init
                 BusValue::Packed {
                     start_column: cols::INIT,

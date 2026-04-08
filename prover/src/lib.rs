@@ -194,8 +194,8 @@ pub(crate) struct VmAirs {
     pub muls: Vec<VmAir>,
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
-    pub halt: VmAir,
-    pub commit: VmAir,
+    pub halt: Option<VmAir>,
+    pub commit: Option<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -207,10 +207,14 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
-            (&self.halt, &mut traces.halt, &()),
-            (&self.commit, &mut traces.commit, &()),
             (&self.register, &mut traces.register, &()),
         ];
+        if let Some(ref halt) = self.halt {
+            pairs.push((halt, &mut traces.halt, &()));
+        }
+        if let Some(ref commit) = self.commit {
+            pairs.push((commit, &mut traces.commit, &()));
+        }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
             pairs.push((air, trace, &()));
@@ -262,10 +266,14 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.bitwise,
             &self.decode,
-            &self.halt,
-            &self.commit,
             &self.register,
         ];
+        if let Some(ref halt) = self.halt {
+            refs.push(halt);
+        }
+        if let Some(ref commit) = self.commit {
+            refs.push(commit);
+        }
 
         for air in &self.cpus {
             refs.push(air);
@@ -308,14 +316,37 @@ impl VmAirs {
     /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
     /// DECODE is always preprocessed.
     ///
-    /// `page_configs` provides the page base addresses for creating PAGE AIRs.
+    /// `page_configs` provides the page base addresses and init values for PAGE AIRs.
     /// `table_counts` specifies how many chunks for each split table.
+    ///
+    /// For sharded proving: `register_commitment` overrides the REGISTER preprocessed
+    /// commitment (computed from the segment's initial register state instead of ELF defaults).
+    /// If `None`, uses the default ELF-based commitment.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+    ) -> Self {
+        Self::new_with_overrides(elf, proof_options, minimal_bitwise, page_configs, table_counts, None, true, true)
+    }
+
+    /// Create all VM AIR instances with optional overrides for sharded proving.
+    ///
+    /// - `register_commitment`: override REGISTER preprocessed commitment (for non-first segments)
+    /// - `include_halt`: include HALT table (only for last segment)
+    /// - `include_commit`: include COMMIT table (only if segment has commit ops)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_overrides(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
+        register_commitment: Option<stark::config::Commitment>,
+        include_halt: bool,
+        include_commit: bool,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -357,10 +388,20 @@ impl VmAirs {
         let branches: Vec<_> = (0..table_counts.branch)
             .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
             .collect();
-        let halt = create_halt_air(proof_options);
-        let commit = create_commit_air(proof_options);
+        let halt = if include_halt {
+            Some(create_halt_air(proof_options))
+        } else {
+            None
+        };
+        let commit = if include_commit {
+            Some(create_commit_air(proof_options))
+        } else {
+            None
+        };
+        let reg_commitment = register_commitment
+            .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
+            reg_commitment,
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs
@@ -657,4 +698,264 @@ pub fn verify_with_options(
 pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let vm_proof = prove(elf_bytes)?;
     verify(&vm_proof, elf_bytes)
+}
+
+// =============================================================================
+// Sharded proving (execution segmentation)
+// =============================================================================
+
+/// Default segment size in instructions for sharded proving.
+pub const DEFAULT_SEGMENT_SIZE: usize = 1 << 22; // ~4M instructions
+
+/// Proof for a single execution segment.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SegmentProof {
+    /// The multi-table STARK proof for this segment.
+    pub proof: MultiProof<F, E, ()>,
+    /// Runtime page ranges for this segment.
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
+    /// Table chunk counts for this segment.
+    pub table_counts: TableCounts,
+    /// Public output bytes committed in this segment.
+    pub public_output: Vec<u8>,
+    /// Page configurations for this segment (init values may differ from ELF for non-first segments).
+    /// Phase 1 (trusted executor): verifier uses these directly.
+    pub page_configs: Vec<page::PageConfig>,
+    /// REGISTER preprocessed commitment for this segment.
+    /// None = use ELF default. Some = use this override (non-first segments).
+    pub register_commitment: Option<stark::config::Commitment>,
+    /// Whether this segment includes the HALT table (only the last segment does).
+    pub is_last_segment: bool,
+}
+
+/// A sharded VM proof: one independent STARK proof per execution segment.
+///
+/// Phase 1: trusted executor — each segment is verified independently.
+/// Continuity between segments is not yet proved cryptographically.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShardedVmProof {
+    /// One proof per execution segment, in order.
+    pub segments: Vec<SegmentProof>,
+    /// Combined public output (concatenation of all segments).
+    pub public_output: Vec<u8>,
+    /// Total number of instructions across all segments.
+    pub total_instructions: usize,
+}
+
+/// Prove an ELF binary execution using sharded proving.
+///
+/// Splits execution into segments of `segment_size` instructions. Each segment
+/// generates its own tables and proof. Trace building is sequential (each segment
+/// needs the previous segment's final state), but proving is parallel.
+pub fn prove_sharded(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    segment_size: usize,
+) -> Result<ShardedVmProof, Error> {
+    prove_sharded_with_options(
+        elf_bytes,
+        private_inputs,
+        segment_size,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &MaxRowsConfig::default(),
+    )
+}
+
+/// Prove an ELF binary using sharded proving with custom options.
+pub fn prove_sharded_with_options(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    segment_size: usize,
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<ShardedVmProof, Error> {
+    use crate::tables::trace_builder::{MemoryState, RegisterState};
+
+    // Phase 1: Execute fully
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let all_logs = &result.logs;
+    let total_instructions = all_logs.len();
+
+    // Phase 2: Split logs into segments, build traces sequentially
+    let num_segments = if total_instructions == 0 {
+        1
+    } else {
+        (total_instructions + segment_size - 1) / segment_size
+    };
+
+    let mut memory_state = MemoryState::from_elf(&program);
+    let mut register_state = RegisterState::new(program.entry_point);
+    let mut segment_traces: Vec<Traces> = Vec::with_capacity(num_segments);
+    let mut segment_public_outputs: Vec<Vec<u8>> = Vec::with_capacity(num_segments);
+    // Capture initial register state per segment for preprocessed commitment
+    let mut segment_initial_reg_states: Vec<Option<register::FinalRegisterStateMap>> =
+        Vec::with_capacity(num_segments);
+
+    for seg_idx in 0..num_segments {
+        let start = seg_idx * segment_size;
+        let end = (start + segment_size).min(total_instructions);
+        let segment_logs = &all_logs[start..end];
+        let is_last = seg_idx == num_segments - 1;
+        let global_log_base = start as u64;
+
+        // For non-first segments, capture register state for preprocessed commitment
+        let initial_reg_state = if seg_idx > 0 {
+            Some(register_state.to_final_state_map())
+        } else {
+            None // Segment 0 uses ELF defaults
+        };
+
+        let (traces, new_mem, new_reg) = Traces::from_segment(
+            &program,
+            segment_logs,
+            max_rows,
+            memory_state,
+            register_state,
+            global_log_base,
+            is_last,
+        )?;
+
+        segment_public_outputs.push(traces.public_output_bytes.clone());
+        segment_initial_reg_states.push(initial_reg_state);
+        segment_traces.push(traces);
+        memory_state = new_mem;
+        register_state = new_reg;
+    }
+
+    // Phase 3: Prove each segment (sequentially for now, parallel later)
+    let mut segment_proofs: Vec<SegmentProof> = Vec::with_capacity(num_segments);
+
+    for (seg_idx, mut traces) in segment_traces.into_iter().enumerate() {
+        let table_counts = traces.table_counts();
+
+        // For non-first segments, compute REGISTER preprocessed commitment from
+        // the segment's initial state (not ELF defaults).
+        let reg_commitment = segment_initial_reg_states[seg_idx].as_ref().map(|state| {
+            register::preprocessed_commitment_from_state(proof_options, state, program.entry_point)
+        });
+
+        let is_last = seg_idx == num_segments - 1;
+        let airs = VmAirs::new_with_overrides(
+            &program,
+            proof_options,
+            false,
+            &traces.page_configs,
+            &table_counts,
+            reg_commitment,
+            is_last, // include_halt: only for last segment
+            true,    // include_commit: always (handles empty ops with zero mults)
+        );
+
+        let runtime_page_ranges = traces.runtime_page_ranges();
+
+        let proof = Prover::multi_prove(
+            airs.air_trace_pairs(&mut traces),
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .map_err(|e| Error::Prover(format!("Segment {seg_idx}: {e:?}")))?;
+
+        segment_proofs.push(SegmentProof {
+            proof,
+            runtime_page_ranges,
+            table_counts,
+            public_output: segment_public_outputs[seg_idx].clone(),
+            page_configs: traces.page_configs,
+            register_commitment: segment_initial_reg_states[seg_idx].as_ref().map(|state| {
+                register::preprocessed_commitment_from_state(
+                    proof_options,
+                    state,
+                    program.entry_point,
+                )
+            }),
+            is_last_segment: is_last,
+        });
+    }
+
+    let combined_output: Vec<u8> = segment_public_outputs.into_iter().flatten().collect();
+
+    Ok(ShardedVmProof {
+        segments: segment_proofs,
+        public_output: combined_output,
+        total_instructions,
+    })
+}
+
+/// Verify a sharded VM proof.
+///
+/// Phase 1: verifies each segment independently. Does NOT verify
+/// cross-segment continuity (trusted executor).
+pub fn verify_sharded(proof: &ShardedVmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
+    verify_sharded_with_options(
+        proof,
+        elf_bytes,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+    )
+}
+
+/// Verify a sharded VM proof with custom options.
+pub fn verify_sharded_with_options(
+    proof: &ShardedVmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+
+    for (seg_idx, seg) in proof.segments.iter().enumerate() {
+        seg.table_counts.validate().map_err(|e| {
+            Error::Prover(format!("Segment {seg_idx} invalid table_counts: {e}"))
+        })?;
+
+        // Phase 1 (trusted executor): use page_configs, register_commitment,
+        // and is_last_segment from the proof.
+        let airs = VmAirs::new_with_overrides(
+            &program,
+            proof_options,
+            false,
+            &seg.page_configs,
+            &seg.table_counts,
+            seg.register_commitment,
+            seg.is_last_segment, // include_halt
+            true,                // include_commit
+        );
+
+        let air_refs = airs.air_refs();
+
+        // Compute expected bus balance from this segment's public output
+        let expected_bus_balance = match compute_expected_commit_bus_balance(
+            &air_refs,
+            &seg.proof,
+            &seg.public_output,
+        ) {
+            Some(balance) => balance,
+            None => return Ok(false),
+        };
+
+        let ok = Verifier::multi_verify(
+            &air_refs,
+            &seg.proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        );
+
+        if !ok {
+            return Ok(false);
+        }
+    }
+
+    // Verify combined public output matches
+    let combined: Vec<u8> = proof
+        .segments
+        .iter()
+        .flat_map(|s| s.public_output.iter().copied())
+        .collect();
+    if combined != proof.public_output {
+        return Ok(false);
+    }
+
+    Ok(true)
 }

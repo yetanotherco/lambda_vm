@@ -1912,3 +1912,62 @@ fn test_addiw_neg_immediate() {
     let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(result, "addiw with negative immediate should verify");
 }
+
+// =============================================================================
+// Sharded proving tests
+// =============================================================================
+
+/// Test sharded prove + verify on a small program with 2 segments.
+///
+/// The "add" program has ~6 instructions. With segment_size=3, this creates
+/// 2 segments: first with 3 instructions, second with ~3 (including halt).
+#[test]
+fn test_sharded_prove_verify_add() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("add");
+    let sharded_proof =
+        crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
+
+    assert!(
+        sharded_proof.segments.len() >= 2,
+        "Expected at least 2 segments, got {}",
+        sharded_proof.segments.len()
+    );
+
+    let result =
+        crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
+    assert!(result, "sharded proof should verify");
+}
+
+/// Test sharded proving with segment_size larger than total instructions (single segment).
+/// Should behave identically to non-sharded proving.
+#[test]
+fn test_sharded_single_segment() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("add");
+    let sharded_proof =
+        crate::prove_sharded(&elf_bytes, &[], 1_000_000).expect("sharded prove failed");
+
+    assert_eq!(
+        sharded_proof.segments.len(),
+        1,
+        "Should have exactly 1 segment"
+    );
+
+    let result =
+        crate::verify_sharded(&sharded_proof, &elf_bytes).expect("sharded verify failed");
+    assert!(result, "single-segment sharded proof should verify");
+}
+
+/// Test that sharded and non-sharded prove give the same public output.
+#[test]
+fn test_sharded_matches_single_output() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("add");
+
+    let single_proof = crate::prove(&elf_bytes).expect("single prove failed");
+    let sharded_proof =
+        crate::prove_sharded(&elf_bytes, &[], 3).expect("sharded prove failed");
+
+    assert_eq!(
+        single_proof.public_output, sharded_proof.public_output,
+        "public output must match between sharded and single prove"
+    );
+}
