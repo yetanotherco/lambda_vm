@@ -2018,7 +2018,7 @@ impl Traces {
         // disk-spill: memw_ops spilled to disk during collection (SpilledVec).
         // non-disk-spill: memw_ops collected in a Vec as before.
         #[cfg(feature = "disk-spill")]
-        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)
                 .map_err(|e| Error::Prover(format!("disk-spill collect_ops: {e}")))?;
         #[cfg(not(feature = "disk-spill"))]
@@ -2237,22 +2237,11 @@ impl Traces {
         #[cfg(not(feature = "disk-spill"))]
         let mut bitwise_table = bitwise::generate_bitwise_trace();
 
-        // --- Collect all bitwise lookups ---
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
-        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
-
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
             .filter(|op| !op.end)
             .map(|op| op.value)
             .collect();
-        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
@@ -2260,10 +2249,60 @@ impl Traces {
             .chunks(max_rows.cpu)
             .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
             .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
-        bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
-        drop(bitwise_ops);
+        // --- Collect all bitwise lookups ---
+        // disk-spill: flush each source individually to avoid accumulating a huge
+        // bitwise_ops vector (~3.8 GB at 8M scale). LT bitwise from MEMW was
+        // already flushed per-chunk in PHASE 3.
+        #[cfg(feature = "disk-spill")]
+        {
+            bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
+            drop(bitwise_ops);
+            bitwise::update_multiplicities(&mut bitwise_table, &collect_bitwise_from_lt(&lt_ops));
+            bitwise::update_multiplicities(&mut bitwise_table, &collect_bitwise_from_mul(&mul_ops));
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_bitwise_from_dvrm(&dvrm_ops),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_bitwise_from_branch(&branch_ops),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &shift::collect_bitwise_from_shift(&shift_ops),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_bitwise_from_memw_aligned(&memw_aligned_ops),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_bitwise_from_page(elf, &memory_state),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_bitwise_from_commit(&commit_ops),
+            );
+            bitwise::update_multiplicities(
+                &mut bitwise_table,
+                &collect_byte_check_ops_for_padding(num_padding_rows),
+            );
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        {
+            bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+            bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+            bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+            bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+            bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+            bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+            bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+            bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+            bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+            bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
+            drop(bitwise_ops);
+        }
 
         #[cfg(feature = "instruments")]
         Self::trace_build_snap("after bitwise drop");
@@ -2332,14 +2371,6 @@ impl Traces {
 
         #[cfg(feature = "instruments")]
         Self::trace_build_snap("after MEMW_A trace gen");
-
-        // disk-spill: lt_ops only has CPU/DVRM LT ops (MEMW LT was processed inline above).
-        // Flush LT bitwise into the bitwise table here (non-disk-spill does it later).
-        #[cfg(feature = "disk-spill")]
-        {
-            let lt_bitwise = collect_bitwise_from_lt(&lt_ops);
-            bitwise::update_multiplicities(&mut bitwise_table, &lt_bitwise);
-        }
 
         #[allow(unused_mut)]
         let mut lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
