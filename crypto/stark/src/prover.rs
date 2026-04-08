@@ -1879,13 +1879,29 @@ pub trait IsStarkProver<
         let phase_start = Instant::now();
 
         // Free main pool buffers — Phase C only uses aux pools.
-        // This reclaims main LDE capacity so aux pools have more headroom.
+        // This reclaims main LDE capacity so aux pools have more headroom,
+        // allowing higher parallelism for aux commits.
         #[cfg(feature = "disk-spill")]
-        for pool in &mut pool_sets {
-            for v in &mut pool.main {
-                *v = Vec::new();
+        let k_commit_c = {
+            for pool in &mut pool_sets {
+                for v in &mut pool.main {
+                    *v = Vec::new();
+                }
             }
-        }
+            // Aux pools are smaller (fewer cols, no main LDE), so we can
+            // process more tables concurrently than Phase A.
+            let k_c = 16_usize.min(k);
+            // Grow pool_sets if Phase C needs more than Phase A had.
+            for _ in k_commit..k_c {
+                pool_sets.push(PoolSet {
+                    main: (0..max_main_cols).map(|_| Vec::new()).collect(),
+                    aux: (0..max_aux_cols).map(|_| Vec::new()).collect(),
+                });
+            }
+            k_c
+        };
+        #[cfg(not(feature = "disk-spill"))]
+        let k_commit_c = k_commit;
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -1905,8 +1921,8 @@ pub trait IsStarkProver<
             Option<Commitment>,
         )> = Vec::with_capacity(num_airs);
 
-        for chunk_start in (0..num_airs).step_by(k_commit) {
-            let chunk_end = (chunk_start + k_commit).min(num_airs);
+        for chunk_start in (0..num_airs).step_by(k_commit_c) {
+            let chunk_end = (chunk_start + k_commit_c).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
 
             #[cfg(feature = "parallel")]
