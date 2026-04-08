@@ -139,9 +139,8 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -265,6 +264,8 @@ pub trait IsStarkVerifier<
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
+
         #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
@@ -273,7 +274,14 @@ pub trait IsStarkVerifier<
             .map(|index| {
                 let step = boundary_constraints.constraints[index].step;
                 let is_aux = boundary_constraints.constraints[index].is_aux;
-                let point = &domain.trace_primitive_root.pow(step as u64);
+                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
+                    Some((_, p)) => p.clone(),
+                    None => {
+                        let p = domain.trace_primitive_root.pow(step as u64);
+                        boundary_step_points.push((step, p.clone()));
+                        p
+                    }
+                };
                 let column_idx = boundary_constraints.constraints[index].col;
                 let trace_evaluation = if is_aux {
                     let column_idx = air.trace_layout().0 + column_idx;
@@ -871,9 +879,12 @@ pub trait IsStarkVerifier<
             trace_term_coeffs.len() * trace_term_coeffs[0].len()
         );
 
-        let mut denoms_trace = (0..ood_evaluations_table_height)
-            .map(|row_idx| evaluation_point - primitive_root.pow(row_idx as u64) * &challenges.z)
-            .collect::<Vec<FieldElement<FieldExtension>>>();
+        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_evaluations_table_height {
+            denoms_trace.push(evaluation_point - &current_z);
+            current_z = primitive_root * &current_z;
+        }
         FieldElement::inplace_batch_inverse(&mut denoms_trace).unwrap();
 
         let trace_term = (0..ood_evaluations_table_width)
@@ -1150,9 +1161,8 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;

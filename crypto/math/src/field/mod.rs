@@ -6,6 +6,7 @@ pub mod extensions_goldilocks;
 /// Optimized Goldilocks field p = 2^64 - 2^32 + 1 (no Montgomery form)
 pub mod goldilocks;
 /// Field for test purposes.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_fields;
 /// Common behaviour for field elements.
 pub mod traits;

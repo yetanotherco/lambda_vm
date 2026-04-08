@@ -50,6 +50,10 @@ use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, co
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
+use crate::tables::memw_aligned::{
+    bus_interactions as memw_aligned_bus_interactions, cols as memw_aligned_cols,
+    constraints as memw_aligned_constraints,
+};
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::register::{
@@ -552,6 +556,24 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW")
+}
+
+/// Create MEMW_A (aligned) AIR with constraints and bus interactions.
+pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_aligned_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_aligned_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_aligned_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("MEMW_A")
 }
 
 /// Create LOAD AIR with constraints and bus interactions.

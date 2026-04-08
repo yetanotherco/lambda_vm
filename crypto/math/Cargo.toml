@@ -25,10 +25,7 @@ num-traits = { version = "0.2.19", default-features = false }
 [dev-dependencies]
 rand_chacha = "0.3.1"
 criterion = "0.5.1"
-const-random = "0.1.15"
-iai-callgrind = "0.3.1"
 proptest = "1.1.0"
-pprof = { version = "0.13.0", features = ["criterion", "flamegraph"] }
 rand = { version = "0.8.5", features = ["std"] }
 
 [features]
@@ -40,6 +37,7 @@ lambdaworks-serde-binary = ["dep:serde", "alloc"]
 lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
 instruments = []
+test-utils = []
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
