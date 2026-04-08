@@ -31,16 +31,14 @@
 })
 #show raw.where(block: true): set block(fill: luma(230))
 
-#meta.summary.map(((ch_title, sections)) => (
-  [
-   #pagebreak(weak: true)
-   #heading(supplement: [Chapter], level: 1, ch_title, numbering: none)
-  ]
-  +
-  sections.map(((sec, sec_title, ref)) => [
-    #pagebreak(weak: true)
-    #heading(supplement: [Section], level: 2, sec_title)#ref
-    #set heading(offset: 2)
-    #include sec
-  ]).join()
-)).join()
+#for (ch_title, sections) in meta.summary {
+  pagebreak(weak: true)
+  heading(supplement: [Chapter], level: 1, ch_title, numbering: none)
+  
+  for (sec, sec_title, ref) in sections {
+    pagebreak(weak: true)
+    [#heading(level: 2, supplement: [Section], sec_title)#ref]
+    set heading(offset: 2)
+    include sec
+  }
+}
