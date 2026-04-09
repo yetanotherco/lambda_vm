@@ -335,19 +335,35 @@ pub trait IsStarkProver<
         let num_cols = columns.len();
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
+        let hashed_leaves: Vec<Commitment> = {
+            (0..num_rows)
+                .into_par_iter()
+                .map_init(
+                    || vec![FieldElement::<E>::zero(); num_cols],
+                    |row_buf, row_idx| {
+                        let br_idx = reverse_index(row_idx, num_rows as u64);
+                        for col_idx in 0..num_cols {
+                            row_buf[col_idx] = columns[col_idx][br_idx].clone();
+                        }
+                        BatchedMerkleTreeBackend::<E>::hash_data(&*row_buf)
+                    },
+                )
+                .collect()
+        };
 
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
-            })
-            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut row_buf = vec![FieldElement::<E>::zero(); num_cols];
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    for col_idx in 0..num_cols {
+                        row_buf[col_idx] = columns[col_idx][br_idx].clone();
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_data(&row_buf)
+                })
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
