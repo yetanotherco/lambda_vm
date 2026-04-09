@@ -1633,7 +1633,8 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
+                    #[allow(unused_mut)]
+                    let (mut tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
                         Self::commit_preprocessed_trace(
                             *trace,
                             domain,
@@ -1669,36 +1670,21 @@ pub trait IsStarkProver<
                     // so multiple tables' trees are written concurrently.
                     #[cfg(feature = "disk-spill")]
                     {
-                        let mut main_tree = Arc::new(tree);
-                        Arc::get_mut(&mut main_tree)
-                            .ok_or_else(|| {
-                                ProvingError::WrongParameter(
-                                    "disk-spill: not sole Arc owner".into(),
-                                )
-                            })?
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill main Merkle tree: {e}"
-                                ))
-                            })?;
+                        tree.spill_nodes_to_disk().map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "disk-spill main Merkle tree: {e}"
+                            ))
+                        })?;
+                        let main_tree = Arc::new(tree);
 
                         let precomputed_tree = pre_tree
-                            .map(|t| {
-                                let mut arc = Arc::new(t);
-                                Arc::get_mut(&mut arc)
-                                    .ok_or_else(|| {
-                                        ProvingError::WrongParameter(
-                                            "disk-spill: not sole Arc owner".into(),
-                                        )
-                                    })?
-                                    .spill_nodes_to_disk()
-                                    .map_err(|e| {
-                                        ProvingError::WrongParameter(format!(
-                                            "disk-spill precomputed Merkle tree: {e}"
-                                        ))
-                                    })?;
-                                Ok(arc)
+                            .map(|mut t| {
+                                t.spill_nodes_to_disk().map_err(|e| {
+                                    ProvingError::WrongParameter(format!(
+                                        "disk-spill precomputed Merkle tree: {e}"
+                                    ))
+                                })?;
+                                Ok(Arc::new(t))
                             })
                             .transpose()?;
 
@@ -1859,27 +1845,18 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        let (tree, root) =
+                        #[allow(unused_mut)]
+                        let (mut tree, root) =
                             Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
                                 .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
 
-                        #[allow(unused_mut)]
-                        let mut aux_tree = Arc::new(tree);
                         #[cfg(feature = "disk-spill")]
-                        Arc::get_mut(&mut aux_tree)
-                            .ok_or_else(|| {
-                                ProvingError::WrongParameter(
-                                    "disk-spill: not sole Arc owner".into(),
-                                )
-                            })?
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill aux Merkle tree: {e}"
-                                ))
-                            })?;
+                        tree.spill_nodes_to_disk().map_err(|e| {
+                            ProvingError::WrongParameter(format!("disk-spill aux Merkle tree: {e}"))
+                        })?;
+                        let aux_tree = Arc::new(tree);
 
                         Ok((Some(aux_tree), Some(root)))
                     } else {
