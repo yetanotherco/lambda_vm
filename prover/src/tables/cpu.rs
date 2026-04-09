@@ -36,7 +36,8 @@
 //!
 //! ### Senders (CPU sends to other tables)
 //! - DECODE: instruction fetch
-//! - IS_BYTE: range checks for rs1, rs2, rd, arg1[i], arg2[i], res[i]
+//! - IS_BYTE: range checks for rs1, rs2, rd
+//! - IS_BYTE_PAIR: range checks for arg1/arg2/res byte pairs (×12, two bytes per interaction)
 //! - IS_BIT: range checks for flags (via templates)
 //! - ADD: for ADD, LOAD, JALR operations
 //! - STORE ADD: for STORE (res = arg1 + imm, separate from main ADD)
@@ -1944,11 +1945,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // Range checks (15 total: 3 IS_BYTE + 12 IS_HALF)
+    // Range checks (15 total: 3 IS_BYTE + 12 IS_BYTE_PAIR)
     // CPU-CR29: IS_BYTE[rs1], CPU-CR30: IS_BYTE[rs2], CPU-CR31: IS_BYTE[rd]
-    // CPU-CR32.i: IS_HALF[arg1[2i] + 256*arg1[2i+1]] (i=0..3)
-    // CPU-CR33.i: IS_HALF[arg2[2i] + 256*arg2[2i+1]] (i=0..3)
-    // CPU-CR34.i: IS_HALF[res[2i] + 256*res[2i+1]] (i=0..3)
+    // CPU-CR32.i: IS_BYTE_PAIR[arg1[2i], arg1[2i+1]] (i=0..3)
+    // CPU-CR33.i: IS_BYTE_PAIR[arg2[2i], arg2[2i+1]] (i=0..3)
+    // CPU-CR34.i: IS_BYTE_PAIR[res[2i], res[2i+1]] (i=0..3)
     // -------------------------------------------------------------------------
     // RS1, RS2, RD are single-byte register indices — checked individually.
     // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
