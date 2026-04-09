@@ -658,7 +658,21 @@ pub fn gkr_prove<E: IsField>(
 
                 // Fold the four gate tables (eq_table was already halved before inner loop)
                 // table[j] = table[2j] + challenge * (table[2j+1] - table[2j])
+                //
+                // When half >= 256 we use par_chunks(2) so that all Rayon threads
+                // participate in folding a single table (instead of just 4-way
+                // parallelism across the four independent tables).
                 let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                    #[cfg(feature = "parallel")]
+                    if half >= 256 {
+                        let folded: Vec<FieldElement<E>> = table
+                            .par_chunks(2)
+                            .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                            .collect();
+                        *table = folded;
+                        return;
+                    }
+                    // Sequential fallback (also used when half < 256)
                     for j in 0..half {
                         let left = &table[2 * j];
                         let right = &table[2 * j + 1];
@@ -667,39 +681,10 @@ pub fn gkr_prove<E: IsField>(
                     table.truncate(half);
                 };
 
-                #[cfg(feature = "parallel")]
-                {
-                    if half >= 256 {
-                        // Fold tables in parallel (each table independently)
-                        rayon::join(
-                            || {
-                                rayon::join(
-                                    || fold_table(&mut nl_table),
-                                    || fold_table(&mut nr_table),
-                                );
-                            },
-                            || {
-                                rayon::join(
-                                    || fold_table(&mut dl_table),
-                                    || fold_table(&mut dr_table),
-                                );
-                            },
-                        );
-                    } else {
-                        fold_table(&mut nl_table);
-                        fold_table(&mut nr_table);
-                        fold_table(&mut dl_table);
-                        fold_table(&mut dr_table);
-                    }
-                }
-
-                #[cfg(not(feature = "parallel"))]
-                {
-                    fold_table(&mut nl_table);
-                    fold_table(&mut nr_table);
-                    fold_table(&mut dl_table);
-                    fold_table(&mut dr_table);
-                }
+                fold_table(&mut nl_table);
+                fold_table(&mut nr_table);
+                fold_table(&mut dl_table);
+                fold_table(&mut dr_table);
 
                 round_polys.push(round_poly);
                 challenges.push(challenge);
