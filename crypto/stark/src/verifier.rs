@@ -944,12 +944,8 @@ pub trait IsStarkVerifier<
             }
 
             // Rounds 2-4: verify (bridge is now a transition constraint)
-            if !Self::verify_rounds_2_to_4(
-                *air,
-                proof,
-                &mut table_transcript,
-                table_rap_challenges,
-            ) {
+            if !Self::verify_rounds_2_to_4(*air, proof, &mut table_transcript, table_rap_challenges)
+            {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1179,13 +1175,8 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges = Self::replay_rounds_after_round_1(
-            air,
-            proof,
-            &domain,
-            transcript,
-            rap_challenges,
-        );
+        let challenges =
+            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
 
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;

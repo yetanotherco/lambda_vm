@@ -25,6 +25,7 @@ pub fn compute_lagrange_kernel<E: IsField>(r: &[FieldElement<E>]) -> Vec<FieldEl
 
     let mut s = vec![one.clone(); big_n];
 
+    #[allow(clippy::needless_range_loop)]
     for j in 0..n {
         let rj = &r[j];
         let one_minus_rj = &one - rj;
@@ -75,10 +76,7 @@ pub fn compute_lagrange_kernel<E: IsField>(r: &[FieldElement<E>]) -> Vec<FieldEl
 /// This is the inner product of `values` with the Lagrange kernel at `r`.
 ///
 /// Panics if `values.len()` is not a power of 2 or if `r.len() != log2(values.len())`.
-pub fn eval_mle<E: IsField>(
-    values: &[FieldElement<E>],
-    r: &[FieldElement<E>],
-) -> FieldElement<E> {
+pub fn eval_mle<E: IsField>(values: &[FieldElement<E>], r: &[FieldElement<E>]) -> FieldElement<E> {
     let n = r.len();
     let big_n = 1usize << n;
     assert_eq!(
@@ -106,10 +104,7 @@ pub fn eval_mle<E: IsField>(
 /// Uses `F * E -> E` multiplication directly (no `to_extension()` conversion).
 ///
 /// Panics if `values.len()` is not a power of 2 or if `r.len() != log2(values.len())`.
-pub fn eval_mle_base<F, E>(
-    values: &[FieldElement<F>],
-    r: &[FieldElement<E>],
-) -> FieldElement<E>
+pub fn eval_mle_base<F, E>(values: &[FieldElement<F>], r: &[FieldElement<E>]) -> FieldElement<E>
 where
     F: IsField + IsSubFieldOf<E>,
     E: IsField,

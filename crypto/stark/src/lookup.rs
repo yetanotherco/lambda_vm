@@ -127,7 +127,6 @@ pub fn logup_random_point_start(interactions: &[BusInteraction]) -> usize {
     LOGUP_GAMMA_POWERS_START + extract_column_indices(interactions).len()
 }
 
-
 // =============================================================================
 // Bus Types
 // =============================================================================
@@ -865,8 +864,7 @@ impl<
         // Add bridge running sum constraint for LogUp-GKR tables
         let mut all_constraints = transition_constraints;
         if num_interactions > 0 {
-            let column_indices =
-                extract_column_indices(&auxiliary_trace_build_data.interactions);
+            let column_indices = extract_column_indices(&auxiliary_trace_build_data.interactions);
             let bridge_constraint = LookupBridgeSumConstraint {
                 constraint_idx: all_constraints.len(),
                 column_indices,
@@ -1043,8 +1041,7 @@ where
                 let n = rap_challenges.len() - rp_start;
                 let mut l0_expected = FieldElement::<E>::one();
                 for j in 0..n {
-                    l0_expected *=
-                        FieldElement::<E>::one() - &rap_challenges[rp_start + j];
+                    l0_expected *= FieldElement::<E>::one() - &rap_challenges[rp_start + j];
                 }
                 // Aux column 0 is the Lagrange kernel; constrain l[0] = prod(1 - r_j)
                 boundary_constraints.push(BoundaryConstraint::new_aux(0, 0, l0_expected));
@@ -1434,7 +1431,6 @@ where
         .collect()
 }
 
-
 // =============================================================================
 // LogUp-GKR Bridge Running Sum
 // =============================================================================
@@ -1497,7 +1493,7 @@ pub(crate) fn extract_column_indices(interactions: &[BusInteraction]) -> Vec<usi
 /// Each row contains: `term[i] = sign_a * m_a[i] / fp_a[i] + sign_b * m_b[i] / fp_b[i]`
 ///
 /// Uses a single batch inversion for both fingerprint vectors (2*N elements).
-#[allow(clippy::needless_range_loop)]
+#[allow(dead_code, clippy::needless_range_loop)]
 fn compute_logup_batched_term_column<F, E>(
     interaction_a: &BusInteraction,
     interaction_b: &BusInteraction,
@@ -1796,7 +1792,6 @@ where
     }
 }
 
-
 // =============================================================================
 // LogUp-GKR Leaf Fraction Computation
 // =============================================================================
@@ -1882,6 +1877,7 @@ where
     z - &linear_combination
 }
 
+#[allow(dead_code)]
 fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     multiplicity: &Multiplicity,
@@ -1936,6 +1932,7 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Computes the fingerprint for an interaction from a `TableView`.
 ///
 /// Returns `z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)`
+#[allow(dead_code)]
 fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     interaction: &BusInteraction,
@@ -1965,6 +1962,7 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
 ///
 /// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
+#[allow(dead_code)]
 struct LookupBatchedTermConstraint {
     interaction_a: BusInteraction,
     interaction_b: BusInteraction,
@@ -1972,6 +1970,7 @@ struct LookupBatchedTermConstraint {
     constraint_idx: usize,
 }
 
+#[allow(dead_code)]
 impl LookupBatchedTermConstraint {
     pub fn new(
         interaction_a: BusInteraction,
@@ -2090,6 +2089,7 @@ where
 ///
 /// For 2 absorbed interactions:
 ///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
+#[allow(dead_code)]
 struct LookupAccumulatedConstraint {
     constraint_idx: usize,
     /// Number of committed term columns (excludes absorbed interactions)
@@ -2100,6 +2100,7 @@ struct LookupAccumulatedConstraint {
     absorbed: Vec<BusInteraction>,
 }
 
+#[allow(dead_code)]
 impl LookupAccumulatedConstraint {
     pub fn new(
         constraint_idx: usize,
@@ -2327,7 +2328,8 @@ where
             let mut running_d = FieldElement::<E>::one();
 
             for (k, inter) in interactions.iter().enumerate() {
-                let fp_k = compute_fingerprint_at_row(inter, main_segment_cols, row, z, &alpha_powers);
+                let fp_k =
+                    compute_fingerprint_at_row(inter, main_segment_cols, row, z, &alpha_powers);
                 let m_k = compute_multiplicity_at_row(inter, main_segment_cols, row);
 
                 // F * E -> E multiplication (no to_extension)
@@ -2349,7 +2351,7 @@ where
 // LogUp-GKR Integration
 // =============================================================================
 
-use crate::gkr::{build_summation_tree, gen_layers, gkr_prove, GkrProof, Layer};
+use crate::gkr::{GkrProof, Layer, build_summation_tree, gen_layers, gkr_prove};
 use crate::lagrange_kernel::{compute_lagrange_kernel, eval_mle_base_with_kernel};
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 
@@ -2454,7 +2456,10 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
                 }
             }
             Multiplicity::Sum3(a, b, c) => {
-                if !claim_map.contains_key(a) || !claim_map.contains_key(b) || !claim_map.contains_key(c) {
+                if !claim_map.contains_key(a)
+                    || !claim_map.contains_key(b)
+                    || !claim_map.contains_key(c)
+                {
                     return false;
                 }
             }
@@ -2917,6 +2922,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::clone_on_copy, clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
     use math::field::goldilocks::GoldilocksField;
@@ -2943,11 +2949,8 @@ mod tests {
         let main_segment_cols = vec![col0.clone()];
 
         // Single sender interaction: bus_id=1, Multiplicity::One, one Direct column
-        let interaction = BusInteraction::sender(
-            1u64,
-            Multiplicity::One,
-            Packing::Direct.columns(&[0]),
-        );
+        let interaction =
+            BusInteraction::sender(1u64, Multiplicity::One, Packing::Direct.columns(&[0]));
         let interactions = vec![interaction];
 
         // Challenges: z=100, alpha=3
@@ -2955,8 +2958,12 @@ mod tests {
         let alpha = FE::from(3u64);
         let challenges = vec![z.clone(), alpha.clone()];
 
-        let (numerators, denominators) =
-            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+        let (numerators, denominators) = compute_logup_leaf_fractions::<F, F>(
+            &interactions,
+            &main_segment_cols,
+            trace_len,
+            &challenges,
+        );
 
         assert_eq!(numerators.len(), trace_len);
         assert_eq!(denominators.len(), trace_len);
@@ -3009,19 +3016,20 @@ mod tests {
         let main_segment_cols = vec![col0.clone(), col1.clone()];
 
         // Receiver interaction: bus_id=0, Multiplicity from column 1
-        let interaction = BusInteraction::receiver(
-            0u64,
-            Multiplicity::Column(1),
-            Packing::Direct.columns(&[0]),
-        );
+        let interaction =
+            BusInteraction::receiver(0u64, Multiplicity::Column(1), Packing::Direct.columns(&[0]));
         let interactions = vec![interaction];
 
         let z = FE::from(50u64);
         let alpha = FE::from(7u64);
         let challenges = vec![z.clone(), alpha.clone()];
 
-        let (numerators, denominators) =
-            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+        let (numerators, denominators) = compute_logup_leaf_fractions::<F, F>(
+            &interactions,
+            &main_segment_cols,
+            trace_len,
+            &challenges,
+        );
 
         let alpha_powers = compute_alpha_powers(&alpha, 2);
 
@@ -3062,25 +3070,22 @@ mod tests {
         let main_segment_cols = vec![col0.clone(), col1.clone()];
 
         // Interaction 0: sender, bus_id=0, Multiplicity::One, column 0
-        let inter0 = BusInteraction::sender(
-            0u64,
-            Multiplicity::One,
-            Packing::Direct.columns(&[0]),
-        );
+        let inter0 = BusInteraction::sender(0u64, Multiplicity::One, Packing::Direct.columns(&[0]));
         // Interaction 1: receiver, bus_id=1, Multiplicity::One, column 1
-        let inter1 = BusInteraction::receiver(
-            1u64,
-            Multiplicity::One,
-            Packing::Direct.columns(&[1]),
-        );
+        let inter1 =
+            BusInteraction::receiver(1u64, Multiplicity::One, Packing::Direct.columns(&[1]));
         let interactions = vec![inter0, inter1];
 
         let z = FE::from(200u64);
         let alpha = FE::from(5u64);
         let challenges = vec![z.clone(), alpha.clone()];
 
-        let (numerators, denominators) =
-            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+        let (numerators, denominators) = compute_logup_leaf_fractions::<F, F>(
+            &interactions,
+            &main_segment_cols,
+            trace_len,
+            &challenges,
+        );
 
         let alpha_powers = compute_alpha_powers(&alpha, 2);
 
@@ -3127,11 +3132,8 @@ mod tests {
         let col0: Vec<FE> = (1..=8).map(|v| FE::from(v as u64)).collect();
         let main_segment_cols = vec![col0];
 
-        let interaction = BusInteraction::sender(
-            2u64,
-            Multiplicity::One,
-            Packing::Direct.columns(&[0]),
-        );
+        let interaction =
+            BusInteraction::sender(2u64, Multiplicity::One, Packing::Direct.columns(&[0]));
 
         let z = FE::from(1000u64);
         let alpha = FE::from(11u64);
