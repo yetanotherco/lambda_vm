@@ -1048,8 +1048,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Linear(vec![
-                    LinearTerm::Column { coefficient: 1, column: cols::OR },
-                    LinearTerm::Column { coefficient: 2, column: cols::XOR },
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::OR,
+                    },
+                    LinearTerm::Column {
+                        coefficient: 2,
+                        column: cols::XOR,
+                    },
                 ]),
             ],
         ));
