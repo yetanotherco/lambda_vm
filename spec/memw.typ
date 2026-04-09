@@ -5,6 +5,7 @@
   render_chip_column_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_padding_table
 )
@@ -24,8 +25,9 @@ in order to satisfy the design of the memory argument (@memory).
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_memw_interactions = compute_nr_interactions(chip)
 
-The `MEMW` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #memw chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions
@@ -73,6 +75,7 @@ The table can be padded to the next power of two with the following value assign
 
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
 #let aligned = raw(alignedchip.name)
+#let nr_aligned_interactions = compute_nr_interactions(alignedchip)
 
 When a memory access happens at an address with proper alignment for its access size
 (i.e., adding the access size to `base_address`'s lowest limb does not overflow), 
@@ -87,7 +90,7 @@ Further logic remains essentially the same, so we briefly present the relevant t
 #let nr_variables = total_nr_variables(alignedchip)
 #let nr_columns = total_nr_instantiated_columns(alignedchip, config)
 
-The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns.
+The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns; it leverages #nr_aligned_interactions interactions.
 #render_chip_column_table(alignedchip, config)
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
@@ -119,8 +122,9 @@ Note moreover that this chip does not guard against misaligned register access f
 == Columns
 #let nr_variables = total_nr_variables(register_chip)
 #let nr_columns = total_nr_instantiated_columns(register_chip, config)
+#let nr_memw_r_interactions = compute_nr_interactions(register_chip)
 
-The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_r_interactions interactions:
 #render_chip_column_table(register_chip, config)
 
 == Assumptions

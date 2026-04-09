@@ -24,6 +24,76 @@
   .sum()
 }
 
+// Given a constraint, compute the number of interactions it induces
+#let get_constraint_interaction_count(constraint) = {
+  let iters = if "iters" in constraint {
+    constraint.iters
+  } else if "iter" in constraint {
+    (constraint.iter,)
+  } else {
+    ()
+  }
+
+  iters.map(i => {
+    assert(
+      i.len() == 3 and type(i.at(1)) == int and type(i.at(2)) == int,
+      message: "invalid iter: " + repr(i),
+    )
+    i.at(2) - i.at(1) + 1
+  })
+  .product(default: 1)
+}
+
+// Compute the number of interactions performed by `chip` and
+// store it as metadata under the `<interaction_count>` label
+// with tag `chip.name`. This tag is overwritten by `name` when specified.
+#let set_nr_interactions(chip, name: none) = {
+  if name == none {
+      name = chip.name
+    }
+
+  let constraints = chip
+    .constraints
+    .values()
+    .flatten()
+
+  // nr. of direct interactions
+  let nr-direct-interactions = constraints
+    .filter(c => c.kind == "interaction")
+    .map(get_constraint_interaction_count)
+    .sum(default: 0)
+  
+  let template-constraints = constraints.filter(c => c.kind == "template")
+
+  context {
+    let lookup-table = query(<interaction_count>).map(x => x.value).sum(default: (:))
+
+    // nr. of indirect interactions through templates
+    let nr-indirect-interactions = template-constraints
+      .map(c => {
+        assert(c.tag in lookup-table, message: "cannot find interaction_count for " + repr(c))
+
+        let template-interactions = lookup-table.at(c.tag)
+        let iter-size = get_constraint_interaction_count(c)
+        iter-size * template-interactions 
+      })
+      .sum(default: 0)
+
+    let total-nr-interactions = nr-direct-interactions + nr-indirect-interactions
+
+    [#metadata((str(name): total-nr-interactions)) <interaction_count>]
+  }
+}
+
+#let compute_nr_interactions(chip) = {
+  set_nr_interactions(chip)
+  context {
+    let lut = query(<interaction_count>).map(c => c.value).sum(default: (:))
+    assert(chip.name in lut, message: "no interaction_count specified for " + repr(chip.name))
+    lut.at(chip.name)
+  }
+}
+
 // Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
 // Prepend `name` to every iterator, if given.
 #let iters_of(obj, name: none) = {

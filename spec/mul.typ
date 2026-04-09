@@ -4,6 +4,7 @@
   render_chip_column_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_assumptions,
   render_chip_padding_table,
@@ -22,8 +23,9 @@ as well as providing access to the low and high halfs of the multiplication resu
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The `MUL` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #mul chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 #let stackrel(top, bottom) = {
