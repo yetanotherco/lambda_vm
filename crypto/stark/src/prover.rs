@@ -692,7 +692,13 @@ pub trait IsStarkProver<
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
             let result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, &**twiddles, main_pool, aux_pool,
+                *air,
+                *trace,
+                domain,
+                metadata,
+                &**twiddles,
+                main_pool,
+                aux_pool,
             )
             .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
