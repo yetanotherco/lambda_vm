@@ -2349,20 +2349,24 @@ where
 // LogUp-GKR Integration
 // =============================================================================
 
-use crate::gkr::{build_summation_tree, gkr_prove, GkrProof};
+use crate::gkr::{build_summation_tree, gen_layers, gkr_prove, GkrProof, Layer};
 use crate::lagrange_kernel::{compute_lagrange_kernel, eval_mle_base_with_kernel};
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 
 /// Result of running the LogUp-GKR sub-protocol for a single table.
 ///
-/// Contains the GKR proof, the random evaluation point, leaf-level claims,
-/// and MLE claims for each distinct main trace column used in bus interactions.
+/// Contains the GKR proof (if single-instance mode), the random evaluation point,
+/// leaf-level claims, and MLE claims for each distinct main trace column used in
+/// bus interactions.
+///
+/// In batch mode, the GKR proof lives in `MultiProof::batch_gkr_proof` and
+/// `gkr_proof` is `None`.
 #[derive(Debug, Clone)]
 pub struct LogUpGkrResult<E: IsField> {
     /// Total table contribution (claimed_sum from GKR root = sum of all fractions).
     pub table_contribution: FieldElement<E>,
-    /// The complete GKR proof for the summation tree.
-    pub gkr_proof: GkrProof<E>,
+    /// The complete GKR proof for the summation tree (None in batch mode).
+    pub gkr_proof: Option<GkrProof<E>>,
     /// The random evaluation point produced by the GKR protocol (length = log2(trace_len)).
     pub random_point: Vec<FieldElement<E>>,
     /// Claimed MLE evaluation of the leaf numerator at the random point.
@@ -2727,6 +2731,82 @@ fn multiplicity_from_claims<E: IsField>(
     }
 }
 
+/// Compute the GKR layer tree for a single table's bus interactions.
+///
+/// This performs steps 1-2 of the LogUp-GKR protocol:
+/// 1. Computes per-row leaf fractions (numerator, denominator) from interactions
+/// 2. Builds the full layer tree via `gen_layers`
+///
+/// Returns `Vec<Layer<E>>` suitable for passing to `gkr_prove_batch`.
+pub fn compute_logup_layers<F, E>(
+    interactions: &[BusInteraction],
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+) -> Vec<Layer<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let (numerators, denominators) =
+        compute_logup_leaf_fractions(interactions, main_segment_cols, trace_len, challenges);
+
+    let input_layer = Layer::LogUpGeneric {
+        numerators,
+        denominators,
+    };
+    gen_layers(input_layer)
+}
+
+/// Finalize a LogUp-GKR result from batch GKR output for a single table.
+///
+/// This performs steps 4-5 of the LogUp-GKR protocol:
+/// 4. Extracts MLE claims for each distinct main trace column at the random point
+/// 5. Computes the Lagrange kernel for reuse in aux trace construction
+///
+/// Called after `gkr_prove_batch` distributes per-instance results.
+pub fn finalize_logup_gkr_result<F, E>(
+    interactions: &[BusInteraction],
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    random_point: Vec<FieldElement<E>>,
+    n_claim: FieldElement<E>,
+    d_claim: FieldElement<E>,
+    table_contribution: FieldElement<E>,
+) -> LogUpGkrResult<E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    // Extract column claims — compute MLE at the random point for each
+    // distinct main trace column index referenced by any interaction.
+    let col_indices = extract_column_indices(interactions);
+
+    // Compute kernel once and reuse for all column claims (and later for aux trace)
+    let kernel = compute_lagrange_kernel(&random_point);
+
+    #[cfg(feature = "parallel")]
+    let col_iter = col_indices.into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let col_iter = col_indices.into_iter();
+
+    let column_claims: Vec<(usize, FieldElement<E>)> = col_iter
+        .map(|col_idx| {
+            let claim = eval_mle_base_with_kernel(&main_segment_cols[col_idx], &kernel);
+            (col_idx, claim)
+        })
+        .collect();
+
+    LogUpGkrResult {
+        table_contribution,
+        gkr_proof: None,
+        random_point,
+        n_claim,
+        d_claim,
+        column_claims,
+        lagrange_kernel: kernel,
+    }
+}
+
 /// Run the LogUp-GKR sub-protocol for a single table's bus interactions.
 ///
 /// This function:
@@ -2827,7 +2907,7 @@ where
 
     LogUpGkrResult {
         table_contribution,
-        gkr_proof,
+        gkr_proof: Some(gkr_proof),
         random_point,
         n_claim,
         d_claim,

@@ -1650,31 +1650,87 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase B': GKR sub-protocol (main transcript)
+        // Round 1, Phase B': Batch GKR sub-protocol (main transcript)
         // =====================================================================
-        // For each table with bus interactions, run the LogUp-GKR sub-protocol.
+        // Compute leaf layers for all tables, then run a single batch GKR proof.
         // GKR messages are bound to the main Fiat-Shamir chain so the verifier
         // can replay them.
 
-        let gkr_results: Vec<Option<LogUpGkrResult<FieldExtension>>> = air_trace_pairs
-            .iter()
-            .map(|(air, trace, _)| {
-                if air.has_trace_interaction() {
-                    let interactions = air.bus_interactions();
-                    let main_segment_cols = trace.columns_main();
-                    let trace_len = trace.num_rows();
-                    Some(crate::lookup::run_logup_gkr(
-                        interactions,
-                        &main_segment_cols,
-                        trace_len,
-                        &lookup_challenges,
-                        transcript,
-                    ))
+        // Step 1: Compute GKR layer trees for each table with bus interactions.
+        let mut leaf_layers_per_table: Vec<Vec<crate::gkr::Layer<FieldExtension>>> = Vec::new();
+        let mut gkr_table_indices: Vec<usize> = Vec::new();
+        for (idx, (air, trace, _)) in air_trace_pairs.iter().enumerate() {
+            if air.has_trace_interaction() {
+                let interactions = air.bus_interactions();
+                let main_segment_cols = trace.columns_main();
+                let trace_len = trace.num_rows();
+                let layers = crate::lookup::compute_logup_layers(
+                    interactions,
+                    &main_segment_cols,
+                    trace_len,
+                    &lookup_challenges,
+                );
+                leaf_layers_per_table.push(layers);
+                gkr_table_indices.push(idx);
+            }
+        }
+
+        // Step 2: Run batch GKR (single proof for all tables).
+        let batch_gkr_proof = if !leaf_layers_per_table.is_empty() {
+            let n_layers_by_instance: Vec<usize> = leaf_layers_per_table
+                .iter()
+                .map(|layers| layers.len() - 1)
+                .collect();
+            let (batch_proof, shared_random_point, per_instance_claims) =
+                crate::gkr::gkr_prove_batch(leaf_layers_per_table, transcript);
+
+            // Step 3: Distribute batch results to per-table LogUpGkrResult.
+            let mut gkr_results_vec: Vec<Option<LogUpGkrResult<FieldExtension>>> =
+                vec![None; num_airs];
+            for (i, &table_idx) in gkr_table_indices.iter().enumerate() {
+                let (n_claim, d_claim) = per_instance_claims[i].clone();
+                let table_contribution = batch_proof.root_claims[i].clone();
+                // Compute table_contribution as n/d (the rational root value).
+                // The root_claims store (numerator, denominator) of the summation tree root.
+                let (root_n, root_d) = table_contribution;
+
+                // The instance eval point for this table
+                let n_vars = n_layers_by_instance[i];
+                let instance_point =
+                    crate::gkr::instance_eval_point(&shared_random_point, n_vars);
+
+                let air = air_trace_pairs[table_idx].0;
+                let trace = &air_trace_pairs[table_idx].1;
+                let interactions = air.bus_interactions();
+                let main_segment_cols = trace.columns_main();
+
+                // Compute the claimed_sum (table contribution) as a single field element.
+                // For the bus balance check, we need n/d as an element.
+                // The summation tree root stores n/d where the claimed_sum = n/d.
+                // We compute it by inverting d and multiplying by n.
+                let table_contrib = if root_d == FieldElement::one() {
+                    root_n
                 } else {
-                    None
-                }
-            })
-            .collect();
+                    &root_n * &root_d.inv().expect("GKR root denominator must be non-zero")
+                };
+
+                let result = crate::lookup::finalize_logup_gkr_result(
+                    interactions,
+                    &main_segment_cols,
+                    instance_point,
+                    n_claim,
+                    d_claim,
+                    table_contrib,
+                );
+                gkr_results_vec[table_idx] = Some(result);
+            }
+
+            (Some(batch_proof), gkr_results_vec)
+        } else {
+            (None, vec![None; num_airs])
+        };
+
+        let (batch_gkr_proof_opt, gkr_results) = batch_gkr_proof;
 
         // =====================================================================
         // Round 1, Phase B'': Sample γ for bridge batching (main transcript)
@@ -1966,9 +2022,14 @@ pub trait IsStarkProver<
                         domain,
                     )?;
 
-                    // Attach LogUp-GKR proof from Phase B' (if this table had bus interactions)
+                    // Attach LogUp-GKR proof metadata from Phase B'.
+                    // In batch mode, gkr_proof is None (the real proof is in MultiProof::batch_gkr_proof).
+                    // We still store random_point and column_claims for per-table verification.
                     proof.logup_gkr_proof = metadata.logup_gkr_result.as_ref().map(|r| LogUpGkrProof {
-                        gkr_proof: r.gkr_proof.clone(),
+                        gkr_proof: r.gkr_proof.clone().unwrap_or_else(|| crate::gkr::GkrProof {
+                            claimed_sum: r.table_contribution.clone(),
+                            layer_proofs: vec![],
+                        }),
                         random_point: r.random_point.clone(),
                         column_claims: r.column_claims.clone(),
                     });
@@ -2033,7 +2094,10 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof { proofs })
+        Ok(MultiProof {
+            proofs,
+            batch_gkr_proof: batch_gkr_proof_opt,
+        })
     }
 
     /// Generate a STARK proof for a single AIR/trace.

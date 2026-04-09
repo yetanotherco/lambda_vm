@@ -791,72 +791,111 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Phase B': Replay GKR proofs (main transcript)
+        // Phase B': Replay batch GKR proof (main transcript)
         // =====================================================================
-        // For each table with bus interactions, replay the GKR verification
-        // on the main transcript. This must match the prover's Phase B' exactly.
+        // Verify the batch GKR proof once, then distribute per-instance claims
+        // to each table. This must match the prover's Phase B' exactly.
 
         let mut gkr_bridge_claims: Vec<Vec<(usize, FieldElement<FieldExtension>)>> =
             Vec::with_capacity(airs.len());
         let mut gkr_random_points: Vec<Vec<FieldElement<FieldExtension>>> =
             Vec::with_capacity(airs.len());
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+        // Collect which tables have interactions (and their n_layers)
+        let mut gkr_table_indices: Vec<usize> = Vec::new();
+        let mut n_layers_by_instance: Vec<usize> = Vec::new();
+        for (idx, air) in airs.iter().enumerate() {
             if air.has_trace_interaction() {
-                let gkr_proof = match &proof.logup_gkr_proof {
-                    Some(p) => p,
-                    None => {
-                        #[cfg(not(feature = "test_fiat_shamir"))]
-                        error!(
-                            "Table {idx}: AIR has interactions but proof missing logup_gkr_proof"
-                        );
-                        return false;
-                    }
-                };
+                gkr_table_indices.push(idx);
+                let trace_len = multi_proof.proofs[idx].trace_length;
+                let n_vars = trace_len.trailing_zeros() as usize;
+                n_layers_by_instance.push(n_vars);
+            }
+        }
 
-                // Replay GKR verification on the main transcript
-                match crate::gkr::gkr_verify(&gkr_proof.gkr_proof, transcript) {
-                    Ok((_random_point, n_claim, d_claim)) => {
+        if !gkr_table_indices.is_empty() {
+            let batch_proof = match &multi_proof.batch_gkr_proof {
+                Some(p) => p,
+                None => {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Tables have bus interactions but MultiProof missing batch_gkr_proof");
+                    return false;
+                }
+            };
+
+            // Verify batch GKR proof
+            match crate::gkr::gkr_verify_batch(batch_proof, &n_layers_by_instance, transcript) {
+                Ok((shared_random_point, per_instance_claims)) => {
+                    // Distribute per-instance results to each table
+                    // Initialize all tables with empty claims
+                    for _ in 0..airs.len() {
+                        gkr_bridge_claims.push(Vec::new());
+                        gkr_random_points.push(Vec::new());
+                    }
+
+                    for (i, &table_idx) in gkr_table_indices.iter().enumerate() {
+                        let air = airs[table_idx];
+                        let proof = &multi_proof.proofs[table_idx];
+
+                        let gkr_proof_data = match &proof.logup_gkr_proof {
+                            Some(p) => p,
+                            None => {
+                                #[cfg(not(feature = "test_fiat_shamir"))]
+                                error!(
+                                    "Table {table_idx}: AIR has interactions but proof missing logup_gkr_proof"
+                                );
+                                return false;
+                            }
+                        };
+
+                        let (n_claim, d_claim) = &per_instance_claims[i];
+
                         // Validate column_claims length matches AIR-expected column set
                         let expected_cols = extract_column_indices(air.bus_interactions());
-                        if gkr_proof.column_claims.len() != expected_cols.len() {
+                        if gkr_proof_data.column_claims.len() != expected_cols.len() {
                             #[cfg(not(feature = "test_fiat_shamir"))]
                             error!(
-                                "Table {idx}: column_claims length mismatch: got {}, expected {}",
-                                gkr_proof.column_claims.len(),
+                                "Table {table_idx}: column_claims length mismatch: got {}, expected {}",
+                                gkr_proof_data.column_claims.len(),
                                 expected_cols.len()
                             );
                             return false;
                         }
 
-                        // Verify that column_claims are consistent with GKR output.
-                        // A malicious prover could provide fake column_claims that don't
-                        // match the (n_claim, d_claim) returned by GKR verification.
+                        // Verify that column_claims are consistent with GKR output
                         if !crate::lookup::reconstruct_and_verify_gkr_claims(
-                            &n_claim,
-                            &d_claim,
-                            &gkr_proof.column_claims,
+                            n_claim,
+                            d_claim,
+                            &gkr_proof_data.column_claims,
                             air.bus_interactions(),
                             &lookup_challenges,
                         ) {
                             #[cfg(not(feature = "test_fiat_shamir"))]
                             error!(
-                                "Table {idx}: GKR column claims verification failed — \
+                                "Table {table_idx}: GKR column claims verification failed — \
                                  column_claims are inconsistent with GKR output (n_claim, d_claim)"
                             );
                             return false;
                         }
-                    }
-                    Err(_e) => {
-                        #[cfg(not(feature = "test_fiat_shamir"))]
-                        error!("Table {idx}: GKR verification failed: {:?}", _e);
-                        return false;
+
+                        gkr_bridge_claims[table_idx] = gkr_proof_data.column_claims.clone();
+
+                        // Compute the instance eval point from the shared random point
+                        let n_vars = n_layers_by_instance[i];
+                        let instance_point =
+                            crate::gkr::instance_eval_point(&shared_random_point, n_vars);
+                        gkr_random_points[table_idx] = instance_point;
                     }
                 }
-
-                gkr_bridge_claims.push(gkr_proof.column_claims.clone());
-                gkr_random_points.push(gkr_proof.random_point.clone());
-            } else {
+                Err(_e) => {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Batch GKR verification failed: {:?}", _e);
+                    return false;
+                }
+            }
+        } else {
+            // No tables with interactions - fill with empty claims
+            for _ in 0..airs.len() {
                 gkr_bridge_claims.push(Vec::new());
                 gkr_random_points.push(Vec::new());
             }
@@ -933,9 +972,17 @@ pub trait IsStarkVerifier<
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-                if air.has_trace_interaction() && let Some(ref gkr_proof) = proof.logup_gkr_proof {
-                    total = total + &gkr_proof.gkr_proof.claimed_sum;
+            if let Some(ref batch_proof) = multi_proof.batch_gkr_proof {
+                // Sum the table contributions from the batch GKR root claims.
+                // Each root_claim is (numerator, denominator); the rational value n/d
+                // is the table's contribution.
+                for (root_n, root_d) in &batch_proof.root_claims {
+                    let contrib = if *root_d == FieldElement::one() {
+                        root_n.clone()
+                    } else {
+                        root_n * &root_d.inv().expect("GKR root denominator must be non-zero")
+                    };
+                    total = total + &contrib;
                 }
             }
 
@@ -968,6 +1015,7 @@ pub trait IsStarkVerifier<
     {
         let multi_proof = MultiProof {
             proofs: vec![proof.clone()],
+            batch_gkr_proof: None,
         };
         Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }

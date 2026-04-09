@@ -5,7 +5,7 @@ use math::field::{
 };
 
 use crate::{
-    config::Commitment, fri::fri_decommit::FriDecommitment, gkr::GkrProof,
+    config::Commitment, fri::fri_decommit::FriDecommitment, gkr::{BatchGkrProof, GkrProof},
     lookup::BusPublicInputs, table::Table,
 };
 
@@ -93,4 +93,9 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
+    /// Batch GKR proof when multiple tables share a single GKR verification.
+    /// Per-table `logup_gkr_proof` contains the column_claims and random_point,
+    /// while this field contains the shared batch proof.
+    #[serde(default)]
+    pub batch_gkr_proof: Option<BatchGkrProof<E>>,
 }

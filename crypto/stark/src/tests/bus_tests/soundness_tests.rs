@@ -805,13 +805,19 @@ fn test_tampered_gkr_column_claims_rejected() {
 fn test_tampered_gkr_claimed_sum_rejected() {
     let (mut multi_proof, airs) = generate_valid_multi_proof();
 
-    // Tamper with the ADD table's GKR claimed_sum (table index 1).
-    let add_proof = &mut multi_proof.proofs[1];
-    if let Some(ref mut gkr_proof) = add_proof.logup_gkr_proof {
-        gkr_proof.gkr_proof.claimed_sum =
-            gkr_proof.gkr_proof.claimed_sum.clone() + FieldElement::one();
+    // Tamper with the batch GKR proof's root_claims for the ADD table (instance 1).
+    // In batch mode, the bus balance check uses batch_gkr_proof.root_claims,
+    // not the per-table logup_gkr_proof.gkr_proof.claimed_sum.
+    if let Some(ref mut batch_proof) = multi_proof.batch_gkr_proof {
+        assert!(
+            batch_proof.root_claims.len() > 1,
+            "batch proof must have multiple root_claims"
+        );
+        // Tamper the ADD table's root claim (instance index 1, numerator)
+        batch_proof.root_claims[1].0 =
+            batch_proof.root_claims[1].0.clone() + FieldElement::one();
     } else {
-        panic!("ADD table must have a logup_gkr_proof");
+        panic!("MultiProof must have a batch_gkr_proof");
     }
 
     let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
@@ -892,32 +898,37 @@ fn test_tampered_sigma_ood_rejected() {
     );
 }
 
-/// Tampered Lagrange kernel random_point is rejected.
+/// Tampered batch GKR child claims alter random_point, causing rejection.
 ///
 /// The Lagrange kernel column l[i] is constrained by a boundary constraint:
 ///   l[0] = prod_{j=0}^{n-1} (1 - r_j)
-/// where r_j are the GKR random point coordinates stored in the proof.
+/// where r_j are the GKR random point coordinates derived from the batch proof.
 ///
-/// If we tamper with the random_point in the proof, the verifier will compute
-/// a different expected l[0] value from the (now-corrupted) random_point, which
-/// will not match the committed l[0] in the trace. This causes the boundary
-/// constraint check to fail.
+/// If we tamper with a child_claims entry in the batch GKR proof, the verifier
+/// will derive a different random_point, which will not match the committed
+/// Lagrange kernel in the trace. This causes the GKR gate check or downstream
+/// boundary constraint check to fail.
 #[test_log::test]
 fn test_tampered_lagrange_kernel_random_point_rejected() {
     let (mut multi_proof, airs) = generate_valid_multi_proof();
 
-    // Tamper with the random_point in the CPU table's LogUp-GKR proof.
-    let cpu_proof = &mut multi_proof.proofs[0];
-    if let Some(ref mut gkr_proof) = cpu_proof.logup_gkr_proof {
+    // Tamper with the batch GKR proof's child_claims in the first layer.
+    // This corrupts the GKR verification, changing the derived random_point.
+    if let Some(ref mut batch_proof) = multi_proof.batch_gkr_proof {
         assert!(
-            !gkr_proof.random_point.is_empty(),
-            "CPU must have a non-empty random_point"
+            !batch_proof.layer_proofs.is_empty(),
+            "batch proof must have layer_proofs"
         );
-        // Corrupt the first coordinate by adding 1.
-        gkr_proof.random_point[0] =
-            gkr_proof.random_point[0].clone() + FieldElement::one();
+        // Corrupt the first child claim of the first layer proof.
+        let layer = &mut batch_proof.layer_proofs[0];
+        assert!(
+            !layer.child_claims_by_instance.is_empty(),
+            "layer must have child_claims"
+        );
+        layer.child_claims_by_instance[0][0] =
+            layer.child_claims_by_instance[0][0].clone() + FieldElement::one();
     } else {
-        panic!("CPU table must have a logup_gkr_proof");
+        panic!("MultiProof must have a batch_gkr_proof");
     }
 
     let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
@@ -930,7 +941,7 @@ fn test_tampered_lagrange_kernel_random_point_rejected() {
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         ),
-        "Tampered random_point must cause verification failure (Lagrange kernel boundary constraint)"
+        "Tampered batch GKR child claims must cause verification failure"
     );
 }
 

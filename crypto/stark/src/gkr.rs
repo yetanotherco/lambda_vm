@@ -1517,7 +1517,7 @@ pub fn gkr_prove_batch<E: IsField>(
 ///   `[shared_point[0] (eta)] ++ shared_point[len - (n_vars - 1)..]`
 ///
 /// Returns an empty vec for n_vars == 0 (trivial/output layers).
-fn instance_eval_point<E: IsField>(
+pub(crate) fn instance_eval_point<E: IsField>(
     shared_point: &[FieldElement<E>],
     n_vars: usize,
 ) -> Vec<FieldElement<E>> {
