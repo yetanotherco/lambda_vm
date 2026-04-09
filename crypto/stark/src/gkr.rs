@@ -550,6 +550,7 @@ pub fn gkr_prove<E: IsField>(
                 // Phase 1: Suffix rounds (first suffix_len rounds)
                 // Process variables current_point[0..suffix_len].
                 // eq_suffix is halved each round; eq_prefix stays fixed.
+                #[allow(clippy::needless_range_loop)]
                 for round_idx in 0..suffix_len {
                     let r_round = &current_point[round_idx];
                     let half = nl_table.len() / 2;
@@ -567,42 +568,41 @@ pub fn gkr_prove<E: IsField>(
                     // weighted by eq_prefix, then weight by eq_suffix.
                     //
                     // h_raw(t) = Σ_s eq_suffix[s] * Σ_p eq_prefix[p] * gate(t, p*suffix_half + s)
-                    let compute_suffix_contribution =
-                        |suffix_idx: usize| -> [FieldElement<E>; 2] {
-                            let eq_s = &eq_suffix[suffix_idx];
-                            let mut contrib_h0 = FieldElement::<E>::zero();
-                            let mut contrib_h2 = FieldElement::<E>::zero();
+                    let compute_suffix_contribution = |suffix_idx: usize| -> [FieldElement<E>; 2] {
+                        let eq_s = &eq_suffix[suffix_idx];
+                        let mut contrib_h0 = FieldElement::<E>::zero();
+                        let mut contrib_h2 = FieldElement::<E>::zero();
 
-                            for prefix_idx in 0..prefix_size {
-                                let j = prefix_idx * suffix_half + suffix_idx;
-                                let eq_p = &eq_prefix[prefix_idx];
+                        #[allow(clippy::needless_range_loop)]
+                        for prefix_idx in 0..prefix_size {
+                            let j = prefix_idx * suffix_half + suffix_idx;
+                            let eq_p = &eq_prefix[prefix_idx];
 
-                                let nl_l = &nl_table[2 * j];
-                                let nl_r = &nl_table[2 * j + 1];
-                                let nr_l = &nr_table[2 * j];
-                                let nr_r = &nr_table[2 * j + 1];
-                                let dl_l = &dl_table[2 * j];
-                                let dl_r = &dl_table[2 * j + 1];
-                                let dr_l = &dr_table[2 * j];
-                                let dr_r = &dr_table[2 * j + 1];
+                            let nl_l = &nl_table[2 * j];
+                            let nl_r = &nl_table[2 * j + 1];
+                            let nr_l = &nr_table[2 * j];
+                            let nr_r = &nr_table[2 * j + 1];
+                            let dl_l = &dl_table[2 * j];
+                            let dl_r = &dl_table[2 * j + 1];
+                            let dr_l = &dr_table[2 * j];
+                            let dr_r = &dr_table[2 * j + 1];
 
-                                // t=0: gate = nl*dr + dl*(nr + lambda*dr)
-                                let gate_0 =
-                                    &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
-                                contrib_h0 = &contrib_h0 + &(eq_p * &gate_0);
+                            // t=0: gate = nl*dr + dl*(nr + lambda*dr)
+                            let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                            contrib_h0 = &contrib_h0 + &(eq_p * &gate_0);
 
-                                // t=2: val = 2*right - left
-                                let nl_2 = &(nl_r + nl_r) - nl_l;
-                                let nr_2 = &(nr_r + nr_r) - nr_l;
-                                let dl_2 = &(dl_r + dl_r) - dl_l;
-                                let dr_2 = &(dr_r + dr_r) - dr_l;
-                                let gate_2 =
-                                    &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
-                                contrib_h2 = &contrib_h2 + &(eq_p * &gate_2);
-                            }
+                            // t=2: val = 2*right - left
+                            let nl_2 = &(nl_r + nl_r) - nl_l;
+                            let nr_2 = &(nr_r + nr_r) - nr_l;
+                            let dl_2 = &(dl_r + dl_r) - dl_l;
+                            let dr_2 = &(dr_r + dr_r) - dr_l;
+                            let gate_2 =
+                                &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                            contrib_h2 = &contrib_h2 + &(eq_p * &gate_2);
+                        }
 
-                            [eq_s * &contrib_h0, eq_s * &contrib_h2]
-                        };
+                        [eq_s * &contrib_h0, eq_s * &contrib_h2]
+                    };
 
                     let zero2 = || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
                     let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
@@ -699,8 +699,7 @@ pub fn gkr_prove<E: IsField>(
                 // Use eq_prefix as the eq_table for standard Dao-Thaler halving.
                 let mut eq_table = eq_prefix;
 
-                for round_idx in suffix_len..parent_num_vars {
-                    let r_round = &current_point[round_idx];
+                for r_round in current_point.iter().take(parent_num_vars).skip(suffix_len) {
                     let half = nl_table.len() / 2;
                     let one = FieldElement::<E>::one();
 
@@ -722,16 +721,14 @@ pub fn gkr_prove<E: IsField>(
                         let dr_l = &dr_table[2 * j];
                         let dr_r = &dr_table[2 * j + 1];
 
-                        let gate_0 =
-                            &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                        let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
                         let h0 = eq_rem * &gate_0;
 
                         let nl_2 = &(nl_r + nl_r) - nl_l;
                         let nr_2 = &(nr_r + nr_r) - nr_l;
                         let dl_2 = &(dl_r + dl_r) - dl_l;
                         let dr_2 = &(dr_r + dr_r) - dr_l;
-                        let gate_2 =
-                            &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                        let gate_2 = &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
                         let h2 = eq_rem * &gate_2;
 
                         [h0, h2]
@@ -858,16 +855,14 @@ pub fn gkr_prove<E: IsField>(
                         let dr_l = &dr_table[2 * j];
                         let dr_r = &dr_table[2 * j + 1];
 
-                        let gate_0 =
-                            &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                        let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
                         let h0 = eq_rem * &gate_0;
 
                         let nl_2 = &(nl_r + nl_r) - nl_l;
                         let nr_2 = &(nr_r + nr_r) - nr_l;
                         let dl_2 = &(dl_r + dl_r) - dl_l;
                         let dr_2 = &(dr_r + dr_r) - dr_l;
-                        let gate_2 =
-                            &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                        let gate_2 = &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
                         let h2 = eq_rem * &gate_2;
 
                         [h0, h2]
@@ -1473,6 +1468,18 @@ pub fn gkr_prove_batch<E: IsField>(
                 sum
             };
 
+            // Per-instance round polynomial evals, used to update combined_claims
+            // via O(1) interpolation instead of O(N) table scan.
+            let mut per_instance_evals: Vec<[FieldElement<E>; 4]> = vec![
+                [
+                    FieldElement::zero(),
+                    FieldElement::zero(),
+                    FieldElement::zero(),
+                    FieldElement::zero()
+                ];
+                per_instance_tables.len()
+            ];
+
             for round_idx in 0..max_parent_vars {
                 // For each active instance, compute the round poly contribution
                 let mut batch_s0 = FieldElement::<E>::zero();
@@ -1489,6 +1496,12 @@ pub fn gkr_prove_batch<E: IsField>(
                         let half_claim =
                             &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
                         // S(0) = S(1) = half_claim, S(2) = S(3) = half_claim (constant)
+                        per_instance_evals[idx] = [
+                            half_claim.clone(),
+                            half_claim.clone(),
+                            half_claim.clone(),
+                            half_claim.clone(),
+                        ];
                         batch_s0 = &batch_s0 + &(&alpha_pow * &half_claim);
                         batch_s1 = &batch_s1 + &(&alpha_pow * &half_claim);
                         batch_s2 = &batch_s2 + &(&alpha_pow * &half_claim);
@@ -1504,6 +1517,12 @@ pub fn gkr_prove_batch<E: IsField>(
                         // Already reduced to constant
                         let half_claim =
                             &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
+                        per_instance_evals[idx] = [
+                            half_claim.clone(),
+                            half_claim.clone(),
+                            half_claim.clone(),
+                            half_claim.clone(),
+                        ];
                         batch_s0 = &batch_s0 + &(&alpha_pow * &half_claim);
                         batch_s1 = &batch_s1 + &(&alpha_pow * &half_claim);
                         batch_s2 = &batch_s2 + &(&alpha_pow * &half_claim);
@@ -1602,6 +1621,7 @@ pub fn gkr_prove_batch<E: IsField>(
                         - &FieldElement::<E>::from(2u64);
                     let s3 = &eq_at_3 * &h3;
 
+                    per_instance_evals[idx] = [s0.clone(), s1.clone(), s2.clone(), s3.clone()];
                     batch_s0 = &batch_s0 + &(&alpha_pow * &s0);
                     batch_s1 = &batch_s1 + &(&alpha_pow * &s1);
                     batch_s2 = &batch_s2 + &(&alpha_pow * &s2);
@@ -1620,26 +1640,23 @@ pub fn gkr_prove_batch<E: IsField>(
                 let challenge: FieldElement<E> = transcript.sample_field_element();
                 _round_combined_claim = round_poly.evaluate(&challenge);
 
-                // Update per-instance: fold tables and update eq_correction
+                // Update per-instance: fold tables, update eq_correction, and
+                // update combined_claims via O(1) polynomial evaluation (not O(N) table scan).
                 for (idx, tables) in per_instance_tables.iter_mut().enumerate() {
+                    // Update combined_claims from saved per-instance round poly evals.
+                    // S_i(challenge) via degree-3 Lagrange interpolation at {0,1,2,3}.
+                    let [ref si0, ref si1, ref si2, ref si3] = per_instance_evals[idx];
+                    let instance_poly =
+                        RoundPoly::new(vec![si0.clone(), si1.clone(), si2.clone(), si3.clone()]);
+                    combined_claims[idx] = instance_poly.evaluate(&challenge);
+
                     let n_unused = max_parent_vars - tables.parent_num_vars;
-                    if round_idx < n_unused {
-                        // Instance hasn't started yet: its per-instance polynomial is
-                        // constant = claim/2 at all evaluation points.
-                        // p_i(challenge) = claim_i / 2.
-                        combined_claims[idx] =
-                            &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
+                    if round_idx < n_unused || tables.dl_table.len() / 2 == 0 {
                         continue;
                     }
 
                     let instance_round = round_idx - n_unused;
                     let half = tables.dl_table.len() / 2;
-
-                    if half == 0 {
-                        combined_claims[idx] =
-                            &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
-                        continue;
-                    }
 
                     // Update eq_correction using instance-specific eval point
                     let r_round = &tables.instance_point[instance_round];
@@ -1650,6 +1667,15 @@ pub fn gkr_prove_batch<E: IsField>(
 
                     // Fold gate tables
                     let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                        #[cfg(feature = "parallel")]
+                        if half >= 256 {
+                            let folded: Vec<FieldElement<E>> = table
+                                .par_chunks(2)
+                                .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                                .collect();
+                            *table = folded;
+                            return;
+                        }
                         for j in 0..half {
                             let left = &table[2 * j];
                             let right = &table[2 * j + 1];
@@ -1664,39 +1690,6 @@ pub fn gkr_prove_batch<E: IsField>(
                     }
                     fold_table(&mut tables.dl_table);
                     fold_table(&mut tables.dr_table);
-
-                    // Update per-instance combined claim
-                    // The per-instance round poly evaluated at challenge:
-                    // We need to recompute. Actually, the combined_claim for the batch
-                    // already accounts for all instances. But we need per-instance claims
-                    // for the next round. Let's just evaluate the per-instance sum at the
-                    // challenge point using the folded tables.
-                    // After folding, the tables have `half` elements. The per-instance claim
-                    // for next round = sum over j of eq_table[j] * gate(j) * eq_correction
-                    // But that's expensive. Instead, use the identity:
-                    // new_claim = S_i(challenge) where S_i is this instance's round poly.
-                    // We already computed S_i(0) and S_i(1) = claim_i - S_i(0).
-                    // For non-trivial instances, we can use the round poly evaluation directly.
-                    // Let's recompute per-instance sum from the folded tables.
-                    let mut new_claim = FieldElement::<E>::zero();
-                    let new_half = tables.dl_table.len();
-                    if tables.is_singles {
-                        for j in 0..new_half {
-                            let eq_rem = &tables.eq_table[j];
-                            let gate = &(&tables.dl_table[j] + &tables.dr_table[j])
-                                + &(&lambda * &(&tables.dl_table[j] * &tables.dr_table[j]));
-                            new_claim = &new_claim + &(eq_rem * &gate);
-                        }
-                    } else {
-                        for j in 0..new_half {
-                            let eq_rem = &tables.eq_table[j];
-                            let gate = &(&tables.nl_table[j] * &tables.dr_table[j])
-                                + &(&tables.dl_table[j]
-                                    * &(&tables.nr_table[j] + &(&lambda * &tables.dr_table[j])));
-                            new_claim = &new_claim + &(eq_rem * &gate);
-                        }
-                    }
-                    combined_claims[idx] = &tables.eq_correction * &new_claim;
                 }
 
                 round_polys.push(round_poly);
@@ -2847,9 +2840,8 @@ mod tests {
     #[test]
     fn test_batch_gkr_same_size_instances() {
         // 3 instances, all with 4 leaves (n_vars=2, 3 layers each)
-        let instances: Vec<Vec<Layer<GoldilocksField>>> = (0..3)
-            .map(|_| gen_layers(make_generic_leaf(2)))
-            .collect();
+        let instances: Vec<Vec<Layer<GoldilocksField>>> =
+            (0..3).map(|_| gen_layers(make_generic_leaf(2))).collect();
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let (proof, shared_point, final_claims) =
@@ -2895,7 +2887,11 @@ mod tests {
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let result = gkr_verify_batch(&proof, &n_layers, &mut verifier_transcript);
-        assert!(result.is_ok(), "mixed-size batch verify failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "mixed-size batch verify failed: {:?}",
+            result.err()
+        );
 
         let (v_point, v_claims) = result.unwrap();
         assert_eq!(v_point, shared_point);
@@ -2906,10 +2902,10 @@ mod tests {
     fn test_batch_gkr_mixed_size_with_singles() {
         // Mix of Generic and Singles leaves with different sizes
         let instances: Vec<Vec<Layer<GoldilocksField>>> = vec![
-            gen_layers(make_singles_leaf(2)),  // 3 layers
-            gen_layers(make_generic_leaf(3)),  // 4 layers
-            gen_layers(make_singles_leaf(5)),  // 6 layers
-            gen_layers(make_generic_leaf(4)),  // 5 layers
+            gen_layers(make_singles_leaf(2)), // 3 layers
+            gen_layers(make_generic_leaf(3)), // 4 layers
+            gen_layers(make_singles_leaf(5)), // 6 layers
+            gen_layers(make_generic_leaf(4)), // 5 layers
         ];
 
         let n_layers: Vec<usize> = instances.iter().map(|l| l.len() - 1).collect();
@@ -2920,7 +2916,11 @@ mod tests {
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let result = gkr_verify_batch(&proof, &n_layers, &mut verifier_transcript);
-        assert!(result.is_ok(), "mixed singles/generic batch verify failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "mixed singles/generic batch verify failed: {:?}",
+            result.err()
+        );
 
         let (v_point, v_claims) = result.unwrap();
         assert_eq!(v_point, shared_point);
@@ -2946,7 +2946,11 @@ mod tests {
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let result = gkr_verify_batch(&proof, &n_layers, &mut verifier_transcript);
-        assert!(result.is_ok(), "many mixed instances batch verify failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "many mixed instances batch verify failed: {:?}",
+            result.err()
+        );
 
         let (v_point, v_claims) = result.unwrap();
         assert_eq!(v_point, shared_point);

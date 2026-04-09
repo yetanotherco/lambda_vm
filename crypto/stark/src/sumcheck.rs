@@ -24,7 +24,10 @@ impl<E: IsField> RoundPoly<E> {
     /// `evals[i]` is the polynomial evaluated at x = i.
     /// The polynomial has degree `evals.len() - 1`.
     pub fn new(evals: Vec<FieldElement<E>>) -> Self {
-        assert!(!evals.is_empty(), "RoundPoly must have at least one evaluation");
+        assert!(
+            !evals.is_empty(),
+            "RoundPoly must have at least one evaluation"
+        );
         Self { evals }
     }
 
@@ -91,8 +94,7 @@ impl<E: IsField> RoundPoly<E> {
 
         // Append point_minus_j values; batch-invert everything in one call
         to_invert.extend(point_minus_j.iter().cloned());
-        FieldElement::inplace_batch_inverse(&mut to_invert)
-            .expect("All values are nonzero");
+        FieldElement::inplace_batch_inverse(&mut to_invert).expect("All values are nonzero");
 
         let (w_inv, pm_inv) = to_invert.split_at(d + 1);
 
@@ -404,7 +406,12 @@ mod tests {
     fn test_evaluate_at_random_point_cubic() {
         // p(x) = x^3 + 2x^2 + 3x + 4
         // Need 4 evaluation points: 0, 1, 2, 3
-        let coeffs = [FE::from(4u64), FE::from(3u64), FE::from(2u64), FE::from(1u64)];
+        let coeffs = [
+            FE::from(4u64),
+            FE::from(3u64),
+            FE::from(2u64),
+            FE::from(1u64),
+        ];
         let evals: Vec<FE> = (0..4)
             .map(|i| eval_poly_coeffs(&coeffs, &FE::from(i as u64)))
             .collect();
@@ -493,12 +500,7 @@ mod tests {
         for x in [0u64, 1, 2, 3, 4, 5, 10, 100, 12345] {
             let point = FE::from(x);
             let expected = eval_poly_coeffs(&coeffs, &point);
-            assert_eq!(
-                poly.evaluate(&point),
-                expected,
-                "Mismatch at x = {}",
-                x
-            );
+            assert_eq!(poly.evaluate(&point), expected, "Mismatch at x = {}", x);
         }
     }
 

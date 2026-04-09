@@ -37,9 +37,7 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
-use super::lookup::{
-    BusPublicInputs, LogUpGkrResult, extend_rap_challenges_with_bridge,
-};
+use super::lookup::{BusPublicInputs, LogUpGkrResult, extend_rap_challenges_with_bridge};
 use super::proof::stark::{DeepPolynomialOpening, LogUpGkrProof, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
@@ -671,7 +669,13 @@ pub trait IsStarkProver<
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
             let result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, &**twiddles, main_pool, aux_pool,
+                *air,
+                *trace,
+                domain,
+                metadata,
+                &**twiddles,
+                main_pool,
+                aux_pool,
             )
             .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
@@ -1696,8 +1700,7 @@ pub trait IsStarkProver<
 
                 // The instance eval point for this table
                 let n_vars = n_layers_by_instance[i];
-                let instance_point =
-                    crate::gkr::instance_eval_point(&shared_random_point, n_vars);
+                let instance_point = crate::gkr::instance_eval_point(&shared_random_point, n_vars);
 
                 let air = air_trace_pairs[table_idx].0;
                 let trace = &air_trace_pairs[table_idx].1;
@@ -1754,9 +1757,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        for ((air, trace, _), gkr_result) in
-            air_trace_pairs.iter_mut().zip(gkr_results.iter())
-        {
+        for ((air, trace, _), gkr_result) in air_trace_pairs.iter_mut().zip(gkr_results.iter()) {
             if air.has_trace_interaction() {
                 if let Some(result) = gkr_result {
                     let kernel = &result.lagrange_kernel;
@@ -1779,12 +1780,11 @@ pub trait IsStarkProver<
                     // So σ[0] = 0 (start), σ[i+1] = σ[i] + l[i]·batched[i] - Δ.
                     // The circular wrap-around at row N-1 requires σ[0] = σ[N-1] + l[N-1]·batched[N-1] - Δ,
                     // which telescopes to: 0 = Σ l[i]·batched[i] - N·Δ = target - target.
-                    let (bridge_offset, gamma_powers) =
-                        crate::lookup::compute_bridge_params(
-                            &result.column_claims,
-                            &gamma,
-                            trace_len,
-                        );
+                    let (bridge_offset, gamma_powers) = crate::lookup::compute_bridge_params(
+                        &result.column_claims,
+                        &gamma,
+                        trace_len,
+                    );
                     let main_cols = trace.columns_main();
 
                     // Pre-compute batched values in parallel: batched[i] = Σ_j main_cols[col_j][i] * γ^j
@@ -1807,6 +1807,7 @@ pub trait IsStarkProver<
                     // Set σ[0] = 0, then build forward: σ[i+1] = σ[i] + l[i]*batched[i] - Δ
                     trace.set_aux(0, 1, FieldElement::<FieldExtension>::zero());
                     let mut sigma = FieldElement::<FieldExtension>::zero();
+                    #[allow(clippy::needless_range_loop)]
                     for row in 0..trace_len - 1 {
                         let l_val = trace.get_aux(row, 0);
                         sigma = sigma + l_val * &batched_values[row] - &bridge_offset;
@@ -1901,10 +1902,8 @@ pub trait IsStarkProver<
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut gkr_results_iter = gkr_results.into_iter();
-        for ((main_commit, (aux_tree, aux_root)), idx) in main_commits
-            .into_iter()
-            .zip(aux_results)
-            .zip(0..num_airs)
+        for ((main_commit, (aux_tree, aux_root)), idx) in
+            main_commits.into_iter().zip(aux_results).zip(0..num_airs)
         {
             let gkr_result = gkr_results_iter.next().unwrap();
 
@@ -2025,14 +2024,17 @@ pub trait IsStarkProver<
                     // Attach LogUp-GKR proof metadata from Phase B'.
                     // In batch mode, gkr_proof is None (the real proof is in MultiProof::batch_gkr_proof).
                     // We still store random_point and column_claims for per-table verification.
-                    proof.logup_gkr_proof = metadata.logup_gkr_result.as_ref().map(|r| LogUpGkrProof {
-                        gkr_proof: r.gkr_proof.clone().unwrap_or_else(|| crate::gkr::GkrProof {
-                            claimed_sum: r.table_contribution.clone(),
-                            layer_proofs: vec![],
-                        }),
-                        random_point: r.random_point.clone(),
-                        column_claims: r.column_claims.clone(),
-                    });
+                    proof.logup_gkr_proof =
+                        metadata.logup_gkr_result.as_ref().map(|r| LogUpGkrProof {
+                            gkr_proof: r.gkr_proof.clone().unwrap_or_else(|| {
+                                crate::gkr::GkrProof {
+                                    claimed_sum: r.table_contribution.clone(),
+                                    layer_proofs: vec![],
+                                }
+                            }),
+                            random_point: r.random_point.clone(),
+                            column_claims: r.column_claims.clone(),
+                        });
 
                     // Collect per-table sub-op timing via TLS.
                     // Both the store (inside prove_rounds_2_to_4) and this take run on the

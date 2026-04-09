@@ -2,6 +2,7 @@
 //!
 //! These tests verify that the verifier correctly rejects proofs that violate
 //! the bus balance invariant.
+#![allow(clippy::clone_on_copy, clippy::type_complexity)]
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -774,14 +775,15 @@ fn test_tampered_gkr_column_claims_rejected() {
             !gkr_proof.column_claims.is_empty(),
             "CPU must have column claims"
         );
-        gkr_proof.column_claims[0].1 =
-            gkr_proof.column_claims[0].1.clone() + FieldElement::one();
+        gkr_proof.column_claims[0].1 = gkr_proof.column_claims[0].1.clone() + FieldElement::one();
     } else {
         panic!("CPU table must have a logup_gkr_proof");
     }
 
-    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
 
     assert!(
         !Verifier::multi_verify(
@@ -814,14 +816,15 @@ fn test_tampered_gkr_claimed_sum_rejected() {
             "batch proof must have multiple root_claims"
         );
         // Tamper the ADD table's root claim (instance index 1, numerator)
-        batch_proof.root_claims[1].0 =
-            batch_proof.root_claims[1].0.clone() + FieldElement::one();
+        batch_proof.root_claims[1].0 = batch_proof.root_claims[1].0.clone() + FieldElement::one();
     } else {
         panic!("MultiProof must have a batch_gkr_proof");
     }
 
-    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
 
     assert!(
         !Verifier::multi_verify(
@@ -847,8 +850,10 @@ fn test_missing_gkr_proof_rejected() {
     // ADD has bus interactions, so the verifier will reject.
     multi_proof.proofs[1].logup_gkr_proof = None;
 
-    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
 
     assert!(
         !Verifier::multi_verify(
@@ -879,13 +884,16 @@ fn test_tampered_sigma_ood_rejected() {
     let num_main_cpu = 5usize;
     let sigma_col_ood_idx = num_main_cpu + 1; // aux column 1 = sigma
     let cpu_proof = &mut multi_proof.proofs[0];
-    let corrupted = *cpu_proof.trace_ood_evaluations.get(0, sigma_col_ood_idx) + FieldElement::one();
+    let corrupted =
+        *cpu_proof.trace_ood_evaluations.get(0, sigma_col_ood_idx) + FieldElement::one();
     cpu_proof
         .trace_ood_evaluations
         .set(0, sigma_col_ood_idx, corrupted);
 
-    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
 
     assert!(
         !Verifier::multi_verify(
@@ -931,8 +939,10 @@ fn test_tampered_lagrange_kernel_random_point_rejected() {
         panic!("MultiProof must have a batch_gkr_proof");
     }
 
-    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
 
     assert!(
         !Verifier::multi_verify(
