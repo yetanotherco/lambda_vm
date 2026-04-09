@@ -4,12 +4,13 @@
 //! same old_timestamp. Most operations (aligned memory + all register accesses)
 //! route here instead of the heavier MEMW table.
 //!
-//! ## Column layout (30 columns)
+//! ## Column layout (29 columns)
 //!
 //! - `is_register`: Bit
-//! - `base_address_high`: Word (32-bit high word)
-//! - `base_address_mid`: Half (16-bit mid)
-//! - `base_address_low[2]`: Bytes (low 2 bytes)
+//! - `base_address[3]`: DWordWHH
+//!   - `base_address[0]`: Half (low 16 bits)
+//!   - `base_address[1]`: Half (mid 16 bits)
+//!   - `base_address[2]`: Word (high 32 bits)
 //! - `value[8]`: BaseField[8]
 //! - `timestamp`: DWordWL (2 cols)
 //! - `write2/4/8`: Bit (access width flags)
@@ -18,14 +19,20 @@
 //! - `mu_read`, `mu_write`: multiplicity columns
 //!
 //! ## Bus Interactions (20)
-//! - 1 AND_BYTE[base_address_low[0], mask] → 0 (alignment check)
+//! - 1 IS_HALF[base_address[0] + mask] (range check: address span fits in 16 bits)
 //! - 1 LT[old_timestamp, timestamp, 0] → 1
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
 //!
+//! ## Constraints (4 total)
+//! - IS_BIT<μ_sum> (1)
+//! - w2 => μ_sum (1)
+//! - IS_BIT<μ_read> (1)
+//! - IS_BIT<μ_write> (1)
+//!
 //! ## Assumptions (caller's responsibility, not enforced here)
-//! - MEMW_A-A2: IS_HALF[base_address_mid]
-//! - MEMW_A-A3.i: IS_BYTE[base_address_low[i]] for i ∈ [0, 1]
+//! - IS_HALF[base_address[i]] for i ∈ [0, 1]
+//! - IS_WORD[base_address[2]]
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -37,44 +44,43 @@ use stark::traits::TransitionEvaluationContext;
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW_A table chunk.
 pub const MAX_ROWS: usize = super::max_rows::MEMW_A;
 
 // =========================================================================
-// Column indices (30 columns)
+// Column indices (29 columns)
 // =========================================================================
 
 pub mod cols {
     pub const IS_REGISTER: usize = 0;
 
-    /// base_address decomposed: high = addr >> 32 (Word, 32-bit)
-    pub const BASE_ADDRESS_HIGH: usize = 1;
-    /// base_address decomposed: mid = (addr >> 16) & 0xFFFF (Half, 16-bit)
-    pub const BASE_ADDRESS_MID: usize = 2;
-    /// base_address decomposed: low bytes
-    /// low[0] = addr & 0xFF, low[1] = (addr >> 8) & 0xFF
-    pub const BASE_ADDRESS_LOW: [usize; 2] = [3, 4];
+    /// base_address: DWordWHH (3 columns)
+    /// base_address[0] = low half (bits 0-15)
+    /// base_address[1] = mid half (bits 16-31)
+    /// base_address[2] = high word (bits 32-63)
+    pub const BASE_ADDRESS: [usize; 3] = [1, 2, 3];
 
-    pub const VALUE: [usize; 8] = [5, 6, 7, 8, 9, 10, 11, 12];
+    pub const VALUE: [usize; 8] = [4, 5, 6, 7, 8, 9, 10, 11];
 
-    pub const TIMESTAMP_0: usize = 13;
-    pub const TIMESTAMP_1: usize = 14;
+    pub const TIMESTAMP_0: usize = 12;
+    pub const TIMESTAMP_1: usize = 13;
 
-    pub const WRITE2: usize = 15;
-    pub const WRITE4: usize = 16;
-    pub const WRITE8: usize = 17;
+    pub const WRITE2: usize = 14;
+    pub const WRITE4: usize = 15;
+    pub const WRITE8: usize = 16;
 
-    pub const OLD: [usize; 8] = [18, 19, 20, 21, 22, 23, 24, 25];
+    pub const OLD: [usize; 8] = [17, 18, 19, 20, 21, 22, 23, 24];
 
     /// Single old_timestamp (shared across all bytes, since they're aligned)
-    pub const OLD_TIMESTAMP_0: usize = 26;
-    pub const OLD_TIMESTAMP_1: usize = 27;
+    pub const OLD_TIMESTAMP_0: usize = 25;
+    pub const OLD_TIMESTAMP_1: usize = 26;
 
-    pub const MU_READ: usize = 28;
-    pub const MU_WRITE: usize = 29;
+    pub const MU_READ: usize = 27;
+    pub const MU_WRITE: usize = 28;
 
-    pub const NUM_COLUMNS: usize = 30;
+    pub const NUM_COLUMNS: usize = 29;
 }
 
 // =========================================================================
@@ -96,17 +102,18 @@ pub fn generate_memw_aligned_trace(
 
         data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
 
-        // Decompose base_address
+        // Decompose base_address as DWordWHH:
+        // base_address[0] = low half (bits 0-15)
+        // base_address[1] = mid half (bits 16-31)
+        // base_address[2] = high word (bits 32-63)
         let addr = op.base_address;
-        let high = addr >> 32;
-        let mid = (addr >> 16) & 0xFFFF;
-        let low_1 = (addr >> 8) & 0xFF;
-        let low_0 = addr & 0xFF;
+        let addr_low_half = addr & 0xFFFF;
+        let addr_mid_half = (addr >> 16) & 0xFFFF;
+        let addr_high_word = addr >> 32;
 
-        data[base + cols::BASE_ADDRESS_HIGH] = FE::from(high);
-        data[base + cols::BASE_ADDRESS_MID] = FE::from(mid);
-        data[base + cols::BASE_ADDRESS_LOW[0]] = FE::from(low_0);
-        data[base + cols::BASE_ADDRESS_LOW[1]] = FE::from(low_1);
+        data[base + cols::BASE_ADDRESS[0]] = FE::from(addr_low_half);
+        data[base + cols::BASE_ADDRESS[1]] = FE::from(addr_mid_half);
+        data[base + cols::BASE_ADDRESS[2]] = FE::from(addr_high_word);
 
         for i in 0..8 {
             data[base + cols::VALUE[i]] = FE::from(op.value[i]);
@@ -145,39 +152,32 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
 
     // -------------------------------------------------------------------------
-    // BITWISE_BYTE[base_address_low[0], mask, 0, op_type=0(AND)] with μ_sum
-    // mask = write2*1 + write4*3 + write8*7
-    // This implicitly range-checks low[0] to [0, 256) AND checks alignment.
+    // IS_HALF[base_address[0] + write2 + 3*write4 + 7*write8] with μ_sum
+    // Range check: ensures base_address[0] + mask fits in 16 bits, so the
+    // byte-address span of the access doesn't overflow the low-half field element.
+    // Alignment itself is the caller's (CPU's) responsibility — see Assumptions above.
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::BitwiseByte,
+        BusId::IsHalfword,
         mu_sum.clone(),
-        vec![
-            // x = base_address_low[0]
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_LOW[0],
-                packing: Packing::Direct,
+        vec![BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BASE_ADDRESS[0],
             },
-            // y = mask = write2*1 + write4*3 + write8*7
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE2,
-                },
-                LinearTerm::Column {
-                    coefficient: 3,
-                    column: cols::WRITE4,
-                },
-                LinearTerm::Column {
-                    coefficient: 7,
-                    column: cols::WRITE8,
-                },
-            ]),
-            // result = 0 (alignment constraint: low bits must be 0)
-            BusValue::constant(0),
-            // op_type = 0 (AND)
-            BusValue::Linear(vec![LinearTerm::Constant(0)]),
-        ],
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE2,
+            },
+            LinearTerm::Column {
+                coefficient: 3,
+                column: cols::WRITE4,
+            },
+            LinearTerm::Column {
+                coefficient: 7,
+                column: cols::WRITE8,
+            },
+        ])],
     ));
 
     // -------------------------------------------------------------------------
@@ -203,30 +203,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Memory bus interactions (16 total)
     // -------------------------------------------------------------------------
-    // For aligned accesses, address for byte i:
-    //   lo = 2^16 * MID + 2^8 * LOW[1] + LOW[0] + i
-    //   hi = HIGH
-    // All old_timestamp references use the single old_timestamp columns.
+    // base_address as DWordWL:
+    //   lo32 = base_address[0] + 2^16 * base_address[1]
+    //   hi32 = base_address[2]
+    // For aligned accesses, address for byte i: lo32 + i (no carry since aligned)
 
-    // Virtual base_address_lo = 2^16 * MID + 2^8 * LOW[1] + LOW[0]
-    // For byte 0, the address is exactly this.
     let base_addr_lo = BusValue::linear(vec![
         LinearTerm::Column {
-            coefficient: 1 << 16,
-            column: cols::BASE_ADDRESS_MID,
-        },
-        LinearTerm::Column {
-            coefficient: 1 << 8,
-            column: cols::BASE_ADDRESS_LOW[1],
-        },
-        LinearTerm::Column {
             coefficient: 1,
-            column: cols::BASE_ADDRESS_LOW[0],
+            column: cols::BASE_ADDRESS[0],
+        },
+        LinearTerm::Column {
+            coefficient: 1 << 16,
+            column: cols::BASE_ADDRESS[1],
         },
     ]);
 
     let base_addr_hi = BusValue::Packed {
-        start_column: cols::BASE_ADDRESS_HIGH,
+        start_column: cols::BASE_ADDRESS[2],
         packing: Packing::Direct,
     };
 
@@ -286,20 +280,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let w2_mult = Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8);
 
     // CM18/19: byte 1 with w2
-    // For aligned accesses, adding 1 to the low byte never overflows to hi word
-    // (since alignment guarantees base_address_lo + width-1 < 2^32).
+    // For aligned accesses, adding 1 to lo32 never overflows (alignment guarantees it).
     let addr_1_lo = BusValue::linear(vec![
         LinearTerm::Column {
-            coefficient: 1 << 16,
-            column: cols::BASE_ADDRESS_MID,
-        },
-        LinearTerm::Column {
-            coefficient: 1 << 8,
-            column: cols::BASE_ADDRESS_LOW[1],
-        },
-        LinearTerm::Column {
             coefficient: 1,
-            column: cols::BASE_ADDRESS_LOW[0],
+            column: cols::BASE_ADDRESS[0],
+        },
+        LinearTerm::Column {
+            coefficient: 1 << 16,
+            column: cols::BASE_ADDRESS[1],
         },
         LinearTerm::Constant(1),
     ]);
@@ -358,16 +347,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for i in 2..=3 {
         let addr_i_lo = BusValue::linear(vec![
             LinearTerm::Column {
-                coefficient: 1 << 16,
-                column: cols::BASE_ADDRESS_MID,
-            },
-            LinearTerm::Column {
-                coefficient: 1 << 8,
-                column: cols::BASE_ADDRESS_LOW[1],
-            },
-            LinearTerm::Column {
                 coefficient: 1,
-                column: cols::BASE_ADDRESS_LOW[0],
+                column: cols::BASE_ADDRESS[0],
+            },
+            LinearTerm::Column {
+                coefficient: 1 << 16,
+                column: cols::BASE_ADDRESS[1],
             },
             LinearTerm::Constant(i as i64),
         ]);
@@ -427,16 +412,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for i in 4..=7 {
         let addr_i_lo = BusValue::linear(vec![
             LinearTerm::Column {
-                coefficient: 1 << 16,
-                column: cols::BASE_ADDRESS_MID,
-            },
-            LinearTerm::Column {
-                coefficient: 1 << 8,
-                column: cols::BASE_ADDRESS_LOW[1],
-            },
-            LinearTerm::Column {
                 coefficient: 1,
-                column: cols::BASE_ADDRESS_LOW[0],
+                column: cols::BASE_ADDRESS[0],
+            },
+            LinearTerm::Column {
+                coefficient: 1 << 16,
+                column: cols::BASE_ADDRESS[1],
             },
             LinearTerm::Constant(i as i64),
         ]);
@@ -495,8 +476,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // CO24: Read receiver (from CPU)
     // -------------------------------------------------------------------------
-    // The MEMW output bus fingerprint uses base_address as [lo32, hi32].
-    // Reconstruct: lo32 = 2^16*MID + 2^8*LOW[1] + LOW[0], hi32 = HIGH
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
         Multiplicity::Column(cols::MU_READ),
@@ -539,7 +518,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
             },
-            // base_address reconstructed as [lo32, hi32]
+            // base_address as DWordWL: [lo32, hi32]
             base_addr_lo.clone(),
             base_addr_hi.clone(),
             // value[8]
@@ -612,7 +591,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
             },
-            // base_address reconstructed
+            // base_address as DWordWL: [lo32, hi32]
             base_addr_lo,
             base_addr_hi,
             // value[8]
@@ -677,7 +656,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints (2 algebraic)
+// Constraints (4 total)
 // =========================================================================
 
 /// MEMW_A constraint kinds.
@@ -766,7 +745,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedC
     }
 }
 
-/// Creates all constraints for the MEMW_A table (2 total).
+/// Creates all constraints for the MEMW_A table (4 total).
 pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
     vec![
         Box::new(MemwAlignedConstraint::new(
@@ -777,6 +756,8 @@ pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, Goldil
             MemwAlignedConstraintKind::W2ImpliesMuSum,
             1,
         )),
+        Box::new(IsBitConstraint::unconditional(cols::MU_READ, 2)),
+        Box::new(IsBitConstraint::unconditional(cols::MU_WRITE, 3)),
     ]
 }
 
@@ -798,16 +779,14 @@ mod tests {
         assert!(trace.num_rows() >= 2);
 
         // Check address decomposition for op[1]: addr = 0x1000
-        // high = 0, mid = 0, low[1] = 0x10, low[0] = 0x00
-        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS_HIGH), FE::from(0u64));
-        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS_MID), FE::from(0u64));
+        // base_address[0] (low half)  = 0x1000
+        // base_address[1] (mid half)  = 0
+        // base_address[2] (high word) = 0
         assert_eq!(
-            *trace.get_main(1, cols::BASE_ADDRESS_LOW[1]),
-            FE::from(0x10u64)
+            *trace.get_main(1, cols::BASE_ADDRESS[0]),
+            FE::from(0x1000u64)
         );
-        assert_eq!(
-            *trace.get_main(1, cols::BASE_ADDRESS_LOW[0]),
-            FE::from(0x00u64)
-        );
+        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS[1]), FE::from(0u64));
+        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS[2]), FE::from(0u64));
     }
 }

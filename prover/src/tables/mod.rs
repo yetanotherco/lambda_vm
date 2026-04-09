@@ -14,7 +14,7 @@
 //! ## Memory Tables
 //!
 //! - **MEMW**: Memory word read/write table (unaligned/split-timestamp path, 49 cols, 26 interactions)
-//! - **MEMW_A**: Memory word read/write table (aligned fast path, 30 cols, 20 interactions)
+//! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
 //! - **PAGE**: Paged memory init/final table (one per used page)
 //! - **REGISTER**: Register init/final table (32 registers × 8 bytes = 256 rows)
@@ -52,7 +52,7 @@ pub use types::BusId;
 /// | Table   | Main | Bus | Eff.width | Max rows |
 /// |---------|------|-----|-----------|----------|
 /// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  30  |  20 |     90    |  2^19 *  |
+/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
 /// | CPU     |  74  |  40 |    194    |  2^19    |
 /// | DVRM    |  34  |  34 |    136    |  2^19    |
 /// | MUL     |  26  |  16 |     74    |  2^20    |
@@ -64,7 +64,7 @@ pub use types::BusId;
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
-    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 90
+    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
     pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
     pub const LT: usize = 1 << 21; // 2,097,152  — eff. width 42
