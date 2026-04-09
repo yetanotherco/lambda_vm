@@ -97,6 +97,7 @@ output = ["arr",
     ["idx", "m", ["+", ["*", 8, "i"], 4]]]
 multiplicity = "μ"
 iter = ["i", 0, 7]
+ref = "sha256:c:read_chunk"
 
 [[constraints.memory]]
 kind = "interaction"
@@ -149,6 +150,7 @@ output = ["arr",
 ]
 iter = ["i", 0, 3]
 multiplicity = "μ"
+ref = "sha256:c:read_state"
 
 [[constraint_groups]]
 name = "sched"

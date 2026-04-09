@@ -32,14 +32,7 @@ The `SHA256_M` interaction signature is used to represent the output of the mess
 The `SHA256_K` interaction signature is used to represent the `k` constants.
 It could either be instantiated with a (short) precomputed table, or through hardcoded LogUp contributions in this chip.
 For this exposition, we choose the former option, and present a table further below.
-Additionally, we introduce a #rotxor chip that takes as input `a`, `r0`, `r1`, `r2` (4-bit values) and a bit `last_rot` and computes
-$
-  cases(
-    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >>> r_2) quad "if" #`last_rot`,
-    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >> r_2) quad "if" #`!last_rot`
-  ),
-$
-where we let $>>>$ denote right rotation and $>>$ logical shift right.
+Additionally, we introduce a #rotxor chip to perform the common action of computing the XOR of three rotations (or shifts) of a word.
 
 Most of the structure and variable naming follows the pseudocode of the wikipedia page#footnote(link("https://web.archive.org/web/20260320010021/https://en.wikipedia.org/wiki/SHA-2#Pseudocode")).
 
@@ -56,7 +49,7 @@ The #sha256 chip leverages #nr_variables variables, spanning #nr_columns columns
 
 The first responsibility of the chip is to read the current state and message chunk from memory,
 passed as arguments through pointers.
-Since the memory ranges could overlap, we read the chunk first, before reading and writing the state at the next timestamp.
+Since the memory ranges could overlap, we read the chunk first (in @sha256:c:read_chunk, at timestamp `timestamp`), before reading and writing the state (in @sha256:c:read_state, at timestamp `timestamp + 1`).
 The addresses containing the state and the current chunk are passed in as arguments `A0 = x10` and `A1 = x11`, respectively.
 Note that following the SHA256 spec, this state and the chunks are read and written as big-endian.
 #render_constraint_table(sha256chip, config, groups: "memory")
@@ -149,7 +142,15 @@ Finally, we chain the rounds together through the interactions.
 
 = #rotxor chip
 
-Refer to the start of this chapter for the formulation of what this chip constrains.
+
+This chip takes as input `a`, `r0`, `r1`, `r2` (4-bit values) and a bit `last_rot` to compute
+$
+  cases(
+    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >>> r_2) quad "if" #`last_rot`,
+    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >> r_2) quad "if" #`!last_rot`
+  ),
+$
+where we let $>>>$ denote right rotation and $>>$ logical shift right.
 We choose this representation so that all shift amounts required fit into 4 bits,
 making the usage of `HWSL` more straightforward and avoid extra columns to represent more bits.
 
