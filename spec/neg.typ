@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, et
+#import "/book.typ": book-page, aside, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_variable_table, render_chip_assumptions, render_constraint_table, compute_nr_interactions,
 
@@ -61,7 +61,8 @@ $
 when `cond` is set.
 When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
-#par(strong("Note"))
-It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
-thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`.
-The input value `x` is still assumed to be range-checked, however.
+#aside("Missing range check?")[
+  It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
+  thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`.
+  The input value `x` is still assumed to be range-checked, however.
+]
