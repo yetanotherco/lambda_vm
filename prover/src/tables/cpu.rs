@@ -495,9 +495,9 @@ impl CpuOperation {
         let arg2 = self.compute_arg2();
         let res = self.compute_res();
 
-        let mut ops = Vec::with_capacity(27);
+        let mut ops = Vec::with_capacity(15);
 
-        // Register indices
+        // 3 IS_BYTE for register indices (single bytes, can't pair)
         ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             self.decode.rs1,
@@ -511,24 +511,18 @@ impl CpuOperation {
             self.decode.rd,
         ));
 
-        // ARG1[0..7], ARG2[0..7], RES[0..7]
-        for i in 0..8 {
-            ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
-                ((arg1 >> (i * 8)) & 0xFF) as u8,
-            ));
-        }
-        for i in 0..8 {
-            ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
-                ((arg2 >> (i * 8)) & 0xFF) as u8,
-            ));
-        }
-        for i in 0..8 {
-            ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
-                ((res >> (i * 8)) & 0xFF) as u8,
-            ));
+        // 12 IS_HALF for ARG1/ARG2/RES byte pairs
+        // Adjacent bytes are batched: IS_HALF(lo + 256*hi) replaces IS_BYTE(lo) + IS_BYTE(hi)
+        for value in [arg1, arg2, res] {
+            for i in 0..4 {
+                let lo = ((value >> (i * 16)) & 0xFF) as u8;
+                let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    lo,
+                    hi,
+                ));
+            }
         }
 
         ops
@@ -1949,42 +1943,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // IS_BYTE interactions (byte range checks, 27 total)
+    // Range checks (15 total: 3 IS_BYTE + 12 IS_HALF)
     // CPU-CR29: IS_BYTE[rs1], CPU-CR30: IS_BYTE[rs2], CPU-CR31: IS_BYTE[rd]
-    // CPU-CR32.i: IS_BYTE[arg1[i]], CPU-CR33.i: IS_BYTE[arg2[i]], CPU-CR34.i: IS_BYTE[res[i]]
+    // CPU-CR32.i: IS_HALF[arg1[2i] + 256*arg1[2i+1]] (i=0..3)
+    // CPU-CR33.i: IS_HALF[arg2[2i] + 256*arg2[2i+1]] (i=0..3)
+    // CPU-CR34.i: IS_HALF[res[2i] + 256*res[2i+1]] (i=0..3)
     // -------------------------------------------------------------------------
-    // Range-check all 27 byte columns: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7].
+    // RS1, RS2, RD are single-byte register indices — checked individually.
+    // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
+    // batched into halfword checks. IS_HALF(lo + 256*hi) implies both bytes
+    // are in [0, 256), so one halfword check replaces two byte checks.
     // Every CPU row (including padding) sends with Multiplicity::One.
-    let byte_columns: [usize; 27] = [
-        cols::RS1,
-        cols::RS2,
-        cols::RD,
-        cols::ARG1[0],
-        cols::ARG1[1],
-        cols::ARG1[2],
-        cols::ARG1[3],
-        cols::ARG1[4],
-        cols::ARG1[5],
-        cols::ARG1[6],
-        cols::ARG1[7],
-        cols::ARG2[0],
-        cols::ARG2[1],
-        cols::ARG2[2],
-        cols::ARG2[3],
-        cols::ARG2[4],
-        cols::ARG2[5],
-        cols::ARG2[6],
-        cols::ARG2[7],
-        cols::RES[0],
-        cols::RES[1],
-        cols::RES[2],
-        cols::RES[3],
-        cols::RES[4],
-        cols::RES[5],
-        cols::RES[6],
-        cols::RES[7],
-    ];
-    for col in byte_columns {
+    for col in [cols::RS1, cols::RS2, cols::RD] {
         interactions.push(BusInteraction::sender(
             BusId::IsByte,
             Multiplicity::One,
@@ -1993,6 +1963,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ));
+    }
+    for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
+        for i in 0..4 {
+            interactions.push(BusInteraction::sender(
+                BusId::IsHalfword,
+                Multiplicity::One,
+                vec![BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: arr[2 * i],
+                    },
+                    LinearTerm::Column {
+                        coefficient: 256,
+                        column: arr[2 * i + 1],
+                    },
+                ])],
+            ));
+        }
     }
 
     // ECALL interaction (single shared bus for HALT and COMMIT)
