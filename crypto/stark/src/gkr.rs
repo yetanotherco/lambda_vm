@@ -5,6 +5,10 @@ use math::field::{element::FieldElement, traits::IsField};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Minimum parent_num_vars for enabling Split-Value Optimization (SVO).
+/// Below this threshold, the standard flat eq_table approach is used.
+const SVO_THRESHOLD: usize = 8;
+
 // =============================================================================
 // Layer enum for gate-specialized GKR
 // =============================================================================
@@ -521,7 +525,6 @@ pub fn gkr_prove<E: IsField>(
             //
             // After suffix rounds, eq_suffix is absorbed into eq_correction, and
             // eq_prefix becomes the eq_table for the remaining prefix rounds.
-            const SVO_THRESHOLD: usize = 8;
             let use_svo = parent_num_vars >= SVO_THRESHOLD;
 
             if use_svo {
@@ -1439,7 +1442,17 @@ pub fn gkr_prove_batch<E: IsField>(
                         my_parent_num_vars
                     );
                     let inst_point = instance_eval_point(&current_point, my_parent_num_vars);
-                    let eq_table = compute_eq_evals(&inst_point);
+                    let use_svo = my_parent_num_vars >= SVO_THRESHOLD;
+                    let svo_suffix_len = if use_svo { my_parent_num_vars / 2 } else { 0 };
+
+                    let (eq_table, eq_prefix, eq_suffix) = if use_svo {
+                        let suffix = compute_eq_evals(&inst_point[..svo_suffix_len]);
+                        let prefix =
+                            compute_eq_evals(&inst_point[svo_suffix_len..my_parent_num_vars]);
+                        (Vec::new(), prefix, suffix)
+                    } else {
+                        (compute_eq_evals(&inst_point), Vec::new(), Vec::new())
+                    };
 
                     PerInstanceTables {
                         nl_table,
@@ -1451,6 +1464,10 @@ pub fn gkr_prove_batch<E: IsField>(
                         is_singles,
                         parent_num_vars: my_parent_num_vars,
                         instance_point: inst_point,
+                        use_svo,
+                        svo_suffix_len,
+                        eq_prefix,
+                        eq_suffix,
                     }
                 })
                 .collect();
@@ -1532,72 +1549,113 @@ pub fn gkr_prove_batch<E: IsField>(
                     }
 
                     // Eq polynomial factoring (same as single-instance prover).
-                    // Use the instance-specific eval point (not the shared current_point)
-                    // so that r_round matches the eq_table built from instance_eval_point.
                     let r_round = tables.instance_point[instance_round].clone();
-
-                    // Pre-halve eq_table
-                    for j in 0..half {
-                        tables.eq_table[j] = &tables.eq_table[2 * j] + &tables.eq_table[2 * j + 1];
-                    }
-                    tables.eq_table.truncate(half);
-
                     let one = FieldElement::<E>::one();
 
-                    // Compute h(0) and h(2) (inner sum without eq_round factor)
-                    let (raw_h0, raw_h2) = if tables.is_singles {
-                        // Singles gate: gate(t) = dl(t) + dr(t) + lambda * dl(t) * dr(t)
-                        // (numerators are all 1, so the fraction sum is 1/dl + 1/dr)
-                        let mut h0 = FieldElement::<E>::zero();
-                        let mut h2 = FieldElement::<E>::zero();
-                        for j in 0..half {
-                            let eq_rem = &tables.eq_table[j];
+                    // Helper: compute gate h(0) and h(2) for a generic pair at index j.
+                    let gate_generic = |tables: &PerInstanceTables<E>,
+                                        j: usize|
+                     -> [FieldElement<E>; 2] {
+                        let nl_l = &tables.nl_table[2 * j];
+                        let nl_r = &tables.nl_table[2 * j + 1];
+                        let nr_l = &tables.nr_table[2 * j];
+                        let nr_r = &tables.nr_table[2 * j + 1];
+                        let dl_l = &tables.dl_table[2 * j];
+                        let dl_r = &tables.dl_table[2 * j + 1];
+                        let dr_l = &tables.dr_table[2 * j];
+                        let dr_r = &tables.dr_table[2 * j + 1];
+
+                        let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                        let nl_2 = &(nl_r + nl_r) - nl_l;
+                        let nr_2 = &(nr_r + nr_r) - nr_l;
+                        let dl_2 = &(dl_r + dl_r) - dl_l;
+                        let dr_2 = &(dr_r + dr_r) - dr_l;
+                        let gate_2 = &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                        [gate_0, gate_2]
+                    };
+
+                    let gate_singles =
+                        |tables: &PerInstanceTables<E>, j: usize| -> [FieldElement<E>; 2] {
                             let dl_l = &tables.dl_table[2 * j];
                             let dl_r = &tables.dl_table[2 * j + 1];
                             let dr_l = &tables.dr_table[2 * j];
                             let dr_r = &tables.dr_table[2 * j + 1];
 
-                            // t=0
                             let gate_0 = &(dl_l + dr_l) + &(&lambda * &(dl_l * dr_l));
-                            h0 = &h0 + &(eq_rem * &gate_0);
-
-                            // t=2
                             let dl_2 = &(dl_r + dl_r) - dl_l;
                             let dr_2 = &(dr_r + dr_r) - dr_l;
                             let gate_2 = &(&dl_2 + &dr_2) + &(&lambda * &(&dl_2 * &dr_2));
-                            h2 = &h2 + &(eq_rem * &gate_2);
-                        }
-                        (h0, h2)
-                    } else {
-                        // Generic gate: nl*dr + dl*(nr + lambda*dr)
-                        let mut h0 = FieldElement::<E>::zero();
-                        let mut h2 = FieldElement::<E>::zero();
-                        for j in 0..half {
-                            let eq_rem = &tables.eq_table[j];
-                            let nl_l = &tables.nl_table[2 * j];
-                            let nl_r = &tables.nl_table[2 * j + 1];
-                            let nr_l = &tables.nr_table[2 * j];
-                            let nr_r = &tables.nr_table[2 * j + 1];
-                            let dl_l = &tables.dl_table[2 * j];
-                            let dl_r = &tables.dl_table[2 * j + 1];
-                            let dr_l = &tables.dr_table[2 * j];
-                            let dr_r = &tables.dr_table[2 * j + 1];
+                            [gate_0, gate_2]
+                        };
 
-                            // t=0
-                            let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
-                            h0 = &h0 + &(eq_rem * &gate_0);
+                    // Compute h(0) and h(2) using SVO or standard path.
+                    let (raw_h0, raw_h2) =
+                        if tables.use_svo && instance_round < tables.svo_suffix_len {
+                            // SVO suffix round: nested eq_suffix × (eq_prefix × gate) loop
+                            let suffix_half = tables.eq_suffix.len() / 2;
+                            let prefix_size = tables.eq_prefix.len();
 
-                            // t=2
-                            let nl_2 = &(nl_r + nl_r) - nl_l;
-                            let nr_2 = &(nr_r + nr_r) - nr_l;
-                            let dl_2 = &(dl_r + dl_r) - dl_l;
-                            let dr_2 = &(dr_r + dr_r) - dr_l;
-                            let gate_2 =
-                                &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
-                            h2 = &h2 + &(eq_rem * &gate_2);
-                        }
-                        (h0, h2)
-                    };
+                            // Pre-halve eq_suffix
+                            for j in 0..suffix_half {
+                                tables.eq_suffix[j] =
+                                    &tables.eq_suffix[2 * j] + &tables.eq_suffix[2 * j + 1];
+                            }
+                            tables.eq_suffix.truncate(suffix_half);
+
+                            let mut h0 = FieldElement::<E>::zero();
+                            let mut h2 = FieldElement::<E>::zero();
+                            for suffix_idx in 0..suffix_half {
+                                let eq_s = &tables.eq_suffix[suffix_idx];
+                                let mut ch0 = FieldElement::<E>::zero();
+                                let mut ch2 = FieldElement::<E>::zero();
+                                #[allow(clippy::needless_range_loop)]
+                                for prefix_idx in 0..prefix_size {
+                                    let j = prefix_idx * suffix_half + suffix_idx;
+                                    let eq_p = &tables.eq_prefix[prefix_idx];
+                                    let [g0, g2] = if tables.is_singles {
+                                        gate_singles(tables, j)
+                                    } else {
+                                        gate_generic(tables, j)
+                                    };
+                                    ch0 = &ch0 + &(eq_p * &g0);
+                                    ch2 = &ch2 + &(eq_p * &g2);
+                                }
+                                h0 = &h0 + &(eq_s * &ch0);
+                                h2 = &h2 + &(eq_s * &ch2);
+                            }
+                            (h0, h2)
+                        } else {
+                            // Standard path (non-SVO, or SVO prefix rounds after suffix is exhausted)
+                            if tables.use_svo && instance_round == tables.svo_suffix_len {
+                                // Transition: absorb remaining eq_suffix into eq_correction
+                                // and switch to eq_prefix as eq_table.
+                                debug_assert_eq!(tables.eq_suffix.len(), 1);
+                                tables.eq_correction = &tables.eq_correction * &tables.eq_suffix[0];
+                                tables.eq_table = std::mem::take(&mut tables.eq_prefix);
+                                tables.use_svo = false;
+                            }
+
+                            // Pre-halve eq_table
+                            for j in 0..half {
+                                tables.eq_table[j] =
+                                    &tables.eq_table[2 * j] + &tables.eq_table[2 * j + 1];
+                            }
+                            tables.eq_table.truncate(half);
+
+                            let mut h0 = FieldElement::<E>::zero();
+                            let mut h2 = FieldElement::<E>::zero();
+                            for j in 0..half {
+                                let eq_rem = &tables.eq_table[j];
+                                let [g0, g2] = if tables.is_singles {
+                                    gate_singles(tables, j)
+                                } else {
+                                    gate_generic(tables, j)
+                                };
+                                h0 = &h0 + &(eq_rem * &g0);
+                                h2 = &h2 + &(eq_rem * &g2);
+                            }
+                            (h0, h2)
+                        };
 
                     // Apply eq_correction
                     let total_h0 = &tables.eq_correction * &raw_h0;
@@ -1807,6 +1865,12 @@ struct PerInstanceTables<E: IsField> {
     /// The instance-specific evaluation point derived from the shared current_point.
     /// Used for r_round lookups in the Dao-Thaler eq factoring.
     instance_point: Vec<FieldElement<E>>,
+    // SVO (Split-Value Optimization) fields.
+    // When use_svo is true, eq is split into prefix × suffix for sqrt memory.
+    use_svo: bool,
+    svo_suffix_len: usize,
+    eq_prefix: Vec<FieldElement<E>>,
+    eq_suffix: Vec<FieldElement<E>>,
 }
 
 // =============================================================================
