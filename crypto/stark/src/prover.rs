@@ -1661,23 +1661,47 @@ pub trait IsStarkProver<
         // can replay them.
 
         // Step 1: Compute GKR layer trees for each table with bus interactions.
-        let mut leaf_layers_per_table: Vec<Vec<crate::gkr::Layer<FieldExtension>>> = Vec::new();
+        // Identify which tables participate, then compute layers in parallel.
         let mut gkr_table_indices: Vec<usize> = Vec::new();
-        for (idx, (air, trace, _)) in air_trace_pairs.iter().enumerate() {
+        for (idx, (air, _, _)) in air_trace_pairs.iter().enumerate() {
             if air.has_trace_interaction() {
+                gkr_table_indices.push(idx);
+            }
+        }
+
+        #[cfg(feature = "parallel")]
+        let leaf_layers_per_table: Vec<Vec<crate::gkr::Layer<FieldExtension>>> = gkr_table_indices
+            .par_iter()
+            .map(|&idx| {
+                let (air, trace, _) = &air_trace_pairs[idx];
                 let interactions = air.bus_interactions();
                 let main_segment_cols = trace.columns_main();
                 let trace_len = trace.num_rows();
-                let layers = crate::lookup::compute_logup_layers(
+                crate::lookup::compute_logup_layers(
                     interactions,
                     &main_segment_cols,
                     trace_len,
                     &lookup_challenges,
-                );
-                leaf_layers_per_table.push(layers);
-                gkr_table_indices.push(idx);
-            }
-        }
+                )
+            })
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let leaf_layers_per_table: Vec<Vec<crate::gkr::Layer<FieldExtension>>> = gkr_table_indices
+            .iter()
+            .map(|&idx| {
+                let (air, trace, _) = &air_trace_pairs[idx];
+                let interactions = air.bus_interactions();
+                let main_segment_cols = trace.columns_main();
+                let trace_len = trace.num_rows();
+                crate::lookup::compute_logup_layers(
+                    interactions,
+                    &main_segment_cols,
+                    trace_len,
+                    &lookup_challenges,
+                )
+            })
+            .collect();
 
         // Step 2: Run batch GKR (single proof for all tables).
         let batch_gkr_proof = if !leaf_layers_per_table.is_empty() {
@@ -1688,17 +1712,13 @@ pub trait IsStarkProver<
             let (batch_proof, shared_random_point, per_instance_claims) =
                 crate::gkr::gkr_prove_batch(leaf_layers_per_table, transcript);
 
-            // Step 3: Distribute batch results to per-table LogUpGkrResult.
-            let mut gkr_results_vec: Vec<Option<LogUpGkrResult<FieldExtension>>> =
-                vec![None; num_airs];
-            for (i, &table_idx) in gkr_table_indices.iter().enumerate() {
+            // Step 3: Distribute batch results to per-table LogUpGkrResult (parallel).
+            // Each table independently computes its Lagrange kernel and column MLE claims.
+            let finalize_one = |i: usize| -> (usize, LogUpGkrResult<FieldExtension>) {
+                let table_idx = gkr_table_indices[i];
                 let (n_claim, d_claim) = per_instance_claims[i].clone();
-                let table_contribution = batch_proof.root_claims[i].clone();
-                // Compute table_contribution as n/d (the rational root value).
-                // The root_claims store (numerator, denominator) of the summation tree root.
-                let (root_n, root_d) = table_contribution;
+                let (root_n, root_d) = batch_proof.root_claims[i].clone();
 
-                // The instance eval point for this table
                 let n_vars = n_layers_by_instance[i];
                 let instance_point = crate::gkr::instance_eval_point(&shared_random_point, n_vars);
 
@@ -1707,10 +1727,6 @@ pub trait IsStarkProver<
                 let interactions = air.bus_interactions();
                 let main_segment_cols = trace.columns_main();
 
-                // Compute the claimed_sum (table contribution) as a single field element.
-                // For the bus balance check, we need n/d as an element.
-                // The summation tree root stores n/d where the claimed_sum = n/d.
-                // We compute it by inverting d and multiplying by n.
                 let table_contrib = if root_d == FieldElement::one() {
                     root_n
                 } else {
@@ -1725,6 +1741,21 @@ pub trait IsStarkProver<
                     d_claim,
                     table_contrib,
                 );
+                (table_idx, result)
+            };
+
+            #[cfg(feature = "parallel")]
+            let finalized: Vec<_> = (0..gkr_table_indices.len())
+                .into_par_iter()
+                .map(finalize_one)
+                .collect();
+
+            #[cfg(not(feature = "parallel"))]
+            let finalized: Vec<_> = (0..gkr_table_indices.len()).map(finalize_one).collect();
+
+            let mut gkr_results_vec: Vec<Option<LogUpGkrResult<FieldExtension>>> =
+                vec![None; num_airs];
+            for (table_idx, result) in finalized {
                 gkr_results_vec[table_idx] = Some(result);
             }
 
