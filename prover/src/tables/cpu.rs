@@ -511,14 +511,15 @@ impl CpuOperation {
             self.decode.rd,
         ));
 
-        // 12 IS_HALF for ARG1/ARG2/RES byte pairs
-        // Adjacent bytes are batched: IS_HALF(lo + 256*hi) replaces IS_BYTE(lo) + IS_BYTE(hi)
+        // 12 IS_BYTE_PAIR for ARG1/ARG2/RES byte pairs
+        // Each pair sends [lo, hi] as two separate bus values, so the LogUp
+        // fingerprint forces each byte to match individually against BITWISE X, Y.
         for value in [arg1, arg2, res] {
             for i in 0..4 {
                 let lo = ((value >> (i * 16)) & 0xFF) as u8;
                 let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
-                ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::IsBytePair,
                     lo,
                     hi,
                 ));
@@ -533,7 +534,7 @@ impl CpuOperation {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let mut lookups = Vec::new();
 
-        // Byte range checks: 27 IS_BYTE
+        // Range checks: 3 IS_BYTE + 12 IS_BYTE_PAIR = 15 ops
         lookups.extend(self.collect_byte_check_ops());
 
         // MSB16 lookups for sign bit extraction (when word_instr=1)
@@ -1951,8 +1952,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // RS1, RS2, RD are single-byte register indices — checked individually.
     // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
-    // batched into halfword checks. IS_HALF(lo + 256*hi) implies both bytes
-    // are in [0, 256), so one halfword check replaces two byte checks.
+    // batched into IS_BYTE_PAIR checks. Each pair sends two separate bus values
+    // [lo, hi], so the LogUp fingerprint forces each byte to match individually
+    // against the BITWISE table's X ∈ [0,255] and Y ∈ [0,255].
     // Every CPU row (including padding) sends with Multiplicity::One.
     for col in [cols::RS1, cols::RS2, cols::RD] {
         interactions.push(BusInteraction::sender(
@@ -1967,18 +1969,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
+                BusId::IsBytePair,
                 Multiplicity::One,
-                vec![BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: arr[2 * i],
+                vec![
+                    BusValue::Packed {
+                        start_column: arr[2 * i],
+                        packing: Packing::Direct,
                     },
-                    LinearTerm::Column {
-                        coefficient: 256,
-                        column: arr[2 * i + 1],
+                    BusValue::Packed {
+                        start_column: arr[2 * i + 1],
+                        packing: Packing::Direct,
                     },
-                ])],
+                ],
             ));
         }
     }

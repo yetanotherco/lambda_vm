@@ -92,9 +92,11 @@ pub mod cols {
     pub const MU_IS_B20: usize = 19;
     /// Multiplicity for HWSL lookups
     pub const MU_HWSL: usize = 20;
+    /// Multiplicity for IS_BYTE_PAIR lookups (two bytes checked individually)
+    pub const MU_IS_BYTE_PAIR: usize = 21;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 21;
+    pub const NUM_COLUMNS: usize = 22;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
@@ -382,6 +384,7 @@ pub fn update_multiplicities(
             BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
+            BitwiseOperationType::IsBytePair => cols::MU_IS_BYTE_PAIR,
         };
 
         // Increment multiplicity
@@ -418,7 +421,7 @@ pub(crate) fn trim_zero_rows(
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
             // Check all multiplicity columns (indices 11-21)
-            (cols::MU_AND..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
+            (cols::MU_AND..=cols::MU_IS_BYTE_PAIR).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -459,6 +462,8 @@ pub enum BitwiseOperationType {
     IsHalf,
     IsB20,
     Hwsl,
+    /// Two bytes checked individually via separate bus values.
+    IsBytePair,
 }
 
 /// A lookup request to the BITWISE precomputed table.
@@ -709,6 +714,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::Z,
                 },
             ])],
+        ),
+        // IS_BYTE_PAIR[X, Y] - range check two individual bytes via separate bus values.
+        // Unlike IS_HALF (which sends X+256*Y as one element), this sends X and Y
+        // as two separate fingerprint elements, so LogUp forces each to match individually.
+        BusInteraction::receiver(
+            BusId::IsBytePair,
+            Multiplicity::Column(cols::MU_IS_BYTE_PAIR),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+            ],
         ),
         // HWSL[X + 256*Y, Z] -> [SLL, SLLC]
         BusInteraction::receiver(
