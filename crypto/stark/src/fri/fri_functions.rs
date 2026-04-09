@@ -17,8 +17,6 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
 ) {
-    let half = evals.len() / 2;
-
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
@@ -40,6 +38,7 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
 
     #[cfg(not(feature = "parallel"))]
     {
+        let half = evals.len() / 2;
         for j in 0..half {
             let lo = &evals[2 * j];
             let hi = &evals[2 * j + 1];
