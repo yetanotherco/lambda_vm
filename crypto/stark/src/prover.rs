@@ -641,7 +641,7 @@ pub trait IsStarkProver<
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
         metadatas: &[Round1Metadata<Field, FieldExtension>],
         domains: &[Domain<Field>],
-        twiddle_caches: &[LdeTwiddles<Field>],
+        twiddle_caches: &[Arc<LdeTwiddles<Field>>],
         main_pool: &mut [Vec<FieldElement<Field>>],
         aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
     ) where
@@ -657,7 +657,13 @@ pub trait IsStarkProver<
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
             let result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, twiddles, main_pool, aux_pool,
+                *air,
+                *trace,
+                domain,
+                metadata,
+                &**twiddles,
+                main_pool,
+                aux_pool,
             )
             .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
@@ -1518,20 +1524,28 @@ pub trait IsStarkProver<
         let phase_start = Instant::now();
 
         let mut domains = Vec::with_capacity(num_airs);
-        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
         let mut max_main_cols = 0usize;
         let mut max_aux_cols = 0usize;
+
+        // Deduplicate twiddle caches: tables with the same lde_size share one Arc.
+        let mut twiddle_by_size: std::collections::HashMap<usize, Arc<LdeTwiddles<Field>>> =
+            std::collections::HashMap::new();
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
-            let twiddles = LdeTwiddles::new(&domain);
+
+            let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+            let twiddles = twiddle_by_size
+                .entry(lde_size)
+                .or_insert_with(|| Arc::new(LdeTwiddles::new(&domain)));
 
             max_main_cols = max_main_cols.max(trace.num_main_columns);
             max_aux_cols = max_aux_cols.max(air.num_auxiliary_rap_columns());
 
             domains.push(domain);
-            twiddle_caches.push(twiddles);
+            twiddle_caches.push(Arc::clone(twiddles));
         }
 
         // Allocate K independent LDE column buffer pool sets for parallel table processing.
@@ -1573,7 +1587,7 @@ pub trait IsStarkProver<
                     let idx = chunk_start + j;
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+                    let twiddles = &*twiddle_caches[idx];
 
                     let result = if air.is_preprocessed() {
                         Self::commit_preprocessed_trace(
@@ -1705,7 +1719,7 @@ pub trait IsStarkProver<
                     let idx = chunk_start + j;
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+                    let twiddles = &*twiddle_caches[idx];
 
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
