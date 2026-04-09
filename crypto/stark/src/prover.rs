@@ -10,7 +10,7 @@ use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
-use math::field::traits::{IsField, IsSubFieldOf};
+use math::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
 use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -37,8 +37,10 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
-use super::lookup::BusPublicInputs;
-use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
+use super::lookup::{
+    BusPublicInputs, LogUpGkrResult, extend_rap_challenges_with_bridge,
+};
+use super::proof::stark::{DeepPolynomialOpening, LogUpGkrProof, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
@@ -155,6 +157,8 @@ where
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
+    /// LogUp-GKR result (when using GKR-based LogUp alongside traditional accumulated column).
+    logup_gkr_result: Option<LogUpGkrResult<FieldExtension>>,
 }
 
 /// Pre-computed twiddle factors and coset weights for a given domain size.
@@ -1506,6 +1510,7 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
+        Field: IsPrimeField,
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
@@ -1645,35 +1650,117 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
+        // Round 1, Phase B': GKR sub-protocol (main transcript)
         // =====================================================================
-        // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
-        // the verifier's forking and makes per-table proving independent.
-        //
-        // Split into two passes for parallelism:
-        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
+        // For each table with bus interactions, run the LogUp-GKR sub-protocol.
+        // GKR messages are bound to the main Fiat-Shamir chain so the verifier
+        // can replay them.
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
-        #[cfg(feature = "instruments")]
-        let phase_start = Instant::now();
-
-        #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+        let gkr_results: Vec<Option<LogUpGkrResult<FieldExtension>>> = air_trace_pairs
+            .iter()
             .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                if air.has_trace_interaction() {
+                    let interactions = air.bus_interactions();
+                    let main_segment_cols = trace.columns_main();
+                    let trace_len = trace.num_rows();
+                    Some(crate::lookup::run_logup_gkr(
+                        interactions,
+                        &main_segment_cols,
+                        trace_len,
+                        &lookup_challenges,
+                        transcript,
+                    ))
                 } else {
                     None
                 }
             })
             .collect();
+
+        // =====================================================================
+        // Round 1, Phase B'': Sample γ for bridge batching (main transcript)
+        // =====================================================================
+        // γ is sampled AFTER all GKR messages are bound to the transcript
+        // but BEFORE forking per table. The verifier replays the same sample.
+
+        let gamma: FieldElement<FieldExtension> = if needs_lookup_challenges {
+            transcript.sample_field_element()
+        } else {
+            FieldElement::zero()
+        };
+
+        // =====================================================================
+        // Phase C: Build aux traces + fork transcripts per table
+        // =====================================================================
+        // For LogUp-GKR tables: build Lagrange kernel (col 0) and bridge
+        // running sum σ (col 1) as the two aux columns.
+
+        // Pass 1: Build aux traces.
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+
+        for ((air, trace, _), gkr_result) in
+            air_trace_pairs.iter_mut().zip(gkr_results.iter())
+        {
+            if air.has_trace_interaction() {
+                if let Some(result) = gkr_result {
+                    let kernel = &result.lagrange_kernel;
+                    let trace_len = trace.num_rows();
+
+                    // Allocate aux table (2 columns: l + σ)
+                    let (_, num_aux_columns) = air.trace_layout();
+                    if num_aux_columns > 0 && trace.num_aux_columns == 0 {
+                        trace.allocate_aux_table(num_aux_columns);
+                    }
+
+                    // Column 0: Lagrange kernel
+                    for (row, val) in kernel.iter().enumerate() {
+                        trace.set_aux(row, 0, val.clone());
+                    }
+
+                    // Column 1: Bridge running sum σ
+                    // The constraint checks: σ[i+1] - σ[i] = l[i]·batched[i] - Δ
+                    // where Δ = bridge_offset = target/N.
+                    // So σ[0] = 0 (start), σ[i+1] = σ[i] + l[i]·batched[i] - Δ.
+                    // The circular wrap-around at row N-1 requires σ[0] = σ[N-1] + l[N-1]·batched[N-1] - Δ,
+                    // which telescopes to: 0 = Σ l[i]·batched[i] - N·Δ = target - target.
+                    let (bridge_offset, gamma_powers) =
+                        crate::lookup::compute_bridge_params(
+                            &result.column_claims,
+                            &gamma,
+                            trace_len,
+                        );
+                    let main_cols = trace.columns_main();
+
+                    // Pre-compute batched values in parallel: batched[i] = Σ_j main_cols[col_j][i] * γ^j
+                    #[cfg(feature = "parallel")]
+                    let batched_iter = (0..trace_len).into_par_iter();
+                    #[cfg(not(feature = "parallel"))]
+                    let batched_iter = 0..trace_len;
+
+                    let column_claims = &result.column_claims;
+                    let batched_values: Vec<FieldElement<FieldExtension>> = batched_iter
+                        .map(|row| {
+                            let mut batched = FieldElement::<FieldExtension>::zero();
+                            for (j, (col_idx, _)) in column_claims.iter().enumerate() {
+                                batched += &main_cols[*col_idx][row] * &gamma_powers[j];
+                            }
+                            batched
+                        })
+                        .collect();
+
+                    // Set σ[0] = 0, then build forward: σ[i+1] = σ[i] + l[i]*batched[i] - Δ
+                    trace.set_aux(0, 1, FieldElement::<FieldExtension>::zero());
+                    let mut sigma = FieldElement::<FieldExtension>::zero();
+                    for row in 0..trace_len - 1 {
+                        let l_val = trace.get_aux(row, 0);
+                        sigma = sigma + l_val * &batched_values[row] - &bridge_offset;
+                        trace.set_aux(row + 1, 1, sigma.clone());
+                    }
+                }
+            } else if air.has_aux_trace() {
+                air.build_auxiliary_trace(*trace, &lookup_challenges);
+            }
+        }
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
@@ -1754,14 +1841,30 @@ pub trait IsStarkProver<
             }
         }
 
-        // Build metadata sequentially from main_commits + aux_results + bus_inputs
+        // Build metadata sequentially from main_commits + aux_results + gkr_results
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
-        for ((main_commit, (aux_tree, aux_root)), bus_public_inputs) in main_commits
+        let mut gkr_results_iter = gkr_results.into_iter();
+        for ((main_commit, (aux_tree, aux_root)), idx) in main_commits
             .into_iter()
             .zip(aux_results)
-            .zip(bus_inputs_vec)
+            .zip(0..num_airs)
         {
+            let gkr_result = gkr_results_iter.next().unwrap();
+
+            // Build per-table rap_challenges: base challenges + bridge params
+            let mut table_rap_challenges = lookup_challenges.clone();
+            if let Some(ref result) = gkr_result {
+                let trace_len = air_trace_pairs[idx].1.num_rows();
+                extend_rap_challenges_with_bridge(
+                    &mut table_rap_challenges,
+                    &result.column_claims,
+                    &gamma,
+                    trace_len,
+                    &result.random_point,
+                );
+            }
+
             metadatas.push(Round1Metadata {
                 main_merkle_tree: Arc::clone(&main_commit.main_tree),
                 main_merkle_root: main_commit.main_root,
@@ -1770,8 +1873,9 @@ pub trait IsStarkProver<
                 num_precomputed_cols: main_commit.num_precomputed_cols,
                 aux_merkle_tree: aux_tree,
                 aux_merkle_root: aux_root,
-                rap_challenges: lookup_challenges.clone(),
-                bus_public_inputs,
+                rap_challenges: table_rap_challenges,
+                bus_public_inputs: None, // LogUp-GKR: no bus_public_inputs needed
+                logup_gkr_result: gkr_result,
             });
         }
 
@@ -1854,13 +1958,20 @@ pub trait IsStarkProver<
                         table_transcript.append_field_element(&bpi.table_contribution);
                     }
 
-                    let proof = Self::prove_rounds_2_to_4(
+                    let mut proof = Self::prove_rounds_2_to_4(
                         *air,
                         *pub_inputs,
                         &round_1_result,
                         table_transcript,
                         domain,
                     )?;
+
+                    // Attach LogUp-GKR proof from Phase B' (if this table had bus interactions)
+                    proof.logup_gkr_proof = metadata.logup_gkr_result.as_ref().map(|r| LogUpGkrProof {
+                        gkr_proof: r.gkr_proof.clone(),
+                        random_point: r.random_point.clone(),
+                        column_claims: r.column_claims.clone(),
+                    });
 
                     // Collect per-table sub-op timing via TLS.
                     // Both the store (inside prove_rounds_2_to_4) and this take run on the
@@ -1936,6 +2047,7 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
+        Field: IsPrimeField,
         PI: Send + Sync + Clone,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
@@ -2101,6 +2213,8 @@ pub trait IsStarkProver<
             nonce: round_4_result.nonce,
             // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+            // LogUp-GKR proof (not yet used; will replace accumulated column in future)
+            logup_gkr_proof: None,
             // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,

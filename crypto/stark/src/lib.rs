@@ -8,12 +8,15 @@ pub mod domain;
 pub mod examples;
 pub mod frame;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod lagrange_kernel;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
+pub mod sumcheck;
 pub mod table;
 pub mod trace;
 pub mod traits;

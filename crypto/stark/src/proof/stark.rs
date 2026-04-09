@@ -5,7 +5,8 @@ use math::field::{
 };
 
 use crate::{
-    config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
+    config::Commitment, fri::fri_decommit::FriDecommitment, gkr::GkrProof,
+    lookup::BusPublicInputs, table::Table,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,6 +30,19 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 }
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
+
+/// Proof for the LogUp-GKR protocol, which replaces the per-row accumulated
+/// column with a GKR-based fractional summation tree proof.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct LogUpGkrProof<E: IsField> {
+    /// GKR proof for the fractional summation tree.
+    pub gkr_proof: GkrProof<E>,
+    /// The random evaluation point from the GKR protocol.
+    pub random_point: Vec<FieldElement<E>>,
+    /// MLE claims for trace columns: (column_index, claimed_value) pairs.
+    pub column_claims: Vec<(usize, FieldElement<E>)>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
@@ -66,6 +80,8 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // 1. Circular constraint offset: L/N per row
     // 2. Bus balance check: Σ table_contribution across all tables = expected_bus_balance
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
+    // LogUp-GKR proof (when using GKR-based LogUp instead of per-row accumulated column)
+    pub logup_gkr_proof: Option<LogUpGkrProof<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
 }

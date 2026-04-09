@@ -9,7 +9,10 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
+    lookup::{
+        LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers,
+        extend_rap_challenges_with_bridge, extract_column_indices,
+    },
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -91,153 +94,6 @@ pub trait IsStarkVerifier<
         (0..number_of_queries)
             .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
             .collect::<Vec<usize>>()
-    }
-
-    /// Returns the list of challenges sent to the prover.
-    fn step_1_replay_rounds_and_recover_challenges(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &VerifierDomain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Challenges<FieldExtension>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        // ===================================
-        // ==========|   Round 1   |==========
-        // ===================================
-
-        // <<<< Receive commitments:[tⱼ]
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-
-        let rap_challenges = air.build_rap_challenges(transcript);
-
-        if let Some(root) = proof.lde_trace_aux_merkle_root {
-            transcript.append_bytes(&root);
-        }
-
-        // ===================================
-        // ==========|   Round 2   |==========
-        // ===================================
-
-        // <<<< Receive challenge: 𝛽
-        let beta = transcript.sample_field_element();
-        let trace_length = proof.trace_length;
-        let num_boundary_constraints = air
-            .boundary_constraints(
-                &proof.public_inputs,
-                &rap_challenges,
-                proof.bus_public_inputs.as_ref(),
-                trace_length,
-            )
-            .constraints
-            .len();
-
-        let num_transition_constraints = air.context().num_transition_constraints;
-
-        let mut coefficients =
-            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
-
-        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coeffs = coefficients;
-
-        // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
-
-        // ===================================
-        // ==========|   Round 3   |==========
-        // ===================================
-
-        // >>>> Send challenge: z
-        let z = transcript.sample_z_ood_with_domain_params(
-            domain.trace_length,
-            domain.lde_length,
-            &domain.coset_offset,
-        );
-
-        // <<<< Receive values: tⱼ(zgᵏ)
-        let trace_ood_evaluations_columns = proof.trace_ood_evaluations.columns();
-        for col in trace_ood_evaluations_columns.iter() {
-            for elem in col.iter() {
-                transcript.append_field_element(elem);
-            }
-        }
-        // <<<< Receive value: Hᵢ(z^N)
-        for element in proof.composition_poly_parts_ood_evaluation.iter() {
-            transcript.append_field_element(element);
-        }
-
-        // ===================================
-        // ==========|   Round 4   |==========
-        // ===================================
-
-        let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
-        let num_terms_trace =
-            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
-        let gamma = transcript.sample_field_element();
-
-        // <<<< Receive challenges: 𝛾, 𝛾'
-        let mut deep_composition_coefficients: Vec<_> =
-            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
-                .take(num_terms_composition_poly + num_terms_trace)
-                .collect();
-
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
-            .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
-            .map(|chunk| chunk.to_vec())
-            .collect();
-
-        // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
-        let gammas = deep_composition_coefficients;
-
-        // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
-
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
-
-        // Receive grinding value
-        let security_bits = air.context().proof_options.grinding_factor;
-        let mut grinding_seed = [0u8; 32];
-        if security_bits > 0
-            && let Some(nonce_value) = proof.nonce
-        {
-            grinding_seed = transcript.state();
-            transcript.append_bytes(&nonce_value.to_be_bytes());
-        }
-
-        // FRI query phase
-        // <<<< Send challenges 𝜄ₛ (iota_s)
-        let number_of_queries = air.options().fri_number_of_queries;
-        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
-
-        Challenges {
-            z,
-            boundary_coeffs,
-            transition_coeffs,
-            trace_term_coeffs,
-            gammas,
-            zetas,
-            iotas,
-            rap_challenges,
-            grinding_seed,
-        }
     }
 
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
@@ -935,38 +791,96 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Validate bus_public_inputs presence against AIR layout
+        // Phase B': Replay GKR proofs (main transcript)
         // =====================================================================
-        // A dishonest prover could omit bus_public_inputs entirely (None) to
-        // bypass the bus balance check. With circular constraints, there are no
-        // boundary constraints on LogUp columns, so the bus balance check is
-        // the only cross-table validation.
+        // For each table with bus interactions, replay the GKR verification
+        // on the main transcript. This must match the prover's Phase B' exactly.
+
+        let mut gkr_bridge_claims: Vec<Vec<(usize, FieldElement<FieldExtension>)>> =
+            Vec::with_capacity(airs.len());
+        let mut gkr_random_points: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(airs.len());
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
-                error!(
-                    "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
-                );
-                return false;
-            }
-            if !air.has_trace_interaction() && proof.bus_public_inputs.is_some() {
-                error!(
-                    "Table {idx}: AIR has no LogUp interactions but proof contains bus_public_inputs"
-                );
-                return false;
+            if air.has_trace_interaction() {
+                let gkr_proof = match &proof.logup_gkr_proof {
+                    Some(p) => p,
+                    None => {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!(
+                            "Table {idx}: AIR has interactions but proof missing logup_gkr_proof"
+                        );
+                        return false;
+                    }
+                };
+
+                // Replay GKR verification on the main transcript
+                match crate::gkr::gkr_verify(&gkr_proof.gkr_proof, transcript) {
+                    Ok((_random_point, n_claim, d_claim)) => {
+                        // Validate column_claims length matches AIR-expected column set
+                        let expected_cols = extract_column_indices(air.bus_interactions());
+                        if gkr_proof.column_claims.len() != expected_cols.len() {
+                            #[cfg(not(feature = "test_fiat_shamir"))]
+                            error!(
+                                "Table {idx}: column_claims length mismatch: got {}, expected {}",
+                                gkr_proof.column_claims.len(),
+                                expected_cols.len()
+                            );
+                            return false;
+                        }
+
+                        // Verify that column_claims are consistent with GKR output.
+                        // A malicious prover could provide fake column_claims that don't
+                        // match the (n_claim, d_claim) returned by GKR verification.
+                        if !crate::lookup::reconstruct_and_verify_gkr_claims(
+                            &n_claim,
+                            &d_claim,
+                            &gkr_proof.column_claims,
+                            air.bus_interactions(),
+                            &lookup_challenges,
+                        ) {
+                            #[cfg(not(feature = "test_fiat_shamir"))]
+                            error!(
+                                "Table {idx}: GKR column claims verification failed — \
+                                 column_claims are inconsistent with GKR output (n_claim, d_claim)"
+                            );
+                            return false;
+                        }
+                    }
+                    Err(_e) => {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!("Table {idx}: GKR verification failed: {:?}", _e);
+                        return false;
+                    }
+                }
+
+                gkr_bridge_claims.push(gkr_proof.column_claims.clone());
+                gkr_random_points.push(gkr_proof.random_point.clone());
+            } else {
+                gkr_bridge_claims.push(Vec::new());
+                gkr_random_points.push(Vec::new());
             }
         }
+
+        // =====================================================================
+        // Phase B'': Sample γ for bridge batching (main transcript)
+        // =====================================================================
+        // Must match prover: γ sampled AFTER all GKR messages, BEFORE forking.
+
+        let gamma: FieldElement<FieldExtension> = if needs_lookup_challenges {
+            transcript.sample_field_element()
+        } else {
+            FieldElement::zero()
+        };
 
         // =====================================================================
         // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
+        // state after Phase B'', domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Must match prover: fork with domain separator for multi-table,
-            // use original transcript directly for single-table.
             let num_tables = airs.len();
             let mut table_transcript = transcript.clone();
             if num_tables > 1 {
@@ -978,18 +892,26 @@ pub trait IsStarkVerifier<
                 table_transcript.append_bytes(&root);
             }
 
-            // Bind table_contribution (L) to transcript, matching prover.
-            if let Some(ref bpi) = proof.bus_public_inputs {
-                table_transcript.append_field_element(&bpi.table_contribution);
+            // Build per-table rap_challenges with bridge params
+            let mut table_rap_challenges = lookup_challenges.clone();
+            if !gkr_bridge_claims[idx].is_empty() {
+                extend_rap_challenges_with_bridge(
+                    &mut table_rap_challenges,
+                    &gkr_bridge_claims[idx],
+                    &gamma,
+                    proof.trace_length,
+                    &gkr_random_points[idx],
+                );
             }
 
-            // Rounds 2-4: verify
+            // Rounds 2-4: verify (bridge is now a transition constraint)
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &mut table_transcript,
-                lookup_challenges.clone(),
+                table_rap_challenges,
             ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
@@ -1003,9 +925,8 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Bus Balance Check: Σ table_contribution = expected_bus_balance
         // =====================================================================
-        // For LogUp with circular constraints, each table's total contribution L
-        // (sum of all per-row terms) is exposed as a public input. The bus balances
-        // when the sum of all table contributions equals the expected target.
+        // With LogUp-GKR, the table contribution is the GKR claimed_sum.
+        // The bus balances when the sum of all claimed_sums equals the expected target.
         // When all bus participants are in-trace, the target is zero. When some
         // receiver contributions are computed externally (e.g. verifier-computed
         // COMMIT output bus), the target is the missing positive remainder.
@@ -1013,17 +934,15 @@ pub trait IsStarkVerifier<
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-                if air.has_trace_interaction()
-                    && let Some(interaction) = &proof.bus_public_inputs
-                {
-                    total = total + &interaction.table_contribution;
+                if air.has_trace_interaction() && let Some(ref gkr_proof) = proof.logup_gkr_proof {
+                    total = total + &gkr_proof.gkr_proof.claimed_sum;
                 }
             }
 
             if total != *expected_bus_balance {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
-                    "LogUp bus does not balance: sum of accumulated values does not match target. total={:?}, target={:?}",
+                    "LogUp bus does not balance: sum of GKR claimed_sums does not match target. total={:?}, target={:?}",
                     total, expected_bus_balance
                 );
                 return false;
@@ -1212,8 +1131,13 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges =
-            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
+        let challenges = Self::replay_rounds_after_round_1(
+            air,
+            proof,
+            &domain,
+            transcript,
+            rap_challenges,
+        );
 
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;

@@ -12,7 +12,7 @@ use math::{
 use crate::{
     constraints::transition::TransitionConstraint,
     domain::Domain,
-    lookup::{BusPublicInputs, PackingShifts},
+    lookup::{BusInteraction, BusPublicInputs, PackingShifts},
 };
 
 use super::{
@@ -179,6 +179,13 @@ pub trait AIR: Send + Sync {
     /// Generic RAP AIRs with auxiliary columns but no bus interactions must return false.
     fn has_trace_interaction(&self) -> bool {
         false
+    }
+
+    /// Returns the bus interactions for this AIR.
+    /// Used by the GKR sub-protocol to compute leaf fractions and column claims.
+    /// Default implementation returns an empty slice.
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &[]
     }
 
     /// Returns the maximum number of bus elements across all interactions.

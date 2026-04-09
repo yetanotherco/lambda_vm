@@ -325,8 +325,8 @@ fn test_air_layout_single_interaction() {
         vec![],
     );
 
-    // 4 main, 1 aux (0 committed pairs + 1 accumulated with 1 absorbed)
-    assert_eq!(air.trace_layout(), (4, 1));
+    // 4 main, 2 aux (Lagrange kernel + bridge running sum σ)
+    assert_eq!(air.trace_layout(), (4, 2));
 }
 
 #[test]
@@ -356,6 +356,6 @@ fn test_air_layout_multiple_interactions() {
         vec![],
     );
 
-    // 5 main, 1 aux (0 committed pairs + 1 accumulated with 2 absorbed)
-    assert_eq!(air.trace_layout(), (5, 1));
+    // 5 main, 2 aux (Lagrange kernel + bridge running sum σ)
+    assert_eq!(air.trace_layout(), (5, 2));
 }
