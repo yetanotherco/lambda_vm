@@ -18,14 +18,37 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     inv_twiddles: &[FieldElement<F>],
 ) {
     let half = evals.len() / 2;
-    for j in 0..half {
-        let lo = &evals[2 * j];
-        let hi = &evals[2 * j + 1];
-        let sum = lo + hi;
-        let diff = lo - hi;
-        evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // Evaluations are stored interleaved: pairs (evals[2j], evals[2j+1]).
+        // Fold each pair in parallel, collecting into a new Vec of half length.
+        let folded: Vec<FieldElement<E>> = evals
+            .par_chunks(2)
+            .zip(inv_twiddles.par_iter())
+            .map(|(pair, tw)| {
+                let lo = &pair[0];
+                let hi = &pair[1];
+                let sum = lo + hi;
+                let diff = lo - hi;
+                &sum + &(tw * &(zeta * &diff))
+            })
+            .collect();
+        *evals = folded;
     }
-    evals.truncate(half);
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        for j in 0..half {
+            let lo = &evals[2 * j];
+            let hi = &evals[2 * j + 1];
+            let sum = lo + hi;
+            let diff = lo - hi;
+            evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+        }
+        evals.truncate(half);
+    }
 }
 
 /// Compute inverse twiddle factors for evaluation-form FRI folding.
