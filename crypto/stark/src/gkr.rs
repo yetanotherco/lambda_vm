@@ -485,13 +485,11 @@ pub fn gkr_prove<E: IsField>(
             // This function has degree 3 in each variable (product of eq * two child values),
             // so the round polynomial needs 4 evaluation points (degree 3).
 
-            // Build the five "bookkeeping" tables for the sumcheck:
-            // - eq_table: eq(current_point, b) for b in {0,1}^parent_num_vars
+            // Build the four gate "bookkeeping" tables for the sumcheck:
             // - nl_table: child_n[2b] (left numerators)
             // - nr_table: child_n[2b+1] (right numerators)
             // - dl_table: child_d[2b] (left denominators)
             // - dr_table: child_d[2b+1] (right denominators)
-            let mut eq_table = compute_eq_evals(&current_point);
             let mut nl_table: Vec<FieldElement<E>> =
                 (0..parent_size).map(|j| child_n[2 * j].clone()).collect();
             let mut nr_table: Vec<FieldElement<E>> = (0..parent_size)
@@ -503,19 +501,6 @@ pub fn gkr_prove<E: IsField>(
                 .map(|j| child_d[2 * j + 1].clone())
                 .collect();
 
-            // Verify initial consistency: the sum of f over {0,1}^parent_num_vars
-            // should equal combined_claim
-            debug_assert!({
-                let mut check_sum = FieldElement::<E>::zero();
-                for j in 0..parent_size {
-                    let gate_val = &(&nl_table[j] * &dr_table[j])
-                        + &(&nr_table[j] * &dl_table[j])
-                        + &(&lambda * &(&dl_table[j] * &dr_table[j]));
-                    check_sum = &check_sum + &(&eq_table[j] * &gate_val);
-                }
-                check_sum == combined_claim
-            });
-
             let mut round_polys = Vec::with_capacity(parent_num_vars);
             let mut challenges = Vec::with_capacity(parent_num_vars);
             let mut round_combined_claim = combined_claim.clone();
@@ -524,170 +509,452 @@ pub fn gkr_prove<E: IsField>(
             // it (N/2 additions) and track the missing fold factors in this scalar.
             let mut eq_correction = FieldElement::<E>::one();
 
-            for r_round in current_point.iter().take(parent_num_vars) {
-                let half = nl_table.len() / 2;
+            // SVO (Split-Value Optimization, ePrint 2025/1117 Algorithm 5):
+            // For large tables, split eq(w, x) into prefix and suffix halves to
+            // reduce memory from 2^l to 2 * 2^{l/2}.
+            //
+            // eq(w, b) = eq_prefix(w_prefix, b_prefix) * eq_suffix(w_suffix, b_suffix)
+            //
+            // During the first suffix_len rounds, eq_suffix is halved each round
+            // while eq_prefix stays fixed. The inner loop restructures as:
+            //   h_raw(t) = Σ_s eq_suffix[s] * Σ_p eq_prefix[p] * gate(t, p*suffix_half + s)
+            //
+            // After suffix rounds, eq_suffix is absorbed into eq_correction, and
+            // eq_prefix becomes the eq_table for the remaining prefix rounds.
+            const SVO_THRESHOLD: usize = 8;
+            let use_svo = parent_num_vars >= SVO_THRESHOLD;
 
-                // Eq polynomial factoring (Dao-Thaler, ePrint 2024/1210):
-                //
-                // Factor eq(current_point, b) into:
-                //   eq_correction (scalar from previous rounds' fold factors) *
-                //   eq_round(r, t) (linear in t, constant across pairs) *
-                //   eq_table[j] (per-pair scalar, independent of t)
-                //
-                // where r = current_point[round_idx] and
-                //   eq_table[j] = eq_orig[2j] + eq_orig[2j+1] (pre-halved)
-                //
-                // The inner sum h_raw(t) = Σ_j eq_table[j] * gate(t, j) is degree 2,
-                // needing only 2 eval points (t=0, t=2) per pair instead of 3.
-                // Then h(t) = eq_correction * h_raw(t), and
-                // S(t) = eq_round(r, t) * h(t) recovers the degree-3 round poly.
-                let one = FieldElement::<E>::one();
+            if use_svo {
+                // --- SVO path: split eq into prefix + suffix ---
+                let suffix_len = parent_num_vars / 2;
+                let _prefix_len = parent_num_vars - suffix_len;
+                let mut eq_suffix = compute_eq_evals(&current_point[..suffix_len]);
+                let eq_prefix = compute_eq_evals(&current_point[suffix_len..parent_num_vars]);
+                let prefix_size = eq_prefix.len(); // = 2^prefix_len, constant during suffix rounds
 
-                // Pre-halve eq_table: compute eq_rem[j] = eq_table[2j] + eq_table[2j+1]
-                // in-place. This replaces fold (which would multiply each entry by the
-                // challenge) with a simple sum. The fold factor is tracked in eq_correction.
-                for j in 0..half {
-                    eq_table[j] = &eq_table[2 * j] + &eq_table[2 * j + 1];
-                }
-                eq_table.truncate(half);
+                // Verify initial consistency using the split eq tables
+                debug_assert!({
+                    let mut check_sum = FieldElement::<E>::zero();
+                    for j in 0..parent_size {
+                        let suffix_idx = j & (eq_suffix.len() - 1);
+                        let prefix_idx = j >> suffix_len;
+                        let eq_val = &eq_suffix[suffix_idx] * &eq_prefix[prefix_idx];
+                        let gate_val = &(&nl_table[j] * &dr_table[j])
+                            + &(&nr_table[j] * &dl_table[j])
+                            + &(&lambda * &(&dl_table[j] * &dr_table[j]));
+                        check_sum = &check_sum + &(&eq_val * &gate_val);
+                    }
+                    check_sum == combined_claim
+                });
 
-                let compute_pair_sums = |j: usize| -> [FieldElement<E>; 2] {
-                    // Pre-halved eq weight (scalar, independent of t)
-                    let eq_rem = &eq_table[j];
+                // Phase 1: Suffix rounds (first suffix_len rounds)
+                // Process variables current_point[0..suffix_len].
+                // eq_suffix is halved each round; eq_prefix stays fixed.
+                for round_idx in 0..suffix_len {
+                    let r_round = &current_point[round_idx];
+                    let half = nl_table.len() / 2;
+                    let suffix_half = eq_suffix.len() / 2;
 
-                    let nl_l = &nl_table[2 * j];
-                    let nl_r = &nl_table[2 * j + 1];
-                    let nr_l = &nr_table[2 * j];
-                    let nr_r = &nr_table[2 * j + 1];
-                    let dl_l = &dl_table[2 * j];
-                    let dl_r = &dl_table[2 * j + 1];
-                    let dr_l = &dr_table[2 * j];
-                    let dr_r = &dr_table[2 * j + 1];
+                    // Pre-halve eq_suffix (same as Dao-Thaler halving for eq_table)
+                    for j in 0..suffix_half {
+                        eq_suffix[j] = &eq_suffix[2 * j] + &eq_suffix[2 * j + 1];
+                    }
+                    eq_suffix.truncate(suffix_half);
 
-                    // t=0: interpolated values are just the left values
-                    // gate = nl*dr + nr*dl + lambda*dl*dr
-                    //      = nl*dr + dl*(nr + lambda*dr)   [3 muls instead of 4]
-                    let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
-                    let h0 = eq_rem * &gate_0;
+                    let one = FieldElement::<E>::one();
 
-                    // t=2: val = 2*right - left
-                    let nl_2 = &(nl_r + nl_r) - nl_l;
-                    let nr_2 = &(nr_r + nr_r) - nr_l;
-                    let dl_2 = &(dl_r + dl_r) - dl_l;
-                    let dr_2 = &(dr_r + dr_r) - dr_l;
-                    let gate_2 = &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
-                    let h2 = eq_rem * &gate_2;
+                    // Inner loop: for each suffix index, accumulate gate contributions
+                    // weighted by eq_prefix, then weight by eq_suffix.
+                    //
+                    // h_raw(t) = Σ_s eq_suffix[s] * Σ_p eq_prefix[p] * gate(t, p*suffix_half + s)
+                    let compute_suffix_contribution =
+                        |suffix_idx: usize| -> [FieldElement<E>; 2] {
+                            let eq_s = &eq_suffix[suffix_idx];
+                            let mut contrib_h0 = FieldElement::<E>::zero();
+                            let mut contrib_h2 = FieldElement::<E>::zero();
 
-                    [h0, h2]
-                };
+                            for prefix_idx in 0..prefix_size {
+                                let j = prefix_idx * suffix_half + suffix_idx;
+                                let eq_p = &eq_prefix[prefix_idx];
 
-                let zero2 = || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
-                let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
-                    [&a[0] + &b[0], &a[1] + &b[1]]
-                };
+                                let nl_l = &nl_table[2 * j];
+                                let nl_r = &nl_table[2 * j + 1];
+                                let nr_l = &nr_table[2 * j];
+                                let nr_r = &nr_table[2 * j + 1];
+                                let dl_l = &dl_table[2 * j];
+                                let dl_r = &dl_table[2 * j + 1];
+                                let dr_l = &dr_table[2 * j];
+                                let dr_r = &dr_table[2 * j + 1];
 
-                #[cfg(feature = "parallel")]
-                let totals: [FieldElement<E>; 2] = if half >= 256 {
-                    (0..half)
-                        .into_par_iter()
-                        .fold(zero2, |acc, j| add2(acc, compute_pair_sums(j)))
-                        .reduce(zero2, add2)
-                } else {
-                    (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)))
-                };
+                                // t=0: gate = nl*dr + dl*(nr + lambda*dr)
+                                let gate_0 =
+                                    &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                                contrib_h0 = &contrib_h0 + &(eq_p * &gate_0);
 
-                #[cfg(not(feature = "parallel"))]
-                let totals: [FieldElement<E>; 2] =
-                    (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)));
+                                // t=2: val = 2*right - left
+                                let nl_2 = &(nl_r + nl_r) - nl_l;
+                                let nr_2 = &(nr_r + nr_r) - nr_l;
+                                let dl_2 = &(dl_r + dl_r) - dl_l;
+                                let dr_2 = &(dr_r + dr_r) - dr_l;
+                                let gate_2 =
+                                    &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                                contrib_h2 = &contrib_h2 + &(eq_p * &gate_2);
+                            }
 
-                // Phase 2: Recover S(t) from h(t) and eq_round(r, t).
-                //
-                // The inner sum h_raw(t) doesn't include the eq_correction factor
-                // (accumulated from previous rounds' fold factors). Apply it now:
-                //   h(t) = eq_correction * h_raw(t)
-                //
-                // eq_round(r, t) = (1-r)(1-t) + r*t
-                //   eq_round(r, 0) = 1-r,  eq_round(r, 1) = r,
-                //   eq_round(r, 2) = 3r-1,  eq_round(r, 3) = 5r-2
-                //
-                // S(0) = (1-r)*h(0), S(1) = round_combined_claim - S(0)
-                // h(1) = S(1)/r, h(3) = 3*h(2) - 3*h(1) + h(0)  (degree-2 extrapolation)
-                // S(2) = (3r-1)*h(2), S(3) = (5r-2)*h(3)
-                let [raw_h0, raw_h2] = totals;
-                let total_h0 = &eq_correction * &raw_h0;
-                let total_h2 = &eq_correction * &raw_h2;
+                            [eq_s * &contrib_h0, eq_s * &contrib_h2]
+                        };
 
-                let one_minus_r = &one - r_round;
-                let s0 = &one_minus_r * &total_h0;
-                let s1 = &round_combined_claim - &s0;
+                    let zero2 = || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
+                    let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
+                        [&a[0] + &b[0], &a[1] + &b[1]]
+                    };
 
-                let r_inv = r_round
-                    .inv()
-                    .expect("r_round = 0 is probability 2^{-64} for random challenges");
-                let h1 = &s1 * &r_inv;
-
-                let three = FieldElement::<E>::from(3u64);
-                let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
-
-                let eq_at_2 = &(&three * r_round) - &one;
-                let s2 = &eq_at_2 * &total_h2;
-
-                let eq_at_3 =
-                    &(&FieldElement::<E>::from(5u64) * r_round) - &FieldElement::<E>::from(2u64);
-                let s3 = &eq_at_3 * &h3;
-
-                let poly_evals = vec![s0, s1, s2, s3];
-
-                let round_poly = RoundPoly::new(poly_evals);
-
-                // Append round polynomial evaluations to transcript
-                for eval in round_poly.evals() {
-                    transcript.append_field_element(eval);
-                }
-
-                // Sample challenge for this round
-                let challenge: FieldElement<E> = transcript.sample_field_element();
-
-                // Update round_combined_claim for next round
-                round_combined_claim = round_poly.evaluate(&challenge);
-
-                // Update eq_correction: accumulate eq(r_round, challenge).
-                // eq(r, c) = r*c + (1-r)*(1-c), the fold factor we skip for eq_table.
-                let eq_update = &(r_round * &challenge) + &(&one_minus_r * &(&one - &challenge));
-                eq_correction = &eq_correction * &eq_update;
-
-                // Fold the four gate tables (eq_table was already halved before inner loop)
-                // table[j] = table[2j] + challenge * (table[2j+1] - table[2j])
-                //
-                // When half >= 256 we use par_chunks(2) so that all Rayon threads
-                // participate in folding a single table (instead of just 4-way
-                // parallelism across the four independent tables).
-                let fold_table = |table: &mut Vec<FieldElement<E>>| {
                     #[cfg(feature = "parallel")]
-                    if half >= 256 {
-                        let folded: Vec<FieldElement<E>> = table
-                            .par_chunks(2)
-                            .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
-                            .collect();
-                        *table = folded;
-                        return;
+                    let totals: [FieldElement<E>; 2] = if suffix_half >= 256 {
+                        (0..suffix_half)
+                            .into_par_iter()
+                            .fold(zero2, |acc, s| add2(acc, compute_suffix_contribution(s)))
+                            .reduce(zero2, add2)
+                    } else {
+                        (0..suffix_half)
+                            .fold(zero2(), |acc, s| add2(acc, compute_suffix_contribution(s)))
+                    };
+
+                    #[cfg(not(feature = "parallel"))]
+                    let totals: [FieldElement<E>; 2] = (0..suffix_half)
+                        .fold(zero2(), |acc, s| add2(acc, compute_suffix_contribution(s)));
+
+                    // Phase 2: Recover S(t) from h(t) and eq_round(r, t).
+                    let [raw_h0, raw_h2] = totals;
+                    let total_h0 = &eq_correction * &raw_h0;
+                    let total_h2 = &eq_correction * &raw_h2;
+
+                    let one_minus_r = &one - r_round;
+                    let s0 = &one_minus_r * &total_h0;
+                    let s1 = &round_combined_claim - &s0;
+
+                    let r_inv = r_round
+                        .inv()
+                        .expect("r_round = 0 is probability 2^{-64} for random challenges");
+                    let h1 = &s1 * &r_inv;
+
+                    let three = FieldElement::<E>::from(3u64);
+                    let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
+
+                    let eq_at_2 = &(&three * r_round) - &one;
+                    let s2 = &eq_at_2 * &total_h2;
+
+                    let eq_at_3 = &(&FieldElement::<E>::from(5u64) * r_round)
+                        - &FieldElement::<E>::from(2u64);
+                    let s3 = &eq_at_3 * &h3;
+
+                    let poly_evals = vec![s0, s1, s2, s3];
+                    let round_poly = RoundPoly::new(poly_evals);
+
+                    for eval in round_poly.evals() {
+                        transcript.append_field_element(eval);
                     }
-                    // Sequential fallback (also used when half < 256)
+
+                    let challenge: FieldElement<E> = transcript.sample_field_element();
+                    round_combined_claim = round_poly.evaluate(&challenge);
+
+                    let eq_update =
+                        &(r_round * &challenge) + &(&one_minus_r * &(&one - &challenge));
+                    eq_correction = &eq_correction * &eq_update;
+
+                    // Fold the four gate tables
+                    let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                        #[cfg(feature = "parallel")]
+                        if half >= 256 {
+                            let folded: Vec<FieldElement<E>> = table
+                                .par_chunks(2)
+                                .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                                .collect();
+                            *table = folded;
+                            return;
+                        }
+                        for j in 0..half {
+                            let left = &table[2 * j];
+                            let right = &table[2 * j + 1];
+                            table[j] = left + &(&challenge * &(right - left));
+                        }
+                        table.truncate(half);
+                    };
+
+                    fold_table(&mut nl_table);
+                    fold_table(&mut nr_table);
+                    fold_table(&mut dl_table);
+                    fold_table(&mut dr_table);
+
+                    round_polys.push(round_poly);
+                    challenges.push(challenge);
+                }
+
+                // Transition: absorb the remaining eq_suffix scalar into eq_correction.
+                // After suffix_len halvings, eq_suffix has been reduced to a single entry.
+                debug_assert_eq!(eq_suffix.len(), 1);
+                eq_correction = &eq_correction * &eq_suffix[0];
+
+                // Phase 2: Prefix rounds (remaining prefix_len rounds)
+                // Use eq_prefix as the eq_table for standard Dao-Thaler halving.
+                let mut eq_table = eq_prefix;
+
+                for round_idx in suffix_len..parent_num_vars {
+                    let r_round = &current_point[round_idx];
+                    let half = nl_table.len() / 2;
+                    let one = FieldElement::<E>::one();
+
+                    // Pre-halve eq_table
                     for j in 0..half {
-                        let left = &table[2 * j];
-                        let right = &table[2 * j + 1];
-                        table[j] = left + &(&challenge * &(right - left));
+                        eq_table[j] = &eq_table[2 * j] + &eq_table[2 * j + 1];
                     }
-                    table.truncate(half);
-                };
+                    eq_table.truncate(half);
 
-                fold_table(&mut nl_table);
-                fold_table(&mut nr_table);
-                fold_table(&mut dl_table);
-                fold_table(&mut dr_table);
+                    let compute_pair_sums = |j: usize| -> [FieldElement<E>; 2] {
+                        let eq_rem = &eq_table[j];
 
-                round_polys.push(round_poly);
-                challenges.push(challenge);
+                        let nl_l = &nl_table[2 * j];
+                        let nl_r = &nl_table[2 * j + 1];
+                        let nr_l = &nr_table[2 * j];
+                        let nr_r = &nr_table[2 * j + 1];
+                        let dl_l = &dl_table[2 * j];
+                        let dl_r = &dl_table[2 * j + 1];
+                        let dr_l = &dr_table[2 * j];
+                        let dr_r = &dr_table[2 * j + 1];
+
+                        let gate_0 =
+                            &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                        let h0 = eq_rem * &gate_0;
+
+                        let nl_2 = &(nl_r + nl_r) - nl_l;
+                        let nr_2 = &(nr_r + nr_r) - nr_l;
+                        let dl_2 = &(dl_r + dl_r) - dl_l;
+                        let dr_2 = &(dr_r + dr_r) - dr_l;
+                        let gate_2 =
+                            &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                        let h2 = eq_rem * &gate_2;
+
+                        [h0, h2]
+                    };
+
+                    let zero2 = || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
+                    let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
+                        [&a[0] + &b[0], &a[1] + &b[1]]
+                    };
+
+                    #[cfg(feature = "parallel")]
+                    let totals: [FieldElement<E>; 2] = if half >= 256 {
+                        (0..half)
+                            .into_par_iter()
+                            .fold(zero2, |acc, j| add2(acc, compute_pair_sums(j)))
+                            .reduce(zero2, add2)
+                    } else {
+                        (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)))
+                    };
+
+                    #[cfg(not(feature = "parallel"))]
+                    let totals: [FieldElement<E>; 2] =
+                        (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)));
+
+                    // Phase 2: Recover S(t) from h(t) and eq_round(r, t).
+                    let [raw_h0, raw_h2] = totals;
+                    let total_h0 = &eq_correction * &raw_h0;
+                    let total_h2 = &eq_correction * &raw_h2;
+
+                    let one_minus_r = &one - r_round;
+                    let s0 = &one_minus_r * &total_h0;
+                    let s1 = &round_combined_claim - &s0;
+
+                    let r_inv = r_round
+                        .inv()
+                        .expect("r_round = 0 is probability 2^{-64} for random challenges");
+                    let h1 = &s1 * &r_inv;
+
+                    let three = FieldElement::<E>::from(3u64);
+                    let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
+
+                    let eq_at_2 = &(&three * r_round) - &one;
+                    let s2 = &eq_at_2 * &total_h2;
+
+                    let eq_at_3 = &(&FieldElement::<E>::from(5u64) * r_round)
+                        - &FieldElement::<E>::from(2u64);
+                    let s3 = &eq_at_3 * &h3;
+
+                    let poly_evals = vec![s0, s1, s2, s3];
+                    let round_poly = RoundPoly::new(poly_evals);
+
+                    for eval in round_poly.evals() {
+                        transcript.append_field_element(eval);
+                    }
+
+                    let challenge: FieldElement<E> = transcript.sample_field_element();
+                    round_combined_claim = round_poly.evaluate(&challenge);
+
+                    let eq_update =
+                        &(r_round * &challenge) + &(&one_minus_r * &(&one - &challenge));
+                    eq_correction = &eq_correction * &eq_update;
+
+                    let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                        #[cfg(feature = "parallel")]
+                        if half >= 256 {
+                            let folded: Vec<FieldElement<E>> = table
+                                .par_chunks(2)
+                                .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                                .collect();
+                            *table = folded;
+                            return;
+                        }
+                        for j in 0..half {
+                            let left = &table[2 * j];
+                            let right = &table[2 * j + 1];
+                            table[j] = left + &(&challenge * &(right - left));
+                        }
+                        table.truncate(half);
+                    };
+
+                    fold_table(&mut nl_table);
+                    fold_table(&mut nr_table);
+                    fold_table(&mut dl_table);
+                    fold_table(&mut dr_table);
+
+                    round_polys.push(round_poly);
+                    challenges.push(challenge);
+                }
+            } else {
+                // --- Standard path for small tables (parent_num_vars < SVO_THRESHOLD) ---
+                let mut eq_table = compute_eq_evals(&current_point);
+
+                // Verify initial consistency
+                debug_assert!({
+                    let mut check_sum = FieldElement::<E>::zero();
+                    for j in 0..parent_size {
+                        let gate_val = &(&nl_table[j] * &dr_table[j])
+                            + &(&nr_table[j] * &dl_table[j])
+                            + &(&lambda * &(&dl_table[j] * &dr_table[j]));
+                        check_sum = &check_sum + &(&eq_table[j] * &gate_val);
+                    }
+                    check_sum == combined_claim
+                });
+
+                for r_round in current_point.iter().take(parent_num_vars) {
+                    let half = nl_table.len() / 2;
+                    let one = FieldElement::<E>::one();
+
+                    // Pre-halve eq_table
+                    for j in 0..half {
+                        eq_table[j] = &eq_table[2 * j] + &eq_table[2 * j + 1];
+                    }
+                    eq_table.truncate(half);
+
+                    let compute_pair_sums = |j: usize| -> [FieldElement<E>; 2] {
+                        let eq_rem = &eq_table[j];
+
+                        let nl_l = &nl_table[2 * j];
+                        let nl_r = &nl_table[2 * j + 1];
+                        let nr_l = &nr_table[2 * j];
+                        let nr_r = &nr_table[2 * j + 1];
+                        let dl_l = &dl_table[2 * j];
+                        let dl_r = &dl_table[2 * j + 1];
+                        let dr_l = &dr_table[2 * j];
+                        let dr_r = &dr_table[2 * j + 1];
+
+                        let gate_0 =
+                            &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
+                        let h0 = eq_rem * &gate_0;
+
+                        let nl_2 = &(nl_r + nl_r) - nl_l;
+                        let nr_2 = &(nr_r + nr_r) - nr_l;
+                        let dl_2 = &(dl_r + dl_r) - dl_l;
+                        let dr_2 = &(dr_r + dr_r) - dr_l;
+                        let gate_2 =
+                            &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
+                        let h2 = eq_rem * &gate_2;
+
+                        [h0, h2]
+                    };
+
+                    let zero2 = || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
+                    let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
+                        [&a[0] + &b[0], &a[1] + &b[1]]
+                    };
+
+                    #[cfg(feature = "parallel")]
+                    let totals: [FieldElement<E>; 2] = if half >= 256 {
+                        (0..half)
+                            .into_par_iter()
+                            .fold(zero2, |acc, j| add2(acc, compute_pair_sums(j)))
+                            .reduce(zero2, add2)
+                    } else {
+                        (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)))
+                    };
+
+                    #[cfg(not(feature = "parallel"))]
+                    let totals: [FieldElement<E>; 2] =
+                        (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)));
+
+                    let [raw_h0, raw_h2] = totals;
+                    let total_h0 = &eq_correction * &raw_h0;
+                    let total_h2 = &eq_correction * &raw_h2;
+
+                    let one_minus_r = &one - r_round;
+                    let s0 = &one_minus_r * &total_h0;
+                    let s1 = &round_combined_claim - &s0;
+
+                    let r_inv = r_round
+                        .inv()
+                        .expect("r_round = 0 is probability 2^{-64} for random challenges");
+                    let h1 = &s1 * &r_inv;
+
+                    let three = FieldElement::<E>::from(3u64);
+                    let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
+
+                    let eq_at_2 = &(&three * r_round) - &one;
+                    let s2 = &eq_at_2 * &total_h2;
+
+                    let eq_at_3 = &(&FieldElement::<E>::from(5u64) * r_round)
+                        - &FieldElement::<E>::from(2u64);
+                    let s3 = &eq_at_3 * &h3;
+
+                    let poly_evals = vec![s0, s1, s2, s3];
+                    let round_poly = RoundPoly::new(poly_evals);
+
+                    for eval in round_poly.evals() {
+                        transcript.append_field_element(eval);
+                    }
+
+                    let challenge: FieldElement<E> = transcript.sample_field_element();
+                    round_combined_claim = round_poly.evaluate(&challenge);
+
+                    let eq_update =
+                        &(r_round * &challenge) + &(&one_minus_r * &(&one - &challenge));
+                    eq_correction = &eq_correction * &eq_update;
+
+                    let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                        #[cfg(feature = "parallel")]
+                        if half >= 256 {
+                            let folded: Vec<FieldElement<E>> = table
+                                .par_chunks(2)
+                                .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                                .collect();
+                            *table = folded;
+                            return;
+                        }
+                        for j in 0..half {
+                            let left = &table[2 * j];
+                            let right = &table[2 * j + 1];
+                            table[j] = left + &(&challenge * &(right - left));
+                        }
+                        table.truncate(half);
+                    };
+
+                    fold_table(&mut nl_table);
+                    fold_table(&mut nr_table);
+                    fold_table(&mut dl_table);
+                    fold_table(&mut dr_table);
+
+                    round_polys.push(round_poly);
+                    challenges.push(challenge);
+                }
             }
 
             // After all rounds, each table has a single entry: the MLE evaluated
@@ -2479,6 +2746,78 @@ mod tests {
         assert_eq!(verifier_d, prover_d);
 
         // Verify consistency with leaf MLEs
+        let expected_n = evaluate_mle(&nums, &verifier_point);
+        let expected_d = evaluate_mle(&dens, &verifier_point);
+        assert_eq!(verifier_n, expected_n);
+        assert_eq!(verifier_d, expected_d);
+    }
+
+    // ==================== SVO (Split-Value Optimization) tests ====================
+
+    #[test]
+    fn test_gkr_prove_verify_roundtrip_512_svo() {
+        // 512 leaves: exercises the SVO path (parent_num_vars = 8 >= SVO_THRESHOLD)
+        // Tree: 10 layers (sizes 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+        let n = 512;
+        let nums: Vec<FE> = (1..=n).map(|i| FE::from(i as u64)).collect();
+        let dens: Vec<FE> = (1..=n).map(|i| FE::from(i as u64 + 1000)).collect();
+        let tree = build_summation_tree(nums.clone(), dens.clone());
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0x5F, 0x00]);
+        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+
+        // Verify with a fresh transcript (same seed)
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0x5F, 0x00]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(
+            result.is_ok(),
+            "GKR verification should succeed for 512 leaves (SVO path): {:?}",
+            result.err()
+        );
+        let (verifier_point, verifier_n, verifier_d) = result.unwrap();
+
+        // The verifier's final point must match the prover's
+        assert_eq!(verifier_point, prover_point);
+
+        // The verifier's leaf claims must match the prover's
+        assert_eq!(verifier_n, prover_n);
+        assert_eq!(verifier_d, prover_d);
+
+        // Verify consistency with leaf MLEs
+        let expected_n = evaluate_mle(&nums, &verifier_point);
+        let expected_d = evaluate_mle(&dens, &verifier_point);
+        assert_eq!(verifier_n, expected_n);
+        assert_eq!(verifier_d, expected_d);
+    }
+
+    #[test]
+    fn test_gkr_prove_verify_roundtrip_1024_svo() {
+        // 1024 leaves: ensures SVO path is exercised at multiple layers
+        // parent_num_vars = 9 at the bottom layer
+        let n = 1024;
+        let nums: Vec<FE> = (1..=n).map(|i| FE::from(i as u64 * 3 + 1)).collect();
+        let dens: Vec<FE> = (1..=n).map(|i| FE::from(i as u64 * 7 + 5)).collect();
+        let tree = build_summation_tree(nums.clone(), dens.clone());
+
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xBB]);
+        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xBB]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(
+            result.is_ok(),
+            "GKR verification should succeed for 1024 leaves (SVO path): {:?}",
+            result.err()
+        );
+        let (verifier_point, verifier_n, verifier_d) = result.unwrap();
+
+        assert_eq!(verifier_point, prover_point);
+        assert_eq!(verifier_n, prover_n);
+        assert_eq!(verifier_d, prover_d);
+
         let expected_n = evaluate_mle(&nums, &verifier_point);
         let expected_d = evaluate_mle(&dens, &verifier_point);
         assert_eq!(verifier_n, expected_n);
