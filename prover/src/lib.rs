@@ -40,8 +40,9 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air, create_register_air,
+    create_decode_air, create_dvrm_air, create_halt_air, create_keccak_air, create_load_air,
+    create_lt_air, create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air,
+    create_register_air,
     create_shift_air,
 };
 
@@ -194,6 +195,7 @@ pub(crate) struct VmAirs {
     pub halt: VmAir,
     pub commit: VmAir,
     pub register: VmAir,
+    pub keccak: VmAir,
     pub pages: Vec<VmAir>,
 }
 
@@ -206,6 +208,7 @@ impl VmAirs {
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
             (&self.register, &mut traces.register, &()),
+            (&self.keccak, &mut traces.keccak, &()),
         ];
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
@@ -254,6 +257,7 @@ impl VmAirs {
             &self.halt,
             &self.commit,
             &self.register,
+            &self.keccak,
         ];
 
         for air in &self.cpus {
@@ -345,6 +349,7 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
+        let keccak = create_keccak_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -377,6 +382,7 @@ impl VmAirs {
             halt,
             commit,
             register,
+            keccak,
             pages,
         }
     }
@@ -596,11 +602,11 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, register, keccak) = 6, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 6 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 6 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

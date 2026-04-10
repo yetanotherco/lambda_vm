@@ -152,88 +152,98 @@ pub mod cols {
     pub const DIVREM: usize = 32;
     /// ECALL (Environment Call)
     pub const ECALL: usize = 33;
+    /// ECALL_COMMIT: 1 when the ECALL is a Commit syscall, 0 otherwise
+    pub const ECALL_COMMIT: usize = 34;
+    /// ECALL_KECCAK: 1 when the ECALL is a KeccakPermute syscall, 0 otherwise
+    pub const ECALL_KECCAK: usize = 35;
     /// EBREAK (Environment Break)
-    pub const EBREAK: usize = 34;
+    pub const EBREAK: usize = 36;
 
     // -------------------------------------------------------------------------
     // Output columns
     // -------------------------------------------------------------------------
 
     /// next_pc[0]: Next program counter (low word)
-    pub const NEXT_PC_0: usize = 35;
+    pub const NEXT_PC_0: usize = 37;
     /// next_pc[1]: Next program counter (high word)
-    pub const NEXT_PC_1: usize = 36;
+    pub const NEXT_PC_1: usize = 38;
 
     /// rvd[0]: Value to write to destination register (low word)
-    pub const RVD_0: usize = 37;
+    pub const RVD_0: usize = 39;
     /// rvd[1]: Value to write to destination register (high word)
-    pub const RVD_1: usize = 38;
+    pub const RVD_1: usize = 40;
 
     // -------------------------------------------------------------------------
     // Auxiliary columns
     // -------------------------------------------------------------------------
 
     /// rv1[0]: Register rs1 value (Half - bits 0-15) [DWordWHH]
-    pub const RV1_0: usize = 39;
+    pub const RV1_0: usize = 41;
     /// rv1[1]: Register rs1 value (Half - bits 16-31) [DWordWHH]
-    pub const RV1_1: usize = 40;
+    pub const RV1_1: usize = 42;
     /// rv1[2]: Register rs1 value (Word - bits 32-63) [DWordWHH]
-    pub const RV1_2: usize = 41;
+    pub const RV1_2: usize = 43;
 
     /// rv2[0]: Register rs2 value (Half - bits 0-15) [DWordWHH]
-    pub const RV2_0: usize = 42;
+    pub const RV2_0: usize = 44;
     /// rv2[1]: Register rs2 value (Half - bits 16-31) [DWordWHH]
-    pub const RV2_1: usize = 43;
+    pub const RV2_1: usize = 45;
     /// rv2[2]: Register rs2 value (Word - bits 32-63) [DWordWHH]
-    pub const RV2_2: usize = 44;
+    pub const RV2_2: usize = 46;
 
     /// rv1_ext_bit: Sign bit of rv1 as 32-bit word (for word_instr sign extension)
-    pub const RV1_EXT_BIT: usize = 45;
+    pub const RV1_EXT_BIT: usize = 47;
 
     /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 46;
-    pub const ARG1_1: usize = 47;
-    pub const ARG1_2: usize = 48;
-    pub const ARG1_3: usize = 49;
-    pub const ARG1_4: usize = 50;
-    pub const ARG1_5: usize = 51;
-    pub const ARG1_6: usize = 52;
-    pub const ARG1_7: usize = 53;
+    pub const ARG1_0: usize = 48;
+    pub const ARG1_1: usize = 49;
+    pub const ARG1_2: usize = 50;
+    pub const ARG1_3: usize = 51;
+    pub const ARG1_4: usize = 52;
+    pub const ARG1_5: usize = 53;
+    pub const ARG1_6: usize = 54;
+    pub const ARG1_7: usize = 55;
 
     /// rv2_ext_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used for arg2 sign extension)
-    pub const RV2_EXT_BIT: usize = 54;
+    pub const RV2_EXT_BIT: usize = 56;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 55;
-    pub const ARG2_1: usize = 56;
-    pub const ARG2_2: usize = 57;
-    pub const ARG2_3: usize = 58;
-    pub const ARG2_4: usize = 59;
-    pub const ARG2_5: usize = 60;
-    pub const ARG2_6: usize = 61;
-    pub const ARG2_7: usize = 62;
+    pub const ARG2_0: usize = 57;
+    pub const ARG2_1: usize = 58;
+    pub const ARG2_2: usize = 59;
+    pub const ARG2_3: usize = 60;
+    pub const ARG2_4: usize = 61;
+    pub const ARG2_5: usize = 62;
+    pub const ARG2_6: usize = 63;
+    pub const ARG2_7: usize = 64;
 
     /// res_ext_bit: Sign bit of res as 32-bit word (for rvd sign extension)
-    pub const RES_EXT_BIT: usize = 63;
+    pub const RES_EXT_BIT: usize = 65;
 
     /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 64;
-    pub const RES_1: usize = 65;
-    pub const RES_2: usize = 66;
-    pub const RES_3: usize = 67;
-    pub const RES_4: usize = 68;
-    pub const RES_5: usize = 69;
-    pub const RES_6: usize = 70;
-    pub const RES_7: usize = 71;
+    pub const RES_0: usize = 66;
+    pub const RES_1: usize = 67;
+    pub const RES_2: usize = 68;
+    pub const RES_3: usize = 69;
+    pub const RES_4: usize = 70;
+    pub const RES_5: usize = 71;
+    pub const RES_6: usize = 72;
+    pub const RES_7: usize = 73;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 72;
+    pub const IS_EQUAL: usize = 74;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 73;
+    pub const BRANCH_COND: usize = 75;
+
+    /// Keccak state address (DWordWL: lo32 and hi32).
+    /// Non-zero only for KeccakPermute ECALLs. Carried in the EcallKeccak bus
+    /// to directly bind the CPU's ECALL to the keccak chip's memory region.
+    pub const KECCAK_STATE_ADDR_0: usize = 76;
+    pub const KECCAK_STATE_ADDR_1: usize = 77;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 74;
+    pub const NUM_COLUMNS: usize = 78;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -298,6 +308,12 @@ pub struct CpuOperation {
 
     /// For Commit ECALLs: byte count from x12
     pub commit_count: u64,
+
+    /// Whether this ECALL is a KeccakPermute syscall
+    pub ecall_keccak: bool,
+
+    /// For KeccakPermute ECALLs: state address from x10
+    pub keccak_state_addr: u64,
 }
 
 impl CpuOperation {
@@ -638,6 +654,9 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        let ecall_keccak = decode.op_ecall
+            && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
@@ -660,6 +679,8 @@ impl CpuOperation {
             ecall_commit,
             commit_buf_addr,
             commit_count,
+            ecall_keccak,
+            keccak_state_addr,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -799,6 +820,12 @@ pub fn generate_cpu_trace(
         data[base + cols::MUL] = FE::from(d.op_mul as u64);
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
+        data[base + cols::ECALL_COMMIT] = FE::from(op.ecall_commit as u64);
+        data[base + cols::ECALL_KECCAK] = FE::from(op.ecall_keccak as u64);
+        data[base + cols::KECCAK_STATE_ADDR_0] =
+            FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
+        data[base + cols::KECCAK_STATE_ADDR_1] =
+            FE::from(op.keccak_state_addr >> 32);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
@@ -1997,13 +2024,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // ECALL interaction (single shared bus for HALT and COMMIT)
     // -------------------------------------------------------------------------
-    // Sends to both HALT and COMMIT tables. Each receiver pattern-matches on
-    // the syscall number in the payload.
-    // multiplicity = ECALL
-    // rv1 = value of a7 register (syscall number).
+    // Sends to HALT table only for non-Commit, non-Keccak ECALLs.
+    // multiplicity = ECALL - ECALL_COMMIT - ECALL_KECCAK (1 for Halt, 0 otherwise)
+    // rv1 = value of a7 register (syscall number). For sys_exit, rv1 = 93.
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Column(cols::ECALL),
+        Multiplicity::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ECALL,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::ECALL_COMMIT,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::ECALL_KECCAK,
+            },
+        ]),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
@@ -2024,6 +2063,80 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // cast(rv1, DWordWL)[1] = rv1_hi32 = RV1_2
             BusValue::Packed {
                 start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // ECALL → COMMIT interaction
+    // -------------------------------------------------------------------------
+    // Sends to COMMIT table only for Commit ECALLs.
+    // multiplicity = ECALL_COMMIT
+    interactions.push(BusInteraction::sender(
+        BusId::EcallCommit,
+        Multiplicity::Column(cols::ECALL_COMMIT),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
+            // rv1 = syscall number (must match COMMIT receiver's hardcoded value)
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // ECALL → KECCAK interaction
+    // -------------------------------------------------------------------------
+    // Sends to the KECCAK table only for KeccakPermute ECALLs.
+    // Payload matches the KECCAK receiver:
+    // [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32, state_addr_lo32, state_addr_hi32]
+    //
+    // Including state_addr directly binds the CPU's keccak ECALL to the keccak
+    // chip's memory region, rather than relying solely on transitive enforcement
+    // through the MEMW bus chain.
+    interactions.push(BusInteraction::sender(
+        BusId::EcallKeccak,
+        Multiplicity::Column(cols::ECALL_KECCAK),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // CPU timestamps fit in u32
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_1,
                 packing: Packing::Direct,
             },
         ],

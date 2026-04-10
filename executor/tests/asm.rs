@@ -788,3 +788,10 @@ fn test_sub_64bit() {
 fn test_sub_underflow() {
     run_program("./program_artifacts/asm/sub_underflow.elf");
 }
+
+// ==================== Keccak Precompile ====================
+
+#[test]
+fn test_keccak() {
+    run_program("./program_artifacts/asm/test_keccak.elf");
+}

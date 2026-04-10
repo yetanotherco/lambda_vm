@@ -28,6 +28,7 @@ pub mod cpu;
 pub mod decode;
 pub mod dvrm;
 pub mod halt;
+pub mod keccak;
 pub mod load;
 pub mod lt;
 pub mod memw;

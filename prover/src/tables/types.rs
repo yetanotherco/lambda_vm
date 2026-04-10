@@ -102,10 +102,14 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode,
-    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
+    /// System call handling (CPU → HALT for Halt ECALLs)
     Ecall,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
     CommitNextByte,
+    /// ECALL dispatch for Commit syscall (CPU → COMMIT)
+    EcallCommit,
+    /// ECALL dispatch for KeccakPermute syscall (CPU → KECCAK)
+    EcallKeccak,
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit,
@@ -136,6 +140,8 @@ impl BusId {
             BusId::Ecall => "Ecall",
             BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
+            BusId::EcallCommit => "EcallCommit",
+            BusId::EcallKeccak => "EcallKeccak",
             BusId::Commit => "Commit",
         }
     }
@@ -167,7 +173,9 @@ impl TryFrom<u64> for BusId {
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
-            21 => Ok(BusId::Commit),
+            21 => Ok(BusId::EcallCommit),
+            22 => Ok(BusId::EcallKeccak),
+            23 => Ok(BusId::Commit),
             other => Err(other),
         }
     }

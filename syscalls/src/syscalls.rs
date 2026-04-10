@@ -14,6 +14,10 @@ enum SyscallNumbers {
     Halt = 93,
 }
 
+/// Syscall number for KeccakPermute (u64::MAX - 1).
+#[cfg(target_arch = "riscv64")]
+const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
+
 #[cfg(target_arch = "riscv64")]
 /// This is a template for printing in the vm
 pub fn print_string(s: &str) {
@@ -118,6 +122,26 @@ pub fn sys_halt() -> ! {
 
 #[cfg(not(target_arch = "riscv64"))]
 pub fn sys_halt() -> ! {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
+///
+/// The state is 200 bytes (25 × u64) stored little-endian in memory.
+pub fn keccak_permute(state: &mut [u64; 25]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a7") KECCAK_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
+pub fn keccak_permute(_state: &mut [u64; 25]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

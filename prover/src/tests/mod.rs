@@ -19,6 +19,8 @@ pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod keccak_tests;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
