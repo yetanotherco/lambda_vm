@@ -1,3 +1,4 @@
+import copy
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
@@ -629,6 +630,7 @@ class VirtualVariable(Variable):
     def __init__(self, config: Config, category: str, data: dict):
         assert_no_unexpected(data, (set(Variable.__annotations__.keys()) | {"def"}) - {"pad"})
         reporter.asserts("def" in data, f"Missing def for virtual column: {data!r}")
+        data = copy.deepcopy(data)
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
         self.def_ = VirtualDef(config, self.name, self.type, def_)
