@@ -7,12 +7,12 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
-enum SyscallNumbers {
+pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    Commit = 3,
     GetPrivateInputs = 4,
-    Halt = 5,
+    Commit = 64,
+    Halt = 93,
 }
 
 impl TryFrom<u64> for SyscallNumbers {
@@ -21,9 +21,9 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
-            3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
-            5 => Ok(SyscallNumbers::Halt),
+            64 => Ok(SyscallNumbers::Commit),
+            93 => Ok(SyscallNumbers::Halt),
             _ => Err(()),
         }
     }
@@ -277,9 +277,11 @@ impl Instruction {
                 }
             }
             Instruction::EcallEbreak => {
-                let syscall_number = registers.read(17)?; // a7
-                let syscall_number = SyscallNumbers::try_from(syscall_number)
-                    .map_err(|_| ExecutionError::UnknownSyscall(syscall_number))?;
+                let syscall_number_raw = registers.read(17)?; // a7
+                let syscall_number = SyscallNumbers::try_from(syscall_number_raw)
+                    .map_err(|_| ExecutionError::UnknownSyscall(syscall_number_raw))?;
+                let mut src2_val = 0u64;
+                let mut dst_val = 0u64;
                 match syscall_number {
                     SyscallNumbers::Print => {
                         // print
@@ -302,10 +304,19 @@ impl Instruction {
                         return Err(ExecutionError::Panic(value.to_owned()));
                     }
                     SyscallNumbers::Commit => {
-                        // commit
-                        let pointer = registers.read(10)?;
-                        let len = registers.read(11)?;
-                        memory.commit_public_output(pointer, len)?;
+                        // commit: write(fd, buf_addr, count) per POSIX convention
+                        // x10 = fd (must be 1 for stdout)
+                        // x11 = buf_addr (buffer address in memory)
+                        // x12 = count (number of bytes to write)
+                        let fd = registers.read(10)?;
+                        if fd != 1 {
+                            return Err(ExecutionError::InvalidCommitFd(fd));
+                        }
+                        let buf_addr = registers.read(11)?;
+                        let count = registers.read(12)?;
+                        memory.commit_public_output(buf_addr, count)?;
+                        src2_val = buf_addr;
+                        dst_val = count;
                     }
                     SyscallNumbers::GetPrivateInputs => {
                         // get private inputs
@@ -319,8 +330,8 @@ impl Instruction {
                         // halt
                         return Ok(Log {
                             current_pc: pc,
-                            next_pc: 0, // We halt by setting pc to 0
-                            src1_val: 0,
+                            next_pc: 0,                   // We halt by setting pc to 0
+                            src1_val: syscall_number_raw, // actual a7 value for rv1
                             src2_val: 0,
                             dst_val: 0,
                         });
@@ -329,9 +340,9 @@ impl Instruction {
                 Log {
                     current_pc: pc,
                     next_pc: pc + REGULAR_PC_UPDATE,
-                    src1_val: 0,
-                    src2_val: 0,
-                    dst_val: 0,
+                    src1_val: syscall_number_raw,
+                    src2_val,
+                    dst_val,
                 }
             }
             Instruction::Fence => {
@@ -485,4 +496,6 @@ pub enum ExecutionError {
     IncorrectMessage,
     #[error("Invalid W-suffix operation: {0:?}")]
     InvalidWSuffixOperation(ArithOp),
+    #[error("Invalid commit fd: expected 1 (stdout), got {0}")]
+    InvalidCommitFd(u64),
 }

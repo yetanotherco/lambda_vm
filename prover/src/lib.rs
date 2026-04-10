@@ -13,16 +13,20 @@
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod tables;
 pub mod test_utils;
+#[cfg(test)]
 pub mod tests;
-pub mod utils;
 
 use std::fmt;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -33,10 +37,12 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
-    create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
-    create_mul_air, create_page_air, create_register_air, create_shift_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
+    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -61,11 +67,13 @@ pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
     pub memw: usize,
+    pub memw_aligned: usize,
     pub load: usize,
     pub mul: usize,
     pub dvrm: usize,
     pub shift: usize,
     pub branch: usize,
+    pub memw_register: usize,
 }
 
 impl TableCounts {
@@ -75,7 +83,16 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
+        self.cpu
+            + self.lt
+            + self.memw
+            + self.memw_aligned
+            + self.load
+            + self.mul
+            + self.dvrm
+            + self.shift
+            + self.branch
+            + self.memw_register
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -87,11 +104,13 @@ impl TableCounts {
             ("cpu", self.cpu),
             ("lt", self.lt),
             ("memw", self.memw),
+            ("memw_aligned", self.memw_aligned),
             ("load", self.load),
             ("mul", self.mul),
             ("dvrm", self.dvrm),
             ("shift", self.shift),
             ("branch", self.branch),
+            ("memw_register", self.memw_register),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -117,6 +136,8 @@ pub struct VmProof {
     /// Number of chunks for each split table.
     /// The verifier needs this to reconstruct matching AIRs.
     pub table_counts: TableCounts,
+    /// Committed public output bytes.
+    pub public_output: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -167,14 +188,17 @@ pub(crate) struct VmAirs {
     pub lts: Vec<VmAir>,
     pub shifts: Vec<VmAir>,
     pub memws: Vec<VmAir>,
+    pub memw_aligneds: Vec<VmAir>,
     pub loads: Vec<VmAir>,
     pub decode: VmAir,
     pub muls: Vec<VmAir>,
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
+    pub commit: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
+    pub memw_registers: Vec<VmAir>,
 }
 
 impl VmAirs {
@@ -184,6 +208,7 @@ impl VmAirs {
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
+            (&self.commit, &mut traces.commit, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -197,6 +222,13 @@ impl VmAirs {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self
+            .memw_aligneds
+            .iter()
+            .zip(traces.memw_aligneds.iter_mut())
+        {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) {
@@ -214,14 +246,26 @@ impl VmAirs {
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
             pairs.push((air, trace, &()));
         }
+        for (air, trace) in self
+            .memw_registers
+            .iter()
+            .zip(traces.memw_registers.iter_mut())
+        {
+            pairs.push((air, trace, &()));
+        }
 
         pairs
     }
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
-        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-            vec![&self.bitwise, &self.decode, &self.halt, &self.register];
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+            &self.bitwise,
+            &self.decode,
+            &self.halt,
+            &self.commit,
+            &self.register,
+        ];
 
         for air in &self.cpus {
             refs.push(air);
@@ -233,6 +277,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.memws {
+            refs.push(air);
+        }
+        for air in &self.memw_aligneds {
             refs.push(air);
         }
         for air in &self.loads {
@@ -248,6 +295,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.pages {
+            refs.push(air);
+        }
+        for air in &self.memw_registers {
             refs.push(air);
         }
 
@@ -287,6 +337,9 @@ impl VmAirs {
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
             .collect();
+        let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
+            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
+            .collect();
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
@@ -305,8 +358,9 @@ impl VmAirs {
             .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
             .collect();
         let halt = create_halt_air(proof_options);
+        let commit = create_commit_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options),
+            register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs
@@ -318,6 +372,9 @@ impl VmAirs {
                 )
             })
             .collect();
+        let memw_registers: Vec<_> = (0..table_counts.memw_register)
+            .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
+            .collect();
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -328,17 +385,97 @@ impl VmAirs {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,
             dvrms,
             branches,
             halt,
+            commit,
             register,
             pages,
+            memw_registers,
         }
     }
 }
+
+// =============================================================================
+// Bus Balance Target: Verifier-Computed COMMIT Output Bus
+// =============================================================================
+
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
+/// trace commitments in the same order as the prover, then samples two
+/// challenge elements.
+pub(crate) fn replay_transcript_phase_a(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    multi_proof: &MultiProof<F, E, ()>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        } else {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        }
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// Compute the bus balance offset for the COMMIT[index, value] bus.
+///
+/// For each public output byte at index `i` with value `v`:
+///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
+///   `term = +1 / fingerprint`
+///
+/// Returns `Some(Σ term)` — the positive receiver contribution that is no
+/// longer present as an in-trace table. For empty public output, returns
+/// `Some(zero)`. Returns `None` on a fingerprint collision (zero divisor),
+/// which the caller should treat as verification failure.
+pub(crate) fn compute_commit_bus_offset(
+    public_output: &[u8],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> Option<FieldElement<E>> {
+    if public_output.is_empty() {
+        return Some(FieldElement::zero());
+    }
+
+    let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
+    let alpha_sq = alpha * alpha;
+
+    let mut total = FieldElement::<E>::zero();
+    for (i, &value) in public_output.iter().enumerate() {
+        let linear_combination = bus_id
+            + (FieldElement::<E>::from(i as u64) * alpha)
+            + (FieldElement::<E>::from(value as u64) * alpha_sq);
+        let fingerprint = z - linear_combination;
+        total += fingerprint.inv().ok()?;
+    }
+    Some(total)
+}
+
+/// Compute the expected COMMIT bus balance for a `MultiProof`.
+///
+/// Replays Phase A of the transcript to recover (z, alpha), then computes
+/// the offset from the given public output bytes. Call this after `multi_prove`
+/// and before `multi_verify`.
+pub(crate) fn compute_expected_commit_bus_balance(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proof: &MultiProof<F, E, ()>,
+    public_output_bytes: &[u8],
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a(airs, proof);
+    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+}
+
+// =============================================================================
+// Public API: Prove / Verify
+// =============================================================================
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
@@ -355,15 +492,37 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    #[cfg(feature = "instruments")]
+    let total_start = std::time::Instant::now();
+
+    // Phase 1: Execute (ELF load + run)
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    #[cfg(feature = "instruments")]
+    let execute_elapsed = phase_start.elapsed();
+
+    // Phase 2: Trace build
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+
+    #[cfg(feature = "instruments")]
+    let trace_build_elapsed = phase_start.elapsed();
+
+    // Phase 3: AIR construction
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         &program,
@@ -373,18 +532,33 @@ pub fn prove_with_options(
         &table_counts,
     );
 
+    #[cfg(feature = "instruments")]
+    let air_elapsed = phase_start.elapsed();
+
     let runtime_page_ranges = traces.runtime_page_ranges();
 
+    // Phase 4: Prove (multi_prove)
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
+    #[cfg(feature = "instruments")]
+    {
+        instruments::print_report(
+            execute_elapsed,
+            trace_build_elapsed,
+            air_elapsed,
+            total_start.elapsed(),
+        );
+    }
+
     Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
+        public_output: traces.public_output_bytes.clone(),
     })
 }
 
@@ -420,11 +594,11 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, register) = 4, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 4 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 4 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
@@ -440,10 +614,24 @@ pub fn verify_with_options(
         &vm_proof.table_counts,
     );
 
+    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // If public_output was tampered, the recomputed offset won't match the
+    // actual bus total in the proof, and multi_verify will reject.
+    let air_refs = airs.air_refs();
+    let expected_bus_balance = match compute_expected_commit_bus_balance(
+        &air_refs,
+        &vm_proof.proof,
+        &vm_proof.public_output,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
+
     Ok(Verifier::multi_verify(
-        &airs.air_refs(),
+        &air_refs,
         &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     ))
 }
 

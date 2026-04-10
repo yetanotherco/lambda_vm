@@ -4,18 +4,19 @@ pub mod constraints;
 pub mod context;
 pub mod debug;
 pub mod domain;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod examples;
 pub mod frame;
 pub mod fri;
 pub mod grinding;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
 pub mod table;
 pub mod trace;
 pub mod traits;
-pub mod transcript;
-pub mod utils;
 pub mod verifier;
 
 #[cfg(test)]

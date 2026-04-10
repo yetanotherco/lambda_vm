@@ -5,5 +5,6 @@ main:
 	# 100 + (-50) = 50
 	addi	a2, zero, 100
 	addiw	a0, a2, -50
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

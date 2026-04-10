@@ -385,36 +385,12 @@ pub fn generate_dvrm_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
-    // -------------------------------------------------------------------------
-    // DVRM-A1.i: IS_HALF[n[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [cols::N_0, cols::N_1, cols::N_2, cols::N_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+    // DVRM-A1.i (IS_HALF[n[i]]) and DVRM-A2.i (IS_HALF[d[i]]) are assumptions:
+    // the CPU (sender) is responsible for range-checking n and d before sending
+    // to DVRM. The DVRM table does NOT send these IS_HALF lookups.
 
     // -------------------------------------------------------------------------
-    // DVRM-A2.i: IS_HALF[d[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [cols::D_0, cols::D_1, cols::D_2, cols::D_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // DVRM-C10.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [cols::R_0, cols::R_1, cols::R_2, cols::R_3] {
         interactions.push(BusInteraction::sender(
@@ -428,7 +404,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C11.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C14.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [
         cols::N_SUB_R_0,
@@ -447,7 +423,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C15.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C11.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3] {
         interactions.push(BusInteraction::sender(
@@ -461,7 +437,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C16 (SIGN): MSB16[sign_n; n[3]] when signed=1
+    // DVRM-C18 (SIGN): MSB16[sign_n; n[3]] when signed=1
     // Multiplicity: Column(SIGNED) = 0 or 1 per unique row.
     // The trace builder deduplicates MSB16 lookups per unique op.
     // -------------------------------------------------------------------------
@@ -481,7 +457,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C17 (SIGN): MSB16[sign_r; r[3]] when signed=1
+    // DVRM-C19 (SIGN): MSB16[sign_r; r[3]] when signed=1
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
@@ -499,7 +475,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C18 (SIGN): MSB16[sign_d; d[3]] when signed=1
+    // DVRM-C20 (SIGN): MSB16[sign_d; d[3]] when signed=1
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
@@ -549,7 +525,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C13: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
+    // DVRM-C9: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
     // Verify n - r = d * q (lower 64 bits)
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
@@ -588,7 +564,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C14: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
+    // DVRM-C10: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
     // Verify upper 64 bits of d * q = sign extension of n_sub_r
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
@@ -885,7 +861,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C20: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
+    // DVRM-C17: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
@@ -1003,17 +979,17 @@ pub enum DvrmConstraintKind {
     AbsDFormula(usize),
     /// DVRM-C7: signed * (1-overflow) - sign_q = 0
     SignQFormula,
-    /// DVRM-C9.i: carry[i] * (1 - carry[i]) = 0 (virtual carries from n = n_sub_r + r)
+    /// DVRM-C12.i: carry[i] * (1 - carry[i]) = 0 (virtual carries from n = n_sub_r + r)
     CarryIsBit(usize),
-    /// DVRM-C12: sign_n_sub_r * (1-sign_n_sub_r) = 0
+    /// DVRM-C15: sign_n_sub_r * (1-sign_n_sub_r) = 0
     SignNSubRIsBit,
-    /// DVRM-C16b: (1-signed) * sign_n = 0
+    /// DVRM-C18b: (1-signed) * sign_n = 0
     UnsignedSignN,
-    /// DVRM-C17b: (1-signed) * sign_r = 0
+    /// DVRM-C19b: (1-signed) * sign_r = 0
     UnsignedSignR,
-    /// DVRM-C18b: (1-signed) * sign_d = 0
+    /// DVRM-C20b: (1-signed) * sign_d = 0
     UnsignedSignD,
-    /// DVRM-C19.i: div_by_zero * (q[i] - 65535) = 0
+    /// DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
     DivByZeroQ(usize),
 }
 
@@ -1250,10 +1226,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
@@ -1316,29 +1288,29 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignQFormula, idx));
     idx += 1;
 
-    // DVRM-C9: carry is bit (×4)
+    // DVRM-C12.i: carry is bit (×4)
     for i in 0..4 {
         constraints.push(DvrmConstraint::new(DvrmConstraintKind::CarryIsBit(i), idx));
         idx += 1;
     }
 
-    // DVRM-C12: sign_n_sub_r is bit
+    // DVRM-C15: sign_n_sub_r is bit
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignNSubRIsBit, idx));
     idx += 1;
 
-    // DVRM-C16b: unsigned sign_n = 0
+    // DVRM-C18b: unsigned sign_n = 0
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignN, idx));
     idx += 1;
 
-    // DVRM-C17b: unsigned sign_r = 0
+    // DVRM-C19b: unsigned sign_r = 0
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignR, idx));
     idx += 1;
 
-    // DVRM-C18b: unsigned sign_d = 0
+    // DVRM-C20b: unsigned sign_d = 0
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignD, idx));
     idx += 1;
 
-    // DVRM-C19: div_by_zero implies q = all 1s (×4)
+    // DVRM-C16.i: div_by_zero implies q = all 1s (×4)
     for i in 0..4 {
         constraints.push(DvrmConstraint::new(DvrmConstraintKind::DivByZeroQ(i), idx));
         idx += 1;

@@ -3,7 +3,9 @@ name: Hyperfine Benchmark
 on:
   pull_request:
     branches: ["**"]
-    paths-ignore: ["spec/**"]
+    paths:
+      - 'executor/src/**'
+      - 'executor/Cargo.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +35,7 @@ jobs:
         id: cache
         with:
           path: ${{ matrix.branch }}_programs/*.elf
-          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/*' ) }}
+          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/**', 'syscalls/src/**' ) }}
           restore-keys: benchmarks-${{ matrix.branch }}-
 
       - name: Setup Rust Environment
@@ -49,7 +51,7 @@ jobs:
 
       - name: Export benchmark hashes
         id: export-hashes
-        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/*' ) }}" >> "$GITHUB_OUTPUT"
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/**', 'syscalls/src/**' ) }}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     strategy:
