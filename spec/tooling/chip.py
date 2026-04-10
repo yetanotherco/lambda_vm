@@ -390,7 +390,7 @@ class Iter:
             yield from callback(env.with_val(self.name, Range.const(i)))
 
 
-def iters_of(obj: dict, name=None) -> list[Iter]:
+def iters_of(obj: dict, config, name=None) -> list[Iter]:
     """Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
     Prepend `name` to every iterator, if given.
     Adapted from the corresponding typst implementation."""
@@ -607,14 +607,14 @@ class VirtualDef:
             idx = data.get("idx", None)
             self.defs = [
                 PolyWithIters(
-                    build_expr(config, data["poly"]), iters_of(data, name=idx)
+                    build_expr(config, data["poly"]), iters_of(data, config, name=idx)
                 )
             ]
         elif "polys" in data:
             idx = data.get("idx", None)
             self.defs = [
                 PolyWithIters(
-                    build_expr(config, poly["poly"]), iters_of(poly, name=idx)
+                    build_expr(config, poly["poly"]), iters_of(poly, config, name=idx)
                 )
                 for poly in data["polys"]
             ]
@@ -753,7 +753,7 @@ class Assumption:
             data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
         )
         self.desc = data["desc"]
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
 
 @dataclass
@@ -778,7 +778,7 @@ class ArithConstraint:
             isinstance(self.desc, str), f"desc is not a string: {self.desc!r}"
         )
         self.poly = build_expr(config, data["poly"])
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
     def typecheck(self, env: Environment) -> Iterable[Never]:
         # TODO? Should we check that there's no overflow of the modulus?
@@ -873,7 +873,7 @@ class InteractionLike:
                 f"Missing {self.conditional_name}: {data!r}",
             )
             self.conditional = None
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
     def typecheck(self, env: Environment) -> Iterable[Signature]:
         def callback(e: Environment) -> Iterable[Signature]:
