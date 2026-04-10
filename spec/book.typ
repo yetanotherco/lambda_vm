@@ -42,6 +42,7 @@
       ("about_ecalls.typ", [About `ECALL`], <ecall>),
       ("halt.typ", [`HALT` chip], <halt>),
       ("commit.typ", [`COMMIT` chip], <commit>),
+      ("sha256.typ", [`SHA256` accelerator], <sha256>),
     ))
   )
 )
