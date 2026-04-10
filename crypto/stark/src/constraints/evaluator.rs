@@ -98,6 +98,33 @@ where
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
                         frame.fill_from_lde(lde_trace, i, offsets);
 
+                        // Try compiled path: bypasses virtual dispatch + to_extension()
+                        // by computing the weighted sum directly with F×E multiplication.
+                        // Requires at least 2 evaluation steps (current + next row).
+                        if num_offsets >= 2 {
+                            let step0 = frame.get_evaluation_step(0);
+                            let step1 = frame.get_evaluation_step(1);
+                            if let Some(compiled_sum) = air.evaluate_transitions_compiled(
+                                &step0.data[0],
+                                &step1.data[0],
+                                &step0.aux_data[0],
+                                &step1.aux_data[0],
+                                transition_coefficients,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                logup_table_offset,
+                            ) {
+                                // Compiled path already returns the weighted sum.
+                                // Apply zerofier (uniform fast path — CPU has uniform zerofier).
+                                let z = if is_uniform {
+                                    zerofier_data.get_uniform(i)
+                                } else {
+                                    zerofier_data.get(0, i)
+                                };
+                                return z * &compiled_sum + boundary;
+                            }
+                        }
+
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
                             periodic_buf[j] = col[i].clone();
                         }
@@ -149,6 +176,30 @@ where
                 .enumerate()
                 .map(|(i, boundary)| {
                     frame.fill_from_lde(lde_trace, i, offsets);
+
+                    // Try compiled path: bypasses virtual dispatch + to_extension()
+                    // Requires at least 2 evaluation steps (current + next row).
+                    if num_offsets >= 2 {
+                        let step0 = frame.get_evaluation_step(0);
+                        let step1 = frame.get_evaluation_step(1);
+                        if let Some(compiled_sum) = air.evaluate_transitions_compiled(
+                            &step0.data[0],
+                            &step1.data[0],
+                            &step0.aux_data[0],
+                            &step1.aux_data[0],
+                            transition_coefficients,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                        ) {
+                            let z = if is_uniform {
+                                zerofier_data.get_uniform(i)
+                            } else {
+                                zerofier_data.get(0, i)
+                            };
+                            return z * &compiled_sum + boundary;
+                        }
+                    }
 
                     for (j, col) in lde_periodic_columns.iter().enumerate() {
                         periodic_buf[j] = col[i].clone();

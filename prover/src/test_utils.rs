@@ -474,9 +474,14 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints.push(c);
     }
 
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: cpu_bus_interactions(),
-    };
+    let interactions = cpu_bus_interactions();
+
+    // Build compiled evaluator with a clone of the interactions
+    let compiled_evaluator = Box::new(
+        crate::constraints::cpu_compiled::CpuCompiledEvaluator::new(interactions.clone()),
+    );
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData { interactions };
 
     AirWithBuses::new(
         cpu_cols::NUM_COLUMNS,
@@ -485,6 +490,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_compiled_evaluator(compiled_evaluator)
     .with_name("CPU")
 }
 
