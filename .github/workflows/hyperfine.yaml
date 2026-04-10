@@ -3,6 +3,7 @@ name: Hyperfine Benchmark
 on:
   pull_request:
     branches: ["**"]
+    paths-ignore: ["spec/**"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

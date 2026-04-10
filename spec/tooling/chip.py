@@ -1043,6 +1043,7 @@ if __name__ == "__main__":
     signatures = read_signatures(config, sys.argv[2])
     if reporter.reported:
         sys.exit(1)
+
     reported = False
     chips: list[Chip] = []
     for file in sys.argv[3:]:
@@ -1050,7 +1051,15 @@ if __name__ == "__main__":
             continue
         chips.append(Chip.from_file(config, file))
         reported |= reporter.reported
-    if not reported:
-        for chip in chips:
-            reporter.update_location(f"Chip {chip.name}")
-            check_signatures(chip.typecheck(), signatures)
+    if reported:
+        sys.exit(1)
+
+    for chip in chips:
+        reporter.update_location(f"Chip {chip.name}")
+        check_signatures(chip.typecheck(), signatures)
+        reported |= reporter.reported
+    if reported:
+        sys.exit(1)
+    else:
+        print("No issues were found.")
+        sys.exit(0)
