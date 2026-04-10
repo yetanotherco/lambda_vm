@@ -1708,6 +1708,7 @@ fn test_verify_rejects_zero_table_counts() {
     let tampered_proof = crate::VmProof {
         table_counts: crate::TableCounts {
             cpu: 0,
+            cpu_bitwise: 0,
             lt: 0,
             memw: 0,
             memw_aligned: 0,
@@ -1776,6 +1777,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
 
     let zero_counts = crate::TableCounts {
         cpu: 0,
+        cpu_bitwise: 0,
         lt: 0,
         memw: 0,
         memw_aligned: 0,

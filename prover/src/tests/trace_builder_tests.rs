@@ -341,8 +341,10 @@ fn test_mixed_instructions() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // 5 ops (4 + ecall) padded to 8
-    assert_eq!(traces.cpus[0].main_table.height, 8);
+    // 4 non-bitwise ops (ADD, SLT, BLT, ECALL) padded to 4
+    assert_eq!(traces.cpus[0].main_table.height, 4);
+    // 1 bitwise op (AND) padded to 4
+    assert_eq!(traces.cpu_bitwises[0].main_table.height, 4);
     assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
     // 1 SLT + 1 BLT = 2 LT ops
     assert!(traces.lts[0].main_table.height >= 2);

@@ -40,9 +40,9 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air,
+    create_cpu_bitwise_air, create_decode_air, create_dvrm_air, create_halt_air, create_load_air,
+    create_lt_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
+    create_mul_air, create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -65,6 +65,7 @@ pub struct RuntimePageRange {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
+    pub cpu_bitwise: usize,
     pub lt: usize,
     pub memw: usize,
     pub memw_aligned: usize,
@@ -84,6 +85,7 @@ impl TableCounts {
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
         self.cpu
+            + self.cpu_bitwise
             + self.lt
             + self.memw
             + self.memw_aligned
@@ -184,6 +186,7 @@ type AirTracePair<'a> = (
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
+    pub cpu_bitwises: Vec<VmAir>,
     pub bitwise: VmAir,
     pub lts: Vec<VmAir>,
     pub shifts: Vec<VmAir>,
@@ -213,6 +216,13 @@ impl VmAirs {
         ];
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self
+            .cpu_bitwises
+            .iter()
+            .zip(traces.cpu_bitwises.iter_mut())
+        {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
@@ -270,6 +280,9 @@ impl VmAirs {
         for air in &self.cpus {
             refs.push(air);
         }
+        for air in &self.cpu_bitwises {
+            refs.push(air);
+        }
         for air in &self.lts {
             refs.push(air);
         }
@@ -319,6 +332,11 @@ impl VmAirs {
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
+            .collect();
+        let cpu_bitwises: Vec<_> = (0..table_counts.cpu_bitwise)
+            .map(|i| {
+                create_cpu_bitwise_air(proof_options).with_name(&format!("CPU_BITWISE[{}]", i))
+            })
             .collect();
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
@@ -381,6 +399,7 @@ impl VmAirs {
 
         Self {
             cpus,
+            cpu_bitwises,
             bitwise,
             lts,
             shifts,

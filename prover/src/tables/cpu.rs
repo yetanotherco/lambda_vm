@@ -306,6 +306,12 @@ impl CpuOperation {
         Self::default()
     }
 
+    /// Returns true if this operation is a bitwise instruction (AND, OR, XOR).
+    /// Used to route operations to the CPU_BITWISE chip.
+    pub fn is_bitwise(&self) -> bool {
+        self.decode.op_and || self.decode.op_or || self.decode.op_xor
+    }
+
     // =========================================================================
     // Convenience accessors for decode fields (reduces verbosity)
     // =========================================================================
@@ -2030,6 +2036,44 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     interactions
+}
+
+/// Bus interactions for the CPU table WITHOUT AND/OR/XOR byte operations.
+///
+/// Used when bitwise instructions (AND, OR, XOR) are routed to a separate
+/// CPU_BITWISE chip. This reduces the CPU effective width by 72 (24 × 3).
+pub fn bus_interactions_without_bitwise_bytes() -> Vec<BusInteraction> {
+    let and_byte_id: u64 = BusId::AndByte.into();
+    let or_byte_id: u64 = BusId::OrByte.into();
+    let xor_byte_id: u64 = BusId::XorByte.into();
+
+    bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id != and_byte_id && i.bus_id != or_byte_id && i.bus_id != xor_byte_id)
+        .collect()
+}
+
+/// Bus interactions for the CPU_BITWISE chip (AND, OR, XOR instructions).
+///
+/// Includes only interactions needed for bitwise operations:
+/// - DECODE (instruction validation)
+/// - IS_BYTE (range checks for rs1, rs2, rd, arg1, arg2, res)
+/// - AND_BYTE, OR_BYTE, XOR_BYTE (byte-level bitwise operations)
+/// - MEMW (register reads for rs1/rs2, register write for rd, PC update)
+pub fn bus_interactions_bitwise_chip() -> Vec<BusInteraction> {
+    let keep_ids: Vec<u64> = vec![
+        BusId::Decode.into(),
+        BusId::IsByte.into(),
+        BusId::AndByte.into(),
+        BusId::OrByte.into(),
+        BusId::XorByte.into(),
+        BusId::Memw.into(),
+    ];
+
+    bus_interactions()
+        .into_iter()
+        .filter(|i| keep_ids.contains(&i.bus_id))
+        .collect()
 }
 
 // =========================================================================
