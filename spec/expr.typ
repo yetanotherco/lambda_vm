@@ -56,8 +56,8 @@
   "div": 5,  // /
   "sum": 6,  // Σ
   "not": 7,  // not
-  "add": 8,  // +
-  "sub": 9,  // -
+  "sub": 8,  // -
+  "add": 9,  // +  
   "eq": 10,   // = and :=
   "MAX": 11, // <the void outside every expression>
 )
@@ -187,7 +187,10 @@
         mwrap($-#rec(PREC.neg, e.at(1))$, pp < PREC.neg)
       } else {
         // Subtraction
-        mwrap($#e.slice(1).map(rec.with(PREC.sub)).join($-$)$, pp < PREC.sub)
+        mwrap(
+          $#rec(PREC.add, e.at(1))-#e.slice(2).map(rec.with(PREC.sub)).join($-$)$,
+          pp <= PREC.sub
+        )
       }
     },
     "cast": (pp, rec, e) => {
