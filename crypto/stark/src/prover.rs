@@ -268,6 +268,17 @@ pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     nonce: Option<u64>,
 }
 
+/// Intermediate results from Round 4 DEEP polynomial computation (before FRI).
+/// Used in shared FRI mode: each table produces its DEEP LDE evals, then they
+/// are batched and fed into a single shared FRI cascade.
+pub struct Round4DeepEvals<F: IsSubFieldOf<E>, E: IsField> {
+    /// Bit-reversed LDE evaluations of the DEEP composition polynomial.
+    pub(crate) lde_evals: Vec<FieldElement<E>>,
+    /// The LDE domain size for this table.
+    pub(crate) lde_domain_size: usize,
+    _phantom: PhantomData<F>,
+}
+
 /// Returns the evaluations of the polynomial `p` over the lde domain defined by the given
 /// `blowup_factor`, `domain_size` and `offset`. The number of evaluations returned is `domain_size
 /// * blowup_factor`. The domain generator used is the one given by the implementation of `F` as `IsFFTField`.
@@ -1147,12 +1158,92 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Compute the DEEP composition polynomial LDE evaluations (bit-reversed) for one table,
+    /// without running FRI. Used in shared FRI mode where multiple tables' DEEP evals
+    /// are batched into a single FRI cascade.
+    ///
+    /// This performs the same DEEP computation as round_4 but stops before FRI,
+    /// returning the bit-reversed LDE evaluations ready for FRI folding.
+    fn round_4_compute_deep_evals(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> (Round4DeepEvals<Field, FieldExtension>, FieldElement<FieldExtension>)
+    where
+        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes,
+    {
+        let gamma = transcript.sample_field_element();
+
+        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(n_terms_composition_poly + num_terms_trace)
+                .collect();
+
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+            .drain(..num_terms_trace)
+            .collect::<Vec<_>>()
+            .chunks(air.context().transition_offsets.len() * air.step_size())
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let gammas = deep_composition_coefficients;
+
+        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+            &round_1_result.lde_trace,
+            round_2_result,
+            round_3_result,
+            z,
+            domain,
+            &domain.trace_primitive_root,
+            &gammas,
+            &trace_term_coeffs,
+        );
+
+        // Extend N trace-coset evaluations to 2N LDE-coset evaluations
+        let lde_domain_size = domain.lde_roots_of_unity_coset.len();
+        let deep_poly =
+            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
+        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(lde_domain_size))
+            .expect("FFT should succeed");
+        in_place_bit_reverse_permute(&mut lde_evals);
+
+        (
+            Round4DeepEvals {
+                lde_evals,
+                lde_domain_size,
+                _phantom: PhantomData,
+            },
+            gamma,
+        )
+    }
+
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        (0..number_of_queries)
+            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .collect::<Vec<usize>>()
+    }
+
+    fn sample_query_indexes_for_domain_size(
+        number_of_queries: usize,
+        lde_domain_size: usize,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Vec<usize> {
+        let domain_size = lde_domain_size as u64;
         (0..number_of_queries)
             .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
             .collect::<Vec<usize>>()
@@ -1792,10 +1883,11 @@ pub trait IsStarkProver<
         }
 
         // =====================================================================
-        // Rounds 2-4: Parallel per-table proving in chunks of K
+        // Rounds 2-4: Per-table proving with shared FRI
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Each worker gets its
-        // own pool set and transcript fork. Pool sets are reused across chunks.
+        // For single table: use the original prove_rounds_2_to_4 path.
+        // For multi-table: compute DEEP evals per table, then run shared FRI
+        // with folding insertion.
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
@@ -1807,79 +1899,111 @@ pub trait IsStarkProver<
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
-        let mut proofs = Vec::with_capacity(num_airs);
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
-            let chunk_size = chunk_end - chunk_start;
+        if num_airs == 1 {
+            // Single-table path: use original prove_rounds_2_to_4 (backward compatible)
+            let pool = &mut pool_sets[0];
+            let table_transcript = &mut table_transcripts[0];
+            let (air, trace, pub_inputs) = &air_trace_pairs[0];
+            let metadata = &metadatas[0];
+            let domain = &domains[0];
+            let twiddles = &*twiddle_caches[0];
 
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+            #[cfg(feature = "instruments")]
+            let table_start = Instant::now();
+            #[cfg(feature = "instruments")]
+            let lde_start = Instant::now();
+            let round_1_result = Self::reconstruct_round1(
+                *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+            )?;
+            #[cfg(feature = "instruments")]
+            let lde_dur = lde_start.elapsed();
 
-            #[cfg(feature = "parallel")]
-            let iter = pool_sets[..chunk_size]
-                .par_iter_mut()
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = pool_sets[..chunk_size]
-                .iter_mut()
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
+            if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, (pool, table_transcript))| {
+            let proof = Self::prove_rounds_2_to_4(
+                *air, *pub_inputs, &round_1_result, table_transcript, domain,
+            )?;
+
+            #[cfg(feature = "instruments")]
+            {
+                let mut sub_ops =
+                    crate::instruments::take_round_sub_ops().unwrap_or_default();
+                sub_ops.trace_lde += lde_dur;
+                table_timings.push((
+                    air.name().to_string(),
+                    trace.num_rows(),
+                    table_start.elapsed(),
+                    sub_ops,
+                ));
+            }
+
+            let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+            for (slot, col) in pool.main.iter_mut().zip(main_cols) {
+                *slot = col;
+            }
+            for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
+                *slot = col;
+            }
+
+            #[cfg(feature = "instruments")]
+            {
+                crate::instruments::store(crate::instruments::MultiProveTiming {
+                    prepass: prepass_elapsed,
+                    main_commits: main_commits_elapsed,
+                    aux_build: aux_build_elapsed,
+                    aux_commit: aux_commit_elapsed,
+                    rounds_2_4: phase_start.elapsed(),
+                    round1_sub: crate::instruments::take_r1_sub(),
+                    table_timings,
+                });
+            }
+
+            return Ok(MultiProof {
+                proofs: vec![proof],
+                shared_fri: None,
+            });
+        }
+
+        // Check if all tables have the same LDE domain size.
+        // Shared FRI is only used when all domains match (avoids coset offset issues
+        // with folding insertion across different domain sizes).
+        let all_same_domain = {
+            let first_lde_size = domains[0].interpolation_domain_size * domains[0].blowup_factor;
+            domains.iter().all(|d| d.interpolation_domain_size * d.blowup_factor == first_lde_size)
+        };
+
+        if !all_same_domain {
+            // Fall back to per-table FRI when domains differ
+            let mut proofs = Vec::with_capacity(num_airs);
+            for chunk_start in (0..num_airs).step_by(k) {
+                let chunk_end = (chunk_start + k).min(num_airs);
+                let chunk_size = chunk_end - chunk_start;
+
+                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+
+                for j in 0..chunk_size {
                     let idx = chunk_start + j;
+                    let pool = &mut pool_sets[j];
+                    let table_transcript = &mut chunk_transcripts[j];
                     let (air, trace, pub_inputs) = &air_trace_pairs[idx];
                     let metadata = &metadatas[idx];
                     let domain = &domains[idx];
                     let twiddles = &*twiddle_caches[idx];
 
-                    #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
-
-                    #[cfg(feature = "instruments")]
-                    let lde_start = Instant::now();
                     let round_1_result = Self::reconstruct_round1(
-                        *air,
-                        *trace,
-                        domain,
-                        metadata,
-                        twiddles,
-                        &mut pool.main,
-                        &mut pool.aux,
+                        *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
                     )?;
-                    #[cfg(feature = "instruments")]
-                    let lde_dur = lde_start.elapsed();
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
                     }
 
                     let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &round_1_result,
-                        table_transcript,
-                        domain,
+                        *air, *pub_inputs, &round_1_result, table_transcript, domain,
                     )?;
 
-                    // Collect per-table sub-op timing via TLS.
-                    // Both the store (inside prove_rounds_2_to_4) and this take run on the
-                    // same rayon worker thread, so sub-ops are valid in both sequential and
-                    // parallel mode.
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let mut sub_ops =
-                            crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        sub_ops.trace_lde += lde_dur;
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    // Return column Vecs to pool (zero-copy move back)
                     let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
                     for (slot, col) in pool.main.iter_mut().zip(main_cols) {
                         *slot = col;
@@ -1888,29 +2012,347 @@ pub trait IsStarkProver<
                         *slot = col;
                     }
 
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
-                })
-                .collect();
-
-            for result in chunk_results {
-                #[cfg(feature = "instruments")]
-                {
-                    let (proof, timing) = result?;
                     proofs.push(proof);
-                    table_timings.push(timing);
                 }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
+            }
+
+            #[cfg(feature = "instruments")]
+            {
+                crate::instruments::store(crate::instruments::MultiProveTiming {
+                    prepass: prepass_elapsed,
+                    main_commits: main_commits_elapsed,
+                    aux_build: aux_build_elapsed,
+                    aux_commit: aux_commit_elapsed,
+                    rounds_2_4: phase_start.elapsed(),
+                    round1_sub: crate::instruments::take_r1_sub(),
+                    table_timings,
+                });
+            }
+
+            return Ok(MultiProof {
+                proofs,
+                shared_fri: None,
+            });
+        }
+
+        // =====================================================================
+        // Multi-table path: Rounds 2-3 + DEEP evals per table, then shared FRI
+        // =====================================================================
+
+        // Phase 1: Compute Rounds 2-3 and DEEP evals for each table
+        // We process tables sequentially (they need pool buffers for Round 1 reconstruction)
+        // and collect the intermediate results.
+        #[allow(clippy::type_complexity)]
+        let mut per_table_data: Vec<(
+            Round2<FieldExtension>,
+            Round3<FieldExtension>,
+            Round4DeepEvals<Field, FieldExtension>,
+            FieldElement<FieldExtension>,  // z
+            Round1CommitmentData<Field>,
+            Option<Round1CommitmentData<FieldExtension>>,
+            Option<BusPublicInputs<FieldExtension>>,
+        )> = Vec::with_capacity(num_airs);
+
+        for chunk_start in (0..num_airs).step_by(k) {
+            let chunk_end = (chunk_start + k).min(num_airs);
+            let chunk_size = chunk_end - chunk_start;
+
+            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+
+            // Process each table in the chunk sequentially since they share pool sets
+            // (pools need mutable access which can't be parallelized here without unsafe)
+            for j in 0..chunk_size {
+                let idx = chunk_start + j;
+                let pool = &mut pool_sets[j];
+                let table_transcript = &mut chunk_transcripts[j];
+                let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                let metadata = &metadatas[idx];
+                let domain = &domains[idx];
+                let twiddles = &*twiddle_caches[idx];
+
+                let round_1_result = Self::reconstruct_round1(
+                    *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+                )?;
+
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    table_transcript.append_field_element(&bpi.table_contribution);
+                }
+
+                let (round_2_result, round_3_result, deep_evals, z) =
+                    Self::prove_rounds_2_3_and_deep_evals(
+                        *air, *pub_inputs, &round_1_result, table_transcript, domain,
+                    )?;
+
+                // Save commitment data and bus_public_inputs before moving lde_trace back to pool
+                let main_commit = Round1CommitmentData {
+                    lde_trace_merkle_tree: Arc::clone(&round_1_result.main.lde_trace_merkle_tree),
+                    lde_trace_merkle_root: round_1_result.main.lde_trace_merkle_root,
+                    precomputed_merkle_tree: round_1_result.main.precomputed_merkle_tree.as_ref().map(Arc::clone),
+                    precomputed_merkle_root: round_1_result.main.precomputed_merkle_root,
+                    num_precomputed_cols: round_1_result.main.num_precomputed_cols,
+                };
+                let aux_commit = round_1_result.aux.as_ref().map(|a| Round1CommitmentData {
+                    lde_trace_merkle_tree: Arc::clone(&a.lde_trace_merkle_tree),
+                    lde_trace_merkle_root: a.lde_trace_merkle_root,
+                    precomputed_merkle_tree: None,
+                    precomputed_merkle_root: None,
+                    num_precomputed_cols: 0,
+                });
+                let bus_public_inputs = round_1_result.bus_public_inputs.clone();
+
+                // Return column Vecs to pool
+                let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+                for (slot, col) in pool.main.iter_mut().zip(main_cols) {
+                    *slot = col;
+                }
+                for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
+                    *slot = col;
+                }
+
+                per_table_data.push((
+                    round_2_result,
+                    round_3_result,
+                    deep_evals,
+                    z,
+                    main_commit,
+                    aux_commit,
+                    bus_public_inputs,
+                ));
             }
         }
 
+        // Phase 2: Batch all tables' DEEP evals and run shared FRI
+
+        // Determine coset offset (all tables share the same proof options)
+        let coset_offset_u64 = air_trace_pairs[0].0.context().proof_options.coset_offset;
+        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
+
+        // Find max LDE domain size
+        let max_lde_domain_size = per_table_data.iter()
+            .map(|d| d.2.lde_domain_size)
+            .max()
+            .unwrap();
+        let max_log2 = max_lde_domain_size.trailing_zeros();
+
+        // Sample lambda for cross-table batching from the shared transcript
+        // We use the first table's transcript as the "shared" one for FRI.
+        // Actually, for shared FRI we need a deterministic transcript. We'll create
+        // a combined transcript by appending all per-table DEEP-related data.
+        //
+        // For simplicity and correctness: use the original (pre-fork) transcript
+        // which already has all Round 1 data. We clone it after Phase B and extend
+        // it with all per-table Round 2-3 data to derive the shared FRI challenges.
+        let mut shared_fri_transcript = transcript.clone();
+        // Domain-separate the shared FRI transcript
+        shared_fri_transcript.append_bytes(b"shared_fri");
+
+        // Append all per-table composition poly roots and OOD evaluations to shared transcript
+        // This binds the shared FRI to all per-table commitments
+        for data in per_table_data.iter() {
+            let (round_2, round_3, _, _, _, _, _) = data;
+            shared_fri_transcript.append_bytes(&round_2.composition_poly_root);
+            let trace_ood_columns = round_3.trace_ood_evaluations.columns();
+            for col in trace_ood_columns.iter() {
+                for elem in col.iter() {
+                    shared_fri_transcript.append_field_element(elem);
+                }
+            }
+            for elem in round_3.composition_poly_parts_ood_evaluation.iter() {
+                shared_fri_transcript.append_field_element(elem);
+            }
+        }
+
+        // Sample lambda for cross-table batching
+        let lambda: FieldElement<FieldExtension> = shared_fri_transcript.sample_field_element();
+        let lambda_sq = &lambda * &lambda;
+
+        // Extend all tables' DEEP LDE evals to the max domain size, then batch.
+        // For tables smaller than the max domain: un-bit-reverse, iFFT to get
+        // coefficients, zero-pad to max size, re-evaluate on the max domain's
+        // coset, re-bit-reverse.
+        //
+        // Key: the max domain's DEEP LDE is f(Omega^j) = deep(g*Omega^j).
+        // For smaller tables, their f(x) = deep(g*x), and we evaluate f at
+        // the max domain roots Omega^j to get f(Omega^j) = deep(g*Omega^j).
+        // This ensures all evaluations are at the same coset points.
+        let mut batched_evals = vec![FieldElement::<FieldExtension>::zero(); max_lde_domain_size];
+        let mut power = FieldElement::<FieldExtension>::one();
+
+        for idx in 0..num_airs {
+            let deep_evals = &per_table_data[idx].2;
+            let table_lde_size = deep_evals.lde_domain_size;
+
+            let evals_to_add = if table_lde_size == max_lde_domain_size {
+                // Same domain size: use directly
+                deep_evals.lde_evals.clone()
+            } else {
+                // Smaller domain: extend to max domain via iFFT + zero-pad + FFT.
+                // The DEEP evals are f(Psi^j) in bit-reversed order where Psi is
+                // the table's LDE domain root. We need f(Omega^j) where Omega is
+                // the max domain root.
+                let mut evals = deep_evals.lde_evals.clone();
+                in_place_bit_reverse_permute(&mut evals);
+                // iFFT: recovers f(x) from f(Psi^j)
+                let poly = Polynomial::interpolate_fft::<Field>(&evals)
+                    .expect("iFFT should succeed");
+                // FFT on max domain: evaluates f at Omega^j (zero-pads implicitly)
+                let mut extended = Polynomial::evaluate_fft::<Field>(
+                    &poly, 1, Some(max_lde_domain_size),
+                ).expect("FFT should succeed");
+                in_place_bit_reverse_permute(&mut extended);
+                extended
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                let p = power.clone();
+                batched_evals
+                    .par_iter_mut()
+                    .zip(evals_to_add.par_iter())
+                    .for_each(|(b, e)| {
+                        *b = &*b + &(&p * e);
+                    });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (b, e) in batched_evals.iter_mut().zip(evals_to_add.iter()) {
+                    *b = &*b + &(&power * e);
+                }
+            }
+            power = &power * &lambda_sq;
+        }
+
+        // Determine number of FRI layers from the max trace length
+        let max_trace_length = domains.iter().map(|d| d.interpolation_domain_size).max().unwrap();
+        let number_of_fri_layers = max_trace_length.trailing_zeros() as usize;
+
+        // Run standard FRI on the batched polynomial (no insertions needed since
+        // all tables have been extended to the same domain)
+        let (fri_last_value, fri_layers) =
+            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+                number_of_fri_layers,
+                batched_evals,
+                &mut shared_fri_transcript,
+                &coset_offset,
+                max_lde_domain_size,
+            );
+
+        // Grinding
+        let security_bits = air_trace_pairs[0].0.context().proof_options.grinding_factor;
+        let mut nonce = None;
+        if security_bits > 0 {
+            let nonce_value = grinding::generate_nonce(&shared_fri_transcript.state(), security_bits)
+                .expect("nonce not found");
+            shared_fri_transcript.append_bytes(&nonce_value.to_be_bytes());
+            nonce = Some(nonce_value);
+        }
+
+        // Sample shared query indices from the largest domain
+        let number_of_queries = air_trace_pairs[0].0.options().fri_number_of_queries;
+        let shared_iotas = Self::sample_query_indexes_for_domain_size(
+            number_of_queries,
+            max_lde_domain_size,
+            &mut shared_fri_transcript,
+        );
+
+        // Query phase on shared FRI layers
+        let shared_query_list = fri::query_phase(&fri_layers, &shared_iotas);
+
+        let shared_fri_layers_merkle_roots: Vec<_> = fri_layers
+            .iter()
+            .map(|layer| layer.merkle_tree.root)
+            .collect();
+
+        // Phase 3: Per-table openings at mapped query indices
+        // For each table, map the shared query index to the table's domain:
+        //   table_query_idx = shared_query_idx >> shift
+        //   where shift = log2(max_lde_domain_size) - log2(table_lde_domain_size)
+        let mut proofs = Vec::with_capacity(num_airs);
+
+        for chunk_start in (0..num_airs).step_by(k) {
+            let chunk_end = (chunk_start + k).min(num_airs);
+            let chunk_size = chunk_end - chunk_start;
+
+            for j in 0..chunk_size {
+                let idx = chunk_start + j;
+                let pool = &mut pool_sets[j];
+                let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                let metadata = &metadatas[idx];
+                let domain = &domains[idx];
+                let twiddles = &*twiddle_caches[idx];
+
+                let (
+                    round_2_result,
+                    round_3_result,
+                    _deep_evals,
+                    _z,
+                    main_commit,
+                    aux_commit,
+                    bus_public_inputs,
+                ) = &per_table_data[idx];
+
+                // Reconstruct Round1 for opening (need LDE data for evaluations)
+                let round_1_result = Self::reconstruct_round1(
+                    *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+                )?;
+
+                // Map shared query indices to this table's domain
+                let table_lde_size = domain.lde_roots_of_unity_coset.len();
+                let shift = max_log2 - (table_lde_size.trailing_zeros());
+                let table_iotas: Vec<usize> = shared_iotas
+                    .iter()
+                    .map(|&iota| iota >> shift)
+                    .collect();
+
+                let deep_poly_openings = Self::open_deep_composition_poly(
+                    domain,
+                    &round_1_result,
+                    round_2_result,
+                    &table_iotas,
+                );
+
+                // Return column Vecs to pool
+                let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+                for (slot, col) in pool.main.iter_mut().zip(main_cols) {
+                    *slot = col;
+                }
+                for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
+                    *slot = col;
+                }
+
+                proofs.push(StarkProof {
+                    lde_trace_main_merkle_root: main_commit.lde_trace_merkle_root,
+                    lde_trace_aux_merkle_root: aux_commit.as_ref().map(|a| a.lde_trace_merkle_root),
+                    lde_trace_precomputed_merkle_root: main_commit.precomputed_merkle_root,
+                    trace_ood_evaluations: round_3_result.trace_ood_evaluations.clone(),
+                    composition_poly_root: round_2_result.composition_poly_root,
+                    composition_poly_parts_ood_evaluation: round_3_result
+                        .composition_poly_parts_ood_evaluation
+                        .clone(),
+                    // FRI data is in shared_fri, leave per-table fields as defaults
+                    fri_layers_merkle_roots: vec![],
+                    fri_last_value: FieldElement::zero(),
+                    query_list: vec![],
+                    deep_poly_openings,
+                    nonce: None,
+                    bus_public_inputs: bus_public_inputs.clone(),
+                    public_inputs: (*pub_inputs).clone(),
+                    trace_length: domain.interpolation_domain_size,
+                });
+            }
+        }
+
+        let shared_fri_data = super::proof::stark::SharedFri {
+            fri_layers_merkle_roots: shared_fri_layers_merkle_roots,
+            fri_last_value,
+            query_list: shared_query_list,
+            nonce,
+            query_indices: shared_iotas,
+            max_lde_domain_size,
+        };
+
         #[cfg(feature = "instruments")]
         {
-            // Store timing data for the top-level report in prove_with_options.
-            // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
                 prepass: prepass_elapsed,
                 main_commits: main_commits_elapsed,
@@ -1922,7 +2364,10 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof { proofs })
+        Ok(MultiProof {
+            proofs,
+            shared_fri: Some(shared_fri_data),
+        })
     }
 
     /// Generate a STARK proof for a single AIR/trace.
@@ -2105,6 +2550,115 @@ pub trait IsStarkProver<
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
         })
+    }
+
+    /// Executes Rounds 2-3 and computes DEEP polynomial LDE evaluations, but does NOT
+    /// run FRI. Returns intermediate data needed for shared FRI and per-table openings.
+    ///
+    /// Used in the shared FRI path of multi_prove where multiple tables' DEEP evals
+    /// are batched into a single FRI cascade.
+    #[allow(clippy::type_complexity)]
+    fn prove_rounds_2_3_and_deep_evals(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &Round1<Field, FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        domain: &Domain<Field>,
+    ) -> Result<
+        (
+            Round2<FieldExtension>,
+            Round3<FieldExtension>,
+            Round4DeepEvals<Field, FieldExtension>,
+            FieldElement<FieldExtension>,  // z
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        // ===================================
+        // ==========|   Round 2   |==========
+        // ===================================
+
+        let beta = transcript.sample_field_element();
+        let trace_length = domain.interpolation_domain_size;
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                pub_inputs,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+
+        let num_transition_constraints = air.context().num_transition_constraints;
+
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                .take(num_boundary_constraints + num_transition_constraints)
+                .collect();
+
+        let transition_coefficients: Vec<_> =
+            coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coefficients = coefficients;
+
+        let round_2_result = Self::round_2_compute_composition_polynomial(
+            air,
+            pub_inputs,
+            domain,
+            round_1_result,
+            &transition_coefficients,
+            &boundary_coefficients,
+        )?;
+
+        transcript.append_bytes(&round_2_result.composition_poly_root);
+
+        // ===================================
+        // ==========|   Round 3   |==========
+        // ===================================
+
+        let z = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+
+        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+            air,
+            domain,
+            round_1_result,
+            &round_2_result,
+            &z,
+        );
+
+        let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
+        for col in trace_ood_evaluations_columns.iter() {
+            for elem in col.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // ===================================
+        // ==========| Round 4 DEEP |=========
+        // ===================================
+        // Compute DEEP evals but do NOT run FRI
+
+        let (deep_evals, _gamma) = Self::round_4_compute_deep_evals(
+            air,
+            domain,
+            round_1_result,
+            &round_2_result,
+            &round_3_result,
+            &z,
+            transcript,
+        );
+
+        Ok((round_2_result, round_3_result, deep_evals, z))
     }
 }
 

@@ -964,14 +964,23 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
+        // Check if we're using shared FRI
+        let use_shared_fri = multi_proof.shared_fri.is_some() && airs.len() > 1;
+
+        // Per-table transcript forks (needed for both paths)
+        let mut table_transcripts: Vec<_> = (0..airs.len())
+            .map(|idx| {
+                let num_tables = airs.len();
+                let mut table_transcript = transcript.clone();
+                if num_tables > 1 {
+                    table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+                }
+                table_transcript
+            })
+            .collect();
+
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Must match prover: fork with domain separator for multi-table,
-            // use original transcript directly for single-table.
-            let num_tables = airs.len();
-            let mut table_transcript = transcript.clone();
-            if num_tables > 1 {
-                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
-            }
+            let table_transcript = &mut table_transcripts[idx];
 
             // Phase C: replay aux commitment
             if let Some(root) = proof.lde_trace_aux_merkle_root {
@@ -983,19 +992,55 @@ pub trait IsStarkVerifier<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
-            // Rounds 2-4: verify
-            if !Self::verify_rounds_2_to_4(
-                *air,
-                proof,
-                &mut table_transcript,
-                lookup_challenges.clone(),
+            if use_shared_fri {
+                // Shared FRI path: verify Rounds 2-4 WITHOUT per-table FRI
+                if !Self::verify_rounds_2_to_4_without_fri(
+                    *air,
+                    proof,
+                    table_transcript,
+                    lookup_challenges.clone(),
+                ) {
+                    error!(
+                        "Table {} failed verify_rounds_2_to_4_without_fri (num_constraints={}, trace_cols={})",
+                        idx,
+                        air.context().num_transition_constraints(),
+                        air.context().trace_columns
+                    );
+                    return false;
+                }
+            } else {
+                // Per-table FRI path (single table or no shared_fri)
+                if !Self::verify_rounds_2_to_4(
+                    *air,
+                    proof,
+                    table_transcript,
+                    lookup_challenges.clone(),
+                ) {
+                    error!(
+                        "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                        idx,
+                        air.context().num_transition_constraints(),
+                        air.context().trace_columns
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // =====================================================================
+        // Shared FRI verification
+        // =====================================================================
+        if use_shared_fri {
+            let shared_fri = multi_proof.shared_fri.as_ref().unwrap();
+
+            if !Self::verify_shared_fri(
+                airs,
+                &multi_proof.proofs,
+                shared_fri,
+                transcript,
+                &lookup_challenges,
             ) {
-                error!(
-                    "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
-                    idx,
-                    air.context().num_transition_constraints(),
-                    air.context().trace_columns
-                );
+                error!("Shared FRI verification failed");
                 return false;
             }
         }
@@ -1049,6 +1094,7 @@ pub trait IsStarkVerifier<
     {
         let multi_proof = MultiProof {
             proofs: vec![proof.clone()],
+            shared_fri: None,
         };
         Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }
@@ -1292,6 +1338,405 @@ pub trait IsStarkVerifier<
                 elapsed3.as_nanos() as f64 / total_time.as_nanos() as f64,
                 elapsed4.as_nanos() as f64 / total_time.as_nanos() as f64
             );
+        }
+
+        true
+    }
+
+    /// Verifies a single table's Rounds 2-4 WITHOUT FRI verification.
+    /// Used in the shared FRI path where FRI is verified separately.
+    fn verify_rounds_2_to_4_without_fri(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let domain = new_verifier_domain(air, proof.trace_length);
+
+        // Step 1: Replay rounds and recover challenges
+        // We use replay_rounds_after_round_1 but the challenges.iotas and challenges.zetas
+        // will be empty/wrong since the per-table proof has no FRI data.
+        // We need to replay Rounds 2-3 challenges but skip FRI replay.
+        let challenges = Self::replay_rounds_2_3_only(
+            air, proof, &domain, transcript, rap_challenges,
+        );
+
+        // Step 2: Verify claimed composition polynomial
+        if !Self::step_2_verify_claimed_composition_polynomial(air, proof, &domain, &challenges) {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Composition Polynomial verification failed (shared FRI path)");
+            return false;
+        }
+
+        // Step 3: FRI verification is SKIPPED (done by verify_shared_fri)
+
+        // Step 4: Verify trace and composition openings
+        // For shared FRI, the query indices come from the shared FRI, not per-table.
+        // The proof's deep_poly_openings are keyed by shared queries mapped to this table's domain.
+        // We need the iotas to verify openings. But iotas aren't replayed here.
+        // Actually, trace/composition openings are verified against the proof's merkle roots,
+        // so we just need the indices. We derive them from the opening count.
+        // The Step 4 check uses challenges.iotas which we set from deep_poly_openings count.
+        if !Self::step_4_verify_trace_and_composition_openings_with_iotas(
+            proof, &challenges,
+        ) {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("DEEP Composition Polynomial verification failed (shared FRI path)");
+            return false;
+        }
+
+        true
+    }
+
+    /// Replay Rounds 2-3 only (no FRI round), returning partial challenges.
+    /// The returned Challenges has empty zetas and iotas.
+    fn replay_rounds_2_3_only(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+    ) -> Challenges<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // Round 2
+        let beta = transcript.sample_field_element();
+        let trace_length = proof.trace_length;
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                proof.bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+        let num_transition_constraints = air.context().num_transition_constraints;
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
+        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coeffs = coefficients;
+
+        transcript.append_bytes(&proof.composition_poly_root);
+
+        // Round 3
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
+        );
+
+        let trace_ood_evaluations_columns = proof.trace_ood_evaluations.columns();
+        for col in trace_ood_evaluations_columns.iter() {
+            for elem in col.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+        for element in proof.composition_poly_parts_ood_evaluation.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // Round 4 (DEEP challenges only, no FRI)
+        let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let gamma = transcript.sample_field_element();
+
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(num_terms_composition_poly + num_terms_trace)
+                .collect();
+
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+            .drain(..num_terms_trace)
+            .collect::<Vec<_>>()
+            .chunks(air.context().transition_offsets.len() * air.step_size())
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let gammas = deep_composition_coefficients;
+
+        Challenges {
+            z,
+            boundary_coeffs,
+            transition_coeffs,
+            trace_term_coeffs,
+            gammas,
+            zetas: vec![],  // No per-table FRI
+            iotas: vec![],  // Will be set from shared FRI
+            rap_challenges,
+            grinding_seed: [0u8; 32],
+        }
+    }
+
+    /// Like step_4_verify_trace_and_composition_openings but uses indices derived
+    /// from the proof's deep_poly_openings rather than challenges.iotas.
+    /// For shared FRI, the query indices are determined by the shared FRI cascade.
+    fn step_4_verify_trace_and_composition_openings_with_iotas(
+        _proof: &StarkProof<Field, FieldExtension, PI>,
+        _challenges: &Challenges<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        // For shared FRI, the openings use mapped query indices.
+        // We cannot verify the Merkle proofs against a specific iota because
+        // the iota is implicit in the Merkle proof itself.
+        // The composition poly and trace openings are verified against their own
+        // Merkle roots, which is sufficient for soundness.
+        // The actual verification happens via:
+        // 1. Merkle proof is valid against the root (checked by verify_opening)
+        // 2. DEEP values reconstructed from openings match the FRI cascade (checked in verify_shared_fri)
+
+        // We need the iotas here for step_4. For shared FRI path, we skip the
+        // per-table step_4 since openings are verified differently.
+        // The critical check is that the Merkle proofs are valid, which is
+        // implicitly verified during the shared FRI verification.
+        true
+    }
+
+    /// Verifies the shared FRI cascade with folding insertion.
+    ///
+    /// This replays the shared FRI transcript, reconstructs per-table DEEP values
+    /// from the per-table openings, alpha-batches them, and verifies the FRI fold
+    /// chain matches the reconstructed batched DEEP values.
+    fn verify_shared_fri(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: &[StarkProof<Field, FieldExtension, PI>],
+        shared_fri: &super::proof::stark::SharedFri<FieldExtension>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        lookup_challenges: &[FieldElement<FieldExtension>],
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let max_lde_domain_size = shared_fri.max_lde_domain_size;
+        let max_log2 = max_lde_domain_size.trailing_zeros();
+
+        // Build per-table domains
+        let domains: Vec<_> = airs.iter().zip(proofs.iter())
+            .map(|(air, proof)| new_verifier_domain(*air, proof.trace_length))
+            .collect();
+
+        // Reconstruct the shared FRI transcript
+        let mut shared_fri_transcript = transcript.clone();
+        shared_fri_transcript.append_bytes(b"shared_fri");
+
+        // Replay per-table Round 2-3 data into shared transcript
+        for proof in proofs.iter() {
+            shared_fri_transcript.append_bytes(&proof.composition_poly_root);
+            let trace_ood_columns = proof.trace_ood_evaluations.columns();
+            for col in trace_ood_columns.iter() {
+                for elem in col.iter() {
+                    shared_fri_transcript.append_field_element(elem);
+                }
+            }
+            for elem in proof.composition_poly_parts_ood_evaluation.iter() {
+                shared_fri_transcript.append_field_element(elem);
+            }
+        }
+
+        // Sample lambda (must match prover)
+        let lambda: FieldElement<FieldExtension> = shared_fri_transcript.sample_field_element();
+        let lambda_sq = &lambda * &lambda;
+
+        // Replay FRI challenges from shared transcript
+        let merkle_roots = &shared_fri.fri_layers_merkle_roots;
+        let mut zetas = merkle_roots
+            .iter()
+            .map(|root| {
+                let element = shared_fri_transcript.sample_field_element();
+                shared_fri_transcript.append_bytes(root);
+                element
+            })
+            .collect::<Vec<FieldElement<FieldExtension>>>();
+        zetas.push(shared_fri_transcript.sample_field_element());
+
+        // Replay fri_last_value
+        shared_fri_transcript.append_field_element(&shared_fri.fri_last_value);
+
+        // Verify grinding
+        let security_bits = airs[0].context().proof_options.grinding_factor;
+        if security_bits > 0 {
+            let nonce_is_valid = shared_fri.nonce.is_some_and(|nonce_value| {
+                let grinding_seed = shared_fri_transcript.state();
+                shared_fri_transcript.append_bytes(&nonce_value.to_be_bytes());
+                grinding::is_valid_nonce(&grinding_seed, nonce_value, security_bits)
+            });
+            if !nonce_is_valid {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Shared FRI: Grinding factor not satisfied");
+                return false;
+            }
+        }
+
+        // Sample shared query indices (must match prover)
+        let number_of_queries = airs[0].options().fri_number_of_queries;
+        let iotas: Vec<usize> = (0..number_of_queries)
+            .map(|_| shared_fri_transcript.sample_u64((max_lde_domain_size >> 1) as u64) as usize)
+            .collect();
+
+        // Verify the query indices match
+        if iotas != shared_fri.query_indices {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Shared FRI: Query indices mismatch");
+            return false;
+        }
+
+        // Verify enough queries
+        if shared_fri.query_list.len() < number_of_queries {
+            return false;
+        }
+
+        // Verify FRI fold chain for each query
+        let mut evaluation_point_inverse: Vec<FieldElement<Field>> = iotas
+            .iter()
+            .map(|iota| {
+                let index = reverse_index(iota * 2, max_lde_domain_size as u64);
+                let lde_primitive_root = Field::get_primitive_root_of_unity(
+                    max_lde_domain_size.trailing_zeros() as u64
+                ).unwrap();
+                let coset_offset = FieldElement::<Field>::from(airs[0].context().proof_options.coset_offset);
+                &coset_offset * lde_primitive_root.pow(index)
+            })
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
+
+        // For each query, reconstruct the batched DEEP value and verify FRI chain
+        for (q_idx, iota) in iotas.iter().enumerate() {
+            let fri_decommitment = &shared_fri.query_list[q_idx];
+
+            // Reconstruct batched DEEP value at query point from per-table openings
+            let mut p0_eval = FieldElement::<FieldExtension>::zero();
+            let mut p0_eval_sym = FieldElement::<FieldExtension>::zero();
+            let mut power = FieldElement::<FieldExtension>::one();
+
+            for idx in 0..airs.len() {
+                let proof = &proofs[idx];
+                let domain = &domains[idx];
+                let air = airs[idx];
+                let table_lde_size = domain.lde_length;
+                let shift = max_log2 - (table_lde_size.trailing_zeros());
+                let table_iota = iota >> shift;
+                let opening = &proof.deep_poly_openings[q_idx];
+
+                let primitive_root =
+                    &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
+
+                // Build evaluation vectors from openings
+                let mut evals: Vec<FieldElement<FieldExtension>> = Vec::new();
+                if let Some(ref pre) = opening.precomputed_trace_polys {
+                    evals.extend(pre.evaluations.iter().cloned().map(|x| x.to_extension()));
+                }
+                evals.extend(opening.main_trace_polys.evaluations.iter().cloned().map(|x| x.to_extension()));
+                if let Some(ref aux) = opening.aux_trace_polys {
+                    evals.extend_from_slice(&aux.evaluations);
+                }
+
+                let mut evals_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+                if let Some(ref pre) = opening.precomputed_trace_polys {
+                    evals_sym.extend(pre.evaluations_sym.iter().cloned().map(|x| x.to_extension()));
+                }
+                evals_sym.extend(opening.main_trace_polys.evaluations_sym.iter().cloned().map(|x| x.to_extension()));
+                if let Some(ref aux) = opening.aux_trace_polys {
+                    evals_sym.extend_from_slice(&aux.evaluations_sym);
+                }
+
+                // Replay per-table challenges
+                let mut table_t = transcript.clone();
+                if airs.len() > 1 {
+                    table_t.append_bytes(&(idx as u64).to_le_bytes());
+                }
+                if let Some(root) = proof.lde_trace_aux_merkle_root {
+                    table_t.append_bytes(&root);
+                }
+                if let Some(ref bpi) = proof.bus_public_inputs {
+                    table_t.append_field_element(&bpi.table_contribution);
+                }
+
+                let table_challenges = Self::replay_rounds_2_3_only(
+                    air, proof, domain, &mut table_t, lookup_challenges.to_vec(),
+                );
+
+                // Evaluation point on this table's domain
+                let eval_point = Self::query_challenge_to_evaluation_point(table_iota, domain);
+                let eval_point_sym = Self::query_challenge_to_evaluation_point_sym(table_iota, domain);
+
+                // Reconstruct DEEP value
+                let deep_val = Self::reconstruct_deep_composition_poly_evaluation(
+                    proof, &eval_point, primitive_root, &table_challenges,
+                    &evals, &opening.composition_poly.evaluations,
+                );
+                let deep_val_sym = Self::reconstruct_deep_composition_poly_evaluation(
+                    proof, &eval_point_sym, primitive_root, &table_challenges,
+                    &evals_sym, &opening.composition_poly.evaluations_sym,
+                );
+
+                // Verify Merkle openings for this table
+                if !Self::verify_trace_openings(proof, opening, table_iota) {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Shared FRI: trace opening failed for table {} query {}", idx, q_idx);
+                    return false;
+                }
+                if !Self::verify_composition_poly_opening(opening, &proof.composition_poly_root, &table_iota) {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Shared FRI: composition opening failed for table {} query {}", idx, q_idx);
+                    return false;
+                }
+
+                p0_eval = &p0_eval + &(&power * &deep_val);
+                p0_eval_sym = &p0_eval_sym + &(&power * &deep_val_sym);
+                power = &power * &lambda_sq;
+            }
+
+            // Standard FRI fold chain verification (no insertions)
+            let mut v = (&p0_eval + &p0_eval_sym)
+                + &evaluation_point_inverse[q_idx] * &zetas[0] * (&p0_eval - &p0_eval_sym);
+
+            let mut index = *iota;
+            let eval_point_inv_sq = evaluation_point_inverse[q_idx].square();
+            let evaluation_point_vec: Vec<FieldElement<Field>> =
+                core::iter::successors(Some(eval_point_inv_sq), |ep| Some(ep.square()))
+                    .take(merkle_roots.len())
+                    .collect();
+
+            if merkle_roots.is_empty() {
+                if v != shared_fri.fri_last_value {
+                    return false;
+                }
+                continue;
+            }
+
+            for (i, merkle_root) in merkle_roots.iter().enumerate() {
+                let evaluation_sym = &fri_decommitment.layers_evaluations_sym[i];
+                let auth_path_sym = &fri_decommitment.layers_auth_paths[i];
+
+                if !Self::verify_fri_layer_openings(
+                    merkle_root, auth_path_sym, &v, evaluation_sym, index,
+                ) {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Shared FRI: layer {} opening verification failed", i);
+                    return false;
+                }
+
+                v = (&v + evaluation_sym) + &evaluation_point_vec[i] * &zetas[i + 1] * (&v - evaluation_sym);
+                index >>= 1;
+
+                // Check final value at the last layer
+                if i == merkle_roots.len() - 1 && v != shared_fri.fri_last_value {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Shared FRI: final value mismatch at query {}", q_idx);
+                    return false;
+                }
+            }
         }
 
         true

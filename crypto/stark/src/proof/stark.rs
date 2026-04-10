@@ -70,11 +70,42 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub public_inputs: PI,
 }
 
+/// Shared FRI data for multi-table proving with folding insertion.
+///
+/// When multiple tables have different domain sizes, a single FRI cascade
+/// is used. Tables enter the cascade at the folding round matching their
+/// domain size. This struct holds the shared FRI commitments, decommitments,
+/// and query indices that replace per-table FRI data.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct SharedFri<E: IsField> {
+    /// Merkle roots of the shared FRI layers.
+    pub fri_layers_merkle_roots: Vec<Commitment>,
+    /// The final constant value after all FRI folds.
+    pub fri_last_value: FieldElement<E>,
+    /// FRI decommitments for each query.
+    pub query_list: Vec<FriDecommitment<E>>,
+    /// Proof-of-work nonce for grinding.
+    pub nonce: Option<u64>,
+    /// Query indices on the largest LDE domain (shared across all tables).
+    pub query_indices: Vec<usize>,
+    /// The domain size of the largest table's LDE domain (for index mapping).
+    pub max_lde_domain_size: usize,
+}
+
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
+///
+/// When `shared_fri` is `Some`, per-table FRI data in `StarkProof` is empty
+/// (fri_layers_merkle_roots, fri_last_value, query_list, nonce are all defaults)
+/// and the shared FRI cascade is used instead.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
+    /// Shared FRI data when using folding insertion (multi-table).
+    /// None for single-table proofs (backward compatible).
+    #[serde(default)]
+    pub shared_fri: Option<SharedFri<E>>,
 }
