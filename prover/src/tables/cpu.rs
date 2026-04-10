@@ -2067,6 +2067,7 @@ pub fn bus_interactions_bitwise_chip() -> Vec<BusInteraction> {
         BusId::AndByte.into(),
         BusId::OrByte.into(),
         BusId::XorByte.into(),
+        BusId::Msb16.into(), // ANDW/ORW/XORW set word_instr=1, triggering MSB16 lookups
         BusId::Memw.into(),
     ];
 

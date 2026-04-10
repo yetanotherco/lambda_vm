@@ -1631,6 +1631,19 @@ pub struct Traces {
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
+/// Count total padding rows that `chunk_and_generate` would produce.
+///
+/// Matches `chunk_and_generate` behavior: empty input produces 1 chunk of 4 padding rows.
+fn count_padding_rows<T>(ops: &[T], max_rows: usize) -> usize {
+    if ops.is_empty() {
+        4 // chunk_and_generate generates 1 chunk, generate_*_trace pads 0 ops to 4
+    } else {
+        ops.chunks(max_rows)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum()
+    }
+}
+
 /// Chunk raw ops and generate one trace table per chunk.
 fn chunk_and_generate<T>(
     ops: &[T],
@@ -1929,23 +1942,19 @@ impl Traces {
             cpu_ops.into_iter().partition(|op| op.is_bitwise());
 
         // CPU and CPU_BITWISE padding rows send IS_BYTE with all-zero values.
-        // Computed after partition so padding reflects actual chunk sizes.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum::<usize>()
-            + cpu_bitwise_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum::<usize>();
+        // Uses count_padding_rows to match chunk_and_generate's behavior
+        // (including the phantom 4-row chunk for empty input).
+        let num_padding_rows: usize = count_padding_rows(&cpu_ops, max_rows.cpu)
+            + count_padding_rows(&cpu_bitwise_ops, max_rows.cpu);
         bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let cpu_bitwises = if cpu_bitwise_ops.is_empty() {
-            Vec::new()
-        } else {
-            chunk_and_generate(&cpu_bitwise_ops, max_rows.cpu, cpu::generate_cpu_trace)
-        };
+        // Always generate at least one CPU_BITWISE chunk (even if empty/padding-only).
+        // This is required for soundness: without a CPU_BITWISE AIR, the verifier
+        // cannot enforce AND/OR/XOR byte lookups. A malicious prover could omit
+        // the chip and forge bitwise results.
+        let cpu_bitwises =
+            chunk_and_generate(&cpu_bitwise_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let memw_aligneds = chunk_and_generate(
             &memw_aligned_ops,
@@ -1968,20 +1977,9 @@ impl Traces {
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
-        // Update DECODE multiplicities
-        // Each CPU operation (from both CPU and CPU_BITWISE chips) looks up the DECODE table once.
-        // Padding rows also look up pc=1 (the CPU padding entry).
-        // When CPU is split, each chunk pads independently.
+        // Update DECODE multiplicities (reuses num_padding_rows from IS_BYTE calculation above).
         let mut decode = decode_trace;
         let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum::<usize>()
-            + cpu_bitwise_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum::<usize>();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(cpu_bitwise_ops.iter().map(|op| op.decode.pc));
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
@@ -2192,22 +2190,17 @@ impl Traces {
             cpu_ops.into_iter().partition(|op| op.is_bitwise());
 
         // CPU and CPU_BITWISE padding rows send IS_BYTE with all-zero values.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum::<usize>()
-            + cpu_bitwise_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum::<usize>();
+        let num_padding_rows: usize = count_padding_rows(&cpu_ops, max_rows.cpu)
+            + count_padding_rows(&cpu_bitwise_ops, max_rows.cpu);
         bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let cpu_bitwises = if cpu_bitwise_ops.is_empty() {
-            Vec::new()
-        } else {
-            chunk_and_generate(&cpu_bitwise_ops, max_rows.cpu, cpu::generate_cpu_trace)
-        };
+        // Always generate at least one CPU_BITWISE chunk (even if empty/padding-only).
+        // This is required for soundness: without a CPU_BITWISE AIR, the verifier
+        // cannot enforce AND/OR/XOR byte lookups. A malicious prover could omit
+        // the chip and forge bitwise results.
+        let cpu_bitwises =
+            chunk_and_generate(&cpu_bitwise_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let memw_aligneds = chunk_and_generate(
             &memw_aligned_ops,
@@ -2230,17 +2223,8 @@ impl Traces {
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
-        // Generate DECODE trace and update multiplicities
-        // Both CPU and CPU_BITWISE chips look up DECODE once per row
+        // Generate DECODE trace and update multiplicities (reuses num_padding_rows from above).
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum::<usize>()
-            + cpu_bitwise_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum::<usize>();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(cpu_bitwise_ops.iter().map(|op| op.decode.pc));
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));

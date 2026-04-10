@@ -104,6 +104,7 @@ impl TableCounts {
     pub fn validate(&self) -> Result<(), Error> {
         let checks = [
             ("cpu", self.cpu),
+            ("cpu_bitwise", self.cpu_bitwise),
             ("lt", self.lt),
             ("memw", self.memw),
             ("memw_aligned", self.memw_aligned),
@@ -218,11 +219,7 @@ impl VmAirs {
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
             pairs.push((air, trace, &()));
         }
-        for (air, trace) in self
-            .cpu_bitwises
-            .iter()
-            .zip(traces.cpu_bitwises.iter_mut())
-        {
+        for (air, trace) in self.cpu_bitwises.iter().zip(traces.cpu_bitwises.iter_mut()) {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {

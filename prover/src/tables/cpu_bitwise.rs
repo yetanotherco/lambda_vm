@@ -8,7 +8,7 @@
 //! constraints (conditional constraints are automatically satisfied since
 //! non-bitwise selectors are always 0).
 
-pub use super::cpu::{cols, generate_cpu_trace, CpuOperation};
+pub use super::cpu::{CpuOperation, cols, generate_cpu_trace};
 
 use stark::lookup::BusInteraction;
 
