@@ -1,7 +1,7 @@
 #import "/book.typ": book-page, aside, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
@@ -43,7 +43,7 @@ Most of the structure and variable naming follows the pseudocode of the wikipedi
 #let nr_columns = total_nr_instantiated_columns(sha256chip, config)
 
 The #sha256 chip leverages #nr_variables variables, spanning #nr_columns columns:
-#render_chip_column_table(sha256chip, config)
+#render_chip_variable_table(sha256chip, config)
 
 == Constraints
 
@@ -82,7 +82,7 @@ The chip therefore contributes the following interaction to the lookup-argument:
 #let nr_columns = total_nr_instantiated_columns(sha256msgschedchip, config)
 
 The #sha256msgsched chip leverages #nr_variables variables, spanning #nr_columns columns:
-#render_chip_column_table(sha256msgschedchip, config)
+#render_chip_variable_table(sha256msgschedchip, config)
 
 == Assumptions
 
@@ -112,7 +112,7 @@ Finally, we contribute to the LogUp.
 #let nr_columns = total_nr_instantiated_columns(sha256roundchip, config)
 
 The #sha256round chip leverages #nr_variables variables, spanning #nr_columns columns:
-#render_chip_column_table(sha256roundchip, config)
+#render_chip_variable_table(sha256roundchip, config)
 
 == Assumptions
 
@@ -160,7 +160,7 @@ making the usage of `HWSL` more straightforward and avoid extra columns to repre
 #let nr_columns = total_nr_instantiated_columns(rotxorchip, config)
 The #rotxor chip leverages #nr_variables variables, spanning #nr_columns columns:
 
-#render_chip_column_table(rotxorchip, config)
+#render_chip_variable_table(rotxorchip, config)
 
 == Assumptions
 
@@ -192,7 +192,7 @@ And finally contribute to the lookup argument.
 
 As mentioned, we provide the round constants through a short precomputed lookup table: #sha256_k.
 
-#render_chip_column_table(sha256_kchip, config)
+#render_chip_variable_table(sha256_kchip, config)
 #render_constraint_table(sha256_kchip, config)
 
 = Notes/optimizations
