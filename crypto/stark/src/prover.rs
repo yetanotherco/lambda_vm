@@ -1662,6 +1662,8 @@ pub trait IsStarkProver<
 
         // Step 1: Compute GKR layer trees for each table with bus interactions.
         // Identify which tables participate, then compute layers in parallel.
+        #[cfg(feature = "instruments")]
+        let gkr_phase_start = Instant::now();
         let mut gkr_table_indices: Vec<usize> = Vec::new();
         for (idx, (air, _, _)) in air_trace_pairs.iter().enumerate() {
             if air.has_trace_interaction() {
@@ -1703,7 +1705,15 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        #[cfg(feature = "instruments")]
+        {
+            let gen_layers_dur = gkr_phase_start.elapsed();
+            info!("     GKR gen_layers (parallel): {:?}", gen_layers_dur);
+        }
+
         // Step 2: Run batch GKR (single proof for all tables).
+        #[cfg(feature = "instruments")]
+        let gkr_step2_start = Instant::now();
         let batch_gkr_proof = if !leaf_layers_per_table.is_empty() {
             let n_layers_by_instance: Vec<usize> = leaf_layers_per_table
                 .iter()
@@ -1712,7 +1722,15 @@ pub trait IsStarkProver<
             let (batch_proof, shared_random_point, per_instance_claims) =
                 crate::gkr::gkr_prove_batch(leaf_layers_per_table, transcript);
 
+            #[cfg(feature = "instruments")]
+            {
+                let batch_gkr_dur = gkr_step2_start.elapsed();
+                info!("     GKR batch_prove: {:?}", batch_gkr_dur);
+            }
+
             // Step 3: Distribute batch results to per-table LogUpGkrResult (parallel).
+            #[cfg(feature = "instruments")]
+            let gkr_step3_start = Instant::now();
             // Each table independently computes its Lagrange kernel and column MLE claims.
             let finalize_one = |i: usize| -> (usize, LogUpGkrResult<FieldExtension>) {
                 let table_idx = gkr_table_indices[i];
@@ -1759,6 +1777,12 @@ pub trait IsStarkProver<
                 gkr_results_vec[table_idx] = Some(result);
             }
 
+            #[cfg(feature = "instruments")]
+            {
+                let finalize_dur = gkr_step3_start.elapsed();
+                info!("     GKR finalize (kernel+MLE, parallel): {:?}", finalize_dur);
+            }
+
             (Some(batch_proof), gkr_results_vec)
         } else {
             (None, vec![None; num_airs])
@@ -1787,6 +1811,8 @@ pub trait IsStarkProver<
         // Pass 1: Build aux traces.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let bridge_start = Instant::now();
 
         for ((air, trace, _), gkr_result) in air_trace_pairs.iter_mut().zip(gkr_results.iter()) {
             if air.has_trace_interaction() {
@@ -1850,6 +1876,11 @@ pub trait IsStarkProver<
             }
         }
 
+        #[cfg(feature = "instruments")]
+        {
+            let bridge_dur = bridge_start.elapsed();
+            info!("     GKR bridge running sum (sequential): {:?}", bridge_dur);
+        }
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
 
