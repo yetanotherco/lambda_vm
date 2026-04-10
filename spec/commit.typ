@@ -10,80 +10,21 @@
   render_chip_padding_table,
 )
 
-#let config = load_config()
-
-#show: book-page("ecall.typ")
-
-ECALLs provide system-level functionalities to the guest program.
-
-When `ECALL` is executed, it is assumed that:
-- register `A7` contains the system call number
-  #footnote([The RISC-V system call ABI; libriscv.no, #link("https://web.archive.org/web/20260128152107/https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[[src]]]),
-- the arguments are located in registers `A0`-`A6`, and
-- the return value is written to `A0`,
-where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
-#footnote([RISC-V - Register sets; en.wikipedia.org, #link("https://web.archive.org/web/20260209053447/https://en.wikipedia.org/wiki/RISC-V#Register_sets")[[src]]]).
-
-
-#let config = load_config()
-#let chip = load_chip("src/halt.toml", config)
-#let halt = raw(chip.name)
-= #halt chip
-
-== Columns
-#let nr_variables = total_nr_variables(chip)
-#let nr_columns = total_nr_instantiated_columns(chip, config)
-#let nr_halt_interactions = compute_nr_interactions(chip)
-
-The #halt chip leverages #nr_variables variable, spanning #nr_columns columns and leverages #nr_halt_interactions interaction(s):
-#render_chip_column_table(chip, config)
-
-== Assumptions
-It is assumed the input is range checked:
-#render_chip_assumptions(chip, config)
-
-== Constraints
-The #halt chip:
-+ makes sure register `x10` (containing the exit code) equals $0$ (@halt:c:read_zero_exit_code),
-+ writes $0$ to all other registers (@halt:c:zeroize_registers_lo/@halt:c:zeroize_registers_hi), and
-+ sets `pc` equal to $1$ (@halt:c:pc).
-Note that the writes performed by all these interactions are accompanied by the timestamp $2^64-1$; the maximum timestamp.
-This prevents any other operation involving memory from being executed hereafter.
-#render_constraint_table(chip, config, groups: "all")
-
-#aside("Note on register clean up",
-[
-  Observe that --- in its current state --- this solution puts the burden of verifying the register cleanup on the verifier inside of the lookup argument.
-  Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there.
-])
-
-=== Lookup
-In this VM, halting is considered equivalent to executing a `sys_exit`.
-Hence, this chip responds to `ECALL`s with system call number 93.
-#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L258")[[src]]])
-The HALT chip therefore contributes the following interaction to the lookup-argument:
-#render_constraint_table(chip, config, groups: "lookup")
-
-== Padding
-This chip should only contain a single row.
-Given that $2^0 = 1$, this chip does not need to be padded.
-As such, no padding is defined.
-
+#show: book-page("commit.typ")
 
 #let config = load_config()
 #let chip = load_chip("src/commit.toml", config)
 #let commit = raw(chip.name)
-= #commit chip
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
-#let nr_commit_interactions = compute_nr_interactions(chip)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The #commit chip leverages #nr_variables variables, spanning #nr_columns columns and leverages #nr_commit_interactions interactions:
+The #commit chip leverages #nr_variables variables, spanning #nr_columns columns and leverages #nr_interactions interactions:
 #render_chip_column_table(chip, config)
 
-== Constraints
+= Constraints
 In this VM, committing is considered equivalent to writing a value to `stdout`.
 Hence, this chip responds to `ECALL`s with system call number 64.
 #footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
@@ -152,11 +93,11 @@ Lastly, we must make sure `first`, `end` and `μ` are bits (@commit:c:range_firs
 These are required to ensure the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ are binary.
 #render_constraint_table(chip, config, groups: "bits")
 
-== Padding
+= Padding
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
 
-== Notes/optimizations
+= Notes/optimizations
 - The current version only supports writing to `stdout`.
   This chip could potentially be extended to support writing to arbitrary `fd`s
 - One might be able to replace @commit:c:end by `end => count = 0`.
