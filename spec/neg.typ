@@ -23,6 +23,8 @@ This template introduces #nr_interactions interaction(s).
 = Constraints
 We constrain this equality using two constraints:
 #render_constraint_table(chip, config)
+
+== Correctness argument
 The constraints force the `carry` values to be fixed.
 Writing `carry`'s definition, we then find that
 $
