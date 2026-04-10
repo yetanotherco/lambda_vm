@@ -1,0 +1,39 @@
+name = "SIGN"
+
+[[variables.input]]
+name = "X"
+type = "Half"
+desc = "Value for which to extract its sign."
+
+[[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "Whether `X` represents a signed value (1) or not (0)"
+
+[[variables.output]]
+name = "sign"
+type = "Bit"
+desc = "Sign of `X`"
+
+
+[[assumptions]]
+desc = "`IS_BIT<signed>`"
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MSB16"
+input = ["X"]
+output = "sign"
+multiplicity = "signed"
+ref = "sign:c:sign_if_signed"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$not#`signed` => #`sign` = 0$"
+poly = ["*", ["not", "signed"], "sign"]
+ref = "sign:c:sign_if_unsigned"
+
