@@ -779,6 +779,31 @@ impl BusValue {
 }
 
 // =============================================================================
+// Compiled Constraint Evaluator
+// =============================================================================
+
+/// Trait for compiled constraint evaluation, bypassing virtual dispatch.
+///
+/// Implementors compute the weighted sum `sum_i beta_i * constraint_i(row)` directly,
+/// using F×E multiplication (3 base muls) instead of `to_extension()` + E×E (6 base muls).
+pub trait CompiledEvaluator<F: IsField, E: IsField>: Send + Sync {
+    /// Compute the weighted sum of ALL constraints (native + LogUp) for one LDE row.
+    ///
+    /// Must return the same value as the virtual-dispatch path to maintain soundness.
+    fn evaluate(
+        &self,
+        main_curr: &[FieldElement<F>],
+        main_next: &[FieldElement<F>],
+        aux_curr: &[FieldElement<E>],
+        aux_next: &[FieldElement<E>],
+        transition_coefficients: &[FieldElement<E>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
+        logup_table_offset: &FieldElement<E>,
+    ) -> FieldElement<E>;
+}
+
+// =============================================================================
 // AirWithBuses
 // =============================================================================
 
@@ -804,6 +829,8 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Optional compiled evaluator: bypasses virtual dispatch in constraint evaluation hot loop.
+    compiled_evaluator: Option<Box<dyn CompiledEvaluator<F, E>>>,
 }
 
 impl<
@@ -896,6 +923,7 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            compiled_evaluator: None,
         }
     }
 
@@ -931,6 +959,19 @@ impl<
     /// making it easy to identify which table is contributing to bus imbalances.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Attach a compiled constraint evaluator that bypasses virtual dispatch.
+    ///
+    /// When set, the evaluator's hot loop calls this instead of iterating over
+    /// `transition_constraints` with dynamic dispatch. The compiled evaluator
+    /// must compute the same weighted sum as the virtual-dispatch path.
+    pub fn with_compiled_evaluator(
+        mut self,
+        evaluator: Box<dyn CompiledEvaluator<F, E>>,
+    ) -> Self {
+        self.compiled_evaluator = Some(evaluator);
         self
     }
 }
@@ -994,6 +1035,31 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn evaluate_transitions_compiled(
+        &self,
+        main_curr: &[FieldElement<Self::Field>],
+        main_next: &[FieldElement<Self::Field>],
+        aux_curr: &[FieldElement<Self::FieldExtension>],
+        aux_next: &[FieldElement<Self::FieldExtension>],
+        transition_coefficients: &[FieldElement<Self::FieldExtension>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
+        logup_table_offset: &FieldElement<Self::FieldExtension>,
+    ) -> Option<FieldElement<Self::FieldExtension>> {
+        self.compiled_evaluator.as_ref().map(|ce| {
+            ce.evaluate(
+                main_curr,
+                main_next,
+                aux_curr,
+                aux_next,
+                transition_coefficients,
+                rap_challenges,
+                logup_alpha_powers,
+                logup_table_offset,
+            )
+        })
     }
 
     fn build_auxiliary_trace(
@@ -1845,6 +1911,105 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
             &mut linear_combination,
             shifts,
         );
+    }
+    z - &linear_combination
+}
+
+/// Computes multiplicity from a raw main trace slice (compiled evaluator path).
+pub fn compute_multiplicity_raw<F: IsField>(
+    main: &[FieldElement<F>],
+    multiplicity: &Multiplicity,
+) -> FieldElement<F> {
+    match multiplicity {
+        Multiplicity::One => FieldElement::<F>::one(),
+        Multiplicity::Column(col) => main[*col].clone(),
+        Multiplicity::Sum(col_a, col_b) => &main[*col_a] + &main[*col_b],
+        Multiplicity::Negated(col) => FieldElement::<F>::one() - &main[*col],
+        Multiplicity::Diff(col_a, col_b) => &main[*col_a] - &main[*col_b],
+        Multiplicity::Sum3(col_a, col_b, col_c) => &main[*col_a] + &main[*col_b] + &main[*col_c],
+        Multiplicity::Linear(terms) => {
+            let mut result = FieldElement::<F>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<F>::from(*coefficient);
+                        result += &main[*column] * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<F>::from(*coefficient);
+                        result += &main[*column] * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<F>::from(*value);
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Computes fingerprint from a raw main trace slice (compiled evaluator path).
+///
+/// Returns `z - (bus_id*alpha^0 + v[0]*alpha^1 + ...)`
+pub fn compute_fingerprint_raw<F: IsSubFieldOf<E>, E: IsField>(
+    main: &[FieldElement<F>],
+    interaction: &BusInteraction,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+    shifts: &PackingShifts<F>,
+) -> FieldElement<E> {
+    let bus_id_f: FieldElement<F> = FieldElement::from(interaction.bus_id);
+    let mut linear_combination = bus_id_f * &alpha_powers[0];
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        match bv {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => {
+                alpha_idx += packing.accumulate_fingerprint_with(
+                    *start_column,
+                    |col| &main[col],
+                    alpha_powers,
+                    alpha_idx,
+                    &mut linear_combination,
+                    shifts,
+                );
+            }
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main[*column] * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main[*column] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(*value);
+                        }
+                    }
+                }
+                linear_combination += result * &alpha_powers[alpha_idx];
+                alpha_idx += 1;
+            }
+        }
     }
     z - &linear_combination
 }

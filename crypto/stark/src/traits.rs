@@ -306,6 +306,38 @@ pub trait AIR: Send + Sync {
         result
     }
 
+    /// Compiled constraint evaluation: computes the weighted sum
+    /// `sum_i beta_i * constraint_i(row)` directly, bypassing virtual dispatch.
+    /// Returns the pre-zerofier composition value for one LDE row.
+    ///
+    /// The key optimization is using F*E multiplication (3 base muls) for
+    /// base-field constraints instead of the `to_extension()` + E*E mul path
+    /// (embed + 6 base muls).
+    ///
+    /// Parameters:
+    /// - `main_curr`/`main_next`: raw column values at current and next LDE rows
+    /// - `aux_curr`/`aux_next`: extension-field column values (LogUp)
+    /// - `transition_coefficients`: random linear combination weights (one per constraint)
+    /// - `rap_challenges`: LogUp challenges `[z, alpha]`
+    /// - `logup_alpha_powers`: precomputed powers of alpha for fingerprint computation
+    /// - `logup_table_offset`: `L/N` per table for circular LogUp constraint
+    ///
+    /// Returns `Some(weighted_sum)` if compiled path is available, `None` to fall back.
+    #[allow(unused_variables)]
+    fn evaluate_transitions_compiled(
+        &self,
+        main_curr: &[FieldElement<Self::Field>],
+        main_next: &[FieldElement<Self::Field>],
+        aux_curr: &[FieldElement<Self::FieldExtension>],
+        aux_next: &[FieldElement<Self::FieldExtension>],
+        transition_coefficients: &[FieldElement<Self::FieldExtension>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
+        logup_table_offset: &FieldElement<Self::FieldExtension>,
+    ) -> Option<FieldElement<Self::FieldExtension>> {
+        None
+    }
+
     fn transition_constraints(
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>>;
