@@ -539,7 +539,8 @@ class Config:
     @classmethod
     def from_file(cls, filename: str | Path) -> Self:
         reporter.update_location(str(filename))
-        return cls(tomllib.load(open(filename, "rb")))
+        with open(filename, "rb") as fp:
+            return cls(tomllib.load(fp))
 
     @classmethod
     def from_string(cls, s: str) -> Self:
@@ -976,7 +977,8 @@ class Chip:
     @classmethod
     def from_file(cls, config: Config, filename: str | Path) -> Self:
         reporter.update_location(str(filename))
-        return cls(config, tomllib.load(open(filename, "rb")))
+        with open(filename, "rb") as fp:
+            return cls(config, tomllib.load(fp))
 
     @classmethod
     def from_string(cls, config: Config, s: str) -> Self:
@@ -1031,7 +1033,8 @@ def build_signature(config: Config, data: dict) -> Signature:
 
 
 def read_signatures(config, filename) -> list[Signature]:
-    data = tomllib.load(open(filename, "rb"))
+    with open(filename, "rb") as fp:
+        data = tomllib.load(fp)
     assert_no_unexpected(data, {"signatures"})
     return [build_signature(config, sig) for sig in data["signatures"]]
 
