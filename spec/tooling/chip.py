@@ -1015,6 +1015,9 @@ def build_signature(config: Config, data: dict) -> Signature:
                 "cond" not in data, f"Template signature with cond: {data!r}"
             )
             Sig = InteractionSignature
+        case other:
+            reporter.error(f"Signature of invalid kind '{other}': {data!r}")
+            Sig = Signature
     tag = data["tag"]
     reporter.asserts(isinstance(tag, str), f"Signature tag not a string: {tag!r}")
     input = [build_type(config, inp) for inp in data["input"]]
