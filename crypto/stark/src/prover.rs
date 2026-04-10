@@ -1561,7 +1561,8 @@ pub trait IsStarkProver<
         let mut max_aux_cols = 0usize;
         let mut max_lde_size = 0usize;
 
-        // Deduplicate twiddle caches: tables with the same lde_size share one Arc.
+        // Share twiddles across tables with equal lde_size. Relies on all AIRs
+        // using the same ProofOptions (blowup_factor, coset_offset).
         let mut twiddle_by_size: std::collections::HashMap<usize, Arc<LdeTwiddles<Field>>> =
             std::collections::HashMap::new();
 
