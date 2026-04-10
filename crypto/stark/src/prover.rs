@@ -476,14 +476,63 @@ pub trait IsStarkProver<
         });
     }
 
+    /// Extend pool columns from their current LDE size to a larger target size.
+    ///
+    /// Each column currently has `current_size` evaluations on the coset {g * omega_S^i}.
+    /// This extends to `target_size` evaluations on {g * omega_M^i} via:
+    ///   iFFT(current_size, offset=g) -> coefficients -> zero-pad -> FFT(target_size, offset=g)
+    ///
+    /// The polynomial is the same -- we're just evaluating at more points.
+    fn extend_pool_columns_to_size<E>(
+        pool: &mut [Vec<FieldElement<E>>],
+        num_cols: usize,
+        target_size: usize,
+        coset_offset: &FieldElement<Field>,
+    ) where
+        Field: IsSubFieldOf<E>,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
+        FieldElement<E>: Send + Sync,
+    {
+        if num_cols == 0 {
+            return;
+        }
+        let current_size = pool[0].len();
+        if current_size >= target_size {
+            return;
+        }
+
+        #[cfg(feature = "parallel")]
+        let iter = pool[..num_cols].par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let iter = pool[..num_cols].iter_mut();
+
+        iter.for_each(|col| {
+            // iFFT on coset to get polynomial coefficients
+            let poly = Polynomial::interpolate_offset_fft::<Field>(col, coset_offset)
+                .expect("iFFT should succeed for LDE extension");
+            // Evaluate on the larger coset (zero-padding is implicit)
+            let extended = Polynomial::evaluate_offset_fft(
+                &poly,
+                1,
+                Some(target_size),
+                coset_offset,
+            )
+            .expect("FFT should succeed for LDE extension");
+            *col = extended;
+        });
+    }
+
     /// Compute main LDE, commit, return tree and root.
     /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
+    /// If `max_lde_size > 0` and exceeds the table's natural LDE size, columns are extended
+    /// to `max_lde_size` before committing so all tables' Merkle trees share the same height.
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
+        max_lde_size: usize,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -503,6 +552,17 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+
+        // Extend to unified domain if this table's LDE is smaller
+        let natural_lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        if max_lde_size > 0 && natural_lde_size < max_lde_size {
+            Self::extend_pool_columns_to_size::<Field>(
+                main_pool,
+                num_cols,
+                max_lde_size,
+                &domain.coset_offset,
+            );
+        }
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
 
@@ -519,6 +579,8 @@ pub trait IsStarkProver<
 
     /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
     /// Uses pool buffers to avoid allocation.
+    /// If `max_lde_size > 0` and exceeds the table's natural LDE size, columns are extended
+    /// to `max_lde_size` before committing so all tables' Merkle trees share the same height.
     #[allow(clippy::type_complexity)]
     fn commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
@@ -527,6 +589,7 @@ pub trait IsStarkProver<
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
+        max_lde_size: usize,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -546,6 +609,17 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+
+        // Extend to unified domain if this table's LDE is smaller
+        let natural_lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        if max_lde_size > 0 && natural_lde_size < max_lde_size {
+            Self::extend_pool_columns_to_size::<Field>(
+                main_pool,
+                num_cols,
+                max_lde_size,
+                &domain.coset_offset,
+            );
+        }
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
 
@@ -581,6 +655,10 @@ pub trait IsStarkProver<
     ///
     /// The Merkle trees were already built during Phase A/C and are reused here,
     /// eliminating redundant Keccak hashing.
+    ///
+    /// If `max_lde_size > 0` and exceeds the table's natural LDE size, columns are
+    /// extended to `max_lde_size` after the normal LDE so the evaluation points match
+    /// the unified domain used for Merkle tree commitments and shared FRI queries.
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
@@ -589,6 +667,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
         aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
+        max_lde_size: usize,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -598,6 +677,24 @@ pub trait IsStarkProver<
         let num_main_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
+
+        // Extend to unified domain if needed
+        let natural_lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        if max_lde_size > 0 && natural_lde_size < max_lde_size {
+            Self::extend_pool_columns_to_size::<Field>(
+                main_pool,
+                num_main_cols,
+                max_lde_size,
+                &domain.coset_offset,
+            );
+        }
+
+        // Determine blowup factor for the LDE trace table
+        let effective_blowup = if max_lde_size > 0 && natural_lde_size < max_lde_size {
+            max_lde_size / domain.interpolation_domain_size
+        } else {
+            domain.blowup_factor
+        };
 
         // Use stored Merkle trees from Phase A/C via Arc (pointer copy, no deep clone)
         let main = Round1CommitmentData::<Field> {
@@ -613,6 +710,15 @@ pub trait IsStarkProver<
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
+            // Extend aux to unified domain if needed
+            if max_lde_size > 0 && natural_lde_size < max_lde_size {
+                Self::extend_pool_columns_to_size::<FieldExtension>(
+                    aux_pool,
+                    n_aux,
+                    max_lde_size,
+                    &domain.coset_offset,
+                );
+            }
             // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
                 lde_trace_merkle_tree: Arc::clone(
@@ -644,7 +750,7 @@ pub trait IsStarkProver<
             .map(std::mem::take)
             .collect();
         let lde_trace =
-            LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), domain.blowup_factor);
+            LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), effective_blowup);
 
         Ok(Round1 {
             lde_trace,
@@ -678,7 +784,7 @@ pub trait IsStarkProver<
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
             let result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, &**twiddles, main_pool, aux_pool,
+                *air, *trace, domain, metadata, &**twiddles, main_pool, aux_pool, 0,
             )
             .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
@@ -871,6 +977,9 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
+    /// If `max_lde_size > 0` and exceeds the table's natural LDE size, the composition
+    /// polynomial part evaluations are extended to `max_lde_size` before committing,
+    /// ensuring the composition poly Merkle tree matches the unified domain height.
     fn round_2_compute_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
@@ -878,6 +987,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
+        max_lde_size: usize,
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -938,6 +1048,24 @@ pub trait IsStarkProver<
                 })
                 .collect()
         };
+
+        // Extend composition poly parts to unified domain if needed
+        let natural_lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let mut lde_composition_poly_parts_evaluations = lde_composition_poly_parts_evaluations;
+        if max_lde_size > 0 && natural_lde_size < max_lde_size {
+            for part in lde_composition_poly_parts_evaluations.iter_mut() {
+                let poly = Polynomial::interpolate_offset_fft::<Field>(part, &domain.coset_offset)
+                    .expect("iFFT should succeed for composition poly extension");
+                let extended = Polynomial::evaluate_offset_fft(
+                    &poly,
+                    1,
+                    Some(max_lde_size),
+                    &domain.coset_offset,
+                )
+                .expect("FFT should succeed for composition poly extension");
+                *part = extended;
+            }
+        }
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
 
@@ -978,6 +1106,15 @@ pub trait IsStarkProver<
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
+        // Determine the effective blowup for composition poly evaluations.
+        // If composition evals were extended to max_lde_size, the stride is
+        // comp_eval_len / domain_size rather than the natural blowup_factor.
+        let comp_blowup = if round_2_result.lde_composition_poly_evaluations.is_empty() {
+            blowup_factor
+        } else {
+            round_2_result.lde_composition_poly_evaluations[0].len() / domain_size
+        };
+
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
         // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
@@ -1002,9 +1139,10 @@ pub trait IsStarkProver<
             .lde_composition_poly_evaluations
             .iter()
             .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
+                // Extract trace-size evaluations (stride = comp_blowup, which equals
+                // blowup_factor for natural domain or max_lde_size/N for extended domain)
                 let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
-                    .map(|i| lde_evals[i * blowup_factor].clone())
+                    .map(|i| lde_evals[i * comp_blowup].clone())
                     .collect();
                 math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
@@ -1277,6 +1415,14 @@ pub trait IsStarkProver<
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
+        // Effective blowup for composition poly evaluations (may differ from trace blowup
+        // when composition evals are extended to the unified domain).
+        let comp_blowup = if num_parts > 0 {
+            round_2_result.lde_composition_poly_evaluations[0].len() / domain_size
+        } else {
+            blowup_factor
+        };
+
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
         let num_eval_points = if trace_terms_gammas.is_empty() {
             0
@@ -1330,12 +1476,13 @@ pub trait IsStarkProver<
         let iter = 0..domain_size;
 
         iter.map(|i| {
-            let row_idx = i * blowup_factor; // LDE row index
+            let trace_row_idx = i * blowup_factor; // LDE row index for trace
+            let comp_row_idx = i * comp_blowup; // LDE row index for composition poly (may differ if extended)
 
             // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][comp_row_idx];
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
@@ -1352,9 +1499,9 @@ pub trait IsStarkProver<
 
                     let t_j_ood = &ood_evals_j[k];
                     let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j) - t_j_ood
+                        lde_trace.get_main(trace_row_idx, j) - t_j_ood
                     } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
+                        lde_trace.get_aux(trace_row_idx, j - num_main_cols) - t_j_ood
                     };
                     result += &gammas_j[k] * numerator * inv_t_k_i;
                 }
@@ -1411,7 +1558,7 @@ pub trait IsStarkProver<
     /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
     /// element. Gathers row data from column-major LDE storage.
     fn open_trace_polys_main(
-        domain: &Domain<Field>,
+        _domain: &Domain<Field>,
         tree: &BatchedMerkleTree<Field>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         challenge: usize,
@@ -1420,7 +1567,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        // Use actual LDE row count (may be extended to max_lde_size for unified domain)
+        let domain_size = lde_trace.num_rows();
 
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
@@ -1435,7 +1583,7 @@ pub trait IsStarkProver<
 
     /// Variant that opens only a range of main columns (for preprocessed tables).
     fn open_trace_polys_main_range(
-        domain: &Domain<Field>,
+        _domain: &Domain<Field>,
         tree: &BatchedMerkleTree<Field>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         challenge: usize,
@@ -1446,7 +1594,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        // Use actual LDE row count (may be extended to max_lde_size for unified domain)
+        let domain_size = lde_trace.num_rows();
 
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
@@ -1468,7 +1617,7 @@ pub trait IsStarkProver<
 
     /// Opens auxiliary trace polynomials at the given challenge index.
     fn open_trace_polys_aux(
-        domain: &Domain<Field>,
+        _domain: &Domain<Field>,
         tree: &BatchedMerkleTree<FieldExtension>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         challenge: usize,
@@ -1477,7 +1626,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        // Use actual LDE row count (may be extended to max_lde_size for unified domain)
+        let domain_size = lde_trace.num_rows();
 
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
@@ -1696,9 +1846,10 @@ pub trait IsStarkProver<
                             air.num_precomputed_columns(),
                             twiddles,
                             &mut pool.main,
+                            max_lde_size,
                         )
                     } else {
-                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)
+                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main, max_lde_size)
                     }
                 })
                 .collect();
@@ -1819,6 +1970,17 @@ pub trait IsStarkProver<
                             domain,
                             twiddles,
                         );
+
+                        // Extend aux columns to unified domain if needed
+                        let natural_lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+                        if natural_lde_size < max_lde_size {
+                            Self::extend_pool_columns_to_size::<FieldExtension>(
+                                &mut pool.aux,
+                                num_aux_cols,
+                                max_lde_size,
+                                &domain.coset_offset,
+                            );
+                        }
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
@@ -1913,7 +2075,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "instruments")]
             let lde_start = Instant::now();
             let round_1_result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+                *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux, 0,
             )?;
             #[cfg(feature = "instruments")]
             let lde_dur = lde_start.elapsed();
@@ -1966,74 +2128,10 @@ pub trait IsStarkProver<
             });
         }
 
-        // Check if all tables have the same LDE domain size.
-        // Shared FRI is only used when all domains match (avoids coset offset issues
-        // with folding insertion across different domain sizes).
-        let all_same_domain = {
-            let first_lde_size = domains[0].interpolation_domain_size * domains[0].blowup_factor;
-            domains.iter().all(|d| d.interpolation_domain_size * d.blowup_factor == first_lde_size)
-        };
-
-        if !all_same_domain {
-            // Fall back to per-table FRI when domains differ
-            let mut proofs = Vec::with_capacity(num_airs);
-            for chunk_start in (0..num_airs).step_by(k) {
-                let chunk_end = (chunk_start + k).min(num_airs);
-                let chunk_size = chunk_end - chunk_start;
-
-                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-
-                for j in 0..chunk_size {
-                    let idx = chunk_start + j;
-                    let pool = &mut pool_sets[j];
-                    let table_transcript = &mut chunk_transcripts[j];
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let metadata = &metadatas[idx];
-                    let domain = &domains[idx];
-                    let twiddles = &*twiddle_caches[idx];
-
-                    let round_1_result = Self::reconstruct_round1(
-                        *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
-                    )?;
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air, *pub_inputs, &round_1_result, table_transcript, domain,
-                    )?;
-
-                    let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
-                    for (slot, col) in pool.main.iter_mut().zip(main_cols) {
-                        *slot = col;
-                    }
-                    for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
-                        *slot = col;
-                    }
-
-                    proofs.push(proof);
-                }
-            }
-
-            #[cfg(feature = "instruments")]
-            {
-                crate::instruments::store(crate::instruments::MultiProveTiming {
-                    prepass: prepass_elapsed,
-                    main_commits: main_commits_elapsed,
-                    aux_build: aux_build_elapsed,
-                    aux_commit: aux_commit_elapsed,
-                    rounds_2_4: phase_start.elapsed(),
-                    round1_sub: crate::instruments::take_r1_sub(),
-                    table_timings,
-                });
-            }
-
-            return Ok(MultiProof {
-                proofs,
-                shared_fri: None,
-            });
-        }
+        // Unified-domain LDE: all tables' trace and composition polynomial evaluations
+        // are extended to max_lde_size, so all Merkle trees share the same height.
+        // This enables shared FRI with uniform query indices (no per-table index mapping).
+        // The per-table FRI fallback has been removed.
 
         // =====================================================================
         // Multi-table path: Rounds 2-3 + DEEP evals per table, then shared FRI
@@ -2071,7 +2169,7 @@ pub trait IsStarkProver<
                 let twiddles = &*twiddle_caches[idx];
 
                 let round_1_result = Self::reconstruct_round1(
-                    *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+                    *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux, 0,
                 )?;
 
                 if let Some(ref bpi) = round_1_result.bus_public_inputs {
@@ -2081,6 +2179,7 @@ pub trait IsStarkProver<
                 let (round_2_result, round_3_result, deep_evals, z) =
                     Self::prove_rounds_2_3_and_deep_evals(
                         *air, *pub_inputs, &round_1_result, table_transcript, domain,
+                        max_lde_size,
                     )?;
 
                 // Save commitment data and bus_public_inputs before moving lde_trace back to pool
@@ -2121,7 +2220,9 @@ pub trait IsStarkProver<
             }
         }
 
-        // Phase 2: Batch all tables' DEEP evals and run shared FRI
+        // Phase 2: Batch all tables' DEEP evals and run shared FRI.
+        // Tables with smaller domains are extended to the max domain size via
+        // iFFT + zero-pad + FFT, so all evaluations are at the same coset points.
 
         // Determine coset offset (all tables share the same proof options)
         let coset_offset_u64 = air_trace_pairs[0].0.context().proof_options.coset_offset;
@@ -2132,18 +2233,10 @@ pub trait IsStarkProver<
             .map(|d| d.2.lde_domain_size)
             .max()
             .unwrap();
-        let max_log2 = max_lde_domain_size.trailing_zeros();
 
-        // Sample lambda for cross-table batching from the shared transcript
-        // We use the first table's transcript as the "shared" one for FRI.
-        // Actually, for shared FRI we need a deterministic transcript. We'll create
-        // a combined transcript by appending all per-table DEEP-related data.
-        //
-        // For simplicity and correctness: use the original (pre-fork) transcript
-        // which already has all Round 1 data. We clone it after Phase B and extend
-        // it with all per-table Round 2-3 data to derive the shared FRI challenges.
+
+        // Build shared FRI transcript (domain-separated from per-table transcripts)
         let mut shared_fri_transcript = transcript.clone();
-        // Domain-separate the shared FRI transcript
         shared_fri_transcript.append_bytes(b"shared_fri");
 
         // Append all per-table composition poly roots and OOD evaluations to shared transcript
@@ -2169,12 +2262,13 @@ pub trait IsStarkProver<
         // Extend all tables' DEEP LDE evals to the max domain size, then batch.
         // For tables smaller than the max domain: un-bit-reverse, iFFT to get
         // coefficients, zero-pad to max size, re-evaluate on the max domain's
-        // coset, re-bit-reverse.
+        // roots, re-bit-reverse.
         //
-        // Key: the max domain's DEEP LDE is f(Omega^j) = deep(g*Omega^j).
-        // For smaller tables, their f(x) = deep(g*x), and we evaluate f at
-        // the max domain roots Omega^j to get f(Omega^j) = deep(g*Omega^j).
-        // This ensures all evaluations are at the same coset points.
+        // The DEEP LDE evals are f(omega^j) in bit-reversed order, where
+        // f(x) = deep(g*x) (the "wrapped" DEEP polynomial). Extending via
+        // plain iFFT + FFT evaluates the same f on the larger domain's roots,
+        // giving f(Omega^j) = deep(g*Omega^j). This ensures all tables'
+        // evaluations are at the same coset points {g * Omega^j}.
         let mut batched_evals = vec![FieldElement::<FieldExtension>::zero(); max_lde_domain_size];
         let mut power = FieldElement::<FieldExtension>::one();
 
@@ -2187,15 +2281,10 @@ pub trait IsStarkProver<
                 deep_evals.lde_evals.clone()
             } else {
                 // Smaller domain: extend to max domain via iFFT + zero-pad + FFT.
-                // The DEEP evals are f(Psi^j) in bit-reversed order where Psi is
-                // the table's LDE domain root. We need f(Omega^j) where Omega is
-                // the max domain root.
                 let mut evals = deep_evals.lde_evals.clone();
                 in_place_bit_reverse_permute(&mut evals);
-                // iFFT: recovers f(x) from f(Psi^j)
                 let poly = Polynomial::interpolate_fft::<Field>(&evals)
                     .expect("iFFT should succeed");
-                // FFT on max domain: evaluates f at Omega^j (zero-pads implicitly)
                 let mut extended = Polynomial::evaluate_fft::<Field>(
                     &poly, 1, Some(max_lde_domain_size),
                 ).expect("FFT should succeed");
@@ -2226,8 +2315,7 @@ pub trait IsStarkProver<
         let max_trace_length = domains.iter().map(|d| d.interpolation_domain_size).max().unwrap();
         let number_of_fri_layers = max_trace_length.trailing_zeros() as usize;
 
-        // Run standard FRI on the batched polynomial (no insertions needed since
-        // all tables have been extended to the same domain)
+        // Run standard FRI on the batched polynomial
         let (fri_last_value, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 number_of_fri_layers,
@@ -2291,24 +2379,21 @@ pub trait IsStarkProver<
                     bus_public_inputs,
                 ) = &per_table_data[idx];
 
-                // Reconstruct Round1 for opening (need LDE data for evaluations)
+                // Reconstruct Round1 for opening with unified domain extension.
+                // The LDE is extended to max_lde_size so all tables share the same
+                // evaluation domain, enabling uniform query indices (no mapping needed).
                 let round_1_result = Self::reconstruct_round1(
                     *air, *trace, domain, metadata, twiddles, &mut pool.main, &mut pool.aux,
+                    max_lde_domain_size,
                 )?;
 
-                // Map shared query indices to this table's domain
-                let table_lde_size = domain.lde_roots_of_unity_coset.len();
-                let shift = max_log2 - (table_lde_size.trailing_zeros());
-                let table_iotas: Vec<usize> = shared_iotas
-                    .iter()
-                    .map(|&iota| iota >> shift)
-                    .collect();
-
+                // All trees share the same height (max_lde_size), so query indices
+                // are used directly without mapping.
                 let deep_poly_openings = Self::open_deep_composition_poly(
                     domain,
                     &round_1_result,
                     round_2_result,
-                    &table_iotas,
+                    &shared_iotas,
                 );
 
                 // Return column Vecs to pool
@@ -2440,6 +2525,7 @@ pub trait IsStarkProver<
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            0,  // no extension for single-table path
         )?;
 
         // >>>> Send commitments: [H₁], [H₂]
@@ -2557,6 +2643,9 @@ pub trait IsStarkProver<
     ///
     /// Used in the shared FRI path of multi_prove where multiple tables' DEEP evals
     /// are batched into a single FRI cascade.
+    ///
+    /// If `max_lde_size > 0`, composition polynomial part evaluations are extended to
+    /// `max_lde_size` before committing, matching the unified domain.
     #[allow(clippy::type_complexity)]
     fn prove_rounds_2_3_and_deep_evals(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -2564,6 +2653,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
+        max_lde_size: usize,
     ) -> Result<
         (
             Round2<FieldExtension>,
@@ -2612,6 +2702,7 @@ pub trait IsStarkProver<
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            max_lde_size,
         )?;
 
         transcript.append_bytes(&round_2_result.composition_poly_root);

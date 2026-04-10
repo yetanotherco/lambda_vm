@@ -1519,7 +1519,6 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let max_lde_domain_size = shared_fri.max_lde_domain_size;
-        let max_log2 = max_lde_domain_size.trailing_zeros();
 
         // Build per-table domains
         let domains: Vec<_> = airs.iter().zip(proofs.iter())
@@ -1596,16 +1595,27 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // Build a unified VerifierDomain for the max LDE domain.
+        // All tables' Merkle trees share this domain height, so evaluation points
+        // are computed from the max domain (no per-table index mapping needed).
+        let max_lde_root_order = max_lde_domain_size.trailing_zeros() as u64;
+        let max_lde_primitive_root = Field::get_primitive_root_of_unity(max_lde_root_order).unwrap();
+        let coset_offset = FieldElement::<Field>::from(airs[0].context().proof_options.coset_offset);
+        let max_domain = VerifierDomain {
+            root_order: max_lde_root_order as u32,
+            trace_length: max_lde_domain_size / 2, // not used for eval point computation
+            lde_length: max_lde_domain_size,
+            trace_primitive_root: max_lde_primitive_root.clone(),
+            lde_primitive_root: max_lde_primitive_root,
+            coset_offset: coset_offset.clone(),
+        };
+
         // Verify FRI fold chain for each query
         let mut evaluation_point_inverse: Vec<FieldElement<Field>> = iotas
             .iter()
             .map(|iota| {
                 let index = reverse_index(iota * 2, max_lde_domain_size as u64);
-                let lde_primitive_root = Field::get_primitive_root_of_unity(
-                    max_lde_domain_size.trailing_zeros() as u64
-                ).unwrap();
-                let coset_offset = FieldElement::<Field>::from(airs[0].context().proof_options.coset_offset);
-                &coset_offset * lde_primitive_root.pow(index)
+                &coset_offset * max_domain.lde_primitive_root.pow(index)
             })
             .collect();
         FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
@@ -1623,9 +1633,6 @@ pub trait IsStarkVerifier<
                 let proof = &proofs[idx];
                 let domain = &domains[idx];
                 let air = airs[idx];
-                let table_lde_size = domain.lde_length;
-                let shift = max_log2 - (table_lde_size.trailing_zeros());
-                let table_iota = iota >> shift;
                 let opening = &proof.deep_poly_openings[q_idx];
 
                 let primitive_root =
@@ -1666,9 +1673,11 @@ pub trait IsStarkVerifier<
                     air, proof, domain, &mut table_t, lookup_challenges.to_vec(),
                 );
 
-                // Evaluation point on this table's domain
-                let eval_point = Self::query_challenge_to_evaluation_point(table_iota, domain);
-                let eval_point_sym = Self::query_challenge_to_evaluation_point_sym(table_iota, domain);
+                // Evaluation point on the unified (max) domain, not the table's natural domain.
+                // Since all tables' LDEs are extended to max_lde_size, the openings are
+                // at max-domain coset points.
+                let eval_point = Self::query_challenge_to_evaluation_point(*iota, &max_domain);
+                let eval_point_sym = Self::query_challenge_to_evaluation_point_sym(*iota, &max_domain);
 
                 // Reconstruct DEEP value
                 let deep_val = Self::reconstruct_deep_composition_poly_evaluation(
@@ -1680,13 +1689,13 @@ pub trait IsStarkVerifier<
                     &evals_sym, &opening.composition_poly.evaluations_sym,
                 );
 
-                // Verify Merkle openings for this table
-                if !Self::verify_trace_openings(proof, opening, table_iota) {
+                // Verify Merkle openings for this table (using unified query index)
+                if !Self::verify_trace_openings(proof, opening, *iota) {
                     #[cfg(not(feature = "test_fiat_shamir"))]
                     error!("Shared FRI: trace opening failed for table {} query {}", idx, q_idx);
                     return false;
                 }
-                if !Self::verify_composition_poly_opening(opening, &proof.composition_poly_root, &table_iota) {
+                if !Self::verify_composition_poly_opening(opening, &proof.composition_poly_root, iota) {
                     #[cfg(not(feature = "test_fiat_shamir"))]
                     error!("Shared FRI: composition opening failed for table {} query {}", idx, q_idx);
                     return false;
