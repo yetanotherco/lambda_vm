@@ -1708,7 +1708,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         {
             let gen_layers_dur = gkr_phase_start.elapsed();
-            info!("     GKR gen_layers (parallel): {:?}", gen_layers_dur);
+            eprintln!("     GKR gen_layers (parallel): {:?}", gen_layers_dur);
         }
 
         // Step 2: Run batch GKR (single proof for all tables).
@@ -1725,7 +1725,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "instruments")]
             {
                 let batch_gkr_dur = gkr_step2_start.elapsed();
-                info!("     GKR batch_prove: {:?}", batch_gkr_dur);
+                eprintln!("     GKR batch_prove: {:?}", batch_gkr_dur);
             }
 
             // Step 3: Distribute batch results to per-table LogUpGkrResult (parallel).
@@ -1780,7 +1780,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "instruments")]
             {
                 let finalize_dur = gkr_step3_start.elapsed();
-                info!("     GKR finalize (kernel+MLE, parallel): {:?}", finalize_dur);
+                eprintln!("     GKR finalize (kernel+MLE, parallel): {:?}", finalize_dur);
             }
 
             (Some(batch_proof), gkr_results_vec)
@@ -1879,7 +1879,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         {
             let bridge_dur = bridge_start.elapsed();
-            info!("     GKR bridge running sum (sequential): {:?}", bridge_dur);
+            eprintln!("     GKR bridge running sum (sequential): {:?}", bridge_dur);
         }
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
