@@ -1,7 +1,7 @@
 #import "/book.typ": book-page, aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   compute_nr_interactions,
@@ -16,13 +16,13 @@
 #let chip = load_chip("src/halt.toml", config)
 #let halt = raw(chip.name)
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)
 
-The #halt chip leverages #nr_variables variable, spanning #nr_columns columns and leverages #nr_interactions interactions::
-#render_chip_column_table(chip, config)
+The #halt chip leverages #nr_variables variable, spanning #nr_columns columns and leverages #nr_interactions interactions:
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 It is assumed the input is range checked:

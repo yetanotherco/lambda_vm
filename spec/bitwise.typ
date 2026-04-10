@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
@@ -19,14 +19,14 @@
 The #bitwise chips deal with precomputed lookup tables for bitwise boolean operations
 and convenience functionalities over small domains.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_precomputed = ("input", "output").map(c => chip.variables.at(c)).flatten().len()
 
 The #bitwise chip is comprised of #nr_variables variables that are expressed using #nr_columns columns.
 Of these, the _input_ and _output_ variables (#nr_precomputed in total) are precomputed.
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`.
 As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
@@ -35,7 +35,7 @@ As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
 This chip adds the following interactions to the lookup:
 #render_constraint_table(chip, config)
 
-= Areas of Optimization
+= Notes/Optimizations
 The following ideas may prove to be optimizations for the #bitwise chip:
 + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. 
   When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`.

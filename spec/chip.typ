@@ -142,11 +142,11 @@
         ([#raw(var.name)], [$:=$], [#expr_to_math(var.pad)],)
       }
     },
-  ), caption: [Overview of padding values for #chip.name chip.])
+  ))
 }
 
-/// Generates a table listing `chip`'s columns.
-#let render_chip_column_table(chip, config) = {
+/// Generates a table listing `chip`'s variables.
+#let render_chip_variable_table(chip, config) = {
 
   // Render a definition's iterators
   let render_def_iters(iters) = {
@@ -235,7 +235,7 @@
       }
       (table.cell(colspan: 4, []), )
     },
-  ), caption: [Column overview of #chip.name chip.])
+  ))
 }
 
 #let cref(obj, body) = {
@@ -278,7 +278,7 @@
     ..for assumption in chip.assumptions {
       ([#tag(assumption)], [#iters(assumption)], [#eval(assumption.desc, mode: "markup")])
     },
-  ), caption: [Assumption overview of #chip.name chip.])
+  ))
 }
 
 /// Generates a table listing all interactions initiated by `chip`'s.
@@ -389,5 +389,5 @@
         }
       }
     }
-  ), caption: [Constraint overview of #chip.name chip.])
+  ))
 }

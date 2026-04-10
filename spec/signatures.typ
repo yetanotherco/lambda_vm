@@ -56,8 +56,7 @@
 
 #let interactions = signatures.signatures.filter(s => s.kind == "interaction")
 The following lists signatures of the #interactions.len() interactions in this VM.
-#figure(
-  table(
+#figure(table(
     columns: (1fr, auto),
     inset: 7pt,
     align: (top+left, center),
@@ -68,14 +67,11 @@ The following lists signatures of the #interactions.len() interactions in this V
     ..for sig in interactions {
       ([#render_signature(sig)], [#interaction_bus_size(sig)])
     },
-  ),
-  caption: "Signature overview of interactions",
-)
+))
 
 #let templates = signatures.signatures.filter(s => s.kind == "template")
 Below, we list the signatures of the #templates.len() templates in this VM.
-#figure(
-  table(
+#figure(table(
     columns: 1fr,
     inset: 7pt,
     align: (top+left, center),
@@ -85,6 +81,4 @@ Below, we list the signatures of the #templates.len() templates in this VM.
     ..for sig in templates {
       ([#render_signature(sig)], )
     },
-  ),
-  caption: "Signature overview of templates",
-)
+))
