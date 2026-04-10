@@ -22,9 +22,9 @@
 #let sha256round = raw(sha256roundchip.name)
 #let rotxor = raw(rotxorchip.name)
 
-The purpose of this set of chips is to provide an accelerator for the SHA256 compression function.
-They do not intend to handle the requisite repeated invocations of this compression,
-nor with padding or the preparation of the initial state.
+The following chips constitute an accelerator for the SHA256 compression function; 
+other aspects of SHA256 hashing (such as repeated compression invocation, 
+input padding and state initialization) fall outside the scope of this accelerator.
 
 The base #sha256 chip provides the `ECALL` interface, interacts with memory and then delegates to the #sha256msgsched and #sha256round chips
 to perform the message schedule and the compression rounds, respectively.
