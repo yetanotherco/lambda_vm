@@ -22,6 +22,20 @@ impl Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
+/// File-backed mmap storage for Merkle tree nodes.
+///
+/// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
+/// node access goes through this mmap instead.
+#[cfg(feature = "disk-spill")]
+pub(crate) struct MmapNodeBacking {
+    mmap: memmap2::Mmap,
+    /// Owns the file descriptor backing the mmap. Dropping it would close
+    /// the descriptor and invalidate the mmap.
+    _file: std::fs::File,
+    node_count: usize,
+    node_size: usize,
+}
+
 /// The struct for the Merkle tree, consisting of the root and the nodes.
 /// A typical tree would look like this
 ///                 root
@@ -31,11 +45,14 @@ impl std::error::Error for Error {}
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
-#[derive(Clone)]
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
+    #[cfg(feature = "disk-spill")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    mmap_backing: Option<MmapNodeBacking>,
 }
 
 const ROOT: usize = 0;
@@ -78,14 +95,44 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
         })
+    }
+
+    /// Total number of nodes in the tree (inner + leaves).
+    #[inline]
+    fn node_count(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            return backing.node_count;
+        }
+        self.nodes.len()
+    }
+
+    /// Access a node by index, returning a reference.
+    ///
+    /// Returns `None` if `idx` is out of bounds.
+    #[inline]
+    fn node_get(&self, idx: usize) -> Option<&B::Node> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            if idx < backing.node_count {
+                // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
+                // to this mmap and asserts align_of::<B::Node>() == 1 at compile time.
+                let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
+                return Some(unsafe { &*(ptr as *const B::Node) });
+            }
+            return None;
+        }
+        self.nodes.get(idx)
     }
 
     /// Returns a Merkle proof for the element/s at position pos
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.nodes.len() / 2;
+        let pos = pos + self.node_count() / 2;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
         };
@@ -101,12 +148,12 @@ where
     /// Returns the Merkle path for the element/s for the leaf at position pos
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
         // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
+        let tree_depth = (self.node_count() + 1).ilog2() as usize;
         let mut merkle_path = Vec::with_capacity(tree_depth);
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.nodes.get(sibling_index(pos)) else {
+            let Some(node) = self.node_get(sibling_index(pos)) else {
                 // out of bounds, exit returning the current merkle_path
                 return Err(Error::OutOfBounds);
             };
@@ -141,7 +188,7 @@ where
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.nodes.len() + 1).div_ceil(2);
+        let num_leaves = (self.node_count() + 1).div_ceil(2);
 
         // Validate all positions are within bounds
         for &pos in pos_list {
@@ -154,7 +201,7 @@ where
         // of the leaves.
         let leaf_positions = pos_list
             .iter()
-            .map(|pos| pos + self.nodes.len() / 2)
+            .map(|pos| pos + self.node_count() / 2)
             .collect::<Vec<usize>>();
         // We get the positions of the nodes for the batch proof.
         let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
@@ -162,7 +209,11 @@ where
         // We get the nodes for the batch proof.
         let batch_auth_path_nodes = batch_auth_path_positions
             .iter()
-            .map(|pos| self.nodes[*pos].clone())
+            .map(|pos| {
+                self.node_get(*pos)
+                    .expect("batch auth path position in bounds")
+                    .clone()
+            })
             .collect();
 
         Ok(BatchProof {
@@ -188,7 +239,7 @@ where
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
         // Number of levels in tree
-        let num_levels = (self.nodes.len() + 1).ilog2();
+        let num_levels = (self.node_count() + 1).ilog2();
 
         // Iter lefevel-by-level from leaves to root.
         for _ in 0..num_levels - 1 {
@@ -216,5 +267,58 @@ where
         // Reverse to get descending order (larger indices first).
         // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
         auth_path_set.into_iter().rev().collect()
+    }
+
+    /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
+    /// Node access methods read from the mmap after this call.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
+    where
+        B::Node: Copy,
+    {
+        const {
+            assert!(
+                align_of::<B::Node>() == 1,
+                "B::Node must have alignment 1 for mmap safety"
+            )
+        }
+        use std::io::Write;
+
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+
+        let node_size = core::mem::size_of::<B::Node>();
+        let node_count = self.nodes.len();
+        let total_bytes = node_count * node_size;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes as u64)?;
+        {
+            let mut writer = std::io::BufWriter::with_capacity(crate::SPILL_BUF_CAPACITY, &file);
+            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+            // the contiguous Vec to a byte slice is valid.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
+            };
+            writer.write_all(bytes)?;
+            writer.flush()?;
+        }
+
+        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+        // so no other process can open or modify it.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+
+        // Free the heap allocation
+        self.nodes = Vec::new();
+
+        self.mmap_backing = Some(MmapNodeBacking {
+            mmap,
+            _file: file,
+            node_count,
+            node_size,
+        });
+
+        Ok(())
     }
 }

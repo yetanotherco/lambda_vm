@@ -1641,6 +1641,28 @@ fn chunk_and_generate<T>(
     }
 }
 
+#[cfg(feature = "disk-spill")]
+fn chunk_generate_and_spill<T>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let op_chunks: Vec<&[T]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(op_chunks.len());
+    for chunk in op_chunks {
+        let mut t = generate(chunk);
+        t.main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        tables.push(t);
+    }
+    Ok(tables)
+}
+
 impl Traces {
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
@@ -1656,6 +1678,54 @@ impl Traces {
             branch: self.branches.len(),
             memw_register: self.memw_registers.len(),
         }
+    }
+
+    /// Spill all trace table main columns to disk.
+    ///
+    /// Frees RAM by memory-mapping the main trace data for every table.
+    /// This is a no-op for tables that are already spilled or empty.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_all_main_to_disk(&mut self) -> Result<(), Error> {
+        let spill = |t: &mut TraceTable<GoldilocksField, GoldilocksExtension>| {
+            t.main_table
+                .spill_to_disk()
+                .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))
+        };
+
+        for t in &mut self.cpus {
+            spill(t)?;
+        }
+        spill(&mut self.bitwise)?;
+        for t in &mut self.lts {
+            spill(t)?;
+        }
+        for t in &mut self.shifts {
+            spill(t)?;
+        }
+        for t in &mut self.memws {
+            spill(t)?;
+        }
+        for t in &mut self.loads {
+            spill(t)?;
+        }
+        spill(&mut self.decode)?;
+        for t in &mut self.muls {
+            spill(t)?;
+        }
+        for t in &mut self.dvrms {
+            spill(t)?;
+        }
+        for t in &mut self.pages {
+            spill(t)?;
+        }
+        spill(&mut self.register)?;
+        for t in &mut self.branches {
+            spill(t)?;
+        }
+        spill(&mut self.halt)?;
+        spill(&mut self.commit)?;
+
+        Ok(())
     }
 
     /// Extract page configurations from ELF only (deterministic from binary).
@@ -1887,8 +1957,31 @@ impl Traces {
         lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
 
         // =====================================================================
-        // PHASE 4: All → Bitwise lookups
+        // PHASE 4+5: Interleaved bitwise flush, trace generation, and drops
+        //
+        // Strategy: generate the bitwise table early, then flush bitwise ops
+        // from each source group in turn, dropping large op vecs as soon as
+        // their traces are generated to minimise peak RSS.
         // =====================================================================
+
+        // Dispatch macro: uses disk-spill variant when the feature is enabled.
+        macro_rules! gen_traces {
+            ($ops:expr, $max:expr, $gen:expr) => {{
+                #[cfg(feature = "disk-spill")]
+                {
+                    chunk_generate_and_spill($ops, $max, $gen)?
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    chunk_and_generate($ops, $max, $gen)
+                }
+            }};
+        }
+
+        // --- Generate bitwise table (empty multiplicities first) ---
+        let mut bitwise_table = bitwise::generate_bitwise_trace();
+
+        // --- Collect all bitwise lookups ---
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
@@ -1905,7 +1998,6 @@ impl Traces {
             .filter(|op| !op.end)
             .map(|op| op.value)
             .collect();
-        // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
@@ -1916,9 +2008,8 @@ impl Traces {
             .sum();
         bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
-        // =====================================================================
-        // PHASE 5: Generate final traces (parallelized)
-        // =====================================================================
+        bitwise::update_multiplicities(&mut bitwise_table, &bitwise_ops);
+        drop(bitwise_ops);
 
         // Extract halt timestamp from the last ECALL instruction
         let halt_op = cpu_ops
@@ -1928,50 +2019,15 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
 
-        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let memw_aligneds = chunk_and_generate(
-            &memw_aligned_ops,
-            max_rows.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace,
-        );
-        let memw_registers = chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
-        );
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-        let branches =
-            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        // --- Generate COMMIT + PAGE + REGISTER + HALT traces ---
+        let commit_trace = commit::generate_commit_trace(&commit_ops);
+        drop(commit_ops);
 
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-        // Update DECODE multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        // When CPU is split, each chunk pads independently
-        let mut decode = decode_trace;
-        let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+        let (pages, page_configs, register_trace, halt_trace);
 
         // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
 
-        // Generate remaining traces in parallel (page, register, halt, commit).
-        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-        let commit_trace = commit::generate_commit_trace(&commit_ops);
-        let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
             let ((pages_val, register_val), halt_val) = rayon::join(
@@ -2004,9 +2060,62 @@ impl Traces {
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
+        // --- Generate traces, dropping op vecs to free memory ---
+        let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        drop(memw_ops);
+
+        let memw_aligneds = gen_traces!(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace
+        );
+        drop(memw_aligned_ops);
+
+        let memw_registers = gen_traces!(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace
+        );
+        drop(memw_register_ops);
+
+        let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        drop(lt_ops);
+
+        // Update DECODE multiplicities
+        // Each CPU operation looks up the DECODE table once
+        // Padding rows also look up pc=1 (the CPU padding entry)
+        // When CPU is split, each chunk pads independently
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        drop(cpu_ops);
+
+        let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
+        drop(load_ops);
+
+        let shifts = gen_traces!(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        drop(shift_ops);
+
+        let muls = gen_traces!(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        drop(mul_ops);
+
+        let dvrms = gen_traces!(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        drop(dvrm_ops);
+
+        let branches = gen_traces!(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        drop(branch_ops);
+
         Ok(Traces {
             cpus,
-            bitwise,
+            bitwise: bitwise_table,
             lts,
             shifts,
             memws,
