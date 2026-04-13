@@ -990,7 +990,14 @@ pub trait IsStarkVerifier<
                     let contrib = if *root_d == FieldElement::one() {
                         root_n.clone()
                     } else {
-                        root_n * &root_d.inv().expect("GKR root denominator must be non-zero")
+                        match root_d.inv() {
+                            Ok(inv) => root_n * &inv,
+                            Err(_) => {
+                                #[cfg(not(feature = "test_fiat_shamir"))]
+                                error!("GKR root denominator is zero — invalid proof");
+                                return false;
+                            }
+                        }
                     };
                     total = total + &contrib;
                 }

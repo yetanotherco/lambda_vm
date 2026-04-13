@@ -2047,6 +2047,14 @@ pub fn gkr_verify_batch<E: IsField>(
                 // instance i's child layer has (n_layers[i] - n_remaining + 1) variables,
                 // so the parent has (n_layers[i] - n_remaining) variables.
                 let parent_num_vars_i = n_layers_by_instance[i] - n_remaining;
+                if num_rounds < parent_num_vars_i {
+                    return Err(GkrError::InvalidTree {
+                        reason: format!(
+                            "layer {}: num_rounds ({}) < parent_num_vars for instance {} ({})",
+                            layer_idx, num_rounds, i, parent_num_vars_i,
+                        ),
+                    });
+                }
                 let sumcheck_n_unused = num_rounds - parent_num_vars_i;
 
                 // eq evaluation: the prover builds eq from the instance-specific eval point
