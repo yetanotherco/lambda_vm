@@ -91,7 +91,7 @@ In the definition of `out`, the output of `chi` and `iota` is combined to constr
 Lastly, the round chip contributes the following interactions to the lookup:
 #render_constraint_table(round_chip, config, groups: "io")
 
-== Optimizations
+== Notes/potential optimizations
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
 - $#`rc[2]` = #`rc[4]` = #`rc[5]` = #`rc[6]` = 0$. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the $iota$-step. This saves 8 columns and 4 `XOR_BYTE` interactions.
 
