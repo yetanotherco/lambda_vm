@@ -1032,7 +1032,7 @@ pub trait IsStarkVerifier<
     {
         let multi_proof = MultiProof {
             proofs: vec![proof.clone()],
-            batch_gkr_proof: None,
+            batch_gkr_proof: proof.batch_gkr_proof.clone(),
         };
         Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }

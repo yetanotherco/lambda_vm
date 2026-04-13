@@ -85,6 +85,10 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // LogUp-GKR proof (when using GKR-based LogUp instead of per-row accumulated column)
     pub logup_gkr_proof: Option<LogUpGkrProof<E>>,
+    // Batch GKR proof shared across all tables in a single-table prove/verify round-trip.
+    // Populated by `Prover::prove` and consumed by `Verifier::verify`.
+    #[serde(default)]
+    pub batch_gkr_proof: Option<BatchGkrProof<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
 }

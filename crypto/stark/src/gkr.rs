@@ -1085,10 +1085,18 @@ pub fn gkr_verify<E: IsField>(
 
         if round_polys.is_empty() {
             // Trivial layer (0 variables in parent): no sumcheck rounds.
-            // The prover just provides child_claims directly.
-            // No gate check here --- soundness is enforced by later layers' sumchecks.
-            // (The verifier's combined_claim may differ from the prover's by a
-            // scaling factor at the first trivial layer, so we skip the check.)
+            // Gate check: verify that n_claim * (dl·dr) = nl·dr + nr·dl.
+            //
+            // The verifier works in normalized form: n_claim = root_n/root_d, d_claim = 1.
+            // The prover's gate equation root_n + λ·root_d = nl·dr + nr·dl + λ·dl·dr,
+            // divided by root_d (= dl·dr), becomes n_claim·(dl·dr) = nl·dr + nr·dl
+            // (the λ terms cancel). This binds claimed_sum to the actual tree structure.
+            let [ref nl, ref nr, ref dl, ref dr] = layer_proof.child_claims;
+            let lhs = &n_claim * &(dl * dr);
+            let rhs = &(nl * dr) + &(nr * dl);
+            if lhs != rhs {
+                return Err(GkrError::GateCheckFailed { layer: layer_idx });
+            }
         } else {
             // Non-trivial layer: verify sumcheck inline.
             let num_rounds = round_polys.len();
@@ -1985,7 +1993,33 @@ pub fn gkr_verify_batch<E: IsField>(
         }
 
         if round_polys.is_empty() {
-            // Trivial layer: no sumcheck needed
+            // Trivial layer: no sumcheck rounds.
+            // Gate check: verify that the alpha-batched combined claims match the
+            // alpha-batched gate evaluations (gate_i = nl·dr + nr·dl + λ·dl·dr, scaled
+            // by 2^n_unused_i to match combined_claims).
+            {
+                let mut actual_sum = FieldElement::<E>::zero();
+                let mut expected_sum = FieldElement::<E>::zero();
+                let mut alpha_pow = FieldElement::<E>::one();
+                for (idx, &i) in active_instances.iter().enumerate() {
+                    let [ref nl, ref nr, ref dl, ref dr] =
+                        layer_proof.child_claims_by_instance[idx];
+                    let gate = &(&(nl * dr) + &(nr * dl)) + &(&lambda * &(dl * dr));
+                    let n_unused = max_layers - n_layers_by_instance[i];
+                    let gate_scaled = if n_unused > 0 {
+                        &gate * &FieldElement::<E>::from(1u64 << n_unused)
+                    } else {
+                        gate
+                    };
+                    actual_sum = &actual_sum + &(&alpha_pow * &combined_claims[idx]);
+                    expected_sum = &expected_sum + &(&alpha_pow * &gate_scaled);
+                    alpha_pow = &alpha_pow * &sumcheck_alpha;
+                }
+                if actual_sum != expected_sum {
+                    return Err(GkrError::GateCheckFailed { layer: layer_idx });
+                }
+            }
+
             // Append child claims and sample eta (same as prover)
             for claims in &layer_proof.child_claims_by_instance {
                 for claim in claims {

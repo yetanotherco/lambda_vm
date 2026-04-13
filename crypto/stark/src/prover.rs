@@ -2171,8 +2171,11 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(air_trace_pairs, transcript)
-            .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(air_trace_pairs, transcript).map(|mut multi_proof| {
+            let mut proof = multi_proof.proofs.remove(0);
+            proof.batch_gkr_proof = multi_proof.batch_gkr_proof;
+            proof
+        })
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
@@ -2335,6 +2338,8 @@ pub trait IsStarkProver<
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             // LogUp-GKR proof (not yet used; will replace accumulated column in future)
             logup_gkr_proof: None,
+            // Batch GKR proof: populated by Prover::prove after multi_prove completes.
+            batch_gkr_proof: None,
             // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
