@@ -1,14 +1,21 @@
-#![no_std]
-#![no_main]
+use lambda_vm_syscalls as syscalls;
 
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
-
-const SIZE: usize = 81;
+const SIZE: usize = {
+    const fn parse(s: &str) -> usize {
+        let b = s.as_bytes();
+        let mut r = 0;
+        let mut i = 0;
+        while i < b.len() {
+            r = r * 10 + (b[i] - b'0') as usize;
+            i += 1;
+        }
+        r
+    }
+    match option_env!("SIZE") {
+        Some(s) => parse(s),
+        None => 81,
+    }
+};
 
 #[inline(never)]
 fn matrix_multiply(a: &[[u32; SIZE]; SIZE], b: &[[u32; SIZE]; SIZE], result: &mut [[u32; SIZE]; SIZE]) {
@@ -44,25 +51,20 @@ fn init_matrix(m: &mut [[u32; SIZE]; SIZE], seed: u32) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub fn main() -> u32 {
+pub fn main() {
     let mut a = [[0u32; SIZE]; SIZE];
     let mut b = [[0u32; SIZE]; SIZE];
     let mut result = [[0u32; SIZE]; SIZE];
 
-    // Initialize matrices with pseudo-random values
     init_matrix(&mut a, 12345);
     init_matrix(&mut b, 67890);
-
-    // Perform matrix multiplication
     matrix_multiply(&a, &b, &mut result);
 
-    // Return checksum: sum of diagonal elements
     let mut checksum = 0u32;
     let mut i = 0;
     while i < SIZE {
         checksum = checksum.wrapping_add(result[i][i]);
         i += 1;
     }
-    checksum
+    syscalls::syscalls::commit(&checksum.to_le_bytes());
 }

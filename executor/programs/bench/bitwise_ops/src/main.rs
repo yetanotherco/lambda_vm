@@ -1,14 +1,21 @@
-#![no_std]
-#![no_main]
+use lambda_vm_syscalls as syscalls;
 
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
-
-const ITERATIONS: usize = 286000;
+const ITERATIONS: usize = {
+    const fn parse(s: &str) -> usize {
+        let b = s.as_bytes();
+        let mut r = 0;
+        let mut i = 0;
+        while i < b.len() {
+            r = r * 10 + (b[i] - b'0') as usize;
+            i += 1;
+        }
+        r
+    }
+    match option_env!("ITERATIONS") {
+        Some(s) => parse(s),
+        None => 286000,
+    }
+};
 
 #[inline(never)]
 fn bitwise_mix(a: u32, b: u32) -> u32 {
@@ -18,8 +25,7 @@ fn bitwise_mix(a: u32, b: u32) -> u32 {
     x.wrapping_add(y).wrapping_add(z)
 }
 
-#[unsafe(no_mangle)]
-pub fn main() -> u32 {
+pub fn main() {
     let mut result = 0x12345678u32;
     let mut i = 0;
 
@@ -30,5 +36,5 @@ pub fn main() -> u32 {
         i += 1;
     }
 
-    result
+    syscalls::syscalls::commit(&result.to_le_bytes());
 }

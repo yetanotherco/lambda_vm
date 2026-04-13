@@ -1,7 +1,22 @@
 use lambda_vm_syscalls as syscalls;
 use tiny_keccak::Hasher;
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: usize = {
+    const fn parse(s: &str) -> usize {
+        let b = s.as_bytes();
+        let mut r = 0;
+        let mut i = 0;
+        while i < b.len() {
+            r = r * 10 + (b[i] - b'0') as usize;
+            i += 1;
+        }
+        r
+    }
+    match option_env!("ITERATIONS") {
+        Some(s) => parse(s),
+        None => 1000,
+    }
+};
 
 pub fn main() {
     let mut output = [0u8; 32];
