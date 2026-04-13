@@ -317,12 +317,10 @@ fn test_bus_interactions_count() {
     // - 1 MSB8 (res_sign_bit)
     // - 1 ZERO (is_equal for BEQ)
     // - 1 LT (less-than comparison)
-    // - 1 M1 (MEMW read rs1 register)
-    // - 1 M3 (MEMW read rs2 register)
-    // - 1 M5 (MEMW write rd register)
+    // - 20 Registers on-Main: 4 accesses × (1 IsHalfword + 2 Memory sender + 2 Memory receiver)
+    //   (replaces M1/M3/M5/CM54 — CPU handles register accesses directly on the Memory bus)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
-    // - 1 CM54 (MEMW PC register read-write)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
@@ -330,8 +328,8 @@ fn test_bus_interactions_count() {
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
     // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 68
-    assert_eq!(interactions.len(), 68);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 20 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 84
+    assert_eq!(interactions.len(), 84);
 }
 
 #[test]

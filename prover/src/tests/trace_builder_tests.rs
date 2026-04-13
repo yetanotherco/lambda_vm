@@ -3,7 +3,6 @@
 use crate::tables::bitwise;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
-use crate::tables::memw_register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
@@ -353,12 +352,17 @@ fn test_mixed_instructions() {
 // =============================================================================
 
 #[test]
-fn test_memw_generated_from_register_ops() {
-    // Test that MEMW operations are generated for register reads/writes
-    // ADD x1, x2, x3 reads x2 (M1), x3 (M3), writes x1 (M5)
+fn test_cpu_populates_register_prev_ts_columns() {
+    // Registers-on-Main: register accesses no longer produce MEMW operations.
+    // Instead, the CPU chip emits the Memory bus interactions directly, using
+    // the RS1_PREV_TS / RS2_PREV_TS / RD_PREV_TS / PC_PREV_TS / RD_PREV_VAL_*
+    // columns populated by the trace builder from register_state.
+    //
+    // This test verifies those columns track register history correctly across
+    // two consecutive instructions that read/write overlapping registers.
     let mut logs = vec![
-        make_add_log(0x1000, 100, 200, 300), // x2=100, x3=200, x1=300
-        make_add_log(0x1004, 0, 0, 0),
+        make_add_log(0x1000, 100, 200, 300), // ADD x1, x2, x3: x2=100, x3=200, x1=300
+        make_add_log(0x1004, 300, 200, 500), // ADD x4, x1, x3: re-reads x1 (just written) and x3
         make_add_log(0x1008, 0, 0, 0),
         make_add_log(0x100c, 0, 0, 0),
     ];
@@ -370,9 +374,9 @@ fn test_memw_generated_from_register_ops() {
             op: ArithOp::Add,
         },
         Instruction::Arith {
-            dst: 0,
-            src1: 0,
-            src2: 0,
+            dst: 4,  // x4
+            src1: 1, // x1 (was just written by op 0)
+            src2: 3, // x3 (read again)
             op: ArithOp::Add,
         },
         Instruction::Arith {
@@ -393,39 +397,44 @@ fn test_memw_generated_from_register_ops() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Register ops should route to MEMW_R (memw_registers), not MEMW_A.
-    // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1).
-    assert!(
-        !traces.memw_registers.is_empty(),
-        "MEMW_R should have at least one chunk for register ops"
+    // CPU timestamps: op 0 at ts=4, op 1 at ts=8 (stride = 4).
+    // Op 0: rs1=x2 @ ts=4, rs2=x3 @ ts=5, rd=x1 @ ts=6.
+    // Op 1: rs1=x1, rs2=x3, rd=x4. prev_ts for:
+    //   rs1=x1 (just written by op 0 at ts=6) should be 6.
+    //   rs2=x3 (read by op 0 at ts=5) should be 5.
+    //   rd=x4 (never touched) should be 0.
+    //   rd_prev_val for x4 should be 0.
+    let cpu_row = traces.cpus[0].main_table.get_row(1);
+    assert_eq!(
+        cpu_row[cols::RS1_PREV_TS],
+        FE::from(6u64),
+        "op 1 rs1_prev_ts should be ts of op 0's rd write (6)"
     );
-    assert!(
-        traces.memw_registers[0].main_table.height >= 3,
-        "MEMW_R should have at least 3 rows for register ops (reads x2, x3 + write x1)"
+    assert_eq!(
+        cpu_row[cols::RS2_PREV_TS],
+        FE::from(5u64),
+        "op 1 rs2_prev_ts should be ts of op 0's rs2 read (5)"
     );
-
-    // Find the register write to x1 in MEMW_R.
-    // MEMW_R columns: ADDRESS = register_index (x1 → index 1),
-    //                 MU_WRITE = 1 for writes, VAL_0 = value low 32 bits.
-    let mut found_write = false;
-    for row_idx in 0..traces.memw_registers[0].main_table.height {
-        let row = traces.memw_registers[0].main_table.get_row(row_idx);
-        // ADDRESS = 1 (x1), MU_WRITE = 1, VAL_0 = 300
-        if row[memw_register::cols::ADDRESS] == FE::from(1u64)
-            && row[memw_register::cols::MU_WRITE] == FE::one()
-        {
-            assert_eq!(
-                row[memw_register::cols::VAL_0],
-                FE::from(300u64),
-                "Write value for x1 should be 300"
-            );
-            found_write = true;
-            break;
-        }
-    }
-    assert!(
-        found_write,
-        "Register write to x1 (ADDRESS=1, MU_WRITE=1, VAL_0=300) not found in MEMW_R"
+    assert_eq!(
+        cpu_row[cols::RD_PREV_TS],
+        FE::from(0u64),
+        "op 1 rd_prev_ts for unused x4 should be 0 (REGISTER init token)"
+    );
+    assert_eq!(
+        cpu_row[cols::RD_PREV_VAL_LO],
+        FE::from(0u64),
+        "op 1 rd_prev_val for unused x4 should be 0"
+    );
+    assert_eq!(
+        cpu_row[cols::RD_PREV_VAL_HI],
+        FE::from(0u64),
+        "op 1 rd_prev_val_hi for unused x4 should be 0"
+    );
+    // PC_PREV_TS for op 1 should be ts+1 of op 0 = 5 (op 0's CM54 write).
+    assert_eq!(
+        cpu_row[cols::PC_PREV_TS],
+        FE::from(5u64),
+        "op 1 pc_prev_ts should be op 0's PC write ts (5)"
     );
 }
 
@@ -474,24 +483,19 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Register ops route to MEMW_R (IS_HALFWORD, not LT).
-    assert!(
-        !traces.memw_registers.is_empty(),
-        "Register ops should route to MEMW_R"
-    );
-
-    // Register ops use IS_HALF for timestamp ordering instead of LT.
+    // Register ops are handled inline on the Memory bus via the CPU chip.
+    // They use IS_HALFWORD for timestamp delta range checks (not LT).
     // Verify the bitwise table has at least one IS_HALF entry with non-zero
-    // multiplicity, proving that MEMW_R's IS_HALF lookups were emitted.
+    // multiplicity, proving that CPU's on-Main IS_HALFWORD lookups were emitted.
     let has_is_half_entry = (0..traces.bitwise.main_table.height)
         .any(|i| traces.bitwise.main_table.get_row(i)[bitwise::cols::MU_IS_HALF] != FE::zero());
     assert!(
         has_is_half_entry,
-        "MEMW_R register ops should produce IS_HALF bitwise entries"
+        "CPU register accesses should produce IS_HALF bitwise entries"
     );
 
     // The LT table should still have ops from non-register MEMW accesses
-    // (e.g. PC next-pc write is a non-register memory op that needs LT).
+    // (e.g. HALT finalization writes that generate LT timestamp checks).
     let total_lt_rows: usize = traces.lts.iter().map(|t| t.main_table.height).sum();
     assert!(
         total_lt_rows > 0,

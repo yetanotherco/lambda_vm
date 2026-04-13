@@ -1429,219 +1429,357 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // =========================================================================
-    // MEMW and LOAD bus interactions (M1, M3, M5, M6, M7)
+    // Register on-Main: Memory bus interactions (replaces M1, M3, M5 sends to MEMW_R)
     // =========================================================================
-    // M1 and M3: Register read interactions (CPU → MEMW μ_read)
-    // -------------------------------------------------------------------------
-    // M1: MEMW[rv1; 1, 2*rs1, rv1, timestamp+0, 1, 0, 0] | read_register1
-    // -------------------------------------------------------------------------
-    // Read from rs1 register via MEMW. Format: 24 elements
-    // [old[8], is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
     //
-    // Registers are stored as WL (2 words), remaining 6 values are unconstrained (zeros).
-    // rv1 is DWordWHH (3 cols: Half, Half, Word) -> pack as WL: lo32 = rv1[0] + 2^16*rv1[1], hi32 = rv1[2]
-    interactions.push(BusInteraction::sender(
-        BusId::Memw,
-        Multiplicity::Column(cols::READ_REGISTER1),
-        vec![
-            // old[0] = lo32 = RV1_0 + 2^16 * RV1_1
-            BusValue::linear(vec![
+    // Each non-padding CPU row directly handles up to 4 register accesses on the
+    // Memory bus (instead of routing them through the MEMW_R chip):
+    //
+    //   - rs1 read  at ts + 0 (multiplicity = READ_REGISTER1)
+    //   - rs2 read  at ts + 1 (multiplicity = READ_REGISTER2)
+    //   - rd  write at ts + 2 (multiplicity = WRITE_REGISTER)
+    //   - PC  read+write at ts + 1 (multiplicity = non_padding_sum, below)
+    //
+    // Per access, 5 bus interactions are emitted (mirroring MEMW_R):
+    //
+    //   1 × IsHalfword[current_ts - prev_ts - 1]   (range-checks delta ∈ [1, 2^16])
+    //   2 × Memory (sender,   read-old word 0, 1)  (prove-old at prev_ts, prev_val)
+    //   2 × Memory (receiver, write-new word 0, 1) (assume-new at current_ts, new_val)
+    //
+    // Memory bus signature: [is_register, addr_lo, addr_hi, ts_lo, ts_hi, value]
+    // Registers are always 2 words: word 0 at addr=2*reg, word 1 at addr=2*reg+1.
+    // Timestamps fit in u32 for CPU-originated ops, so ts_hi = 0 always.
+
+    // -------------------------------------------------------------------------
+    // rs1 read @ timestamp + 0 (multiplicity = READ_REGISTER1)
+    // -------------------------------------------------------------------------
+    // rv1 is DWordWHH (3 cols): lo32 = RV1_0 + 2^16*RV1_1, hi32 = RV1_2.
+    // For a read, old_value == new_value == rv1.
+    {
+        let mult = Multiplicity::Column(cols::READ_REGISTER1);
+        // IsHalfword[TIMESTAMP - RS1_PREV_TS - 1]
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mult.clone(),
+            vec![BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RV1_0,
+                    column: cols::TIMESTAMP,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV1_1,
+                    coefficient: -1,
+                    column: cols::RS1_PREV_TS,
                 },
-            ]),
-            // old[1] = hi32 = RV1_2
-            BusValue::Packed {
-                start_column: cols::RV1_2,
-                packing: Packing::Direct,
+                LinearTerm::Constant(-1),
+            ])],
+        ));
+        let rv1_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::RV1_0,
             },
-            // old[2..7] = 0 (unconstrained for registers)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // is_register = 1
-            BusValue::constant(1),
-            // base_address[0] = 2 * rs1
-            BusValue::linear(vec![LinearTerm::Column {
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::RV1_1,
+            },
+        ]);
+        let rv1_hi = BusValue::Packed {
+            start_column: cols::RV1_2,
+            packing: Packing::Direct,
+        };
+        let addr_w0 = BusValue::linear(vec![LinearTerm::Column {
+            coefficient: 2,
+            column: cols::RS1,
+        }]);
+        let addr_w1 = BusValue::linear(vec![
+            LinearTerm::Column {
                 coefficient: 2,
                 column: cols::RS1,
-            }]),
-            // base_address[1] = 0
-            BusValue::constant(0),
-            // value[0..7] = same as old (rv1 as WL + 6 zeros)
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RV1_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV1_1,
-                },
-            ]),
-            BusValue::Packed {
-                start_column: cols::RV1_2,
-                packing: Packing::Direct,
             },
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // timestamp[0] = timestamp, timestamp[1] = 0
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0),
-            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
-            BusValue::constant(1),
-            BusValue::constant(0),
-            BusValue::constant(0),
-        ],
-    ));
+            LinearTerm::Constant(1),
+        ]);
+        let prev_ts = BusValue::Packed {
+            start_column: cols::RS1_PREV_TS,
+            packing: Packing::Direct,
+        };
+        let curr_ts = BusValue::Packed {
+            start_column: cols::TIMESTAMP,
+            packing: Packing::Direct,
+        };
+        // Memory read-old word 0 (sender)
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0.clone(),
+                BusValue::constant(0),
+                prev_ts.clone(),
+                BusValue::constant(0),
+                rv1_lo.clone(),
+            ],
+        ));
+        // Memory read-old word 1 (sender)
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w1.clone(),
+                BusValue::constant(0),
+                prev_ts,
+                BusValue::constant(0),
+                rv1_hi.clone(),
+            ],
+        ));
+        // Memory write-new word 0 (receiver)
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0,
+                BusValue::constant(0),
+                curr_ts.clone(),
+                BusValue::constant(0),
+                rv1_lo,
+            ],
+        ));
+        // Memory write-new word 1 (receiver)
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult,
+            vec![
+                BusValue::constant(1),
+                addr_w1,
+                BusValue::constant(0),
+                curr_ts,
+                BusValue::constant(0),
+                rv1_hi,
+            ],
+        ));
+    }
 
     // -------------------------------------------------------------------------
-    // M3: MEMW[rv2; 1, 2*rs2, rv2, timestamp+1, 0, 0, 1] | read_register2
+    // rs2 read @ timestamp + 1 (multiplicity = READ_REGISTER2)
     // -------------------------------------------------------------------------
-    // Same pattern as M1 but with RV2 and timestamp+1
-    interactions.push(BusInteraction::sender(
-        BusId::Memw,
-        Multiplicity::Column(cols::READ_REGISTER2),
-        vec![
-            // old[0] = lo32 = RV2_0 + 2^16 * RV2_1
-            BusValue::linear(vec![
+    {
+        let mult = Multiplicity::Column(cols::READ_REGISTER2);
+        // IsHalfword[(TIMESTAMP + 1) - RS2_PREV_TS - 1] = [TIMESTAMP - RS2_PREV_TS]
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mult.clone(),
+            vec![BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RV2_0,
+                    column: cols::TIMESTAMP,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV2_1,
+                    coefficient: -1,
+                    column: cols::RS2_PREV_TS,
                 },
-            ]),
-            // old[1] = hi32 = RV2_2
-            BusValue::Packed {
-                start_column: cols::RV2_2,
-                packing: Packing::Direct,
+            ])],
+        ));
+        let rv2_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::RV2_0,
             },
-            // old[2..7] = 0
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // is_register = 1
-            BusValue::constant(1),
-            // base_address[0] = 2 * rs2
-            BusValue::linear(vec![LinearTerm::Column {
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::RV2_1,
+            },
+        ]);
+        let rv2_hi = BusValue::Packed {
+            start_column: cols::RV2_2,
+            packing: Packing::Direct,
+        };
+        let addr_w0 = BusValue::linear(vec![LinearTerm::Column {
+            coefficient: 2,
+            column: cols::RS2,
+        }]);
+        let addr_w1 = BusValue::linear(vec![
+            LinearTerm::Column {
                 coefficient: 2,
                 column: cols::RS2,
-            }]),
-            // base_address[1] = 0
-            BusValue::constant(0),
-            // value[0..7] = rv2 as WL + 6 zeros
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RV2_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV2_1,
-                },
-            ]),
-            BusValue::Packed {
-                start_column: cols::RV2_2,
-                packing: Packing::Direct,
             },
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // timestamp[0] = timestamp + 1, timestamp[1] = 0
-            BusValue::linear(vec![
+            LinearTerm::Constant(1),
+        ]);
+        let prev_ts = BusValue::Packed {
+            start_column: cols::RS2_PREV_TS,
+            packing: Packing::Direct,
+        };
+        let curr_ts = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP,
+            },
+            LinearTerm::Constant(1),
+        ]);
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0.clone(),
+                BusValue::constant(0),
+                prev_ts.clone(),
+                BusValue::constant(0),
+                rv2_lo.clone(),
+            ],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w1.clone(),
+                BusValue::constant(0),
+                prev_ts,
+                BusValue::constant(0),
+                rv2_hi.clone(),
+            ],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0,
+                BusValue::constant(0),
+                curr_ts.clone(),
+                BusValue::constant(0),
+                rv2_lo,
+            ],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult,
+            vec![
+                BusValue::constant(1),
+                addr_w1,
+                BusValue::constant(0),
+                curr_ts,
+                BusValue::constant(0),
+                rv2_hi,
+            ],
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // rd write @ timestamp + 2 (multiplicity = WRITE_REGISTER)
+    // -------------------------------------------------------------------------
+    // old_value = (RD_PREV_VAL_LO, RD_PREV_VAL_HI) tracked in trace builder.
+    // new_value = rvd (RVD_0, RVD_1, DWordWL).
+    {
+        let mult = Multiplicity::Column(cols::WRITE_REGISTER);
+        // IsHalfword[(TIMESTAMP + 2) - RD_PREV_TS - 1] = [TIMESTAMP - RD_PREV_TS + 1]
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mult.clone(),
+            vec![BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
                     column: cols::TIMESTAMP,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::RD_PREV_TS,
                 },
                 LinearTerm::Constant(1),
-            ]),
-            BusValue::constant(0),
-            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
-            BusValue::constant(1),
-            BusValue::constant(0),
-            BusValue::constant(0),
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // M5: MEMW[1, 2*rd, rvd, timestamp+2, 0, 0, 1] | write_register
-    // -------------------------------------------------------------------------
-    // Write to rd register via MEMW. Format: 16 elements (write, no old)
-    // [is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
-    //
-    // rvd is DWordWL (2 cols: Word, Word)
-    // MEMW uses EXCLUSIVE encoding for write flags: (0, 0, 1) for 8-byte access
-    // ("exactly N bytes" semantics, not "at least N bytes")
-    interactions.push(BusInteraction::sender(
-        BusId::Memw,
-        Multiplicity::Column(cols::WRITE_REGISTER),
-        vec![
-            // is_register = 1
-            BusValue::constant(1),
-            // base_address[0] = 2 * rd
-            BusValue::linear(vec![LinearTerm::Column {
+            ])],
+        ));
+        let old_lo = BusValue::Packed {
+            start_column: cols::RD_PREV_VAL_LO,
+            packing: Packing::Direct,
+        };
+        let old_hi = BusValue::Packed {
+            start_column: cols::RD_PREV_VAL_HI,
+            packing: Packing::Direct,
+        };
+        let new_lo = BusValue::Packed {
+            start_column: cols::RVD_0,
+            packing: Packing::Direct,
+        };
+        let new_hi = BusValue::Packed {
+            start_column: cols::RVD_1,
+            packing: Packing::Direct,
+        };
+        let addr_w0 = BusValue::linear(vec![LinearTerm::Column {
+            coefficient: 2,
+            column: cols::RD,
+        }]);
+        let addr_w1 = BusValue::linear(vec![
+            LinearTerm::Column {
                 coefficient: 2,
                 column: cols::RD,
-            }]),
-            // base_address[1] = 0
-            BusValue::constant(0),
-            // value[0] = rvd_lo = RVD_0
-            BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::Direct,
             },
-            // value[1] = rvd_hi = RVD_1
-            BusValue::Packed {
-                start_column: cols::RVD_1,
-                packing: Packing::Direct,
+            LinearTerm::Constant(1),
+        ]);
+        let prev_ts = BusValue::Packed {
+            start_column: cols::RD_PREV_TS,
+            packing: Packing::Direct,
+        };
+        let curr_ts = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP,
             },
-            // value[2..7] = 0
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // timestamp[0] = timestamp + 2, timestamp[1] = 0
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::TIMESTAMP,
-                },
-                LinearTerm::Constant(2),
-            ]),
-            BusValue::constant(0),
-            // write2=1, write4=0, write8=0 (EXCLUSIVE encoding for 2-Word register access)
-            BusValue::constant(1),
-            BusValue::constant(0),
-            BusValue::constant(0),
-        ],
-    ));
+            LinearTerm::Constant(2),
+        ]);
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0.clone(),
+                BusValue::constant(0),
+                prev_ts.clone(),
+                BusValue::constant(0),
+                old_lo,
+            ],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w1.clone(),
+                BusValue::constant(0),
+                prev_ts,
+                BusValue::constant(0),
+                old_hi,
+            ],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult.clone(),
+            vec![
+                BusValue::constant(1),
+                addr_w0,
+                BusValue::constant(0),
+                curr_ts.clone(),
+                BusValue::constant(0),
+                new_lo,
+            ],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            mult,
+            vec![
+                BusValue::constant(1),
+                addr_w1,
+                BusValue::constant(0),
+                curr_ts,
+                BusValue::constant(0),
+                new_hi,
+            ],
+        ));
+    }
 
+    // =========================================================================
+    // LOAD and STORE bus interactions (M6, M7)
+    // =========================================================================
     // -------------------------------------------------------------------------
     // M6: LOAD[rvd; base_address, timestamp, read2, read4, read8, signed] | LOAD
     // -------------------------------------------------------------------------
@@ -1773,16 +1911,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // CM54: MEMW[pc; 1, 510, next_pc, timestamp+1, 1, 0, 0] | 1 - pad
+    // PC register read-write @ timestamp + 1 (register on-Main, replaces CM54)
     // -------------------------------------------------------------------------
-    // PC register read-write via MEMW. Format: 24 elements (with old)
-    // [old[8], is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
+    // Every non-padding CPU row reads the current PC and writes next_pc to x255
+    // (Word addresses 510, 511). Multiplicity = sum of 16 ALU flags (= 1 for
+    // non-padding rows, 0 for padding).
     //
-    // Every non-padding CPU row reads pc and writes next_pc to register x255 (address 510).
-    // Multiplicity = sum of all ALU flags = 1 for non-padding rows, 0 for padding.
-    interactions.push(BusInteraction::sender(
-        BusId::Memw,
-        Multiplicity::Linear(vec![
+    // old_value = (PC_0, PC_1) — the PC entering this instruction
+    // new_value = (NEXT_PC_0, NEXT_PC_1) — the PC of the next instruction
+    {
+        let non_padding = Multiplicity::Linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
                 column: cols::ADD,
@@ -1847,62 +1985,102 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: 1,
                 column: cols::EBREAK,
             },
-        ]),
-        vec![
-            // old[0] = PC_0 (low word of current pc)
-            BusValue::Packed {
-                start_column: cols::PC_0,
-                packing: Packing::Direct,
-            },
-            // old[1] = PC_1 (high word of current pc)
-            BusValue::Packed {
-                start_column: cols::PC_1,
-                packing: Packing::Direct,
-            },
-            // old[2..7] = 0 (unconstrained for registers)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // is_register = 1
-            BusValue::constant(1),
-            // base_address = [510, 0] (register x255)
-            BusValue::constant(510),
-            BusValue::constant(0),
-            // value[0] = NEXT_PC_0 (low word of next_pc)
-            BusValue::Packed {
-                start_column: cols::NEXT_PC_0,
-                packing: Packing::Direct,
-            },
-            // value[1] = NEXT_PC_1 (high word of next_pc)
-            BusValue::Packed {
-                start_column: cols::NEXT_PC_1,
-                packing: Packing::Direct,
-            },
-            // value[2..7] = 0 (unconstrained for registers)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // timestamp[0] = timestamp + 1, timestamp[1] = 0
-            BusValue::linear(vec![
+        ]);
+        // IsHalfword[(TIMESTAMP + 1) - PC_PREV_TS - 1] = [TIMESTAMP - PC_PREV_TS]
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            non_padding.clone(),
+            vec![BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
                     column: cols::TIMESTAMP,
                 },
-                LinearTerm::Constant(1),
-            ]),
-            BusValue::constant(0),
-            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
-            BusValue::constant(1),
-            BusValue::constant(0),
-            BusValue::constant(0),
-        ],
-    ));
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::PC_PREV_TS,
+                },
+            ])],
+        ));
+        let pc_lo = BusValue::Packed {
+            start_column: cols::PC_0,
+            packing: Packing::Direct,
+        };
+        let pc_hi = BusValue::Packed {
+            start_column: cols::PC_1,
+            packing: Packing::Direct,
+        };
+        let next_pc_lo = BusValue::Packed {
+            start_column: cols::NEXT_PC_0,
+            packing: Packing::Direct,
+        };
+        let next_pc_hi = BusValue::Packed {
+            start_column: cols::NEXT_PC_1,
+            packing: Packing::Direct,
+        };
+        let prev_ts = BusValue::Packed {
+            start_column: cols::PC_PREV_TS,
+            packing: Packing::Direct,
+        };
+        let curr_ts = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP,
+            },
+            LinearTerm::Constant(1),
+        ]);
+        // Memory read-old word 0 (sender): [1, 510, 0, PC_PREV_TS, 0, PC_0]
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            non_padding.clone(),
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(510),
+                BusValue::constant(0),
+                prev_ts.clone(),
+                BusValue::constant(0),
+                pc_lo,
+            ],
+        ));
+        // Memory read-old word 1 (sender): [1, 511, 0, PC_PREV_TS, 0, PC_1]
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            non_padding.clone(),
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(511),
+                BusValue::constant(0),
+                prev_ts,
+                BusValue::constant(0),
+                pc_hi,
+            ],
+        ));
+        // Memory write-new word 0 (receiver): [1, 510, 0, TIMESTAMP+1, 0, NEXT_PC_0]
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            non_padding.clone(),
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(510),
+                BusValue::constant(0),
+                curr_ts.clone(),
+                BusValue::constant(0),
+                next_pc_lo,
+            ],
+        ));
+        // Memory write-new word 1 (receiver): [1, 511, 0, TIMESTAMP+1, 0, NEXT_PC_1]
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            non_padding,
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(511),
+                BusValue::constant(0),
+                curr_ts,
+                BusValue::constant(0),
+                next_pc_hi,
+            ],
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // BRANCH interaction (for branch/jump target calculation)

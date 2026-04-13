@@ -10,9 +10,11 @@
 //! ```text
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
-//! PHASE 2: CPU ops → MEMW, MEMW_A, MEMW_R, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering); MEMW_R uses IS_HALFWORD instead
-//! PHASE 4: LT, MEMW_A, MEMW_R → Bitwise lookups
+//! PHASE 2: CPU ops → MEMW, MEMW_A, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
+//!          Register accesses (rs1/rs2/rd/PC) are handled inline on the Memory bus
+//!          by the CPU chip (Registers on-Main) and do not produce MEMW ops here.
+//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering)
+//! PHASE 4: LT, MEMW_A → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -44,7 +46,6 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
-use super::memw_register;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -302,61 +303,12 @@ fn collect_cpu_ops(
         cpu_ops.push(op);
     }
 
-    // Phase 1 of "Registers on-Main": populate prev_ts columns for each CPU operation.
-    // This tracks the timestamp of the previous access to each register.
-    populate_register_prev_ts(&mut cpu_ops);
+    // Note: register prev_ts / prev_val columns are populated later in
+    // `collect_ops_from_cpu`, where they are read from `register_state`
+    // (the unified source of truth that also accounts for COMMIT ECALL
+    // register accesses).
 
     Ok(cpu_ops)
-}
-
-/// Populates prev_ts and prev_val fields on CpuOperations by tracking
-/// register access history. Used by the Registers-on-Main optimization.
-///
-/// CPU instruction timing within one cycle (timestamp = ts):
-///   - M1 (read rs1) at ts
-///   - M3 (read rs2) at ts+1
-///   - M5 (write rd) at ts+2
-///   - CM54 (write x255 PC) at ts+3
-fn populate_register_prev_ts(cpu_ops: &mut [CpuOperation]) {
-    // last_ts[reg_idx] = mem_step of last access (read or write) to that register.
-    // Indices 0..32 for general registers, 255 for PC (x255).
-    // Initialized to 0 (matches REGISTER table init token at ts=0).
-    let mut last_ts: [u64; 256] = [0; 256];
-    // last_val[reg_idx] = last value written to that register (0 initially).
-    let mut last_val: [u64; 256] = [0; 256];
-
-    for op in cpu_ops.iter_mut() {
-        let ts = op.timestamp;
-
-        // M1: read rs1 at ts (only if read_register1)
-        if op.decode.read_register1 {
-            let reg = op.decode.rs1 as usize;
-            op.rs1_prev_ts = last_ts[reg];
-            last_ts[reg] = ts;
-        }
-
-        // M3: read rs2 at ts+1 (only if read_register2)
-        if op.decode.read_register2 {
-            let reg = op.decode.rs2 as usize;
-            op.rs2_prev_ts = last_ts[reg];
-            last_ts[reg] = ts + 1;
-        }
-
-        // M5: write rd at ts+2 (only if write_register)
-        if op.decode.write_register {
-            let reg = op.decode.rd as usize;
-            op.rd_prev_ts = last_ts[reg];
-            op.rd_prev_val_lo = (last_val[reg] & 0xFFFF_FFFF) as u32;
-            op.rd_prev_val_hi = (last_val[reg] >> 32) as u32;
-            last_ts[reg] = ts + 2;
-            last_val[reg] = op.rvd;
-        }
-
-        // CM54: write x255 (PC) at ts+3 — fires for every non-padding row.
-        op.pc_prev_ts = last_ts[255];
-        last_ts[255] = ts + 3;
-        last_val[255] = op.next_pc;
-    }
 }
 
 // =============================================================================
@@ -374,9 +326,12 @@ fn populate_register_prev_ts(cpu_ops: &mut [CpuOperation]) {
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops)
+///
+/// `cpu_ops` is mutated in place to populate the Registers-on-Main prev_ts
+/// and prev_val columns from `register_state` before each op is processed.
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
-    cpu_ops: &[CpuOperation],
+    cpu_ops: &mut [CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
@@ -396,7 +351,7 @@ fn collect_ops_from_cpu(
     let mut current_commit_index = 0u32;
     let mut commit_ecall_count = 0u32;
 
-    for op in cpu_ops {
+    for op in cpu_ops.iter_mut() {
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
@@ -410,9 +365,10 @@ fn collect_ops_from_cpu(
             memw_ops.push(memw_op);
         }
 
-        // Collect register operations (M1, M3, M5)
-        let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
-        memw_ops.extend(reg_memw_ops);
+        // Register accesses (rs1, rs2, rd, PC): populate on-Main prev_ts/prev_val
+        // columns AND update register_state. No MEMW operations are produced —
+        // the CPU chip emits the Memory bus interactions directly.
+        track_register_ops_from_cpu(op, register_state);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -583,33 +539,36 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
-/// Collects register read/write operations (M1, M3, M5) from CpuOperation.
+/// Tracks register read/write operations (rs1, rs2, rd, PC) for the Registers
+/// on-Main optimization.
 ///
-/// Returns: Vec of MEMW operations for register accesses
-fn collect_register_ops_from_cpu(
-    op: &CpuOperation,
-    register_state: &mut RegisterState,
-) -> Vec<MemwOperation> {
-    let mut memw_ops = Vec::with_capacity(4);
+/// Instead of producing MEMW operations for register accesses (previously routed
+/// through the MEMW_R chip), this function:
+///   1. Reads the previous (value, timestamp) from `register_state` before the
+///      access happens and stores them in the CpuOperation's prev_ts / prev_val
+///      columns. These columns feed the CPU chip's Memory bus interactions.
+///   2. Updates `register_state` so subsequent ops (including this op's own
+///      dependent accesses, and COMMIT / HALT paths that still run later) see
+///      the post-access state.
+///
+/// Per-instruction memory timestamps match the CPU chip's sends:
+///   - rs1 read  at timestamp + 0 (if READ_REGISTER1 && rs1 != 0)
+///   - rs2 read  at timestamp + 1 (if READ_REGISTER2 && rs2 != 0)
+///   - rd  write at timestamp + 2 (if WRITE_REGISTER && rd != 0)
+///   - PC  read-write at timestamp + 1 (every non-padding row)
+fn track_register_ops_from_cpu(op: &mut CpuOperation, register_state: &mut RegisterState) {
     let d = &op.decode;
 
-    // M1: Read rs1 register at timestamp+0
-    // Skip x0 (hardwired zero). x255 (the register where the pc is stored) is handled
-    // via read_pc/write_pc since regs[] only covers indices 0..31.
+    // rs1 read @ ts + 0
+    // Guards match CPU column: READ_REGISTER1 = d.read_register1 && rs1 != 0.
+    // x255 (PC) is stored in register_state.pc_register, not regs[].
     if d.read_register1 && d.rs1 != 0 {
-        let reg_value = pack_register_value(op.rv1);
-        let reg_addr = 2 * d.rs1 as u64;
         let (_old_val, old_ts) = if d.rs1 == 255 {
             register_state.read_pc()
         } else {
             register_state.read(d.rs1)
         };
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        op.rs1_prev_ts = old_ts;
         if d.rs1 == 255 {
             register_state.write_pc(op.rv1, op.timestamp);
         } else {
@@ -617,51 +576,29 @@ fn collect_register_ops_from_cpu(
         }
     }
 
-    // M3: Read rs2 register at timestamp+1
+    // rs2 read @ ts + 1
     if d.read_register2 && d.rs2 != 0 {
-        let reg_value = pack_register_value(op.rv2);
-        let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        op.rs2_prev_ts = old_ts;
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
 
-    // M5: Write rd register at timestamp+2
+    // rd write @ ts + 2
+    // prev_val is needed here to prove the old state on the Memory bus.
     if d.write_register && d.rd != 0 {
-        let reg_value = pack_register_value(op.rvd);
-        let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
-        let old_value = pack_register_value(old_val);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 2, false)
-            .with_old(old_value, old_timestamps);
-        memw_ops.push(memw_op);
+        op.rd_prev_ts = old_ts;
+        op.rd_prev_val_lo = (old_val & 0xFFFF_FFFF) as u32;
+        op.rd_prev_val_hi = (old_val >> 32) as u32;
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
-    // CM54: PC register read-write at timestamp+1
-    // Every non-padding CPU row sends a MEMW for x255 (address 510).
-    // old = pc (current), value = next_pc (new).
+    // PC (x255) read-write @ ts + 1 — always, for every non-padding row.
     {
-        let pc_value = pack_register_value(op.decode.pc);
-        let next_pc_value = pack_register_value(op.next_pc);
-        let (_old_val, old_ts) = register_state.read_pc();
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
-            .with_old(pc_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let (_pc_val, pc_ts) = register_state.read_pc();
+        op.pc_prev_ts = pc_ts;
         register_state.write_pc(op.next_pc, op.timestamp + 1);
     }
-
-    memw_ops
 }
 
 /// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
@@ -922,6 +859,89 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 }
 
 /// Collects bitwise lookups from MEMW_A operations.
+/// Collects IS_HALFWORD bitwise lookups for CPU register-on-Main range checks.
+///
+/// For each non-padding CPU instruction, the CPU chip sends IS_HALFWORD queries
+/// for each register access. These entries populate the Bitwise table so that
+/// those queries are received (balancing the IS_HALFWORD bus).
+///
+/// Deltas match the CPU chip bus interactions exactly:
+///   - rs1: IS_HALF[TIMESTAMP - RS1_PREV_TS - 1]  (if READ_REGISTER1)
+///   - rs2: IS_HALF[TIMESTAMP - RS2_PREV_TS]       (if READ_REGISTER2)
+///   - rd:  IS_HALF[TIMESTAMP - RD_PREV_TS + 1]    (if WRITE_REGISTER)
+///   - PC:  IS_HALF[TIMESTAMP - PC_PREV_TS]          (if non-padding row)
+fn collect_bitwise_from_cpu_registers(cpu_ops: &[CpuOperation]) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::with_capacity(cpu_ops.len() * 4);
+
+    for op in cpu_ops {
+        let d = &op.decode;
+        // CPU timestamps always fit in u32; use low 32 bits.
+        let ts = (op.timestamp & 0xFFFF_FFFF) as u32;
+
+        // rs1: IS_HALF[ts - rs1_prev_ts - 1] — fires when READ_REGISTER1=1
+        if d.read_register1 && d.rs1 != 0 {
+            let prev = (op.rs1_prev_ts & 0xFFFF_FFFF) as u32;
+            let delta = ts.wrapping_sub(prev).wrapping_sub(1) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (delta & 0xFF) as u8,
+                (delta >> 8) as u8,
+            ));
+        }
+
+        // rs2: IS_HALF[ts - rs2_prev_ts] — fires when READ_REGISTER2=1
+        if d.read_register2 && d.rs2 != 0 {
+            let prev = (op.rs2_prev_ts & 0xFFFF_FFFF) as u32;
+            let delta = ts.wrapping_sub(prev) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (delta & 0xFF) as u8,
+                (delta >> 8) as u8,
+            ));
+        }
+
+        // rd: IS_HALF[ts - rd_prev_ts + 1] — fires when WRITE_REGISTER=1
+        if d.write_register && d.rd != 0 {
+            let prev = (op.rd_prev_ts & 0xFFFF_FFFF) as u32;
+            let delta = ts.wrapping_sub(prev).wrapping_add(1) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (delta & 0xFF) as u8,
+                (delta >> 8) as u8,
+            ));
+        }
+
+        // PC: IS_HALF[ts - pc_prev_ts] — fires for every non-padding row
+        let non_padding = d.op_add
+            || d.op_sub
+            || d.op_slt
+            || d.op_and
+            || d.op_or
+            || d.op_xor
+            || d.op_shift
+            || d.op_jalr
+            || d.op_beq
+            || d.op_blt
+            || d.op_load
+            || d.op_store
+            || d.op_mul
+            || d.op_divrem
+            || d.op_ecall
+            || d.op_ebreak;
+        if non_padding {
+            let prev = (op.pc_prev_ts & 0xFFFF_FFFF) as u32;
+            let delta = ts.wrapping_sub(prev) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (delta & 0xFF) as u8,
+                (delta >> 8) as u8,
+            ));
+        }
+    }
+
+    ops
+}
+
 ///
 /// Per operation:
 /// - 1 IS_HALF for alignment check: IS_HALF[base_address[0] + mask]
@@ -956,59 +976,6 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
     }
 
     bitwise_ops
-}
-
-// =============================================================================
-// Routing predicates (MEMW_R register fast path)
-// =============================================================================
-
-/// An operation routes to MEMW_R if:
-/// 1. It's a 2-word register access (is_register = true, width = 2)
-/// 2. Both words share the same old_timestamp (atomic register write)
-/// 3. timestamp[1] == old_timestamp[1] (upper limbs match)
-/// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
-/// 5. timestamp[0] - old_timestamp[0] <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
-///
-/// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
-/// dynamic write flags. MEMW_R hardcodes write2=1.
-fn is_register_op(op: &MemwOperation) -> bool {
-    if !op.is_register || op.width != 2 {
-        return false;
-    }
-    // Both words must share old_timestamp (atomic register write assumption)
-    if op.old_timestamp[0] != op.old_timestamp[1] {
-        return false;
-    }
-    let ts = op.timestamp;
-    let old_ts = op.old_timestamp[0];
-    let ts_lo = ts & 0xFFFF_FFFF;
-    let old_ts_lo = old_ts & 0xFFFF_FFFF;
-    let ts_hi = ts >> 32;
-    let old_ts_hi = old_ts >> 32;
-    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
-}
-
-/// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
-///
-/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
-/// in a halfword (proving the timestamp delta is in range [1, 2^16]).
-fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    ops.iter()
-        .map(|op| {
-            let ts_lo = op.timestamp & 0xFFFF_FFFF;
-            let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
-            debug_assert!(
-                ts_lo > old_ts_lo,
-                "ts_lo must exceed old_ts_lo (enforced by is_register_op)"
-            );
-            let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
-            BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (diff_minus_1 & 0xFF) as u8,
-                (diff_minus_1 >> 8) as u8,
-            )
-        })
-        .collect()
 }
 
 // =============================================================================
@@ -1678,9 +1645,6 @@ pub struct Traces {
 
     /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
-
-    /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
-    pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1709,7 +1673,6 @@ impl Traces {
             dvrm: self.dvrms.len(),
             shift: self.shifts.len(),
             branch: self.branches.len(),
-            memw_register: self.memw_registers.len(),
         }
     }
 
@@ -1849,7 +1812,7 @@ impl Traces {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let mut cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -1859,17 +1822,17 @@ impl Traces {
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
 
-        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-        // Order matters: register ops would also pass is_aligned_op, so check first.
-        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_register_op);
+        // Route aligned memory ops to MEMW_A, everything else to MEMW.
+        // (Register accesses from CPU now flow directly on the Memory bus via the
+        // CPU chip — see Registers on-Main. Any residual register ops here come
+        // from COMMIT / HALT and go through the general MEMW path.)
         let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
             memw_ops.into_iter().partition(is_aligned_op);
 
@@ -1950,8 +1913,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
+        // CPU register-on-Main: IS_HALFWORD range checks for rs1/rs2/rd/PC
+        bitwise_ops.extend(collect_bitwise_from_cpu_registers(&cpu_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
@@ -1989,11 +1952,6 @@ impl Traces {
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
-        );
-        let memw_registers = chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
         );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
@@ -2077,7 +2035,6 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
-            memw_registers,
         })
     }
 
@@ -2095,7 +2052,7 @@ impl Traces {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let mut cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -2106,16 +2063,17 @@ impl Traces {
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
 
-        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_register_op);
+        // Route aligned memory ops to MEMW_A, everything else to MEMW.
+        // Register accesses from CPU flow directly on the Memory bus via the CPU
+        // chip (Registers on-Main); any residual register ops come from COMMIT /
+        // HALT and go through the general MEMW path.
         let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
             memw_ops.into_iter().partition(is_aligned_op);
 
@@ -2196,8 +2154,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
+        // CPU register-on-Main: IS_HALFWORD range checks for rs1/rs2/rd/PC
+        bitwise_ops.extend(collect_bitwise_from_cpu_registers(&cpu_ops));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -2232,11 +2190,6 @@ impl Traces {
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
-        );
-        let memw_registers = chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
         );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
@@ -2306,7 +2259,6 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
-            memw_registers,
         })
     }
 
@@ -2359,53 +2311,3 @@ impl Traces {
     }
 }
 
-#[cfg(test)]
-mod routing_tests {
-    use super::*;
-
-    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
-        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
-            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
-    }
-
-    #[test]
-    fn test_is_register_op_delta_at_boundary_routes_in() {
-        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
-        let op = make_register_op(0x10000, 0);
-        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_delta_above_boundary_falls_back() {
-        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
-        let op = make_register_op(0x10001, 0);
-        assert!(
-            !is_register_op(&op),
-            "delta = 2^16 + 1 should fall back to MEMW_A"
-        );
-    }
-
-    #[test]
-    fn test_is_register_op_delta_one_routes_in() {
-        // delta = 1: minimum allowed value
-        let op = make_register_op(1, 0);
-        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_delta_zero_falls_back() {
-        // delta = 0: ts[0] not strictly greater than old_ts[0]
-        let op = make_register_op(5, 5);
-        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_upper_limb_mismatch_falls_back() {
-        // ts_hi != old_ts_hi: shared upper limb assumption violated
-        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
-        assert!(
-            !is_register_op(&op),
-            "different upper limbs should fall back to MEMW_A"
-        );
-    }
-}
