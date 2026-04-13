@@ -485,10 +485,11 @@ impl CpuOperation {
         }
     }
 
-    /// Collects IS_BYTE lookups for CPU byte range checks.
+    /// Collects CPU range-check lookups for register indices and byte pairs.
     ///
-    /// The CPU has 27 byte columns that must be range-checked: RS1, RS2, RD,
-    /// ARG1[0..7], ARG2[0..7], RES[0..7]. Each generates one IS_BYTE lookup.
+    /// The CPU sends:
+    /// - 3 IS_BYTE lookups for RS1, RS2, RD
+    /// - 12 IS_BYTE_PAIR lookups for adjacent bytes in ARG1, ARG2, and RES
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
