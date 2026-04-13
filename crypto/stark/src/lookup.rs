@@ -116,15 +116,17 @@ pub const LOGUP_CHALLENGE_GAMMA: usize = 2;
 pub const LOGUP_BRIDGE_OFFSET_IDX: usize = 3;
 
 /// Start index of precomputed gamma powers in the per-table rap_challenges vector.
-/// rap_challenges[LOGUP_GAMMA_POWERS_START + j] = γ^j for j = 0, 1, ..., K-1.
+/// rap_challenges[LOGUP_GAMMA_POWERS_START + j] = γ^j for j = 0, 1, ..., K.
+/// K+1 powers total: γ^0..γ^{K-1} for column inner products, γ^K for the l² self-check.
 pub const LOGUP_GAMMA_POWERS_START: usize = 4;
 
 /// Start index of GKR random_point coordinates in rap_challenges.
-/// After gamma_powers[0..K], we append random_point[0..n].
-/// The actual index is LOGUP_GAMMA_POWERS_START + K where K = number of distinct column indices.
+/// After gamma_powers[0..K+1] (K+1 powers, one extra for the l² self-check),
+/// we append random_point[0..n].
 /// Use `logup_random_point_start(interactions)` to compute the concrete index.
 pub fn logup_random_point_start(interactions: &[BusInteraction]) -> usize {
-    LOGUP_GAMMA_POWERS_START + extract_column_indices(interactions).len()
+    // +1 for the extra γ^K power used by the Lagrange kernel l² self-check (BUG-004 fix)
+    LOGUP_GAMMA_POWERS_START + extract_column_indices(interactions).len() + 1
 }
 
 // =============================================================================
@@ -1036,7 +1038,8 @@ where
         // where r_j are the GKR random point coordinates stored in rap_challenges.
         if self.has_trace_interaction() {
             let k = extract_column_indices(&self.auxiliary_trace_build_data.interactions).len();
-            let rp_start = LOGUP_GAMMA_POWERS_START + k;
+            // +1: gamma_powers now has K+1 elements (γ^0..γ^K), so random_point starts at 4+K+1
+            let rp_start = LOGUP_GAMMA_POWERS_START + k + 1;
             if rap_challenges.len() > rp_start {
                 let n = rap_challenges.len() - rp_start;
                 let mut l0_expected = FieldElement::<E>::one();
@@ -1640,22 +1643,31 @@ where
 /// Compute the bridge offset (target/N) and gamma powers from column claims.
 ///
 /// Returns (bridge_offset, gamma_powers) where:
-/// - bridge_offset = (Σ_j γ^j · c_j) / N
-/// - gamma_powers = [γ^0, γ^1, ..., γ^{K-1}]
+/// - bridge_offset = (Σ_j γ^j · c_j + γ^K · l_mle_claim) / N
+/// - gamma_powers = [γ^0, γ^1, ..., γ^K]   (K+1 powers; γ^K is for the l² self-check)
+///
+/// The extra γ^K · l_mle_claim term in the target implements the Lagrange kernel
+/// self-evaluation check (BUG-004): the bridge constraint forces Σ_i l[i]² = l_mle_claim
+/// via Schwartz-Zippel over γ, where l_mle_claim = ∏_k (r_k² + (1-r_k)²) is the
+/// expected squared-ℓ₂ norm of the true Lagrange kernel.
 ///
 /// Both prover and verifier call this to derive the same values.
 pub fn compute_bridge_params<E: IsField>(
     column_claims: &[(usize, FieldElement<E>)],
     gamma: &FieldElement<E>,
     trace_len: usize,
+    l_mle_claim: &FieldElement<E>,
 ) -> (FieldElement<E>, Vec<FieldElement<E>>) {
     let k = column_claims.len();
-    let gamma_powers = compute_alpha_powers(gamma, k);
+    // K+1 powers: γ^0..γ^{K-1} for column inner products, γ^K for l² self-check
+    let gamma_powers = compute_alpha_powers(gamma, k + 1);
 
     let mut target = FieldElement::<E>::zero();
     for ((_, c_j), gp) in column_claims.iter().zip(gamma_powers.iter()) {
         target += c_j * gp;
     }
+    // γ^K · l_mle_claim: enforces Σ_i l[i]² = l_mle_claim via Schwartz-Zippel
+    target += l_mle_claim * &gamma_powers[k];
 
     let n_inv = FieldElement::<E>::from(trace_len as u64).inv().unwrap();
     let bridge_offset = &target * &n_inv;
@@ -1669,8 +1681,8 @@ pub fn compute_bridge_params<E: IsField>(
 /// - [0] = z, [1] = α (original)
 /// - [2] = γ
 /// - [3] = bridge_offset (target/N)
-/// - [4..4+K] = γ^0, γ^1, ..., γ^{K-1}
-/// - [4+K..4+K+n] = random_point[0], ..., random_point[n-1]
+/// - [4..4+K+1] = γ^0, γ^1, ..., γ^K   (K+1 powers; γ^K is for the l² self-check)
+/// - [4+K+1..4+K+1+n] = random_point[0], ..., random_point[n-1]
 pub fn extend_rap_challenges_with_bridge<E: IsField>(
     rap_challenges: &mut Vec<FieldElement<E>>,
     column_claims: &[(usize, FieldElement<E>)],
@@ -1678,14 +1690,25 @@ pub fn extend_rap_challenges_with_bridge<E: IsField>(
     trace_len: usize,
     random_point: &[FieldElement<E>],
 ) {
-    let (bridge_offset, gamma_powers) = compute_bridge_params(column_claims, gamma, trace_len);
+    // BUG-004: compute l_mle_claim = ∏_k (r_k² + (1-r_k)²).
+    // When l[i] = eq(bits(i), r), Σ_i l[i]² equals this value.
+    // Including it in the bridge target (via γ^K) forces the bridge constraint to
+    // check Σ_i l[i]² = l_mle_claim, binding the committed l column to eq(·, r).
+    let one = FieldElement::<E>::one();
+    let l_mle_claim = random_point.iter().fold(one.clone(), |acc, r_k| {
+        let one_minus_r = &one - r_k;
+        acc * (r_k.square() + one_minus_r.square())
+    });
+
+    let (bridge_offset, gamma_powers) =
+        compute_bridge_params(column_claims, gamma, trace_len, &l_mle_claim);
     rap_challenges.push(gamma.clone()); // index 2
     rap_challenges.push(bridge_offset); // index 3
     for gp in gamma_powers {
-        rap_challenges.push(gp); // indices 4, 5, ...
+        rap_challenges.push(gp); // indices 4, 5, ..., 4+K
     }
     for rp in random_point {
-        rap_challenges.push(rp.clone()); // indices 4+K, 4+K+1, ...
+        rap_challenges.push(rp.clone()); // indices 4+K+1, 4+K+2, ...
     }
 }
 
@@ -1750,7 +1773,9 @@ where
                 // l (aux column 0)
                 let l_curr = step0.get_aux_evaluation_element(0, 0);
 
-                // batched_curr = Σ_j γ^j · col_j_curr using precomputed gamma powers
+                // batched_curr = Σ_j γ^j · col_j_curr + γ^K · l_curr
+                // The extra γ^K · l_curr term makes l_curr * batched include γ^K · l_curr²,
+                // enforcing Σ_i l[i]² = l_mle_claim via Schwartz-Zippel over γ (BUG-004 fix).
                 let mut batched = FieldElement::<E>::zero();
                 for (j, &col_idx) in self.column_indices.iter().enumerate() {
                     let gamma_j = &rap_challenges[LOGUP_GAMMA_POWERS_START + j];
@@ -1758,6 +1783,10 @@ where
                     // F×E→E: base field column × extension field gamma power
                     batched += col_val * gamma_j;
                 }
+                // γ^K self-check term (l² contribution)
+                let k = self.column_indices.len();
+                let gamma_k = &rap_challenges[LOGUP_GAMMA_POWERS_START + k];
+                batched += gamma_k * l_curr;
 
                 // σ_next - σ_curr - l_curr * batched + bridge_offset
                 transition_evaluations[self.constraint_idx] =
@@ -1784,6 +1813,10 @@ where
                     let col_val = step0.get_main_evaluation_element(0, col_idx);
                     batched += col_val * gamma_j;
                 }
+                // γ^K self-check term (l² contribution, mirrors prover path)
+                let k = self.column_indices.len();
+                let gamma_k = &rap_challenges[LOGUP_GAMMA_POWERS_START + k];
+                batched += gamma_k * l_curr;
 
                 transition_evaluations[self.constraint_idx] =
                     sigma_next - sigma_curr - l_curr * &batched + bridge_offset;
@@ -2408,6 +2441,11 @@ pub struct LogUpGkrResult<E: IsField> {
 /// * `interactions` - The AIR's bus interactions
 /// * `challenges` - LogUp challenges `[z, alpha]`
 ///
+/// # Arguments
+/// * `n_layers` - number of GKR summation layers for this instance (0 = single-row table).
+///   For 0-layer instances the MLE of any column at the empty point equals its single row value,
+///   so the cross-multiplication check is exact and applied unconditionally.
+///
 /// # Returns
 /// `true` if verification passes, `false` otherwise.
 pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
@@ -2416,6 +2454,7 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
     column_claims: &[(usize, FieldElement<E>)],
     interactions: &[BusInteraction],
     challenges: &[FieldElement<E>],
+    n_layers: usize,
 ) -> bool {
     // Build a map from column index to claimed MLE value
     let claim_map: std::collections::HashMap<usize, &FieldElement<E>> = column_claims
@@ -2536,19 +2575,20 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
     //   N(i) = sign * m(i), D(i) = fp(i)
     // so MLE(N)(r) and MLE(D)(r) can be exactly reconstructed from column MLEs.
     //
-    // For multi-interaction tables, the cross-multiplication introduces nonlinear
-    // terms (products of fingerprints/multiplicities across interactions), so
-    // MLE(N)(r) != n_recon and MLE(D)(r) != d_recon in general.
-    // Soundness for these tables is ensured by the bridge running sum constraint.
-    if interactions.len() == 1 {
+    // For multi-interaction tables with n_layers > 0, the cross-multiplication
+    // introduces nonlinear terms (products of fingerprints/multiplicities across
+    // interactions), so MLE(N)(r) != n_recon and MLE(D)(r) != d_recon in general.
+    //
+    // For 0-layer instances (n_layers == 0, single-row tables): the MLE at the empty
+    // evaluation point equals the single row value exactly — no nonlinearity. The check
+    // is valid and applied unconditionally regardless of interaction count (BUG-011 fix).
+    if interactions.len() == 1 || n_layers == 0 {
         // Direct check: reconstructed values must match GKR output as rational numbers.
-        // The GKR verifier may return (n_claim, d_claim) in a different representation
-        // than the prover's raw (numerator, denominator) — e.g. (claimed_sum, 1) instead
-        // of (root_n, root_d). So we compare as rationals: running_n / running_d == n_claim / d_claim
+        // Compare as rationals: running_n / running_d == n_claim / d_claim
         // i.e. running_n * d_claim == n_claim * running_d.
         &running_n * d_claim == n_claim * &running_d
     } else {
-        // Multi-interaction: structural check passed above.
+        // Multi-interaction with n_layers > 0: structural check passed above.
         // The bridge constraint (verified during STARK proof) ensures column_claims
         // are consistent with the committed trace.
         true

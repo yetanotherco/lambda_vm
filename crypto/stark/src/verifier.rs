@@ -862,13 +862,16 @@ pub trait IsStarkVerifier<
                             return false;
                         }
 
-                        // Verify that column_claims are consistent with GKR output
+                        // Verify that column_claims are consistent with GKR output.
+                        // Pass n_layers_by_instance[i] so 0-layer multi-interaction tables
+                        // get the direct rational check (BUG-011 fix).
                         if !crate::lookup::reconstruct_and_verify_gkr_claims(
                             n_claim,
                             d_claim,
                             &gkr_proof_data.column_claims,
                             air.bus_interactions(),
                             &lookup_challenges,
+                            n_layers_by_instance[i],
                         ) {
                             #[cfg(not(feature = "test_fiat_shamir"))]
                             error!(
@@ -902,9 +905,20 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Phase B'': Sample γ for bridge batching (main transcript)
+        // Phase B'': Bind column_claims to transcript, then sample γ (BUG-012 fix)
         // =====================================================================
-        // Must match prover: γ sampled AFTER all GKR messages, BEFORE forking.
+        // column_claims for multi-interaction tables were previously not transcript-bound,
+        // creating an adaptive-prover gap. Append them before sampling γ so that γ
+        // depends on the claimed column MLE values. Must match prover ordering exactly.
+        if needs_lookup_challenges {
+            for &table_idx in &gkr_table_indices {
+                if let Some(p) = &multi_proof.proofs[table_idx].logup_gkr_proof {
+                    for (_, claim_val) in &p.column_claims {
+                        transcript.append_field_element(claim_val);
+                    }
+                }
+            }
+        }
 
         let gamma: FieldElement<FieldExtension> = if needs_lookup_challenges {
             transcript.sample_field_element()

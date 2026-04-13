@@ -1767,10 +1767,18 @@ pub trait IsStarkProver<
         let (batch_gkr_proof_opt, gkr_results) = batch_gkr_proof;
 
         // =====================================================================
-        // Round 1, Phase B'': Sample γ for bridge batching (main transcript)
+        // Round 1, Phase B'': Bind column_claims, then sample γ (BUG-012 fix)
         // =====================================================================
-        // γ is sampled AFTER all GKR messages are bound to the transcript
-        // but BEFORE forking per table. The verifier replays the same sample.
+        // column_claims for multi-interaction tables were previously not transcript-bound.
+        // Append them before sampling γ so that γ is adaptive-prover resistant.
+        // Verifier must replay in the same order (same gkr_table_indices ordering).
+        if needs_lookup_challenges {
+            for result in gkr_results.iter().flatten() {
+                for (_, claim_val) in &result.column_claims {
+                    transcript.append_field_element(claim_val);
+                }
+            }
+        }
 
         let gamma: FieldElement<FieldExtension> = if needs_lookup_challenges {
             transcript.sample_field_element()
@@ -1807,30 +1815,45 @@ pub trait IsStarkProver<
 
                     // Column 1: Bridge running sum σ
                     // The constraint checks: σ[i+1] - σ[i] = l[i]·batched[i] - Δ
-                    // where Δ = bridge_offset = target/N.
+                    // where Δ = bridge_offset = target/N and batched[i] = Σ_j γ^j·col_j[i] + γ^K·l[i].
                     // So σ[0] = 0 (start), σ[i+1] = σ[i] + l[i]·batched[i] - Δ.
-                    // The circular wrap-around at row N-1 requires σ[0] = σ[N-1] + l[N-1]·batched[N-1] - Δ,
-                    // which telescopes to: 0 = Σ l[i]·batched[i] - N·Δ = target - target.
+                    // The circular wrap-around at row N-1 telescopes to:
+                    //   0 = Σ l[i]·batched[i] - N·Δ = target - target.
+
+                    // BUG-004 fix: compute l_mle_claim = ∏_k (r_k² + (1-r_k)²)
+                    let one = FieldElement::<FieldExtension>::one();
+                    let l_mle_claim = result.random_point.iter().fold(one.clone(), |acc, r_k| {
+                        let one_minus_r = &one - r_k;
+                        acc * (r_k.square() + one_minus_r.square())
+                    });
+
                     let (bridge_offset, gamma_powers) = crate::lookup::compute_bridge_params(
                         &result.column_claims,
                         &gamma,
                         trace_len,
+                        &l_mle_claim,
                     );
                     let main_cols = trace.columns_main();
 
-                    // Pre-compute batched values in parallel: batched[i] = Σ_j main_cols[col_j][i] * γ^j
+                    // Pre-compute batched values: batched[i] = Σ_j γ^j·col_j[i] + γ^K·l[i]
+                    // The γ^K·l[i] term makes l[i]·batched[i] include γ^K·l[i]²,
+                    // enforcing Σ_i l[i]² = l_mle_claim via Schwartz-Zippel (BUG-004 fix).
                     #[cfg(feature = "parallel")]
                     let batched_iter = (0..trace_len).into_par_iter();
                     #[cfg(not(feature = "parallel"))]
                     let batched_iter = 0..trace_len;
 
                     let column_claims = &result.column_claims;
+                    let k = column_claims.len(); // γ^K index
+                    let kernel = &result.lagrange_kernel;
                     let batched_values: Vec<FieldElement<FieldExtension>> = batched_iter
                         .map(|row| {
                             let mut batched = FieldElement::<FieldExtension>::zero();
                             for (j, (col_idx, _)) in column_claims.iter().enumerate() {
                                 batched += &main_cols[*col_idx][row] * &gamma_powers[j];
                             }
+                            // γ^K · l[row] (self-check term)
+                            batched += &gamma_powers[k] * &kernel[row];
                             batched
                         })
                         .collect();
