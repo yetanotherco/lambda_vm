@@ -1,0 +1,25 @@
+name: Spec tests
+on:
+  pull_request:
+    branches:
+      - main
+      - 'spec/**'
+  push:
+    branches: ["**"]
+    paths: ["spec/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  spec_structure:
+    name: Spec structure test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+      - run: python3 spec/tooling/chip.py spec/src/config.toml spec/src/signatures.toml spec/src/*.toml
