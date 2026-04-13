@@ -572,6 +572,11 @@ fn bridge_timestamp_gap(
     value: u64,
     reload_ops: &mut Vec<RegisterReloadOp>,
 ) -> u64 {
+    debug_assert!(
+        curr_ts >= prev_ts,
+        "bridge_timestamp_gap: curr_ts ({curr_ts}) < prev_ts ({prev_ts}) for reg_idx={reg_idx}"
+    );
+
     let val_lo = (value & 0xFFFF_FFFF) as u32;
     let val_hi = (value >> 32) as u32;
 
@@ -947,6 +952,10 @@ fn collect_bitwise_from_cpu_registers(cpu_ops: &[CpuOperation]) -> Vec<BitwiseOp
         // rs1: IS_HALF[ts - rs1_prev_ts - 1] — fires when READ_REGISTER1=1
         if d.read_register1 && d.rs1 != 0 {
             let prev = (op.rs1_prev_ts & 0xFFFF_FFFF) as u32;
+            debug_assert!(
+                ts > prev,
+                "rs1 IS_HALF delta underflow: ts={ts} prev={prev}"
+            );
             let delta = ts.wrapping_sub(prev).wrapping_sub(1) as u16;
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
@@ -958,6 +967,10 @@ fn collect_bitwise_from_cpu_registers(cpu_ops: &[CpuOperation]) -> Vec<BitwiseOp
         // rs2: IS_HALF[ts - rs2_prev_ts] — fires when READ_REGISTER2=1
         if d.read_register2 && d.rs2 != 0 {
             let prev = (op.rs2_prev_ts & 0xFFFF_FFFF) as u32;
+            debug_assert!(
+                ts >= prev,
+                "rs2 IS_HALF delta underflow: ts={ts} prev={prev}"
+            );
             let delta = ts.wrapping_sub(prev) as u16;
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
@@ -969,6 +982,10 @@ fn collect_bitwise_from_cpu_registers(cpu_ops: &[CpuOperation]) -> Vec<BitwiseOp
         // rd: IS_HALF[ts - rd_prev_ts + 1] — fires when WRITE_REGISTER=1
         if d.write_register && d.rd != 0 {
             let prev = (op.rd_prev_ts & 0xFFFF_FFFF) as u32;
+            debug_assert!(
+                ts >= prev,
+                "rd IS_HALF delta underflow: ts={ts} prev={prev}"
+            );
             let delta = ts.wrapping_sub(prev).wrapping_add(1) as u16;
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
@@ -996,6 +1013,10 @@ fn collect_bitwise_from_cpu_registers(cpu_ops: &[CpuOperation]) -> Vec<BitwiseOp
             || d.op_ebreak;
         if non_padding {
             let prev = (op.pc_prev_ts & 0xFFFF_FFFF) as u32;
+            debug_assert!(
+                ts >= prev,
+                "PC IS_HALF delta underflow: ts={ts} prev={prev}"
+            );
             let delta = ts.wrapping_sub(prev) as u16;
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,

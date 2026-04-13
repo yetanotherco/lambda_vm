@@ -104,7 +104,7 @@ pub fn generate_register_reload_trace(
     }
     // Padding rows remain zero-initialized: old_ts = new_ts = 0 → self-canceling tokens.
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, num_rows)
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
 // =========================================================================

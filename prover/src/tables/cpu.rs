@@ -235,20 +235,37 @@ pub mod cols {
     // -------------------------------------------------------------------------
     // Registers on-Main: prev_ts columns (Phase 1)
     // -------------------------------------------------------------------------
-    // These columns track the timestamp of the previous access to each register.
-    // Used to eliminate the MEMW_R chip by handling register state inline in CPU.
+    // -------------------------------------------------------------------------
+    // Registers-on-Main columns (cols 74–79)
+    //
+    // These columns are WITNESS-ONLY — they have no polynomial transition or
+    // boundary constraints. Their correctness is enforced exclusively by the
+    // Memory bus (LogUp multiset argument):
+    //
+    //   - Each PREV_TS / PREV_VAL column appears in a Memory bus prove-old sender
+    //     token. For that token to be matched, there must be an identical receiver
+    //     token (assume-new) emitted by a prior CPU row or REGISTER_RELOAD row.
+    //     Any fake value breaks the global multiset balance and fails verification.
+    //
+    //   - The IS_HALF range check (IS_HALF[TIMESTAMP - PREV_TS ± k]) prevents
+    //     timestamp deltas from wrapping the Goldilocks field order, bounding each
+    //     gap to [0, 65534]. Gaps larger than this are bridged by REGISTER_RELOAD.
+    //
+    // This is intentional: the Memory bus argument is the sole enforcement
+    // mechanism, analogous to how MEMW_R used to enforce register ordering.
+    // -------------------------------------------------------------------------
 
-    /// rs1_prev_ts: Previous mem_step when rs1 was last accessed
+    /// rs1_prev_ts: timestamp of the previous access to rs1 (bus-enforced witness)
     pub const RS1_PREV_TS: usize = 74;
-    /// rs2_prev_ts: Previous mem_step when rs2 was last accessed
+    /// rs2_prev_ts: timestamp of the previous access to rs2 (bus-enforced witness)
     pub const RS2_PREV_TS: usize = 75;
-    /// rd_prev_ts: Previous mem_step when rd was last written
+    /// rd_prev_ts: timestamp of the previous access to rd (bus-enforced witness)
     pub const RD_PREV_TS: usize = 76;
-    /// rd_prev_val_lo: Previous value of rd (low 32 bits) — for proving old state
+    /// rd_prev_val_lo: previous value of rd, low 32 bits (bus-enforced witness)
     pub const RD_PREV_VAL_LO: usize = 77;
-    /// rd_prev_val_hi: Previous value of rd (high 32 bits)
+    /// rd_prev_val_hi: previous value of rd, high 32 bits (bus-enforced witness)
     pub const RD_PREV_VAL_HI: usize = 78;
-    /// pc_prev_ts: Previous mem_step when x255 (PC) was last updated
+    /// pc_prev_ts: timestamp of the previous access to x255/PC (bus-enforced witness)
     pub const PC_PREV_TS: usize = 79;
 
     /// Total number of columns
@@ -1442,13 +1459,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //
     // Per access, 5 bus interactions are emitted (mirroring MEMW_R):
     //
-    //   1 × IsHalfword[current_ts - prev_ts - 1]   (range-checks delta ∈ [1, 2^16])
+    //   1 × IsHalfword[current_ts - prev_ts ± k]   (range-checks delta ∈ [0, 65535])
     //   2 × Memory (sender,   read-old word 0, 1)  (prove-old at prev_ts, prev_val)
     //   2 × Memory (receiver, write-new word 0, 1) (assume-new at current_ts, new_val)
     //
     // Memory bus signature: [is_register, addr_lo, addr_hi, ts_lo, ts_hi, value]
     // Registers are always 2 words: word 0 at addr=2*reg, word 1 at addr=2*reg+1.
     // Timestamps fit in u32 for CPU-originated ops, so ts_hi = 0 always.
+    //
+    // Soundness note: RS1_PREV_TS, RS2_PREV_TS, RD_PREV_TS, RD_PREV_VAL_LO/HI,
+    // and PC_PREV_TS (cols 74–79) are witness-only columns with no polynomial
+    // constraints. Their correctness is enforced by the Memory bus multiset
+    // argument (LogUp): a prove-old sender at (addr, prev_ts, prev_val) must be
+    // matched by a prior assume-new receiver with the same tuple. Any fake value
+    // leaves an unmatched token, failing verification. The IS_HALF checks bound
+    // each gap to [0, 65535]; larger gaps are bridged by the REGISTER_RELOAD table.
 
     // -------------------------------------------------------------------------
     // rs1 read @ timestamp + 0 (multiplicity = READ_REGISTER1)
