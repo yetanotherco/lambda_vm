@@ -35,9 +35,7 @@ use crate::tables::commit::{
     bus_interactions as commit_bus_interactions, cols as commit_cols,
     create_constraints as commit_constraints,
 };
-use crate::tables::cpu::{
-    CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
-};
+use crate::tables::cpu::{CpuOperation, cols as cpu_cols};
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
@@ -475,7 +473,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
     }
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: cpu_bus_interactions(),
+        interactions: crate::tables::cpu::bus_interactions_without_load_store(),
     };
 
     AirWithBuses::new(
@@ -486,6 +484,38 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("CPU")
+}
+
+/// Create CPU_MEMORY AIR for LOAD/STORE instructions.
+///
+/// Uses the same 74 columns and constraints as CPU, but with a different
+/// set of bus interactions (only memory-relevant ones).
+pub fn create_cpu_memory_air(proof_options: &ProofOptions) -> VmAir {
+    let (is_bit, add, other, _) = create_all_cpu_constraints();
+
+    let mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = Vec::new();
+    for c in is_bit {
+        transition_constraints.push(Box::new(c));
+    }
+    for c in add {
+        transition_constraints.push(Box::new(c));
+    }
+    for c in other {
+        transition_constraints.push(c);
+    }
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: crate::tables::cpu_memory::bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        cpu_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("CPU_MEMORY")
 }
 
 /// Create Bitwise AIR with bus interactions.

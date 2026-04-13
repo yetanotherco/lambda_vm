@@ -1576,6 +1576,9 @@ pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
     pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// CPU_MEMORY traces for LOAD/STORE instructions (split into chunks)
+    pub cpu_memories: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// BITWISE precomputed lookup table (2^20 rows)
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -1641,11 +1644,24 @@ fn chunk_and_generate<T>(
     }
 }
 
+/// Count total padding rows that `chunk_and_generate` would produce.
+/// Matches behavior: empty input produces 1 chunk of 4 padding rows.
+fn count_padding_rows<T>(ops: &[T], max_rows: usize) -> usize {
+    if ops.is_empty() {
+        4
+    } else {
+        ops.chunks(max_rows)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum()
+    }
+}
+
 impl Traces {
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
         crate::TableCounts {
             cpu: self.cpus.len(),
+            cpu_memory: self.cpu_memories.len(),
             lt: self.lts.len(),
             memw: self.memws.len(),
             memw_aligned: self.memw_aligneds.len(),
@@ -1908,14 +1924,6 @@ impl Traces {
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
-        // CPU padding rows send IS_BYTE with all-zero values.
-        // Add corresponding ops so the bitwise table multiplicities balance.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
-
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1928,7 +1936,20 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
 
+        // Route LOAD/STORE instructions to CPU_MEMORY chip
+        let (cpu_memory_ops, cpu_ops): (Vec<_>, Vec<_>) =
+            cpu_ops.into_iter().partition(|op| op.is_memory());
+
+        // CPU and CPU_MEMORY padding rows send IS_BYTE with all-zero values.
+        let num_padding_rows: usize = count_padding_rows(&cpu_ops, max_rows.cpu)
+            + count_padding_rows(&cpu_memory_ops, max_rows.cpu);
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        // Always generate at least one CPU_MEMORY chunk for soundness
+        // (prevents malicious prover from omitting LOAD/STORE constraints).
+        let cpu_memories =
+            chunk_and_generate(&cpu_memory_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let memw_aligneds = chunk_and_generate(
             &memw_aligned_ops,
@@ -1957,11 +1978,9 @@ impl Traces {
         // When CPU is split, each chunk pads independently
         let mut decode = decode_trace;
         let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
+        // Reuses num_padding_rows (CPU + CPU_MEMORY combined) computed earlier.
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(cpu_memory_ops.iter().map(|op| op.decode.pc));
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
@@ -2006,6 +2025,7 @@ impl Traces {
 
         Ok(Traces {
             cpus,
+            cpu_memories,
             bitwise,
             lts,
             shifts,
@@ -2152,13 +2172,6 @@ impl Traces {
         // COMMIT table sends IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
-        // CPU padding rows send IS_BYTE with all-zero values.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
-
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -2171,7 +2184,20 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
 
+        // Route LOAD/STORE instructions to CPU_MEMORY chip
+        let (cpu_memory_ops, cpu_ops): (Vec<_>, Vec<_>) =
+            cpu_ops.into_iter().partition(|op| op.is_memory());
+
+        // CPU and CPU_MEMORY padding rows send IS_BYTE with all-zero values.
+        let num_padding_rows: usize = count_padding_rows(&cpu_ops, max_rows.cpu)
+            + count_padding_rows(&cpu_memory_ops, max_rows.cpu);
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        // Always generate at least one CPU_MEMORY chunk for soundness
+        // (prevents malicious prover from omitting LOAD/STORE constraints).
+        let cpu_memories =
+            chunk_and_generate(&cpu_memory_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let memw_aligneds = chunk_and_generate(
             &memw_aligned_ops,
@@ -2195,15 +2221,10 @@ impl Traces {
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
         // Generate DECODE trace and update multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        // When CPU is split, each chunk pads independently
+        // Both CPU and CPU_MEMORY chips look up DECODE once per row.
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(cpu_memory_ops.iter().map(|op| op.decode.pc));
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
         let register_final_state = register_state.to_final_state_map();
@@ -2235,6 +2256,7 @@ impl Traces {
 
         Ok(Traces {
             cpus,
+            cpu_memories,
             bitwise,
             lts,
             shifts,

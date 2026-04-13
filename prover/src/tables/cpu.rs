@@ -306,6 +306,12 @@ impl CpuOperation {
         Self::default()
     }
 
+    /// Returns true if this operation is a memory instruction (LOAD, STORE).
+    /// Used to route operations to the CPU_MEMORY chip.
+    pub fn is_memory(&self) -> bool {
+        self.decode.op_load || self.decode.op_store
+    }
+
     // =========================================================================
     // Convenience accessors for decode fields (reduces verbosity)
     // =========================================================================
@@ -2030,6 +2036,55 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     interactions
+}
+
+/// Bus interactions for the CPU table WITHOUT LOAD/STORE-specific interactions.
+///
+/// Used when LOAD/STORE instructions are routed to a separate CPU_MEMORY chip.
+/// Removes: BusId::Load (LOAD bus interaction) and M7 STORE (BusId::Memw with
+/// multiplicity = cols::STORE).
+pub fn bus_interactions_without_load_store() -> Vec<BusInteraction> {
+    let load_id: u64 = BusId::Load.into();
+
+    bus_interactions()
+        .into_iter()
+        .filter(|i| {
+            // Remove BusId::Load (LOAD bus interaction)
+            if i.bus_id == load_id {
+                return false;
+            }
+            // Remove M7 STORE (BusId::Memw with mult = STORE column)
+            if matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::STORE) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Bus interactions for the CPU_MEMORY chip (LOAD, STORE instructions).
+///
+/// Excludes interactions that bitwise/branch/arithmetic-only instructions need:
+/// AND/OR/XOR byte ops, ZERO, LT, MUL, DVRM, SHIFT, BRANCH, ECALL.
+/// Keeps: DECODE, IS_BYTE, MSB16, MEMW (M1/M3/M5/CM54/M7), LOAD.
+pub fn bus_interactions_memory_chip() -> Vec<BusInteraction> {
+    let drop_ids: Vec<u64> = vec![
+        BusId::AndByte.into(),
+        BusId::OrByte.into(),
+        BusId::XorByte.into(),
+        BusId::Zero.into(),
+        BusId::Lt.into(),
+        BusId::Mul.into(),
+        BusId::Dvrm.into(),
+        BusId::Shift.into(),
+        BusId::Branch.into(),
+        BusId::Ecall.into(),
+    ];
+
+    bus_interactions()
+        .into_iter()
+        .filter(|i| !drop_ids.contains(&i.bus_id))
+        .collect()
 }
 
 // =========================================================================
