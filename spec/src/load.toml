@@ -1,0 +1,160 @@
+name = "LOAD"
+
+# Input
+
+[[variables.input]]
+name = "base_address"
+type = "DWordWL"
+desc = "The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+pad = 0
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp at which this memory access is said to occur"
+pad = 0
+
+[[variables.input]]
+name = "read2"
+type = "Bit"
+desc = "Whether to read exactly 2 bytes"
+pad = 0
+
+[[variables.input]]
+name = "read4"
+type = "Bit"
+desc = "Whether to read exactly 4 bytes"
+pad = 0
+
+[[variables.input]]
+name = "read8"
+type = "Bit"
+desc = "Whether to read exactly 8 bytes"
+pad = 0
+
+[[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "Whether to sign-extend (1) or zero-extend (0)"
+pad = 0
+
+# Output
+
+[[variables.output]]
+name = "res"
+type = "DWordBL"
+desc = "The result of reading (up to) 8 bytes from `base_address`, extended corresponding to `signed`."
+pad = 0
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "sign_bit"
+type = "Bit"
+desc = "The sign bit extracted from the bytes retrieved from memory"
+pad = 0
+
+# Virtual
+
+[[variables.virtual]]
+name = "read1"
+type = "Bit"
+desc = "Whether to read exactly 1 byte"
+def = ["-", "μ", "read2", "read4", "read8"]
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+
+[[assumptions]]
+desc = "`IS_WORD[base_address[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_BIT<signed>`"
+
+[[assumptions]]
+desc = "`IS_BIT<read2>`"
+
+[[assumptions]]
+desc = "`IS_BIT<read4>`"
+
+[[assumptions]]
+desc = "`IS_BIT<read8>`"
+
+[[assumptions]]
+desc = "`IS_BIT<read2 + read4 + read8>`"
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`read2` + #`read4` + #`read8` => #`μ`$"
+poly = ["*", ["+", "read2", "read4", "read8"], ["not", "μ"]]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, "base_address", ["cast", "res", ["BaseField", 8]], "timestamp", "read2", "read4", "read8"]
+output = "res"
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MSB8"
+input = [["idx", "res", 0]]
+output = "sign_bit"
+multiplicity = "read1"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MSB8"
+input = [["idx", "res", 1]]
+output = "sign_bit"
+multiplicity = "read2"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MSB8"
+input = [["idx", "res", 3]]
+output = "sign_bit"
+multiplicity = "read4"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$!#`read8` => #`res`_i = #`signed` dot #`sign_bit` dot 255$"
+poly = ["*", ["not", "read8"], ["-", ["idx", "res", "i"], ["*", "signed", "sign_bit", 255]]]
+iter = ["i", 4, 7]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$!(#`read4` + #`read8`) => #`res`_i = #`signed` dot #`sign_bit` dot 255$"
+poly = ["*", ["-", 1, "read4", "read8"], ["-", ["idx", "res", "i"], ["*", "signed", "sign_bit", 255]]]
+iter = ["i", 2, 3]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$!(#`read2` + #`read4` + #`read8`) => #`res`_1 = #`signed` dot #`sign_bit` dot 255$"
+poly = ["*", ["-", 1, "read2", "read4", "read8"], ["-", ["idx", "res", 1], ["*", "signed", "sign_bit", 255]]]
+
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "LOAD"
+input = ["base_address", "timestamp", "read2", "read4", "read8", "signed"]
+output = ["cast", "res", "DWordWL"]
+multiplicity = ["-", "μ"]
