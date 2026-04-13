@@ -1,0 +1,206 @@
+name = "MUL"
+
+
+# Input
+
+[[variables.input]]
+name = "lhs"
+type = "DWordHL"
+desc = "the left hand operator."
+pad = 0
+
+[[variables.input]]
+name = "lhs_signed"
+type = "Bit"
+desc = "whether to interpret `lhs` as a signed integer (1) or not (0)."
+pad = 0
+
+[[variables.input]]
+name = "rhs"
+type = "DWordHL"
+desc = "the right hand operator."
+pad = 0
+
+[[variables.input]]
+name = "rhs_signed"
+type = "Bit"
+desc = "whether to interpret `rhs` as a signed integer (1) or not (0)."
+pad = 0
+
+
+# Output
+
+[[variables.output]]
+name = "lo"
+type = "DWordHL"
+desc = "the lower limbs of the (extended) multiplication result"
+pad = 0
+
+[[variables.output]]
+name = "hi"
+type = "DWordHL"
+desc = "the upper limbs of the (extended) multiplication result"
+pad = 0
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "lhs_is_negative"
+type = "Bit"
+desc = "whether `lhs` is negative (1) or not (0)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rhs_is_negative"
+type = "Bit"
+desc = "whether `rhs` is negative (1) or not (0)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "raw_product"
+type = ["B51", 4]
+desc = "raw multiplication output"
+pad = 0
+
+# Virtual
+
+[[variables.virtual]]
+name = "lhs_ext"
+type = ["Half", 8]
+desc = "sign-extended value of `lhs`"
+def = {idx="i", polys=[
+    {iter=[0, 3], poly=["idx", "lhs", "i"]},
+    {iter=[4, 7], poly=["*", 0xFFFF, "lhs_is_negative"]},
+]}
+
+[[variables.virtual]]
+name = "rhs_ext"
+type = ["Half", 8]
+desc = "sign-extended value of `rhs`"
+def = {idx="i", polys=[
+    {iter=[0, 3], poly=["idx", "rhs", "i"]},
+    {iter=[4, 7], poly=["*", 0xFFFF, "rhs_is_negative"]},
+]}
+
+[[variables.virtual]]
+name = "res"
+type = "QuadWL"
+desc = "concatenation of `lo` and `hi`."
+def = {idx="i", polys=[
+    {iter=[0, 1], poly=["idx", ["cast", "lo", "DWordWL"], "i"]},
+    {iter=[2, 3], poly=["idx", ["cast", "hi", "DWordWL"], ["-", "i", 2]]},
+]}
+
+
+[[variables.virtual]]
+name = "carry"
+type = ["B20", 4]
+desc = "carry values"
+def = {idx="i", polys=[
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
+    {iter=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "res", "i"]]]},
+]}
+
+[[variables.virtual]]
+name = "μ_sum"
+type = "BaseField"
+desc = "sum of multiplicies"
+def = ["+", "μ_lo", "μ_hi"]
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ_lo"
+type = "BaseField"
+desc = ""
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ_hi"
+type = "BaseField"
+desc = ""
+pad = 0
+
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_HALF[lhs[i]]`"
+iter = ["i", 0, 3]
+
+[[assumptions]]
+desc = "`IS_HALF[rhs[i]]`"
+iter = ["i", 0, 3]
+ref = "mul:a:rhs"
+
+# Constraints
+
+[[constraint_groups]]
+name = "def"
+
+[[constraints.def]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "lhs", 3], "lhs_signed"]
+output = "lhs_is_negative"
+ref = "mul:c:lhs_is_negative"
+
+[[constraints.def]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "rhs", 3], "rhs_signed"]
+output = "rhs_is_negative"
+ref = "mul:c:rhs_is_negative"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "lo", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "mul:c:range_lo"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "hi", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "mul:c:range_hi"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_B20"
+input = [["idx", "carry", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "mul:c:carry"
+
+[[constraint_groups]]
+name = "prod"
+
+
+[[constraints.prod]]
+kind = "arith"
+constraint = "$#`raw_product[i]` = sum_(#`k`=0)^1 2^(16k) sum_(#`j`=0)^(2i+k) #`lhs_ext[j]` dot #`rhs_ext[2i+k-j]`$"
+poly = ["-", ["sum", ["=", "k", 0], 1, ["*", ["^", 2, ["*", 16, "k"]], ["sum", ["=", "j", 0], ["+", ["*", 2, "i"], "k"], ["*", ["idx", "lhs_ext", "j"], ["idx", "rhs_ext", ["-", ["+", ["*", 2, "i"], "k"], "j"]]]]]], ["idx", "raw_product", "i"]]
+iter = ["i", 0, 3]
+ref = "mul:c:raw_product"
+
+[[constraint_groups]]
+name = "lookup"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "MUL"
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 0]
+output = ["cast", "lo", "DWordWL"]
+multiplicity = ["-", "μ_lo"]
+ref = "mul:c:lookup_lo"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "MUL"
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 1]
+output = ["cast", "hi", "DWordWL"]
+multiplicity = ["-", "μ_hi"]
+ref = "mul:c:lookup_hi"
