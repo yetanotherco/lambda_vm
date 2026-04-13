@@ -386,6 +386,7 @@ fn evaluate_mle<E: IsField>(
 ///
 /// # Panics
 /// Panics if the tree is empty or has inconsistent layer sizes.
+#[allow(clippy::type_complexity)]
 pub fn gkr_prove<E: IsField>(
     tree: &[SummationLayer<E>],
     transcript: &mut impl IsTranscript<E>,
@@ -2890,8 +2891,7 @@ mod tests {
 
         // Corrupt nl (child_claims[0]) by adding 1 — this breaks the gate equation
         // n_claim*(dl*dr) = nl*dr + nr*dl without altering the transcript ordering
-        proof.layer_proofs[0].child_claims[0] =
-            proof.layer_proofs[0].child_claims[0].clone() + FE::one();
+        proof.layer_proofs[0].child_claims[0] += FE::one();
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xC0]);
         let result = gkr_verify(&proof, &mut verifier_transcript);
