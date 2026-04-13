@@ -232,8 +232,27 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 73;
 
+    // -------------------------------------------------------------------------
+    // Registers on-Main: prev_ts columns (Phase 1)
+    // -------------------------------------------------------------------------
+    // These columns track the timestamp of the previous access to each register.
+    // Used to eliminate the MEMW_R chip by handling register state inline in CPU.
+
+    /// rs1_prev_ts: Previous mem_step when rs1 was last accessed
+    pub const RS1_PREV_TS: usize = 74;
+    /// rs2_prev_ts: Previous mem_step when rs2 was last accessed
+    pub const RS2_PREV_TS: usize = 75;
+    /// rd_prev_ts: Previous mem_step when rd was last written
+    pub const RD_PREV_TS: usize = 76;
+    /// rd_prev_val_lo: Previous value of rd (low 32 bits) — for proving old state
+    pub const RD_PREV_VAL_LO: usize = 77;
+    /// rd_prev_val_hi: Previous value of rd (high 32 bits)
+    pub const RD_PREV_VAL_HI: usize = 78;
+    /// pc_prev_ts: Previous mem_step when x255 (PC) was last updated
+    pub const PC_PREV_TS: usize = 79;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 74;
+    pub const NUM_COLUMNS: usize = 80;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -298,6 +317,22 @@ pub struct CpuOperation {
 
     /// For Commit ECALLs: byte count from x12
     pub commit_count: u64,
+
+    // -------------------------------------------------------------------------
+    // Registers on-Main: prev_ts tracking (Phase 1)
+    // -------------------------------------------------------------------------
+    /// Previous mem_step when rs1 was last accessed (0 if never)
+    pub rs1_prev_ts: u64,
+    /// Previous mem_step when rs2 was last accessed (0 if never)
+    pub rs2_prev_ts: u64,
+    /// Previous mem_step when rd was last written (0 if never)
+    pub rd_prev_ts: u64,
+    /// Previous value of rd (low 32 bits) before this write
+    pub rd_prev_val_lo: u32,
+    /// Previous value of rd (high 32 bits) before this write
+    pub rd_prev_val_hi: u32,
+    /// Previous mem_step when x255 (PC) was last updated
+    pub pc_prev_ts: u64,
 }
 
 impl CpuOperation {
@@ -660,6 +695,13 @@ impl CpuOperation {
             ecall_commit,
             commit_buf_addr,
             commit_count,
+            // Registers on-Main (Phase 1): populated later by populate_register_prev_ts
+            rs1_prev_ts: 0,
+            rs2_prev_ts: 0,
+            rd_prev_ts: 0,
+            rd_prev_val_lo: 0,
+            rd_prev_val_hi: 0,
+            pc_prev_ts: 0,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -856,6 +898,14 @@ pub fn generate_cpu_trace(
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+
+        // Registers on-Main: prev_ts columns (Phase 1, populated only)
+        data[base + cols::RS1_PREV_TS] = FE::from(op.rs1_prev_ts);
+        data[base + cols::RS2_PREV_TS] = FE::from(op.rs2_prev_ts);
+        data[base + cols::RD_PREV_TS] = FE::from(op.rd_prev_ts);
+        data[base + cols::RD_PREV_VAL_LO] = FE::from(op.rd_prev_val_lo as u64);
+        data[base + cols::RD_PREV_VAL_HI] = FE::from(op.rd_prev_val_hi as u64);
+        data[base + cols::PC_PREV_TS] = FE::from(op.pc_prev_ts);
     }
 
     // Padding rows: per spec, padding uses pc=1 (odd address, unreachable during

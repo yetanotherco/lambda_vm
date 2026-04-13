@@ -301,7 +301,62 @@ fn collect_cpu_ops(
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
     }
+
+    // Phase 1 of "Registers on-Main": populate prev_ts columns for each CPU operation.
+    // This tracks the timestamp of the previous access to each register.
+    populate_register_prev_ts(&mut cpu_ops);
+
     Ok(cpu_ops)
+}
+
+/// Populates prev_ts and prev_val fields on CpuOperations by tracking
+/// register access history. Used by the Registers-on-Main optimization.
+///
+/// CPU instruction timing within one cycle (timestamp = ts):
+///   - M1 (read rs1) at ts
+///   - M3 (read rs2) at ts+1
+///   - M5 (write rd) at ts+2
+///   - CM54 (write x255 PC) at ts+3
+fn populate_register_prev_ts(cpu_ops: &mut [CpuOperation]) {
+    // last_ts[reg_idx] = mem_step of last access (read or write) to that register.
+    // Indices 0..32 for general registers, 255 for PC (x255).
+    // Initialized to 0 (matches REGISTER table init token at ts=0).
+    let mut last_ts: [u64; 256] = [0; 256];
+    // last_val[reg_idx] = last value written to that register (0 initially).
+    let mut last_val: [u64; 256] = [0; 256];
+
+    for op in cpu_ops.iter_mut() {
+        let ts = op.timestamp;
+
+        // M1: read rs1 at ts (only if read_register1)
+        if op.decode.read_register1 {
+            let reg = op.decode.rs1 as usize;
+            op.rs1_prev_ts = last_ts[reg];
+            last_ts[reg] = ts;
+        }
+
+        // M3: read rs2 at ts+1 (only if read_register2)
+        if op.decode.read_register2 {
+            let reg = op.decode.rs2 as usize;
+            op.rs2_prev_ts = last_ts[reg];
+            last_ts[reg] = ts + 1;
+        }
+
+        // M5: write rd at ts+2 (only if write_register)
+        if op.decode.write_register {
+            let reg = op.decode.rd as usize;
+            op.rd_prev_ts = last_ts[reg];
+            op.rd_prev_val_lo = (last_val[reg] & 0xFFFF_FFFF) as u32;
+            op.rd_prev_val_hi = (last_val[reg] >> 32) as u32;
+            last_ts[reg] = ts + 2;
+            last_val[reg] = op.rvd;
+        }
+
+        // CM54: write x255 (PC) at ts+3 — fires for every non-padding row.
+        op.pc_prev_ts = last_ts[255];
+        last_ts[255] = ts + 3;
+        last_val[255] = op.next_pc;
+    }
 }
 
 // =============================================================================

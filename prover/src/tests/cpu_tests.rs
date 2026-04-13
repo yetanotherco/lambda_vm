@@ -336,7 +336,8 @@ fn test_bus_interactions_count() {
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 74);
+    // 74 base + 6 prev_ts cols (Phase 1 of Registers on-Main)
+    assert_eq!(cols::NUM_COLUMNS, 80);
 }
 
 #[test]
