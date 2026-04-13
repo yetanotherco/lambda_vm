@@ -52,7 +52,7 @@ CLI="$ROOT_DIR/target/release/cli"
 parse_timing() {
     awk '
     function secs(    s) {
-        if (match($0, /[0-9]+\.[0-9]+s/)) {
+        if (match($0, /[0-9]+\.?[0-9]*s/)) {
             s = substr($0, RSTART, RLENGTH - 1)
             return s
         }
@@ -202,7 +202,8 @@ do
         steps=$(get_val "$DATA" "steps")
         val=$(get_val "$DATA" "$key")
         [ -z "$val" ] && continue
-        steps_m=$(awk "BEGIN {printf \"%.2f\", $steps / 1000000}")
+        [ -z "$steps" ] && continue
+        steps_m=$(awk -v s="$steps" 'BEGIN {printf "%.2f", s / 1000000}')
         PAIRS="$PAIRS $steps_m $val"
     done
 
@@ -226,4 +227,3 @@ do
 done
 
 echo ""
-echo "Raw data in $TMP_DIR/"
