@@ -1,0 +1,64 @@
+name = "PAGE"
+
+# Input
+
+[[variables.constant]]
+name = "page"
+type = "DWordWL"
+desc = "Constant column containing the page base address; should be integrated into the constraints directly"
+
+[[variables.input]]
+name = "offset"
+type = "RowIndex"
+desc = "The offset from the page base address."
+
+[[variables.input]]
+name = "init"
+type = "Byte"
+desc = "The initial value of this address. Can be replaced by a constant zero for zero-initialization"
+
+[[variables.input]]
+name = "fini"
+type = "Byte"
+desc = "The final value this address took"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp at which this address was last accessed"
+
+# Virtual
+
+[[variables.virtual]]
+name = "address"
+type = "DWordWL"
+desc = "Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table."
+def = ["+", "page", ["*", "offset", ["cast", 1, "DWordWL"]]]
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = ["init"]
+multiplicity = 1
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = ["fini"]
+multiplicity = 1
+
+[[constraints.all]]
+kind = "interaction"
+tag = "memory"
+input = [0, "address", ["cast", 0, "DWordWL"], "init"]
+multiplicity = -1
+
+[[constraints.all]]
+kind = "interaction"
+tag = "memory"
+input = [0, "address", "timestamp", "fini"]
+multiplicity = 1

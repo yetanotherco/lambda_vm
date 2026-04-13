@@ -10,9 +10,9 @@
 //! ```text
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
-//! PHASE 2: CPU ops → MEMW, MEMW_A, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering)
-//! PHASE 4: LT, MEMW_A → Bitwise lookups
+//! PHASE 2: CPU ops → MEMW, MEMW_A, MEMW_R, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
+//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering); MEMW_R uses IS_HALFWORD instead
+//! PHASE 4: LT, MEMW_A, MEMW_R → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -45,6 +45,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
+use super::memw_register;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -910,6 +911,59 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 }
 
 // =============================================================================
+// Routing predicates (MEMW_R register fast path)
+// =============================================================================
+
+/// An operation routes to MEMW_R if:
+/// 1. It's a 2-word register access (is_register = true, width = 2)
+/// 2. Both words share the same old_timestamp (atomic register write)
+/// 3. timestamp[1] == old_timestamp[1] (upper limbs match)
+/// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
+/// 5. timestamp[0] - old_timestamp[0] <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
+///
+/// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
+/// dynamic write flags. MEMW_R hardcodes write2=1.
+fn is_register_op(op: &MemwOperation) -> bool {
+    if !op.is_register || op.width != 2 {
+        return false;
+    }
+    // Both words must share old_timestamp (atomic register write assumption)
+    if op.old_timestamp[0] != op.old_timestamp[1] {
+        return false;
+    }
+    let ts = op.timestamp;
+    let old_ts = op.old_timestamp[0];
+    let ts_lo = ts & 0xFFFF_FFFF;
+    let old_ts_lo = old_ts & 0xFFFF_FFFF;
+    let ts_hi = ts >> 32;
+    let old_ts_hi = old_ts >> 32;
+    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
+}
+
+/// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
+///
+/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
+/// in a halfword (proving the timestamp delta is in range [1, 2^16]).
+fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+    ops.iter()
+        .map(|op| {
+            let ts_lo = op.timestamp & 0xFFFF_FFFF;
+            let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
+            debug_assert!(
+                ts_lo > old_ts_lo,
+                "ts_lo must exceed old_ts_lo (enforced by is_register_op)"
+            );
+            let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
+            BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (diff_minus_1 & 0xFF) as u8,
+                (diff_minus_1 >> 8) as u8,
+            )
+        })
+        .collect()
+}
+
+// =============================================================================
 // Phase 4: All → Bitwise lookups
 // =============================================================================
 
@@ -1738,6 +1792,9 @@ pub struct Traces {
 
     /// KECCAK table for keccak-f[1600] permutation precompile
     pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
+    pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 impl Traces {
@@ -1763,6 +1820,11 @@ impl Traces {
             "MEMW_A       chunks={:>4} total_rows={:>12}",
             self.memw_aligneds.len(),
             sum_rows(&self.memw_aligneds)
+        );
+        eprintln!(
+            "MEMW_R       chunks={:>4} total_rows={:>12}",
+            self.memw_registers.len(),
+            sum_rows(&self.memw_registers)
         );
         eprintln!(
             "LOAD         chunks={:>4} total_rows={:>12}",
@@ -1881,6 +1943,7 @@ impl Traces {
             dvrm: self.dvrms.len(),
             shift: self.shifts.len(),
             branch: self.branches.len(),
+            memw_register: self.memw_registers.len(),
         }
     }
 
@@ -2085,7 +2148,10 @@ impl Traces {
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
 
-        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
+        // Order matters: register ops would also pass is_aligned_op, so check first.
+        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_register_op);
         let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
             memw_ops.into_iter().partition(is_aligned_op);
 
@@ -2189,6 +2255,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
@@ -2276,6 +2344,13 @@ impl Traces {
         );
         drop(memw_aligned_ops);
 
+        let memw_registers = gen_traces!(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace
+        );
+        drop(memw_register_ops);
+
         let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         drop(lt_ops);
 
@@ -2330,6 +2405,7 @@ impl Traces {
             halt: halt_trace,
             commit: commit_trace,
             keccak: keccak_trace,
+            memw_registers,
         })
     }
 
@@ -2365,7 +2441,9 @@ impl Traces {
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
 
-        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
+        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_register_op);
         let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
             memw_ops.into_iter().partition(is_aligned_op);
 
@@ -2446,6 +2524,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -2484,6 +2564,11 @@ impl Traces {
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
+        );
+        let memw_registers = chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
         );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
@@ -2555,6 +2640,7 @@ impl Traces {
             halt: halt_trace,
             commit: commit_trace,
             keccak: keccak_trace,
+            memw_registers,
         })
     }
 
@@ -2604,5 +2690,56 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         Self::from_logs_trimmed(logs, instructions, max_rows)
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
+        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
+            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn test_is_register_op_delta_at_boundary_routes_in() {
+        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
+        let op = make_register_op(0x10000, 0);
+        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_above_boundary_falls_back() {
+        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
+        let op = make_register_op(0x10001, 0);
+        assert!(
+            !is_register_op(&op),
+            "delta = 2^16 + 1 should fall back to MEMW_A"
+        );
+    }
+
+    #[test]
+    fn test_is_register_op_delta_one_routes_in() {
+        // delta = 1: minimum allowed value
+        let op = make_register_op(1, 0);
+        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_zero_falls_back() {
+        // delta = 0: ts[0] not strictly greater than old_ts[0]
+        let op = make_register_op(5, 5);
+        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_upper_limb_mismatch_falls_back() {
+        // ts_hi != old_ts_hi: shared upper limb assumption violated
+        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
+        assert!(
+            !is_register_op(&op),
+            "different upper limbs should fall back to MEMW_A"
+        );
     }
 }

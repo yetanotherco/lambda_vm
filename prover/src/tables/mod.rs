@@ -33,6 +33,7 @@ pub mod load;
 pub mod lt;
 pub mod memw;
 pub mod memw_aligned;
+pub mod memw_register;
 pub mod mul;
 pub mod page;
 pub mod register;
@@ -60,6 +61,7 @@ pub use types::BusId;
 /// | SHIFT   |  27  |  15 |     72    |  2^20    |
 /// | LOAD    |  18  |   5 |     33    |  2^21    |
 /// | BRANCH  |  14  |   6 |     32    |  2^21    |
+/// | MEMW_R  |  10  |   7 |     31    |  2^21    |
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
@@ -70,6 +72,7 @@ pub mod max_rows {
     pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
     pub const LOAD: usize = 1 << 21; // 2,097,152 — eff. width 33
     pub const BRANCH: usize = 1 << 21; // 2,097,152 — eff. width 32
+    pub const MEMW_R: usize = 1 << 21; // 2,097,152 — eff. width 31
 }
 
 /// Per-table maximum row limits, configurable for different environments.
@@ -87,6 +90,7 @@ pub struct MaxRowsConfig {
     pub shift: usize,
     pub load: usize,
     pub branch: usize,
+    pub memw_register: usize,
 }
 
 impl Default for MaxRowsConfig {
@@ -101,6 +105,7 @@ impl Default for MaxRowsConfig {
             shift: max_rows::SHIFT,
             load: max_rows::LOAD,
             branch: max_rows::BRANCH,
+            memw_register: max_rows::MEMW_R,
         }
     }
 }
@@ -119,6 +124,7 @@ impl MaxRowsConfig {
             shift: 1 << 5,
             load: 1 << 5,
             branch: 1 << 5,
+            memw_register: 1 << 5,
         }
     }
 }
