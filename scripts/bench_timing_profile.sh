@@ -2,7 +2,11 @@
 # Per-phase timing profile across program sizes.
 # Shows how each proving phase and sub-operation scales with program size.
 #
-# Usage: bench_timing_profile.sh [--no-build] [--programs "1M 2M 4M 8M"]
+# Usage: bench_timing_profile.sh [--no-build] [--programs "1M 2M 4M 8M"] [--program fib_iterative]
+#
+# --program: which program to profile (default: fib_iterative)
+#   fib_iterative: uses asm/ ELFs, sizes like 500k/1M/2M
+#   modular_exp, bitwise_ops, matrix_multiply, keccak: uses bench/ ELFs, sizes are iteration counts
 #
 # Requires: instruments feature.
 # Timing is deterministic with instruments, so 1 run per size is enough.
@@ -19,15 +23,29 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 BUILD=true
-PROGRAMS="500k 1M 2M 4M"
+PROGRAM="fib_iterative"
+PROGRAMS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-build) BUILD=false; shift ;;
+        --program) PROGRAM="$2"; shift 2 ;;
         --programs) PROGRAMS="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# Set defaults and ELF directory based on program
+if [ "$PROGRAM" = "fib_iterative" ]; then
+    ELF_DIR="$ROOT_DIR/executor/program_artifacts/asm"
+    [ -z "$PROGRAMS" ] && PROGRAMS="500k 1M 2M 4M"
+else
+    ELF_DIR="$ROOT_DIR/executor/program_artifacts/bench"
+    if [ -z "$PROGRAMS" ]; then
+        echo "Error: --programs required for bench programs" >&2
+        exit 1
+    fi
+fi
 
 suffix_to_steps() {
     case $1 in
@@ -35,7 +53,7 @@ suffix_to_steps() {
         500k) echo 500000 ;; 1M) echo 1000000 ;; 1200k) echo 1200000 ;;
         2M) echo 2000000 ;; 4M) echo 4000000 ;; 8M) echo 8000000 ;;
         16M) echo 16000000 ;; 32M) echo 32000000 ;; 64M) echo 64000000 ;; 128M) echo 128000000 ;;
-        *) echo "Unknown: $1" >&2; exit 1 ;;
+        *) echo "$1" ;;  # bench programs: size is the iteration count
     esac
 }
 
@@ -95,10 +113,10 @@ parse_timing() {
 }
 
 for size in $PROGRAMS; do
-    ELF="$ELF_DIR/fib_iterative_${size}.elf"
+    ELF="$ELF_DIR/${PROGRAM}_${size}.elf"
     [ -f "$ELF" ] || { echo "Missing: $ELF"; continue; }
     steps=$(suffix_to_steps "$size")
-    echo -e "${GREEN}Running fib_iterative_${size}...${NC}"
+    echo -e "${GREEN}Running ${PROGRAM}_${size}...${NC}"
 
     STDERR="$TMP_DIR/${size}_stderr.txt"
     "$CLI" prove "$ELF" -o "$TMP_DIR/proof.bin" 2>"$STDERR" >/dev/null
