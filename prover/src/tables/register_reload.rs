@@ -159,12 +159,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::One,
         vec![
-            BusValue::constant(1),   // is_register = 1
-            addr_w0.clone(),         // addr_lo = 2 * reg_idx
-            BusValue::constant(0),   // addr_hi = 0
-            old_ts.clone(),          // ts_lo = old_ts
-            BusValue::constant(0),   // ts_hi = 0
-            val_lo.clone(),          // value = val_lo
+            BusValue::constant(1), // is_register = 1
+            addr_w0.clone(),       // addr_lo = 2 * reg_idx
+            BusValue::constant(0), // addr_hi = 0
+            old_ts.clone(),        // ts_lo = old_ts
+            BusValue::constant(0), // ts_hi = 0
+            val_lo.clone(),        // value = val_lo
         ],
     ));
 
@@ -173,12 +173,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::One,
         vec![
-            BusValue::constant(1),   // is_register = 1
-            addr_w1.clone(),         // addr_lo = 2 * reg_idx + 1
-            BusValue::constant(0),   // addr_hi = 0
-            old_ts,                  // ts_lo = old_ts
-            BusValue::constant(0),   // ts_hi = 0
-            val_hi.clone(),          // value = val_hi
+            BusValue::constant(1), // is_register = 1
+            addr_w1.clone(),       // addr_lo = 2 * reg_idx + 1
+            BusValue::constant(0), // addr_hi = 0
+            old_ts,                // ts_lo = old_ts
+            BusValue::constant(0), // ts_hi = 0
+            val_hi.clone(),        // value = val_hi
         ],
     ));
 
@@ -187,12 +187,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::One,
         vec![
-            BusValue::constant(1),   // is_register = 1
-            addr_w0,                 // addr_lo = 2 * reg_idx
-            BusValue::constant(0),   // addr_hi = 0
-            new_ts.clone(),          // ts_lo = new_ts
-            BusValue::constant(0),   // ts_hi = 0
-            val_lo,                  // value = val_lo
+            BusValue::constant(1), // is_register = 1
+            addr_w0,               // addr_lo = 2 * reg_idx
+            BusValue::constant(0), // addr_hi = 0
+            new_ts.clone(),        // ts_lo = new_ts
+            BusValue::constant(0), // ts_hi = 0
+            val_lo,                // value = val_lo
         ],
     ));
 
@@ -201,12 +201,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::One,
         vec![
-            BusValue::constant(1),   // is_register = 1
-            addr_w1,                 // addr_lo = 2 * reg_idx + 1
-            BusValue::constant(0),   // addr_hi = 0
-            new_ts,                  // ts_lo = new_ts
-            BusValue::constant(0),   // ts_hi = 0
-            val_hi,                  // value = val_hi
+            BusValue::constant(1), // is_register = 1
+            addr_w1,               // addr_lo = 2 * reg_idx + 1
+            BusValue::constant(0), // addr_hi = 0
+            new_ts,                // ts_lo = new_ts
+            BusValue::constant(0), // ts_hi = 0
+            val_hi,                // value = val_hi
         ],
     ));
 

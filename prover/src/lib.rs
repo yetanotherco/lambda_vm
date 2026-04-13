@@ -41,8 +41,8 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air,
-    create_register_air, create_register_reload_air, create_shift_air,
+    create_memw_air, create_memw_aligned_air, create_mul_air, create_page_air, create_register_air,
+    create_register_reload_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};

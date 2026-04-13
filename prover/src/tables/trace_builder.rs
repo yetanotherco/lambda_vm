@@ -1891,8 +1891,15 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, reload_ops) =
-            collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
+        let (
+            mut memw_ops,
+            load_ops,
+            mut lt_ops,
+            shift_ops,
+            mut bitwise_ops,
+            commit_ops,
+            reload_ops,
+        ) = collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -2134,8 +2141,15 @@ impl Traces {
         // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, reload_ops) =
-            collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
+        let (
+            mut memw_ops,
+            load_ops,
+            mut lt_ops,
+            shift_ops,
+            mut bitwise_ops,
+            commit_ops,
+            reload_ops,
+        ) = collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -2270,8 +2284,7 @@ impl Traces {
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
             chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
-        let register_reload_trace =
-            register_reload::generate_register_reload_trace(&reload_ops);
+        let register_reload_trace = register_reload::generate_register_reload_trace(&reload_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -2385,4 +2398,3 @@ impl Traces {
         Self::from_logs_trimmed(logs, instructions, max_rows)
     }
 }
-
