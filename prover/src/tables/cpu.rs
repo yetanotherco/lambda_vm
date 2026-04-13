@@ -2045,16 +2045,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// multiplicity = cols::STORE).
 pub fn bus_interactions_without_load_store() -> Vec<BusInteraction> {
     let load_id: u64 = BusId::Load.into();
+    let memw_id: u64 = BusId::Memw.into();
 
     bus_interactions()
         .into_iter()
         .filter(|i| {
-            // Remove BusId::Load (LOAD bus interaction)
+            // Remove BusId::Load (LOAD bus interaction, M6)
             if i.bus_id == load_id {
                 return false;
             }
-            // Remove M7 STORE (BusId::Memw with mult = STORE column)
-            if matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::STORE) {
+            // Remove M7 STORE: BusId::Memw with mult = Column(cols::STORE).
+            // Match on BOTH bus_id AND multiplicity to avoid false positives if
+            // another interaction ever uses cols::STORE as its multiplicity.
+            if i.bus_id == memw_id
+                && matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::STORE)
+            {
                 return false;
             }
             true
@@ -2068,10 +2073,14 @@ pub fn bus_interactions_without_load_store() -> Vec<BusInteraction> {
 /// AND/OR/XOR byte ops, ZERO, LT, MUL, DVRM, SHIFT, BRANCH, ECALL.
 /// Keeps: DECODE, IS_BYTE, MSB16, MEMW (M1/M3/M5/CM54/M7), LOAD.
 pub fn bus_interactions_memory_chip() -> Vec<BusInteraction> {
+    // MSB16 is dropped because LOAD/STORE never set word_instr=1 (only ArithW
+    // variants do), so MSB16 multiplicity is always 0 in this chip — keeping
+    // them would add 3 dead auxiliary columns.
     let drop_ids: Vec<u64> = vec![
         BusId::AndByte.into(),
         BusId::OrByte.into(),
         BusId::XorByte.into(),
+        BusId::Msb16.into(),
         BusId::Zero.into(),
         BusId::Lt.into(),
         BusId::Mul.into(),
