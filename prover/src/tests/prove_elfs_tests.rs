@@ -1901,6 +1901,34 @@ fn test_verify_rejects_inflated_table_counts() {
     );
 }
 
+/// A program with no bitwise instructions must still produce a CPU_BITWISE
+/// phantom chunk and verify successfully. This exercises the soundness fix
+/// that always generates a CPU_BITWISE chunk: without it a malicious prover
+/// could omit the chip and bypass AND/OR/XOR byte-lookup constraints.
+#[test]
+fn test_prove_elfs_no_bitwise_instructions() {
+    let (elf, logs, instructions) = run_asm_elf("sub_neg_result");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    // Confirm no bitwise ops were generated — the only CPU_BITWISE chunk must
+    // be the phantom padding chunk (4 rows).
+    assert_eq!(
+        traces.cpu_bitwises.len(),
+        1,
+        "Expected exactly 1 phantom CPU_BITWISE chunk for zero-bitwise program"
+    );
+    assert_eq!(
+        traces.cpu_bitwises[0].main_table.height, 4,
+        "Phantom chunk should contain 4 padding rows"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Proof verification failed for zero-bitwise program (phantom CPU_BITWISE chunk)"
+    );
+}
+
 /// Regression test: addiw with negative immediate must verify.
 /// arg2_sign_bit is the sign bit of rv2 (bit 31), not of arg2, per spec
 /// constraint CPU-CE61: MSB16[arg2_sign_bit; rv2[1]].

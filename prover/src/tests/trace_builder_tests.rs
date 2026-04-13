@@ -350,6 +350,47 @@ fn test_mixed_instructions() {
     assert!(traces.lts[0].main_table.height >= 2);
 }
 
+#[test]
+fn test_no_bitwise_ops_produce_phantom_chunk() {
+    // A program with only ADD and ECALL — no AND, OR, or XOR instructions.
+    // The trace builder must still emit exactly one CPU_BITWISE chunk (the
+    // phantom padding chunk) so the verifier can instantiate the CPU_BITWISE
+    // AIR and enforce byte-lookup soundness even when no bitwise ops executed.
+    let mut logs = vec![
+        make_add_log(0x1000, 10, 20, 30),
+        make_add_log(0x1004, 1, 2, 3),
+    ];
+    let mut instrs = vec![
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    ];
+    append_ecall(&mut logs, &mut instrs);
+    let instructions = make_instructions(&logs, &instrs);
+
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
+
+    // No bitwise ops: must produce exactly 1 phantom chunk of 4 padding rows.
+    assert_eq!(
+        traces.cpu_bitwises.len(),
+        1,
+        "Expected exactly 1 phantom CPU_BITWISE chunk for a zero-bitwise program"
+    );
+    assert_eq!(
+        traces.cpu_bitwises[0].main_table.height, 4,
+        "Phantom chunk should contain 4 padding rows"
+    );
+}
+
 // =============================================================================
 // Phase 2 Tests: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
