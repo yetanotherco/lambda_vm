@@ -38,6 +38,7 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
 
     #[cfg(not(feature = "parallel"))]
     {
+        let half = evals.len() / 2;
         for j in 0..half {
             let lo = &evals[2 * j];
             let hi = &evals[2 * j + 1];
