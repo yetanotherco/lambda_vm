@@ -6,7 +6,8 @@
 //!
 //! - **BITWISE**: Precomputed lookup table for bitwise operations (2^20 rows)
 //! - **LT**: Less-than comparison table
-//! - **CPU**: Main execution table
+//! - **CPU**: Main execution table (non-bitwise instructions)
+//! - **CPU_BITWISE**: CPU table for AND, OR, XOR instructions
 //! - **DECODE**: Instruction decode table
 //! - **BRANCH**: Branch target calculation table
 //! - **HALT**: Single-row halt table
@@ -54,7 +55,8 @@ pub use types::BusId;
 /// |---------|------|-----|-----------|----------|
 /// | MEMW    |  49  |  26 |    127    |  2^19    |
 /// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  74  |  40 |    194    |  2^19    |
+/// | CPU     |  74  |  44 |    206    |  2^19    |
+/// | CPU_BIT |  74  |  60 |    254    |  2^19    |
 /// | DVRM    |  34  |  34 |    136    |  2^19    |
 /// | MUL     |  26  |  16 |     74    |  2^20    |
 /// | LT      |  15  |   9 |     42    |  2^21    |
@@ -63,7 +65,8 @@ pub use types::BusId;
 /// | BRANCH  |  14  |   6 |     32    |  2^21    |
 /// | MEMW_R  |  10  |   7 |     31    |  2^21    |
 pub mod max_rows {
-    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
+    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 206
+    pub const CPU_BITWISE: usize = 1 << 19; // 524,288 — eff. width 254
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
     pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
