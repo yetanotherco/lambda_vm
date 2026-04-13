@@ -11,7 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_DIR="/tmp/bench_timing_profile"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 ELF_DIR="$ROOT_DIR/executor/program_artifacts/asm"
 
 GREEN='\033[0;32m'
@@ -39,7 +40,6 @@ suffix_to_steps() {
     esac
 }
 
-rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR"
 
 if $BUILD; then
     echo -e "${GREEN}Building CLI with instruments...${NC}"
@@ -49,10 +49,8 @@ fi
 CLI="$ROOT_DIR/target/release/cli"
 
 # Parse instruments stderr into key=value pairs.
-# Uses occurrence counting to disambiguate expand_pool_to_lde and commit (Merkle).
 parse_timing() {
     awk '
-    BEGIN { lde_n = 0; merkle_n = 0 }
     function secs(    s) {
         if (match($0, /[0-9]+\.[0-9]+s/)) {
             s = substr($0, RSTART, RLENGTH - 1)
@@ -69,16 +67,10 @@ parse_timing() {
     /Aux trace build/ { v = secs(); if (v) print "aux_build=" v }
     /Aux trace commit/ { v = secs(); if (v) print "aux_commit=" v }
     /Rounds 2/ { v = secs(); if (v) print "rounds24=" v }
-    /expand_pool_to_lde/ && !/R1  expand/ {
-        lde_n++; v = secs()
-        if (v && lde_n == 1) print "main_lde=" v
-        if (v && lde_n == 2) print "aux_lde=" v
-    }
-    /commit \(Merkle\)/ {
-        merkle_n++; v = secs()
-        if (v && merkle_n == 1) print "main_merkle=" v
-        if (v && merkle_n == 2) print "aux_merkle=" v
-    }
+    /Main expand_pool_to_lde/ { v = secs(); if (v) print "main_lde=" v }
+    /Aux expand_pool_to_lde/  { v = secs(); if (v) print "aux_lde=" v }
+    /Main commit \(Merkle\)/  { v = secs(); if (v) print "main_merkle=" v }
+    /Aux commit \(Merkle\)/   { v = secs(); if (v) print "aux_merkle=" v }
     /R1  expand_pool_to_lde/ { v = secs(); if (v) print "r1_lde=" v }
     /R2  evaluate/           { v = secs(); if (v) print "r2_evaluate=" v }
     /R2  decompose/          { v = secs(); if (v) print "r2_decompose=" v }

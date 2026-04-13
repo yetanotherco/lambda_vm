@@ -75,12 +75,12 @@ pub fn print_report(
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
         row_top("Round 1", round1, total);
         row_sub("  Main trace commits", mp.main_commits, total);
-        row_sub("    expand_pool_to_lde", mp.round1_sub.main_lde, total);
-        row_sub("    commit (Merkle)", mp.round1_sub.main_merkle, total);
+        row_sub("    Main expand_pool_to_lde", mp.round1_sub.main_lde, total);
+        row_sub("    Main commit (Merkle)", mp.round1_sub.main_merkle, total);
         row_sub("  Aux trace build (parallel)", mp.aux_build, total);
         row_sub("  Aux trace commit", mp.aux_commit, total);
-        row_sub("    expand_pool_to_lde", mp.round1_sub.aux_lde, total);
-        row_sub("    commit (Merkle)", mp.round1_sub.aux_merkle, total);
+        row_sub("    Aux expand_pool_to_lde", mp.round1_sub.aux_lde, total);
+        row_sub("    Aux commit (Merkle)", mp.round1_sub.aux_merkle, total);
         row_top("Rounds 2\u{2013}4", mp.rounds_2_4, total);
 
         // Merge split tables: MEMW[0..4] → MEMW x5
