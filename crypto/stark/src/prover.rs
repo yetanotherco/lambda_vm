@@ -131,6 +131,10 @@ where
 /// Metadata from Round 1 commitments — stores Merkle trees, roots, and cached LDE evaluations.
 /// LDE evaluations are cached from Phase A/C and consumed in Phase D (Rounds 2-4),
 /// eliminating the expensive recomputation (iFFT + coset shift + FFT per column).
+///
+/// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
+/// and Phase D (O(N × cols × lde_size)), but pool pre-allocation is removed, so peak heap
+/// is lower overall (~70 GB vs ~220 GB at 8M cycles).
 pub struct Round1Metadata<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
@@ -598,11 +602,11 @@ pub trait IsStarkProver<
                     metadata
                         .aux_merkle_tree
                         .as_ref()
-                        .expect("aux tree must exist when has_trace_interaction"),
+                        .expect("aux tree must exist when has_aux_trace"),
                 ),
                 lde_trace_merkle_root: metadata
                     .aux_merkle_root
-                    .expect("aux root must exist when has_trace_interaction"),
+                    .expect("aux root must exist when has_aux_trace"),
                 precomputed_merkle_tree: None,
                 precomputed_merkle_root: None,
                 num_precomputed_cols: 0,
@@ -1866,11 +1870,11 @@ pub trait IsStarkProver<
                                 metadata
                                     .aux_merkle_tree
                                     .as_ref()
-                                    .expect("aux tree must exist when has_trace_interaction"),
+                                    .expect("aux tree must exist when has_aux_trace"),
                             ),
                             lde_trace_merkle_root: metadata
                                 .aux_merkle_root
-                                .expect("aux root must exist when has_trace_interaction"),
+                                .expect("aux root must exist when has_aux_trace"),
                             precomputed_merkle_tree: None,
                             precomputed_merkle_root: None,
                             num_precomputed_cols: 0,
