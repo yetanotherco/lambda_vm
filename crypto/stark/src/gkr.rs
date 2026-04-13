@@ -389,12 +389,15 @@ fn evaluate_mle<E: IsField>(
 pub fn gkr_prove<E: IsField>(
     tree: &[SummationLayer<E>],
     transcript: &mut impl IsTranscript<E>,
-) -> (
-    GkrProof<E>,
-    Vec<FieldElement<E>>,
-    FieldElement<E>,
-    FieldElement<E>,
-) {
+) -> Result<
+    (
+        GkrProof<E>,
+        Vec<FieldElement<E>>,
+        FieldElement<E>,
+        FieldElement<E>,
+    ),
+    GkrError,
+> {
     assert!(!tree.is_empty(), "tree must have at least one layer");
 
     let num_layers = tree.len(); // layers 0..num_layers-1, root is at num_layers-1
@@ -408,8 +411,10 @@ pub fn gkr_prove<E: IsField>(
     let root_n = &root.numerators[0];
     let root_d = &root.denominators[0];
 
-    // Compute claimed_sum = root_n / root_d
-    let root_d_inv = root_d.inv().expect("root denominator must be nonzero");
+    // Compute claimed_sum = root_n / root_d. root_d = 0 means the LogUp challenge z
+    // collided with a fingerprint denominator (probability ~1/p ≈ 2^{-64}); return
+    // an error rather than panicking so the caller can retry with a fresh transcript.
+    let root_d_inv = root_d.inv().map_err(|_| GkrError::ZeroDenominator)?;
     let claimed_sum = root_n * &root_d_inv;
 
     // Append the claimed sum to the transcript
@@ -417,7 +422,7 @@ pub fn gkr_prove<E: IsField>(
 
     // If the tree has only 1 layer (just leaves = root), no reductions needed
     if num_layers == 1 {
-        return (
+        return Ok((
             GkrProof {
                 claimed_sum,
                 layer_proofs: vec![],
@@ -425,7 +430,7 @@ pub fn gkr_prove<E: IsField>(
             vec![],
             root_n.clone(),
             root_d.clone(),
-        );
+        ));
     }
 
     let mut layer_proofs = Vec::with_capacity(num_layers - 1);
@@ -992,7 +997,7 @@ pub fn gkr_prove<E: IsField>(
         }
     }
 
-    (
+    Ok((
         GkrProof {
             claimed_sum,
             layer_proofs,
@@ -1000,10 +1005,10 @@ pub fn gkr_prove<E: IsField>(
         current_point,
         n_claim,
         d_claim,
-    )
+    ))
 }
 
-/// Errors that can occur during GKR verification.
+/// Errors that can occur during GKR proving or verification.
 #[derive(Debug, Clone)]
 pub enum GkrError {
     /// The summation tree structure is invalid.
@@ -1015,6 +1020,9 @@ pub enum GkrError {
     /// The claimed sum does not match (unused in the verifier itself,
     /// but available for callers that compare the claimed sum to an external value).
     ClaimedSumMismatch,
+    /// The root denominator is zero (LogUp challenge z collided with a fingerprint
+    /// denominator). Probability ~1/p ≈ 2^{-64}; prover should sample a new transcript.
+    ZeroDenominator,
 }
 
 impl fmt::Display for GkrError {
@@ -1031,6 +1039,12 @@ impl fmt::Display for GkrError {
             }
             GkrError::ClaimedSumMismatch => {
                 write!(f, "claimed sum mismatch")
+            }
+            GkrError::ZeroDenominator => {
+                write!(
+                    f,
+                    "GKR root denominator is zero (LogUp challenge z collided with a fingerprint denominator; probability ~1/p ≈ 2^{{-64}})"
+                )
             }
         }
     }
@@ -1069,7 +1083,7 @@ pub fn gkr_verify<E: IsField>(
     // Step 2: Initialize claims.
     // The verifier sets n_claim = claimed_sum, d_claim = 1.
     // This represents the same rational value as root_n/root_d.
-    // Soundness of the first (trivial) layer is enforced by later sumcheck layers.
+    // Trivial layers (0 sumcheck rounds) are gate-checked directly in the loop below.
     let mut n_claim = proof.claimed_sum.clone();
     let mut d_claim = FieldElement::<E>::one();
     let mut current_point: Vec<FieldElement<E>> = vec![];
@@ -2400,7 +2414,8 @@ mod tests {
         let tree = build_summation_tree(nums, dens);
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, final_point, final_n_claim, final_d_claim) = gkr_prove(&tree, &mut transcript);
+        let (proof, final_point, final_n_claim, final_d_claim) =
+            gkr_prove(&tree, &mut transcript).unwrap();
 
         // claimed_sum = 68/55
         let expected_sum = &FE::from(68u64) * &FE::from(55u64).inv().unwrap();
@@ -2451,7 +2466,8 @@ mod tests {
         let tree = build_summation_tree(nums.clone(), dens.clone());
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, final_point, final_n_claim, final_d_claim) = gkr_prove(&tree, &mut transcript);
+        let (proof, final_point, final_n_claim, final_d_claim) =
+            gkr_prove(&tree, &mut transcript).unwrap();
 
         // claimed_sum = root_n / root_d = 1136 / 384
         let expected_sum = &FE::from(1136u64) * &FE::from(384u64).inv().unwrap();
@@ -2505,7 +2521,7 @@ mod tests {
         let expected_sum = root_n * &root_d.inv().unwrap();
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, _, _, _) = gkr_prove(&tree, &mut transcript);
+        let (proof, _, _, _) = gkr_prove(&tree, &mut transcript).unwrap();
 
         assert_eq!(proof.claimed_sum, expected_sum);
     }
@@ -2520,7 +2536,8 @@ mod tests {
         let tree = build_summation_tree(nums.clone(), dens.clone());
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, final_point, final_n_claim, final_d_claim) = gkr_prove(&tree, &mut transcript);
+        let (proof, final_point, final_n_claim, final_d_claim) =
+            gkr_prove(&tree, &mut transcript).unwrap();
 
         // Should have 3 layer proofs
         assert_eq!(proof.layer_proofs.len(), 3);
@@ -2553,7 +2570,8 @@ mod tests {
         let tree = build_summation_tree(nums.clone(), dens.clone());
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAB]);
-        let (proof, final_point, final_n_claim, final_d_claim) = gkr_prove(&tree, &mut transcript);
+        let (proof, final_point, final_n_claim, final_d_claim) =
+            gkr_prove(&tree, &mut transcript).unwrap();
 
         // Should have 4 layer proofs
         assert_eq!(proof.layer_proofs.len(), 4);
@@ -2586,10 +2604,10 @@ mod tests {
         let tree = build_summation_tree(nums, dens);
 
         let mut t1 = DefaultTranscript::<GoldilocksField>::new(&[0x42]);
-        let (proof1, point1, n1, d1) = gkr_prove(&tree, &mut t1);
+        let (proof1, point1, n1, d1) = gkr_prove(&tree, &mut t1).unwrap();
 
         let mut t2 = DefaultTranscript::<GoldilocksField>::new(&[0x42]);
-        let (proof2, point2, n2, d2) = gkr_prove(&tree, &mut t2);
+        let (proof2, point2, n2, d2) = gkr_prove(&tree, &mut t2).unwrap();
 
         assert_eq!(proof1.claimed_sum, proof2.claimed_sum);
         assert_eq!(point1, point2);
@@ -2635,7 +2653,7 @@ mod tests {
         // Re-run the protocol manually to extract the combined_claim at each layer
         // and verify the sumcheck round poly sum
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, _, _, _) = gkr_prove(&tree, &mut transcript);
+        let (proof, _, _, _) = gkr_prove(&tree, &mut transcript).unwrap();
 
         // Replay transcript to get the same challenges
         let mut replay = DefaultTranscript::<GoldilocksField>::new(&[]);
@@ -2700,7 +2718,8 @@ mod tests {
         let tree = build_summation_tree(nums, dens);
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, final_point, final_n_claim, final_d_claim) = gkr_prove(&tree, &mut transcript);
+        let (proof, final_point, final_n_claim, final_d_claim) =
+            gkr_prove(&tree, &mut transcript).unwrap();
 
         assert_eq!(proof.claimed_sum, FE::from(6u64)); // 42/7 = 6
         assert_eq!(proof.layer_proofs.len(), 0);
@@ -2732,7 +2751,8 @@ mod tests {
 
         // Prove
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
-        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Verify with a fresh transcript (same seed)
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
@@ -2772,7 +2792,8 @@ mod tests {
 
         // Prove
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
-        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Verify with a fresh transcript (same seed)
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
@@ -2818,7 +2839,7 @@ mod tests {
 
         // Prove with correct claimed_sum
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
-        let (mut proof, _, _, _) = gkr_prove(&tree, &mut prover_transcript);
+        let (mut proof, _, _, _) = gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Tamper with the claimed_sum
         proof.claimed_sum = &proof.claimed_sum + &FE::one();
@@ -2837,6 +2858,52 @@ mod tests {
     }
 
     #[test]
+    fn test_gkr_verify_trivial_layer_gate_check_rejected() {
+        // A 4-leaf tree produces:
+        //   layer_proofs[0]: trivial (root→layer1, parent_num_vars=0, round_polys=[])
+        //   layer_proofs[1]: non-trivial (layer1→leaves, parent_num_vars=1)
+        //
+        // Tamper with child_claims of the trivial layer_proofs[0] and assert
+        // that gkr_verify returns GkrError::GateCheckFailed.
+        let nums = vec![
+            FE::from(1u64),
+            FE::from(3u64),
+            FE::from(5u64),
+            FE::from(7u64),
+        ];
+        let dens = vec![
+            FE::from(2u64),
+            FE::from(4u64),
+            FE::from(6u64),
+            FE::from(8u64),
+        ];
+        let tree = build_summation_tree(nums, dens);
+
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xC0]);
+        let (mut proof, _, _, _) = gkr_prove(&tree, &mut prover_transcript).unwrap();
+
+        // layer_proofs[0] is the trivial layer: round_polys must be empty
+        assert!(
+            proof.layer_proofs[0].sumcheck_proof.round_polys.is_empty(),
+            "layer_proofs[0] must be the trivial layer for a 4-leaf tree"
+        );
+
+        // Corrupt nl (child_claims[0]) by adding 1 — this breaks the gate equation
+        // n_claim*(dl*dr) = nl*dr + nr*dl without altering the transcript ordering
+        proof.layer_proofs[0].child_claims[0] =
+            proof.layer_proofs[0].child_claims[0].clone() + FE::one();
+
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xC0]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(
+            matches!(result, Err(GkrError::GateCheckFailed { layer: 0 })),
+            "Tampered trivial-layer child_claims must be rejected with GateCheckFailed {{ layer: 0 }}, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_gkr_prove_verify_roundtrip_16() {
         // 16 leaves with various fractions
         // Tree: 5 layers (sizes 16, 8, 4, 2, 1)
@@ -2846,7 +2913,8 @@ mod tests {
 
         // Prove
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
-        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Verify with a fresh transcript (same seed)
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
@@ -2885,7 +2953,8 @@ mod tests {
 
         // Prove
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0x5F, 0x00]);
-        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Verify with a fresh transcript (same seed)
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0x5F, 0x00]);
@@ -2922,7 +2991,8 @@ mod tests {
         let tree = build_summation_tree(nums.clone(), dens.clone());
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xBB]);
-        let (proof, prover_point, prover_n, prover_d) = gkr_prove(&tree, &mut prover_transcript);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xBB]);
         let result = gkr_verify(&proof, &mut verifier_transcript);

@@ -2384,9 +2384,8 @@ where
 // LogUp-GKR Integration
 // =============================================================================
 
-use crate::gkr::{GkrProof, Layer, build_summation_tree, gen_layers, gkr_prove};
+use crate::gkr::{GkrProof, Layer, gen_layers};
 use crate::lagrange_kernel::{compute_lagrange_kernel, eval_mle_base_with_kernel};
-use crypto::fiat_shamir::is_transcript::IsTranscript;
 
 /// Result of running the LogUp-GKR sub-protocol for a single table.
 ///
@@ -2844,115 +2843,6 @@ where
     LogUpGkrResult {
         table_contribution,
         gkr_proof: None,
-        random_point,
-        n_claim,
-        d_claim,
-        column_claims,
-        lagrange_kernel: kernel,
-    }
-}
-
-/// Run the LogUp-GKR sub-protocol for a single table's bus interactions.
-///
-/// This function:
-/// 1. Computes per-row leaf fractions (numerator, denominator) from interactions
-/// 2. Builds a binary summation tree over the leaf fractions
-/// 3. Runs the GKR protocol to prove the summation tree root
-/// 4. Extracts MLE claims for each distinct main trace column at the GKR random point
-///
-/// The GKR proof replaces the traditional per-row accumulated column with a
-/// logarithmic-depth interactive proof, reducing auxiliary trace columns.
-pub fn run_logup_gkr<F, E>(
-    interactions: &[BusInteraction],
-    main_segment_cols: &[Vec<FieldElement<F>>],
-    trace_len: usize,
-    challenges: &[FieldElement<E>],
-    transcript: &mut impl IsTranscript<E>,
-) -> LogUpGkrResult<E>
-where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    // Step 1: Compute per-row leaf fractions
-    let (numerators, denominators) =
-        compute_logup_leaf_fractions(interactions, main_segment_cols, trace_len, challenges);
-
-    // Step 2: Build the summation tree
-    let tree = build_summation_tree(numerators, denominators);
-
-    // Step 3: Run the GKR protocol
-    let (gkr_proof, random_point, n_claim, d_claim) = gkr_prove(&tree, transcript);
-
-    let table_contribution = gkr_proof.claimed_sum.clone();
-
-    // Step 4: Extract column claims — compute MLE at the random point for each
-    // distinct main trace column index referenced by any interaction.
-    let mut seen_cols = std::collections::HashSet::new();
-    for inter in interactions {
-        for val in &inter.values {
-            for col_idx in val.column_indices() {
-                seen_cols.insert(col_idx);
-            }
-        }
-        // Also collect column indices from multiplicities
-        match &inter.multiplicity {
-            Multiplicity::One => {}
-            Multiplicity::Column(c) => {
-                seen_cols.insert(*c);
-            }
-            Multiplicity::Sum(a, b) => {
-                seen_cols.insert(*a);
-                seen_cols.insert(*b);
-            }
-            Multiplicity::Negated(c) => {
-                seen_cols.insert(*c);
-            }
-            Multiplicity::Diff(a, b) => {
-                seen_cols.insert(*a);
-                seen_cols.insert(*b);
-            }
-            Multiplicity::Sum3(a, b, c) => {
-                seen_cols.insert(*a);
-                seen_cols.insert(*b);
-                seen_cols.insert(*c);
-            }
-            Multiplicity::Linear(terms) => {
-                for term in terms {
-                    match term {
-                        LinearTerm::Column { column, .. } => {
-                            seen_cols.insert(*column);
-                        }
-                        LinearTerm::ColumnUnsigned { column, .. } => {
-                            seen_cols.insert(*column);
-                        }
-                        LinearTerm::Constant(_) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    let mut col_indices: Vec<usize> = seen_cols.into_iter().collect();
-    col_indices.sort_unstable();
-
-    // Compute kernel once and reuse for all column claims (and later for aux trace)
-    let kernel = compute_lagrange_kernel(&random_point);
-
-    #[cfg(feature = "parallel")]
-    let col_iter = col_indices.into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let col_iter = col_indices.into_iter();
-
-    let column_claims: Vec<(usize, FieldElement<E>)> = col_iter
-        .map(|col_idx| {
-            let claim = eval_mle_base_with_kernel(&main_segment_cols[col_idx], &kernel);
-            (col_idx, claim)
-        })
-        .collect();
-
-    LogUpGkrResult {
-        table_contribution,
-        gkr_proof: Some(gkr_proof),
         random_point,
         n_claim,
         d_claim,

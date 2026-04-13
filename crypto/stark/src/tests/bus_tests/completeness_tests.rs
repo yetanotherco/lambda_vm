@@ -531,3 +531,46 @@ fn test_bus_value_features() {
         &FieldElement::zero(),
     ));
 }
+
+/// Single-table prove+verify via Prover::prove and Verifier::verify (regression for BUG-014).
+///
+/// Verifies that batch_gkr_proof is propagated through the single-proof path:
+/// Prover::prove must embed it in StarkProof, and Verifier::verify must accept it.
+///
+/// The CPU table with all-zero multiplicity columns (add_flag=mul_flag=0) has
+/// a GKR claimed_sum of 0 per bus, so the bus balance (sum = 0) holds without
+/// a corresponding receiver table.
+#[test_log::test]
+fn test_single_table_prove_verify_with_gkr() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4], // add_flag = 0: no sends to ADD bus
+            vec![FE::zero(); 4], // mul_flag = 0: no sends to MUL bus
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+
+    let proof = Prover::prove(
+        &cpu_air,
+        &mut cpu_trace,
+        &(),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover::prove must succeed for a GKR-backed AIR");
+
+    assert!(
+        proof.batch_gkr_proof.is_some(),
+        "batch_gkr_proof must be propagated by Prover::prove (BUG-014 regression)"
+    );
+
+    assert!(
+        Verifier::verify(&proof, &cpu_air, &mut DefaultTranscript::<E>::new(&[]),),
+        "Verifier::verify must accept a proof produced by Prover::prove for a GKR-backed AIR"
+    );
+}
