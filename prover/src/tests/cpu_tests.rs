@@ -5,7 +5,10 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables::cpu::{
+    CpuOperation, bus_interactions, bus_interactions_bitwise_chip,
+    bus_interactions_without_bitwise_bytes, cols, generate_cpu_trace,
+};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{DecodeEntry, FE};
 
@@ -332,6 +335,72 @@ fn test_bus_interactions_count() {
     // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
     // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 68
     assert_eq!(interactions.len(), 68);
+}
+
+/// Verify the interaction counts after the CPU/CPU_BITWISE split match the expected values.
+///
+/// | Function                            | Interactions | Eff. width (74 + 3×n) |
+/// |-------------------------------------|:------------:|:---------------------:|
+/// | bus_interactions()                  |      68      |          278          |
+/// | bus_interactions_without_bitwise_bytes() |   44      |          206          |
+/// | bus_interactions_bitwise_chip()     |      60      |          254          |
+#[test]
+fn test_bus_interactions_split_counts() {
+    assert_eq!(bus_interactions_without_bitwise_bytes().len(), 44);
+    assert_eq!(bus_interactions_bitwise_chip().len(), 60);
+}
+
+/// Verify that AND_BYTE, OR_BYTE, and XOR_BYTE interactions are exclusive to
+/// CPU_BITWISE: absent from the main CPU, present in the bitwise chip.
+///
+/// This is the invariant that was violated when MSB16 was initially missing
+/// from bus_interactions_bitwise_chip — adding a new bus ID to bus_interactions()
+/// requires manually deciding which chip it belongs to.
+#[test]
+fn test_bus_interactions_bitwise_exclusivity() {
+    use std::collections::HashSet;
+
+    let and_id: u64 = crate::tables::types::BusId::AndByte.into();
+    let or_id: u64 = crate::tables::types::BusId::OrByte.into();
+    let xor_id: u64 = crate::tables::types::BusId::XorByte.into();
+    let bitwise_byte_ids: HashSet<u64> = [and_id, or_id, xor_id].into();
+
+    let cpu_ids: HashSet<u64> = bus_interactions_without_bitwise_bytes()
+        .iter()
+        .map(|i| i.bus_id)
+        .collect();
+    let bitwise_ids: HashSet<u64> = bus_interactions_bitwise_chip()
+        .iter()
+        .map(|i| i.bus_id)
+        .collect();
+
+    // AND/OR/XOR byte IDs must be absent from the main CPU chip.
+    for id in &bitwise_byte_ids {
+        assert!(
+            !cpu_ids.contains(id),
+            "bus_id {id} (AND/OR/XOR byte) should not appear in bus_interactions_without_bitwise_bytes"
+        );
+    }
+
+    // AND/OR/XOR byte IDs must be present in the bitwise chip.
+    for id in &bitwise_byte_ids {
+        assert!(
+            bitwise_ids.contains(id),
+            "bus_id {id} (AND/OR/XOR byte) must be present in bus_interactions_bitwise_chip"
+        );
+    }
+
+    // Every other ID in the bitwise chip must also appear in the main CPU chip
+    // (shared interactions such as DECODE, IS_BYTE, MSB16, MEMW).
+    for id in &bitwise_ids {
+        if bitwise_byte_ids.contains(id) {
+            continue;
+        }
+        assert!(
+            cpu_ids.contains(id),
+            "bus_id {id} is in bus_interactions_bitwise_chip but missing from bus_interactions_without_bitwise_bytes — was it added to bus_interactions() without updating both split functions?"
+        );
+    }
 }
 
 #[test]
