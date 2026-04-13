@@ -1913,6 +1913,16 @@ pub fn gkr_verify_batch<E: IsField>(
 
     let max_layers = *n_layers_by_instance.iter().max().unwrap();
 
+    if proof.layer_proofs.len() != max_layers {
+        return Err(GkrError::InvalidTree {
+            reason: format!(
+                "expected {} layer proofs but got {}",
+                max_layers,
+                proof.layer_proofs.len(),
+            ),
+        });
+    }
+
     // Track per-instance state
     let mut n_claims: Vec<Option<FieldElement<E>>> = vec![None; n_instances];
     let mut d_claims: Vec<Option<FieldElement<E>>> = vec![None; n_instances];
@@ -1962,6 +1972,17 @@ pub fn gkr_verify_batch<E: IsField>(
         }
 
         let round_polys = &layer_proof.sumcheck_proof.round_polys;
+
+        if layer_proof.child_claims_by_instance.len() < active_instances.len() {
+            return Err(GkrError::InvalidTree {
+                reason: format!(
+                    "layer {}: child_claims_by_instance has {} entries but {} active instances",
+                    layer_idx,
+                    layer_proof.child_claims_by_instance.len(),
+                    active_instances.len(),
+                ),
+            });
+        }
 
         if round_polys.is_empty() {
             // Trivial layer: no sumcheck needed
