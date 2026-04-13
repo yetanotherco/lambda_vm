@@ -49,6 +49,7 @@ use super::memw_aligned;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
+use super::register_reload::{self, RegisterReloadOp};
 use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
@@ -341,6 +342,7 @@ fn collect_ops_from_cpu(
     Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
+    Vec<RegisterReloadOp>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -348,6 +350,7 @@ fn collect_ops_from_cpu(
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
+    let mut reload_ops: Vec<RegisterReloadOp> = Vec::new();
     let mut current_commit_index = 0u32;
     let mut commit_ecall_count = 0u32;
 
@@ -368,7 +371,8 @@ fn collect_ops_from_cpu(
         // Register accesses (rs1, rs2, rd, PC): populate on-Main prev_ts/prev_val
         // columns AND update register_state. No MEMW operations are produced —
         // the CPU chip emits the Memory bus interactions directly.
-        track_register_ops_from_cpu(op, register_state);
+        // Phase 4: reload ops bridge large timestamp gaps (>MAX_REG_GAP).
+        track_register_ops_from_cpu(op, register_state, &mut reload_ops);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -434,6 +438,7 @@ fn collect_ops_from_cpu(
         shift_ops,
         bitwise_ops,
         commit_ops,
+        reload_ops,
     )
 }
 
@@ -539,6 +544,52 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
+/// Maximum timestamp gap allowed before inserting a register reload step.
+///
+/// The CPU chip's IS_HALF range checks require deltas that fit in 16 bits:
+///   - rs1: IS_HALF[TIMESTAMP - RS1_PREV_TS - 1] ≤ 65535  → max gap = 65536
+///   - rs2: IS_HALF[TIMESTAMP - RS2_PREV_TS]     ≤ 65535  → max gap = 65535
+///   - rd:  IS_HALF[TIMESTAMP - RD_PREV_TS  + 1] ≤ 65535  → max gap = 65534
+///   - PC:  IS_HALF[TIMESTAMP - PC_PREV_TS]      ≤ 65535  → max gap = 65535
+///
+/// We use 65534 (the most restrictive, for rd) uniformly across all register
+/// types. This may add one extra reload step for rs1 at the boundary, but
+/// keeps the implementation uniform and correct for all cases.
+const MAX_REG_GAP: u64 = 65534;
+
+/// Generates register reload ops to bridge a large timestamp gap.
+///
+/// If `curr_ts - prev_ts > MAX_REG_GAP`, inserts intermediate reload steps
+/// (each at most MAX_REG_GAP timestamps apart) and returns the effective
+/// previous timestamp to use in the CPU column.
+///
+/// For each reload step: prove-old at `old_ts`, assume-new at `new_ts`,
+/// keeping the register value unchanged.
+fn bridge_timestamp_gap(
+    reg_idx: u8,
+    prev_ts: u64,
+    curr_ts: u64,
+    value: u64,
+    reload_ops: &mut Vec<RegisterReloadOp>,
+) -> u64 {
+    let val_lo = (value & 0xFFFF_FFFF) as u32;
+    let val_hi = (value >> 32) as u32;
+
+    let mut ts = prev_ts;
+    while curr_ts.saturating_sub(ts) > MAX_REG_GAP {
+        let next_ts = ts + MAX_REG_GAP;
+        reload_ops.push(RegisterReloadOp {
+            reg_idx,
+            old_ts: ts,
+            new_ts: next_ts,
+            val_lo,
+            val_hi,
+        });
+        ts = next_ts;
+    }
+    ts // effective prev_ts for the CPU column
+}
+
 /// Tracks register read/write operations (rs1, rs2, rd, PC) for the Registers
 /// on-Main optimization.
 ///
@@ -550,25 +601,34 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 ///   2. Updates `register_state` so subsequent ops (including this op's own
 ///      dependent accesses, and COMMIT / HALT paths that still run later) see
 ///      the post-access state.
+///   3. Phase 4: for gaps > MAX_REG_GAP, inserts reload ops into `reload_ops`
+///      and sets prev_ts to the last intermediate timestamp so the CPU IS_HALF
+///      check stays within [0, 65535].
 ///
 /// Per-instruction memory timestamps match the CPU chip's sends:
 ///   - rs1 read  at timestamp + 0 (if READ_REGISTER1 && rs1 != 0)
 ///   - rs2 read  at timestamp + 1 (if READ_REGISTER2 && rs2 != 0)
 ///   - rd  write at timestamp + 2 (if WRITE_REGISTER && rd != 0)
 ///   - PC  read-write at timestamp + 1 (every non-padding row)
-fn track_register_ops_from_cpu(op: &mut CpuOperation, register_state: &mut RegisterState) {
+fn track_register_ops_from_cpu(
+    op: &mut CpuOperation,
+    register_state: &mut RegisterState,
+    reload_ops: &mut Vec<RegisterReloadOp>,
+) {
     let d = &op.decode;
 
     // rs1 read @ ts + 0
     // Guards match CPU column: READ_REGISTER1 = d.read_register1 && rs1 != 0.
     // x255 (PC) is stored in register_state.pc_register, not regs[].
     if d.read_register1 && d.rs1 != 0 {
-        let (_old_val, old_ts) = if d.rs1 == 255 {
+        let (old_val, old_ts) = if d.rs1 == 255 {
             register_state.read_pc()
         } else {
             register_state.read(d.rs1)
         };
-        op.rs1_prev_ts = old_ts;
+        let effective_prev_ts =
+            bridge_timestamp_gap(d.rs1, old_ts, op.timestamp, old_val, reload_ops);
+        op.rs1_prev_ts = effective_prev_ts;
         if d.rs1 == 255 {
             register_state.write_pc(op.rv1, op.timestamp);
         } else {
@@ -578,8 +638,10 @@ fn track_register_ops_from_cpu(op: &mut CpuOperation, register_state: &mut Regis
 
     // rs2 read @ ts + 1
     if d.read_register2 && d.rs2 != 0 {
-        let (_old_val, old_ts) = register_state.read(d.rs2);
-        op.rs2_prev_ts = old_ts;
+        let (old_val, old_ts) = register_state.read(d.rs2);
+        let effective_prev_ts =
+            bridge_timestamp_gap(d.rs2, old_ts, op.timestamp, old_val, reload_ops);
+        op.rs2_prev_ts = effective_prev_ts;
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
 
@@ -587,7 +649,9 @@ fn track_register_ops_from_cpu(op: &mut CpuOperation, register_state: &mut Regis
     // prev_val is needed here to prove the old state on the Memory bus.
     if d.write_register && d.rd != 0 {
         let (old_val, old_ts) = register_state.read(d.rd);
-        op.rd_prev_ts = old_ts;
+        let effective_prev_ts =
+            bridge_timestamp_gap(d.rd, old_ts, op.timestamp, old_val, reload_ops);
+        op.rd_prev_ts = effective_prev_ts;
         op.rd_prev_val_lo = (old_val & 0xFFFF_FFFF) as u32;
         op.rd_prev_val_hi = (old_val >> 32) as u32;
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
@@ -595,8 +659,10 @@ fn track_register_ops_from_cpu(op: &mut CpuOperation, register_state: &mut Regis
 
     // PC (x255) read-write @ ts + 1 — always, for every non-padding row.
     {
-        let (_pc_val, pc_ts) = register_state.read_pc();
-        op.pc_prev_ts = pc_ts;
+        let (pc_val, pc_ts) = register_state.read_pc();
+        let effective_pc_prev_ts =
+            bridge_timestamp_gap(255, pc_ts, op.timestamp, pc_val, reload_ops);
+        op.pc_prev_ts = effective_pc_prev_ts;
         register_state.write_pc(op.next_pc, op.timestamp + 1);
     }
 }
@@ -1645,6 +1711,10 @@ pub struct Traces {
 
     /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// REGISTER_RELOAD table for bridging large timestamp gaps in register accesses.
+    /// Empty (padding-only) for programs where all register gaps fit in 16 bits.
+    pub register_reload: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1821,7 +1891,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, reload_ops) =
             collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -1984,6 +2054,7 @@ impl Traces {
         // Generate remaining traces in parallel (page, register, halt, commit).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let commit_trace = commit::generate_commit_trace(&commit_ops);
+        let register_reload_trace = register_reload::generate_register_reload_trace(&reload_ops);
         let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
@@ -2035,6 +2106,7 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            register_reload: register_reload_trace,
         })
     }
 
@@ -2062,7 +2134,7 @@ impl Traces {
         // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops, reload_ops) =
             collect_ops_from_cpu(&mut cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -2198,6 +2270,8 @@ impl Traces {
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
             chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        let register_reload_trace =
+            register_reload::generate_register_reload_trace(&reload_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -2259,6 +2333,7 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            register_reload: register_reload_trace,
         })
     }
 

@@ -59,6 +59,9 @@ use crate::tables::page::{bus_interactions as page_bus_interactions, cols as pag
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
 };
+use crate::tables::register_reload::{
+    bus_interactions as register_reload_bus_interactions, cols as register_reload_cols,
+};
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
 };
@@ -768,4 +771,27 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
+}
+
+/// Create REGISTER_RELOAD AIR with bus interactions.
+///
+/// The REGISTER_RELOAD table bridges large timestamp gaps for register accesses
+/// by providing intermediate Memory bus prove-old/assume-new token pairs.
+/// This prevents IS_HALF overflow when a register goes unaccessed for more
+/// than MAX_REG_GAP (65534) timestamps.
+pub fn create_register_reload_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: register_reload_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        register_reload_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("REGISTER_RELOAD")
 }

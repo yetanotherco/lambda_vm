@@ -35,6 +35,7 @@ pub mod memw_aligned;
 pub mod mul;
 pub mod page;
 pub mod register;
+pub mod register_reload;
 pub mod shift;
 pub mod trace_builder;
 
