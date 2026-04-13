@@ -1740,6 +1740,99 @@ pub struct Traces {
     pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
+impl Traces {
+    /// Print a per-table row count report (including chunked tables).
+    /// Also prints total rows for each table type.
+    pub fn print_row_report(&self) {
+        fn sum_rows(tables: &[TraceTable<GoldilocksField, GoldilocksExtension>]) -> usize {
+            tables.iter().map(|t| t.num_rows()).sum()
+        }
+
+        eprintln!("=== Trace row report ===");
+        eprintln!(
+            "CPU          chunks={:>4} total_rows={:>12}",
+            self.cpus.len(),
+            sum_rows(&self.cpus)
+        );
+        eprintln!(
+            "MEMW         chunks={:>4} total_rows={:>12}",
+            self.memws.len(),
+            sum_rows(&self.memws)
+        );
+        eprintln!(
+            "MEMW_A       chunks={:>4} total_rows={:>12}",
+            self.memw_aligneds.len(),
+            sum_rows(&self.memw_aligneds)
+        );
+        eprintln!(
+            "LOAD         chunks={:>4} total_rows={:>12}",
+            self.loads.len(),
+            sum_rows(&self.loads)
+        );
+        eprintln!(
+            "LT           chunks={:>4} total_rows={:>12}",
+            self.lts.len(),
+            sum_rows(&self.lts)
+        );
+        eprintln!(
+            "MUL          chunks={:>4} total_rows={:>12}",
+            self.muls.len(),
+            sum_rows(&self.muls)
+        );
+        eprintln!(
+            "DVRM         chunks={:>4} total_rows={:>12}",
+            self.dvrms.len(),
+            sum_rows(&self.dvrms)
+        );
+        eprintln!(
+            "SHIFT        chunks={:>4} total_rows={:>12}",
+            self.shifts.len(),
+            sum_rows(&self.shifts)
+        );
+        eprintln!(
+            "BRANCH       chunks={:>4} total_rows={:>12}",
+            self.branches.len(),
+            sum_rows(&self.branches)
+        );
+        eprintln!(
+            "BITWISE      chunks={:>4} total_rows={:>12}",
+            1,
+            self.bitwise.num_rows()
+        );
+        eprintln!(
+            "DECODE       chunks={:>4} total_rows={:>12}",
+            1,
+            self.decode.num_rows()
+        );
+        eprintln!(
+            "REGISTER     chunks={:>4} total_rows={:>12}",
+            1,
+            self.register.num_rows()
+        );
+        eprintln!(
+            "HALT         chunks={:>4} total_rows={:>12}",
+            1,
+            self.halt.num_rows()
+        );
+        eprintln!(
+            "COMMIT       chunks={:>4} total_rows={:>12}",
+            1,
+            self.commit.num_rows()
+        );
+        eprintln!(
+            "KECCAK       chunks={:>4} total_rows={:>12}",
+            1,
+            self.keccak.num_rows()
+        );
+        eprintln!(
+            "PAGE         chunks={:>4} total_rows={:>12}",
+            self.pages.len(),
+            sum_rows(&self.pages)
+        );
+        eprintln!("========================");
+    }
+}
+
 /// Chunk raw ops and generate one trace table per chunk.
 fn chunk_and_generate<T>(
     ops: &[T],

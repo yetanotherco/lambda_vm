@@ -517,6 +517,9 @@ pub fn prove_with_options(
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
+    eprintln!("Instructions executed: {}", result.logs.len());
+    traces.print_row_report();
+
     drop(result);
 
     #[cfg(feature = "disk-spill")]
