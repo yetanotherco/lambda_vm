@@ -2086,7 +2086,6 @@ pub trait IsStarkProver<
             let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
                 crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
-                trace_lde: std::time::Duration::ZERO, // LDE timing in Phase A/C (accum_r1_main/aux)
                 constraints: r2_constraints,
                 comp_decompose: r2_fft,
                 comp_commit: r2_merkle,
