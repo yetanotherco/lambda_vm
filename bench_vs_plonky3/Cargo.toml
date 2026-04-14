@@ -1,0 +1,35 @@
+[package]
+name = "bench-vs-plonky3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Lambda STARK
+stark = { path = "../crypto/stark", features = ["test-utils"] }
+crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
+math = { path = "../crypto/math", features = ["std", "lambdaworks-serde-binary"] }
+
+# Plonky3 (all 0.5.2)
+p3-air = "0.5.2"
+p3-field = "0.5.2"
+p3-goldilocks = "0.5.2"
+p3-matrix = "0.5.2"
+p3-commit = "0.5.2"
+p3-challenger = "0.5.2"
+p3-symmetric = "0.5.2"
+p3-merkle-tree = "0.5.2"
+p3-keccak = "0.5.2"
+p3-fri = "0.5.2"
+p3-uni-stark = "0.5.2"
+p3-dft = "0.5.2"
+
+[dev-dependencies]
+criterion = { version = "0.4", default-features = false }
+
+[features]
+default = []
+parallel = ["stark/parallel"]
+
+[[bench]]
+name = "stark_comparison"
+harness = false
