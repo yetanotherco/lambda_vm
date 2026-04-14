@@ -458,6 +458,12 @@ where
     ) -> std::io::Result<memmap2::Mmap> {
         use std::io::Write;
 
+        debug_assert_eq!(
+            elem_size,
+            std::mem::size_of::<T>(),
+            "elem_size must match size_of::<T>(); the `col.len() * elem_size` byte count below assumes it"
+        );
+
         let num_cols = columns.len();
         let num_rows = if num_cols > 0 { columns[0].len() } else { 0 };
         debug_assert!(
