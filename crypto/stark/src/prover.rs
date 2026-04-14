@@ -1821,6 +1821,8 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
                         trace.extract_columns_aux_into(&mut pool.aux);
+                        #[cfg(feature = "disk-spill")]
+                        trace.aux_table.advise_drop_cache();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_pool_to_lde::<FieldExtension>(
