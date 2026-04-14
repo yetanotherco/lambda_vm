@@ -113,6 +113,8 @@ pub fn print_report(
         let threshold = total.as_secs_f64() * 0.02;
         let mut others_dur = Duration::ZERO;
         let mut others_count = 0usize;
+        let mut page_others_dur = Duration::ZERO;
+        let mut page_others_count = 0usize;
 
         for (name, t) in &sorted {
             if t.total_dur.as_secs_f64() >= threshold {
@@ -123,10 +125,17 @@ pub fn print_report(
                 };
                 let label = format!("    {:<18} {:>6}", display_name, fmt_rows(t.total_rows),);
                 row_sub(&label, t.total_dur, total);
+            } else if name.starts_with("PAGE:") {
+                page_others_dur += t.total_dur;
+                page_others_count += 1;
             } else {
                 others_dur += t.total_dur;
                 others_count += 1;
             }
+        }
+        if page_others_count > 0 {
+            let label = format!("    ({page_others_count} PAGE tables)");
+            row_sub(&label, page_others_dur, total);
         }
         if others_count > 0 {
             let label = format!("    ({others_count} others)");
