@@ -3,6 +3,7 @@
 use crate::tables::bitwise;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
+use crate::tables::register_reload;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
@@ -563,5 +564,85 @@ fn test_lt_generates_bitwise_lookups() {
         row[bitwise::cols::MU_IS_HALF],
         FE::zero(),
         "IS_HALF lookup for lhs_sub_rhs[0] should have non-zero multiplicity"
+    );
+}
+
+/// Test that REGISTER_RELOAD rows are generated when a register goes unaccessed
+/// for more than MAX_REG_GAP (65534) timestamps.
+///
+/// Timeline:
+///   - x5 initialized at ts=0 (value=0, via REGISTER table init)
+///   - 16383 ADD x0, x0, x0 instructions (ts=4..65532), none touch x5
+///   - Instruction 16383 (0-indexed): ADD x6, x5, x0 — first CPU access to x5
+///     at ts = 4 * 16384 = 65536. Gap = 65536 > 65534 → one reload op for x5.
+///
+/// Row 0 of REGISTER_RELOAD must contain:
+///   reg_idx=5, old_ts=0, new_ts=65534, val_lo=0, val_hi=0
+///
+/// (x6 and x17 also each generate one reload row; total active rows ≥ 1.)
+#[test]
+fn test_register_reload_triggered_for_large_timestamp_gap() {
+    const N_NOPS: usize = 16383;
+
+    let mut logs: Vec<Log> = Vec::with_capacity(N_NOPS + 2);
+    let mut instrs: Vec<Instruction> = Vec::with_capacity(N_NOPS + 2);
+
+    // N_NOPS instructions that don't touch x5: ADD x0, x0, x0
+    for i in 0..N_NOPS as u64 {
+        logs.push(make_add_log(0x1000 + i * 4, 0, 0, 0));
+        instrs.push(Instruction::Arith {
+            dst: 0,
+            src1: 0,
+            src2: 0,
+            op: ArithOp::Add,
+        });
+    }
+
+    // Instruction N_NOPS: ADD x6, x5, x0 — first access to x5 (value=0).
+    // rs1=x5 is processed before rd=x6, so the x5 reload appears first.
+    logs.push(make_add_log(0x1000 + N_NOPS as u64 * 4, 0, 0, 0));
+    instrs.push(Instruction::Arith {
+        dst: 6,
+        src1: 5,
+        src2: 0,
+        op: ArithOp::Add,
+    });
+
+    append_ecall(&mut logs, &mut instrs);
+    let instructions = make_instructions(&logs, &instrs);
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
+
+    // Row 0: the first reload is for x5 (rs1 processed before rd=x6)
+    let reload_row = traces.register_reload.main_table.get_row(0);
+    assert_eq!(
+        reload_row[register_reload::cols::REG_IDX],
+        FE::from(5u64),
+        "reg_idx should be 5"
+    );
+    assert_eq!(
+        reload_row[register_reload::cols::OLD_TS],
+        FE::from(0u64),
+        "old_ts should be 0"
+    );
+    assert_eq!(
+        reload_row[register_reload::cols::NEW_TS],
+        FE::from(65534u64),
+        "new_ts should be MAX_REG_GAP = 65534"
+    );
+    assert_eq!(
+        reload_row[register_reload::cols::VAL_LO],
+        FE::from(0u64),
+        "val_lo should be 0"
+    );
+    assert_eq!(
+        reload_row[register_reload::cols::VAL_HI],
+        FE::from(0u64),
+        "val_hi should be 0"
+    );
+
+    // The table must have at least 2 rows (x5 reload + at least one more)
+    assert!(
+        traces.register_reload.main_table.height >= 2,
+        "register_reload table should have at least 2 rows"
     );
 }

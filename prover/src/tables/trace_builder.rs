@@ -2419,3 +2419,63 @@ impl Traces {
         Self::from_logs_trimmed(logs, instructions, max_rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::register_reload::RegisterReloadOp;
+    use super::{MAX_REG_GAP, bridge_timestamp_gap};
+
+    #[test]
+    fn test_bridge_no_reload_at_exact_gap() {
+        // gap == MAX_REG_GAP: condition `gap > MAX_REG_GAP` is false → no ops
+        let mut ops: Vec<RegisterReloadOp> = Vec::new();
+        let eff = bridge_timestamp_gap(1, 0, MAX_REG_GAP, 0, &mut ops);
+        assert!(ops.is_empty());
+        assert_eq!(eff, 0);
+    }
+
+    #[test]
+    fn test_bridge_one_reload_step() {
+        // gap == MAX_REG_GAP + 1: exactly one reload op is inserted
+        let mut ops: Vec<RegisterReloadOp> = Vec::new();
+        let prev_ts = 10;
+        let curr_ts = prev_ts + MAX_REG_GAP + 1;
+        let value: u64 = 0xDEAD_BEEF_1234_5678;
+        let eff = bridge_timestamp_gap(3, prev_ts, curr_ts, value, &mut ops);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].reg_idx, 3);
+        assert_eq!(ops[0].old_ts, prev_ts);
+        assert_eq!(ops[0].new_ts, prev_ts + MAX_REG_GAP);
+        assert_eq!(ops[0].val_lo, 0x1234_5678_u32);
+        assert_eq!(ops[0].val_hi, 0xDEAD_BEEF_u32);
+        // Effective prev_ts must leave the remaining delta ≤ MAX_REG_GAP
+        assert_eq!(eff, prev_ts + MAX_REG_GAP);
+        assert!(curr_ts - eff <= MAX_REG_GAP);
+    }
+
+    #[test]
+    fn test_bridge_three_reload_steps() {
+        // gap == 3 * MAX_REG_GAP + 1: three chained reload ops
+        let mut ops: Vec<RegisterReloadOp> = Vec::new();
+        let curr_ts = 3 * MAX_REG_GAP + 1;
+        let eff = bridge_timestamp_gap(7, 0, curr_ts, 99, &mut ops);
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].old_ts, 0);
+        assert_eq!(ops[0].new_ts, MAX_REG_GAP);
+        assert_eq!(ops[1].old_ts, MAX_REG_GAP);
+        assert_eq!(ops[1].new_ts, 2 * MAX_REG_GAP);
+        assert_eq!(ops[2].old_ts, 2 * MAX_REG_GAP);
+        assert_eq!(ops[2].new_ts, 3 * MAX_REG_GAP);
+        assert_eq!(eff, 3 * MAX_REG_GAP);
+        assert!(curr_ts - eff <= MAX_REG_GAP);
+    }
+
+    #[test]
+    fn test_bridge_zero_gap() {
+        // prev_ts == curr_ts: no ops, effective ts unchanged
+        let mut ops: Vec<RegisterReloadOp> = Vec::new();
+        let eff = bridge_timestamp_gap(0, 42, 42, 0, &mut ops);
+        assert!(ops.is_empty());
+        assert_eq!(eff, 42);
+    }
+}
