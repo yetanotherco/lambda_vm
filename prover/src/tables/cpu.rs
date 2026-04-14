@@ -298,6 +298,15 @@ pub struct CpuOperation {
 
     /// For Commit ECALLs: byte count from x12
     pub commit_count: u64,
+
+    /// Whether this ECALL is a GetPrivateInputs syscall
+    pub ecall_get_private_inputs: bool,
+
+    /// For GetPrivateInputs ECALLs: destination pointer from x10
+    pub private_input_dest: u64,
+
+    /// For GetPrivateInputs ECALLs: total byte count (length prefix + data)
+    pub private_input_len: u64,
 }
 
 impl CpuOperation {
@@ -638,6 +647,13 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        let ecall_get_private_inputs =
+            decode.op_ecall && log.src1_val == SyscallNumbers::GetPrivateInputs as u64;
+        let (private_input_dest, private_input_len) = if ecall_get_private_inputs {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
+        };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
@@ -660,6 +676,9 @@ impl CpuOperation {
             ecall_commit,
             commit_buf_addr,
             commit_count,
+            ecall_get_private_inputs,
+            private_input_dest,
+            private_input_len,
         };
 
         // Compute runtime-specific values based on instruction type

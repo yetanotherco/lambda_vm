@@ -320,12 +320,16 @@ impl Instruction {
                         dst_val = count;
                     }
                     SyscallNumbers::GetPrivateInputs => {
-                        // get private inputs
+                        // get private inputs: copy length-prefixed bytes to guest buffer
                         let pointer = registers.read(10)?;
                         let private_inputs = memory.load_private_inputs()?;
                         for (i, byte) in private_inputs.iter().enumerate() {
                             memory.store_byte(pointer + i as u64, *byte);
                         }
+                        // Capture dest pointer and byte count in the log so
+                        // the prover can replay these writes into MemoryState.
+                        src2_val = pointer;
+                        dst_val = private_inputs.len() as u64;
                     }
                     SyscallNumbers::Exit | SyscallNumbers::Halt => {
                         // halt / exit

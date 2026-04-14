@@ -513,7 +513,7 @@ pub fn prove_with_options(
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor =
-        Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
+        Executor::new(&program, private_input.clone()).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -527,7 +527,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, &private_input)?;
 
     eprintln!("Instructions executed: {}", result.logs.len());
     traces.print_row_report();
