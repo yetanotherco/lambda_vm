@@ -65,7 +65,7 @@ ref = "keccak:c:read_addr"
 [[constraints.mem]]
 kind = "template"
 tag = "ADD"
-input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "x"], "y"]], "DWordWL"]]
+input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
 output = ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"]
 iters = [["x", 0, 4], ["y", 0, 4]]
 ref = "keccak:c:state_ptr"
