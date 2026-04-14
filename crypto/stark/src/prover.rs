@@ -1562,7 +1562,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "parallel")]
             let spill_iter = air_trace_pairs.par_iter_mut();
             #[cfg(not(feature = "parallel"))]
-            let spill_iter = air_trace_pairs.iter_mut();
+            let mut spill_iter = air_trace_pairs.iter_mut();
 
             spill_iter.try_for_each(|(_, trace, _)| {
                 trace.main_table.spill_to_disk().map_err(|e| {
@@ -1887,7 +1887,7 @@ pub trait IsStarkProver<
                     .zip(pool_chunk.par_iter())
                     .enumerate();
                 #[cfg(not(feature = "parallel"))]
-                let spill_iter = spilled_chunk.iter_mut().zip(pool_chunk.iter()).enumerate();
+                let mut spill_iter = spilled_chunk.iter_mut().zip(pool_chunk.iter()).enumerate();
 
                 spill_iter.try_for_each(|(j, (spilled_opt, pool))| {
                     let idx = chunk_start + j;
