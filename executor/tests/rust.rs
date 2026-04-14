@@ -280,6 +280,22 @@ fn test_ethrex() {
 
 #[ignore = "Ignored until the vm is fast enough to run this test"]
 #[test]
+fn test_ethrex_empty_block() {
+    use guest_program::{execution::execution_program, input::ProgramInput};
+    use rkyv::rancor::Error;
+    use std::fs;
+    let inputs = fs::read("tests/ethrex_empty_block.bin").unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input).unwrap();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ethrex.elf",
+        output.encode(),
+        inputs,
+    );
+}
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
 fn test_ckzg() {
     run_program_and_check_public_output("./program_artifacts/rust/ckzg.elf", vec![1, 1], vec![]);
 }
