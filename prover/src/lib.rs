@@ -138,9 +138,6 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
-    /// Private input bytes (needed by verifier to reconstruct PAGE init data
-    /// for the private input memory region at 0xFF000000).
-    pub private_input: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -516,7 +513,7 @@ pub fn prove_with_options(
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor =
-        Executor::new(&program, private_input.clone()).map_err(|e| Error::Execution(format!("{e}")))?;
+        Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -530,7 +527,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, &private_input)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
     eprintln!("Instructions executed: {}", result.logs.len());
     traces.print_row_report();
@@ -578,7 +575,6 @@ pub fn prove_with_options(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
-        private_input,
     })
 }
 
@@ -610,11 +606,8 @@ pub fn verify_with_options(
     vm_proof.table_counts.validate()?;
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
-        &vm_proof.runtime_page_ranges,
-        &vm_proof.private_input,
-    );
+    let page_configs =
+        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
