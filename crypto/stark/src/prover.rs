@@ -1761,19 +1761,20 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let aux_iter = air_trace_pairs.iter_mut();
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
+            .map(
+                |(air, trace, _)| -> Result<Option<BusPublicInputs<FieldExtension>>, ProvingError> {
+                    if !air.has_aux_trace() {
+                        return Ok(None);
+                    }
                     let result = air.build_auxiliary_trace(*trace, &lookup_challenges);
                     #[cfg(feature = "disk-spill")]
-                    trace
-                        .spill_aux_to_disk()
-                        .expect("disk-spill aux trace after build");
-                    result
-                } else {
-                    None
-                }
-            })
-            .collect();
+                    trace.spill_aux_to_disk().map_err(|e| {
+                        ProvingError::WrongParameter(format!("disk-spill aux trace: {e}"))
+                    })?;
+                    Ok(result)
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
