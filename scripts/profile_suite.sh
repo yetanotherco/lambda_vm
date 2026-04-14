@@ -54,6 +54,10 @@ NC='\033[0m'
 FEATURES="instruments"
 $HEAP && FEATURES="jemalloc-stats,instruments"
 
+# Clear stale results so only the current run's data remains.
+$HEAP   && rm -rf /tmp/bench_heap_profile
+$TIMING && rm -rf /tmp/bench_timing_profile
+
 echo -e "${GREEN}Building CLI with $FEATURES...${NC}"
 cargo build --release -p cli --features "$FEATURES" \
     --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
