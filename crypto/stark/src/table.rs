@@ -43,26 +43,12 @@ impl std::fmt::Debug for TableMmapBacking {
     }
 }
 
-/// NOTE: compares all mmap bytes, O(n) in table size. Only used by Table's PartialEq derive.
-#[cfg(feature = "disk-spill")]
-impl PartialEq for TableMmapBacking {
-    fn eq(&self, other: &Self) -> bool {
-        self.width == other.width
-            && self.height == other.height
-            && self.elem_size == other.elem_size
-            && self.mmap[..] == other.mmap[..]
-    }
-}
-
-#[cfg(feature = "disk-spill")]
-impl Eq for TableMmapBacking {}
-
 /// A two-dimensional Table holding field elements, arranged in a row-major order.
 /// This is the basic underlying data structure used for any two-dimensional component in the
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
-#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -72,6 +58,26 @@ pub struct Table<F: IsField> {
     #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
+
+/// Element-wise comparison via `get()`, so spilled tables compare by field
+/// equality (canonicalized per `F::eq`) rather than raw mmap bytes.
+impl<F: IsField> PartialEq for Table<F> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.width != other.width || self.height != other.height {
+            return false;
+        }
+        for row in 0..self.height {
+            for col in 0..self.width {
+                if self.get(row, col) != other.get(row, col) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+impl<F: IsField> Eq for Table<F> {}
 
 impl<F: IsField> Table<F> {
     /// Crates a new Table instance from a one-dimensional array in row major order
