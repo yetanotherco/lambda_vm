@@ -774,7 +774,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1499,7 +1499,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1553,7 +1553,7 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1640,7 +1640,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();

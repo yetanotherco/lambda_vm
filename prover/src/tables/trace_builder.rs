@@ -1782,6 +1782,7 @@ impl Traces {
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
+        private_input: &[u8],
     ) -> Vec<PageConfig> {
         let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1792,6 +1793,29 @@ impl Traces {
                     base + i * page_size as u64,
                     page_size,
                 ));
+            }
+        }
+        // Add private input pages (0xFF000000+) with init data
+        if !private_input.is_empty() {
+            const PRIVATE_INPUT_START: u64 = 0xFF000000;
+            let len_bytes = (private_input.len() as u32).to_le_bytes();
+            let all_bytes: Vec<u8> = len_bytes.iter().chain(private_input.iter()).copied().collect();
+            let mut pi_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+            for (i, chunk) in all_bytes.chunks(4).enumerate() {
+                let mut padded = [0u8; 4];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                for (j, &b) in padded.iter().enumerate() {
+                    let addr = PRIVATE_INPUT_START + (i as u64 * 4) + j as u64;
+                    let pg_base = page::page_base_for_address(addr, page_size);
+                    let offset = page::offset_in_page(addr, page_size);
+                    let data = pi_page_data
+                        .entry(pg_base)
+                        .or_insert_with(|| vec![0u8; page_size]);
+                    data[offset] = b;
+                }
+            }
+            for (pg_base, init_data) in pi_page_data {
+                configs.push(PageConfig::with_data(pg_base, page_size, init_data));
             }
         }
         configs.sort_by_key(|c| c.page_base);

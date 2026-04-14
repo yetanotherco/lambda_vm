@@ -138,6 +138,9 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
+    /// Private input bytes (needed by verifier to reconstruct PAGE init data
+    /// for the private input memory region at 0xFF000000).
+    pub private_input: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -575,6 +578,7 @@ pub fn prove_with_options(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
+        private_input,
     })
 }
 
@@ -606,8 +610,11 @@ pub fn verify_with_options(
     vm_proof.table_counts.validate()?;
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &vm_proof.runtime_page_ranges,
+        &vm_proof.private_input,
+    );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
