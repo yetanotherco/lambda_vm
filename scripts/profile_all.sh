@@ -3,11 +3,23 @@
 # Output:
 #   /tmp/bench_heap_profile/<program>/
 #   /tmp/bench_timing_profile/<program>/
+#
+# Flags: --no-heap, --no-timing to skip either profile type.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+HEAP=true
+TIMING=true
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-heap)   HEAP=false; shift ;;
+        --no-timing) TIMING=false; shift ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
 
 # program env_var sizes
 # env_var="-" means fib_iterative (prebuilt ELFs, no build step)
@@ -22,8 +34,11 @@ CONFIGS=(
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-echo -e "${GREEN}Building CLI with jemalloc-stats + instruments...${NC}"
-cargo build --release -p cli --features jemalloc-stats,instruments \
+FEATURES="instruments"
+$HEAP && FEATURES="jemalloc-stats,instruments"
+
+echo -e "${GREEN}Building CLI with $FEATURES...${NC}"
+cargo build --release -p cli --features "$FEATURES" \
     --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
 
 for config in "${CONFIGS[@]}"; do
@@ -36,14 +51,18 @@ for config in "${CONFIGS[@]}"; do
         bash "$SCRIPT_DIR/build_bench_sizes.sh" "$prog" "$env_var" $sizes
     fi
 
-    bash "$SCRIPT_DIR/bench_heap_profile.sh" --no-build \
-        --program "$prog" --programs "$sizes"
+    if $HEAP; then
+        bash "$SCRIPT_DIR/bench_heap_profile.sh" --no-build \
+            --program "$prog" --programs "$sizes"
+    fi
 
-    bash "$SCRIPT_DIR/bench_timing_profile.sh" --no-build \
-        --program "$prog" --programs "$sizes"
+    if $TIMING; then
+        bash "$SCRIPT_DIR/bench_timing_profile.sh" --no-build \
+            --program "$prog" --programs "$sizes"
+    fi
 done
 
 echo ""
 echo "Results:"
-echo "  Heap:   /tmp/bench_heap_profile/<program>/"
-echo "  Timing: /tmp/bench_timing_profile/<program>/"
+$HEAP   && echo "  Heap:   /tmp/bench_heap_profile/<program>/"
+$TIMING && echo "  Timing: /tmp/bench_timing_profile/<program>/"
