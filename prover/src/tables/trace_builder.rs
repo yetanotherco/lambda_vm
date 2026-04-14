@@ -97,6 +97,31 @@ impl MemoryState {
         Self { cells }
     }
 
+    /// Pre-populate the private input region at 0xFF000000.
+    ///
+    /// Mirrors `executor::vm::memory::Memory::store_private_inputs()`:
+    /// stores a 4-byte LE length prefix followed by the raw bytes, all at timestamp=0.
+    fn load_private_inputs(&mut self, data: &[u8]) {
+        const PRIVATE_INPUT_START: u64 = 0xFF000000;
+        if data.is_empty() {
+            return;
+        }
+        // Store length as u32 LE at 0xFF000000
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        for (i, &b) in len_bytes.iter().enumerate() {
+            self.cells.insert(PRIVATE_INPUT_START + i as u64, (b, 0));
+        }
+        // Store input bytes at 0xFF000004+, 4-byte aligned (matching set_bytes_aligned)
+        let base = PRIVATE_INPUT_START + 4;
+        for (i, chunk) in data.chunks(4).enumerate() {
+            let mut bytes = [0u8; 4];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            for (j, &b) in bytes.iter().enumerate() {
+                self.cells.insert(base + (i as u64 * 4) + j as u64, (b, 0));
+            }
+        }
+    }
+
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
         self.cells.get(&address).copied().unwrap_or((0, 0))
@@ -1505,6 +1530,7 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
+    private_input: &[u8],
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1513,7 +1539,7 @@ fn generate_page_tables(
 
     let page_size = page::DEFAULT_PAGE_SIZE;
 
-    // Collect ELF page init data (needed for PageConfig::with_data)
+    // Collect init data for pages (ELF segments + private inputs)
     let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
 
     for segment in &elf.data {
@@ -1531,6 +1557,26 @@ fn generate_page_tables(
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add private input init data at 0xFF000000+
+    if !private_input.is_empty() {
+        const PRIVATE_INPUT_START: u64 = 0xFF000000;
+        let len_bytes = (private_input.len() as u32).to_le_bytes();
+        let all_bytes: Vec<u8> = len_bytes.iter().chain(private_input.iter()).copied().collect();
+        for (i, chunk) in all_bytes.chunks(4).enumerate() {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            for (j, &b) in padded.iter().enumerate() {
+                let addr = PRIVATE_INPUT_START + (i as u64 * 4) + j as u64;
+                let pg_base = page::page_base_for_address(addr, page_size);
+                let offset = page::offset_in_page(addr, page_size);
+                let page_data = elf_page_data
+                    .entry(pg_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = b;
             }
         }
     }
@@ -1806,6 +1852,7 @@ impl Traces {
         elf: &Elf,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
     ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
@@ -1829,6 +1876,7 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
+        memory_state.load_private_inputs(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
@@ -2004,7 +2052,7 @@ impl Traces {
             let ((pages_val, register_val), halt_val) = rayon::join(
                 || {
                     rayon::join(
-                        || generate_page_tables(elf, &memory_state),
+                        || generate_page_tables(elf, &memory_state, private_input),
                         || {
                             register::generate_register_trace(
                                 &register_final_state,
@@ -2023,7 +2071,7 @@ impl Traces {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
+            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state, private_input);
             pages = pages_v;
             page_configs = page_configs_v;
             register_trace =
