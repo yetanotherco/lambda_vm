@@ -39,6 +39,10 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
+///
+/// `#[repr(transparent)]` is required by the disk-spill code in
+/// `crypto/stark` (`table.rs`, `trace.rs`), which casts mmap bytes to
+/// `FieldElement<F>`.
 #[allow(clippy::derived_hash_with_manual_eq)]
 #[repr(transparent)]
 #[derive(Debug, Clone, Hash, Copy)]
