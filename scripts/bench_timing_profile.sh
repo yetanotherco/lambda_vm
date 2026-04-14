@@ -228,7 +228,7 @@ do
         steps=$(get_val "$DATA" "steps")
         val=$(get_val "$DATA" "$key")
         [ -z "$val" ] && continue
-        steps_m=$(awk "BEGIN {printf \"%.2f\", $steps / 1000000}")
+        steps_m=$(awk "BEGIN {printf \"%.6f\", $steps / 1000000}")
         PAIRS="$PAIRS $steps_m $val"
     done
 
