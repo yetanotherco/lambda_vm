@@ -34,7 +34,7 @@ desc = "the right-rotated component of `rotated_Cxz`"
 [[variables.auxiliary]]
 name = "Dxz"
 type = [["Byte", 8], 5]
-desc = "$#`Cxz[x,y,z]` xor #`rotated_Cxz[`\\(#`x` +1) mod 5#`,y,z]`$"
+desc = "$#`Cxz[`\\(#`x` - 1) mod 5#`,y,z]` xor #`rotated_Cxz[`\\(#`x` + 1) mod 5#`,y,z]`$"
 
 [[variables.auxiliary]]
 name = "theta"
