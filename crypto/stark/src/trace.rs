@@ -306,7 +306,9 @@ where
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row < backing.num_rows && col < backing.num_main_cols,
                 "get_main out of bounds: row={row}, col={col}, num_rows={}, num_main_cols={}",
                 backing.num_rows,
@@ -325,7 +327,9 @@ where
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row < backing.num_rows && col < backing.num_aux_cols,
                 "get_aux out of bounds: row={row}, col={col}, num_rows={}, num_aux_cols={}",
                 backing.num_rows,
