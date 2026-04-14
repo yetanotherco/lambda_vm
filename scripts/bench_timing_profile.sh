@@ -203,7 +203,7 @@ do
         val=$(get_val "$DATA" "$key")
         [ -z "$val" ] && continue
         [ -z "$steps" ] && continue
-        steps_m=$(awk -v s="$steps" 'BEGIN {printf "%.2f", s / 1000000}')
+        steps_m=$(awk -v s="$steps" 'BEGIN {printf "%.6f", s / 1000000}')
         PAIRS="$PAIRS $steps_m $val"
     done
 
