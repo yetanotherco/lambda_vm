@@ -105,16 +105,18 @@ jobs:
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-prover]
+    needs: [test-executor, test-prover, test-disk-spill]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
           executor="${{ needs.test-executor.result }}"
           prover="${{ needs.test-prover.result }}"
+          disk_spill="${{ needs.test-disk-spill.result }}"
 
           echo "test-executor: $executor"
           echo "test-prover: $prover"
+          echo "test-disk-spill: $disk_spill"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
@@ -123,6 +125,50 @@ jobs:
           if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
             exit 1
           fi
+          if [[ "$disk_spill" != "success" && "$disk_spill" != "skipped" ]]; then
+            exit 1
+          fi
+
+  test-disk-spill:
+    name: Disk-spill tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-disk-spill"
+          cache-all-crates: "true"
+
+      - name: Cache compiled ASM ELF artifacts
+        id: cache-asm-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/asm
+          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
+
+      - name: Install clang and lld
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Compile ASM programs to ELF
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-programs-asm
+
+      - name: Run stark disk-spill tests
+        run: |
+          cargo test --release -p stark --features disk-spill disk_spill
+
+      - name: Run prover disk-spill tests
+        run: |
+          cargo test --release -p lambda-vm-prover --features disk-spill disk_spill -- --test-threads=1
 
   build-prover-tests:
     name: Build prover tests
