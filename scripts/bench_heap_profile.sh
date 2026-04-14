@@ -180,7 +180,7 @@ for phase in $PHASES; do
             prev_val=$(grep "^${prev_phase_key}=" "$DATA" | cut -d= -f2)
             delta=$((cur - prev_val))
         fi
-        steps_m=$(awk "BEGIN {printf \"%.2f\", $steps / 1000000}")
+        steps_m=$(awk "BEGIN {printf \"%.6f\", $steps / 1000000}")
         PAIRS="$PAIRS $steps_m $delta"
     done
 
@@ -216,7 +216,7 @@ for size in $PROGRAMS; do
     steps=$(grep "^steps=" "$DATA" | cut -d= -f2)
     peak=$(grep "^peak=" "$DATA" | cut -d= -f2)
     [ -z "$peak" ] && continue
-    steps_m=$(awk "BEGIN {printf \"%.2f\", $steps / 1000000}")
+    steps_m=$(awk "BEGIN {printf \"%.6f\", $steps / 1000000}")
     PEAK_PAIRS="$PEAK_PAIRS $steps_m $peak"
 done
 
