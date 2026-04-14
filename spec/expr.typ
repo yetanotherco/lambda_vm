@@ -107,7 +107,7 @@
     "mod": (pp, rec, e) => {
       assert(e.len() == 3 and type(e.at(2)) == int, message: "Invalid mod expr: " + repr(e))
       cwrap(
-        rec(PREC.mod, e.at(1)) + `%` + rec(PREC.mod, e.at(2)), 
+        rec(PREC.mod, e.at(1)) + ` % ` + rec(PREC.mod, e.at(2)), 
         pp <= PREC.mod
       ) 
     },
