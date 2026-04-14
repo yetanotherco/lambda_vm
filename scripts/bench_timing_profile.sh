@@ -47,6 +47,8 @@ else
     fi
 fi
 
+TMP_DIR="$TMP_DIR/$PROGRAM"
+
 suffix_to_steps() {
     case $1 in
         160k) echo 160000 ;; 250k) echo 250000 ;; 372k) echo 372000 ;;
