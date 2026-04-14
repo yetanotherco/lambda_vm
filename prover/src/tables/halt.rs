@@ -36,9 +36,15 @@ pub mod cols {
     pub const TIMESTAMP_0: usize = 0;
     /// timestamp[1]: Word (upper 32 bits of halt timestamp)
     pub const TIMESTAMP_1: usize = 1;
+    /// gpi_timestamp[0]: Word (lower 32 bits of GetPrivateInputs timestamp, 0 if none)
+    pub const GPI_TIMESTAMP_0: usize = 2;
+    /// gpi_timestamp[1]: Word (upper 32 bits of GetPrivateInputs timestamp, 0 if none)
+    pub const GPI_TIMESTAMP_1: usize = 3;
+    /// Whether a GetPrivateInputs ecall occurred (0 or 1)
+    pub const HAS_GPI: usize = 4;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 2;
+    pub const NUM_COLUMNS: usize = 5;
 }
 
 // =========================================================================
@@ -52,7 +58,10 @@ pub mod cols {
 /// first ECALL, so a valid trace always contains exactly one. If a program had multiple
 /// ECALLs, the CPU would send multiple bus interactions but HALT only receives one,
 /// causing a bus imbalance and proof failure.
-pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+pub fn generate_halt_trace(
+    timestamp: u64,
+    gpi_timestamp: Option<u64>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // CPU timestamps must fit in u32 (timestamp_hi should be 0)
     debug_assert!(
         timestamp <= u32::MAX as u64,
@@ -61,7 +70,18 @@ pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, Goldil
     let timestamp_lo = timestamp & 0xFFFF_FFFF;
     let timestamp_hi = timestamp >> 32;
 
-    let data = vec![FE::from(timestamp_lo), FE::from(timestamp_hi)];
+    let (gpi_lo, gpi_hi, has_gpi) = match gpi_timestamp {
+        Some(ts) => (ts & 0xFFFF_FFFF, ts >> 32, 1u64),
+        None => (0, 0, 0),
+    };
+
+    let data = vec![
+        FE::from(timestamp_lo),
+        FE::from(timestamp_hi),
+        FE::from(gpi_lo),
+        FE::from(gpi_hi),
+        FE::from(has_gpi),
+    ];
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
@@ -158,6 +178,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::constant(93), // syscall number lo = sys_exit (93)
             BusValue::constant(0),  // syscall number hi = 0
+        ],
+    ));
+
+    // ECALL receiver for GetPrivateInputs (syscall 4).
+    // The ecall is handled internally by the executor; the prover just needs
+    // to consume the bus token so the Ecall bus balances.
+    interactions.push(BusInteraction::receiver(
+        BusId::Ecall,
+        Multiplicity::Column(cols::HAS_GPI),
+        vec![
+            BusValue::Packed {
+                start_column: cols::GPI_TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::GPI_TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(4), // syscall number lo = GetPrivateInputs (4)
+            BusValue::constant(0), // syscall number hi = 0
         ],
     ));
 

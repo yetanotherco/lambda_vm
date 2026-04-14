@@ -324,7 +324,6 @@ fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-    private_input: &[u8],
 ) -> (
     Vec<MemwOperation>,
     Vec<LoadOperation>,
@@ -359,22 +358,6 @@ fn collect_ops_from_cpu(
         // Collect register operations (M1, M3, M5)
         let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
         memw_ops.extend(reg_memw_ops);
-
-        // GetPrivateInputs ECALL: replay the byte-by-byte writes into MemoryState
-        // so subsequent loads from the guest buffer see the correct old_values.
-        if op.ecall_get_private_inputs && op.private_input_len > 0 {
-            let dest = op.private_input_dest;
-            let len = op.private_input_len as usize;
-            // The executor copies length-prefixed private input bytes to the dest pointer.
-            // We need to replicate those writes at the ECALL's timestamp.
-            let pi_bytes = private_input;
-            let len_prefix = (pi_bytes.len() as u32).to_le_bytes();
-            let all_bytes: Vec<u8> =
-                len_prefix.iter().chain(pi_bytes.iter()).copied().collect();
-            for (i, &byte) in all_bytes[..len].iter().enumerate() {
-                memory_state.write_byte(dest + i as u64, byte, op.timestamp);
-            }
-        }
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -1823,7 +1806,6 @@ impl Traces {
         elf: &Elf,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
     ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
@@ -1849,7 +1831,7 @@ impl Traces {
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state, private_input);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -1972,6 +1954,10 @@ impl Traces {
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
+        let gpi_timestamp = cpu_ops
+            .iter()
+            .find(|op| op.ecall_get_private_inputs)
+            .map(|op| op.timestamp);
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
@@ -2031,7 +2017,7 @@ impl Traces {
                         },
                     )
                 },
-                || halt::generate_halt_trace(halt_timestamp),
+                || halt::generate_halt_trace(halt_timestamp, gpi_timestamp),
             );
             let (pages_v, page_configs_v) = pages_val;
             pages = pages_v;
@@ -2046,7 +2032,7 @@ impl Traces {
             page_configs = page_configs_v;
             register_trace =
                 register::generate_register_trace(&register_final_state, elf.entry_point);
-            halt_trace = halt::generate_halt_trace(halt_timestamp);
+            halt_trace = halt::generate_halt_trace(halt_timestamp, gpi_timestamp);
         }
 
         Ok(Traces {
@@ -2096,7 +2082,7 @@ impl Traces {
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state, &[]);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -2215,6 +2201,10 @@ impl Traces {
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
+        let gpi_timestamp = cpu_ops
+            .iter()
+            .find(|op| op.ecall_get_private_inputs)
+            .map(|op| op.timestamp);
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
@@ -2262,7 +2252,7 @@ impl Traces {
         {
             let (register_val, halt_val) = rayon::join(
                 || register::generate_register_trace(&register_final_state, entry_point),
-                || halt::generate_halt_trace(halt_timestamp),
+                || halt::generate_halt_trace(halt_timestamp, gpi_timestamp),
             );
             register_trace = register_val;
             halt_trace = halt_val;
@@ -2270,7 +2260,7 @@ impl Traces {
         #[cfg(not(feature = "parallel"))]
         {
             register_trace = register::generate_register_trace(&register_final_state, entry_point);
-            halt_trace = halt::generate_halt_trace(halt_timestamp);
+            halt_trace = halt::generate_halt_trace(halt_timestamp, gpi_timestamp);
         }
 
         // Create empty PAGE tables for legacy API

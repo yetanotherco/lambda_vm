@@ -138,6 +138,9 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
+    /// Private input bytes. The verifier needs these to reconstruct the
+    /// synthetic ELF segment at 0xFF000000 for PAGE table init data.
+    pub private_input: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -474,6 +477,41 @@ pub(crate) fn compute_expected_commit_bus_balance(
 }
 
 // =============================================================================
+// Private Input Segment
+// =============================================================================
+
+/// Add a synthetic ELF segment at 0xFF000000 containing the private input data.
+///
+/// The executor stores `[len_u32_le, data...]` at 0xFF000000 before execution.
+/// Adding this as an ELF segment lets the prover's MemoryState and PAGE tables
+/// see the correct init values, so the Memory bus balances when the guest reads
+/// these bytes via GetPrivateInputs.
+fn add_private_input_segment(program: &mut Elf, private_input: &[u8]) {
+    if private_input.is_empty() {
+        return;
+    }
+    let len_bytes = (private_input.len() as u32).to_le_bytes();
+    let all_bytes: Vec<u8> = len_bytes
+        .iter()
+        .chain(private_input.iter())
+        .copied()
+        .collect();
+    let words: Vec<u32> = all_bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut buf = [0u8; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(buf)
+        })
+        .collect();
+    program.data.push(executor::elf::Segment {
+        base_addr: 0xFF000000,
+        values: words,
+        is_executable: false,
+    });
+}
+
+// =============================================================================
 // Public API: Prove / Verify
 // =============================================================================
 
@@ -511,9 +549,11 @@ pub fn prove_with_options(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let mut program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    add_private_input_segment(&mut program, &private_input);
+    let saved_private_input = private_input.clone();
     let executor =
-        Executor::new(&program, private_input.clone()).map_err(|e| Error::Execution(format!("{e}")))?;
+        Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -527,7 +567,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, &private_input)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
     eprintln!("Instructions executed: {}", result.logs.len());
     traces.print_row_report();
@@ -575,6 +615,7 @@ pub fn prove_with_options(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
+        private_input: saved_private_input,
     })
 }
 
@@ -605,7 +646,8 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let mut program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    add_private_input_segment(&mut program, &vm_proof.private_input);
     let page_configs =
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
