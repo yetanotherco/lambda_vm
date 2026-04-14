@@ -4,7 +4,9 @@
 #   /tmp/bench_heap_profile/<program>/
 #   /tmp/bench_timing_profile/<program>/
 #
-# Flags: --no-heap, --no-timing to skip either profile type.
+# Flags:
+#   --no-heap, --no-timing  skip either profile type
+#   --program <name>        run only the given program (default: all)
 
 set -euo pipefail
 
@@ -13,10 +15,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 HEAP=true
 TIMING=true
+ONLY=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-heap)   HEAP=false; shift ;;
         --no-timing) TIMING=false; shift ;;
+        --program)   ONLY="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -30,6 +34,19 @@ CONFIGS=(
     "bitwise_ops     ITERATIONS      50000 100000 200000 400000"
     "matrix_multiply SIZE            20 40 60 80"
 )
+
+if [ -n "$ONLY" ]; then
+    filtered=()
+    for config in "${CONFIGS[@]}"; do
+        read -r prog _ <<< "$config"
+        [ "$prog" = "$ONLY" ] && filtered+=("$config")
+    done
+    if [ ${#filtered[@]} -eq 0 ]; then
+        echo "Error: unknown program '$ONLY'" >&2
+        exit 1
+    fi
+    CONFIGS=("${filtered[@]}")
+fi
 
 GREEN='\033[0;32m'
 NC='\033[0m'
