@@ -1,6 +1,7 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
+  compute_nr_interactions,
   render_chip_assumptions,
   render_chip_variable_table,
   total_nr_variables,
@@ -28,8 +29,9 @@ The keccak accelerator comprises two chips: a core chip that interacts with the 
 == Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The #keccak chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #keccak chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
 == Constraints
@@ -56,8 +58,9 @@ The #keccak table can be padded to the next power of two with the following valu
 == Columns
 #let nr_variables = total_nr_variables(round_chip)
 #let nr_columns = total_nr_instantiated_columns(round_chip, config)
+#let nr_interactions = compute_nr_interactions(round_chip)
 
-The #keccak_rnd chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #keccak_rnd chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(round_chip, config)
 
 
