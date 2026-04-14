@@ -518,6 +518,13 @@ pub fn prove_with_options(
 
     drop(result);
 
+    // Spill main traces before AIR construction so the precomputed commitments
+    // (decode, register, page, bitwise) are built while traces are mmapped.
+    #[cfg(feature = "disk-spill")]
+    traces
+        .spill_all_main_to_disk()
+        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
 

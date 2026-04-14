@@ -1686,46 +1686,37 @@ impl Traces {
     /// This is a no-op for tables that are already spilled or empty.
     #[cfg(feature = "disk-spill")]
     pub fn spill_all_main_to_disk(&mut self) -> Result<(), Error> {
-        let spill = |t: &mut TraceTable<GoldilocksField, GoldilocksExtension>| {
+        #[cfg(feature = "parallel")]
+        use rayon::prelude::*;
+
+        let mut all_traces: Vec<&mut TraceTable<GoldilocksField, GoldilocksExtension>> = Vec::new();
+        all_traces.extend(self.cpus.iter_mut());
+        all_traces.push(&mut self.bitwise);
+        all_traces.extend(self.lts.iter_mut());
+        all_traces.extend(self.shifts.iter_mut());
+        all_traces.extend(self.memws.iter_mut());
+        all_traces.extend(self.memw_aligneds.iter_mut());
+        all_traces.extend(self.loads.iter_mut());
+        all_traces.push(&mut self.decode);
+        all_traces.extend(self.muls.iter_mut());
+        all_traces.extend(self.dvrms.iter_mut());
+        all_traces.extend(self.pages.iter_mut());
+        all_traces.push(&mut self.register);
+        all_traces.extend(self.branches.iter_mut());
+        all_traces.push(&mut self.halt);
+        all_traces.push(&mut self.commit);
+        all_traces.extend(self.memw_registers.iter_mut());
+
+        #[cfg(feature = "parallel")]
+        let iter = all_traces.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = all_traces.into_iter();
+
+        iter.try_for_each(|t| {
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))
-        };
-
-        for t in &mut self.cpus {
-            spill(t)?;
-        }
-        spill(&mut self.bitwise)?;
-        for t in &mut self.lts {
-            spill(t)?;
-        }
-        for t in &mut self.shifts {
-            spill(t)?;
-        }
-        for t in &mut self.memws {
-            spill(t)?;
-        }
-        for t in &mut self.loads {
-            spill(t)?;
-        }
-        spill(&mut self.decode)?;
-        for t in &mut self.muls {
-            spill(t)?;
-        }
-        for t in &mut self.dvrms {
-            spill(t)?;
-        }
-        for t in &mut self.pages {
-            spill(t)?;
-        }
-        spill(&mut self.register)?;
-        for t in &mut self.branches {
-            spill(t)?;
-        }
-        spill(&mut self.halt)?;
-        spill(&mut self.commit)?;
-
-        Ok(())
+        })
     }
 
     /// Extract page configurations from ELF only (deterministic from binary).
