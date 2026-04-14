@@ -159,6 +159,7 @@ def iters_to_text(obj: dict) -> str:
 
 # Chapters in order (from book.typ)
 CHAPTERS = [
+    ("logup", "LogUp Argument"),
     ("memory", "Memory Argument"),
     ("variables", "Variables"),
     ("signatures", "Signatures"),
@@ -166,17 +167,20 @@ CHAPTERS = [
     ("sign", "SIGN Template"),
     ("add", "ADD/SUB Template"),
     ("neg", "NEG Template"),
+    ("memw", "MEMW Chip"),
     ("decode", "DECODE Table"),
     ("cpu", "CPU Chip"),
     ("shift", "SHIFT Chip"),
     ("branch", "BRANCH Chip"),
-    ("memw", "MEMW Chip"),
     ("lt", "LT Chip"),
     ("mul", "MUL Chip"),
     ("dvrm", "DVRM Chip"),
     ("load", "LOAD Chip"),
-    ("ecall", "ECALL Chips"),
     ("bitwise", "BITWISE Chips"),
+    ("about_ecalls", "About ECALL"),
+    ("halt", "HALT Chip"),
+    ("commit", "COMMIT Chip"),
+    ("sha256", "SHA256 Accelerator"),
 ]
 
 
@@ -221,6 +225,9 @@ def parse_typst_prose(content: str) -> list:
             if current_para:
                 elements.append(('para', ' '.join(current_para)))
                 current_para = []
+            # Extract chip variable (first argument)
+            chip_var_match = re.match(r'#render_constraint_table\((\w+)', stripped)
+            chip_var = chip_var_match.group(1) if chip_var_match else None
             # Extract group names: handles both single `groups: "g"` and array `groups: ("g1", "g2")`
             groups = []
             array_match = re.search(r'groups:\s*\(([^)]*)\)', stripped)
@@ -231,7 +238,43 @@ def parse_typst_prose(content: str) -> list:
                 if single_match:
                     groups = [single_match.group(1)]
             if groups:
-                elements.append(('render_constraints', groups))
+                elements.append(('render_constraints', (chip_var, groups)))
+            else:
+                # No groups specified — render all
+                elements.append(('render_constraints', (chip_var, None)))
+            i += 1
+            continue
+
+        # Capture explicit variable/column table renders
+        if stripped.startswith('#render_chip_variable_table') or stripped.startswith('#render_chip_column_table'):
+            if current_para:
+                elements.append(('para', ' '.join(current_para)))
+                current_para = []
+            chip_var_match = re.match(r'#render_chip_(?:variable|column)_table\((\w+)', stripped)
+            chip_var = chip_var_match.group(1) if chip_var_match else None
+            elements.append(('render_variables', chip_var))
+            i += 1
+            continue
+
+        # Capture explicit assumptions renders
+        if stripped.startswith('#render_chip_assumptions'):
+            if current_para:
+                elements.append(('para', ' '.join(current_para)))
+                current_para = []
+            chip_var_match = re.match(r'#render_chip_assumptions\((\w+)', stripped)
+            chip_var = chip_var_match.group(1) if chip_var_match else None
+            elements.append(('render_assumptions', chip_var))
+            i += 1
+            continue
+
+        # Capture explicit padding table renders
+        if stripped.startswith('#render_chip_padding_table'):
+            if current_para:
+                elements.append(('para', ' '.join(current_para)))
+                current_para = []
+            chip_var_match = re.match(r'#render_chip_padding_table\((\w+)', stripped)
+            chip_var = chip_var_match.group(1) if chip_var_match else None
+            elements.append(('render_padding', chip_var))
             i += 1
             continue
 
@@ -248,13 +291,27 @@ def parse_typst_prose(content: str) -> list:
             i += 1
             continue
 
-        # Detect chip switches: #let chip = load_chip("src/foo.toml", config)
-        load_chip_match = re.match(r'#let\s+chip\s*=\s*load_chip\("([^"]+)"', stripped)
+        # Detect chip loads: #let <varname> = load_chip("src/foo.toml", config)
+        load_chip_match = re.match(r'#let\s+(\w+)\s*=\s*load_chip\("([^"]+)"', stripped)
         if load_chip_match:
             if current_para:
                 elements.append(('para', ' '.join(current_para)))
                 current_para = []
-            elements.append(('load_chip', load_chip_match.group(1)))
+            var_name = load_chip_match.group(1)
+            chip_path = load_chip_match.group(2)
+            elements.append(('load_chip', (var_name, chip_path)))
+            i += 1
+            continue
+
+        # Detect chip name aliases: #let <alias> = raw(<chipvar>.name)
+        name_alias_match = re.match(r'#let\s+(\w+)\s*=\s*raw\((\w+)\.name\)', stripped)
+        if name_alias_match:
+            if current_para:
+                elements.append(('para', ' '.join(current_para)))
+                current_para = []
+            alias = name_alias_match.group(1)
+            chip_var = name_alias_match.group(2)
+            elements.append(('name_alias', (alias, chip_var)))
             i += 1
             continue
 
@@ -266,8 +323,8 @@ def parse_typst_prose(content: str) -> list:
             i += 1
             continue
 
-        # Headings
-        if stripped.startswith('=='):
+        # Headings (= level 1, == level 2, etc.)
+        if stripped.startswith('=') and (len(stripped) == 1 or stripped[len(re.match(r'^=+', stripped).group())] == ' '):
             if current_para:
                 elements.append(('para', ' '.join(current_para)))
                 current_para = []
@@ -529,12 +586,37 @@ def render_assumptions_table(chip: dict, config: dict) -> str:
     return "\n".join(lines)
 
 
+def render_padding_table(chip: dict, config: dict) -> str:
+    """Render padding data as Markdown table."""
+    padding = chip.get("padding", {})
+    if not padding:
+        return ""
+
+    lines = []
+    lines.append("| Column | Value |")
+    lines.append("|--------|-------|")
+
+    for col_name, value in padding.items():
+        lines.append(f"| `{col_name}` | `{value}` |")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, spec_dir: Path = None) -> str:
     """Convert a chapter from .typ and .toml to Markdown."""
     lines = [f"# {title}", ""]
 
-    # Load TOML data (may be empty for multi-chip files like ecall)
-    chip = load_toml(toml_path)
+    # Load default TOML data (may be empty for prose-only or multi-chip files)
+    default_chip = load_toml(toml_path)
+
+    # Chip registry: variable_name -> chip_data
+    chips = {}
+    if default_chip:
+        chips['chip'] = default_chip
+
+    # Name alias registry: alias -> chip_var_name (from #let alias = raw(chipvar.name))
+    name_aliases = {}
 
     def reset_chip_state():
         return {
@@ -545,7 +627,29 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
             'constraint_counter': 1,
         }
 
-    state = reset_chip_state()
+    # State registry: variable_name -> render state
+    states = {}
+    if default_chip:
+        states['chip'] = reset_chip_state()
+
+    def resolve_chip(var_name):
+        """Resolve chip variable name to (chip_data, state)."""
+        if var_name and var_name in chips:
+            if var_name not in states:
+                states[var_name] = reset_chip_state()
+            return chips[var_name], states[var_name]
+        # Fallback to default 'chip' key
+        if 'chip' in chips:
+            if 'chip' not in states:
+                states['chip'] = reset_chip_state()
+            return chips['chip'], states['chip']
+        # Fallback to first loaded chip
+        if chips:
+            first_key = next(iter(chips))
+            if first_key not in states:
+                states[first_key] = reset_chip_state()
+            return chips[first_key], states[first_key]
+        return {}, reset_chip_state()
 
     # Parse Typst prose
     if typ_path.exists():
@@ -554,51 +658,73 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
 
         for elem_type, content in elements:
             if elem_type == 'load_chip':
-                # Multi-chip file: switch active chip and reset per-chip state
-                chip_toml_path = spec_dir / content if spec_dir else Path(content)
-                chip = load_toml(chip_toml_path)
-                state = reset_chip_state()
+                var_name, chip_path = content
+                chip_toml_path = spec_dir / chip_path if spec_dir else Path(chip_path)
+                chips[var_name] = load_toml(chip_toml_path)
+                states[var_name] = reset_chip_state()
                 continue
 
-            rendered_columns = state['rendered_columns']
-            rendered_assumptions = state['rendered_assumptions']
-            rendered_constraints = state['rendered_constraints']
-            rendered_constraint_groups = state['rendered_constraint_groups']
-            constraint_counter = state['constraint_counter']
+            if elem_type == 'name_alias':
+                alias, chip_var = content
+                name_aliases[alias] = chip_var
+                continue
 
             if elem_type.startswith('h'):
                 level = int(elem_type[1])
                 lines.append("")
-                # Replace Typst variable references in headings with chip name if available
                 heading_text = content
-                if chip and chip.get('name'):
-                    heading_text = re.sub(r'`[^`]*`\s*chip\b', f"`{chip['name']}` chip", heading_text)
-                lines.append("#" * level + " " + heading_text)
+                # Replace Typst variable references (#varname) with chip names
+                for alias, chip_var in name_aliases.items():
+                    if f'#{alias}' in heading_text and chip_var in chips:
+                        chip_name = chips[chip_var].get('name', alias)
+                        heading_text = heading_text.replace(f'#{alias}', f'`{chip_name}`')
+                # Offset by +1 since the chapter title already uses #
+                lines.append("#" * (level + 1) + " " + heading_text)
                 lines.append("")
 
-                # Render TOML data after relevant headings
-                content_lower = content.lower()
-                if 'column' in content_lower and chip and not rendered_columns:
-                    lines.append(render_variables_table(chip, config))
-                    state['rendered_columns'] = True
-                elif 'assumption' in content_lower and chip and not rendered_assumptions:
-                    lines.append(render_assumptions_table(chip, config))
-                    state['rendered_assumptions'] = True
-                elif content_lower == "constraints" and chip:
-                    state['rendered_constraints'] = True
+            elif elem_type == 'render_variables':
+                chip_var = content
+                chip_data, st = resolve_chip(chip_var)
+                if chip_data and not st['rendered_columns']:
+                    lines.append(render_variables_table(chip_data, config))
+                    st['rendered_columns'] = True
 
-            elif elem_type == 'render_constraints' and chip:
-                # content is a list of group names to render (in order)
-                group_names = content
-                for group_name in group_names:
-                    if group_name not in state['rendered_constraint_groups']:
-                        # Use the running render-order counter so numbering matches Typst
-                        group_table = render_constraints_table(chip, config, group_filter=group_name, skip_heading=True, start_counter=state['constraint_counter'])
-                        if group_table.strip():
-                            lines.append(group_table)
-                        state['rendered_constraint_groups'].add(group_name)
-                    # Always advance the counter for this group (rendered or already seen)
-                    state['constraint_counter'] += len(chip.get("constraints", {}).get(group_name, []))
+            elif elem_type == 'render_assumptions':
+                chip_var = content
+                chip_data, st = resolve_chip(chip_var)
+                if chip_data and not st['rendered_assumptions']:
+                    lines.append(render_assumptions_table(chip_data, config))
+                    st['rendered_assumptions'] = True
+
+            elif elem_type == 'render_padding':
+                chip_var = content
+                chip_data, st = resolve_chip(chip_var)
+                if chip_data:
+                    padding = render_padding_table(chip_data, config)
+                    if padding.strip():
+                        lines.append(padding)
+
+            elif elem_type == 'render_constraints':
+                chip_var, group_names = content
+                chip_data, st = resolve_chip(chip_var)
+                if chip_data:
+                    if group_names is None:
+                        # Render all groups
+                        group_names = [cg["name"] for cg in chip_data.get("constraint_groups", [])]
+                    for group_name in group_names:
+                        if group_name not in st['rendered_constraint_groups']:
+                            group_table = render_constraints_table(
+                                chip_data, config,
+                                group_filter=group_name,
+                                skip_heading=True,
+                                start_counter=st['constraint_counter'],
+                            )
+                            if group_table.strip():
+                                lines.append(group_table)
+                            st['rendered_constraint_groups'].add(group_name)
+                        st['constraint_counter'] += len(
+                            chip_data.get("constraints", {}).get(group_name, [])
+                        )
 
             elif elem_type == 'para':
                 lines.append(content)
@@ -608,40 +734,41 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
                 lines.append(f"> **Note:** {content}")
                 lines.append("")
 
-    # Render any TOML data that wasn't triggered by prose headings (for the last active chip)
-    rendered_columns = state['rendered_columns']
-    rendered_assumptions = state['rendered_assumptions']
-    rendered_constraints = state['rendered_constraints']
-    rendered_constraint_groups = state['rendered_constraint_groups']
-    constraint_counter = state['constraint_counter']
+    # Fallback: render any TOML data not yet triggered by explicit render calls
+    for var_name, chip_data in chips.items():
+        if var_name not in states:
+            states[var_name] = reset_chip_state()
+        st = states[var_name]
 
-    if chip:
-        if chip.get("variables") and not rendered_columns:
+        if chip_data.get("variables") and not st['rendered_columns']:
             lines.append("## Columns")
             lines.append("")
-            lines.append(render_variables_table(chip, config))
+            lines.append(render_variables_table(chip_data, config))
 
-        if chip.get("assumptions") and not rendered_assumptions:
+        if chip_data.get("assumptions") and not st['rendered_assumptions']:
             lines.append("## Assumptions")
             lines.append("")
-            lines.append(render_assumptions_table(chip, config))
+            lines.append(render_assumptions_table(chip_data, config))
 
-        if chip.get("constraints"):
-            # Get remaining groups in TOML order
-            all_groups_ordered = [cg["name"] for cg in chip.get("constraint_groups", [])]
-            remaining_groups = [g for g in all_groups_ordered if g not in rendered_constraint_groups]
+        if chip_data.get("constraints"):
+            all_groups_ordered = [cg["name"] for cg in chip_data.get("constraint_groups", [])]
+            remaining_groups = [g for g in all_groups_ordered if g not in st['rendered_constraint_groups']]
 
-            if remaining_groups and not rendered_constraints:
-                # No prose Constraints section existed, add one
+            if remaining_groups and not st['rendered_constraints']:
                 lines.append("## Constraints")
                 lines.append("")
 
-            # Render any constraint groups not already rendered inline, continuing the counter
             for group_name in remaining_groups:
-                group_table = render_constraints_table(chip, config, group_filter=group_name, start_counter=constraint_counter)
+                group_table = render_constraints_table(
+                    chip_data, config,
+                    group_filter=group_name,
+                    start_counter=st['constraint_counter'],
+                )
                 if group_table.strip():
                     lines.append(group_table)
-                constraint_counter += len(chip.get("constraints", {}).get(group_name, []))
+                st['constraint_counter'] += len(
+                    chip_data.get("constraints", {}).get(group_name, [])
+                )
 
     result = "\n".join(lines)
     result = re.sub(r'\n{3,}', '\n\n', result)
