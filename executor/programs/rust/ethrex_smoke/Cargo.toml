@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "ethrex_smoke"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }
+guest-program = { git = "https://github.com/lambdaclass/ethrex.git", package = "guest_program", default-features = false, branch = "crypto-default-features" }
+rkyv = { version = "0.8.10", features = ["std", "unaligned"] }

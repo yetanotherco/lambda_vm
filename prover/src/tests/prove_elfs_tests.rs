@@ -1899,6 +1899,29 @@ fn test_verify_rejects_inflated_table_counts() {
     );
 }
 
+/// Smoke test: reads ethrex ProgramInput, deserializes it, commits block count.
+/// Tests that private inputs + commit work without the full ethrex execution.
+#[test]
+#[ignore = "Requires ethrex_smoke.elf + ethrex_empty_block.bin"]
+fn test_prove_ethrex_smoke() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("Failed to get workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex_smoke.elf"))
+        .expect("Failed to read ethrex_smoke ELF");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin"))
+        .expect("Failed to read empty block fixture");
+    let vm_proof = crate::prove_with_input(&elf_bytes, input).expect("Proving failed");
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("Verification failed"),
+        "Smoke test proof should verify"
+    );
+    // 1 block in the input → commit 4 bytes (u32 little-endian)
+    assert_eq!(vm_proof.public_output, 1u32.to_le_bytes());
+}
+
 /// Prove and verify an empty Ethereum block via the ethrex guest program.
 #[test]
 #[ignore = "Requires ethrex.elf + ethrex_empty_block.bin; needs ~64GB+ RAM"]
