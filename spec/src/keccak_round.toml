@@ -187,6 +187,7 @@ input = [["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["idx", ["idx", ["idx"
 output = ["idx", ["idx", ["idx", "Cxz", "x"], 0], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
+ref = "keccak:c:theta_cxz_start"
 
 [[constraints.theta]]
 kind = "interaction"
@@ -195,6 +196,7 @@ input = [["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["id
 output = ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 1]], "z"]
 iters = [["x", 0, 4], ["y", 2, 4], ["z", 0, 7]]
 multiplicity = "μ"
+ref = "keccak:c:theta_cxz"
 
 [[constraints.theta]]
 kind = "interaction"
