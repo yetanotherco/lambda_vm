@@ -1004,7 +1004,7 @@ fn test_debug_memory_bus_tokens() {
 
     let z: i128 = 1000;
     let alpha: i128 = 2;
-    let bus_id: i128 = 17; // BusId::Memory
+    let bus_id: i128 = 14; // BusId::Memory
 
     // Compute fingerprint for a token
     let fingerprint =
