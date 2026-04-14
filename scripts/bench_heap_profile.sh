@@ -232,11 +232,17 @@ echo "$PEAK_PAIRS" | awk '{
     for (i=0;i<n;i++) { p=a+b*x[i]; ss_res+=(y[i]-p)^2; ss_tot+=(y[i]-ym)^2 }
     r2 = (ss_tot>0) ? 1 - ss_res/ss_tot : 1
     printf "  Model: peak = %.0f + %.0f * steps_M  (R²=%.4f)\n\n", a, b, r2
-    targets[0]=8; targets[1]=16; targets[2]=32; targets[3]=64
-    labels[0]="8M"; labels[1]="16M"; labels[2]="32M"; labels[3]="64M"
+    xmax = 0
+    for (i=0;i<n;i++) if (x[i] > xmax) xmax = x[i]
+    mults[0]=2; mults[1]=4; mults[2]=8; mults[3]=16
     for (t=0; t<4; t++) {
-        pred = a + b * targets[t]
-        printf "  fib_iterative_%-6s  ~%.0f MB  (~%.0f GB)\n", labels[t], pred, pred/1024
+        target_m = mults[t] * xmax
+        pred = a + b * target_m
+        abs = target_m * 1000000
+        if (abs >= 1000000)  lbl = sprintf("%gM", abs / 1000000)
+        else if (abs >= 1000) lbl = sprintf("%gk", abs / 1000)
+        else                  lbl = sprintf("%g", abs)
+        printf "  fib_iterative_%-6s  ~%.0f MB  (~%.0f GB)\n", lbl, pred, pred/1024
     }
 }'
 
