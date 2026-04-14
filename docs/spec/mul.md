@@ -2,9 +2,9 @@
 
 The  chip constrains multiplication, both signed and unsigned, as well as providing access to the low and high halfs of the multiplication result.
 
-= Columns
+= Variables
 
-The `MUL` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 `mat(delim: , top; bottom)` }
 
@@ -58,9 +58,7 @@ The  chip contributes the following to the lookup:
 
 The table can be padded to the next power of two with the following value assignments:
 
-= Notes - `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked. Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere.
-
-As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`; the value sent into the lookup could then be assumed range-checked by the other side of the relation. This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
+= Notes/optimizations - `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked. Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere. - As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`; the value sent into the lookup could then be assumed range-checked by the other side of the relation. This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
 
 ## Columns
 

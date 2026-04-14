@@ -2,9 +2,9 @@
 
 The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
 
-= Columns
+= Variables
 
-The `LT` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 

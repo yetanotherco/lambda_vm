@@ -2,9 +2,9 @@
 
 The  chip provides division and remainder functionality, both signed and unsigned.
 
-= Columns
+= Variables
 
-The `DVRM` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 

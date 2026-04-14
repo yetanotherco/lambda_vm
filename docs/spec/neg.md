@@ -2,11 +2,13 @@
 
 It requires `cond` to be a bit.
 
-= Variables
+= Variables This template introduces  interaction(s).
 
 = Assumptions
 
 = Constraints We constrain this equality using two constraints:
+
+## Correctness argument
 
 The constraints force the `carry` values to be fixed. Writing `carry`'s definition, we then find that $
 
@@ -18,7 +20,7 @@ The constraints force the `carry` values to be fixed. Writing `carry`'s definiti
 
 &= 2^32 dot `neg`_1 + `neg`_0\ &= 2^32 dot (2^32 - (`x as DWordWL`)_1 - 1) + (2^32 - (`x as DWordWL`)_0)  \ &= 2^64 - 2^32 dot (`x as DWordWL`)_1 - 2^32 + 2^32 - (`x as DWordWL`)_0  \ &= 2^64 - ((`x as DWordWL`)_0 + 2^32 dot (`x as DWordWL`)_1) \ &= 2^64 - `x`\ &equiv -x mod 2^64 $ when `cond` is set. When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
-= Note It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`. The input value `x` is still assumed to be range-checked, however.
+It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`. The input value `x` is still assumed to be range-checked, however. ]
 
 ## Columns
 

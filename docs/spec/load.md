@@ -2,9 +2,9 @@
 
 The  chip provides functionality to read values from memory and sign-extend them where appropriate. It delegates low-level memory handling to the `MEMW` chip ([memw]).
 
-= Columns
+= Variables
 
-The `LOAD` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 

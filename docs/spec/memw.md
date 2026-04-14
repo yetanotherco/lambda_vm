@@ -2,9 +2,9 @@
 
 The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
 
-= Columns
+= Variables
 
-The `MEMW` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -59,7 +59,7 @@ When a memory access happens at an address with proper alignment for its access 
 
 Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
 
-The  chip only needs  variables, expressed through  columns.
+The  chip only needs  variables, expressed through  columns; it leverages  interactions.
 
 ## Padding
 
@@ -72,6 +72,41 @@ The  chip provides a fast-path for accessing registers. This fast-path leverages
 Note: as a result of hard optimization, this chip can only be used for register accesses for which + ``timestamp` - `old_timestamp` in [1, 2^16]`, and + ``timestamp[0]` > `old_timestamp[0]`` If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
 
 Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide `2 dot `address`` in the lookup.
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interactions:
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
+| `MEMW-A2` |  | `IS_BIT<write2>` |
+| `MEMW-A3` |  | `IS_BIT<write4>` |
+| `MEMW-A4` |  | `IS_BIT<write8>` |
+| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
+| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+The following range checks are assumed to be performed/enforced outside of this chip:
+
+## Constraints
+
+Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
+
+Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
+
+With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
+
+This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
+
+Lastly, this chip contributes the following interactions to the logup:
+
+## Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+= Notes/optimizations The following ideas may prove to be optimizations for the // chip: - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
 
 ## Columns
 
@@ -135,36 +170,3 @@ address_add := ['arr', ['-', ['+', ['idx', 'base_address', 0], 'i', 1], ['*', ['
 |------|------|-------------|
 | `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
 | `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
-
-The  chip is comprised of  variables that are expressed using  columns:
-
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
-| `MEMW-A2` |  | `IS_BIT<write2>` |
-| `MEMW-A3` |  | `IS_BIT<write4>` |
-| `MEMW-A4` |  | `IS_BIT<write8>` |
-| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
-| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-The following range checks are assumed to be performed/enforced outside of this chip:
-
-## Constraints
-
-Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
-
-Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
-
-With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
-
-This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
-
-Lastly, this chip contributes the following interactions to the logup:
-
-## Padding
-
-The table can be padded to the next power of two with the following value assignments:
-
-= Future optimization ideas - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.

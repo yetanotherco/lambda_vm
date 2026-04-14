@@ -6,9 +6,9 @@ $ $
 
 $ Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
 
-= Columns
+= Variables
 
-The `SHIFT` chip is comprised of  variables that are expressed using  columns:
+The `SHIFT` chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 

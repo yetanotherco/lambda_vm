@@ -114,11 +114,11 @@ return vars.map(v => { let (label, factor) = if type(v) == array { (v.at(0), v.a
 
 The following lists signatures of the .len() interactions in this VM.
 
-table( columns: (1fr, auto), inset: 7pt, align: (top+left, center), stroke: none, table.header([*Signature*], [*Bus size*]), table.hline(stroke: 1pt), table.vline(stroke: 1pt, x: 1), ..for sig in interactions { ([], []) }, ), caption: "Signature overview of interactions",
+columns: (1fr, auto), inset: 7pt, align: (top+left, center), stroke: none, table.header([*Signature*], [*Bus size*]), table.hline(stroke: 1pt), table.vline(stroke: 1pt, x: 1), ..for sig in interactions { ([], []) }, ))
 
 Below, we list the signatures of the .len() templates in this VM.
 
-table( columns: 1fr, inset: 7pt, align: (top+left, center), stroke: none, table.header([*Signature*]), table.hline(stroke: 1pt), ..for sig in templates { ([], ) }, ), caption: "Signature overview of templates",
+columns: 1fr, inset: 7pt, align: (top+left, center), stroke: none, table.header([*Signature*]), table.hline(stroke: 1pt), ..for sig in templates { ([], ) }, ))
 
 ---
 
@@ -126,13 +126,15 @@ table( columns: 1fr, inset: 7pt, align: (top+left, center), stroke: none, table.
 
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
 
-= Variables The  template operates on two variables: `cond` and `X`:
+= Variables The  template operates on  variables:
 
 = Constraints It takes only one constraint to enforce that `X` must be either `0` or `1` whenever ``cond` eq.not 0`:
 
 *Note*: - In case of _unconditional_ template application, `cond` can be dropped from the constraint, simplifying it to ``X` (1- `X`) = 0`. - As described earlier, the `cond` variable must be describable by a degree-1 (i.e., linear) expression. This is to make sure that [isbit:c:isbit]'s expression has degree at most 3.
 
-= Proof of correctness If `cond` is `0`, [isbit:c:isbit] is trivially satisfied: `X` can assume any value and the polynomial constraint will evaluate to `0` regardless. When ``cond` eq.not 0`, it follows that the statement can only be proven when ``X` (1-`X`) equiv 0 mod p`, with `p` the modulus of the field. Because `BaseField` is a prime field, this equality is only satisfied if either ``X` equiv 0 mod p` or `1-`X` equiv 0 mod p`. Hence, it is proven that when ``cond` eq.not 0`, [isbit:c:isbit] is only satisfied if ``X` in {0, 1}`. 
+## Correctness argument
+
+If `cond` is `0`, [isbit:c:isbit] is trivially satisfied: `X` can assume any value and the polynomial constraint will evaluate to `0` regardless. When ``cond` eq.not 0`, it follows that the statement can only be proven when ``X` (1-`X`) equiv 0 mod p`, with `p` the modulus of the field. Because `BaseField` is a prime field, this equality is only satisfied if either ``X` equiv 0 mod p` or `1-`X` equiv 0 mod p`. Hence, it is proven that when ``cond` eq.not 0`, [isbit:c:isbit] is only satisfied if ``X` in {0, 1}`. 
 
 ## Columns
 
@@ -163,7 +165,7 @@ Barring exceptional cases, this template is used to assert that a variable of ty
 
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are `1`, and `0` otherwise.
 
-= Variables The  template operates on three variables:
+= Variables The  template introduces  interaction(s):
 
 = Assumptions The  template operates on the following assumptions:
 
@@ -210,7 +212,7 @@ For ease of notation, we moreover introduce the  constraint template $
 
 $ in both conditional and unconditional versions. It constrains that ``diff` equiv `lhs` - `rhs` (mod 2^64)` when the expression `cond` is non-zero.
 
-= Variables
+= Variables This template introduces  interaction(s).
 
 = Assumptions
 
@@ -271,11 +273,13 @@ carry (when iter=1) := 2^-32 * (lhs[1] + rhs[1] + carry[0] - sum[1])
 
 It requires `cond` to be a bit.
 
-= Variables
+= Variables This template introduces  interaction(s).
 
 = Assumptions
 
 = Constraints We constrain this equality using two constraints:
+
+## Correctness argument
 
 The constraints force the `carry` values to be fixed. Writing `carry`'s definition, we then find that $
 
@@ -287,7 +291,7 @@ The constraints force the `carry` values to be fixed. Writing `carry`'s definiti
 
 &= 2^32 dot `neg`_1 + `neg`_0\ &= 2^32 dot (2^32 - (`x as DWordWL`)_1 - 1) + (2^32 - (`x as DWordWL`)_0)  \ &= 2^64 - 2^32 dot (`x as DWordWL`)_1 - 2^32 + 2^32 - (`x as DWordWL`)_0  \ &= 2^64 - ((`x as DWordWL`)_0 + 2^32 dot (`x as DWordWL`)_1) \ &= 2^64 - `x`\ &equiv -x mod 2^64 $ when `cond` is set. When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
-= Note It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`. The input value `x` is still assumed to be range-checked, however.
+It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`. The input value `x` is still assumed to be range-checked, however. ]
 
 ## Columns
 
@@ -343,7 +347,7 @@ carry (when iter=1) := 2^-32 * ((x::DWordWL)[1] + neg[1] + carry[0])
 
 All `RV64IMC` instruction are to be decoded to a format that can be interpreted by the VM. This section outlines the decoding table being used in the VM. For reasons of efficiency, data in this table is significantly compressed. Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it. Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
 
-= Columns
+= Variables
 
 The  table is comprised of  variables that are expressed using  columns:
 
@@ -369,7 +373,7 @@ super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
 
 show figure: set block(breakable: true)
 
-figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), ), caption: [Decoding table] }
+figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), )) }
 
 // OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
 
@@ -411,9 +415,9 @@ This entry is used to pad the `CPU` table. More details on this matter are provi
 
 The  chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations. It bases its decisions on the entry of the `DECODE` table ([decode]) corresponding the the current program counter (PC).
 
-= Columns
+= Variables
 
-The `CPU` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -652,9 +656,9 @@ $ $
 
 $ Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
 
-= Columns
+= Variables
 
-The `SHIFT` chip is comprised of  variables that are expressed using  columns:
+The `SHIFT` chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -847,9 +851,9 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 
 The  chip computes the target address of a branching instruction.
 
-= Columns
+= Variables
 
-The `BRANCH` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -941,9 +945,9 @@ next_pc (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 
 The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
 
-= Columns
+= Variables
 
-The `MEMW` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -998,7 +1002,7 @@ When a memory access happens at an address with proper alignment for its access 
 
 Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
 
-The  chip only needs  variables, expressed through  columns.
+The  chip only needs  variables, expressed through  columns; it leverages  interactions.
 
 ## Padding
 
@@ -1011,6 +1015,41 @@ The  chip provides a fast-path for accessing registers. This fast-path leverages
 Note: as a result of hard optimization, this chip can only be used for register accesses for which + ``timestamp` - `old_timestamp` in [1, 2^16]`, and + ``timestamp[0]` > `old_timestamp[0]`` If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
 
 Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide `2 dot `address`` in the lookup.
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interactions:
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
+| `MEMW-A2` |  | `IS_BIT<write2>` |
+| `MEMW-A3` |  | `IS_BIT<write4>` |
+| `MEMW-A4` |  | `IS_BIT<write8>` |
+| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
+| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+The following range checks are assumed to be performed/enforced outside of this chip:
+
+## Constraints
+
+Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
+
+Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
+
+With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
+
+This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
+
+Lastly, this chip contributes the following interactions to the logup:
+
+## Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+= Notes/optimizations The following ideas may prove to be optimizations for the // chip: - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
 
 ## Columns
 
@@ -1075,48 +1114,15 @@ address_add := ['arr', ['-', ['+', ['idx', 'base_address', 0], 'i', 1], ['*', ['
 | `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
 | `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
 
-The  chip is comprised of  variables that are expressed using  columns:
-
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
-| `MEMW-A2` |  | `IS_BIT<write2>` |
-| `MEMW-A3` |  | `IS_BIT<write4>` |
-| `MEMW-A4` |  | `IS_BIT<write8>` |
-| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
-| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-The following range checks are assumed to be performed/enforced outside of this chip:
-
-## Constraints
-
-Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
-
-Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
-
-With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
-
-This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
-
-Lastly, this chip contributes the following interactions to the logup:
-
-## Padding
-
-The table can be padded to the next power of two with the following value assignments:
-
-= Future optimization ideas - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
-
 ---
 
 # LT Chip
 
 The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
 
-= Columns
+= Variables
 
-The `LT` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 
@@ -1220,9 +1226,9 @@ unsigned_lt := carry[1]
 
 The  chip constrains multiplication, both signed and unsigned, as well as providing access to the low and high halfs of the multiplication result.
 
-= Columns
+= Variables
 
-The `MUL` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 `mat(delim: , top; bottom)` }
 
@@ -1276,9 +1282,7 @@ The  chip contributes the following to the lookup:
 
 The table can be padded to the next power of two with the following value assignments:
 
-= Notes - `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked. Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere.
-
-As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`; the value sent into the lookup could then be assumed range-checked by the other side of the relation. This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
+= Notes/optimizations - `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked. Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere. - As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`; the value sent into the lookup could then be assumed range-checked by the other side of the relation. This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
 
 ## Columns
 
@@ -1365,9 +1369,9 @@ carry (when iter=[1, 3]) := 2^-32 * (raw_product[i] + carry[i - 1] - res[i])
 
 The  chip provides division and remainder functionality, both signed and unsigned.
 
-= Columns
+= Variables
 
-The `DVRM` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -1570,9 +1574,9 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 
 The  chip provides functionality to read values from memory and sign-extend them where appropriate. It delegates low-level memory handling to the `MEMW` chip ([memw]).
 
-= Columns
+= Variables
 
-The `LOAD` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 
@@ -1661,175 +1665,13 @@ read1 := μ - read2 - read4 - read8
 
 # ECALL Chips
 
-ECALLs provide system-level functionalities to the guest program.
-
-When `ECALL` is executed, it is assumed that: - register `A7` contains the system call number
-
-- the arguments are located in registers `A0`-`A6`, and - the return value is written to `A0`, where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
-
-=  chip
-
-## Columns
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `timestamp` | `DWordWL` | timestamp at which to halt the program |
-
-The  chip leverages  variable, spanning  columns:
-
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `HALT-A1.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-It is assumed the input is range checked:
-
-## Constraints
-
-The  chip: + makes sure register `x10` (containing the exit code) equals `0` ([halt:c:read_zero_exit_code]), + writes `0` to all other registers ([halt:c:zeroize_registers_lo]/[halt:c:zeroize_registers_hi]), and + sets `pc` equal to `1` ([halt:c:pc]). Note that the writes performed by all these interactions are accompanied by the timestamp `2^64-1`; the maximum timestamp. This prevents any other operation involving memory from being executed hereafter.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `HALT-C1.i` | i ∈ [1, 9] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
-| `HALT-C2` |  | `MEMW[0::BaseField[8]; 1, (2 * 10)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
-| `HALT-C3.i` | i ∈ [11, 31] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
-| `HALT-C4` |  | `MEMW[1, (2 * 255)::DWordWL, ['arr', 1, 0, 0, 0, 0, 0, 0, 0], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
-
-[ Observe that --- in its current state --- this solution puts the burden of verifying the register cleanup on the verifier inside of the lookup argument. Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there. ])
-
-### Lookup
-
-In this VM, halting is considered equivalent to executing a `sys_exit`. Hence, this chip responds to `ECALL`s with system call number 93.
-
-The HALT chip therefore contributes the following interaction to the lookup-argument:
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `HALT-C5` | `ECALL[timestamp, 93::DWordWL]` | -1 |
-
-## Padding
-
-This chip should only contain a single row. Given that `2^0 = 1`, this chip does not need to be padded. As such, no padding is defined.
-
-=  chip
-
-## Columns
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `timestamp` | `DWordWL` | timestamp at which to commit |
-
-### Auxiliary
-
-| Name | Type | Description |
-|------|------|-------------|
-| `index` | `BaseField` | Index of value being committed. |
-| `address` | `DWordWL` | Address of first byte to commit. |
-| `address_incr` | `DWordHL` | $`address` + 1$ |
-| `count` | `DWordWL` | number of bytes to commit |
-| `count_decr` | `DWordHL` | $`count` - 1$ |
-| `first` | `Bit` | Whether this is the first commitment in this sequence. |
-| `end` | `Bit` | Whether this is the end of the commitment sequence. |
-| `value` | `Byte` | Byte stored at `address`. |
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ` | `Bit` |  |
-
-The  chip leverages  variables, spanning  columns:
-
-## Constraints
-
-In this VM, committing is considered equivalent to writing a value to `stdout`. Hence, this chip responds to `ECALL`s with system call number 64.
-
-Since we do not know how many bytes are to be committed, this chip employs a recursive design: each iteration commits one byte, and recursively "calls" itself to commit the remaining bytes. As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not. This is why [commit:c:receive_ecall] has multiplicity `-`first``.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `COMMIT-C1` | `ECALL[timestamp, 64::DWordWL]` | -first |
-
-The `write` operation --- writing to a file descriptor --- has the following signature:
-
-```c ssize_t write(size_t count; int fd, const void buf[count], size_t count); ```
-
-That is to say, - `A0` contains the file descriptor, - `A1` contains the address of `buf`'s first byte, - `A2` contains `count`, and - the written count should be written to `A0`.
-
-[commit:c:read_address] reads `address` from `x11` (=`A1`) and [commit:c:read_count] reads `count` from `x12` (=`A2`). Since we only support writing to `stdout` (which corresponds to ``fd` = 1`
-
-we assert that `x10` contains `1` in [commit:c:read_fd_write_count]. Note that this constraint _also_ writes `count` to `A0`; in this VM it is impossible for a commit to be interrupted or fail. Lastly, the `index` is read from `x254`; in the same operation, ``index` + `count`` is written back to this location by [commit:c:read_index]. This, too, leverages the fact that a commit will not be interrupted or fail to update the `index` for the next commit sequence. Again, each of these memory interactions only take place when this is the `first` call in the recursion tree.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `COMMIT-C2` | `MEMW[['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C3` | `MEMW[['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C4` | `MEMW[['arr', 1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C5` | `MEMW[['arr', 'index', 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, ['arr', ['+', 'index', ['cast', 'count', 'BaseField']], 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
-
-*Note*: the observant reader will notice that [commit:c:read_index] casts `count` to a `BaseField`, potentiallly losing information. This is indeed correct. However, since it is practically impossible to commit more than `2^64-2^32` bytes in a single VM execution, it was decided to permit this.
-
-Next, we read the `value` located at buffer address `address` and commit to it under the given `index`. This is only performed when we have not yet reached the `end` of the commit sequence.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `COMMIT-C6` | `MEMW[['arr', 'value', 0, 0, 0, 0, 0, 0, 0]; 0, address, ['arr', 'value', 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
-| `COMMIT-C7` | `COMMIT[index, value]` | μ - end |
-
-In parallel, we compute ``address_incr` = `address` + 1` ([commit:c:address_incr]) as address of the next byte to commit, and ``count_decr` = `count` - 1` ([commit:c:count_decr]) as the number of bytes that still has to be committed after committing this byte. [commit:c:range_address_incr] and [commit:c:range_count_decr] are included to satisfy [add:a:sum] respectively [add:a:rhs].
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `COMMIT-C8` |  | `ADD<address_incr::DWordWL; address, 1::DWordWL>` |  |
-| `COMMIT-C9.i` | i ∈ [0, 3] | `IS_HALF[address_incr[i]]` | μ |
-| `COMMIT-C10` |  | `SUB<count_decr::DWordWL; count, 1::DWordWL>` |  |
-| `COMMIT-C11.i` | i ∈ [0, 3] | `IS_HALF[count_decr[i]]` | μ |
-
-When `count` hits `0`, we should stop performing further recursive calls. We use the `end` bit to indicate these circumstances.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `COMMIT-C12` | `ZERO[end; (65535 - count_decr[0]) + (65535 - count_decr[1]) + (65535 - count_decr[2]) + (65535 - count_decr[3])]` | μ |
-
-*Note*: + Rather than setting ``end` = 1` when ``count` = 0`, we do so when ``count_decr` = -1`. This technique allows `count` to be stored in a `DWordWL` rather than a `DWordHL`, saving two columns. + `forall i in [0, 3]: 65535 - `count_decr`_i >= 0` as a result of [commit:c:range_count_decr]. Hence, $ sum_(i=0)^3 65535 - `count_decr`_i = 0 arrow.l.r.double.long forall i in [0, 3]: `count_decr`_i = 65535 $
-
-When this was not the `end` byte to commit in this recursion sequence, we recursively _Commit the Next Byte_ (`CNB`), specifying the timestamp, address to continue reading and the number of bytes that should still be committed ([commit:c:send_commit_next_byte]). Since that certainly won't be the `first` call in the sequence, we read `address_incr` and `count_decr` from the previous recursion level into `address` and `count` and continue executing the commit.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `COMMIT-C13` | `CNB[timestamp, index + 1, address_incr::DWordWL, count_decr::DWordWL]` | μ - end |
-| `COMMIT-C14` | `CNB[timestamp, index, address, count]` | -(μ - first) |
-
-Lastly, we must make sure `first`, `end` and `μ` are bits ([commit:c:range_first], [commit:c:range_end], [commit:c:range_mu]), and that when either ``first` = 1` or ``end` = 1` imply that ``μ` = 1` ([commit:c:first_or_end_implies_mu]). These are required to ensure the multiplicities `-(`μ` - `first`)` and ``μ` - `end`` are binary.
-
-| Tag | Description |
-|-----|-------------|
-| `COMMIT-C15` | `IS_BIT<first>` |
-| `COMMIT-C16` | `IS_BIT<end>` |
-| `COMMIT-C17` | `IS_BIT<μ>` |
-| `COMMIT-C18` | `first` + `end` => `μ` = 1 |
-| | _polynomial:_ `(first + end) * (1 - μ) = 0` |
-
-## Padding
-
-To pad this chip, use the below data.
-
-## Notes/optimizations
-
-- The current version only supports writing to `stdout`. This chip could potentially be extended to support writing to arbitrary `fd`s - One might be able to replace [commit:c:end] by `end => count = 0`. While loosening the constraint (`count = 0 => end` is no longer enforced), this should not cause any problems: if the prover does not set `end` when `count=0`, they simply cannot complete the proof. First of all, one would have to recursively work through all `2^64` values of `count`, something that is practically infeasible. Moreover, if this is done with a sequence that originally has ``count` > 0`, one will inevitably have to read a memory address twice at the same timestamp, which is impossible to prove. In addition to dropping the `ZERO` lookup, this optimization might also permit moving `count_decr` from a `DWordHL` to a `DWordWL`, saving two columns. - Given that it is practically infeasible to commit more than ``p`-1 = 2^64-2^32` bytes in a program, it might suffice to store `count_decr` in a `BaseField`. Note that this would probably involve having an extra (virtual) column storing `count` in `BaseField` form as well. Moreover, one might need to add a lookup to `LT` to ensure ``count` <= `p`-1` when being read from memory at the beginning of each commitment sequence.
-
 ---
 
 # BITWISE Chips
 
 The  chips deal with precomputed lookup tables for bitwise boolean operations and convenience functionalities over small domains.
 
-= Columns
+= Variables
 
 The  chip is comprised of  variables that are expressed using  columns. Of these, the _input_ and _output_ variables ( in total) are precomputed.
 
@@ -1837,7 +1679,7 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 
 = Lookup This chip adds the following interactions to the lookup:
 
-= Areas of Optimization The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
+= Notes/Optimizations The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
 
 ## Columns
 

@@ -4,7 +4,7 @@ For ease of notation, we moreover introduce the  constraint template $
 
 $ in both conditional and unconditional versions. It constrains that ``diff` equiv `lhs` - `rhs` (mod 2^64)` when the expression `cond` is non-zero.
 
-= Variables
+= Variables This template introduces  interaction(s).
 
 = Assumptions
 

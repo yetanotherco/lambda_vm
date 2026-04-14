@@ -2,9 +2,9 @@
 
 The  chip computes the target address of a branching instruction.
 
-= Columns
+= Variables
 
-The `BRANCH` chip is comprised of  variables that are expressed using  columns:
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
 
 = Assumptions
 

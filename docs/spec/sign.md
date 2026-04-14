@@ -2,7 +2,7 @@
 
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are `1`, and `0` otherwise.
 
-= Variables The  template operates on three variables:
+= Variables The  template introduces  interaction(s):
 
 = Assumptions The  template operates on the following assumptions:
 
