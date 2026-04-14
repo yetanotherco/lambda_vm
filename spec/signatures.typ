@@ -1,20 +1,11 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_signatures, load_config
+#import "/expr.typ": type_to_code
 
 #show: book-page("signatures.typ")
 
 #let config = load_config()
 #let signatures = load_signatures(config)
-
-// Render a type
-#let render_type(typ) = {
-  let res = ``
-  while type(typ) == array {
-    res += `[` + raw(str(typ.at(1))) + `]`
-    typ = typ.at(0)
-  }
-  raw(typ) + res
-}
 
 // Render a signature
 #let render_signature(sig) = {
@@ -29,11 +20,11 @@
     raw(cond) + ` => `
   } else {``}
 
-  let input_str = sig.input.map(render_type).join(`, `)
+  let input_str = sig.input.map(type_to_code).join(`, `)
 
   let output = sig.at("output", default: none)
   let output_str = if output != none {
-    render_type(output) + `; `
+    type_to_code(output) + `; `
   } else {``}
 
   return [#cond_str#raw(sig.tag)#lb#output_str#input_str#rb]
