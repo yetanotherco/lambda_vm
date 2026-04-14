@@ -63,15 +63,15 @@ for size in $PROGRAMS; do
     rm -f "$TMP_DIR/proof.bin"
 
     # Parse absolute heap values (second-to-last column) from HEAP PROFILE section
-    HEAP_VALS=$(awk '/^=== HEAP PROFILE/,/^  ─/{
-        if (/After execute/)       printf "execute=%s\n", $(NF-1)
-        if (/After trace build/)   printf "trace_build=%s\n", $(NF-1)
-        if (/After AIR/)           printf "air=%s\n", $(NF-1)
-        if (/after pool alloc/)    printf "pool_alloc=%s\n", $(NF-1)
-        if (/after main commits/)  printf "main_commits=%s\n", $(NF-1)
-        if (/after aux build/)     printf "aux_build=%s\n", $(NF-1)
-        if (/after aux commit/)    printf "aux_commit=%s\n", $(NF-1)
-    }' "$STDERR")
+    HEAP_VALS=$(awk '
+        /After execute/          { printf "execute=%s\n",      $(NF-1) }
+        /After trace build/      { printf "trace_build=%s\n",  $(NF-1) }
+        /After AIR/              { printf "air=%s\n",          $(NF-1) }
+        /after pool alloc/       { printf "pool_alloc=%s\n",   $(NF-1) }
+        /after main commits/     { printf "main_commits=%s\n", $(NF-1) }
+        /after aux build/        { printf "aux_build=%s\n",    $(NF-1) }
+        /after aux commit/       { printf "aux_commit=%s\n",   $(NF-1) }
+    ' "$STDERR")
 
     PEAK=$(grep -o 'Peak heap: [0-9]*' "$STDOUT" | awk '{print $3}')
     echo "steps=$steps" > "$TMP_DIR/${size}_data.txt"
