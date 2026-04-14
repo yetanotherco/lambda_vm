@@ -14,9 +14,6 @@ use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing the mmap. Dropping it would close
-    /// the descriptor and invalidate the mmap.
-    _file: std::fs::File,
     /// Number of columns per row.
     width: usize,
     /// Number of rows.
@@ -260,11 +257,13 @@ impl<F: IsField> Table<F> {
 
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
+        // The mapping keeps its own reference to the underlying object
+        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
+        // `file` local can drop at end of scope without invalidating it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         self.mmap_backing = Some(TableMmapBacking {
             mmap,
-            _file: file,
             width: self.width,
             height: self.height,
             elem_size,

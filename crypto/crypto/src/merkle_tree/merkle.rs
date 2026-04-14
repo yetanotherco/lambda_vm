@@ -29,9 +29,6 @@ impl std::error::Error for Error {}
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing the mmap. Dropping it would close
-    /// the descriptor and invalidate the mmap.
-    _file: std::fs::File,
     node_count: usize,
     node_size: usize,
 }
@@ -307,6 +304,9 @@ where
 
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
+        // The mapping keeps its own reference to the underlying object
+        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
+        // `file` local can drop at end of scope without invalidating it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         // Free the heap allocation
@@ -314,7 +314,6 @@ where
 
         self.mmap_backing = Some(MmapNodeBacking {
             mmap,
-            _file: file,
             node_count,
             node_size,
         });

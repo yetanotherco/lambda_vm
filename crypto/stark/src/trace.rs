@@ -229,11 +229,7 @@ where
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapBacking {
     main_mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing main_mmap.
-    _main_file: std::fs::File,
     aux_mmap: Option<memmap2::Mmap>,
-    /// Owns the file descriptor backing aux_mmap.
-    _aux_file: Option<std::fs::File>,
     num_rows: usize,
     num_main_cols: usize,
     num_aux_cols: usize,
@@ -401,7 +397,7 @@ where
         };
 
         let main_elem_size = std::mem::size_of::<FieldElement<F>>();
-        let (main_mmap, main_file) =
+        let main_mmap =
             Self::write_pool_columns_to_mmap(&main_pool[..num_main_cols], main_elem_size)?;
 
         let lde_step_size = trace_step_size * blowup_factor;
@@ -414,9 +410,7 @@ where
             blowup_factor,
             mmap_backing: Some(MmapBacking {
                 main_mmap,
-                _main_file: main_file,
                 aux_mmap: None,
-                _aux_file: None,
                 num_rows,
                 num_main_cols,
                 num_aux_cols: 0,
@@ -441,27 +435,27 @@ where
         }
 
         let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
-        let (aux_mmap, aux_file) =
-            Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
+        let aux_mmap = Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
 
         let backing = self
             .mmap_backing
             .as_mut()
             .expect("add_aux_from_pool requires main already spilled");
         backing.aux_mmap = Some(aux_mmap);
-        backing._aux_file = Some(aux_file);
         backing.num_aux_cols = num_aux_cols;
 
         Ok(())
     }
 
-    /// Write pool columns to a temp file and return the mmap + file handle.
+    /// Write pool columns to a temp file and return the mmap.
+    /// The file descriptor is closed before returning; the mapping keeps
+    /// its own reference to the underlying object.
     /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     fn write_pool_columns_to_mmap<T>(
         columns: &[Vec<T>],
         elem_size: usize,
-    ) -> std::io::Result<(memmap2::Mmap, std::fs::File)> {
+    ) -> std::io::Result<memmap2::Mmap> {
         use std::io::Write;
 
         let num_cols = columns.len();
@@ -488,8 +482,11 @@ where
         }
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
+        // The mapping keeps its own reference to the underlying object
+        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
+        // `file` local can drop at end of scope without invalidating it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Ok((mmap, file))
+        Ok(mmap)
     }
 }
 
