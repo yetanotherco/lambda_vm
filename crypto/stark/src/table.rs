@@ -241,16 +241,29 @@ impl<F: IsField> Table<F> {
         }
 
         let elem_size = std::mem::size_of::<FieldElement<F>>();
-        let total_bytes = self.data.len() * elem_size;
+        let total_bytes = (self.data.len() as u64)
+            .checked_mul(elem_size as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "spill_to_disk: byte count overflows u64",
+                )
+            })?;
 
         let file = tempfile::tempfile()?;
-        file.set_len(total_bytes as u64)?;
+        file.set_len(total_bytes)?;
         {
             let mut writer = std::io::BufWriter::new(&file);
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The Vec has the same byte layout as a contiguous array.
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, total_bytes) };
+            // `self.data.len() * elem_size` fits in usize because Vec allocations
+            // are bounded by isize::MAX bytes.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    self.data.as_ptr() as *const u8,
+                    self.data.len() * elem_size,
+                )
+            };
             writer.write_all(bytes)?;
             writer.flush()?;
         }

@@ -464,7 +464,15 @@ where
             columns.iter().all(|c| c.len() == num_rows),
             "all columns must have the same length"
         );
-        let total_bytes = (num_cols * num_rows * elem_size) as u64;
+        let total_bytes = (num_cols as u64)
+            .checked_mul(num_rows as u64)
+            .and_then(|n| n.checked_mul(elem_size as u64))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "write_pool_columns_to_mmap: byte count overflows u64",
+                )
+            })?;
 
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes)?;
@@ -473,6 +481,8 @@ where
             for col in columns {
                 // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.
+                // `col.len() * elem_size` fits in usize because Vec allocations
+                // are bounded by isize::MAX bytes.
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
                 };
