@@ -2,15 +2,76 @@
 
 All `RV64IMC` instruction are to be decoded to a format that can be interpreted by the VM. This section outlines the decoding table being used in the VM. For reasons of efficiency, data in this table is significantly compressed. Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it. Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
 
-= Variables
+## Variables
 
 The  table is comprised of  variables that are expressed using  columns:
 
-= Padding The  table must be padded to a length that is a power of two. Empty rows with the following content can be added to achieve this:
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `pc` | `DWordWL` | value of the program counter this instruction is associated with. |
+| `packed_decode` | `BaseField` | Ordered concatenation of several small variables. The `decode (uncompressed)` section explains the purpose of each variable.\ A list of each variable and the bit(-range) in which it is located:\ [0] `read_register1`, \ [1] `read_register2`, \ [2] `write_register`, \ [3] `memory_2bytes`, \ [4] `memory_4bytes`, \ [5] `memory_8bytes`, \ [6] `c_type`, \ [7] `signed`, \ [8] `mp_selector`, \ [9] `muldiv_selector`, \ [10] `word_instr`, \ [11] `ADD`, \ [12] `SUB`, \ [13] `SLT`, \ [14] `AND`, \ [15] `OR`, \ [16] `XOR`, \ [17] `SHIFT`, \ [18] `JALR`, \ [19] `BEQ`, \ [20] `BLT`, \ [21] `LOAD`, \ [22] `STORE`, \ [23] `MUL`, \ [24] `DIVREM`, \ [25] `ECALL`, \ [26] `EBREAK`; \ [27:35] `rs1`, \ [35:43] `rs2`, \ [43:51] `rd`, \ the remaining bits are set to zero.  |
+| `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `BaseField` | The multiplicity with which this instruction is looked up in the `CPU` table. |
+
+## Padding
+
+The  table must be padded to a length that is a power of two. Empty rows with the following content can be added to achieve this:
 
 Note that this row sets the `EBREAK` flag. Given that `CPU` asserts that `EBREAK = 0` (see [cpu:c:ebreak_traps]), using this "padding-instruction" would immediately make the CPU table unprovable. Note moreover that the `pc` is set to `7`. This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _`4`_ (i.e., the max `pc`-increment) greater than _`1`_ (i.e., the `pc`-value used in the [additional instruction] referred to by `CPU`-padding lines).
 
-= Decoding For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
+## Decoding
+
+For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `pc` | `DWordWL` | value of the program counter this instruction is associated with. |
+| `rs1` | `Byte` | index of source register 1. |
+| `rs2` | `Byte` | index of source register 2. |
+| `rd` | `Byte` | index of destination register. |
+| `read_register1` | `Bit` | whether to load the contents of address `rs1` (1) or `0` (0) into `rv1`. |
+| `read_register2` | `Bit` | whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`. |
+| `write_register` | `Bit` | whether the result should be written to `rd` ($=0$ for memory write and when $`rd` = `x0`$. |
+| `mem_2B` | `Bit` | whether the memory access (read or write) touches exactly $2$ bytes. |
+| `mem_4B` | `Bit` | whether the memory access (read or write) touches exactly $4$ bytes. |
+| `mem_8B` | `Bit` | whether the memory access (read or write) touches exactly $8$ bytes. |
+| `c_type` | `Bit` | Whether the instruction is of type `C`, i.e., whether it is $2$ bytes long instead of $4$. |
+| `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
+| `signed` | `Bit` | selector used to indicate signed or unsigned input interpretation. |
+| `mp_selector` | `Bit` | Multi-purpose selector used by the CPU to to configure several ALU operations in different ways.            See the `CPU` chip for more details. |
+| `muldiv_selector` | `Bit` | selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted. |
+| `word_instr` | `Bit` | Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended. |
+| `ADD` | `Bit` | ALU selector flag |
+| `SUB` | `Bit` | ALU selector flag |
+| `SLT` | `Bit` | ALU selector flag |
+| `AND` | `Bit` | ALU selector flag |
+| `OR` | `Bit` | ALU selector flag |
+| `XOR` | `Bit` | ALU selector flag |
+| `SHIFT` | `Bit` | ALU selector flag |
+| `JALR` | `Bit` | ALU selector flag |
+| `BEQ` | `Bit` | ALU selector flag |
+| `BLT` | `Bit` | ALU selector flag |
+| `LOAD` | `Bit` | ALU selector flag |
+| `STORE` | `Bit` | ALU selector flag |
+| `MUL` | `Bit` | ALU selector flag |
+| `DIVREM` | `Bit` | ALU selector flag |
+| `ECALL` | `Bit` | ALU selector flag |
+| `EBREAK` | `Bit` | ALU selector flag |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `BaseField` | The multiplicity with which this instruction is looked up in the `CPU` table. |
 
 We will illustrate how each instruction should be expressed in this (uncompressed) decoding table. The columns of the accompanying table represent the following: - *`operation`*: the assembly operation being encoded. - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one. - *`w_instr`*, *`signed`*: whether to set the `word_instr` and `signed` flags, respectively. - *other*: the other flags that should be set or variables that should be given specific values.
 
@@ -18,7 +79,7 @@ For the purpose of brevity and readability, the table uses the following rules-o
 
 Further clarification is provided in the notes following the table.
 
-## C-type instructions
+### C-type instructions
 
 The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
 
@@ -36,30 +97,14 @@ figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: 
 
 show figure: (it) => align(left, []) [ ] }
 
-## Notes
+### Notes
 
 We note the following about the above decoding table:
 
 enum.item( referenceable_note( "note_word_instr", [`word_instr`: `[W]` indicates that ``word_instr` = 1` for the `W`-variant of the operation, and `0` for the non-`W`-variant.] ), enum.item( referenceable_note( "note_signed", [`signed`: .not`[U]` indicates that ``signed` = 1` for the *non-`U`*-variant of the operation, and `0` for the `U`-variant.] ), enum.item( referenceable_note( "note-lui", [`LUI`: this operation loads the 20-bit `imm` in the upper bits of `rd`. Observe that this can be represented using `ADDI rd, x0, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-auipc", [`AUIPC`: this operation adds the 20-bit immediate to the upper bits of `pc` and stores the result in `rd`. Given that the `pc` is stored in `x255`, this operation can be represented using `ADDI rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-jal", [`JAL`: this operation stores ``pc` + 4` in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`. Note that this can be represented using `JALR rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[1:21]` of `imm` and extending it to 64 bits; the least significant bit should always be 0.*] ), enum.item( referenceable_note( "note-ecall", [`ECALL`: "On RISC-V a system call has its own instruction: `ECALL`. [...] A7 [= register `x17`] contains the system call number." [[source]] ] ), enum.item( referenceable_note( "note-fence", [`FENCE`: currently, the VM interprets this operation as `ADDI x0 x0 0`; a no-op.]
 
-## One more instruction <cpu-padding-decode-row>
+### One more instruction <cpu-padding-decode-row>
 
 In addition to decoding all instructions provided in the ELF and adding a corresponding entry to the  table, one must include an entry that has ``pc` = 1` and every other variable set to `0`. Note that this will never conflict with any entry in the ELF, since it has an odd `pc` value.
 
 This entry is used to pad the `CPU` table. More details on this matter are provided in the `CPU` chip.
-
-## Columns
-
-### Output
-
-| Name | Type | Description |
-|------|------|-------------|
-| `pc` | `DWordWL` | value of the program counter this instruction is associated with. |
-| `packed_decode` | `BaseField` | Ordered concatenation of several small variables. The `decode (uncompressed)` section explains the purpose of each variable.\ A list of each variable and the bit(-range) in which it is located:\ [0] `read_register1`, \ [1] `read_register2`, \ [2] `write_register`, \ [3] `memory_2bytes`, \ [4] `memory_4bytes`, \ [5] `memory_8bytes`, \ [6] `c_type`, \ [7] `signed`, \ [8] `mp_selector`, \ [9] `muldiv_selector`, \ [10] `word_instr`, \ [11] `ADD`, \ [12] `SUB`, \ [13] `SLT`, \ [14] `AND`, \ [15] `OR`, \ [16] `XOR`, \ [17] `SHIFT`, \ [18] `JALR`, \ [19] `BEQ`, \ [20] `BLT`, \ [21] `LOAD`, \ [22] `STORE`, \ [23] `MUL`, \ [24] `DIVREM`, \ [25] `ECALL`, \ [26] `EBREAK`; \ [27:35] `rs1`, \ [35:43] `rs2`, \ [43:51] `rd`, \ the remaining bits are set to zero.  |
-| `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ` | `BaseField` | The multiplicity with which this instruction is looked up in the `CPU` table. |

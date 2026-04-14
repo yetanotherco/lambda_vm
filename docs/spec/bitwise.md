@@ -2,17 +2,9 @@
 
 The  chips deal with precomputed lookup tables for bitwise boolean operations and convenience functionalities over small domains.
 
-= Variables
+## Variables
 
 The  chip is comprised of  variables that are expressed using  columns. Of these, the _input_ and _output_ variables ( in total) are precomputed.
-
-*Note*: This table contains one row for every possible value of `(X, Y, Z)`. As such, it has length `2^8 dot 2^8 dot 2^4 = 2^(20)`.
-
-= Lookup This chip adds the following interactions to the lookup:
-
-= Notes/Optimizations The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
-
-## Columns
 
 ### Input
 
@@ -50,9 +42,11 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `μ_IS_B20` | `BaseField` |  |
 | `μ_HWSL` | `BaseField` |  |
 
-## Constraints
+*Note*: This table contains one row for every possible value of `(X, Y, Z)`. As such, it has length `2^8 dot 2^8 dot 2^4 = 2^(20)`.
 
-### contributions
+## Lookup
+
+This chip adds the following interactions to the lookup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
@@ -66,3 +60,7 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `BITWISE-C8` | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
 | `BITWISE-C9` | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
 | `BITWISE-C10` | `HWSL[['arr', 'SLL', 'SLLC']; X + 256 * Y, Z]` | -μ_HWSL |
+
+## Notes/Optimizations
+
+The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.

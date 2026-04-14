@@ -4,13 +4,9 @@ For ease of notation, we moreover introduce the  constraint template $
 
 $ in both conditional and unconditional versions. It constrains that ``diff` equiv `lhs` - `rhs` (mod 2^64)` when the expression `cond` is non-zero.
 
-= Variables This template introduces  interaction(s).
+## Variables
 
-= Assumptions
-
-= Constraints This template introduces the following constraints
-
-## Columns
+This template introduces  interaction(s).
 
 ### Input
 
@@ -53,7 +49,7 @@ carry (when iter=1) := 2^-32 * (lhs[1] + rhs[1] + carry[0] - sum[1])
 
 ## Constraints
 
-### all
+This template introduces the following constraints
 
 | Tag | Range | Description |
 |-----|-------|-------------|

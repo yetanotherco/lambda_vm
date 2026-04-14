@@ -6,11 +6,11 @@ While RAM is byte addressed, we do choose to store registers as a `DWordWL` over
 
 On a high level, we ensure memory consistency by an interacting system of reads and writes to a lookup argument, combined with an initialization and finalization scheme. The initialization and finalization schemes together ensure both that (1) the necessary preconditions for the lookup system are satisfied, and (2) the program is executed with the correct initial memory and register contents as specified by the ELF binary and the ISA.
 
-= Memory types
+## Memory types
 
 A commonly made distinction of memory types is that of _read-only_ and _read-write_ memory, with the more restrictive read-only variant often allowing for more efficient solutions (be that regarding prover time, verifier time or proof size) via table lookup proofs. Naturally, the VM’s main memory and registers should be handled by a read-write system as the guest program/environment can issue instructions that write to memory. While there are some subsystems that can be modelled as read-only memory ---e.g., the program memory and instruction decoding--- we opt to integrate these into the proof system via chip interactions (relying on techniques derived from table lookup arguments). As such, we only concern ourselves with read-write memory, moving forward.
 
-= Memory operations
+## Memory operations
 
 Every memory operation has some conceptual attributes that are relevant to mention or discuss:
 
@@ -20,7 +20,7 @@ Since we will have to ensure that memory accesses are temporally consistent with
 
 For reasons of completeness (since temporal integrity as discussed below is a security necessity), we cannot deal with multiple accesses to the same address at identical timestamps. However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp --- consider, e.g., the case of reading a word as 4 bytes with the `LW` load instruction. This property is already taken into account where possible in the design of the system. For instance, in the CPU chip, we can ensure that there are at most 3 memory accesses not guaranteed to be independent, so a timestamp granularity of 4 timestamps per cycle is enough. ]
 
-= Permutation argument
+## Permutation argument
 
 We can conceptually organise the state of the memory as a collection of "tokens" that represent tuples `(serif("timestamp"), serif("address"), serif("value"))`, meaning the current value written to `serif("address")` is `serif("value")`, last written to memory at `serif("timestamp")`. Having exactly one value associated with any address will be ensured (see further down in this document) by the interaction of memory initialization, memory finalization, and the effects of memory operations.
 
@@ -32,13 +32,13 @@ Naturally, for a read operation, the _values_ embedded in the consumed and emitt
 
 So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens), this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument ([logup]): consuming a token corresponds to a "receive" and emitting a new token is a "send".
 
-= Temporal integrity
+## Temporal integrity
 
 To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token to have a strictly greater timestamp than the consumed token. This raises the question of how to represent timestamps and cleanly perform this check, as over a finite field the “less than” relation is ill-defined (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers). We choose to represent timestamps as machine words, using the existing `LT` chip ([lt]) functionality for comparisons. The full implementation of the timestamp system can be seen in the `timestamp` column of the `CPU` ([cpu]) and `MEMW` chips ([memw]). The `CPU` merely passes in the current timestamp, while `MEMW` can recall the previously written timestamp and constrain the correct sequencing.
 
 - Clean definition of “less-than”, using the already existing `LT` functionality in the ALU - Harder to perform increments, needing extra constraints beyond field arithmetic - But this can be alleviated by providing a precomputed column that has a fixed increment per CPU row ][ - Comparison is more annoying, but can work by: - Decomposition into a machine word and chip interaction with the LT chip - Bit decomposition and comparison constraints - Range-checking the difference to be sufficiently small w.r.t. the field characteristic. - Increments and basic arithmetic operations are cheap ] ]
 
-= Initialization and Finalization
+## Initialization and Finalization
 
 Because the LogUp argument handling token consumption and emission needs to be fully balanced --- every token emitted should be consumed, and vice versa --- we need to have a system to emit the initial tokens and consume the final tokens. This needs to ensure that every address has at most a single initializing emission, and at most one finalizing consumption. Having at most one initialization will, through the correctness of the lookup argument, immediately lead to having at most one correct finalization, and vice versa.
 
@@ -48,7 +48,7 @@ For our chosen scheme (which we refer to as "paged initialization/finalization")
 
 Concretely, each page gets an associated `PAGE` table, consisting of N variables over N columns. For each such table, the `page` variable is instantiated as the constant base address of the page. The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size, but the verifier should still check that no pages overlap and all `page` values are page-aligned.
 
-## Page initialization
+### Page initialization
 
 > **Note:** check whether we need `fini` to be range-checked
 
@@ -57,6 +57,33 @@ We present here a set of constraints on the `PAGE` table that
 + enforces the initial and final values of each address are bytes + adds the initial and final interaction to the LogUp argument
 
 For zero-initialized pages, `init` can be a constant `0`, and hence doesn't need a column, nor a range check.
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `offset` | `RowIndex` | The offset from the page base address. |
+| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
+| `fini` | `Byte` | The final value this address took |
+| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
+
+**Definition of `address`:**
+```
+address := page + offset * 1::DWordWL
+```
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `PAGE-C1` | `IS_BYTE[init]` | 1 |
+| `PAGE-C2` | `IS_BYTE[fini]` | 1 |
+| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
+| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |
 
 We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
 
@@ -68,14 +95,14 @@ _Sparse initialization/finalization_
 
 One or more STARK tables (depending on the amount of memory used) consisting of `(address, value)` columns are introduced, where for zero-initialization, `value` can be constant zero. Transition constraints ensure that `address` is strictly increasing, enforcing the "at most once" property; `value` is range-checked to consist of bytes. Similar to paged finalization, an additional `timestamp` column is added, containing the final timestamp each address was accessed. This table is then further used to contribute to the LogUp sum as with any other interactions. - The transition constraints can be chosen to only apply on finalization, as at-most-once finalization is enough to ensure consistency. - Sparse initialization is incompatible with paged finalization, see also the remark under free-zero initialization above. - This would require transition constraints, which currently are not needed elsewhere in the VM design - Additionally, for memory use exceeding the capacity of a single initialization/finalization table, some form of transition constraint between tables is needed - Alternatively, transition constraints could potentially be avoided by more integration into the LogUp system, but this could turn out more costly in practice - This is compatible with the above "free zero" initialization - Since a prover-committed address column is needed (rather than a precomputed one), the number of required columns increases. - As an optimization, the address column could potentially be used simultaneously for initialization and finalization - Sparse initialization/finalization reduces the cost for sparse memory access patterns, where only a few addresses would be accessed per page. Most programs and compilers should however favor a memory locality that makes paged initialization/finalization comparable. ]
 
-## Register initialization/finalization
+### Register initialization/finalization
 
 The initial and final state of registers can be entirely known by the verifier, since the relevant initialization values are either zero, or embedded in the ELF, and the final values can be set to a known value by the `HALT` ecall ([ecall]). As additionally, the number of registers is small, the verifier can directly add the required balancing terms to the LogUp sum.
 
-= Notes and considerations
+## Notes and considerations
 
 - Register reads and writes may interact within a single cycle, so a correct and fixed ordering needs to be ensured - Correctness of initialization and completeness of finalization need to be ensured
 
-= Future topics of interest
+## Future topics of interest
 
 - Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research) - Double check whether IS_BYTE constraints are needed for fini
