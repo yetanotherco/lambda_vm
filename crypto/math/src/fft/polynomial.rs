@@ -215,7 +215,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///
     /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
     /// since data is already in the buffer. Used for transpose elimination: columns are
-    /// extracted directly into pool buffers, then expanded in-place.
+    /// extracted directly into owned buffers, then expanded in-place.
     pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         buffer: &mut Vec<FieldElement<E>>,
         blowup_factor: usize,
