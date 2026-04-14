@@ -17,18 +17,20 @@ fn main() {
     let mut stdin = SP1Stdin::new();
     stdin.write(&n);
 
-    // Setup
-    let pk = client.setup(FIB_ELF.clone()).expect("setup failed");
-
-    // Execute for cycle count
+    // Cycle count — executed *before* the timer starts, matching Lambda's
+    // pre-pass for symmetry. This costs extra wall-clock but does not inflate
+    // the measured proving time.
     let (_, report) = client
         .execute(FIB_ELF.clone(), stdin.clone())
         .run()
         .unwrap();
     println!("Cycles: {}", report.total_instruction_count());
 
-    // Core proof (no recursion)
+    // Timed window: end-to-end single-shot proving, including `setup`
+    // (verifying-key derivation) and the `core` proof itself. No recursion /
+    // compression, no verification.
     let start = Instant::now();
+    let pk = client.setup(FIB_ELF.clone()).expect("setup failed");
     let proof = client
         .prove(&pk, stdin)
         .core()
@@ -38,7 +40,7 @@ fn main() {
 
     println!("Proving time: {:.3}s", elapsed.as_secs_f64());
 
-    // Verify
+    // Verify (outside the timer, same as Lambda).
     client
         .verify(&proof, pk.verifying_key(), None)
         .expect("verify failed");

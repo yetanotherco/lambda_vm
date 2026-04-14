@@ -3,7 +3,7 @@
 #
 # Usage: ./bench_vs/run.sh [-n 1000 50000 100000 | --steps 1000000 2000000]
 #                         [--lambda-only | --sp1-only] [--report-dir DIR]
-#                         [--target-steps N] [--no-color]
+#                         [--target-cycles N] [--no-color]
 #
 # Without an explicit series, defaults to:
 #   - iterations mode: 1000 10000 100000 300000
@@ -21,7 +21,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="/tmp/bench_fib"
 REPORT_DIR=""
 NO_COLOR=false
-TARGET_STEPS="${TARGET_STEPS:-500000000}"
+TARGET_CYCLES="${TARGET_CYCLES:-${TARGET_STEPS:-500000000}}"
 APPROX_STEPS_PER_ITERATION=5
 
 RED='\033[0;31m'
@@ -78,9 +78,15 @@ while [[ $# -gt 0 ]]; do
             REPORT_DIR=$2
             shift 2
             ;;
+        --target-cycles)
+            if [[ $# -lt 2 ]]; then echo "--target-cycles requires an argument"; exit 1; fi
+            TARGET_CYCLES=$2
+            shift 2
+            ;;
         --target-steps)
             if [[ $# -lt 2 ]]; then echo "--target-steps requires an argument"; exit 1; fi
-            TARGET_STEPS=$2
+            TARGET_CYCLES=$2
+            echo "Warning: --target-steps is deprecated; use --target-cycles" >&2
             shift 2
             ;;
         --no-color)
@@ -88,7 +94,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-steps N] [--no-color]"
+            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-cycles N] [--no-color]"
             echo ""
             echo "  -n N1 N2 ...      Fibonacci iteration counts (space-separated)"
             echo "                    Default iteration series: ${DEFAULT_ITERATION_SERIES[*]}"
@@ -96,8 +102,9 @@ while [[ $# -gt 0 ]]; do
             echo "                    Default step series: ${DEFAULT_STEP_SERIES[*]}"
             echo "  --lambda-only     Only run Lambda VM benchmark"
             echo "  --sp1-only        Only run SP1 benchmark"
-            echo "  --report-dir DIR  Write TSV, metrics, markdown summary, and raw outputs"
-            echo "  --target-steps N  Projection target in workload steps (default: $TARGET_STEPS)"
+            echo "  --report-dir DIR   Write TSV, metrics, markdown summary, and raw outputs"
+            echo "  --target-cycles N  Projection target in cycles (default: $TARGET_CYCLES)"
+            echo "  --target-steps N   Deprecated alias for --target-cycles"
             echo "  --no-color        Disable ANSI colors"
             exit 0
             ;;
@@ -253,7 +260,7 @@ PY
 echo -e "${BOLD}=== Fibonacci Benchmark: Lambda VM vs SP1 v6 ===${NC}"
 echo -e "Series mode: ${YELLOW}${SERIES_MODE}${NC}"
 echo -e "Requested series: ${YELLOW}${SERIES[*]}${NC}"
-echo -e "Projection target: ${YELLOW}${TARGET_STEPS}${NC} workload steps"
+echo -e "Projection target: ${YELLOW}${TARGET_CYCLES}${NC} cycles"
 echo ""
 
 # --- Pre-build --------------------------------------------------------------
@@ -325,9 +332,11 @@ fi
 
 RESULT_TARGET_STEPS=()
 RESULT_ITERATIONS=()
-RESULT_PROJECTION_STEPS=()
 RESULT_LAMBDA=()
+RESULT_LAMBDA_AXIS=()
+RESULT_LAMBDA_CYCLES=()
 RESULT_SP1=()
+RESULT_SP1_AXIS=()
 RESULT_SP1_CYCLES=()
 RESULT_RATIO=()
 
@@ -335,23 +344,25 @@ LAMBDA_PROJECTION_STEPS=()
 LAMBDA_TIMES=()
 SP1_PROJECTION_STEPS=()
 SP1_TIMES=()
-PROJECTION_AXIS="target_workload_steps"
+# Axis: use measured dynamic instruction counts per prover. If cycle data is
+# unavailable for a run, fall back to the approximated target_workload_steps.
+PROJECTION_AXIS="measured_cycles"
 
 if [ -n "$REPORT_DIR" ]; then
-    printf "target_steps\titerations\tprojection_steps\tlambda_time_s\tsp1_time_s\tsp1_cycles\tratio_lambda_over_sp1\n" > "$REPORT_DIR/results.tsv"
+    printf "target_steps\titerations\tlambda_time_s\tlambda_axis_value\tlambda_cycles\tsp1_time_s\tsp1_axis_value\tsp1_cycles\tratio_lambda_over_sp1\n" > "$REPORT_DIR/results.tsv"
 fi
 
 run_one() {
     local n=$1
     local target_steps=$2
     local lambda_time="n/a"
+    local lambda_cycles="n/a"
     local sp1_time="n/a"
     local sp1_cycles="n/a"
-    local projection_steps=$target_steps
     local ratio="n/a"
 
     echo ""
-    echo -e "${BOLD}--- target≈${target_steps} steps (n=${n} iterations) ---${NC}"
+    echo -e "${BOLD}--- target~=${target_steps} steps (n=${n} iterations) ---${NC}"
 
     if $RUN_LAMBDA; then
         local input_file="$TMP_DIR/lambda_${n}.bin"
@@ -361,7 +372,7 @@ run_one() {
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
         local lambda_output
-        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" --time 2>"$stderr_file"); then
+        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" --time --cycles 2>"$stderr_file"); then
             echo -e "  ${RED}[Lambda VM] FAILED:${NC}"
             cat "$stderr_file"
             exit 1
@@ -369,13 +380,21 @@ run_one() {
         rm -f "$proof_file"
 
         lambda_time=$(echo "$lambda_output" | grep -o 'Proving time: [0-9.]*s' | grep -o '[0-9.]*')
+        lambda_cycles=$(echo "$lambda_output" | grep -o 'Cycles: [0-9]*' | grep -o '[0-9]*')
         if [ -z "$lambda_time" ]; then
             echo -e "  ${RED}[Lambda VM] FAILED: could not parse proving time${NC}"
             printf "%s\n" "$lambda_output"
             exit 1
         fi
+        if [ -z "$lambda_cycles" ]; then
+            lambda_cycles="n/a"
+        fi
 
-        echo -e "  Lambda VM: ${BOLD}${lambda_time}s${NC}"
+        if [ "$lambda_cycles" != "n/a" ]; then
+            echo -e "  Lambda VM: ${BOLD}${lambda_time}s${NC} (${lambda_cycles} cycles)"
+        else
+            echo -e "  Lambda VM: ${BOLD}${lambda_time}s${NC}"
+        fi
 
         if [ -n "$REPORT_DIR" ]; then
             printf "%s\n" "$lambda_output" > "$REPORT_DIR/raw/lambda_${n}.stdout"
@@ -411,30 +430,45 @@ run_one() {
         ratio=$(LC_NUMERIC=C awk -v lambda="$lambda_time" -v sp1="$sp1_time" 'BEGIN { printf "%.3f", lambda / sp1 }')
     fi
 
+    # Axis selection per prover: use measured cycles when available, otherwise
+    # fall back to the approximated target_steps.
+    local lambda_axis="$target_steps"
+    if [ "$lambda_cycles" != "n/a" ]; then
+        lambda_axis="$lambda_cycles"
+    fi
+    local sp1_axis="$target_steps"
+    if [ "$sp1_cycles" != "n/a" ]; then
+        sp1_axis="$sp1_cycles"
+    fi
+
     if [ "$lambda_time" != "n/a" ]; then
-        LAMBDA_PROJECTION_STEPS+=("$target_steps")
+        LAMBDA_PROJECTION_STEPS+=("$lambda_axis")
         LAMBDA_TIMES+=("$lambda_time")
     fi
     if [ "$sp1_time" != "n/a" ]; then
-        SP1_PROJECTION_STEPS+=("$target_steps")
+        SP1_PROJECTION_STEPS+=("$sp1_axis")
         SP1_TIMES+=("$sp1_time")
     fi
 
     RESULT_TARGET_STEPS+=("$target_steps")
     RESULT_ITERATIONS+=("$n")
-    RESULT_PROJECTION_STEPS+=("$projection_steps")
     RESULT_LAMBDA+=("$lambda_time")
+    RESULT_LAMBDA_AXIS+=("$lambda_axis")
+    RESULT_LAMBDA_CYCLES+=("$lambda_cycles")
     RESULT_SP1+=("$sp1_time")
+    RESULT_SP1_AXIS+=("$sp1_axis")
     RESULT_SP1_CYCLES+=("$sp1_cycles")
     RESULT_RATIO+=("$ratio")
 
     if [ -n "$REPORT_DIR" ]; then
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
             "$target_steps" \
             "$n" \
-            "$projection_steps" \
             "$lambda_time" \
+            "$lambda_axis" \
+            "$lambda_cycles" \
             "$sp1_time" \
+            "$sp1_axis" \
             "$sp1_cycles" \
             "$ratio" >> "$REPORT_DIR/results.tsv"
     fi
@@ -469,7 +503,7 @@ compute_projection() {
     fi
 
     read -r slope intercept r2 <<< "$(fit_series "$steps_slash" "$times_slash")"
-    projected_s=$(project_series "$slope" "$intercept" "$TARGET_STEPS")
+    projected_s=$(project_series "$slope" "$intercept" "$TARGET_CYCLES")
     projected_h=$(format_hours "$projected_s")
 
     case "$label" in
@@ -505,20 +539,21 @@ echo -e "Program: Fibonacci (u64 wrapping)"
 echo ""
 
 if $RUN_LAMBDA && $RUN_SP1; then
-    printf "  %-12s  %-12s  %12s  %12s  %12s  %8s\n" "Target steps" "Iterations" "Lambda VM" "SP1 v6" "SP1 cycles" "Ratio"
-    printf "  %-12s  %-12s  %12s  %12s  %12s  %8s\n" "------------" "----------" "---------" "------" "----------" "-----"
+    printf "  %-12s  %-12s  %14s  %14s  %14s  %14s  %8s\n" "Target steps" "Iterations" "Lambda (s)" "Lambda cycles" "SP1 (s)" "SP1 cycles" "Ratio"
+    printf "  %-12s  %-12s  %14s  %14s  %14s  %14s  %8s\n" "------------" "----------" "----------" "-------------" "-------" "----------" "-----"
 elif $RUN_LAMBDA; then
-    printf "  %-12s  %-12s  %12s\n" "Target steps" "Iterations" "Lambda VM"
-    printf "  %-12s  %-12s  %12s\n" "------------" "----------" "---------"
+    printf "  %-12s  %-12s  %14s  %14s\n" "Target steps" "Iterations" "Lambda (s)" "Lambda cycles"
+    printf "  %-12s  %-12s  %14s  %14s\n" "------------" "----------" "----------" "-------------"
 else
-    printf "  %-12s  %-12s  %12s  %12s\n" "Target steps" "Iterations" "SP1 v6" "SP1 cycles"
-    printf "  %-12s  %-12s  %12s  %12s\n" "------------" "----------" "------" "----------"
+    printf "  %-12s  %-12s  %14s  %14s\n" "Target steps" "Iterations" "SP1 (s)" "SP1 cycles"
+    printf "  %-12s  %-12s  %14s  %14s\n" "------------" "----------" "-------" "----------"
 fi
 
 for i in "${!RESULT_ITERATIONS[@]}"; do
     target_steps="${RESULT_TARGET_STEPS[$i]}"
     n="${RESULT_ITERATIONS[$i]}"
     lambda_time="${RESULT_LAMBDA[$i]}"
+    lambda_cycles="${RESULT_LAMBDA_CYCLES[$i]}"
     sp1_time="${RESULT_SP1[$i]}"
     sp1_cycles="${RESULT_SP1_CYCLES[$i]}"
     ratio="${RESULT_RATIO[$i]}"
@@ -531,19 +566,20 @@ for i in "${!RESULT_ITERATIONS[@]}"; do
             else
                 ratio_colored="${GREEN}${ratio_colored}${NC}"
             fi
-            printf "  %-12s  %-12s  %11ss  %11ss  %12s  " "$target_steps" "$n" "$lambda_time" "$sp1_time" "$sp1_cycles"
+            printf "  %-12s  %-12s  %13ss  %14s  %13ss  %14s  " "$target_steps" "$n" "$lambda_time" "$lambda_cycles" "$sp1_time" "$sp1_cycles"
             echo -e "$ratio_colored"
         else
-            printf "  %-12s  %-12s  %12s  %12s  %12s  %8s\n" "$target_steps" "$n" "${lambda_time}s" "${sp1_time}s" "$sp1_cycles" "-"
+            printf "  %-12s  %-12s  %14s  %14s  %14s  %14s  %8s\n" "$target_steps" "$n" "${lambda_time}s" "$lambda_cycles" "${sp1_time}s" "$sp1_cycles" "-"
         fi
     elif $RUN_LAMBDA; then
-        printf "  %-12s  %-12s  %11ss\n" "$target_steps" "$n" "$lambda_time"
+        printf "  %-12s  %-12s  %13ss  %14s\n" "$target_steps" "$n" "$lambda_time" "$lambda_cycles"
     else
-        printf "  %-12s  %-12s  %11ss  %12s\n" "$target_steps" "$n" "$sp1_time" "$sp1_cycles"
+        printf "  %-12s  %-12s  %13ss  %14s\n" "$target_steps" "$n" "$sp1_time" "$sp1_cycles"
     fi
 done
 
 echo ""
+echo -e "Timing window covers single-shot end-to-end proving; SP1 includes setup; both exclude verification."
 if $RUN_LAMBDA && $RUN_SP1; then
     echo -e "Green ratio = Lambda VM faster, Red = SP1 faster"
 fi
@@ -551,14 +587,14 @@ echo "Raw data in $TMP_DIR/"
 
 if [ -n "$LAMBDA_PROJECTED_S" ] || [ -n "$SP1_PROJECTED_S" ]; then
     echo ""
-    echo -e "${BOLD}=== Linear Projection to ${TARGET_STEPS} Workload Steps ===${NC}"
-    echo "  Axis: target workload steps"
-    echo "  Note: when using iterations input, target steps are approximated as ${APPROX_STEPS_PER_ITERATION} * n"
+    echo -e "${BOLD}=== Linear Projection to ${TARGET_CYCLES} Cycles ===${NC}"
+    echo "  Axis: measured dynamic instruction count per prover (cycles). When cycle data is"
+    echo "        unavailable the script falls back to target_workload_steps ~= ${APPROX_STEPS_PER_ITERATION} * n."
     if [ -n "$LAMBDA_PROJECTED_S" ]; then
-        echo "  Lambda VM: ${LAMBDA_PROJECTED_S}s (${LAMBDA_PROJECTED_H}h), R²=${LAMBDA_R2}"
+        echo "  Lambda VM: ${LAMBDA_PROJECTED_S}s (${LAMBDA_PROJECTED_H}h), R2=${LAMBDA_R2}"
     fi
     if [ -n "$SP1_PROJECTED_S" ]; then
-        echo "  SP1 v6:    ${SP1_PROJECTED_S}s (${SP1_PROJECTED_H}h), R²=${SP1_R2}"
+        echo "  SP1 v6:    ${SP1_PROJECTED_S}s (${SP1_PROJECTED_H}h), R2=${SP1_R2}"
     fi
 fi
 
@@ -571,10 +607,13 @@ if [ -n "$REPORT_DIR" ]; then
         echo "target_steps_series=$(join_slash "${RESULT_TARGET_STEPS[@]}")"
         echo "iterations=$(join_slash "${RESULT_ITERATIONS[@]}")"
         echo "projection_axis=$PROJECTION_AXIS"
-        echo "target_steps=$TARGET_STEPS"
-        echo "projection_steps=$(join_slash "${RESULT_PROJECTION_STEPS[@]}")"
+        echo "timing_window=setup_plus_end_to_end_prove_no_verify"
+        echo "target_cycles=$TARGET_CYCLES"
         echo "lambda_times=$(join_slash "${RESULT_LAMBDA[@]}")"
+        echo "lambda_axis_values=$(join_slash "${RESULT_LAMBDA_AXIS[@]}")"
+        echo "lambda_cycles=$(join_slash "${RESULT_LAMBDA_CYCLES[@]}")"
         echo "sp1_times=$(join_slash "${RESULT_SP1[@]}")"
+        echo "sp1_axis_values=$(join_slash "${RESULT_SP1_AXIS[@]}")"
         echo "sp1_cycles=$(join_slash "${RESULT_SP1_CYCLES[@]}")"
         echo "ratios=$(join_slash "${RESULT_RATIO[@]}")"
         if [ -n "$LAMBDA_PROJECTED_S" ]; then
@@ -596,25 +635,27 @@ if [ -n "$REPORT_DIR" ]; then
     {
         echo "# Lambda VM vs SP1 v6 Benchmark"
         echo
-        echo "Projection axis: \`$PROJECTION_AXIS\`"
+        echo "Timing window: \`single-shot end-to-end prove\` (SP1 includes setup; both exclude verification and recursion)."
         echo
-        echo "| Target steps | Iterations | Projection steps | Lambda VM (s) | SP1 v6 (s) | SP1 cycles | Ratio |"
-        echo "|-------------:|-----------:|-----------------:|--------------:|-----------:|-----------:|------:|"
+        echo "Projection axis: \`$PROJECTION_AXIS\` (measured dynamic instruction count per prover)."
+        echo
+        echo "| Target steps | Iterations | Lambda VM (s) | Lambda cycles | SP1 v6 (s) | SP1 cycles | Ratio |"
+        echo "|-------------:|-----------:|--------------:|--------------:|-----------:|-----------:|------:|"
         for i in "${!RESULT_ITERATIONS[@]}"; do
             printf "| %s | %s | %s | %s | %s | %s | %s |\n" \
                 "${RESULT_TARGET_STEPS[$i]}" \
                 "${RESULT_ITERATIONS[$i]}" \
-                "${RESULT_PROJECTION_STEPS[$i]}" \
                 "${RESULT_LAMBDA[$i]}" \
+                "${RESULT_LAMBDA_CYCLES[$i]}" \
                 "${RESULT_SP1[$i]}" \
                 "${RESULT_SP1_CYCLES[$i]}" \
                 "${RESULT_RATIO[$i]}"
         done
         echo
-        echo "## Linear Projection to ${TARGET_STEPS} Workload Steps"
+        echo "## Linear Projection to ${TARGET_CYCLES} Cycles"
         echo
-        echo "| Prover | Slope (s / 1M workload steps) | Intercept (s) | R² | Projected @ ${TARGET_STEPS} (s) | Projected @ ${TARGET_STEPS} (h) |"
-        echo "|--------|-------------------------------:|--------------:|---:|------------------------------:|------------------------------:|"
+        echo "| Prover | Slope (s / 1M cycles) | Intercept (s) | R2 | Projected @ ${TARGET_CYCLES} (s) | Projected @ ${TARGET_CYCLES} (h) |"
+        echo "|--------|----------------------:|--------------:|---:|------------------------------:|------------------------------:|"
         if [ -n "$LAMBDA_PROJECTED_S" ]; then
             printf "| Lambda VM | %s | %s | %s | %s | %s |\n" \
                 "$LAMBDA_SLOPE" \

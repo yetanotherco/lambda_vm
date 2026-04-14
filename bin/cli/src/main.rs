@@ -128,9 +128,13 @@ enum Commands {
         #[arg(long)]
         blowup: Option<u8>,
 
-        /// Print timing breakdown
+        /// Print proving time
         #[arg(long)]
         time: bool,
+
+        /// Execute one pre-pass outside the timer and print dynamic instruction count
+        #[arg(long)]
+        cycles: bool,
     },
 
     /// Verify a proof bundle
@@ -168,7 +172,8 @@ fn main() -> ExitCode {
             private_input,
             blowup,
             time,
-        } => cmd_prove(elf, output, private_input, blowup, time),
+            cycles,
+        } => cmd_prove(elf, output, private_input, blowup, time, cycles),
         Commands::Verify {
             proof,
             elf,
@@ -290,6 +295,7 @@ fn cmd_prove(
     private_input_path: Option<PathBuf>,
     blowup: Option<u8>,
     time: bool,
+    cycles: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -306,6 +312,35 @@ fn cmd_prove(
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
+    };
+
+    // Pre-pass: execute once outside the timer to count dynamic instructions.
+    // Mirrors SP1's cycle-count pass so both provers report the same kind of
+    // number without inflating the measured proving time.
+    let cycle_count = if cycles {
+        let program = match Elf::load(&elf_data) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to load ELF for cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+        let executor = match Executor::new(&program, private_inputs.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to create executor for cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+        match executor.run() {
+            Ok(result) => Some(result.logs.len() as u64),
+            Err(e) => {
+                eprintln!("Execution failed during cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
     };
 
     #[cfg(feature = "jemalloc-stats")]
@@ -370,6 +405,9 @@ fn cmd_prove(
     }
 
     eprintln!("Proof written to {:?}", output_path);
+    if let Some(c) = cycle_count {
+        println!("Cycles: {}", c);
+    }
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
     }
