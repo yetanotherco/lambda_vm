@@ -1,0 +1,53 @@
+name = "NEG"
+
+[[variables.condition]]
+name = "cond"
+type = "Bit"
+desc = "condition on whether to negate x"
+
+[[variables.input]]
+name = "x"
+type = "DWordHL"
+desc = "value to compute negation of"
+
+[[variables.output]]
+name = "neg"
+type = "DWordWL"
+desc = "negation of `x` if $#`cond` != 0$; unconstrained otherwise."
+
+[[variables.virtual]]
+name = "carry"
+type = ["Bit", 2]
+desc = "carries of the addition $#`neg` + #`x`$."
+def = {idx="i", polys=[
+    {iter=0, poly=["*", ["^", 2, -32], ["+", ["idx", ["cast", "x", "DWordWL"], 0], ["idx", "neg", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["+", ["idx", ["cast", "x", "DWordWL"], 1], ["idx", "neg", 1], ["idx", "carry", 0]]]}
+]}
+
+
+[[assumptions]]
+desc = "`IS_HALF[x[i]]`"
+iter = ["i", 0, 3]
+
+[[assumptions]]
+desc = "`IS_BIT<cond>`"
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["idx", "x", 0], ["idx", "x", 1]]]
+output = ["not", ["idx", "carry", 0]]
+multiplicity = "cond"
+ref = "neg:c:carry_0"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["idx", "x", 0], ["idx", "x", 1], ["idx", "x", 2], ["idx", "x", 3]]]
+output = ["not", ["idx", "carry", 1]]
+multiplicity = "cond"
+ref = "neg:c:carry_1"
