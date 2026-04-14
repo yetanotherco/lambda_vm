@@ -257,6 +257,22 @@ with open(path, "wb") as fh:
 PY
 }
 
+extract_proving_time() {
+    sed -nE '/Proving time: [0-9.]+s/ {
+        s/.*Proving time: ([0-9.]+)s.*/\1/
+        p
+        q
+    }'
+}
+
+extract_cycles() {
+    sed -nE '/Cycles: [0-9]+/ {
+        s/.*Cycles: ([0-9]+).*/\1/
+        p
+        q
+    }'
+}
+
 echo -e "${BOLD}=== Fibonacci Benchmark: Lambda VM vs SP1 v6 ===${NC}"
 echo -e "Series mode: ${YELLOW}${SERIES_MODE}${NC}"
 echo -e "Requested series: ${YELLOW}${SERIES[*]}${NC}"
@@ -379,8 +395,8 @@ run_one() {
         fi
         rm -f "$proof_file"
 
-        lambda_time=$(echo "$lambda_output" | grep -o 'Proving time: [0-9.]*s' | grep -o '[0-9.]*')
-        lambda_cycles=$(echo "$lambda_output" | grep -o 'Cycles: [0-9]*' | grep -o '[0-9]*')
+        lambda_time=$(printf "%s\n" "$lambda_output" | extract_proving_time)
+        lambda_cycles=$(printf "%s\n" "$lambda_output" | extract_cycles)
         if [ -z "$lambda_time" ]; then
             echo -e "  ${RED}[Lambda VM] FAILED: could not parse proving time${NC}"
             printf "%s\n" "$lambda_output"
@@ -411,8 +427,8 @@ run_one() {
             exit 1
         fi
 
-        sp1_time=$(grep -o 'Proving time: [0-9.]*s' "$sp1_output_file" | grep -o '[0-9.]*')
-        sp1_cycles=$(grep -o 'Cycles: [0-9]*' "$sp1_output_file" | grep -o '[0-9]*')
+        sp1_time=$(extract_proving_time < "$sp1_output_file")
+        sp1_cycles=$(extract_cycles < "$sp1_output_file")
         if [ -z "$sp1_time" ] || [ -z "$sp1_cycles" ]; then
             echo -e "  ${RED}[SP1 v6] FAILED: could not parse output${NC}"
             cat "$sp1_output_file"
