@@ -49,17 +49,18 @@ pub use types::BusId;
 /// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
 ///    benchmarks show better parallel throughput with smaller chunks.)
 ///
-/// | Table   | Main | Bus | Eff.width | Max rows |
-/// |---------|------|-----|-----------|----------|
-/// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  74  |  40 |    194    |  2^19    |
-/// | DVRM    |  34  |  34 |    136    |  2^19    |
-/// | MUL     |  26  |  16 |     74    |  2^20    |
-/// | LT      |  15  |   9 |     42    |  2^21    |
-/// | SHIFT   |  27  |  15 |     72    |  2^20    |
-/// | LOAD    |  18  |   5 |     33    |  2^21    |
-/// | BRANCH  |  14  |   6 |     32    |  2^21    |
+/// | Table           | Main | Bus | Eff.width | Max rows |
+/// |-----------------|------|-----|-----------|----------|
+/// | MEMW            |  49  |  26 |    127    |  2^19    |
+/// | MEMW_A          |  29  |  20 |     89    |  2^19 *  |
+/// | CPU             |  80  |  38 |    194    |  2^19    |
+/// | REGISTER_RELOAD |   5  |   4 |     17    |  (none)  |
+/// | DVRM            |  34  |  34 |    136    |  2^19    |
+/// | MUL             |  26  |  16 |     74    |  2^20    |
+/// | LT              |  15  |   9 |     42    |  2^21    |
+/// | SHIFT           |  27  |  15 |     72    |  2^20    |
+/// | LOAD            |  18  |   5 |     33    |  2^21    |
+/// | BRANCH          |  14  |   6 |     32    |  2^21    |
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)

@@ -2012,6 +2012,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ]);
         // IsHalfword[(TIMESTAMP + 1) - PC_PREV_TS - 1] = [TIMESTAMP - PC_PREV_TS]
+        //
+        // AUIPC/JAL special case (rs1 = 255): the rs1 block runs first and
+        // consumes the old PC token, then produces a new token at TIMESTAMP.
+        // The PC block then reads PC_PREV_TS = TIMESTAMP, so the IS_HALF delta
+        // is TIMESTAMP - TIMESTAMP = 0. IS_HALF[0] is valid (0 ∈ [0, 65535]).
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             non_padding.clone(),

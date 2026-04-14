@@ -663,6 +663,11 @@ fn track_register_ops_from_cpu(
     }
 
     // PC (x255) read-write @ ts + 1 — always, for every non-padding row.
+    //
+    // AUIPC/JAL (rs1 = 255): the rs1 block above already called write_pc with
+    // timestamp = op.timestamp, so read_pc() returns pc_ts = op.timestamp here.
+    // This produces pc_prev_ts = op.timestamp and IS_HALF[TIMESTAMP - PC_PREV_TS]
+    // = IS_HALF[0] in the AIR — a valid one-step ordering check by design.
     {
         let (pc_val, pc_ts) = register_state.read_pc();
         let effective_pc_prev_ts =
@@ -929,7 +934,6 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
     true
 }
 
-/// Collects bitwise lookups from MEMW_A operations.
 /// Collects IS_HALFWORD bitwise lookups for CPU register-on-Main range checks.
 ///
 /// For each non-padding CPU instruction, the CPU chip sends IS_HALFWORD queries
