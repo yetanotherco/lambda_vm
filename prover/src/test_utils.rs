@@ -31,6 +31,10 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::commit::{
+    bus_interactions as commit_bus_interactions, cols as commit_cols,
+    create_constraints as commit_constraints,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
@@ -45,6 +49,14 @@ use crate::tables::load::{
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
+};
+use crate::tables::memw_aligned::{
+    bus_interactions as memw_aligned_bus_interactions, cols as memw_aligned_cols,
+    constraints as memw_aligned_constraints,
+};
+use crate::tables::memw_register::{
+    bus_interactions as memw_register_bus_interactions, cols as memw_register_cols,
+    constraints as memw_register_constraints,
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
@@ -348,20 +360,6 @@ pub fn collect_bitwise_ops_from_load(
         .collect()
 }
 
-/// Collect LT operations from MEMW operations.
-///
-/// The MEMW table sends LT lookups for:
-/// - Timestamp ordering: old_timestamp[i] < timestamp
-/// - Overflow checking: base_address < base_address + offset
-pub fn collect_lt_lookups_from_memw(
-    memw_ops: &[crate::tables::memw::MemwOperation],
-) -> Vec<LtOperation> {
-    memw_ops
-        .iter()
-        .flat_map(|op| op.collect_lt_lookups())
-        .collect()
-}
-
 // =============================================================================
 // Minimal Trace Generation (for testing/benchmarking only)
 // =============================================================================
@@ -376,7 +374,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
 
     for op in ops {
         let key = (op.x, op.y, op.z);
@@ -391,9 +389,8 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
             BitwiseOperationType::IsHalf => 7,
             BitwiseOperationType::IsB20 => 8,
             BitwiseOperationType::Hwsl => 9,
-            BitwiseOperationType::Hwslc => 10,
         };
-        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
+        row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
 
     // Need at least 4 rows for FRI, pad to power of 2
@@ -451,7 +448,6 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
         data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
         data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
         data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
@@ -564,6 +560,42 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW")
+}
+
+/// Create MEMW_A (aligned) AIR with constraints and bus interactions.
+pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_aligned_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_aligned_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_aligned_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("MEMW_A")
+}
+
+/// Create MEMW_R (register) AIR with constraints and bus interactions.
+pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_register_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_register_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_register_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("MEMW_R")
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
@@ -692,6 +724,24 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("HALT")
+}
+
+/// Create COMMIT AIR with constraints and bus interactions.
+pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = commit_constraints(0);
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: commit_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        commit_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("COMMIT")
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.

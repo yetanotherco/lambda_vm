@@ -1,10 +1,12 @@
-#import "/book.typ": book-page, et
+#import "/book.typ": book-page, aside, et
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table
+#import "/chip.typ": render_chip_variable_table, render_chip_assumptions, render_constraint_table, compute_nr_interactions,
 
 #let config = load_config()
 #let chip = load_chip("src/neg.toml", config)
 #show: book-page(chip.name)
+
+#let nr_interactions = compute_nr_interactions(chip)
 
 #let neg = raw(chip.name)
 
@@ -12,7 +14,8 @@
 It requires `cond` to be a bit.
 
 = Variables
-#render_chip_column_table(chip, config)
+This template introduces #nr_interactions interaction(s).
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 #render_chip_assumptions(chip, config)
@@ -20,6 +23,8 @@ It requires `cond` to be a bit.
 = Constraints
 We constrain this equality using two constraints:
 #render_constraint_table(chip, config)
+
+== Correctness argument
 The constraints force the `carry` values to be fixed.
 Writing `carry`'s definition, we then find that
 $
@@ -58,7 +63,8 @@ $
 when `cond` is set.
 When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
-= Note
-It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
-thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`.
-The input value `x` is still assumed to be range-checked, however.
+#aside("Missing range check?")[
+  It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
+  thus allowing it be represented by the unrangecheckable `DWordWL` rather than a `DWordHL`.
+  The input value `x` is still assumed to be range-checked, however.
+]

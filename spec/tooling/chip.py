@@ -1,3 +1,4 @@
+import copy
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
@@ -390,7 +391,7 @@ class Iter:
             yield from callback(env.with_val(self.name, Range.const(i)))
 
 
-def iters_of(obj: dict, name=None) -> list[Iter]:
+def iters_of(obj: dict, config, name=None) -> list[Iter]:
     """Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
     Prepend `name` to every iterator, if given.
     Adapted from the corresponding typst implementation."""
@@ -538,7 +539,8 @@ class Config:
     @classmethod
     def from_file(cls, filename: str | Path) -> Self:
         reporter.update_location(str(filename))
-        return cls(tomllib.load(open(filename, "rb")))
+        with open(filename, "rb") as fp:
+            return cls(tomllib.load(fp))
 
     @classmethod
     def from_string(cls, s: str) -> Self:
@@ -607,14 +609,14 @@ class VirtualDef:
             idx = data.get("idx", None)
             self.defs = [
                 PolyWithIters(
-                    build_expr(config, data["poly"]), iters_of(data, name=idx)
+                    build_expr(config, data["poly"]), iters_of(data, config, name=idx)
                 )
             ]
         elif "polys" in data:
             idx = data.get("idx", None)
             self.defs = [
                 PolyWithIters(
-                    build_expr(config, poly["poly"]), iters_of(poly, name=idx)
+                    build_expr(config, poly["poly"]), iters_of(poly, config, name=idx)
                 )
                 for poly in data["polys"]
             ]
@@ -629,6 +631,7 @@ class VirtualVariable(Variable):
     def __init__(self, config: Config, category: str, data: dict):
         assert_no_unexpected(data, (set(Variable.__annotations__.keys()) | {"def"}) - {"pad"})
         reporter.asserts("def" in data, f"Missing def for virtual column: {data!r}")
+        data = copy.deepcopy(data)
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
         self.def_ = VirtualDef(config, self.name, self.type, def_)
@@ -753,7 +756,7 @@ class Assumption:
             data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
         )
         self.desc = data["desc"]
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
 
 @dataclass
@@ -778,7 +781,7 @@ class ArithConstraint:
             isinstance(self.desc, str), f"desc is not a string: {self.desc!r}"
         )
         self.poly = build_expr(config, data["poly"])
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
     def typecheck(self, env: Environment) -> Iterable[Never]:
         # TODO? Should we check that there's no overflow of the modulus?
@@ -873,7 +876,7 @@ class InteractionLike:
                 f"Missing {self.conditional_name}: {data!r}",
             )
             self.conditional = None
-        self.iters = iters_of(data)
+        self.iters = iters_of(data, config)
 
     def typecheck(self, env: Environment) -> Iterable[Signature]:
         def callback(e: Environment) -> Iterable[Signature]:
@@ -974,7 +977,8 @@ class Chip:
     @classmethod
     def from_file(cls, config: Config, filename: str | Path) -> Self:
         reporter.update_location(str(filename))
-        return cls(config, tomllib.load(open(filename, "rb")))
+        with open(filename, "rb") as fp:
+            return cls(config, tomllib.load(fp))
 
     @classmethod
     def from_string(cls, config: Config, s: str) -> Self:
@@ -1015,6 +1019,9 @@ def build_signature(config: Config, data: dict) -> Signature:
                 "cond" not in data, f"Template signature with cond: {data!r}"
             )
             Sig = InteractionSignature
+        case other:
+            reporter.error(f"Signature of invalid kind '{other}': {data!r}")
+            Sig = Signature
     tag = data["tag"]
     reporter.asserts(isinstance(tag, str), f"Signature tag not a string: {tag!r}")
     input = [build_type(config, inp) for inp in data["input"]]
@@ -1026,7 +1033,8 @@ def build_signature(config: Config, data: dict) -> Signature:
 
 
 def read_signatures(config, filename) -> list[Signature]:
-    data = tomllib.load(open(filename, "rb"))
+    with open(filename, "rb") as fp:
+        data = tomllib.load(fp)
     assert_no_unexpected(data, {"signatures"})
     return [build_signature(config, sig) for sig in data["signatures"]]
 
@@ -1043,6 +1051,7 @@ if __name__ == "__main__":
     signatures = read_signatures(config, sys.argv[2])
     if reporter.reported:
         sys.exit(1)
+
     reported = False
     chips: list[Chip] = []
     for file in sys.argv[3:]:
@@ -1050,7 +1059,15 @@ if __name__ == "__main__":
             continue
         chips.append(Chip.from_file(config, file))
         reported |= reporter.reported
-    if not reported:
-        for chip in chips:
-            reporter.update_location(f"Chip {chip.name}")
-            check_signatures(chip.typecheck(), signatures)
+    if reported:
+        sys.exit(1)
+
+    for chip in chips:
+        reporter.update_location(f"Chip {chip.name}")
+        check_signatures(chip.typecheck(), signatures)
+        reported |= reporter.reported
+    if reported:
+        sys.exit(1)
+    else:
+        print("No issues were found.")
+        sys.exit(0)

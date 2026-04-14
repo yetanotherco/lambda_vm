@@ -1,14 +1,14 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_padding_table,
   render_chip_assumptions
 )
-
 
 #let config = load_config()
 #let chip = load_chip("src/dvrm.toml", config)
@@ -19,12 +19,13 @@
 
 The #dvrm chip provides division and remainder functionality, both signed and unsigned.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The `DVRM` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(chip, config)
+The #dvrm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 #render_chip_assumptions(chip, config)

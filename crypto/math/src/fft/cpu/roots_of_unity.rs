@@ -54,22 +54,17 @@ pub fn get_powers_of_primitive_root_coset<F: IsFFTField>(
     count: usize,
     offset: &FieldElement<F>,
 ) -> Result<Vec<FieldElement<F>>, FFTError> {
-    let root = F::get_primitive_root_of_unity(n)?;
-    let results = (0..count).map(|i| offset * root.pow(i));
-
-    Ok(results.collect())
-}
-
-/// Returns 2^`order` / 2 twiddle factors for FFT in some configuration `config`.
-/// Twiddle factors are powers of a primitive root of unity of the field, used for FFT
-/// computations. FFT only requires the first half of all the powers
-pub fn get_twiddles<F: IsFFTField>(
-    order: u64,
-    config: RootsConfig,
-) -> Result<Vec<FieldElement<F>>, FFTError> {
-    if order > 63 {
-        return Err(FFTError::OrderError(order));
+    if count == 0 {
+        return Ok(Vec::new());
     }
 
-    get_powers_of_primitive_root(order, (1 << order) / 2, config)
+    let root = F::get_primitive_root_of_unity(n)?;
+    let mut results = Vec::with_capacity(count);
+    let mut current = offset.clone();
+    for _ in 0..count {
+        results.push(current.clone());
+        current = &current * &root;
+    }
+
+    Ok(results)
 }

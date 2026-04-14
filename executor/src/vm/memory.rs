@@ -208,3 +208,57 @@ pub enum MemoryError {
     #[error("Private input size exceeded")]
     PrivateInputSizeExceeded,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Memory;
+
+    #[test]
+    fn test_commit_public_output_single() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'a');
+        memory.store_byte(0x101, b'b');
+
+        memory
+            .commit_public_output(0x100, 2)
+            .expect("commit should succeed");
+
+        assert_eq!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable"),
+            b"ab".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_commit_public_output_overwrites() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'a');
+        memory.store_byte(0x101, b'b');
+        memory.store_byte(0x104, b'c');
+        memory.store_byte(0x105, b'd');
+
+        memory
+            .commit_public_output(0x100, 2)
+            .expect("first commit should succeed");
+        memory
+            .commit_public_output(0x104, 2)
+            .expect("second commit should succeed");
+
+        // Overwrite semantics: second commit replaces first
+        assert_eq!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable"),
+            b"cd".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_commit_public_output_size_exceeded() {
+        let mut memory = Memory::default();
+        let err = memory.commit_public_output(0x100, 1025);
+        assert!(err.is_err());
+    }
+}

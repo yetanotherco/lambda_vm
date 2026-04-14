@@ -130,10 +130,10 @@ fn test_cpu_operation_compute_arg2_add_with_rs2() {
     let mut op = CpuOperation::new();
     op.rv2 = 0xABCD_EF00;
     op.decode.rs2 = 5; // Non-zero rs2
-    op.decode.imm = 0x1234_5678;
+    op.decode.imm = 0; // Per CPU-A2: when rs2 != 0, imm must be 0
     op.decode.op_add = true;
 
-    // ADD with rs2 != 0 uses rv2
+    // ADD with rs2 != 0: arg2 = rv2 + imm = rv2 + 0 = rv2
     assert_eq!(op.compute_arg2(), 0xABCD_EF00);
 }
 
@@ -286,7 +286,7 @@ fn test_trace_generation_res_dwordbl() {
 }
 
 #[test]
-fn test_trace_generation_sign_bits() {
+fn test_trace_generation_ext_bits() {
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
             word_instr: true,
@@ -301,8 +301,8 @@ fn test_trace_generation_sign_bits() {
     let trace = generate_cpu_trace(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    assert_eq!(row0[cols::RV1_SIGN_BIT], FE::one());
-    assert_eq!(row0[cols::RES_SIGN_BIT], FE::one());
+    assert_eq!(row0[cols::RV1_EXT_BIT], FE::one());
+    assert_eq!(row0[cols::RES_EXT_BIT], FE::one());
 }
 
 #[test]
@@ -322,14 +322,16 @@ fn test_bus_interactions_count() {
     // - 1 M5 (MEMW write rd register)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
+    // - 1 CM54 (MEMW PC register read-write)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 = 40
-    assert_eq!(interactions.len(), 40);
+    // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
+    // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 68
+    assert_eq!(interactions.len(), 68);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
+    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -136,9 +136,8 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -259,6 +258,8 @@ pub trait IsStarkVerifier<
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
+
         #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
@@ -267,7 +268,14 @@ pub trait IsStarkVerifier<
             .map(|index| {
                 let step = boundary_constraints.constraints[index].step;
                 let is_aux = boundary_constraints.constraints[index].is_aux;
-                let point = &domain.trace_primitive_root.pow(step as u64);
+                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
+                    Some((_, p)) => p.clone(),
+                    None => {
+                        let p = domain.trace_primitive_root.pow(step as u64);
+                        boundary_step_points.push((step, p.clone()));
+                        p
+                    }
+                };
                 let column_idx = boundary_constraints.constraints[index].col;
                 let trace_evaluation = if is_aux {
                     let column_idx = air.trace_layout().0 + column_idx;
@@ -331,12 +339,14 @@ pub trait IsStarkVerifier<
 
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
+        let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
+            &packing_shifts,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
@@ -793,9 +803,12 @@ pub trait IsStarkVerifier<
             trace_term_coeffs.len() * trace_term_coeffs[0].len()
         );
 
-        let mut denoms_trace = (0..ood_evaluations_table_height)
-            .map(|row_idx| evaluation_point - primitive_root.pow(row_idx as u64) * &challenges.z)
-            .collect::<Vec<FieldElement<FieldExtension>>>();
+        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_evaluations_table_height {
+            denoms_trace.push(evaluation_point - &current_z);
+            current_z = primitive_root * &current_z;
+        }
         FieldElement::inplace_batch_inverse(&mut denoms_trace).unwrap();
 
         let trace_term = (0..ood_evaluations_table_width)
@@ -851,6 +864,7 @@ pub trait IsStarkVerifier<
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -987,11 +1001,14 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ table_contribution = 0
+        // Bus Balance Check: Σ table_contribution = expected_bus_balance
         // =====================================================================
         // For LogUp with circular constraints, each table's total contribution L
         // (sum of all per-row terms) is exposed as a public input. The bus balances
-        // when the sum of all table contributions equals zero.
+        // when the sum of all table contributions equals the expected target.
+        // When all bus participants are in-trace, the target is zero. When some
+        // receiver contributions are computed externally (e.g. verifier-computed
+        // COMMIT output bus), the target is the missing positive remainder.
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
@@ -1003,11 +1020,11 @@ pub trait IsStarkVerifier<
                 }
             }
 
-            if total != FieldElement::zero() {
+            if total != *expected_bus_balance {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
-                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
-                    total
+                    "LogUp bus does not balance: sum of accumulated values does not match target. total={:?}, target={:?}",
+                    total, expected_bus_balance
                 );
                 return false;
             }
@@ -1030,8 +1047,10 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
-        let multi_proof = MultiProof::new(vec![proof.clone()]);
-        Self::multi_verify(&[air], &multi_proof, transcript)
+        let multi_proof = MultiProof {
+            proofs: vec![proof.clone()],
+        };
+        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
@@ -1066,9 +1085,8 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;

@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
@@ -21,12 +21,12 @@ For reasons of efficiency, data in this table is significantly compressed.
 Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it.
 Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The #decode table is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 
 = Padding
 The #decode table must be padded to a length that is a power of two.
@@ -46,7 +46,7 @@ Note that the below table is _not_ used in practice: it is solely used for the p
 #let config = load_config()
 #let uncompressed_chip = load_chip("src/decode_uncompressed.toml", config)
 
-#render_chip_column_table(uncompressed_chip, config)
+#render_chip_variable_table(uncompressed_chip, config)
 
 We will illustrate how each instruction should be expressed in this (uncompressed) decoding table.
 The columns of the accompanying table represent the following:
@@ -93,9 +93,7 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
     ..lines.flatten(),
     table.hline(stroke: 1.5pt),
     table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]),
-    ),  
-    caption: [Decoding table]
-  )
+  ))
 }
 
 #let decoding = (

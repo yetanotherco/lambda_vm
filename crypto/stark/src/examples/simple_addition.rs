@@ -42,11 +42,6 @@ where
         0
     }
 
-    fn end_exemptions(&self) -> usize {
-        // Apply to ALL rows including the last one
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,

@@ -2,9 +2,10 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_padding_table
 )
@@ -21,12 +22,13 @@ in chunks of 1, 2, 4 or 8 values.
 It introduces the old value and last-accessed timestamps of memory addresses internally,
 in order to satisfy the design of the memory argument (@memory).
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_memw_interactions = compute_nr_interactions(chip)
 
-The `MEMW` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(chip, config)
+The #memw chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_interactions interaction(s):
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 
@@ -73,6 +75,7 @@ The table can be padded to the next power of two with the following value assign
 
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
 #let aligned = raw(alignedchip.name)
+#let nr_aligned_interactions = compute_nr_interactions(alignedchip)
 
 When a memory access happens at an address with proper alignment for its access size
 (i.e., adding the access size to `base_address`'s lowest limb does not overflow), 
@@ -87,8 +90,8 @@ Further logic remains essentially the same, so we briefly present the relevant t
 #let nr_variables = total_nr_variables(alignedchip)
 #let nr_columns = total_nr_instantiated_columns(alignedchip, config)
 
-The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns.
-#render_chip_column_table(alignedchip, config)
+The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns; it leverages #nr_aligned_interactions interactions.
+#render_chip_variable_table(alignedchip, config)
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
 
@@ -116,12 +119,13 @@ If either of these rules does not apply to your access, you should fall back to 
 
 Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide $2 dot #`address`$ in the lookup. 
 
-== Columns
+== Variables
 #let nr_variables = total_nr_variables(register_chip)
 #let nr_columns = total_nr_instantiated_columns(register_chip, config)
+#let nr_memw_r_interactions = compute_nr_interactions(register_chip)
 
-The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(register_chip, config)
+The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_r_interactions interactions:
+#render_chip_variable_table(register_chip, config)
 
 == Assumptions
 The following range checks are assumed to be performed/enforced outside of this chip:
@@ -151,7 +155,8 @@ Lastly, this chip contributes the following interactions to the logup:
 The table can be padded to the next power of two with the following value assignments:
 #render_chip_padding_table(register_chip, config)
 
-= Future optimization ideas
+= Notes/optimizations
+The following ideas may prove to be optimizations for the #memw/#aligned/#reg chip:
 - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
 - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.

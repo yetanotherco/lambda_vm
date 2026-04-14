@@ -2,11 +2,12 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   render_chip_padding_table,
   render_constraint_table,
   total_nr_instantiated_columns,
   total_nr_variables,
+  compute_nr_interactions,
 )
 
 #let config = load_config()
@@ -17,12 +18,13 @@
 
 The #lt chip constrains an indicator bit for the less-than relation, signed or unsigned.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The `LT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(chip, config)
+The #lt chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+#render_chip_variable_table(chip, config)
 
 = Assumptions
 We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.

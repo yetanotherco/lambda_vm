@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
-  render_chip_column_table,
+  render_chip_variable_table,
   render_chip_padding_table,
   render_constraint_table,
   total_nr_instantiated_columns,
@@ -168,7 +168,7 @@ We present here a set of constraints on the `PAGE` table that
 For zero-initialized pages, `init` can be a constant `0`,
 and hence doesn't need a column, nor a range check.
 
-#render_chip_column_table(chip, config)
+#render_chip_variable_table(chip, config)
 #render_constraint_table(chip, config)
 
 

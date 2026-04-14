@@ -30,12 +30,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROGRAM: executor/programs/asm/fib_iterative_2M.s
-  ELF: executor/program_artifacts/asm/fib_iterative_2M.elf
+  PROGRAM: executor/programs/asm/fib_iterative_8M.s
+  ELF: executor/program_artifacts/asm/fib_iterative_8M.elf
   BENCH_RUNS_PR: 3
-  BENCH_RUNS_BASELINE: 5
-  GROWTH_PROGRAMS: "fib_iterative_250k fib_iterative_500k fib_iterative_1M fib_iterative_2M"
-  GROWTH_STEPS: "250000 500000 1000000 2000000"
+  BENCH_RUNS_BASELINE: 3
+  GROWTH_PROGRAMS: "fib_iterative_1M fib_iterative_2M fib_iterative_4M fib_iterative_8M"
+  GROWTH_STEPS: "1000000 2000000 4000000 8000000"
 
 jobs:
   benchmark:
@@ -79,6 +79,13 @@ jobs:
       - name: Compile benchmark ELFs
         run: |
           mkdir -p executor/program_artifacts/asm
+          # Compile main benchmark ELF
+          MAIN_SRC="$PROGRAM"
+          MAIN_OUT="$ELF"
+          if [ ! -f "$MAIN_OUT" ] && [ -f "$MAIN_SRC" ]; then
+            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+              "$MAIN_SRC" -o "$MAIN_OUT"
+          fi
           for prog in $GROWTH_PROGRAMS; do
             SRC="executor/programs/asm/${prog}.s"
             OUT="executor/program_artifacts/asm/${prog}.elf"
@@ -100,6 +107,16 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Growth benchmarks: run on /bench-growth, push to main, or workflow_dispatch
+          # Skip on plain /bench to keep it fast
+          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-growth'; then
+            echo "run_growth=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run_growth=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_growth=false" >> "$GITHUB_OUTPUT"
+          fi
+
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             CUSTOM_N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench[[:space:]]*\([0-9]\+\).*|\1|p')
             RUNS=${CUSTOM_N:-$BENCH_RUNS_PR}
@@ -116,13 +133,34 @@ jobs:
           fi
 
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-          echo "Using $RUNS benchmark iterations"
+
+          # Parse TABLE_PARALLELISM:
+          # /bench-growth always uses k=1 (for reproducible comparisons)
+          # /bench accepts k=N parameter
+          TABLE_K=""
+          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-growth'; then
+            TABLE_K="1"
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
+          fi
+          echo "table_parallelism=${TABLE_K:-}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$TABLE_K" ]; then
+            echo "Using $RUNS iterations, TABLE_PARALLELISM=$TABLE_K"
+          else
+            echo "Using $RUNS iterations, TABLE_PARALLELISM=default"
+          fi
 
       - name: Benchmark PR
         id: pr
         env:
           RUNS: ${{ steps.config.outputs.runs }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         run: |
+          if [ -n "$TABLE_PARALLELISM" ]; then
+            export TABLE_PARALLELISM
+            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
+          fi
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
@@ -184,6 +222,7 @@ jobs:
 
       - name: Memory growth (PR)
         id: pr-growth
+        if: steps.config.outputs.run_growth == 'true'
         env:
           TABLE_PARALLELISM: "1"
         run: |
@@ -304,7 +343,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUNS: ${{ steps.config.outputs.runs }}
+          RUN_GROWTH: ${{ steps.config.outputs.run_growth }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         run: |
+          if [ -n "$TABLE_PARALLELISM" ]; then
+            export TABLE_PARALLELISM
+            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
+          fi
           # Save current HEAD
           PR_SHA=$(git rev-parse HEAD)
 
@@ -365,6 +410,10 @@ jobs:
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
           # --- Growth benchmarks (TABLE_PARALLELISM=1, 2 samples each) ---
+          # Only run if /bench-growth, push, or workflow_dispatch
+          if [ "$RUN_GROWTH" != "true" ]; then
+            echo "Skipping growth benchmarks (use /bench-growth to enable)"
+          else
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
@@ -423,6 +472,7 @@ jobs:
           echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
+          fi  # end run_growth check
 
           # Restore PR checkout
           git checkout "$PR_SHA"
@@ -620,7 +670,7 @@ jobs:
 
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
-            let body = `## Benchmark — fib_iterative_2M${nLabel}\n\n`;
+            let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
             body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
@@ -675,8 +725,8 @@ jobs:
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              const labels = ['250k', '500k', '1M', '2M'];
-              const programs = ['fib_iterative_250k', 'fib_iterative_500k', 'fib_iterative_1M', 'fib_iterative_2M'];
+              const labels = ['1M', '2M', '4M', '8M'];
+              const programs = ['fib_iterative_1M', 'fib_iterative_2M', 'fib_iterative_4M', 'fib_iterative_8M'];
 
               body += `\n## Memory Growth\n\n`;
               body += `<sub>Measured with \`TABLE_PARALLELISM=1\` (sequential) · best of 2 samples per point</sub>\n\n`;
@@ -741,6 +791,7 @@ jobs:
             // Find existing comment (check both old and new markers for transition)
             const existing = comments.find(c =>
               c.user.type === 'Bot' && (
+                c.body.includes('Benchmark — fib_iterative_8M') ||
                 c.body.includes('Benchmark — fib_iterative_2M') ||
                 c.body.includes('Benchmark — fib_iterative_372k')
               )

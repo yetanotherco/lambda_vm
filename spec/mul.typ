@@ -1,9 +1,10 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
-  render_chip_column_table,
+  render_chip_variable_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  compute_nr_interactions,
   render_constraint_table,
   render_chip_assumptions,
   render_chip_padding_table,
@@ -19,12 +20,13 @@
 The #mul chip constrains multiplication, both signed and unsigned,
 as well as providing access to the low and high halfs of the multiplication result.
 
-= Columns
+= Variables
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#let nr_interactions = compute_nr_interactions(chip)
 
-The `MUL` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
-#render_chip_column_table(chip, config)
+The #mul chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+#render_chip_variable_table(chip, config)
 
 #let stackrel(top, bottom) = {
  $mat(delim: #none, top; bottom)$
@@ -100,11 +102,10 @@ The table can be padded to the next power of two with the following value assign
 
 #render_chip_padding_table(chip, config)
 
-= Notes
+= Notes/optimizations
 - `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked.
   Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere.
-
-  As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, 
+- As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, 
   where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`;
   the value sent into the lookup could then be assumed range-checked by the other side of the relation.
   This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.

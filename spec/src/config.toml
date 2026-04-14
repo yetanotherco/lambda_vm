@@ -78,7 +78,7 @@ label = "DWordHHW"
 subtypes = ["Word", "Half", "Half"]
 desc = """\
        Variable that can only assume values in the range $[0, 2^64)$. \\
-       Represented as a `Word` and two `Half` variables.\
+       Represented as a `Word` and two `Half` variables. \
        The `Word` is the *least* significant digit.
        """
 
@@ -87,8 +87,24 @@ label = "DWordWHH"
 subtypes = ["Half", "Half", "Word"]
 desc = """\
        Variable that can only assume values in the range $[0, 2^64)$. \\
-       Represented as a `Word` and two `Half` variables.\
+       Represented as a `Word` and two `Half` variables. \
        The `Word` is the *most* significant digit.
+       """
+
+[[variables.types]]
+label = "WordBL"
+subtypes = ["Byte", "Byte", "Byte", "Byte"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^32)$. \\
+       Represented as an array of four `Byte` variables.\
+       """
+
+[[variables.types]]
+label = "WordHL"
+subtypes = ["Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^32)$. \\
+       Represented as an array of two `Half` variables.\
        """
 
 [[variables.types]]
