@@ -1870,10 +1870,6 @@ fn build_traces(
     // Padding rows also look up pc=1 (the CPU padding entry)
     // When CPU is split, each chunk pads independently
     let mut decode = decode_trace;
-    let num_padding_rows: usize = cpu_ops
-        .chunks(max_rows.cpu)
-        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-        .sum();
     let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
     decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
     decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
