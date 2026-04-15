@@ -67,11 +67,11 @@ parse_timing() {
     /Aux trace build/ { v = secs(); if (v) print "aux_build=" v }
     /Aux trace commit/ { v = secs(); if (v) print "aux_commit=" v }
     /Rounds 2/ { v = secs(); if (v) print "rounds24=" v }
-    /Main expand_pool_to_lde/ { v = secs(); if (v) print "main_lde=" v }
-    /Aux expand_pool_to_lde/  { v = secs(); if (v) print "aux_lde=" v }
-    /Main commit \(Merkle\)/  { v = secs(); if (v) print "main_merkle=" v }
-    /Aux commit \(Merkle\)/   { v = secs(); if (v) print "aux_merkle=" v }
-    /R1  expand_pool_to_lde/ { v = secs(); if (v) print "r1_lde=" v }
+    /Main expand_(pool|columns)_to_lde/ { v = secs(); if (v) print "main_lde=" v }
+    /Aux expand_(pool|columns)_to_lde/  { v = secs(); if (v) print "aux_lde=" v }
+    /Main commit \(Merkle\)/            { v = secs(); if (v) print "main_merkle=" v }
+    /Aux commit \(Merkle\)/             { v = secs(); if (v) print "aux_merkle=" v }
+    /R1  expand_(pool|columns)_to_lde/ { v = secs(); if (v) print "r1_lde=" v }
     /R2  evaluate/           { v = secs(); if (v) print "r2_evaluate=" v }
     /R2  decompose/          { v = secs(); if (v) print "r2_decompose=" v }
     /R2  commit_comp/        { v = secs(); if (v) print "r2_commit_comp=" v }
