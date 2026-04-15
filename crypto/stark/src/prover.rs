@@ -81,7 +81,7 @@ where
 {
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
-    /// Wrapped in Arc to share with Round1Metadata without deep-cloning (~64MB per table).
+    /// Wrapped in Arc to share with Round1Commitments without deep-cloning (~64MB per table).
     pub(crate) lde_trace_merkle_tree: Arc<BatchedMerkleTree<F>>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
@@ -126,10 +126,9 @@ where
     num_precomputed_cols: usize,
 }
 
-/// Metadata from Round 1 commitments — stores Merkle trees and roots, but not LDE evaluations.
-/// LDE evaluations are recomputed from the trace in Rounds 2-4; Merkle trees are retained
-/// to avoid expensive Keccak re-hashing.
-pub struct Round1Metadata<Field, FieldExtension>
+/// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
+/// Borrowed (not consumed) when building `Round1` in Phase D.
+pub struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
@@ -562,7 +561,7 @@ pub trait IsStarkProver<
     fn round1_from_lde(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: LDETraceTable<Field, FieldExtension>,
-        metadata: &Round1Metadata<Field, FieldExtension>,
+        metadata: &Round1Commitments<Field, FieldExtension>,
     ) -> Round1<Field, FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -613,7 +612,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        metadata: &Round1Metadata<Field, FieldExtension>,
+        metadata: &Round1Commitments<Field, FieldExtension>,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
         aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
@@ -658,7 +657,7 @@ pub trait IsStarkProver<
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
-        metadatas: &[Round1Metadata<Field, FieldExtension>],
+        metadatas: &[Round1Commitments<Field, FieldExtension>],
         domains: &[Domain<Field>],
         twiddle_caches: &[LdeTwiddles<Field>],
         main_pool: &mut [Vec<FieldElement<Field>>],
@@ -1890,14 +1889,14 @@ pub trait IsStarkProver<
         }
 
         // Build metadata sequentially from main_commits + aux_results + bus_inputs
-        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
+        let mut metadatas: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         for ((main_commit, (aux_tree, aux_root)), bus_public_inputs) in main_commits
             .into_iter()
             .zip(aux_results)
             .zip(bus_inputs_vec)
         {
-            metadatas.push(Round1Metadata {
+            metadatas.push(Round1Commitments {
                 main_merkle_tree: Arc::clone(&main_commit.main_tree),
                 main_merkle_root: main_commit.main_root,
                 precomputed_merkle_tree: main_commit.precomputed_tree.as_ref().map(Arc::clone),
