@@ -1,0 +1,167 @@
+name = "DECODE"
+
+[[variables.output]]
+name = "pc"
+type = "DWordWL"
+desc = "value of the program counter this instruction is associated with."
+
+[[variables.output]]
+name = "rs1"
+type = "Byte"
+desc = "index of source register 1."
+
+[[variables.output]]
+name = "rs2"
+type = "Byte"
+desc = "index of source register 2."
+
+[[variables.output]]
+name = "rd"
+type = "Byte"
+desc = "index of destination register."
+
+[[variables.output]]
+name = "read_register1"
+type = "Bit"
+desc = "whether to load the contents of address `rs1` (1) or `0` (0) into `rv1`."
+
+[[variables.output]]
+name = "read_register2"
+type = "Bit"
+desc = "whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`."
+
+[[variables.output]]
+name = "write_register"
+type = "Bit"
+desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."
+
+[[variables.output]]
+name = "mem_2B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $2$ bytes."
+
+[[variables.output]]
+name = "mem_4B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $4$ bytes."
+
+[[variables.output]]
+name = "mem_8B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $8$ bytes."
+
+[[variables.output]]
+name = "c_type"
+type = "Bit"
+desc = "Whether the instruction is of type `C`, i.e., whether it is $2$ bytes long instead of $4$."
+
+[[variables.output]]
+name = "imm"
+type = "DWordWL"
+desc = "the *fully extended (!)* 64-bit version of the immediate."
+
+[[variables.output]]
+name = "signed"
+type = "Bit"
+desc = "selector used to indicate signed or unsigned input interpretation."
+
+[[variables.output]]
+name = "mp_selector"
+type = "Bit"
+desc = """Multi-purpose selector used by the CPU to to configure several ALU operations in different ways. 
+          See the `CPU` chip for more details."""
+
+[[variables.output]]
+name = "muldiv_selector"
+type = "Bit"
+desc = "selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted."
+
+[[variables.output]]
+name = "word_instr"
+type = "Bit"
+desc = "Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended."
+
+[[variables.output]]
+name = "ADD"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "SUB"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "SLT"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "AND"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "OR"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "XOR"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "SHIFT"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "JALR"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "BEQ"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "BLT"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "LOAD"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "STORE"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "MUL"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "DIVREM"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "ECALL"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.output]]
+name = "EBREAK"
+type = "Bit"
+desc = "ALU selector flag"
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = "The multiplicity with which this instruction is looked up in the `CPU` table."
