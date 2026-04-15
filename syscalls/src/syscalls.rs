@@ -106,7 +106,8 @@ pub enum SyscallError {
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
-    print_string("sys_halt called\n");
+    // NOTE: no print_string here — the Print ecall is unmatched on the Ecall bus
+    // and would cause a verification failure.
     unsafe {
         asm!(
             "ecall",

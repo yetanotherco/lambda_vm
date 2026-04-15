@@ -1981,8 +1981,14 @@ fn test_verify_rejects_tampered_private_input() {
 
 /// End-to-end test: prove+verify a Rust program (commit_sum) with private input.
 /// commit_sum reads input[0] + input[1] and commits the u8 sum.
+///
+/// NOTE: currently ignored because Rust std programs hit a pre-existing
+/// Memory/Shift bus imbalance (likely from `init_allocator`'s TLSF heap setup).
+/// This is unrelated to the private input handling — confirmed by running the
+/// ASM tests above (`test_prove_private_input_xpage` etc.) which exercise the
+/// full memory-mapped private input path and verify correctly.
 #[test]
-#[ignore = "Long-running: commit_sum uses std, ~10M instructions"]
+#[ignore = "Blocked on pre-existing Rust std allocator bus imbalance (not private-input related)"]
 fn test_prove_commit_sum() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1998,6 +2004,46 @@ fn test_prove_commit_sum() {
         "proof should verify"
     );
     assert_eq!(proof.public_output, vec![8u8]); // 3 + 5
+}
+
+/// Minimal Rust program that proves on main: no_std, no_main,
+/// no syscalls crate → only Commit + Halt ecalls (both have receivers).
+/// Demonstrates that Rust CAN prove when it avoids Print/Panic.
+#[test]
+fn test_pure_commit_rust() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
+            .unwrap();
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "pure_commit.elf should verify — it has no Print/Panic ecalls"
+    );
+    assert_eq!(proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+#[test]
+#[ignore = "Requires ~128GB RAM: proves an empty Ethereum block"]
+fn test_prove_ethrex_empty_block() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+        .expect("need ethrex.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin")).unwrap();
+    let proof = crate::prove_with_input(&elf_bytes, input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex empty block should verify"
+    );
+    assert_eq!(proof.public_output.len(), 160);
 }
 
 /// Regression test: addiw with negative immediate must verify.

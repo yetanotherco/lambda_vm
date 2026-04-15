@@ -21,6 +21,17 @@ fn run_program(elf_path: &str) {
     );
 }
 
+#[test]
+fn test_debug_commit_sum_count() {
+    let elf_data = std::fs::read("./program_artifacts/rust/commit_sum.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let executor = Executor::new(&program, vec![3u8, 5u8]).unwrap();
+    let result = executor.run().unwrap();
+    eprintln!("Instructions: {}", result.logs.len());
+    eprintln!("Output: {:?}", result.return_values.memory_values);
+    assert_eq!(result.return_values.memory_values, vec![8u8]);
+}
+
 /// Test that the memory-mapped private input region is readable by guest programs.
 /// The ASM program reads from 0xFF000000 and commits 8 bytes of data.
 #[test]
