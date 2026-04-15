@@ -552,8 +552,7 @@ pub fn prove_with_options(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    let mut program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    add_private_input_segment(&mut program, &private_input);
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let saved_private_input = private_input.clone();
     let executor =
         Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
@@ -650,8 +649,7 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
-    let mut program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    add_private_input_segment(&mut program, &vm_proof.private_input);
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf_and_runtime_with_gpi(
         &program,
         &vm_proof.runtime_page_ranges,

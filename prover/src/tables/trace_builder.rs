@@ -367,13 +367,6 @@ fn collect_ops_from_cpu(
         if op.ecall_get_private_inputs && op.private_input_len > 0 {
             let dest = op.private_input_dest;
             let len = op.private_input_len as usize;
-            eprintln!(
-                "GPI: dest=0x{:x}, len={}, pages={:x}..={:x}",
-                dest,
-                len,
-                dest / 4096,
-                (dest + len as u64 - 1) / 4096,
-            );
             let len_prefix = (private_input.len() as u32).to_le_bytes();
             let all_bytes: Vec<u8> =
                 len_prefix.iter().chain(private_input.iter()).copied().collect();
