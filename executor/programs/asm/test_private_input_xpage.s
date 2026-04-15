@@ -1,38 +1,32 @@
 	.attribute	5, "rv64i2p1"
 	.globl	main
 main:
-	# Loop: read N bytes of private input, write each back to memory, commit 8 bytes.
-	# This mimics what a real program would do: read private input, do memory ops on it.
+	# Read private input directly from 0xFF000000 (memory-mapped).
+	# Layout: [len:u32 LE] [data...]
+	# Commits 8 bytes of data.
+	#
+	# Note: lui in RV64 sign-extends to 64 bits. lui with 0xFF000 would give
+	# 0xFFFFFFFFFF000000. To get 0xFF000000 we need to construct it differently:
+	# lui x, 0x100000 gives 0x100000000 (53 upper bits), too high.
+	# Instead: load 0x0FF00000 and shift left by 4 bits, OR similar tricks.
+	# Simplest: use li macro and let the assembler handle it.
 
-	li	t0, -4096		# 1: sp offset (fits in imm)
-	add	sp, sp, t0		# 2: allocate 4KB stack
-	li	t0, -4096
-	add	sp, sp, t0		# 3: another 4KB (total 8KB, spans 2 pages)
+	li	t0, 0xFF000000		# 1: t0 = 0xFF000000 (private input base)
 
-	# GetPrivateInputs: copy to sp
-	mv	a0, sp			# 4: dest = sp
-	li	a7, 4			# 5: syscall = GetPrivateInputs
-	ecall				# 6: get_private_input
+	# Read length at 0xFF000000
+	lw	t3, 0(t0)		# 2: t3 = length
 
-	# Read 8 bytes at sp+8 (aligned), write to sp+2000
-	ld	t1, 8(sp)		# 7
-	sd	t1, 2000(sp)		# 8
+	# Load 8 bytes of data at 0xFF000008 (aligned, 4 bytes into data region)
+	ld	t1, 8(t0)		# 3
 
-	# Read 8 bytes at sp+2000 (should match what we just wrote)
-	ld	t2, 2000(sp)		# 9
-
-	# Commit 8 bytes from sp+8
-	addi	a1, sp, 8		# 10
-	li	a0, 1			# 11
-	li	a2, 8			# 12
-	li	a7, 64			# 13
-	ecall				# 14
+	# Commit 8 bytes from 0xFF000008
+	addi	a1, t0, 8		# 4: buf_addr = 0xFF000008
+	li	a0, 1			# 5: fd = 1
+	li	a2, 8			# 6: count = 8
+	li	a7, 64			# 7: syscall = Commit
+	ecall				# 8: commit
 
 	# Halt
-	li	t0, 4096		# 15
-	add	sp, sp, t0		# 16
-	li	t0, 4096
-	add	sp, sp, t0		# 17
-	li	a0, 0			# 18
-	li	a7, 93			# 19
-	ecall				# 20
+	li	a0, 0			# 9: exit_code = 0
+	li	a7, 93			# 10: syscall = Halt
+	ecall				# 11: halt

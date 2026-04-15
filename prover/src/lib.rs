@@ -138,6 +138,10 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
+    /// Private input bytes. The verifier needs these to reconstruct the
+    /// PAGE preprocessed commitments for the private-input memory region
+    /// (pages at `PRIVATE_INPUT_START_INDEX = 0xFF000000`).
+    pub private_input: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -515,6 +519,10 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    // Clone private_input so we can (a) hand ownership to the executor,
+    // (b) pass a reference to the trace builder, and (c) include it in VmProof
+    // for the verifier to reconstruct PAGE init data.
+    let saved_private_input = private_input.clone();
     let executor =
         Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -530,7 +538,8 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &result.logs, max_rows, &saved_private_input)?;
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -575,6 +584,7 @@ pub fn prove_with_options(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
+        private_input: saved_private_input,
     })
 }
 
@@ -607,7 +617,11 @@ pub fn verify_with_options(
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
+        Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &vm_proof.runtime_page_ranges,
+            &vm_proof.private_input,
+        );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
