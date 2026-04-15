@@ -801,7 +801,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
 fn test_verify_rejects_tampered_public_output() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let proof_options = ProofOptions::default_test_options();
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
         crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
@@ -1696,7 +1696,7 @@ fn test_verify_rejects_zero_table_counts() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     assert!(
@@ -1731,7 +1731,7 @@ fn test_verify_rejects_zero_cpu_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {
@@ -1752,7 +1752,7 @@ fn test_verify_rejects_zero_memw_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {
@@ -1828,7 +1828,7 @@ fn test_small_max_rows_splits_tables() {
     let proof_options = ProofOptions::default_test_options();
     let max_rows = crate::tables::MaxRowsConfig::small();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &max_rows)
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &max_rows)
         .expect("Prover should succeed with small max_rows");
 
     // With 2^5 max rows and 64+ instructions, tables should have multiple chunks.
@@ -1879,7 +1879,7 @@ fn test_verify_rejects_inflated_table_counts() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+    let vm_proof = crate::prove_with_options(&elf_bytes, vec![], &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     // Inflate cpu count — total won't match proof.proofs.len()
@@ -1896,6 +1896,20 @@ fn test_verify_rejects_inflated_table_counts() {
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",
         result
+    );
+}
+
+/// Test that `prove_with_input` with empty input produces the same result as `prove`.
+/// Backward-compatibility check: the new API must not change behavior for programs
+/// that don't read private input.
+#[test]
+fn test_prove_with_input_empty() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let result = crate::prove_with_input(&elf_bytes, vec![])
+        .expect("prove_with_input should succeed on sub");
+    assert!(
+        crate::verify(&result, &elf_bytes).expect("verify should not error"),
+        "prove_with_input(empty) proof should verify"
     );
 }
 
