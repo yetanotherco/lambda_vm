@@ -1,11 +1,14 @@
 use lambda_vm_syscalls as syscalls;
 
+// Three SIZE×SIZE u32 matrices live on the stack (~12·SIZE² bytes).
+// SIZE ≲ 150 is safe; beyond that, expect stack overflow.
 const SIZE: usize = {
     const fn parse(s: &str) -> usize {
         let b = s.as_bytes();
         let mut r = 0;
         let mut i = 0;
         while i < b.len() {
+            assert!(b[i] >= b'0' && b[i] <= b'9');
             r = r * 10 + (b[i] - b'0') as usize;
             i += 1;
         }
