@@ -178,7 +178,6 @@ where
         lde: Lde<Field, FieldExtension>,
         step_size: usize,
         blowup_factor: usize,
-        has_aux_trace: bool,
     ) -> Round1<Field, FieldExtension> {
         let lde_trace = LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
 
@@ -190,23 +189,18 @@ where
             num_precomputed_cols: self.num_precomputed_cols,
         };
 
-        let aux = if has_aux_trace {
-            Some(Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    self.aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_aux_trace"),
-                ),
-                lde_trace_merkle_root: self
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_aux_trace"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            })
-        } else {
-            None
-        };
+        let aux =
+            self.aux_merkle_tree
+                .as_ref()
+                .map(|tree| Round1CommitmentData::<FieldExtension> {
+                    lde_trace_merkle_tree: Arc::clone(tree),
+                    lde_trace_merkle_root: self
+                        .aux_merkle_root
+                        .expect("aux root must exist when aux tree exists"),
+                    precomputed_merkle_tree: None,
+                    precomputed_merkle_root: None,
+                    num_precomputed_cols: 0,
+                });
 
         Round1 {
             lde_trace,
@@ -1832,12 +1826,8 @@ pub trait IsStarkProver<
                     let table_start = Instant::now();
 
                     // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result = commitment.build_round1(
-                        lde,
-                        air.step_size(),
-                        domain.blowup_factor,
-                        air.has_aux_trace(),
-                    );
+                    let round_1_result =
+                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
