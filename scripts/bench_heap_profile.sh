@@ -35,6 +35,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case $PROGRAM in
+    fib_iterative|keccak|modular_exp|bitwise_ops|matrix_multiply) ;;
+    *) echo "Error: unknown --program '$PROGRAM'" >&2; exit 1 ;;
+esac
+
 # Set defaults and ELF directory based on program
 if [ "$PROGRAM" = "fib_iterative" ]; then
     ELF_DIR="$ROOT_DIR/executor/program_artifacts/asm"
