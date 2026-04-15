@@ -7,6 +7,7 @@ const ITERATIONS: usize = {
         let mut r = 0;
         let mut i = 0;
         while i < b.len() {
+            assert!(b[i] >= b'0' && b[i] <= b'9');
             r = r * 10 + (b[i] - b'0') as usize;
             i += 1;
         }
