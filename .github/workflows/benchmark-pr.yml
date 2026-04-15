@@ -41,12 +41,14 @@ jobs:
   benchmark:
     runs-on: [self-hosted, bench]
     # Skip unless: push to main, workflow_dispatch, or "/bench" comment on a PR
+    # (but not "/bench-suite", which runs benchmark_suite below)
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench') &&
+       !startsWith(github.event.comment.body, '/bench-suite') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       - name: React to comment
@@ -812,3 +814,130 @@ jobs:
                 body
               });
             }
+
+  benchmark_suite:
+    runs-on: [self-hosted, bench]
+    # Triggered by "/bench-suite [prog ...]" PR comments.
+    # Programs default to the full suite; pass names to restrict.
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/bench-suite') &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+    steps:
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Get PR head ref
+        id: pr-ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.issue.number }}
+        run: |
+          SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr-ref.outputs.sha }}
+
+      - name: Parse program args
+        id: args
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          FIRST_LINE=$(printf '%s' "$COMMENT_BODY" | head -n 1 | tr -d '\r')
+          if ! echo "$FIRST_LINE" | grep -qE '^/bench-suite($|[[:space:]])'; then
+            echo "::error::Invalid command: '$FIRST_LINE'"
+            exit 1
+          fi
+          REST=$(echo "$FIRST_LINE" | sed -n 's|^/bench-suite[[:space:]]*\(.*\)|\1|p')
+          FLAGS=""
+          if [ -n "$REST" ]; then
+            for p in $REST; do
+              case "$p" in
+                fib_iterative|keccak|modular_exp|bitwise_ops|matrix_multiply)
+                  FLAGS="$FLAGS --program $p"
+                  ;;
+                *)
+                  echo "::error::Unknown program '$p' (allowed: fib_iterative, keccak, modular_exp, bitwise_ops, matrix_multiply)"
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Compile fib_iterative ELFs
+        run: |
+          mkdir -p executor/program_artifacts/asm
+          for size in 500k 1M 2M; do
+            SRC="executor/programs/asm/fib_iterative_${size}.s"
+            OUT="executor/program_artifacts/asm/fib_iterative_${size}.elf"
+            if [ ! -f "$OUT" ] && [ -f "$SRC" ]; then
+              clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+                "$SRC" -o "$OUT"
+            fi
+          done
+
+      - name: Run profile suite
+        env:
+          FLAGS: ${{ steps.args.outputs.flags }}
+        run: |
+          set -o pipefail
+          bash scripts/profile_suite.sh $FLAGS 2>&1 | tee /tmp/suite_output.txt
+
+      - name: Package artifacts
+        if: always()
+        run: |
+          mkdir -p /tmp/suite_artifact
+          [ -f /tmp/suite_output.txt ] && cp /tmp/suite_output.txt /tmp/suite_artifact/
+          [ -d /tmp/bench_heap_profile ] && cp -r /tmp/bench_heap_profile /tmp/suite_artifact/
+          [ -d /tmp/bench_timing_profile ] && cp -r /tmp/bench_timing_profile /tmp/suite_artifact/
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-suite-${{ steps.pr-ref.outputs.sha }}
+          path: /tmp/suite_artifact/
+          retention-days: 30
+
+      - name: Post PR comment
+        if: success()
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            let out = fs.readFileSync('/tmp/suite_output.txt', 'utf8');
+            out = out.replace(/\x1b\[[0-9;]*m/g, '');
+            const LIMIT = 58000;
+            const truncated = out.length > LIMIT;
+            const body = truncated ? out.slice(0, LIMIT) : out;
+            const artifactUrl = process.env.ARTIFACT_URL;
+            let comment = `## Profile suite\n\n\`\`\`text\n${body}\n\`\`\`\n`;
+            if (truncated) {
+              comment += `\n> Output truncated. Full output in [workflow artifacts](${artifactUrl}).\n`;
+            } else {
+              comment += `\n<sub>Full artifacts in [workflow run](${artifactUrl}).</sub>\n`;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment,
+            });
