@@ -3,7 +3,7 @@
 use crate::tables::bitwise;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
-use crate::tables::memw_aligned;
+use crate::tables::memw_register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
@@ -393,43 +393,39 @@ fn test_memw_generated_from_register_ops() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // MEMW_A table should have register operations (register ops are always aligned)
-    // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1)
+    // Register ops should route to MEMW_R (memw_registers), not MEMW_A.
+    // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1).
     assert!(
-        !traces.memw_aligneds.is_empty(),
-        "MEMW_A should have at least one chunk for register ops"
+        !traces.memw_registers.is_empty(),
+        "MEMW_R should have at least one chunk for register ops"
     );
     assert!(
-        traces.memw_aligneds[0].main_table.height >= 3,
-        "MEMW_A should have at least 3 rows for register ops"
+        traces.memw_registers[0].main_table.height >= 3,
+        "MEMW_R should have at least 3 rows for register ops (reads x2, x3 + write x1)"
     );
 
-    // Find the register write to x1 in MEMW_A
-    // Register address for x1 = 2*1 = 2, decomposed: high=0, mid=0, low=[2,0]
+    // Find the register write to x1 in MEMW_R.
+    // MEMW_R columns: ADDRESS = register_index (x1 → index 1),
+    //                 MU_WRITE = 1 for writes, VAL_0 = value low 32 bits.
     let mut found_write = false;
-    for chunk in &traces.memw_aligneds {
-        for row_idx in 0..chunk.main_table.height {
-            let row = chunk.main_table.get_row(row_idx);
-            // Check for register write: is_register=1, base_address_low[0]=2, mu_write=1
-            if row[memw_aligned::cols::IS_REGISTER] == FE::one()
-                && row[memw_aligned::cols::BASE_ADDRESS_LOW[0]] == FE::from(2u64)
-                && row[memw_aligned::cols::BASE_ADDRESS_MID] == FE::zero()
-                && row[memw_aligned::cols::BASE_ADDRESS_HIGH] == FE::zero()
-                && row[memw_aligned::cols::MU_WRITE] == FE::one()
-            {
-                // Check value is 300 (lo32 word for register DWordWL packing)
-                assert_eq!(row[memw_aligned::cols::VALUE[0]], FE::from(300u64));
-                found_write = true;
-                break;
-            }
-        }
-        if found_write {
+    for row_idx in 0..traces.memw_registers[0].main_table.height {
+        let row = traces.memw_registers[0].main_table.get_row(row_idx);
+        // ADDRESS = 1 (x1), MU_WRITE = 1, VAL_0 = 300
+        if row[memw_register::cols::ADDRESS] == FE::from(1u64)
+            && row[memw_register::cols::MU_WRITE] == FE::one()
+        {
+            assert_eq!(
+                row[memw_register::cols::VAL_0],
+                FE::from(300u64),
+                "Write value for x1 should be 300"
+            );
+            found_write = true;
             break;
         }
     }
     assert!(
         found_write,
-        "Register write to x1 not found in MEMW_A table"
+        "Register write to x1 (ADDRESS=1, MU_WRITE=1, VAL_0=300) not found in MEMW_R"
     );
 }
 
@@ -478,31 +474,28 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // LT table should have ops from MEMW timestamp ordering
-    // First instruction: 3 register ops (M1, M3, M5) → at least 3 LT ops for C7
-    // Each LT op checks old_timestamp < timestamp
-    // For first access, old_timestamp=0, timestamp=4, so LT(0, 4) should exist
-
-    // Find LT op with lhs=0, rhs=4 (first register read's timestamp check)
-    let mut found_timestamp_lt = false;
-    for row_idx in 0..traces.lts[0].main_table.height {
-        let row = traces.lts[0].main_table.get_row(row_idx);
-        // Check for LT(0, 4): lhs=0, rhs=4, signed=0
-        if row[lt::cols::LHS_0] == FE::zero()
-            && row[lt::cols::LHS_1] == FE::zero()
-            && row[lt::cols::LHS_2] == FE::zero()
-            && row[lt::cols::RHS_0] == FE::from(4u64)
-            && row[lt::cols::RHS_1] == FE::zero()
-            && row[lt::cols::RHS_2] == FE::zero()
-            && row[lt::cols::SIGNED] == FE::zero()
-        {
-            found_timestamp_lt = true;
-            break;
-        }
-    }
+    // Register ops route to MEMW_R (IS_HALFWORD, not LT).
     assert!(
-        found_timestamp_lt,
-        "LT op for timestamp ordering (0 < 4) not found"
+        !traces.memw_registers.is_empty(),
+        "Register ops should route to MEMW_R"
+    );
+
+    // Register ops use IS_HALF for timestamp ordering instead of LT.
+    // Verify the bitwise table has at least one IS_HALF entry with non-zero
+    // multiplicity, proving that MEMW_R's IS_HALF lookups were emitted.
+    let has_is_half_entry = (0..traces.bitwise.main_table.height)
+        .any(|i| traces.bitwise.main_table.get_row(i)[bitwise::cols::MU_IS_HALF] != FE::zero());
+    assert!(
+        has_is_half_entry,
+        "MEMW_R register ops should produce IS_HALF bitwise entries"
+    );
+
+    // The LT table should still have ops from non-register MEMW accesses
+    // (e.g. PC next-pc write is a non-register memory op that needs LT).
+    let total_lt_rows: usize = traces.lts.iter().map(|t| t.main_table.height).sum();
+    assert!(
+        total_lt_rows > 0,
+        "LT table should have ops from non-register MEMW timestamp ordering"
     );
 }
 

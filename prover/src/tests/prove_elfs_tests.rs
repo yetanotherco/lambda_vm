@@ -1272,13 +1272,10 @@ fn test_debug_memory_tokens_sb_sh() {
             let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
             let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
-            // address_add(0) = base + 1, now virtual (computed from base + overflow)
-            let overflow0 = memw
-                .main_table
-                .get(row, memw_cols::ADD_LIMB_OVERFLOW[0])
-                .to_raw();
-            let addr1_lo = base_lo + 1 - overflow0 * (1u64 << 32);
-            let addr1_hi = base_hi + overflow0;
+            // address_add(0) = base + 1, now virtual (computed from base + carry)
+            let carry0 = memw.main_table.get(row, memw_cols::CARRY[0]).to_raw();
+            let addr1_lo = base_lo + 1 - carry0 * (1u64 << 32);
+            let addr1_hi = base_hi + carry0;
 
             // CM16: SEND old token for byte 1
             let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1_lo, old_ts1_hi, old1);
@@ -1666,6 +1663,33 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     );
 }
 
+/// Verify that register ops route to MEMW_R and a full prove/verify roundtrip
+/// succeeds. Uses `test_add_8` which exercises register reads and writes.
+#[test]
+fn test_prove_verify_with_memw_register() {
+    let (elf, logs, instructions) = run_asm_elf("test_add_8");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    // Register ops must go to MEMW_R, not to MEMW_A.
+    assert!(
+        !traces.memw_registers.is_empty(),
+        "register ops should route to MEMW_R: memw_registers must be non-empty"
+    );
+
+    // MEMW_A should still have non-register aligned ops (e.g. stack stores).
+    assert!(
+        !traces.memw_aligneds.is_empty(),
+        "MEMW_A should still have aligned non-register ops"
+    );
+
+    // Full prove + verify roundtrip.
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "prove/verify should succeed when MEMW_R handles register ops"
+    );
+}
+
 /// Verify rejects table_counts with all zeros.
 #[test]
 fn test_verify_rejects_zero_table_counts() {
@@ -1692,6 +1716,7 @@ fn test_verify_rejects_zero_table_counts() {
             dvrm: 0,
             shift: 0,
             branch: 0,
+            memw_register: 0,
         },
         ..vm_proof
     };
@@ -1759,6 +1784,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         dvrm: 0,
         shift: 0,
         branch: 0,
+        memw_register: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
