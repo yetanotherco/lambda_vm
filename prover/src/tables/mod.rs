@@ -51,8 +51,6 @@ pub use types::BusId;
 ///
 /// Capped tables use 2^20, not the 2^21 the formula gives. A 2^21 chunk
 /// runs on a single thread and peaks at twice the memory of a 2^20 chunk.
-/// Programs that exceed 2^20 rows in a capped table hit a table-overflow
-/// error.
 ///
 /// | Table   | Main | Bus | Eff.width | Max rows        |
 /// |---------|------|-----|-----------|-----------------|
