@@ -167,20 +167,15 @@ where
             .unwrap()
     }
 
-    /// Extract main columns directly into pre-allocated output buffers.
-    ///
-    /// Eliminates the T1 transpose allocation that `columns_main()` performs.
-    /// When `output` buffers have sufficient capacity, no heap allocation occurs.
-    pub fn extract_columns_main_into(&self, output: &mut [Vec<FieldElement<F>>]) {
-        self.main_table.extract_columns_into(output);
+    /// Extract main columns as owned vectors, each allocated at `capacity`.
+    /// Pass the LDE size so downstream FFT expansion is in-place.
+    pub fn extract_columns_main(&self, capacity: usize) -> Vec<Vec<FieldElement<F>>> {
+        self.main_table.extract_columns(capacity)
     }
 
-    /// Extract auxiliary columns directly into pre-allocated output buffers.
-    ///
-    /// Eliminates the T1 transpose allocation that `columns_aux()` performs.
-    /// When `output` buffers have sufficient capacity, no heap allocation occurs.
-    pub fn extract_columns_aux_into(&self, output: &mut [Vec<FieldElement<E>>]) {
-        self.aux_table.extract_columns_into(output);
+    /// Extract auxiliary columns as owned vectors, each allocated at `capacity`.
+    pub fn extract_columns_aux(&self, capacity: usize) -> Vec<Vec<FieldElement<E>>> {
+        self.aux_table.extract_columns(capacity)
     }
 }
 /// Column-major LDE trace table.
