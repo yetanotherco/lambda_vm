@@ -127,7 +127,8 @@ fn test_eval_fold_matches_coeff_fold() {
     let mut path_b_evals = evals_fft;
     in_place_bit_reverse_permute(&mut path_b_evals);
     let inv_twiddles = compute_coset_twiddles_inv::<GoldilocksField>(&coset_offset, n);
-    fold_evaluations_in_place(&mut path_b_evals, &beta, &inv_twiddles);
+    let mut scratch = Vec::new();
+    fold_evaluations_in_place(&mut path_b_evals, &mut scratch, &beta, &inv_twiddles);
 
     assert_eq!(path_a_evals, path_b_evals);
 }

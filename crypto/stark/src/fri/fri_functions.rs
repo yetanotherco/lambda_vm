@@ -14,6 +14,9 @@ use math::field::{
 /// in bit-reversed order, preserving conjugate pairing for the next fold.
 pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     evals: &mut Vec<FieldElement<E>>,
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))] scratch: &mut Vec<
+        FieldElement<E>,
+    >,
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
 ) {
@@ -26,7 +29,7 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
         // Index-based iteration matches the sequential path and panics on a
         // short `inv_twiddles`; `par_chunks(2).zip(inv_twiddles)` would drop
         // a trailing odd element and silently truncate on length mismatch.
-        let folded: Vec<FieldElement<E>> = (0..half)
+        (0..half)
             .into_par_iter()
             .map(|j| {
                 let lo = &evals[2 * j];
@@ -35,8 +38,8 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
                 let diff = lo - hi;
                 &sum + &(&inv_twiddles[j] * &(zeta * &diff))
             })
-            .collect();
-        *evals = folded;
+            .collect_into_vec(scratch);
+        std::mem::swap(evals, scratch);
     }
 
     #[cfg(not(feature = "parallel"))]

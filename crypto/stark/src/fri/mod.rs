@@ -39,6 +39,8 @@ where
     let mut fri_layer_list = Vec::with_capacity(number_layers);
     let mut current_coset_offset = coset_offset.clone();
     let mut current_domain_size = domain_size;
+    // Scratch buffer reused across fold levels to avoid reallocating once per level.
+    let mut scratch: Vec<FieldElement<E>> = Vec::with_capacity(evals.len() / 2);
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
@@ -47,7 +49,7 @@ where
         current_domain_size /= 2;
 
         // Fold evaluations in-place (no FFT needed)
-        fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+        fold_evaluations_in_place(&mut evals, &mut scratch, &zeta, &inv_twiddles);
 
         // Build Merkle tree from consecutive pairs
         let leaves: Vec<[FieldElement<E>; 2]> = evals
@@ -75,7 +77,7 @@ where
     let zeta = transcript.sample_field_element();
 
     // Final fold
-    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+    fold_evaluations_in_place(&mut evals, &mut scratch, &zeta, &inv_twiddles);
 
     let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
 
