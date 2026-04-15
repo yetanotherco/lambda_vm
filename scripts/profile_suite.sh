@@ -6,7 +6,8 @@
 #
 # Flags:
 #   --no-heap, --no-timing  skip either profile type
-#   --program <name>        run only the given program (default: all)
+#   --program <name>        run only the given program; repeat to select several
+#                           (default: all programs)
 
 set -euo pipefail
 
@@ -15,12 +16,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 HEAP=true
 TIMING=true
-ONLY=""
+ONLY_LIST=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-heap)   HEAP=false; shift ;;
         --no-timing) TIMING=false; shift ;;
-        --program)   ONLY="$2"; shift 2 ;;
+        --program)   ONLY_LIST+=("$2"); shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -35,16 +36,23 @@ CONFIGS=(
     "matrix_multiply SIZE            20 40 60 80"
 )
 
-if [ -n "$ONLY" ]; then
+if [ ${#ONLY_LIST[@]} -gt 0 ]; then
     filtered=()
-    for config in "${CONFIGS[@]}"; do
-        read -r prog _ <<< "$config"
-        [ "$prog" = "$ONLY" ] && filtered+=("$config")
+    for only in "${ONLY_LIST[@]}"; do
+        found=false
+        for config in "${CONFIGS[@]}"; do
+            read -r prog _ <<< "$config"
+            if [ "$prog" = "$only" ]; then
+                filtered+=("$config")
+                found=true
+                break
+            fi
+        done
+        if ! $found; then
+            echo "Error: unknown program '$only'" >&2
+            exit 1
+        fi
     done
-    if [ ${#filtered[@]} -eq 0 ]; then
-        echo "Error: unknown program '$ONLY'" >&2
-        exit 1
-    fi
     CONFIGS=("${filtered[@]}")
 fi
 
