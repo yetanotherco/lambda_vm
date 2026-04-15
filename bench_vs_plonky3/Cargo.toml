@@ -20,14 +20,18 @@ p3-symmetric = "0.5.2"
 p3-merkle-tree = "0.5.2"
 p3-keccak = "0.5.2"
 p3-fri = "0.5.2"
-p3-uni-stark = "0.5.2"
-p3-dft = "0.5.2"
+p3-uni-stark = { version = "0.5.2", features = ["parallel"] }
+p3-dft = { version = "0.5.2", features = ["parallel"] }
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false }
 
 [features]
-default = []
+# Both provers run multi-threaded by default: Plonky3's `Radix2DitParallel` DFT
+# uses rayon unconditionally, so Lambda must also enable `parallel` for a fair
+# apples-to-apples comparison. Disable with `--no-default-features` to compare
+# single-threaded.
+default = ["parallel"]
 parallel = ["stark/parallel"]
 
 [[bench]]

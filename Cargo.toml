@@ -19,3 +19,8 @@ debug = true
 
 # For profiling with samply/perf, build with:
 #   CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
+
+# Patched p3-goldilocks to disable NEON packing. Used only by bench_vs_plonky3
+# for apples-to-apples scalar comparison against Lambda STARK.
+[patch.crates-io]
+p3-goldilocks = { path = "bench_vs_plonky3/vendor-p3-goldilocks" }

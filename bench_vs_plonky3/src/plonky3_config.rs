@@ -16,8 +16,14 @@ type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
 type FieldHash = SerializingHasher<U64Hash>;
 type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
-pub type ValMmcs =
-    MerkleTreeMmcs<[Val; p3_keccak::VECTOR_LEN], [u64; p3_keccak::VECTOR_LEN], FieldHash, MyCompress, 2, 4>;
+pub type ValMmcs = MerkleTreeMmcs<
+    [Val; p3_keccak::VECTOR_LEN],
+    [u64; p3_keccak::VECTOR_LEN],
+    FieldHash,
+    MyCompress,
+    2,
+    4,
+>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Dft = Radix2DitParallel<Val>;
 pub type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
@@ -35,21 +41,19 @@ fn build_mmcs() -> (ValMmcs, ChallengeMmcs, ByteHash) {
     (val_mmcs, challenge_mmcs, byte_hash)
 }
 
-/// Creates a Plonky3 STARK config with parameters matched to Lambda's benchmark config:
-/// blowup=4, 30 FRI queries, no grinding.
-///
-/// This matches `benchmark_proof_options()` in Lambda's prover_benchmark.rs.
+/// Creates a Plonky3 STARK config with parameters matched to Lambda's
+/// `profile_prover.rs`: blowup=4, 100 FRI queries, no grinding.
 pub fn matched_params_config() -> P3Config {
     let (val_mmcs, challenge_mmcs, byte_hash) = build_mmcs();
     let dft = Dft::default();
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
-    // Match Lambda's benchmark_proof_options(): blowup=4, queries=30, grinding=0
+    // Match Lambda's profile_prover: blowup=4, queries=100, grinding=0.
     let fri_params = FriParameters {
         log_blowup: 2, // blowup = 4
         log_final_poly_len: 0,
         max_log_arity: 1,
-        num_queries: 30,
+        num_queries: 100,
         commit_proof_of_work_bits: 0,
         query_proof_of_work_bits: 0,
         mmcs: challenge_mmcs,
