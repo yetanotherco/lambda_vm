@@ -1662,6 +1662,7 @@ fn chunk_and_generate<T>(
 ///
 /// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
 /// (for HALT finalization), and returns fully-routed ops ready for Phase 3+.
+#[allow(clippy::too_many_arguments)]
 fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
     mut memw_ops: Vec<MemwOperation>,
@@ -1766,6 +1767,7 @@ fn collect_all_ops(
 ///
 /// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
 /// and PAGE bitwise lookups; `None` produces empty page tables.
+#[allow(clippy::too_many_arguments)]
 fn build_traces(
     ops: CollectedOps,
     elf: Option<&Elf>,
