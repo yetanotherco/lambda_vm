@@ -1930,6 +1930,55 @@ fn test_prove_private_input_xpage() {
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
 
+/// Same ASM program but with different input values to make sure the output
+/// actually depends on the private input (not a hardcoded constant masquerading
+/// as a proof).
+#[test]
+fn test_prove_private_input_different_values() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = vec![
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+    ];
+    let proof = crate::prove_with_input(&elf_bytes, input.clone()).expect("prove");
+    assert!(crate::verify(&proof, &elf_bytes).expect("verify"), "proof should verify");
+    // ASM commits 8 bytes starting at 0xFF000008 = input[4..12]
+    assert_eq!(proof.public_output, input[4..12].to_vec());
+}
+
+/// Security test: verifier must reject a proof whose `private_input` field was
+/// tampered with after proving. Private input is committed via the PAGE
+/// preprocessed commitments at 0xFF000000, so any mismatch between the prover's
+/// input and the verifier's reconstructed pages must fail verification.
+#[test]
+fn test_verify_rejects_tampered_private_input() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_input(&elf_bytes, input.clone()).expect("prove");
+
+    // Baseline: untampered proof must verify.
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("verify should not error"),
+        "Baseline proof must verify before tampering"
+    );
+
+    // Tamper: flip a bit in the private input.
+    let mut tampered_input = vm_proof.private_input.clone();
+    tampered_input[0] ^= 0x01;
+    let tampered_proof = crate::VmProof {
+        private_input: tampered_input,
+        ..vm_proof
+    };
+
+    // The verifier reconstructs PAGE commitments from the tampered input, which
+    // don't match the prover's commitments — verification must fail.
+    let verified = crate::verify(&tampered_proof, &elf_bytes)
+        .expect("verify should not error on tampered input");
+    assert!(
+        !verified,
+        "Verifier must reject proof with tampered private_input"
+    );
+}
+
 /// End-to-end test: prove+verify a Rust program (commit_sum) with private input.
 /// commit_sum reads input[0] + input[1] and commits the u8 sum.
 #[test]
