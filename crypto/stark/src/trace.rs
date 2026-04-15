@@ -229,11 +229,7 @@ where
 #[cfg(feature = "disk-spill")]
 pub(crate) struct MmapBacking {
     main_mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing main_mmap.
-    _main_file: std::fs::File,
     aux_mmap: Option<memmap2::Mmap>,
-    /// Owns the file descriptor backing aux_mmap.
-    _aux_file: Option<std::fs::File>,
     num_rows: usize,
     num_main_cols: usize,
     num_aux_cols: usize,
@@ -306,7 +302,9 @@ where
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row < backing.num_rows && col < backing.num_main_cols,
                 "get_main out of bounds: row={row}, col={col}, num_rows={}, num_main_cols={}",
                 backing.num_rows,
@@ -325,7 +323,9 @@ where
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row < backing.num_rows && col < backing.num_aux_cols,
                 "get_aux out of bounds: row={row}, col={col}, num_rows={}, num_aux_cols={}",
                 backing.num_rows,
@@ -397,7 +397,7 @@ where
         };
 
         let main_elem_size = std::mem::size_of::<FieldElement<F>>();
-        let (main_mmap, main_file) =
+        let main_mmap =
             Self::write_pool_columns_to_mmap(&main_pool[..num_main_cols], main_elem_size)?;
 
         let lde_step_size = trace_step_size * blowup_factor;
@@ -410,9 +410,7 @@ where
             blowup_factor,
             mmap_backing: Some(MmapBacking {
                 main_mmap,
-                _main_file: main_file,
                 aux_mmap: None,
-                _aux_file: None,
                 num_rows,
                 num_main_cols,
                 num_aux_cols: 0,
@@ -437,28 +435,34 @@ where
         }
 
         let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
-        let (aux_mmap, aux_file) =
-            Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
+        let aux_mmap = Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
 
         let backing = self
             .mmap_backing
             .as_mut()
             .expect("add_aux_from_pool requires main already spilled");
         backing.aux_mmap = Some(aux_mmap);
-        backing._aux_file = Some(aux_file);
         backing.num_aux_cols = num_aux_cols;
 
         Ok(())
     }
 
-    /// Write pool columns to a temp file and return the mmap + file handle.
+    /// Write pool columns to a temp file and return the mmap.
+    /// The file descriptor is closed before returning; the mapping keeps
+    /// its own reference to the underlying object.
     /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     fn write_pool_columns_to_mmap<T>(
         columns: &[Vec<T>],
         elem_size: usize,
-    ) -> std::io::Result<(memmap2::Mmap, std::fs::File)> {
+    ) -> std::io::Result<memmap2::Mmap> {
         use std::io::Write;
+
+        debug_assert_eq!(
+            elem_size,
+            std::mem::size_of::<T>(),
+            "elem_size must match size_of::<T>(); the `col.len() * elem_size` byte count below assumes it"
+        );
 
         let num_cols = columns.len();
         let num_rows = if num_cols > 0 { columns[0].len() } else { 0 };
@@ -466,7 +470,15 @@ where
             columns.iter().all(|c| c.len() == num_rows),
             "all columns must have the same length"
         );
-        let total_bytes = (num_cols * num_rows * elem_size) as u64;
+        let total_bytes = (num_cols as u64)
+            .checked_mul(num_rows as u64)
+            .and_then(|n| n.checked_mul(elem_size as u64))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "write_pool_columns_to_mmap: byte count overflows u64",
+                )
+            })?;
 
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes)?;
@@ -475,6 +487,8 @@ where
             for col in columns {
                 // SAFETY: T is a FieldElement which is #[repr(transparent)],
                 // so the Vec has the same byte layout as a contiguous array.
+                // `col.len() * elem_size` fits in usize because Vec allocations
+                // are bounded by isize::MAX bytes.
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
                 };
@@ -484,8 +498,11 @@ where
         }
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
+        // The mapping keeps its own reference to the underlying object
+        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
+        // `file` local can drop at end of scope without invalidating it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Ok((mmap, file))
+        Ok(mmap)
     }
 }
 

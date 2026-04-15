@@ -14,9 +14,6 @@ use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
-    /// Owns the file descriptor backing the mmap. Dropping it would close
-    /// the descriptor and invalidate the mmap.
-    _file: std::fs::File,
     /// Number of columns per row.
     width: usize,
     /// Number of rows.
@@ -46,26 +43,12 @@ impl std::fmt::Debug for TableMmapBacking {
     }
 }
 
-/// NOTE: compares all mmap bytes, O(n) in table size. Only used by Table's PartialEq derive.
-#[cfg(feature = "disk-spill")]
-impl PartialEq for TableMmapBacking {
-    fn eq(&self, other: &Self) -> bool {
-        self.width == other.width
-            && self.height == other.height
-            && self.elem_size == other.elem_size
-            && self.mmap[..] == other.mmap[..]
-    }
-}
-
-#[cfg(feature = "disk-spill")]
-impl Eq for TableMmapBacking {}
-
 /// A two-dimensional Table holding field elements, arranged in a row-major order.
 /// This is the basic underlying data structure used for any two-dimensional component in the
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
-#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -75,6 +58,26 @@ pub struct Table<F: IsField> {
     #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
+
+/// Element-wise comparison via `get()`, so spilled tables compare by field
+/// equality (canonicalized per `F::eq`) rather than raw mmap bytes.
+impl<F: IsField> PartialEq for Table<F> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.width != other.width || self.height != other.height {
+            return false;
+        }
+        for row in 0..self.height {
+            for col in 0..self.width {
+                if self.get(row, col) != other.get(row, col) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+impl<F: IsField> Eq for Table<F> {}
 
 impl<F: IsField> Table<F> {
     /// Crates a new Table instance from a one-dimensional array in row major order
@@ -130,7 +133,9 @@ impl<F: IsField> Table<F> {
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row_idx < backing.height,
                 "Table::get_row out of bounds: row={row_idx}, height={}",
                 backing.height
@@ -192,7 +197,9 @@ impl<F: IsField> Table<F> {
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(
+            // Guard the unsafe pointer math below; matches the non-spill
+            // path's checked indexing so release builds don't drop the check.
+            assert!(
                 row < backing.height && col < backing.width,
                 "Table::get out of bounds: row={row}, col={col}, height={}, width={}",
                 backing.height,
@@ -240,27 +247,42 @@ impl<F: IsField> Table<F> {
         }
 
         let elem_size = std::mem::size_of::<FieldElement<F>>();
-        let total_bytes = self.data.len() * elem_size;
+        let total_bytes = (self.data.len() as u64)
+            .checked_mul(elem_size as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "spill_to_disk: byte count overflows u64",
+                )
+            })?;
 
         let file = tempfile::tempfile()?;
-        file.set_len(total_bytes as u64)?;
+        file.set_len(total_bytes)?;
         {
             let mut writer = std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The Vec has the same byte layout as a contiguous array.
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, total_bytes) };
+            // `self.data.len() * elem_size` fits in usize because Vec allocations
+            // are bounded by isize::MAX bytes.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    self.data.as_ptr() as *const u8,
+                    self.data.len() * elem_size,
+                )
+            };
             writer.write_all(bytes)?;
             writer.flush()?;
         }
 
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
+        // The mapping keeps its own reference to the underlying object
+        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
+        // `file` local can drop at end of scope without invalidating it.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
         self.mmap_backing = Some(TableMmapBacking {
             mmap,
-            _file: file,
             width: self.width,
             height: self.height,
             elem_size,
