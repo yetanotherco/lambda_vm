@@ -81,7 +81,7 @@ where
 {
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
-    /// Wrapped in Arc to share with Round1Metadata without deep-cloning (~64MB per table).
+    /// Wrapped in Arc to share with Round1Commitments without deep-cloning (~64MB per table).
     pub(crate) lde_trace_merkle_tree: Arc<BatchedMerkleTree<F>>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
@@ -124,17 +124,11 @@ where
     precomputed_tree: Option<Arc<BatchedMerkleTree<Field>>>,
     precomputed_root: Option<Commitment>,
     num_precomputed_cols: usize,
-    /// Cached main LDE columns from Phase A, used in Phase D to skip recomputation.
-    cached_main_lde: Vec<Vec<FieldElement<Field>>>,
 }
 
-/// Metadata from Round 1 commitments — stores Merkle trees, roots, and cached LDE evaluations.
-/// LDE evaluations are cached from Phase A/C and consumed in Phase D (Rounds 2-4),
-/// eliminating the expensive recomputation (iFFT + coset shift + FFT per column).
-///
-/// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
-/// and Phase D (O(N × cols × lde_size)).
-pub struct Round1Metadata<Field, FieldExtension>
+/// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
+/// Borrowed (not consumed) when building `Round1` in Phase D.
+pub struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
@@ -160,10 +154,68 @@ where
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
-    /// Cached main LDE columns from Phase A (consumed by Phase D).
-    cached_main_lde: Vec<Vec<FieldElement<Field>>>,
-    /// Cached aux LDE columns from Phase C (consumed by Phase D).
-    cached_aux_lde: Vec<Vec<FieldElement<FieldExtension>>>,
+}
+
+/// LDE columns for main (Phase A) and auxiliary (Phase C) traces, consumed by value in Phase D.
+///
+/// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
+/// and Phase D (O(N × cols × lde_size)).
+struct Lde<Field: IsFFTField, FieldExtension: IsField> {
+    main: Vec<Vec<FieldElement<Field>>>,
+    aux: Vec<Vec<FieldElement<FieldExtension>>>,
+}
+
+impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
+    FieldExtension: IsField + Send + Sync,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
+{
+    /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
+    fn build_round1(
+        &self,
+        lde: Lde<Field, FieldExtension>,
+        step_size: usize,
+        blowup_factor: usize,
+        has_aux_trace: bool,
+    ) -> Round1<Field, FieldExtension> {
+        let lde_trace = LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
+
+        let main = Round1CommitmentData::<Field> {
+            lde_trace_merkle_tree: Arc::clone(&self.main_merkle_tree),
+            lde_trace_merkle_root: self.main_merkle_root,
+            precomputed_merkle_tree: self.precomputed_merkle_tree.as_ref().map(Arc::clone),
+            precomputed_merkle_root: self.precomputed_merkle_root,
+            num_precomputed_cols: self.num_precomputed_cols,
+        };
+
+        let aux = if has_aux_trace {
+            Some(Round1CommitmentData::<FieldExtension> {
+                lde_trace_merkle_tree: Arc::clone(
+                    self.aux_merkle_tree
+                        .as_ref()
+                        .expect("aux tree must exist when has_aux_trace"),
+                ),
+                lde_trace_merkle_root: self
+                    .aux_merkle_root
+                    .expect("aux root must exist when has_aux_trace"),
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            })
+        } else {
+            None
+        };
+
+        Round1 {
+            lde_trace,
+            main,
+            aux,
+            rap_challenges: self.rap_challenges.clone(),
+            bus_public_inputs: self.bus_public_inputs.clone(),
+        }
+    }
 }
 
 /// Pre-computed twiddle factors and coset weights for a given domain size.
@@ -513,7 +565,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_cols = trace.num_main_columns;
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
         #[cfg(feature = "instruments")]
@@ -529,7 +580,7 @@ pub trait IsStarkProver<
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..num_cols])
+            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
                 .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
@@ -549,16 +600,16 @@ pub trait IsStarkProver<
         ))
     }
 
-    /// Recompute Round1 from the trace, reusing the Merkle trees stored in metadata.
+    /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
     ///
-    /// Only used by `run_debug_checks` — Phase D consumes the cached LDE from
-    /// metadata directly and does not go through this path.
+    /// Only used by `run_debug_checks` — Phase D consumes the cached LDE
+    /// directly and does not go through this path.
     #[cfg(feature = "debug-checks")]
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        metadata: &Round1Metadata<Field, FieldExtension>,
+        commitment: &Round1Commitments<Field, FieldExtension>,
         twiddles: &LdeTwiddles<Field>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
@@ -566,53 +617,23 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let mut main_columns = trace.extract_columns_main(lde_size);
-        Self::expand_columns_to_lde::<Field>(&mut main_columns, domain, twiddles);
+        let mut main = trace.extract_columns_main(lde_size);
+        Self::expand_columns_to_lde::<Field>(&mut main, domain, twiddles);
 
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-            lde_trace_merkle_root: metadata.main_merkle_root,
-            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
-            precomputed_merkle_root: metadata.precomputed_merkle_root,
-            num_precomputed_cols: metadata.num_precomputed_cols,
-        };
-
-        let (aux, aux_columns) = if air.has_aux_trace() {
-            let mut aux_columns = trace.extract_columns_aux(lde_size);
-            Self::expand_columns_to_lde::<FieldExtension>(&mut aux_columns, domain, twiddles);
-            let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    metadata
-                        .aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_aux_trace"),
-                ),
-                lde_trace_merkle_root: metadata
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_aux_trace"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            };
-            (Some(aux_commitment), aux_columns)
+        let aux = if air.has_aux_trace() {
+            let mut aux = trace.extract_columns_aux(lde_size);
+            Self::expand_columns_to_lde::<FieldExtension>(&mut aux, domain, twiddles);
+            aux
         } else {
-            (None, Vec::new())
+            Vec::new()
         };
 
-        let lde_trace = LDETraceTable::from_columns(
-            main_columns,
-            aux_columns,
+        Ok(commitment.build_round1(
+            Lde { main, aux },
             air.step_size(),
             domain.blowup_factor,
-        );
-
-        Ok(Round1 {
-            lde_trace,
-            main,
-            aux,
-            rap_challenges: metadata.rap_challenges.clone(),
-            bus_public_inputs: metadata.bus_public_inputs.clone(),
-        })
+            air.has_aux_trace(),
+        ))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
@@ -620,7 +641,7 @@ pub trait IsStarkProver<
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
-        metadatas: &[Round1Metadata<Field, FieldExtension>],
+        commitments: &[Round1Commitments<Field, FieldExtension>],
         domains: &[Domain<Field>],
         twiddle_caches: &[LdeTwiddles<Field>],
     ) where
@@ -630,12 +651,12 @@ pub trait IsStarkProver<
     {
         let mut temp_results: Vec<Round1<Field, FieldExtension>> =
             Vec::with_capacity(air_trace_pairs.len());
-        for (((air, trace, _), metadata), (domain, twiddles)) in air_trace_pairs
+        for (((air, trace, _), commitment), (domain, twiddles)) in air_trace_pairs
             .iter()
-            .zip(metadatas.iter())
+            .zip(commitments.iter())
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
-            let result = Self::reconstruct_round1(*air, *trace, domain, metadata, twiddles)
+            let result = Self::reconstruct_round1(*air, *trace, domain, commitment, twiddles)
                 .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
         }
@@ -1521,6 +1542,7 @@ pub trait IsStarkProver<
         let phase_start = Instant::now();
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
+        let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1564,8 +1586,8 @@ pub trait IsStarkProver<
                     precomputed_tree: pre_tree.map(Arc::new),
                     precomputed_root: pre_root,
                     num_precomputed_cols: n_pre,
-                    cached_main_lde: cached_main,
                 });
+                main_ldes.push(cached_main);
             }
         }
 
@@ -1693,15 +1715,19 @@ pub trait IsStarkProver<
             }
         }
 
-        // Build metadata sequentially from main_commits + aux_results + bus_inputs
-        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
+        // Build commitments and cached LDEs as separate vecs:
+        // commitments are borrowed in Phase D, LDEs are consumed by value.
+        let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
-        for ((main_commit, (aux_tree, aux_root, cached_aux)), bus_public_inputs) in main_commits
-            .into_iter()
-            .zip(aux_results)
-            .zip(bus_inputs_vec)
+        let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
+            main_commits
+                .into_iter()
+                .zip(main_ldes)
+                .zip(aux_results)
+                .zip(bus_inputs_vec)
         {
-            metadatas.push(Round1Metadata {
+            commitments.push(Round1Commitments {
                 main_merkle_tree: main_commit.main_tree,
                 main_merkle_root: main_commit.main_root,
                 precomputed_merkle_tree: main_commit.precomputed_tree,
@@ -1711,8 +1737,10 @@ pub trait IsStarkProver<
                 aux_merkle_root: aux_root,
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
-                cached_main_lde: main_commit.cached_main_lde,
-                cached_aux_lde: cached_aux,
+            });
+            cached_ldes.push(Lde {
+                main: main_lde,
+                aux: cached_aux,
             });
         }
 
@@ -1720,7 +1748,7 @@ pub trait IsStarkProver<
         let aux_commit_elapsed = phase_start.elapsed();
 
         #[cfg(feature = "debug-checks")]
-        Self::run_debug_checks(&air_trace_pairs, &metadatas, &domains, &twiddle_caches);
+        Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
 
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
@@ -1740,25 +1768,31 @@ pub trait IsStarkProver<
         )> = Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
+        let mut lde_drain = cached_ldes.into_iter();
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
+            let chunk_size = chunk_end - chunk_start;
 
-            let chunk_metadatas = &mut metadatas[chunk_start..chunk_end];
+            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
+                lde_drain.by_ref().take(chunk_size).collect();
+            let chunk_commitments = &commitments[chunk_start..chunk_end];
             let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
 
             #[cfg(feature = "parallel")]
-            let iter = chunk_metadatas
-                .par_iter_mut()
+            let iter = chunk_ldes
+                .into_par_iter()
+                .zip(chunk_commitments.par_iter())
                 .zip(chunk_transcripts.par_iter_mut())
                 .enumerate();
             #[cfg(not(feature = "parallel"))]
-            let iter = chunk_metadatas
-                .iter_mut()
+            let iter = chunk_ldes
+                .into_iter()
+                .zip(chunk_commitments.iter())
                 .zip(chunk_transcripts.iter_mut())
                 .enumerate();
 
             let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, (metadata, table_transcript))| {
+                .map(|(j, ((lde, commitment), table_transcript))| {
                     let idx = chunk_start + j;
                     let (air, trace, pub_inputs) = &air_trace_pairs[idx];
                     let _ = trace; // used by instruments
@@ -1767,54 +1801,13 @@ pub trait IsStarkProver<
                     #[cfg(feature = "instruments")]
                     let table_start = Instant::now();
 
-                    // Build Round1 from cached LDE (zero-copy move, no recomputation).
-                    let cached_main = std::mem::take(&mut metadata.cached_main_lde);
-                    let cached_aux = std::mem::take(&mut metadata.cached_aux_lde);
-
-                    let lde_trace = LDETraceTable::from_columns(
-                        cached_main,
-                        cached_aux,
+                    // Build Round1 from cached LDE (consumed by value, no recomputation).
+                    let round_1_result = commitment.build_round1(
+                        lde,
                         air.step_size(),
                         domain.blowup_factor,
+                        air.has_aux_trace(),
                     );
-
-                    let main = Round1CommitmentData::<Field> {
-                        lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                        lde_trace_merkle_root: metadata.main_merkle_root,
-                        precomputed_merkle_tree: metadata
-                            .precomputed_merkle_tree
-                            .as_ref()
-                            .map(Arc::clone),
-                        precomputed_merkle_root: metadata.precomputed_merkle_root,
-                        num_precomputed_cols: metadata.num_precomputed_cols,
-                    };
-
-                    let aux = if air.has_aux_trace() {
-                        Some(Round1CommitmentData::<FieldExtension> {
-                            lde_trace_merkle_tree: Arc::clone(
-                                metadata
-                                    .aux_merkle_tree
-                                    .as_ref()
-                                    .expect("aux tree must exist when has_aux_trace"),
-                            ),
-                            lde_trace_merkle_root: metadata
-                                .aux_merkle_root
-                                .expect("aux root must exist when has_aux_trace"),
-                            precomputed_merkle_tree: None,
-                            precomputed_merkle_root: None,
-                            num_precomputed_cols: 0,
-                        })
-                    } else {
-                        None
-                    };
-
-                    let round_1_result = Round1 {
-                        lde_trace,
-                        main,
-                        aux,
-                        rap_challenges: metadata.rap_challenges.clone(),
-                        bus_public_inputs: metadata.bus_public_inputs.clone(),
-                    };
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
