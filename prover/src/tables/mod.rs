@@ -49,32 +49,29 @@ pub use types::BusId;
 /// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
 ///    benchmarks show better parallel throughput with smaller chunks.)
 ///
-/// Capped tables use 2^20, not the 2^21 the formula gives. A 2^21 chunk
-/// runs on a single thread and peaks at twice the memory of a 2^20 chunk.
-///
-/// | Table   | Main | Bus | Eff.width | Max rows        |
-/// |---------|------|-----|-----------|-----------------|
-/// | MEMW    |  49  |  26 |    127    |  2^19           |
-/// | MEMW_A  |  29  |  20 |     89    |  2^19 *         |
-/// | CPU     |  74  |  40 |    194    |  2^19           |
-/// | DVRM    |  34  |  34 |    136    |  2^19           |
-/// | MUL     |  26  |  16 |     74    |  2^20           |
-/// | LT      |  15  |   9 |     42    |  2^20 (capped)  |
-/// | SHIFT   |  27  |  15 |     72    |  2^20           |
-/// | LOAD    |  18  |   5 |     33    |  2^20 (capped)  |
-/// | BRANCH  |  14  |   6 |     32    |  2^20 (capped)  |
-/// | MEMW_R  |  10  |   7 |     31    |  2^20 (capped)  |
+/// | Table   | Main | Bus | Eff.width | Max rows |
+/// |---------|------|-----|-----------|----------|
+/// | MEMW    |  49  |  26 |    127    |  2^19    |
+/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
+/// | CPU     |  74  |  40 |    194    |  2^19    |
+/// | DVRM    |  34  |  34 |    136    |  2^19    |
+/// | MUL     |  26  |  16 |     74    |  2^20    |
+/// | LT      |  15  |   9 |     42    |  2^20    |
+/// | SHIFT   |  27  |  15 |     72    |  2^20    |
+/// | LOAD    |  18  |   5 |     33    |  2^20    |
+/// | BRANCH  |  14  |   6 |     32    |  2^20    |
+/// | MEMW_R  |  10  |   7 |     31    |  2^20    |
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
     pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
     pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
-    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42 (capped at 2^20)
+    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42
     pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
-    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33 (capped at 2^20)
-    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32 (capped at 2^20)
-    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31 (capped at 2^20)
+    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
+    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
+    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
 }
 
 /// Per-table maximum row limits, configurable for different environments.
