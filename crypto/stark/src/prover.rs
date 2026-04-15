@@ -628,7 +628,12 @@ pub trait IsStarkProver<
             Vec::new()
         };
 
-        Ok(commitment.build_round1(Lde { main, aux }, air.step_size(), domain.blowup_factor))
+        Ok(commitment.build_round1(
+            Lde { main, aux },
+            air.step_size(),
+            domain.blowup_factor,
+            air.has_aux_trace(),
+        ))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
