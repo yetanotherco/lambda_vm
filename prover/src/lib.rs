@@ -493,8 +493,12 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
 
 /// Prove an ELF binary execution with a private input.
 ///
-/// The `private_input` bytes are passed to the executor; the guest program
-/// retrieves them via the `GetPrivateInputs` syscall.
+/// The `private_input` bytes are pre-loaded at `PRIVATE_INPUT_START_INDEX`
+/// (`0xFF000000`) as an initial memory segment (4-byte LE length prefix +
+/// data). The guest reads them via normal RISC-V loads — see
+/// `syscalls::syscalls::get_private_input`. The bytes are also included in
+/// the returned `VmProof` so the verifier can reconstruct the matching PAGE
+/// preprocessed commitments.
 pub fn prove_with_input(elf_bytes: &[u8], private_input: Vec<u8>) -> Result<VmProof, Error> {
     prove_with_options(
         elf_bytes,

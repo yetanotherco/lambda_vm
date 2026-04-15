@@ -1343,19 +1343,14 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
     ops
 }
 
-/// Collects IS_BYTE lookups from PAGE data (init and fini values).
+/// Build a `page_base → init_data` map from the ELF segments and the private
+/// input region.
 ///
-/// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init] for initialization range check
-/// - C2: IS_BYTE[fini] for finalization range check
-///
-/// This must be called BEFORE bitwise multiplicities are updated.
-/// Build a page_base → init_data map from the ELF segments and the private input region.
-///
-/// The private input is laid out at `PRIVATE_INPUT_START_INDEX` as a 4-byte LE length
-/// prefix followed by the raw bytes (matching `Memory::store_private_inputs` and
-/// `MemoryState::add_private_input`). Both the prover (trace generation) and verifier
-/// (page config reconstruction) call this so they agree on PAGE init values exactly.
+/// The private input is laid out at `PRIVATE_INPUT_START_INDEX` as a 4-byte LE
+/// length prefix followed by the raw bytes (matching
+/// `Memory::store_private_inputs` and `MemoryState::add_private_input`). Both
+/// the prover (trace generation) and verifier (page config reconstruction) call
+/// this so they agree on PAGE init values exactly.
 fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1400,6 +1395,13 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     init_page_data
 }
 
+/// Collects IS_BYTE lookups from PAGE data (init and fini values).
+///
+/// Each PAGE byte generates 2 IS_BYTE lookups:
+/// - C1: IS_BYTE[init] for initialization range check
+/// - C2: IS_BYTE[fini] for finalization range check
+///
+/// This must be called BEFORE bitwise multiplicities are updated.
 fn collect_bitwise_from_page(
     elf: &Elf,
     memory_state: &MemoryState,
@@ -1694,11 +1696,13 @@ impl Traces {
         }
     }
 
-    /// Extract page configurations from ELF only (deterministic from binary).
+    /// Extract page configurations for the deterministic portion of memory:
+    /// ELF segments and the private-input region at `PRIVATE_INPUT_START_INDEX`.
     ///
-    /// Returns PageConfigs for pages covered by ELF segments, with their
-    /// init data populated. Used by the verifier to reconstruct the ELF
-    /// portion of the PAGE table layout.
+    /// Returns PageConfigs for every page covered by an ELF segment or by the
+    /// private-input bytes, with init data populated. Used by the verifier to
+    /// reconstruct these pages (runtime-only pages like stack/heap come from
+    /// `page_configs_from_elf_and_runtime`).
     pub fn page_configs_from_elf(elf: &Elf, private_input: &[u8]) -> Vec<PageConfig> {
         let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, private_input);

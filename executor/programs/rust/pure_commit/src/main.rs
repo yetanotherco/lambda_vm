@@ -1,9 +1,8 @@
-// Minimal Rust program that proves on main:
-// - no_std, no_main (no Rust std runtime)
-// - no allocator (no TLSF init)
-// - no syscalls crate (no Print/Panic ecalls)
-// - Only uses Commit (64) and Halt (93) ecalls, both of which have
-//   receivers on the Ecall bus.
+// Minimal Rust guest program: no_std, no_main, no allocator, no syscalls crate.
+// Uses only raw inline `asm!("ecall")` for Commit (64) and Halt (93).
+// Serves as a control case in the prover test suite (`test_pure_commit_rust`):
+// verifies that Rust can compile to a provable ELF when the heap allocator is
+// bypassed, independent of the Rust-std startup path.
 #![no_std]
 #![no_main]
 

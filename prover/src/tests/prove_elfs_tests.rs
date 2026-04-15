@@ -1981,14 +1981,7 @@ fn test_verify_rejects_tampered_private_input() {
 
 /// End-to-end test: prove+verify a Rust program (commit_sum) with private input.
 /// commit_sum reads input[0] + input[1] and commits the u8 sum.
-///
-/// NOTE: currently ignored because Rust std programs hit a pre-existing
-/// Memory/Shift bus imbalance (likely from `init_allocator`'s TLSF heap setup).
-/// This is unrelated to the private input handling — confirmed by running the
-/// ASM tests above (`test_prove_private_input_xpage` etc.) which exercise the
-/// full memory-mapped private input path and verify correctly.
 #[test]
-#[ignore = "Blocked on pre-existing Rust std allocator bus imbalance (not private-input related)"]
 fn test_prove_commit_sum() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -2004,6 +1997,28 @@ fn test_prove_commit_sum() {
         "proof should verify"
     );
     assert_eq!(proof.public_output, vec![8u8]); // 3 + 5
+}
+
+/// Regression test: a minimal Rust std program that uses `init_allocator()`
+/// and `String::from("Hello World") + commit`. Exercises the full stack:
+/// TLSF heap init, SRL on high-bit-set values (fixed in `shift::compute_aux`)
+/// and CSR instructions (fixed in `DecodeEntry::from(Instruction::CSR)`).
+#[test]
+fn test_prove_allocator_minimal_reproducer() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
+            .unwrap();
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "allocator.elf should verify"
+    );
+    assert_eq!(proof.public_output, b"Hello World");
 }
 
 /// Minimal Rust program that proves on main: no_std, no_main,
