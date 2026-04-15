@@ -156,11 +156,11 @@ where
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
-/// Cached LDE columns from Phase A (main) and Phase C (aux), consumed by value in Phase D.
+/// LDE columns for main (Phase A) and auxiliary (Phase C) traces, consumed by value in Phase D.
 ///
 /// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
 /// and Phase D (O(N × cols × lde_size)).
-struct CachedLde<Field: IsFFTField, FieldExtension: IsField> {
+struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     main: Vec<Vec<FieldElement<Field>>>,
     aux: Vec<Vec<FieldElement<FieldExtension>>>,
 }
@@ -172,10 +172,10 @@ where
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
-    /// Build a `Round1` by consuming a `CachedLde` and borrowing commitment data.
+    /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
     fn build_round1(
         &self,
-        lde: CachedLde<Field, FieldExtension>,
+        lde: Lde<Field, FieldExtension>,
         step_size: usize,
         blowup_factor: usize,
         has_aux_trace: bool,
@@ -1749,7 +1749,7 @@ pub trait IsStarkProver<
         // commitments are borrowed in Phase D, LDEs are consumed by value.
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
-        let mut cached_ldes: Vec<CachedLde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
         for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
             main_commits
                 .into_iter()
@@ -1768,7 +1768,7 @@ pub trait IsStarkProver<
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
             });
-            cached_ldes.push(CachedLde {
+            cached_ldes.push(Lde {
                 main: main_lde,
                 aux: cached_aux,
             });
@@ -1803,7 +1803,7 @@ pub trait IsStarkProver<
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
 
-            let chunk_ldes: Vec<CachedLde<Field, FieldExtension>> =
+            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
                 lde_drain.by_ref().take(chunk_size).collect();
             let chunk_commitments = &commitments[chunk_start..chunk_end];
             let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
