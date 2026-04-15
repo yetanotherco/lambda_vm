@@ -103,7 +103,7 @@ done
 # --- Display ---------------------------------------------------------------
 
 get_val() {
-    grep "^${2}=" "$1" 2>/dev/null | cut -d= -f2
+    awk -F= -v k="$2" '$1==k {print $2; exit}' "$1" 2>/dev/null
 }
 
 print_section() {
