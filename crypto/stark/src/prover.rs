@@ -81,7 +81,7 @@ where
 {
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
-    /// Wrapped in Arc to share with Round1Metadata without deep-cloning (~64MB per table).
+    /// Wrapped in Arc to share with Round1Cache without deep-cloning (~64MB per table).
     pub(crate) lde_trace_merkle_tree: Arc<BatchedMerkleTree<F>>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
@@ -134,7 +134,7 @@ where
 ///
 /// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
 /// and Phase D (O(N × cols × lde_size)).
-pub struct Round1Metadata<Field, FieldExtension>
+pub struct Round1Cache<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
@@ -166,7 +166,7 @@ where
     cached_aux_lde: Vec<Vec<FieldElement<FieldExtension>>>,
 }
 
-impl<Field, FieldExtension> Round1Metadata<Field, FieldExtension>
+impl<Field, FieldExtension> Round1Cache<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
     FieldExtension: IsField + Send + Sync,
@@ -617,7 +617,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        metadata: &Round1Metadata<Field, FieldExtension>,
+        metadata: &Round1Cache<Field, FieldExtension>,
         twiddles: &LdeTwiddles<Field>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
@@ -679,7 +679,7 @@ pub trait IsStarkProver<
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
-        metadatas: &[Round1Metadata<Field, FieldExtension>],
+        metadatas: &[Round1Cache<Field, FieldExtension>],
         domains: &[Domain<Field>],
         twiddle_caches: &[LdeTwiddles<Field>],
     ) where
@@ -1753,14 +1753,14 @@ pub trait IsStarkProver<
         }
 
         // Build metadata sequentially from main_commits + aux_results + bus_inputs
-        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
+        let mut metadatas: Vec<Round1Cache<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         for ((main_commit, (aux_tree, aux_root, cached_aux)), bus_public_inputs) in main_commits
             .into_iter()
             .zip(aux_results)
             .zip(bus_inputs_vec)
         {
-            metadatas.push(Round1Metadata {
+            metadatas.push(Round1Cache {
                 main_merkle_tree: main_commit.main_tree,
                 main_merkle_root: main_commit.main_root,
                 precomputed_merkle_tree: main_commit.precomputed_tree,
