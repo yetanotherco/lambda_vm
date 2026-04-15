@@ -611,53 +611,18 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let mut main_columns = trace.extract_columns_main(lde_size);
-        Self::expand_columns_to_lde::<Field>(&mut main_columns, domain, twiddles);
+        let mut main = trace.extract_columns_main(lde_size);
+        Self::expand_columns_to_lde::<Field>(&mut main, domain, twiddles);
 
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Arc::clone(&commitment.main_merkle_tree),
-            lde_trace_merkle_root: commitment.main_merkle_root,
-            precomputed_merkle_tree: commitment.precomputed_merkle_tree.as_ref().map(Arc::clone),
-            precomputed_merkle_root: commitment.precomputed_merkle_root,
-            num_precomputed_cols: commitment.num_precomputed_cols,
-        };
-
-        let (aux, aux_columns) = if air.has_aux_trace() {
-            let mut aux_columns = trace.extract_columns_aux(lde_size);
-            Self::expand_columns_to_lde::<FieldExtension>(&mut aux_columns, domain, twiddles);
-            let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    commitment
-                        .aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_aux_trace"),
-                ),
-                lde_trace_merkle_root: commitment
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_aux_trace"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            };
-            (Some(aux_commitment), aux_columns)
+        let aux = if air.has_aux_trace() {
+            let mut aux = trace.extract_columns_aux(lde_size);
+            Self::expand_columns_to_lde::<FieldExtension>(&mut aux, domain, twiddles);
+            aux
         } else {
-            (None, Vec::new())
+            Vec::new()
         };
 
-        let lde_trace = LDETraceTable::from_columns(
-            main_columns,
-            aux_columns,
-            air.step_size(),
-            domain.blowup_factor,
-        );
-
-        Ok(Round1 {
-            lde_trace,
-            main,
-            aux,
-            rap_challenges: commitment.rap_challenges.clone(),
-            bus_public_inputs: commitment.bus_public_inputs.clone(),
-        })
+        Ok(commitment.build_round1(Lde { main, aux }, air.step_size(), domain.blowup_factor))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
