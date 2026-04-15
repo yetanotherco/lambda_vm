@@ -166,6 +166,66 @@ where
     cached_aux_lde: Vec<Vec<FieldElement<FieldExtension>>>,
 }
 
+impl<Field, FieldExtension> Round1Metadata<Field, FieldExtension>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
+    FieldExtension: IsField + Send + Sync,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
+{
+    /// Consume cached LDE columns and Merkle trees to build a `Round1` result.
+    ///
+    /// Called once per table in Phase D. After this, `cached_main_lde` and
+    /// `cached_aux_lde` are empty (moved into the returned `LDETraceTable`).
+    fn into_round1(
+        &mut self,
+        step_size: usize,
+        blowup_factor: usize,
+        has_aux_trace: bool,
+    ) -> Round1<Field, FieldExtension> {
+        let lde_trace = LDETraceTable::from_columns(
+            std::mem::take(&mut self.cached_main_lde),
+            std::mem::take(&mut self.cached_aux_lde),
+            step_size,
+            blowup_factor,
+        );
+
+        let main = Round1CommitmentData::<Field> {
+            lde_trace_merkle_tree: Arc::clone(&self.main_merkle_tree),
+            lde_trace_merkle_root: self.main_merkle_root,
+            precomputed_merkle_tree: self.precomputed_merkle_tree.as_ref().map(Arc::clone),
+            precomputed_merkle_root: self.precomputed_merkle_root,
+            num_precomputed_cols: self.num_precomputed_cols,
+        };
+
+        let aux = if has_aux_trace {
+            Some(Round1CommitmentData::<FieldExtension> {
+                lde_trace_merkle_tree: Arc::clone(
+                    self.aux_merkle_tree
+                        .as_ref()
+                        .expect("aux tree must exist when has_aux_trace"),
+                ),
+                lde_trace_merkle_root: self
+                    .aux_merkle_root
+                    .expect("aux root must exist when has_aux_trace"),
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            })
+        } else {
+            None
+        };
+
+        Round1 {
+            lde_trace,
+            main,
+            aux,
+            rap_challenges: self.rap_challenges.clone(),
+            bus_public_inputs: self.bus_public_inputs.clone(),
+        }
+    }
+}
+
 /// Pre-computed twiddle factors and coset weights for a given domain size.
 ///
 /// Shared across all columns of the same table, and across all phases (A, C, Rounds 2-4)
@@ -513,7 +573,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_cols = trace.num_main_columns;
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
         #[cfg(feature = "instruments")]
@@ -529,7 +588,7 @@ pub trait IsStarkProver<
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..num_cols])
+            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
                 .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
@@ -1768,53 +1827,11 @@ pub trait IsStarkProver<
                     let table_start = Instant::now();
 
                     // Build Round1 from cached LDE (zero-copy move, no recomputation).
-                    let cached_main = std::mem::take(&mut metadata.cached_main_lde);
-                    let cached_aux = std::mem::take(&mut metadata.cached_aux_lde);
-
-                    let lde_trace = LDETraceTable::from_columns(
-                        cached_main,
-                        cached_aux,
+                    let round_1_result = metadata.into_round1(
                         air.step_size(),
                         domain.blowup_factor,
+                        air.has_aux_trace(),
                     );
-
-                    let main = Round1CommitmentData::<Field> {
-                        lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                        lde_trace_merkle_root: metadata.main_merkle_root,
-                        precomputed_merkle_tree: metadata
-                            .precomputed_merkle_tree
-                            .as_ref()
-                            .map(Arc::clone),
-                        precomputed_merkle_root: metadata.precomputed_merkle_root,
-                        num_precomputed_cols: metadata.num_precomputed_cols,
-                    };
-
-                    let aux = if air.has_aux_trace() {
-                        Some(Round1CommitmentData::<FieldExtension> {
-                            lde_trace_merkle_tree: Arc::clone(
-                                metadata
-                                    .aux_merkle_tree
-                                    .as_ref()
-                                    .expect("aux tree must exist when has_aux_trace"),
-                            ),
-                            lde_trace_merkle_root: metadata
-                                .aux_merkle_root
-                                .expect("aux root must exist when has_aux_trace"),
-                            precomputed_merkle_tree: None,
-                            precomputed_merkle_root: None,
-                            num_precomputed_cols: 0,
-                        })
-                    } else {
-                        None
-                    };
-
-                    let round_1_result = Round1 {
-                        lde_trace,
-                        main,
-                        aux,
-                        rap_challenges: metadata.rap_challenges.clone(),
-                        bus_public_inputs: metadata.bus_public_inputs.clone(),
-                    };
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
