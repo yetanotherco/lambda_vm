@@ -141,6 +141,9 @@ pub struct VmProof {
     /// Private input bytes. The verifier needs these to reconstruct the
     /// synthetic ELF segment at 0xFF000000 for PAGE table init data.
     pub private_input: Vec<u8>,
+    /// GetPrivateInputs destination address and byte count.
+    /// The verifier uses this to reconstruct PAGE init data for the guest buffer.
+    pub gpi_dest: Option<(u64, usize)>,
 }
 
 /// Error type for the prover crate.
@@ -567,7 +570,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, &saved_private_input)?;
 
     eprintln!("Instructions executed: {}", result.logs.len());
     traces.print_row_report();
@@ -616,6 +619,7 @@ pub fn prove_with_options(
         table_counts,
         public_output: traces.public_output_bytes.clone(),
         private_input: saved_private_input,
+        gpi_dest: traces.gpi_dest,
     })
 }
 
@@ -648,8 +652,12 @@ pub fn verify_with_options(
 
     let mut program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     add_private_input_segment(&mut program, &vm_proof.private_input);
-    let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
+    let page_configs = Traces::page_configs_from_elf_and_runtime_with_gpi(
+        &program,
+        &vm_proof.runtime_page_ranges,
+        &vm_proof.private_input,
+        vm_proof.gpi_dest,
+    );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.

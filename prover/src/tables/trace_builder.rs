@@ -324,6 +324,7 @@ fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
+    private_input: &[u8],
 ) -> (
     Vec<MemwOperation>,
     Vec<LoadOperation>,
@@ -358,6 +359,28 @@ fn collect_ops_from_cpu(
         // Collect register operations (M1, M3, M5)
         let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
         memw_ops.extend(reg_memw_ops);
+
+        // GetPrivateInputs ECALL: write bytes to MemoryState at timestamp=0.
+        // Using timestamp=0 treats these writes as "pre-execution init state" —
+        // the PAGE table will pick them up as init values (same as ELF data).
+        // No MEMW operations are needed since the writes aren't tracked by CPU.
+        if op.ecall_get_private_inputs && op.private_input_len > 0 {
+            let dest = op.private_input_dest;
+            let len = op.private_input_len as usize;
+            eprintln!(
+                "GPI: dest=0x{:x}, len={}, pages={:x}..={:x}",
+                dest,
+                len,
+                dest / 4096,
+                (dest + len as u64 - 1) / 4096,
+            );
+            let len_prefix = (private_input.len() as u32).to_le_bytes();
+            let all_bytes: Vec<u8> =
+                len_prefix.iter().chain(private_input.iter()).copied().collect();
+            for (i, &byte) in all_bytes[..len].iter().enumerate() {
+                memory_state.write_byte(dest + i as u64, byte, 0);
+            }
+        }
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -1330,7 +1353,12 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 /// - C2: IS_BYTE[fini] for finalization range check
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
-fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_page(
+    elf: &Elf,
+    memory_state: &MemoryState,
+    private_input: &[u8],
+    gpi_dest: Option<(u64, usize)>,
+) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1353,6 +1381,24 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add GPI init data
+    if let Some((dest, len)) = gpi_dest {
+        if !private_input.is_empty() {
+            let len_prefix = (private_input.len() as u32).to_le_bytes();
+            let all_bytes: Vec<u8> =
+                len_prefix.iter().chain(private_input.iter()).copied().collect();
+            for (i, &byte) in all_bytes[..len].iter().enumerate() {
+                let addr = dest + i as u64;
+                let pg_base = page::page_base_for_address(addr, page_size);
+                let offset = page::offset_in_page(addr, page_size);
+                let page_data = elf_page_data
+                    .entry(pg_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte;
             }
         }
     }
@@ -1505,6 +1551,8 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
+    private_input: &[u8],
+    gpi_dest: Option<(u64, usize)>,
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1531,6 +1579,24 @@ fn generate_page_tables(
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add GPI init data for guest buffer pages
+    if let Some((dest, len)) = gpi_dest {
+        if !private_input.is_empty() {
+            let len_prefix = (private_input.len() as u32).to_le_bytes();
+            let all_bytes: Vec<u8> =
+                len_prefix.iter().chain(private_input.iter()).copied().collect();
+            for (i, &byte) in all_bytes[..len].iter().enumerate() {
+                let addr = dest + i as u64;
+                let pg_base = page::page_base_for_address(addr, page_size);
+                let offset = page::offset_in_page(addr, page_size);
+                let page_data = elf_page_data
+                    .entry(pg_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte;
             }
         }
     }
@@ -1614,6 +1680,9 @@ pub struct Traces {
 
     /// Committed public output bytes recovered during trace generation.
     pub public_output_bytes: Vec<u8>,
+
+    /// GetPrivateInputs destination address and byte count (if any).
+    pub gpi_dest: Option<(u64, usize)>,
 
     /// BRANCH target calculation traces (wrapped in Vec for uniform architecture)
     pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -1752,6 +1821,56 @@ impl Traces {
         configs
     }
 
+    /// Like `page_configs_from_elf_and_runtime` but also handles GetPrivateInputs
+    /// writes that need non-zero init data for guest buffer pages.
+    pub fn page_configs_from_elf_and_runtime_with_gpi(
+        elf: &Elf,
+        runtime_page_ranges: &[crate::RuntimePageRange],
+        private_input: &[u8],
+        gpi_dest: Option<(u64, usize)>,
+    ) -> Vec<PageConfig> {
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        let mut configs = Self::page_configs_from_elf(elf);
+
+        // Build GPI init data map (page_base → init bytes)
+        let mut gpi_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+        if let Some((dest, len)) = gpi_dest {
+            if !private_input.is_empty() {
+                let len_prefix = (private_input.len() as u32).to_le_bytes();
+                let all_bytes: Vec<u8> =
+                    len_prefix.iter().chain(private_input.iter()).copied().collect();
+                for (i, &byte) in all_bytes[..len].iter().enumerate() {
+                    let addr = dest + i as u64;
+                    let pg_base = page::page_base_for_address(addr, page_size);
+                    let offset = page::offset_in_page(addr, page_size);
+                    let data = gpi_page_data
+                        .entry(pg_base)
+                        .or_insert_with(|| vec![0u8; page_size]);
+                    data[offset] = byte;
+                }
+            }
+        }
+
+        // Add runtime pages, overriding with GPI init data where applicable
+        for r in runtime_page_ranges {
+            let (base, count) = (r.base, r.count);
+            for i in 0..count {
+                let pg_base = base + i * page_size as u64;
+                if let Some(init_data) = gpi_page_data.remove(&pg_base) {
+                    configs.push(PageConfig::with_data(pg_base, page_size, init_data));
+                } else {
+                    configs.push(PageConfig::zero_init(pg_base, page_size));
+                }
+            }
+        }
+        // Add any remaining GPI pages not covered by runtime ranges
+        for (pg_base, init_data) in gpi_page_data {
+            configs.push(PageConfig::with_data(pg_base, page_size, init_data));
+        }
+        configs.sort_by_key(|c| c.page_base);
+        configs
+    }
+
     /// Extracts runtime page ranges from the generated page configs.
     ///
     /// Returns run-length encoded `(base, count)` pairs for page bases not
@@ -1806,6 +1925,7 @@ impl Traces {
         elf: &Elf,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
     ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
@@ -1831,7 +1951,13 @@ impl Traces {
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state, private_input);
+
+        // Extract GPI dest info for page table generation
+        let gpi_dest_info: Option<(u64, usize)> = cpu_ops
+            .iter()
+            .find(|op| op.ecall_get_private_inputs)
+            .map(|op| (op.private_input_dest, op.private_input_len as usize));
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -1925,7 +2051,7 @@ impl Traces {
         // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
         bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state, private_input, gpi_dest_info));
 
         let public_output_bytes: Vec<u8> = commit_ops
             .iter()
@@ -2008,7 +2134,7 @@ impl Traces {
             let ((pages_val, register_val), halt_val) = rayon::join(
                 || {
                     rayon::join(
-                        || generate_page_tables(elf, &memory_state),
+                        || generate_page_tables(elf, &memory_state, private_input, gpi_dest_info),
                         || {
                             register::generate_register_trace(
                                 &register_final_state,
@@ -2027,7 +2153,7 @@ impl Traces {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
+            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state, private_input, gpi_dest_info);
             pages = pages_v;
             page_configs = page_configs_v;
             register_trace =
@@ -2050,6 +2176,10 @@ impl Traces {
             page_configs,
             register: register_trace,
             public_output_bytes,
+            gpi_dest: cpu_ops
+                .iter()
+                .find(|op| op.ecall_get_private_inputs)
+                .map(|op| (op.private_input_dest, op.private_input_len as usize)),
             branches,
             halt: halt_trace,
             commit: commit_trace,
@@ -2082,7 +2212,7 @@ impl Traces {
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state, &[]);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -2283,6 +2413,10 @@ impl Traces {
             page_configs,
             register: register_trace,
             public_output_bytes,
+            gpi_dest: cpu_ops
+                .iter()
+                .find(|op| op.ecall_get_private_inputs)
+                .map(|op| (op.private_input_dest, op.private_input_len as usize)),
             branches,
             halt: halt_trace,
             commit: commit_trace,
