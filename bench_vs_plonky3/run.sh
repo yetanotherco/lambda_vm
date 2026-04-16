@@ -344,11 +344,13 @@ for i in "${!RESULT_LOG_ROWS[@]}"; do
     rt="${RESULT_RATIO[$i]}"
     if $RUN_LAMBDA && $RUN_P3; then
         color=$GREEN
+        verdict="Lambda faster"
         if awk -v l="$lt" -v p="$pt" 'BEGIN{ exit !(l+0 > p+0) }'; then
             color=$RED
+            verdict="P3 faster"
         fi
-        printf "  %-9s  %-12s  %13ss  %13ss  ${color}%9sx${NC}\n" \
-            "$lr" "$rows" "$lt" "$pt" "$rt"
+        printf "  %-9s  %-12s  %13ss  %13ss  ${color}%9sx${NC}  (${color}%s${NC})\n" \
+            "$lr" "$rows" "$lt" "$pt" "$rt" "$verdict"
     elif $RUN_LAMBDA; then
         printf "  %-9s  %-12s  %13ss\n" "$lr" "$rows" "$lt"
     else
@@ -358,7 +360,8 @@ done
 
 echo ""
 if $RUN_LAMBDA && $RUN_P3; then
-    echo -e "Timing window: single-shot end-to-end prove. Ratio < 1 → Lambda faster."
+    echo -e "Timing window: single-shot end-to-end prove."
+    echo -e "Ratio = Lambda / P3. ratio > 1 → P3 faster (Lambda took ratio× longer); ratio < 1 → Lambda faster."
 fi
 if $NO_P3_PATCH; then
     echo -e "${YELLOW}Note:${NC} Plonky3 was built without the degree-3 patch; Challenge type is degree-2."
@@ -368,6 +371,16 @@ fi
 # --- Machine-readable report ------------------------------------------------
 
 if [ -n "$REPORT_DIR" ]; then
+    # Slash-joined helpers for metrics.txt (mirrors the format used by
+    # bench_vs/run.sh).
+    join_slash() {
+        local joined=""
+        for value in "$@"; do
+            joined="${joined:+$joined/}$value"
+        done
+        printf "%s\n" "$joined"
+    }
+
     {
         printf "log_rows\trows\tlambda_median_s\tp3_median_s\tratio_lambda_over_p3\truns\n"
         for i in "${!RESULT_LOG_ROWS[@]}"; do
@@ -382,29 +395,23 @@ if [ -n "$REPORT_DIR" ]; then
     } > "$REPORT_DIR/results.tsv"
 
     {
-        echo "# Lambda STARK vs Plonky3 Benchmark"
-        echo
-        echo "Timing window: \`single-shot end-to-end prove\` (no verification)."
-        echo "num-sequences: \`$NUM_SEQUENCES\`, columns: \`$((2 * NUM_SEQUENCES))\`, blowup: 2, fri_queries: 219, grinding: 0."
-        echo "runs per size: \`$RUNS\` (median reported)."
-        echo "arch: \`$(uname -m)\`, scalar mode: \`$($SCALAR && echo on || echo off)\`."
+        echo "arch=$(uname -m)"
+        echo "num_sequences=$NUM_SEQUENCES"
+        echo "columns=$((2 * NUM_SEQUENCES))"
+        echo "blowup=2"
+        echo "fri_queries=219"
+        echo "grinding=0"
+        echo "runs_per_size=$RUNS"
+        echo "p3_extension=$($NO_P3_PATCH && echo 'degree2_vanilla' || echo 'degree3_patched')"
+        echo "scalar=$($SCALAR && echo on || echo off)"
         if $SCALAR && [ -n "$SCALAR_RUSTFLAGS" ]; then
-            echo "RUSTFLAGS: \`$SCALAR_RUSTFLAGS\`."
+            echo "rustflags=$SCALAR_RUSTFLAGS"
         fi
-        if $NO_P3_PATCH; then
-            echo
-            echo "> Plonky3 built without the vendored degree-3 patch: Challenge type is degree-2 (vanilla crates.io p3-goldilocks 0.5.2). Lambda still uses degree 3."
-        fi
-        echo
-        echo "| log-rows | rows | Lambda (s) | P3 (s) | Lambda / P3 |"
-        echo "|---------:|-----:|-----------:|-------:|------------:|"
-        for i in "${!RESULT_LOG_ROWS[@]}"; do
-            printf "| %s | %s | %s | %s | %s |\n" \
-                "${RESULT_LOG_ROWS[$i]}" \
-                "${RESULT_ROWS[$i]}" \
-                "${RESULT_LAMBDA[$i]}" \
-                "${RESULT_P3[$i]}" \
-                "${RESULT_RATIO[$i]}"
-        done
-    } > "$REPORT_DIR/summary.md"
+        echo "timing_window=single_shot_end_to_end_prove_no_verify"
+        echo "log_rows_series=$(join_slash "${RESULT_LOG_ROWS[@]}")"
+        echo "rows_series=$(join_slash "${RESULT_ROWS[@]}")"
+        echo "lambda_medians=$(join_slash "${RESULT_LAMBDA[@]}")"
+        echo "p3_medians=$(join_slash "${RESULT_P3[@]}")"
+        echo "ratios_lambda_over_p3=$(join_slash "${RESULT_RATIO[@]}")"
+    } > "$REPORT_DIR/metrics.txt"
 fi

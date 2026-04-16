@@ -46,6 +46,3 @@ jobs:
           name: bench-vs-p3-nightly-${{ github.run_number }}-${{ github.sha }}
           path: bench_vs_p3_artifacts
           retention-days: 90
-
-      - name: Publish summary
-        run: cat bench_vs_p3_artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
