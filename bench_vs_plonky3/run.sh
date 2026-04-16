@@ -303,13 +303,13 @@ for lr in "${LOG_ROWS[@]}"; do
     if $RUN_LAMBDA; then
         echo -ne "  ${GREEN}[lambda]${NC} "
         lambda_median=$(run_prover lambda "$lr")
-        echo "median ${BOLD}${lambda_median}s${NC} from $RUNS runs: $(paste -sd, "$TMP_DIR/lambda_${lr}.times")"
+        echo -e "median ${BOLD}${lambda_median}s${NC} from $RUNS runs: $(paste -sd, "$TMP_DIR/lambda_${lr}.times")"
     fi
 
     if $RUN_P3; then
         echo -ne "  ${GREEN}[p3]${NC}     "
         p3_median=$(run_prover p3 "$lr")
-        echo "median ${BOLD}${p3_median}s${NC} from $RUNS runs: $(paste -sd, "$TMP_DIR/p3_${lr}.times")"
+        echo -e "median ${BOLD}${p3_median}s${NC} from $RUNS runs: $(paste -sd, "$TMP_DIR/p3_${lr}.times")"
     fi
 
     local_ratio="n/a"
@@ -361,7 +361,6 @@ done
 echo ""
 if $RUN_LAMBDA && $RUN_P3; then
     echo -e "Timing window: single-shot end-to-end prove."
-    echo -e "Ratio = Lambda / P3. ratio > 1 → P3 faster (Lambda took ratio× longer); ratio < 1 → Lambda faster."
 fi
 if $NO_P3_PATCH; then
     echo -e "${YELLOW}Note:${NC} Plonky3 was built without the degree-3 patch; Challenge type is degree-2."
