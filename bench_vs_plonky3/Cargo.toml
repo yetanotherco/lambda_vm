@@ -23,6 +23,10 @@ p3-fri = "0.5.2"
 p3-uni-stark = { version = "0.5.2", features = ["parallel"] }
 p3-dft = { version = "0.5.2", features = ["parallel"] }
 
+# Tracing for P3 span-based profiling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false }
 
@@ -33,6 +37,7 @@ criterion = { version = "0.4", default-features = false }
 # single-threaded.
 default = ["parallel"]
 parallel = ["stark/parallel"]
+instruments = ["stark/instruments"]
 
 [[bench]]
 name = "stark_comparison"
