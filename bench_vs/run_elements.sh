@@ -88,6 +88,14 @@ extract_elements() {
     }'
 }
 
+extract_aux_elements() {
+    sed -nE '/Aux elements: [0-9]+/ {
+        s/.*Aux elements: ([0-9]+).*/\1/
+        p
+        q
+    }'
+}
+
 # Format Lambda/SP1 ratio as +3.6x (Lambda bigger) or -0.21x (Lambda smaller).
 format_ratio() {
     local num=$1 den=$2
@@ -170,8 +178,10 @@ echo ""
 # --- Results arrays ---------------------------------------------------------
 RESULT_N=()
 RESULT_LAMBDA=()
+RESULT_LAMBDA_AUX=()
 RESULT_SP1_V6=()
 RESULT_SP1_V5=()
+RESULT_SP1_V5_AUX=()
 
 for n in "${SERIES[@]}"; do
     echo -e "${BOLD}--- n = $n iterations ---${NC}"
@@ -182,12 +192,18 @@ for n in "${SERIES[@]}"; do
     echo -e "  ${GREEN}[Lambda VM] Counting elements...${NC}"
     lambda_out=$("$CLI" count-elements "$LAMBDA_ELF" --private-input "$input_file" 2>/dev/null)
     lambda_elems=$(printf "%s\n" "$lambda_out" | extract_elements)
+    lambda_aux=$(printf "%s\n" "$lambda_out" | extract_aux_elements)
     if [ -z "$lambda_elems" ]; then
         echo -e "  ${RED}[Lambda VM] FAILED to parse element count${NC}"
         echo "$lambda_out"
         lambda_elems="n/a"
     else
-        echo -e "  Lambda VM: ${BOLD}${lambda_elems}${NC} elements"
+        echo -e "  Lambda VM: ${BOLD}${lambda_elems}${NC} main elements"
+    fi
+    if [ -z "$lambda_aux" ]; then
+        lambda_aux="n/a"
+    else
+        echo -e "  Lambda VM: ${BOLD}${lambda_aux}${NC} aux elements"
     fi
 
     # SP1 v6 — prove and extract element count
@@ -212,27 +228,36 @@ for n in "${SERIES[@]}"; do
     sp1v5_out_file="$TMP_DIR/sp1v5_${n}.out"
     if "$SP1_V5_BIN" "$SP1_V5_GUEST_ELF" "$n" > "$sp1v5_out_file" 2>&1; then
         sp1v5_elems=$(extract_elements < "$sp1v5_out_file")
+        sp1v5_aux=$(extract_aux_elements < "$sp1v5_out_file")
         if [ -z "$sp1v5_elems" ]; then
             echo -e "  ${RED}[SP1 v5] FAILED to parse element count${NC}"
             sp1v5_elems="n/a"
         else
-            echo -e "  SP1 v5:    ${BOLD}${sp1v5_elems}${NC} elements"
+            echo -e "  SP1 v5:    ${BOLD}${sp1v5_elems}${NC} main elements"
+        fi
+        if [ -z "$sp1v5_aux" ]; then
+            sp1v5_aux="n/a"
+        else
+            echo -e "  SP1 v5:    ${BOLD}${sp1v5_aux}${NC} aux elements"
         fi
     else
         echo -e "  ${RED}[SP1 v5] FAILED${NC}"
         cat "$sp1v5_out_file"
         sp1v5_elems="n/a"
+        sp1v5_aux="n/a"
     fi
 
     RESULT_N+=("$n")
     RESULT_LAMBDA+=("$lambda_elems")
+    RESULT_LAMBDA_AUX+=("$lambda_aux")
     RESULT_SP1_V6+=("$sp1v6_elems")
     RESULT_SP1_V5+=("$sp1v5_elems")
+    RESULT_SP1_V5_AUX+=("$sp1v5_aux")
     echo ""
 done
 
 # --- Summary table ----------------------------------------------------------
-echo -e "${BOLD}=== Summary: Main-Trace Field Elements (rows × cols, all tables) ===${NC}"
+echo -e "${BOLD}=== Summary: Main-Trace Field Elements (base field, rows × cols) ===${NC}"
 echo -e "  Program : Fibonacci (u64 wrapping)"
 echo -e "  Metric  : sum of padded_rows × num_columns across all AIR tables"
 echo -e "  Fields  : Lambda VM = Goldilocks 64-bit | SP1 = BabyBear 32-bit"
@@ -259,5 +284,31 @@ done
 echo ""
 echo -e "  +Nx = Lambda has N× more elements than SP1"
 echo -e "  -Nx = Lambda has N× fewer elements than SP1"
+echo ""
+
+# --- Auxiliary elements table -----------------------------------------------
+echo -e "${BOLD}=== Summary: Aux-Trace Field Elements (extension field, bus interactions) ===${NC}"
+echo -e "  Metric  : sum of padded_rows × num_bus_interactions across all AIR tables"
+echo -e "  Fields  : Lambda VM = Goldilocks cubic EF | SP1 v5 = BabyBear degree-4 EF"
+echo -e "  Note    : SP1 v6 has no committed interaction columns (GKR-based bus)"
+echo ""
+
+printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_R}s\n" \
+    "Fibonacci n" "Lambda VM" "SP1 v5" "vs SP1 v5"
+printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_R}s\n" \
+    "-------------" "------------------" "------------------" "-----------"
+
+for i in "${!RESULT_N[@]}"; do
+    lam_aux="${RESULT_LAMBDA_AUX[$i]}"
+    v5_aux="${RESULT_SP1_V5_AUX[$i]}"
+    printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_R}s\n" \
+        "$(fmt_num "${RESULT_N[$i]}")" \
+        "$(fmt_num "$lam_aux")" \
+        "$(fmt_num "$v5_aux")" \
+        "$(format_ratio "$lam_aux" "$v5_aux")"
+done
+echo ""
+echo -e "  +Nx = Lambda has N× more aux elements than SP1 v5"
+echo -e "  -Nx = Lambda has N× fewer aux elements than SP1 v5"
 echo ""
 echo "Raw outputs in $TMP_DIR/"

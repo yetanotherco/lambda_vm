@@ -1706,6 +1706,78 @@ impl Traces {
         total
     }
 
+    /// Returns the total number of auxiliary-trace field elements (extension field)
+    /// across all tables.
+    ///
+    /// The LogUp layout packs N bus interactions into ⌈N/2⌉ EF columns
+    /// (`num_committed_pairs + 1` accumulated column). Each EF column costs one
+    /// extension-field element per row.
+    pub fn total_auxiliary_field_elements(&self) -> u64 {
+        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
+        let n_lt = aux_cols(super::lt::bus_interactions().len());
+        let n_shift = aux_cols(super::shift::bus_interactions().len());
+        let n_memw = aux_cols(super::memw::bus_interactions().len());
+        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
+        let n_load = aux_cols(super::load::bus_interactions().len());
+        let n_decode = aux_cols(super::decode::bus_interactions().len());
+        let n_mul = aux_cols(super::mul::bus_interactions().len());
+        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
+        let n_branch = aux_cols(super::branch::bus_interactions().len());
+        let n_halt = aux_cols(super::halt::bus_interactions().len());
+        let n_commit = aux_cols(super::commit::bus_interactions().len());
+        let n_register = aux_cols(super::register::bus_interactions().len());
+        // page::bus_interactions count is constant regardless of page_base.
+        let n_page = aux_cols(super::page::bus_interactions(0).len());
+        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
+
+        let mut total: u64 = 0;
+        for t in &self.cpus {
+            total += (t.num_rows() * n_cpu) as u64;
+        }
+        total += (self.bitwise.num_rows() * n_bitwise) as u64;
+        for t in &self.lts {
+            total += (t.num_rows() * n_lt) as u64;
+        }
+        for t in &self.shifts {
+            total += (t.num_rows() * n_shift) as u64;
+        }
+        for t in &self.memws {
+            total += (t.num_rows() * n_memw) as u64;
+        }
+        for t in &self.memw_aligneds {
+            total += (t.num_rows() * n_memw_a) as u64;
+        }
+        for t in &self.loads {
+            total += (t.num_rows() * n_load) as u64;
+        }
+        total += (self.decode.num_rows() * n_decode) as u64;
+        for t in &self.muls {
+            total += (t.num_rows() * n_mul) as u64;
+        }
+        for t in &self.dvrms {
+            total += (t.num_rows() * n_dvrm) as u64;
+        }
+        for t in &self.branches {
+            total += (t.num_rows() * n_branch) as u64;
+        }
+        total += (self.halt.num_rows() * n_halt) as u64;
+        total += (self.commit.num_rows() * n_commit) as u64;
+        total += (self.register.num_rows() * n_register) as u64;
+        for t in &self.pages {
+            total += (t.num_rows() * n_page) as u64;
+        }
+        for t in &self.memw_registers {
+            total += (t.num_rows() * n_memw_r) as u64;
+        }
+        total
+    }
+
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
         crate::TableCounts {

@@ -364,7 +364,7 @@ fn cmd_prove(
     // Pre-pass: build traces and count field elements without running the proof.
     let element_count = if elements {
         match prover::count_elements(&elf_data, &private_inputs) {
-            Ok(n) => Some(n),
+            Ok(counts) => Some(counts),
             Err(e) => {
                 eprintln!("Failed to count elements: {:?}", e);
                 return ExitCode::FAILURE;
@@ -439,8 +439,9 @@ fn cmd_prove(
     if let Some(c) = cycle_count {
         println!("Cycles: {}", c);
     }
-    if let Some(e) = element_count {
-        println!("Elements: {}", e);
+    if let Some((main, aux)) = element_count {
+        println!("Elements: {}", main);
+        println!("Aux elements: {}", aux);
     }
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
@@ -534,8 +535,9 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
     };
 
     match prover::count_elements(&elf_data, &private_inputs) {
-        Ok(n) => {
-            println!("Elements: {}", n);
+        Ok((main, aux)) => {
+            println!("Elements: {}", main);
+            println!("Aux elements: {}", aux);
             ExitCode::SUCCESS
         }
         Err(e) => {

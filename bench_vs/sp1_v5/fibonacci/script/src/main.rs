@@ -25,7 +25,11 @@ fn main() {
     // Timed window: setup + core proof only.
     let start = Instant::now();
     let (pk, _vk) = client.setup(&elf);
-    let proof = client.prove(&pk, &stdin).core().run().expect("prove failed");
+    let proof = client
+        .prove(&pk, &stdin)
+        .core()
+        .run()
+        .expect("prove failed");
     let elapsed = start.elapsed();
 
     println!("Proving time: {:.3}s", elapsed.as_secs_f64());
@@ -51,4 +55,26 @@ fn main() {
         _ => 0,
     };
     println!("Elements: {}", total_elements);
+
+    // Count auxiliary (permutation/interaction) field elements.
+    // For each chip: rows = 1 << log_degree, aux_cols = permutation.local.len().
+    // These are extension-field columns used for bus argument (LogUp/permutation).
+    let aux_elements: usize = match &proof.proof {
+        SP1Proof::Core(shards) => shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .chip_ordering
+                    .values()
+                    .map(|&idx| {
+                        let chip = &shard.opened_values.chips[idx];
+                        let rows = 1usize << chip.log_degree;
+                        chip.permutation.local.len() * rows
+                    })
+                    .sum::<usize>()
+            })
+            .sum(),
+        _ => 0,
+    };
+    println!("Aux elements: {}", aux_elements);
 }
