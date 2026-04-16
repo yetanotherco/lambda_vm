@@ -127,12 +127,22 @@ fi
 # p3-goldilocks-patched (adds BinomiallyExtendable<3>, disables NEON). For the
 # nightly we build against vanilla crates.io p3-goldilocks — we comment the
 # block out and drop the `p3-degree3` feature.
+#
+# Both Cargo.toml AND Cargo.lock are backed up before the build: dropping the
+# patch makes cargo re-resolve p3-goldilocks against crates.io, which rewrites
+# Cargo.lock. The trap restores both so the working tree is clean on exit.
 CARGO_TOML="$ROOT_DIR/Cargo.toml"
+CARGO_LOCK="$ROOT_DIR/Cargo.lock"
 CARGO_TOML_BAK=""
+CARGO_LOCK_BAK=""
 BUILD_FEATURE_FLAGS=()
 if $NO_P3_PATCH; then
     CARGO_TOML_BAK="$CARGO_TOML.bak.p3bench.$$"
     cp "$CARGO_TOML" "$CARGO_TOML_BAK"
+    if [ -f "$CARGO_LOCK" ]; then
+        CARGO_LOCK_BAK="$CARGO_LOCK.bak.p3bench.$$"
+        cp "$CARGO_LOCK" "$CARGO_LOCK_BAK"
+    fi
     # Comment the [patch.crates-io] block and its entries (until the next blank
     # line or next [section]).
     python3 - "$CARGO_TOML" <<'PY'
@@ -161,7 +171,7 @@ for ln in lines:
         out.append(ln)
 path.write_text("".join(out))
 PY
-    trap 'if [ -n "$CARGO_TOML_BAK" ] && [ -f "$CARGO_TOML_BAK" ]; then mv "$CARGO_TOML_BAK" "$CARGO_TOML"; fi' EXIT INT TERM
+    trap 'if [ -n "$CARGO_TOML_BAK" ] && [ -f "$CARGO_TOML_BAK" ]; then mv "$CARGO_TOML_BAK" "$CARGO_TOML"; fi; if [ -n "$CARGO_LOCK_BAK" ] && [ -f "$CARGO_LOCK_BAK" ]; then mv "$CARGO_LOCK_BAK" "$CARGO_LOCK"; fi' EXIT INT TERM
     BUILD_FEATURE_FLAGS=(--no-default-features --features parallel)
 fi
 
@@ -219,7 +229,13 @@ cargo build --release -p bench-vs-plonky3 --bin prove_bench \
     --manifest-path "$ROOT_DIR/Cargo.toml" \
     ${BUILD_FEATURE_FLAGS[@]+"${BUILD_FEATURE_FLAGS[@]}"} 2>&1 | tail -5
 
-BIN="$ROOT_DIR/target/release/prove_bench"
+# Resolve the actual target directory via cargo metadata so we find the binary
+# whether cargo used ./target/ (default) or a custom CARGO_TARGET_DIR.
+TARGET_DIR=$(cargo metadata --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' \
+    2>/dev/null || echo "$ROOT_DIR/target")
+BIN="$TARGET_DIR/release/prove_bench"
 if [ ! -x "$BIN" ]; then
     echo -e "${RED}[build] prove_bench not produced at $BIN${NC}"
     exit 1
@@ -393,7 +409,18 @@ if [ -n "$REPORT_DIR" ]; then
         done
     } > "$REPORT_DIR/results.tsv"
 
+    # Capture commit + timestamp so the artifact is self-describing.
+    git_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    git_dirty="clean"
+    if ! git -C "$ROOT_DIR" diff --quiet HEAD -- 2>/dev/null; then
+        git_dirty="dirty"
+    fi
+    timestamp_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
     {
+        echo "timestamp_utc=$timestamp_utc"
+        echo "git_sha=$git_sha"
+        echo "git_tree=$git_dirty"
         echo "arch=$(uname -m)"
         echo "num_sequences=$NUM_SEQUENCES"
         echo "columns=$((2 * NUM_SEQUENCES))"
