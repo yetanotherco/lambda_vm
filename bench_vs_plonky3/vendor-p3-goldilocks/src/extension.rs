@@ -35,6 +35,32 @@ impl HasTwoAdicBinomialExtension<2> for Goldilocks {
     }
 }
 
+impl BinomiallyExtendableAlgebra<Self, 3> for Goldilocks {}
+
+impl BinomiallyExtendable<3> for Goldilocks {
+    // Verifiable in Sage with
+    // `R.<x> = GF(p)[]; assert (x^3 - 2).is_irreducible()`.
+    // Same irreducible as Lambda's Degree3GoldilocksExtensionField.
+    const W: Self = Self::new(2);
+
+    // DTH_ROOT = primitive 3rd root of unity = 7^((p-1)/3) mod p.
+    const DTH_ROOT: Self = Self::new(18446744065119617025);
+
+    // Generator of GF(p^3)* = 5 + w. Verified: passes order checks for
+    // all small prime factors of p^3 - 1.
+    const EXT_GENERATOR: [Self; 3] = [Self::new(5), Self::ONE, Self::ZERO];
+}
+
+impl HasTwoAdicBinomialExtension<3> for Goldilocks {
+    // v_2(p^3 - 1) = v_2(p-1) + v_2(p^2+p+1) = 32 + 0 = 32.
+    const EXT_TWO_ADICITY: usize = 32;
+
+    fn ext_two_adic_generator(bits: usize) -> [Self; 3] {
+        assert!(bits <= 32);
+        field_to_array(Self::two_adic_generator(bits))
+    }
+}
+
 impl BinomiallyExtendableAlgebra<Self, 5> for Goldilocks {}
 
 impl BinomiallyExtendable<5> for Goldilocks {

@@ -27,12 +27,13 @@ const NUM_SEQUENCES: usize = 16;
 const ROWS: usize = 1 << 18;
 const TRACE_LABEL: &str = "fib_pair_16seq_2^18";
 
-/// Proof options matching Lambda's `profile_prover.rs`:
-/// blowup=4, 100 queries, no grinding — production-like settings.
+/// Production proof options: blowup=2, 219 queries (from
+/// `GoldilocksCubicProofOptions::with_blowup(2)`), grinding=0 (excluded
+/// from benchmark — identical PoW work on both sides, not informative).
 fn benchmark_proof_options() -> ProofOptions {
     ProofOptions {
-        blowup_factor: 4,
-        fri_number_of_queries: 100,
+        blowup_factor: 2,
+        fri_number_of_queries: 219,
         coset_offset: 3,
         grinding_factor: 0,
     }

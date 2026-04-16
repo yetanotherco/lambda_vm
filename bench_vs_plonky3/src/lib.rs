@@ -22,8 +22,8 @@ mod tests {
 
     fn benchmark_proof_options() -> ProofOptions {
         ProofOptions {
-            blowup_factor: 4,
-            fri_number_of_queries: 100,
+            blowup_factor: 2,
+            fri_number_of_queries: 219,
             coset_offset: 3,
             grinding_factor: 0,
         }

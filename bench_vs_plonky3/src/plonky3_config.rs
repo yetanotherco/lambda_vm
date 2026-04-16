@@ -10,7 +10,9 @@ use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, Serializing
 use p3_uni_stark::StarkConfig;
 
 pub type Val = Goldilocks;
-pub type Challenge = BinomialExtensionField<Val, 2>;
+/// Degree-3 cubic extension, same as Lambda's `Degree3GoldilocksExtensionField`.
+/// Irreducible: x^3 - 2 (W = 2). Implemented in vendor-p3-goldilocks.
+pub type Challenge = BinomialExtensionField<Val, 3>;
 
 type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
@@ -42,18 +44,20 @@ fn build_mmcs() -> (ValMmcs, ChallengeMmcs, ByteHash) {
 }
 
 /// Creates a Plonky3 STARK config with parameters matched to Lambda's
-/// `profile_prover.rs`: blowup=4, 100 FRI queries, no grinding.
+/// production config `GoldilocksCubicProofOptions::with_blowup(2)`:
+/// blowup=2, 219 FRI queries, grinding=0 (excluded from benchmark).
 pub fn matched_params_config() -> P3Config {
     let (val_mmcs, challenge_mmcs, byte_hash) = build_mmcs();
     let dft = Dft::default();
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
-    // Match Lambda's profile_prover: blowup=4, queries=100, grinding=0.
+    // Match Lambda production: blowup=2, queries=219, grinding=0.
+    // Grinding excluded from benchmark (identical PoW on both sides).
     let fri_params = FriParameters {
-        log_blowup: 2, // blowup = 4
+        log_blowup: 1, // blowup = 2
         log_final_poly_len: 0,
         max_log_arity: 1,
-        num_queries: 100,
+        num_queries: 219,
         commit_proof_of_work_bits: 0,
         query_proof_of_work_bits: 0,
         mmcs: challenge_mmcs,
