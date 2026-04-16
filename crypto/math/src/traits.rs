@@ -32,6 +32,18 @@ pub trait AsBytes {
     fn as_bytes(&self) -> alloc::vec::Vec<u8>;
 }
 
+/// Zero-allocation byte serialization for Merkle tree hashing.
+///
+/// Unlike `AsBytes::as_bytes()` which returns `Vec<u8>` (heap allocation per call),
+/// this trait writes bytes directly into a caller-provided buffer. For Merkle trees
+/// with millions of field elements, this eliminates millions of 8-byte allocations.
+pub trait WriteBytes {
+    /// Byte length of this element's big-endian representation.
+    const BYTE_LEN: usize;
+    /// Write big-endian bytes into `buf[..BYTE_LEN]`.
+    fn write_bytes_be(&self, buf: &mut [u8]);
+}
+
 #[cfg(feature = "alloc")]
 impl AsBytes for u32 {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {

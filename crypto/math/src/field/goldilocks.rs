@@ -482,6 +482,14 @@ impl AsBytes for FieldElement<GoldilocksField> {
     }
 }
 
+impl crate::traits::WriteBytes for FieldElement<GoldilocksField> {
+    const BYTE_LEN: usize = 8;
+    #[inline(always)]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        buf[..8].copy_from_slice(&self.canonical_u64().to_be_bytes());
+    }
+}
+
 // Implement IsPrimeField for the native Goldilocks
 use crate::errors::CreationError;
 use crate::field::traits::IsPrimeField;

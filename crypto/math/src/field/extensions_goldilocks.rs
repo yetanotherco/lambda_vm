@@ -524,6 +524,17 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     }
 }
 
+impl crate::traits::WriteBytes for FieldElement<Degree3GoldilocksExtensionField> {
+    const BYTE_LEN: usize = 24; // 3 × 8 bytes
+    #[inline(always)]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        let components = self.value();
+        components[0].write_bytes_be(&mut buf[0..8]);
+        components[1].write_bytes_be(&mut buf[8..16]);
+        components[2].write_bytes_be(&mut buf[16..24]);
+    }
+}
+
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
     fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
         let mut sample = [0u8; 8];

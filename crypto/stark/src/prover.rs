@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
@@ -32,7 +31,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -63,6 +62,9 @@ impl<
     FieldExtension: Send + Sync + IsField,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
+where
+    FieldElement<Field>: math::traits::WriteBytes,
+    FieldElement<FieldExtension>: math::traits::WriteBytes,
 {
 }
 
@@ -352,7 +354,9 @@ pub trait IsStarkProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
->
+> where
+    FieldElement<Field>: math::traits::WriteBytes,
+    FieldElement<FieldExtension>: math::traits::WriteBytes,
 {
     /// Returns the Merkle tree and the commitment to the vectors `vectors`.
     fn batch_commit_extension(
@@ -379,28 +383,39 @@ pub trait IsStarkProver<
         columns: &[Vec<FieldElement<E>>],
     ) -> Option<(BatchedMerkleTree<E>, Commitment)>
     where
-        FieldElement<E>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::WriteBytes,
         E: IsField,
     {
+        use math::traits::WriteBytes;
+        use sha3::Digest;
+
         if columns.is_empty() || columns[0].is_empty() {
             return None;
         }
 
         let num_rows = columns[0].len();
         let num_cols = columns.len();
+        let byte_len = <FieldElement<E> as WriteBytes>::BYTE_LEN;
 
         #[cfg(feature = "parallel")]
         let iter = (0..num_rows).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
+        // Zero per-element heap allocations: write bytes directly from columns
+        // into a per-row buffer, then hash once.
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+                let total_bytes = num_cols * byte_len;
+                let mut buf = vec![0u8; total_bytes];
+                for col_idx in 0..num_cols {
+                    columns[col_idx][br_idx]
+                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                }
+                let mut hasher = sha3::Keccak256::new();
+                hasher.update(&buf);
+                hasher.finalize().into()
             })
             .collect();
 
@@ -690,8 +705,11 @@ pub trait IsStarkProver<
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::WriteBytes,
     {
+        use math::traits::WriteBytes;
+        use sha3::Digest;
+
         let num_parts = lde_composition_poly_parts_evaluations.len();
         if num_parts == 0 {
             return None;
@@ -704,16 +722,13 @@ pub trait IsStarkProver<
         let num_leaves = num_rows / 2;
         debug_assert!(
             num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index to be correct"
-        );
-        debug_assert!(
-            num_rows.is_power_of_two(),
             "num_rows must be a power of two for reverse_index"
         );
 
-        // Skip the transpose + merge by computing leaf data inline.
+        let byte_len = <FieldElement<FieldExtension> as WriteBytes>::BYTE_LEN;
+
+        // Zero per-element allocations: write bytes directly from column data.
         // Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
-        // Build the merged leaf data and hash in one pass.
         #[cfg(feature = "parallel")]
         let iter = (0..num_leaves).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -723,14 +738,20 @@ pub trait IsStarkProver<
             .map(|leaf_idx| {
                 let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
                 let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                let mut leaf = Vec::with_capacity(2 * num_parts);
+                let total_bytes = 2 * num_parts * byte_len;
+                let mut buf = vec![0u8; total_bytes];
+                let mut offset = 0;
                 for part in lde_composition_poly_parts_evaluations.iter() {
-                    leaf.push(part[br_0].clone());
+                    part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+                    offset += byte_len;
                 }
                 for part in lde_composition_poly_parts_evaluations.iter() {
-                    leaf.push(part[br_1].clone());
+                    part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+                    offset += byte_len;
                 }
-                BatchedMerkleTreeBackend::<FieldExtension>::hash_data(&leaf)
+                let mut hasher = sha3::Keccak256::new();
+                hasher.update(&buf);
+                hasher.finalize().into()
             })
             .collect();
 
