@@ -492,6 +492,19 @@ pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmPr
     )
 }
 
+/// Count the total number of main-trace field elements (sum of rows × columns for
+/// every table) without running the STARK proof step.
+pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<u64, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let traces = Traces::from_elf_and_logs(&program, &result.logs, &MaxRowsConfig::default())?;
+    Ok(traces.total_field_elements())
+}
+
 /// Prove an ELF binary execution with custom proof options and max rows config.
 pub fn prove_with_options(
     elf_bytes: &[u8],

@@ -135,6 +135,10 @@ enum Commands {
         /// Execute one pre-pass outside the timer and print dynamic instruction count
         #[arg(long)]
         cycles: bool,
+
+        /// Build traces and print total main-trace field elements (rows × columns summed across all tables)
+        #[arg(long)]
+        elements: bool,
     },
 
     /// Verify a proof bundle
@@ -155,6 +159,17 @@ enum Commands {
         #[arg(long)]
         time: bool,
     },
+
+    /// Count main-trace field elements (rows × columns, summed across all tables) without proving
+    CountElements {
+        /// Path to the ELF file
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -173,13 +188,15 @@ fn main() -> ExitCode {
             blowup,
             time,
             cycles,
-        } => cmd_prove(elf, output, private_input, blowup, time, cycles),
+            elements,
+        } => cmd_prove(elf, output, private_input, blowup, time, cycles, elements),
         Commands::Verify {
             proof,
             elf,
             blowup,
             time,
         } => cmd_verify(proof, elf, blowup, time),
+        Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
 
@@ -296,6 +313,7 @@ fn cmd_prove(
     blowup: Option<u8>,
     time: bool,
     cycles: bool,
+    elements: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -336,6 +354,19 @@ fn cmd_prove(
             Ok(result) => Some(result.logs.len() as u64),
             Err(e) => {
                 eprintln!("Execution failed during cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Pre-pass: build traces and count field elements without running the proof.
+    let element_count = if elements {
+        match prover::count_elements(&elf_data, &private_inputs) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("Failed to count elements: {:?}", e);
                 return ExitCode::FAILURE;
             }
         }
@@ -408,6 +439,9 @@ fn cmd_prove(
     if let Some(c) = cycle_count {
         println!("Cycles: {}", c);
     }
+    if let Some(e) = element_count {
+        println!("Elements: {}", e);
+    }
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
     }
@@ -479,5 +513,34 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
     } else {
         eprintln!("Verification failed!");
         ExitCode::FAILURE
+    }
+}
+
+fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) -> ExitCode {
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match prover::count_elements(&elf_data, &private_inputs) {
+        Ok(n) => {
+            println!("Elements: {}", n);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Failed to count elements: {:?}", e);
+            ExitCode::FAILURE
+        }
     }
 }
