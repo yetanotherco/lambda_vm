@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn instruments_breakdown() {
         let num_sequences = 16;
-        let rows = 1 << 18;
+        let rows = 1 << 19;
         let proof_options = benchmark_proof_options();
 
         let initial_values: Vec<(FE, FE)> = (0..num_sequences)

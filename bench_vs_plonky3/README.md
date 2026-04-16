@@ -134,6 +134,48 @@ bash ./bench_vs_plonky3/run.sh \
 The `bench_vs_p3_artifacts/` directory is uploaded as an artifact named
 `bench-vs-p3-nightly-<run_number>-<sha>` with 90-day retention.
 
+## Breakdown (per-phase timing) for manual analysis
+
+The nightly only reports wall-clock totals. When you need to see *where* the
+time goes (constraint eval vs FFT vs FRI vs Merkle vs queries on the Lambda
+side, and the per-span breakdown on the Plonky3 side), run the
+`instruments_breakdown` test:
+
+```bash
+# x86_64 (server), Goldilocks scalar:
+RUSTFLAGS="-C target-feature=-avx2,-avx512f" \
+cargo test -p bench-vs-plonky3 --features instruments --release -- \
+  instruments_breakdown --nocapture
+
+# aarch64 (M1), 100% scalar:
+RUSTFLAGS="-C target-feature=-sha3" \
+cargo test -p bench-vs-plonky3 --features instruments --release -- \
+  instruments_breakdown --nocapture
+```
+
+- `--features instruments` activates `stark/instruments` — without it, the
+  per-phase timers are no-ops and the Lambda breakdown prints zeros.
+- `--release` is mandatory (debug numbers are meaningless).
+- `--nocapture` is required to see the output (`cargo test` swallows stdout
+  otherwise).
+- The test hardcodes `num_sequences = 16`, `rows = 1 << 19` (524 288), same
+  shape as the nightly, so the breakdown maps onto the nightly numbers.
+- Output is split in two sections:
+  - **Lambda**: explicit per-phase totals (Pre-pass / R1 Main commits / R1 Aux
+    build+commit / Rounds 2-4) plus sub-ops (Main LDE, Main Merkle, constraint
+    eval, decompose+extend, composition Merkle, OOD, deep comp, deep extend,
+    FRI commit, queries+open).
+  - **Plonky3**: every `tracing` span emitted at DEBUG during
+    `p3_uni_stark::prove`, sorted by wall-clock descending, filtered ≥ 0.1 ms.
+    Spans nest (e.g. `prove ⊃ compute_quotient_values`), so Σspans > total is
+    expected and not a bug. `(unaccounted)` can be negative from nesting.
+
+Details of every timer (which method it wraps, where it lives) are in
+[`INSTRUMENTATION.md`](INSTRUMENTATION.md).
+
+The nightly does **not** activate this path — it would add ~1 % overhead and
+pollute the historical wall-clock numbers.
+
 ## Notes on fairness
 
 - **Extension field**: default mode uses the vendored `p3-goldilocks-patched`
