@@ -1,0 +1,56 @@
+[package]
+name = "bench-vs-plonky3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Lambda STARK
+stark = { path = "../crypto/stark", features = ["test-utils"] }
+crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
+math = { path = "../crypto/math", features = ["std", "lambdaworks-serde-binary"] }
+
+# Plonky3 (all 0.5.2)
+p3-air = "0.5.2"
+p3-field = "0.5.2"
+p3-goldilocks = "0.5.2"
+p3-matrix = "0.5.2"
+p3-commit = "0.5.2"
+p3-challenger = "0.5.2"
+p3-symmetric = "0.5.2"
+p3-merkle-tree = "0.5.2"
+p3-keccak = "0.5.2"
+p3-fri = "0.5.2"
+p3-uni-stark = { version = "0.5.2", features = ["parallel"] }
+p3-dft = { version = "0.5.2", features = ["parallel"] }
+
+# Tracing for P3 span-based profiling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.4", default-features = false }
+
+[features]
+# Both provers run multi-threaded by default: Plonky3's `Radix2DitParallel` DFT
+# uses rayon unconditionally, so Lambda must also enable `parallel` for a fair
+# apples-to-apples comparison. Disable with `--no-default-features` to compare
+# single-threaded.
+#
+# `p3-degree3` (default on) selects the cubic extension for Plonky3's
+# Challenge type, matching Lambda's `Degree3GoldilocksExtensionField`. It
+# requires the root `[patch.crates-io]` pointing at p3-goldilocks-patched.
+# Disable it (`--no-default-features --features parallel`) together with
+# commenting the patch block to build against vanilla crates.io
+# p3-goldilocks (degree-2 extension).
+default = ["parallel", "p3-degree3"]
+parallel = ["stark/parallel"]
+instruments = ["stark/instruments"]
+p3-degree3 = []
+
+[[bin]]
+name = "prove_bench"
+path = "src/bin/prove_bench.rs"
+
+[[bench]]
+name = "stark_comparison"
+harness = false

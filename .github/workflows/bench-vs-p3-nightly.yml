@@ -1,0 +1,51 @@
+name: Bench Vs Plonky3 Nightly
+
+on:
+  schedule:
+    # 04:30 America/Argentina/Buenos_Aires = 07:30 UTC
+    # SP1 nightly fires at 06:00 UTC (03:00 BA) and runs ~1.5h; scheduling 1.5h
+    # later leaves the self-hosted bench runner free.
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-vs-p3-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-vs-p3:
+    runs-on: [self-hosted, bench]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run nightly Plonky3 benchmark
+        run: |
+          bash ./bench_vs_plonky3/run.sh \
+            --log-rows 19 \
+            --num-sequences 16 \
+            --runs 3 \
+            --no-p3-patch \
+            --scalar \
+            --report-dir bench_vs_p3_artifacts \
+            --no-color
+
+      - name: Upload nightly benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-vs-p3-nightly-${{ github.run_number }}-${{ github.sha }}
+          path: bench_vs_p3_artifacts
+          retention-days: 90
+
+      - name: Publish summary
+        run: cat bench_vs_p3_artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"

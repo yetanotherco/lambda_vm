@@ -6,6 +6,7 @@ members = [
   "crypto/crypto",
   "crypto/math",
   "bin/cli",
+  "bench_vs_plonky3",
 ]
 
 resolver = "2"
@@ -18,3 +19,11 @@ debug = true
 
 # For profiling with samply/perf, build with:
 #   CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
+
+# Patched p3-goldilocks adds a BinomiallyExtendable<3> impl for degree-3
+# extension (same as Lambda's x^3 - 2) and disables NEON packing on aarch64.
+# Used only by bench_vs_plonky3 for apples-to-apples comparisons against
+# Lambda STARK. The nightly workflow comments this block out at CI time to
+# benchmark vanilla p3-goldilocks (degree-2 extension).
+[patch.crates-io]
+p3-goldilocks = { path = "bench_vs_plonky3/p3-goldilocks-patched" }
