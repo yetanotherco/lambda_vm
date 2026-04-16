@@ -43,15 +43,13 @@ pub enum BusId {
     // =========================================================================
     // Range checks (BITWISE table provides)
     // =========================================================================
-    /// Range check: value is a valid byte [0, 256)
+    /// Range check: both values are valid bytes [0, 256).
+    /// Single-byte checks send the second value as 0.
     IsByte = 0,
     /// Range check: value is a valid halfword [0, 2^16)
     IsHalfword,
-    /// Range check: two values are each valid bytes [0, 256).
-    /// Sends [X, Y] as two separate bus values for individual byte checking.
-    IsBytePair,
     /// Range check: value is a 20-bit value [0, 2^20)
-    IsB20,
+    IsB20 = 3,
 
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
@@ -120,7 +118,6 @@ impl BusId {
         match self {
             BusId::IsByte => "IsByte",
             BusId::IsHalfword => "IsHalfword",
-            BusId::IsBytePair => "IsBytePair",
             BusId::IsB20 => "IsB20",
             BusId::AndByte => "AndByte",
             BusId::OrByte => "OrByte",
@@ -152,7 +149,6 @@ impl TryFrom<u64> for BusId {
         match value {
             0 => Ok(BusId::IsByte),
             1 => Ok(BusId::IsHalfword),
-            2 => Ok(BusId::IsBytePair),
             3 => Ok(BusId::IsB20),
             4 => Ok(BusId::AndByte),
             5 => Ok(BusId::OrByte),

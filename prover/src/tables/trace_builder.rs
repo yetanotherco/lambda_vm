@@ -1240,7 +1240,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - IS_BYTE[next_pc_low[1]] - range check bits 8-15
+/// - IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
 /// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
@@ -1260,7 +1260,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
 
-        // IS_BYTE[next_pc_low[1]] - range check for byte value
+        // IS_BYTE[next_pc_low[1], 0] - range check for byte value
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             next_pc_low_1,
@@ -1305,7 +1305,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 3 IsByte(0) + 12 IsBytePair(0,0) = 15 ops.
+/// Per padding row: 3 IsByte(0,0) + 12 IsByte(0,0) = 15 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -1320,10 +1320,10 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
                 0,
             ));
         }
-        // 12 IS_BYTE_PAIR for ARG1/ARG2/RES byte pairs (all zero in padding)
+        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
         for _ in 0..12 {
             ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsBytePair,
+                BitwiseOperationType::IsByte,
                 0,
                 0,
             ));
@@ -1335,8 +1335,8 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
 /// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init] for initialization range check
-/// - C2: IS_BYTE[fini] for finalization range check
+/// - C1: IS_BYTE[init, 0] for initialization range check
+/// - C2: IS_BYTE[fini, 0] for finalization range check
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
 fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
@@ -1392,13 +1392,13 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1: IS_BYTE[init]
+            // C1: IS_BYTE[init, 0]
             bitwise_ops.push(BitwiseOperation::single_byte(
                 BitwiseOperationType::IsByte,
                 init,
             ));
 
-            // C2: IS_BYTE[fini]
+            // C2: IS_BYTE[fini, 0]
             bitwise_ops.push(BitwiseOperation::single_byte(
                 BitwiseOperationType::IsByte,
                 fini,

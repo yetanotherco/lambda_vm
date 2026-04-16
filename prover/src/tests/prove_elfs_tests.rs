@@ -1401,12 +1401,12 @@ fn test_debug_memory_tokens_sb_sh() {
         total_page_rows * 2
     );
     println!(
-        "IS_BYTE[0]: {} lookups (most bytes are 0)",
+        "IS_BYTE[0, 0]: {} lookups (most bytes are 0)",
         is_byte_from_page[0]
     );
 
     // Check if bitwise table has matching multiplicities for IS_BYTE
-    // IS_BYTE uses rows 0..255 for each byte value, MU_IS_BYTE is column 17
+    // Single-byte IS_BYTE uses rows 0..255 with Y=0, MU_IS_BYTE is column 17
     use crate::tables::bitwise::cols as bitwise_cols;
     let bitwise_is_byte_mult: u64 = (0..256usize)
         .map(|byte_val| {

@@ -297,8 +297,8 @@ pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions
 ///
 /// ## Bus Interactions
 ///
-/// - PAGE-C1: IS_BYTE[init] - sender, multiplicity 1 (range check)
-/// - PAGE-C2: IS_BYTE[fini] - sender, multiplicity 1 (range check)
+/// - PAGE-C1: IS_BYTE[init, 0] - sender, multiplicity 1 (range check)
+/// - PAGE-C2: IS_BYTE[fini, 0] - sender, multiplicity 1 (range check)
 /// - PAGE-C3: memory[0, address, 0, init] - receiver, multiplicity -1
 /// - PAGE-C4: memory[0, address, timestamp, fini] - sender, multiplicity 1
 ///
@@ -322,23 +322,29 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // PAGE-C1: IS_BYTE[init] - range check initial value
+        // PAGE-C1: IS_BYTE[init, 0] - range check initial value
         BusInteraction::sender(
             BusId::IsByte,
             Multiplicity::One,
-            vec![BusValue::Packed {
-                start_column: cols::INIT,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::INIT,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
-        // PAGE-C2: IS_BYTE[fini] - range check final value
+        // PAGE-C2: IS_BYTE[fini, 0] - range check final value
         BusInteraction::sender(
             BusId::IsByte,
             Multiplicity::One,
-            vec![BusValue::Packed {
-                start_column: cols::FINI,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::FINI,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
         // PAGE-C3: memory[0, address, 0, init] - receive initial token
         BusInteraction::receiver(
