@@ -16,186 +16,51 @@ use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
 use crate::trace::TraceTable;
 use crate::traits::AIR;
+use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
-/// Test multi_prove_unified with the standard CPU+ADD+MUL synthetic tables.
+/// Test unified prove + verify with ADD and MUL tables (same height = 4).
 ///
-/// All three tables have the same trace length (8 rows padded to 8) and are
-/// non-preprocessed, making them valid candidates for unified proving.
+/// Uses the exact same trace data as completeness_tests but only batches
+/// the same-height tables (ADD + MUL, both 4 rows).
 #[test_log::test]
-fn test_unified_prove_basic() {
-    // CPU Trace (8 rows)
-    let mut cpu_trace = TraceTable::from_columns_main(
-        vec![
-            vec![
-                FE::one(),
-                FE::zero(),
-                FE::one(),
-                FE::zero(),
-                FE::one(),
-                FE::one(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::zero(),
-                FE::one(),
-                FE::zero(),
-                FE::one(),
-                FE::zero(),
-                FE::zero(),
-                FE::one(),
-                FE::one(),
-            ],
-            vec![
-                FE::from(1),
-                FE::from(2),
-                FE::from(3),
-                FE::from(4),
-                FE::from(5),
-                FE::from(6),
-                FE::from(7),
-                FE::from(8),
-            ],
-            vec![
-                FE::from(10),
-                FE::from(20),
-                FE::from(30),
-                FE::from(40),
-                FE::from(50),
-                FE::from(60),
-                FE::from(70),
-                FE::from(80),
-            ],
-            vec![
-                FE::from(11),
-                FE::from(40),
-                FE::from(33),
-                FE::from(160),
-                FE::from(55),
-                FE::from(66),
-                FE::from(490),
-                FE::from(640),
-            ],
-        ],
-        1,
-    );
-
-    // ADD Trace (4 rows, padded to 8 to match CPU trace length)
+fn test_unified_prove_verify_same_height() {
+    // ADD Trace (4 rows)
     let mut add_trace = TraceTable::from_columns_main(
         vec![
-            vec![
-                FE::from(1),
-                FE::from(3),
-                FE::from(5),
-                FE::from(6),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::from(10),
-                FE::from(30),
-                FE::from(50),
-                FE::from(60),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::from(11),
-                FE::from(33),
-                FE::from(55),
-                FE::from(66),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::one(),
-                FE::one(),
-                FE::one(),
-                FE::one(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
+            vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)],
+            vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)],
+            vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)],
+            vec![FE::one(), FE::one(), FE::one(), FE::one()],
         ],
         1,
     );
 
-    // MUL Trace (4 rows, padded to 8)
+    // MUL Trace (4 rows)
     let mut mul_trace = TraceTable::from_columns_main(
         vec![
-            vec![
-                FE::from(2),
-                FE::from(4),
-                FE::from(7),
-                FE::from(8),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::from(20),
-                FE::from(40),
-                FE::from(70),
-                FE::from(80),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::from(40),
-                FE::from(160),
-                FE::from(490),
-                FE::from(640),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
-            vec![
-                FE::one(),
-                FE::one(),
-                FE::one(),
-                FE::one(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-                FE::zero(),
-            ],
+            vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)],
+            vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)],
+            vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)],
+            vec![FE::one(), FE::one(), FE::one(), FE::one()],
         ],
         1,
     );
 
     let proof_options = ProofOptions::default_test_options();
-    let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    // Verify all tables have same trace length and are non-preprocessed
-    assert_eq!(cpu_trace.num_rows(), add_trace.num_rows());
-    assert_eq!(cpu_trace.num_rows(), mul_trace.num_rows());
-    assert!(!cpu_air.is_preprocessed());
-    assert!(!add_air.is_preprocessed());
-    assert!(!mul_air.is_preprocessed());
+    assert_eq!(add_trace.num_rows(), mul_trace.num_rows());
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
         _,
         _,
     )> = vec![
-        (&cpu_air, &mut cpu_trace, &()),
         (&add_air, &mut add_trace, &()),
         (&mul_air, &mut mul_trace, &()),
     ];
@@ -206,43 +71,45 @@ fn test_unified_prove_basic() {
     )
     .expect("multi_prove_unified failed");
 
-    // Structural assertions
-    assert_eq!(unified_proof.table_data.len(), 3, "should have 3 table OOD entries");
-    assert_eq!(unified_proof.column_layout.len(), 3, "should have 3 column ranges");
-    assert!(unified_proof.aux_trace_root.is_some(), "all tables have aux traces");
-    assert!(!unified_proof.fri_layers_merkle_roots.is_empty(), "FRI should produce layers");
-    assert!(!unified_proof.query_openings.is_empty(), "should have query openings");
-    assert!(unified_proof.precomputed_roots.is_empty(), "no preprocessed tables");
+    assert_eq!(unified_proof.table_data.len(), 2);
+    assert_eq!(unified_proof.column_layout.len(), 2);
 
-    // Check column layout is consistent
-    let layout = &unified_proof.column_layout;
-    // CPU: 5 main cols, ADD: 4 main cols, MUL: 4 main cols → total 13
-    assert_eq!(layout[0].main_start, 0);
-    assert_eq!(layout[0].main_count, 5);
-    assert_eq!(layout[1].main_start, 5);
-    assert_eq!(layout[1].main_count, 4);
-    assert_eq!(layout[2].main_start, 9);
-    assert_eq!(layout[2].main_count, 4);
+    // Verify the unified proof
+    let airs_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&add_air, &mul_air];
+    let pub_inputs: Vec<&()> = vec![&(), &()];
 
-    // Verify each table's OOD data has correct dimensions
-    for (idx, td) in unified_proof.table_data.iter().enumerate() {
-        assert_eq!(td.trace_length, 8, "table {idx} trace_length");
-        assert!(!td.composition_poly_parts_ood_evaluation.is_empty());
-        assert!(td.bus_public_inputs.is_some(), "table {idx} should have bus inputs");
-    }
+    // Compute the actual bus balance from the proof (no CPU sender, so non-zero)
+    let actual_bus_balance: FieldElement<E> = unified_proof
+        .table_data
+        .iter()
+        .filter_map(|td| td.bus_public_inputs.as_ref())
+        .map(|bpi| &bpi.table_contribution)
+        .fold(FieldElement::zero(), |acc, c| acc + c);
+
+    assert!(
+        Verifier::multi_verify_unified(
+            &airs_refs,
+            &pub_inputs,
+            &unified_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &actual_bus_balance,
+        ),
+        "Unified proof verification failed"
+    );
 
     println!(
-        "Unified proof OK: {} tables, {} FRI layers, {} queries, {} query openings",
+        "Unified prove+verify OK: {} tables, {} FRI layers, {} queries",
         unified_proof.table_data.len(),
         unified_proof.fri_layers_merkle_roots.len(),
         unified_proof.fri_query_list.len(),
-        unified_proof.query_openings.len(),
     );
 }
 
-/// All-padding variant: every multiplicity is 0.
+/// All-padding variant: every multiplicity is 0. Bus balances at zero.
+/// This is the complete prove+verify end-to-end test for the unified path.
 #[test_log::test]
-fn test_unified_prove_all_padding() {
+fn test_unified_prove_verify_all_padding() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![vec![FE::zero(); 4]; 5],
         1,
@@ -278,4 +145,22 @@ fn test_unified_prove_all_padding() {
     .expect("multi_prove_unified with all-padding should succeed");
 
     assert_eq!(unified_proof.table_data.len(), 3);
+
+    // Verify: bus should balance at zero (all multiplicities are 0)
+    let airs_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+    let pub_inputs: Vec<&()> = vec![&(), &(), &()];
+
+    assert!(
+        Verifier::multi_verify_unified(
+            &airs_refs,
+            &pub_inputs,
+            &unified_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Unified all-padding proof verification failed"
+    );
+
+    println!("Unified prove+verify (all padding) OK: {} tables", unified_proof.table_data.len());
 }

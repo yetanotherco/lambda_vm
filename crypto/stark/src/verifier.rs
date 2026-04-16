@@ -1296,4 +1296,519 @@ pub trait IsStarkVerifier<
 
         true
     }
+
+    /// Verifies a unified multi-table STARK proof with batched commitments and single FRI.
+    ///
+    /// The `airs` must be non-preprocessed, same-height tables, in the same order as
+    /// the prover's `air_trace_pairs`.
+    fn multi_verify_unified(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        pub_inputs: &[&PI],
+        proof: &crate::proof::unified::UnifiedMultiProof<Field, FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let num_airs = airs.len();
+        if num_airs != proof.table_data.len() || num_airs != proof.column_layout.len() {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!(
+                "AIR count ({}) doesn't match table_data ({}) or column_layout ({})",
+                num_airs,
+                proof.table_data.len(),
+                proof.column_layout.len()
+            );
+            return false;
+        }
+        if num_airs == 0 {
+            return true;
+        }
+
+        let needs_lookup = airs.iter().any(|a| a.has_aux_trace());
+        let trace_length = proof.table_data[0].trace_length;
+        let domain = new_verifier_domain(airs[0], trace_length);
+
+        // =================================================================
+        // Step 1: Replay transcript and recover challenges
+        // =================================================================
+
+        // Phase A: main trace root
+        transcript.append_bytes(&proof.main_trace_root);
+
+        // Phase B: LogUp challenges
+        let rap_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Phase C: aux root + bus_public_inputs
+        if let Some(ref root) = proof.aux_trace_root {
+            transcript.append_bytes(root);
+        }
+        for td in &proof.table_data {
+            if let Some(ref bpi) = td.bus_public_inputs {
+                transcript.append_field_element(&bpi.table_contribution);
+            }
+        }
+
+        // Validate bus_public_inputs presence
+        for (idx, (air, td)) in airs.iter().zip(&proof.table_data).enumerate() {
+            if air.has_trace_interaction() && td.bus_public_inputs.is_none() {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Table {idx}: AIR has LogUp but proof missing bus_public_inputs");
+                return false;
+            }
+        }
+
+        // Round 2: sample beta, receive composition root
+        let beta: FieldElement<FieldExtension> = transcript.sample_field_element();
+        transcript.append_bytes(&proof.composition_poly_root);
+
+        // Round 3: sample z, receive OOD data
+        let z: FieldElement<FieldExtension> = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
+        );
+
+        for td in &proof.table_data {
+            for col in td.trace_ood_evaluations.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
+            }
+            for elem in &td.composition_poly_parts_ood_evaluation {
+                transcript.append_field_element(elem);
+            }
+        }
+
+        // Round 4: sample gamma
+        let gamma: FieldElement<FieldExtension> = transcript.sample_field_element();
+
+        // FRI commit replay
+        let mut zetas: Vec<FieldElement<FieldExtension>> = proof
+            .fri_layers_merkle_roots
+            .iter()
+            .map(|root| {
+                let element = transcript.sample_field_element();
+                transcript.append_bytes(root);
+                element
+            })
+            .collect();
+        zetas.push(transcript.sample_field_element());
+        transcript.append_field_element(&proof.fri_last_value);
+
+        // Grinding
+        let security_bits = airs[0].context().proof_options.grinding_factor;
+        if security_bits > 0 {
+            let seed = transcript.state();
+            match proof.nonce {
+                Some(nonce_value) if grinding::is_valid_nonce(&seed, nonce_value, security_bits) => {
+                    transcript.append_bytes(&nonce_value.to_be_bytes());
+                }
+                _ => {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Grinding factor not satisfied");
+                    return false;
+                }
+            }
+        }
+
+        // FRI query indices
+        let number_of_queries = airs[0].options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, &domain, transcript);
+
+        // =================================================================
+        // Step 2: Verify composition polynomial per table
+        // =================================================================
+
+        for (idx, (air, td)) in airs.iter().zip(&proof.table_data).enumerate() {
+            let pi = pub_inputs[idx];
+            let num_boundary = air
+                .boundary_constraints(
+                    pi,
+                    &rap_challenges,
+                    td.bus_public_inputs.as_ref(),
+                    trace_length,
+                )
+                .constraints
+                .len();
+            let num_transition = air.context().num_transition_constraints;
+
+            let mut coefficients: Vec<FieldElement<FieldExtension>> =
+                core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                    .take(num_boundary + num_transition)
+                    .collect();
+            let transition_coefficients: Vec<_> =
+                coefficients.drain(..num_transition).collect();
+            let boundary_coefficients = coefficients;
+
+            // Boundary quotient at z
+            let boundary_constraints = air.boundary_constraints(
+                pi,
+                &rap_challenges,
+                td.bus_public_inputs.as_ref(),
+                trace_length,
+            );
+
+            let mut boundary_denoms: Vec<FieldElement<FieldExtension>> = Vec::new();
+            let boundary_nums: Vec<FieldElement<FieldExtension>> = boundary_constraints
+                .constraints
+                .iter()
+                .map(|bc| {
+                    let point = domain.trace_primitive_root.pow(bc.step as u64);
+                    boundary_denoms.push(-point + &z);
+                    // For aux boundary constraints, adjust column index past main columns
+                    let col_idx = if bc.is_aux {
+                        td.num_main_cols + bc.col
+                    } else {
+                        bc.col
+                    };
+                    -&bc.value + &td.trace_ood_evaluations.get_row(0)[col_idx]
+                })
+                .collect();
+            FieldElement::inplace_batch_inverse(&mut boundary_denoms).unwrap();
+
+            let boundary_quotient: FieldElement<FieldExtension> = boundary_nums
+                .iter()
+                .zip(&boundary_denoms)
+                .zip(&boundary_coefficients)
+                .map(|((num, den), coeff)| num * den * coeff)
+                .fold(FieldElement::zero(), |acc, x| acc + x);
+
+            // Transition evaluation at z
+            let periodic_values: Vec<FieldElement<FieldExtension>> = air
+                .get_periodic_column_polynomials(trace_length)
+                .iter()
+                .map(|poly| poly.evaluate(&z))
+                .collect();
+
+            let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+                if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                    compute_alpha_powers(
+                        &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                        air.max_bus_elements(),
+                    )
+                } else {
+                    Vec::new()
+                };
+
+            let logup_table_offset = match &td.bus_public_inputs {
+                Some(bpi) => {
+                    let n = FieldElement::<Field>::from(trace_length as u64);
+                    match n.inv() {
+                        Ok(n_inv) => n_inv * &bpi.table_contribution,
+                        Err(_) => return false,
+                    }
+                }
+                None => FieldElement::zero(),
+            };
+
+            let ood_frame =
+                td.trace_ood_evaluations
+                    .into_frame(td.num_main_cols, air.step_size());
+            let packing_shifts = crate::lookup::PackingShifts::<FieldExtension>::new();
+            let ctx = TransitionEvaluationContext::new_verifier(
+                &ood_frame,
+                &periodic_values,
+                &rap_challenges,
+                &logup_alpha_powers,
+                &logup_table_offset,
+                &packing_shifts,
+            );
+            let transition_vals = air.compute_transition(&ctx);
+
+            let mut denominators = vec![
+                FieldElement::<FieldExtension>::zero();
+                air.num_transition_constraints()
+            ];
+            air.transition_constraints().iter().for_each(|c| {
+                denominators[c.constraint_idx()] = c.evaluate_zerofier(
+                    &z,
+                    &domain.trace_primitive_root,
+                    trace_length,
+                );
+            });
+
+            let transition_sum = itertools::izip!(
+                transition_vals,
+                &transition_coefficients,
+                denominators
+            )
+            .fold(FieldElement::zero(), |acc, (val, coeff, denom)| {
+                acc + coeff * val * &denom
+            });
+
+            let computed = &boundary_quotient + transition_sum;
+            let claimed: FieldElement<FieldExtension> = td
+                .composition_poly_parts_ood_evaluation
+                .iter()
+                .rev()
+                .fold(FieldElement::zero(), |acc, coeff| acc * &z + coeff);
+
+            if computed != claimed {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Table {idx}: composition polynomial mismatch at z");
+                return false;
+            }
+        }
+
+        // =================================================================
+        // Step 3: Verify FRI with unified DEEP reconstruction
+        // =================================================================
+
+        let num_eval_points = 2;
+        let primitive_root =
+            &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
+
+        // Precompute gamma powers (must match prover's assignment)
+        let mut total_terms = 0usize;
+        for td in &proof.table_data {
+            let num_cols = td.num_main_cols + td.num_aux_cols;
+            total_terms +=
+                num_cols * num_eval_points + td.composition_poly_parts_ood_evaluation.len();
+        }
+        let gamma_powers: Vec<FieldElement<FieldExtension>> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(total_terms)
+                .collect();
+
+        let mut eval_point_inv: Vec<FieldElement<Field>> = iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, &domain))
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut eval_point_inv).unwrap();
+
+        for (q_idx, iota) in iotas.iter().enumerate() {
+            let opening = &proof.query_openings[q_idx];
+            let index = iota * 2;
+            let index_sym = iota * 2 + 1;
+
+            // Verify main tree openings
+            if !opening.main_proof.verify::<BatchedMerkleTreeBackend<Field>>(
+                &proof.main_trace_root,
+                index,
+                &opening.main_evaluations,
+            ) || !opening.main_proof_sym.verify::<BatchedMerkleTreeBackend<Field>>(
+                &proof.main_trace_root,
+                index_sym,
+                &opening.main_evaluations_sym,
+            ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Query {q_idx}: main tree opening failed");
+                return false;
+            }
+
+            // Verify aux tree openings
+            if let Some(ref aux_root) = proof.aux_trace_root {
+                if let (Some(p), Some(ps)) =
+                    (&opening.aux_proof, &opening.aux_proof_sym)
+                {
+                    if !p.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                        aux_root,
+                        index,
+                        &opening.aux_evaluations,
+                    ) || !ps.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                        aux_root,
+                        index_sym,
+                        &opening.aux_evaluations_sym,
+                    ) {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!("Query {q_idx}: aux tree opening failed");
+                        return false;
+                    }
+                }
+            }
+
+            // Verify composition tree opening (pair-merged)
+            {
+                let mut comp_leaf = opening.composition_evaluations.clone();
+                comp_leaf.extend_from_slice(&opening.composition_evaluations_sym);
+                if !opening
+                    .composition_proof
+                    .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                        &proof.composition_poly_root,
+                        *iota,
+                        &comp_leaf,
+                    )
+                {
+                    #[cfg(not(feature = "test_fiat_shamir"))]
+                    error!("Query {q_idx}: composition tree opening failed");
+                    return false;
+                }
+            }
+
+            // Reconstruct DEEP at query point and symmetric
+            let ep = Self::query_challenge_to_evaluation_point(*iota, &domain);
+            let ep_sym = Self::query_challenge_to_evaluation_point_sym(*iota, &domain);
+
+            let deep = Self::reconstruct_unified_deep(
+                &proof.table_data,
+                &proof.column_layout,
+                &z,
+                &gamma_powers,
+                &ep,
+                primitive_root,
+                &opening.main_evaluations,
+                &opening.aux_evaluations,
+                &opening.composition_evaluations,
+            );
+            let deep_sym = Self::reconstruct_unified_deep(
+                &proof.table_data,
+                &proof.column_layout,
+                &z,
+                &gamma_powers,
+                &ep_sym,
+                primitive_root,
+                &opening.main_evaluations_sym,
+                &opening.aux_evaluations_sym,
+                &opening.composition_evaluations_sym,
+            );
+
+            // Verify FRI folding for this query
+            let fri_roots = &proof.fri_layers_merkle_roots;
+            let ep_inv_sq_chain: Vec<FieldElement<Field>> =
+                core::iter::successors(Some(eval_point_inv[q_idx].square()), |ep| {
+                    Some(ep.square())
+                })
+                .take(fri_roots.len())
+                .collect();
+
+            let mut v = (&deep + &deep_sym)
+                + &eval_point_inv[q_idx] * &zetas[0] * (&deep - &deep_sym);
+            let mut fri_index = *iota;
+
+            if fri_roots.is_empty() {
+                if v != proof.fri_last_value {
+                    return false;
+                }
+                continue;
+            }
+
+            let fri_decommitment = &proof.fri_query_list[q_idx];
+            let fri_ok = fri_roots
+                .iter()
+                .enumerate()
+                .zip(&fri_decommitment.layers_auth_paths)
+                .zip(&fri_decommitment.layers_evaluations_sym)
+                .zip(ep_inv_sq_chain)
+                .fold(
+                    true,
+                    |result,
+                     ((((i, merkle_root), auth_path), eval_sym), ep_inv)| {
+                        let layer_ok = Self::verify_fri_layer_openings(
+                            merkle_root,
+                            auth_path,
+                            &v,
+                            eval_sym,
+                            fri_index,
+                        );
+                        v = (&v + eval_sym)
+                            + ep_inv * &zetas[i + 1] * (&v - eval_sym);
+                        fri_index >>= 1;
+
+                        if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
+                            result & layer_ok
+                        } else {
+                            result & (v == proof.fri_last_value) & layer_ok
+                        }
+                    },
+                );
+
+            if !fri_ok {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Query {q_idx}: FRI verification failed");
+                return false;
+            }
+        }
+
+        // =================================================================
+        // Step 4: Bus balance check
+        // =================================================================
+
+        if needs_lookup {
+            let total: FieldElement<FieldExtension> = proof
+                .table_data
+                .iter()
+                .filter_map(|td| td.bus_public_inputs.as_ref())
+                .map(|bpi| &bpi.table_contribution)
+                .fold(FieldElement::zero(), |acc, c| acc + c);
+
+            if total != *expected_bus_balance {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("LogUp bus does not balance");
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Reconstruct the unified DEEP polynomial evaluation at a single point.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_unified_deep(
+        table_data: &[crate::proof::unified::TableOodData<FieldExtension>],
+        column_layout: &[crate::proof::unified::ColumnRange],
+        z: &FieldElement<FieldExtension>,
+        gamma_powers: &[FieldElement<FieldExtension>],
+        x: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        main_evals: &[FieldElement<Field>],
+        aux_evals: &[FieldElement<FieldExtension>],
+        comp_evals: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let z_shifted = [z.clone(), primitive_root * z];
+        let mut trace_denoms: Vec<FieldElement<FieldExtension>> =
+            z_shifted.iter().map(|zk| x - zk).collect();
+        FieldElement::inplace_batch_inverse(&mut trace_denoms).unwrap();
+
+        let mut result = FieldElement::<FieldExtension>::zero();
+        let mut term_idx = 0usize;
+
+        for (td, layout) in table_data.iter().zip(column_layout) {
+            let ood_cols = td.trace_ood_evaluations.columns();
+
+            // Main trace terms
+            for j in 0..layout.main_count {
+                let t_val: FieldElement<FieldExtension> =
+                    main_evals[layout.main_start + j].clone().to_extension();
+                for k in 0..2 {
+                    let num = &t_val - &ood_cols[j][k];
+                    result += &gamma_powers[term_idx] * &num * &trace_denoms[k];
+                    term_idx += 1;
+                }
+            }
+
+            // Aux trace terms
+            for j in 0..layout.aux_count {
+                let t_val = &aux_evals[layout.aux_start + j];
+                let ood_idx = layout.main_count + j;
+                for k in 0..2 {
+                    let num = t_val - &ood_cols[ood_idx][k];
+                    result += &gamma_powers[term_idx] * &num * &trace_denoms[k];
+                    term_idx += 1;
+                }
+            }
+
+            // Composition terms
+            let num_parts = td.composition_poly_parts_ood_evaluation.len();
+            let z_power_k = z.pow(num_parts);
+            let comp_denom = (x - &z_power_k).inv().expect("comp denom non-zero");
+            for p in 0..num_parts {
+                let h_val = &comp_evals[layout.comp_start + p];
+                let h_ood = &td.composition_poly_parts_ood_evaluation[p];
+                let num = h_val - h_ood;
+                result += &gamma_powers[term_idx] * &num * &comp_denom;
+                term_idx += 1;
+            }
+        }
+
+        result
+    }
 }
