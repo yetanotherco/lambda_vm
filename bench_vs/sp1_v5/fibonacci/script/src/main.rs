@@ -57,8 +57,10 @@ fn main() {
     println!("Elements: {}", total_elements);
 
     // Count auxiliary (permutation/interaction) field elements.
-    // For each chip: rows = 1 << log_degree, aux_cols = permutation.local.len().
-    // These are extension-field columns used for bus argument (LogUp/permutation).
+    // SP1 v5 flattens the EF permutation trace to base field before PCS commitment
+    // (flatten_to_base()), so permutation.local has permutation_width × D entries where
+    // D=4 is BabyBear's extension degree. Dividing by D gives EF columns × rows,
+    // matching Lambda VM's unit (which commits EF columns directly, not flattened).
     let aux_elements: usize = match &proof.proof {
         SP1Proof::Core(shards) => shards
             .iter()
@@ -69,7 +71,8 @@ fn main() {
                     .map(|&idx| {
                         let chip = &shard.opened_values.chips[idx];
                         let rows = 1usize << chip.log_degree;
-                        chip.permutation.local.len() * rows
+                        // permutation.local.len() = permutation_width × 4; divide by 4 to get EF cols.
+                        (chip.permutation.local.len() / 4) * rows
                     })
                     .sum::<usize>()
             })

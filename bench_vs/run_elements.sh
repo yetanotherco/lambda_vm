@@ -10,6 +10,7 @@
 #   - Lambda VM CLI build dependencies available
 #   - SP1 toolchain installed (sp1up)
 #   - Rust stable installed
+#   - python3 installed
 
 set -euo pipefail
 
@@ -96,7 +97,8 @@ extract_aux_elements() {
     }'
 }
 
-# Format Lambda/SP1 ratio as +3.6x (Lambda bigger) or -0.21x (Lambda smaller).
+# Format Lambda/SP1 ratio as +3.6x (Lambda bigger) or -3.6x (Lambda smaller).
+# Always shows how many times larger the bigger side is, with sign indicating direction.
 format_ratio() {
     local num=$1 den=$2
     if [ "$num" = "n/a" ] || [ "$den" = "n/a" ]; then
@@ -105,7 +107,7 @@ format_ratio() {
     fi
     python3 -c "
 r = $num / $den
-print(f'+{r:.1f}x' if r >= 1 else f'-{r:.2f}x')
+print(f'+{r:.1f}x' if r >= 1 else f'-{1/r:.1f}x')
 "
 }
 
@@ -190,20 +192,26 @@ for n in "${SERIES[@]}"; do
 
     # Lambda VM — count-elements subcommand (no proof)
     echo -e "  ${GREEN}[Lambda VM] Counting elements...${NC}"
-    lambda_out=$("$CLI" count-elements "$LAMBDA_ELF" --private-input "$input_file" 2>/dev/null)
-    lambda_elems=$(printf "%s\n" "$lambda_out" | extract_elements)
-    lambda_aux=$(printf "%s\n" "$lambda_out" | extract_aux_elements)
-    if [ -z "$lambda_elems" ]; then
-        echo -e "  ${RED}[Lambda VM] FAILED to parse element count${NC}"
-        echo "$lambda_out"
+    lambda_out_file="$TMP_DIR/lambda_${n}.out"
+    if "$CLI" count-elements "$LAMBDA_ELF" --private-input "$input_file" > "$lambda_out_file" 2>&1; then
+        lambda_elems=$(extract_elements < "$lambda_out_file")
+        lambda_aux=$(extract_aux_elements < "$lambda_out_file")
+        if [ -z "$lambda_elems" ]; then
+            echo -e "  ${RED}[Lambda VM] FAILED to parse element count${NC}"
+            lambda_elems="n/a"
+        else
+            echo -e "  Lambda VM: ${BOLD}${lambda_elems}${NC} main elements"
+        fi
+        if [ -z "$lambda_aux" ]; then
+            lambda_aux="n/a"
+        else
+            echo -e "  Lambda VM: ${BOLD}${lambda_aux}${NC} aux elements"
+        fi
+    else
+        echo -e "  ${RED}[Lambda VM] FAILED${NC}"
+        cat "$lambda_out_file"
         lambda_elems="n/a"
-    else
-        echo -e "  Lambda VM: ${BOLD}${lambda_elems}${NC} main elements"
-    fi
-    if [ -z "$lambda_aux" ]; then
         lambda_aux="n/a"
-    else
-        echo -e "  Lambda VM: ${BOLD}${lambda_aux}${NC} aux elements"
     fi
 
     # SP1 v6 — prove and extract element count
@@ -283,13 +291,14 @@ for i in "${!RESULT_N[@]}"; do
 done
 echo ""
 echo -e "  +Nx = Lambda has N× more elements than SP1"
-echo -e "  -Nx = Lambda has N× fewer elements than SP1"
+echo -e "  -Nx = SP1 has N× more elements than Lambda"
 echo ""
 
 # --- Auxiliary elements table -----------------------------------------------
-echo -e "${BOLD}=== Summary: Aux-Trace Field Elements (extension field, bus interactions) ===${NC}"
-echo -e "  Metric  : sum of padded_rows × num_bus_interactions across all AIR tables"
-echo -e "  Fields  : Lambda VM = Goldilocks cubic EF | SP1 v5 = BabyBear degree-4 EF"
+echo -e "${BOLD}=== Summary: Aux-Trace Field Elements (EF columns × rows) ===${NC}"
+echo -e "  Metric  : sum of padded_rows × committed_EF_columns across all AIR tables"
+echo -e "  Unit    : EF columns (Lambda VM = ⌈bus_interactions/2⌉, SP1 v5 = permutation_width)"
+echo -e "  Fields  : Lambda VM = Goldilocks cubic EF (3 BF/EF) | SP1 v5 = BabyBear quartic EF (4 BF/EF)"
 echo -e "  Note    : SP1 v6 has no committed interaction columns (GKR-based bus)"
 echo ""
 
@@ -309,6 +318,6 @@ for i in "${!RESULT_N[@]}"; do
 done
 echo ""
 echo -e "  +Nx = Lambda has N× more aux elements than SP1 v5"
-echo -e "  -Nx = Lambda has N× fewer aux elements than SP1 v5"
+echo -e "  -Nx = SP1 v5 has N× more aux elements than Lambda"
 echo ""
 echo "Raw outputs in $TMP_DIR/"

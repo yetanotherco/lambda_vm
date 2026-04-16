@@ -497,7 +497,9 @@ pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmPr
 ///
 /// Returns `(main_elements, aux_elements)` where `main_elements` is the sum of
 /// `rows × columns` over all main (base-field) trace columns, and `aux_elements`
-/// is the sum of `rows × bus_interactions` over all extension-field interaction columns.
+/// is the sum of `rows × ⌈bus_interactions/2⌉` over all tables — i.e. the number
+/// of committed extension-field columns times rows (LogUp batching packs two
+/// interactions per column).
 pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u64), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
