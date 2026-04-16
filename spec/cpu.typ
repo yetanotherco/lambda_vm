@@ -60,9 +60,12 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 
 The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled.
 Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs.
+The `pc` register behaves very predictably with respect to its timestamps and when it is being read,
+so for performance reasons, we inline its memory interactions directly into the #cpu chip.
 The timestamps are ensured to be disjoint for disjoint memory locations.
 One consequence of that is that `next_pc` is written at `timestamp + 1`
 to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction.
+#rj[We can try to do a bit more, and move `double_pc_read` into decoding, so that `AUIPC` could set `read_register1 = 0`.]
 
 #render_constraint_table(chip, config, groups: "mem")
 

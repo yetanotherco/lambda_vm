@@ -222,6 +222,18 @@ pad = 0
 
 # Auxiliary
 [[variables.auxiliary]]
+name = "prev_pc_timestamp_borrow"
+type = "Bit"
+desc = "The borrow bit for computing the previous timestamp the PC was accessed"
+pad = 0
+
+[[variables.auxiliary]]
+name = "pc_double_read"
+type = "Bit"
+desc = "Whether the PC is being read as a general purpose register (rs1) this cycle"
+pad = 0
+
+[[variables.auxiliary]]
 name = "rv1"
 type = "DWordWHH"
 desc = "The value of register `rs1`"
@@ -692,11 +704,38 @@ input = [0, ["cast", "res", "DWordWL"], ["cast", "arg2", ["Byte", 8]], ["+", "ti
 multiplicity = "STORE"
 
 [[constraints.mem]]
+kind = "arith"
+constraint = "$#`pc_double_read` => #`rs1` = 255$"
+poly = ["*", ["-", 1, "pc_double_read"], ["-", "rs1", 255]]
+
+[[constraints.mem]]
+kind = "template"
+tag = "IS_BIT"
+input = ["pc_double_read"]
+
+[[constraints.mem]]
+kind = "template"
+tag = "IS_BIT"
+input = ["prev_pc_timestamp_borrow"]
+
+[[constraints.mem]]
+kind = "arith"
+constraint = "$#`pc_double_read` => #`prev_pc_timestamp_borrow` = 0$"
+poly = ["*", ["-", 1, "pc_double_read"], "prev_pc_timestamp_borrow"]
+
+[[constraints.mem]]
 kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 255], "DWordWL"], ["arr", ["idx", "next_pc", 0], ["idx", "next_pc", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
-output = ["arr", ["idx", "pc", 0], ["idx", "pc", 1], 0, 0, 0, 0, 0, 0]
+tag = "memory"
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["arr", ["+", ["-", ["idx", "timestamp", 0], ["*", 3, ["not", "pc_double_read"]]], ["*", ["^", 2, 32], "prev_pc_timestamp_borrow"]], ["-", ["idx", "timestamp", 1], "prev_pc_timestamp_borrow"]], ["idx", "pc", "i"]]
 multiplicity = ["not", "pad"]
+iter = ["i", 0, 1]
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "memory"
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], ["idx", "next_pc", "i"]]
+multiplicity = ["-", ["not", "pad"]]
+iter = ["i", 0, 1]
 
 
 [[constraint_groups]]
