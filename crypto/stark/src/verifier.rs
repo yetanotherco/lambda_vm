@@ -870,6 +870,9 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        // If unified_proof is present, use hybrid verification (requires PI: Default)
+        // The caller should use multi_verify_hybrid directly when PI is not Default.
+
         if airs.len() != multi_proof.proofs.len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
@@ -1035,6 +1038,219 @@ pub trait IsStarkVerifier<
         true
     }
 
+    /// Verify a hybrid multi-proof (unified batched + individual per-table proofs).
+    ///
+    /// Replays the same transcript as `multi_prove_hybrid`:
+    /// 1. Phase A: individual table roots + batched main root
+    /// 2. Phase B: sample LogUp challenges
+    /// 3. Fork: individual tables verified per-table, batched via unified path
+    /// 4. Bus balance check across all tables
+    fn multi_verify_hybrid(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Default,
+    {
+        let unified_proof = match &multi_proof.unified_proof {
+            Some(p) => p,
+            None => return false,
+        };
+        let unified_indices = &multi_proof.unified_indices;
+
+        let num_airs = airs.len();
+        let needs_lookup = airs.iter().any(|a| a.has_aux_trace());
+
+        // Build sets for classification
+        let is_unified: Vec<bool> = (0..num_airs)
+            .map(|i| unified_indices.contains(&i))
+            .collect();
+
+        // Verify proof counts match
+        let expected_individual = is_unified.iter().filter(|&&u| !u).count();
+        if multi_proof.proofs.len() != expected_individual {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!(
+                "Individual proof count ({}) doesn't match expected ({})",
+                multi_proof.proofs.len(),
+                expected_individual
+            );
+            return false;
+        }
+        if unified_proof.table_data.len() != unified_indices.len() {
+            return false;
+        }
+
+        // =================================================================
+        // Phase A: Replay main trace commitments (same order as prover)
+        // =================================================================
+        // Individual tables first, then batched root
+
+        for &idx in (0..num_airs).collect::<Vec<_>>().iter() {
+            if is_unified[idx] {
+                continue; // batched tables committed together below
+            }
+            let air = airs[idx];
+            // Find this table's proof in the individual proofs list
+            let individual_pos = (0..idx).filter(|&i| !is_unified[i]).count();
+            let proof = &multi_proof.proofs[individual_pos];
+
+            if air.is_preprocessed() {
+                let expected = air.precomputed_commitment();
+                match &proof.lde_trace_precomputed_merkle_root {
+                    Some(actual) if *actual == expected => {}
+                    _ => {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!("Table {idx}: preprocessed commitment mismatch");
+                        return false;
+                    }
+                }
+                transcript.append_bytes(&expected);
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            } else {
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            }
+        }
+        // Batched main root
+        transcript.append_bytes(&unified_proof.main_trace_root);
+
+        // =================================================================
+        // Phase B: Sample shared LogUp challenges
+        // =================================================================
+
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // =================================================================
+        // Validate bus_public_inputs
+        // =================================================================
+
+        for (idx, air) in airs.iter().enumerate() {
+            if is_unified[idx] {
+                let pos = unified_indices.iter().position(|&i| i == idx).unwrap();
+                if air.has_trace_interaction()
+                    && unified_proof.table_data[pos].bus_public_inputs.is_none()
+                {
+                    return false;
+                }
+            } else {
+                let individual_pos = (0..idx).filter(|&i| !is_unified[i]).count();
+                let proof = &multi_proof.proofs[individual_pos];
+                if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
+                    return false;
+                }
+            }
+        }
+
+        // =================================================================
+        // Individual tables: fork + verify per-table
+        // =================================================================
+
+        let mut individual_proof_idx = 0;
+        for idx in 0..num_airs {
+            if is_unified[idx] {
+                continue;
+            }
+            let air = airs[idx];
+            let proof = &multi_proof.proofs[individual_proof_idx];
+            individual_proof_idx += 1;
+
+            let mut table_transcript = transcript.clone();
+            table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                table_transcript.append_bytes(&root);
+            }
+            if let Some(ref bpi) = proof.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
+
+            if !Self::verify_rounds_2_to_4(
+                air,
+                proof,
+                &mut table_transcript,
+                lookup_challenges.clone(),
+            ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("Table {idx} (individual) failed verification");
+                return false;
+            }
+        }
+
+        // =================================================================
+        // Batched tables: unified verification on forked transcript
+        // =================================================================
+
+        let batched_airs: Vec<&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>> =
+            unified_indices.iter().map(|&i| airs[i]).collect();
+
+        let mut batched_transcript = transcript.clone();
+        batched_transcript.append_bytes(&(num_airs as u64).to_le_bytes());
+
+        // Compute partial bus balance for the batched group
+        let batched_bus_balance: FieldElement<FieldExtension> = unified_proof
+            .table_data
+            .iter()
+            .filter_map(|td| td.bus_public_inputs.as_ref())
+            .map(|bpi| &bpi.table_contribution)
+            .fold(FieldElement::zero(), |acc, c| acc + c);
+
+        // Verify the unified proof for batched tables.
+        // multi_verify_unified takes &[&PI]; construct from Default trait.
+        // For the VM (PI=()), this is always valid.
+        let default_pi = PI::default();
+        let pi_refs: Vec<&PI> = vec![&default_pi; batched_airs.len()];
+
+        if !Self::multi_verify_unified(
+            &batched_airs,
+            &pi_refs,
+            unified_proof,
+            &mut batched_transcript,
+            &batched_bus_balance,
+        ) {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Unified batched proof verification failed");
+            return false;
+        }
+
+        // =================================================================
+        // Global bus balance check
+        // =================================================================
+
+        if needs_lookup {
+            let mut total = FieldElement::<FieldExtension>::zero();
+            // Individual tables
+            for proof in &multi_proof.proofs {
+                if let Some(ref bpi) = proof.bus_public_inputs {
+                    total = total + &bpi.table_contribution;
+                }
+            }
+            // Batched tables
+            for td in &unified_proof.table_data {
+                if let Some(ref bpi) = td.bus_public_inputs {
+                    total = total + &bpi.table_contribution;
+                }
+            }
+
+            if total != *expected_bus_balance {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("LogUp bus does not balance (hybrid verify)");
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Verify a single STARK proof.
     /// This is equivalent to calling `multi_verify` with a single-element slice.
     fn verify(
@@ -1049,6 +1265,8 @@ pub trait IsStarkVerifier<
     {
         let multi_proof = MultiProof {
             proofs: vec![proof.clone()],
+            unified_proof: None,
+            unified_indices: Vec::new(),
         };
         Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }

@@ -73,8 +73,19 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
+///
+/// When `unified_proof` is present, the tables at `unified_indices` are proved
+/// collectively via batched commitment + single FRI. Their entries in `proofs`
+/// are absent — `proofs` only contains per-table proofs for non-unified tables.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
+    /// Per-table proofs for individually-proved tables.
     pub proofs: Vec<StarkProof<F, E, PI>>,
+    /// Batched proof for tables at `unified_indices` (if any).
+    #[serde(default)]
+    pub unified_proof: Option<Box<super::unified::UnifiedMultiProof<F, E>>>,
+    /// Indices (in the original AIR ordering) of tables covered by `unified_proof`.
+    #[serde(default)]
+    pub unified_indices: Vec<usize>,
 }

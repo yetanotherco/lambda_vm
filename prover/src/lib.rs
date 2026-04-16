@@ -531,8 +531,9 @@ pub fn prove_with_options(
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
-    // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
+    // Phase 4: Prove (multi_prove_hybrid — uses unified batched commitment + single FRI
+    // for non-preprocessed same-height tables, per-table for the rest)
+    let proof = Prover::multi_prove_hybrid(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -587,8 +588,48 @@ pub fn verify_with_options(
     let page_configs =
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
-    // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
+    let airs = VmAirs::new(
+        &program,
+        proof_options,
+        false,
+        &page_configs,
+        &vm_proof.table_counts,
+    );
+
+    let air_refs = airs.air_refs();
+
+    // Hybrid proof: unified_proof present → verify with hybrid verifier
+    if vm_proof.proof.unified_proof.is_some() {
+        // Cross-check: individual proofs + unified tables should cover all AIRs
+        let expected_individual =
+            air_refs.len() - vm_proof.proof.unified_indices.len();
+        if expected_individual != vm_proof.proof.proofs.len() {
+            return Err(Error::InvalidTableCounts(format!(
+                "expected {} individual proofs, got {}",
+                expected_individual,
+                vm_proof.proof.proofs.len(),
+            )));
+        }
+
+        // Recompute expected bus balance
+        let expected_bus_balance = match compute_expected_commit_bus_balance(
+            &air_refs,
+            &vm_proof.proof,
+            &vm_proof.public_output,
+        ) {
+            Some(balance) => balance,
+            None => return Ok(false),
+        };
+
+        return Ok(Verifier::multi_verify_hybrid(
+            &air_refs,
+            &vm_proof.proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ));
+    }
+
+    // Legacy path: all per-table proofs
     let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
@@ -600,18 +641,6 @@ pub fn verify_with_options(
         )));
     }
 
-    let airs = VmAirs::new(
-        &program,
-        proof_options,
-        false,
-        &page_configs,
-        &vm_proof.table_counts,
-    );
-
-    // Recompute the COMMIT output bus offset from VmProof.public_output.
-    // If public_output was tampered, the recomputed offset won't match the
-    // actual bus total in the proof, and multi_verify will reject.
-    let air_refs = airs.air_refs();
     let expected_bus_balance = match compute_expected_commit_bus_balance(
         &air_refs,
         &vm_proof.proof,

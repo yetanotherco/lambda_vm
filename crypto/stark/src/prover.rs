@@ -1871,7 +1871,762 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof { proofs })
+        Ok(MultiProof {
+            proofs,
+            unified_proof: None,
+            unified_indices: Vec::new(),
+        })
+    }
+
+    /// Hybrid proving: batches non-preprocessed same-height tables via unified
+    /// commitment + single FRI, while individually proving the rest.
+    ///
+    /// All tables share a single transcript through Phase A+B (main commitments
+    /// + LogUp challenges), then fork: individual tables get per-table forked
+    /// transcripts, batched tables get one shared forked transcript.
+    ///
+    /// Falls back to `multi_prove` if no tables can be batched.
+    fn multi_prove_hybrid(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        let num_airs = air_trace_pairs.len();
+        if num_airs == 0 {
+            return Ok(MultiProof {
+                proofs: Vec::new(),
+                unified_proof: None,
+                unified_indices: Vec::new(),
+            });
+        }
+
+        // Classify tables into batchable (non-preprocessed, same height) vs individual
+        let mut height_counts: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (air, trace, _) in &air_trace_pairs {
+            if !air.is_preprocessed() {
+                *height_counts.entry(trace.num_rows()).or_insert(0) += 1;
+            }
+        }
+        // Target height = most common height among non-preprocessed tables
+        let target_height = height_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(h, _)| h);
+
+        let mut batched_indices: Vec<usize> = Vec::new();
+        let mut individual_indices: Vec<usize> = Vec::new();
+
+        if let Some(th) = target_height {
+            for (idx, (air, trace, _)) in air_trace_pairs.iter().enumerate() {
+                if !air.is_preprocessed() && trace.num_rows() == th {
+                    batched_indices.push(idx);
+                } else {
+                    individual_indices.push(idx);
+                }
+            }
+        }
+
+        // Need at least 2 tables to batch; otherwise fall back to per-table
+        if batched_indices.len() < 2 {
+            return Self::multi_prove(air_trace_pairs, transcript);
+        }
+
+        info!(
+            "multi_prove_hybrid: {} batched (height={}), {} individual",
+            batched_indices.len(),
+            target_height.unwrap(),
+            individual_indices.len()
+        );
+
+        let needs_lookup = air_trace_pairs.iter().any(|(a, _, _)| a.has_aux_trace());
+
+        // =====================================================================
+        // Phase A: Commit all main traces to shared transcript
+        // =====================================================================
+
+        // Compute domains/twiddles per table
+        let mut domains = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
+        for (air, trace, _) in &air_trace_pairs {
+            let domain = new_domain(*air, trace.num_rows());
+            let twiddles = LdeTwiddles::new(&domain);
+            domains.push(domain);
+            twiddle_caches.push(twiddles);
+        }
+
+        // Individual tables: commit per-table (same as multi_prove Phase A)
+        let mut individual_main_commits: Vec<(usize, MainCommitData<Field>)> = Vec::new();
+        let mut individual_main_ldes: Vec<(usize, Vec<Vec<FieldElement<Field>>>)> = Vec::new();
+
+        for &idx in &individual_indices {
+            let (air, trace, _) = &air_trace_pairs[idx];
+            let domain = &domains[idx];
+            let twiddles = &twiddle_caches[idx];
+
+            let (tree, root, pre_tree, pre_root, n_pre, cached_main) =
+                if air.is_preprocessed() {
+                    Self::commit_preprocessed_trace(
+                        *trace,
+                        domain,
+                        air.precomputed_commitment(),
+                        air.num_precomputed_columns(),
+                        twiddles,
+                    )?
+                } else {
+                    Self::commit_main_trace(*trace, domain, twiddles)?
+                };
+
+            if let Some(ref pr) = pre_root {
+                transcript.append_bytes(pr);
+            }
+            transcript.append_bytes(&root);
+
+            individual_main_commits.push((
+                idx,
+                MainCommitData {
+                    main_tree: Arc::new(tree),
+                    main_root: root,
+                    precomputed_tree: pre_tree.map(Arc::new),
+                    precomputed_root: pre_root,
+                    num_precomputed_cols: n_pre,
+                },
+            ));
+            individual_main_ldes.push((idx, cached_main));
+        }
+
+        // Batched tables: batch-commit all main LDE columns in one tree
+        let batched_domain = &domains[batched_indices[0]];
+        let batched_twiddles = &twiddle_caches[batched_indices[0]];
+        let batched_lde_size =
+            batched_domain.interpolation_domain_size * batched_domain.blowup_factor;
+
+        let mut per_batched_main_lde: Vec<Vec<Vec<FieldElement<Field>>>> =
+            Vec::with_capacity(batched_indices.len());
+
+        for &idx in &batched_indices {
+            let (_, trace, _) = &air_trace_pairs[idx];
+            let mut columns = trace.extract_columns_main(batched_lde_size);
+            Self::expand_columns_to_lde::<Field>(&mut columns, batched_domain, batched_twiddles);
+            per_batched_main_lde.push(columns);
+        }
+
+        // Batch commit main
+        let batched_main_tree = {
+            use sha3::Digest;
+            #[cfg(feature = "parallel")]
+            let iter = (0..batched_lde_size).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = 0..batched_lde_size;
+
+            let leaves: Vec<Commitment> = iter
+                .map(|row_idx| {
+                    let br = reverse_index(row_idx, batched_lde_size as u64);
+                    let mut hasher = sha3::Keccak256::new();
+                    for table_cols in &per_batched_main_lde {
+                        for col in table_cols {
+                            hasher.update(col[br].as_bytes());
+                        }
+                    }
+                    hasher.finalize().into()
+                })
+                .collect();
+            Arc::new(
+                BatchedMerkleTree::<Field>::build_from_hashed_leaves(leaves)
+                    .ok_or(ProvingError::EmptyCommitment)?,
+            )
+        };
+        let batched_main_root = batched_main_tree.root;
+        transcript.append_bytes(&batched_main_root);
+
+        // =====================================================================
+        // Phase B: Sample shared LogUp challenges
+        // =====================================================================
+
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // =====================================================================
+        // Build all auxiliary traces (shared challenges)
+        // =====================================================================
+
+        #[cfg(feature = "parallel")]
+        let aux_iter = air_trace_pairs.par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = air_trace_pairs.iter_mut();
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+            .map(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // =====================================================================
+        // Fork transcripts: individual per-table + one for batched group
+        // =====================================================================
+        // Individual tables use indices 0..num_airs-1 as fork IDs (matching multi_prove).
+        // The batched group uses index num_airs as its fork ID.
+
+        let mut individual_transcripts: Vec<_> = individual_indices
+            .iter()
+            .map(|&idx| {
+                let mut t = transcript.clone();
+                t.append_bytes(&(idx as u64).to_le_bytes());
+                t
+            })
+            .collect();
+
+        let mut batched_transcript = transcript.clone();
+        batched_transcript.append_bytes(&(num_airs as u64).to_le_bytes());
+
+        // =====================================================================
+        // Individual tables: Phase C + Rounds 2-4 (per-table, same as multi_prove)
+        // =====================================================================
+
+        let mut individual_proofs: Vec<(usize, StarkProof<Field, FieldExtension, PI>)> =
+            Vec::with_capacity(individual_indices.len());
+
+        for (pos, &idx) in individual_indices.iter().enumerate() {
+            let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+            let domain = &domains[idx];
+            let twiddles = &twiddle_caches[idx];
+            let t = &mut individual_transcripts[pos];
+
+            // Aux commit
+            let (aux_tree, aux_root, cached_aux) = if air.has_aux_trace() {
+                let mut columns = trace.extract_columns_aux(
+                    domain.interpolation_domain_size * domain.blowup_factor,
+                );
+                Self::expand_columns_to_lde::<FieldExtension>(&mut columns, domain, twiddles);
+                let (tree, root) = Self::commit_columns_bit_reversed(&columns)
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                (Some(Arc::new(tree)), Some(root), columns)
+            } else {
+                (None, None, Vec::new())
+            };
+
+            if let Some(ref root) = aux_root {
+                t.append_bytes(root);
+            }
+
+            // Build Round1
+            let (_, main_commit) = individual_main_commits
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .unwrap();
+            let (_, main_lde) = individual_main_ldes
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .unwrap();
+
+            let commitments = Round1Commitments {
+                main_merkle_tree: Arc::clone(&main_commit.main_tree),
+                main_merkle_root: main_commit.main_root,
+                precomputed_merkle_tree: main_commit.precomputed_tree.as_ref().map(Arc::clone),
+                precomputed_merkle_root: main_commit.precomputed_root,
+                num_precomputed_cols: main_commit.num_precomputed_cols,
+                aux_merkle_tree: aux_tree,
+                aux_merkle_root: aux_root,
+                rap_challenges: lookup_challenges.clone(),
+                bus_public_inputs: bus_inputs_vec[idx].clone(),
+            };
+
+            let lde = Lde {
+                main: main_lde.clone(),
+                aux: cached_aux,
+            };
+            let round_1 = commitments.build_round1(
+                lde,
+                air.step_size(),
+                domain.blowup_factor,
+                air.has_aux_trace(),
+            );
+
+            if let Some(ref bpi) = round_1.bus_public_inputs {
+                t.append_field_element(&bpi.table_contribution);
+            }
+
+            let proof = Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1, t, domain)?;
+            individual_proofs.push((idx, proof));
+        }
+
+        // =====================================================================
+        // Batched tables: unified Phase C + Rounds 2-4
+        // =====================================================================
+
+        // Extract batched air_trace_pairs (borrow references)
+        let batched_bus_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
+            batched_indices.iter().map(|&idx| bus_inputs_vec[idx].clone()).collect();
+
+        // Call multi_prove_unified's logic: Phase C through Round 4
+        // We manually inline the unified path here since we already did Phase A+B.
+        let unified_proof = Self::unified_phase_c_through_round4(
+            &air_trace_pairs,
+            &batched_indices,
+            &mut per_batched_main_lde,
+            &batched_bus_inputs,
+            &lookup_challenges,
+            batched_domain,
+            batched_twiddles,
+            batched_main_tree,
+            batched_main_root,
+            batched_lde_size,
+            &mut batched_transcript,
+        )?;
+
+        // =====================================================================
+        // Assemble result
+        // =====================================================================
+
+        // Sort individual proofs by original index
+        individual_proofs.sort_by_key(|(idx, _)| *idx);
+        let proofs: Vec<StarkProof<Field, FieldExtension, PI>> =
+            individual_proofs.into_iter().map(|(_, p)| p).collect();
+
+        Ok(MultiProof {
+            proofs,
+            unified_proof: Some(Box::new(unified_proof)),
+            unified_indices: batched_indices,
+        })
+    }
+
+    /// Phase C through Round 4 for the unified (batched) path.
+    /// Called by `multi_prove_hybrid` after Phase A+B are complete.
+    #[allow(clippy::too_many_arguments)]
+    fn unified_phase_c_through_round4(
+        air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
+        batched_indices: &[usize],
+        per_batched_main_lde: &mut [Vec<Vec<FieldElement<Field>>>],
+        batched_bus_inputs: &[Option<BusPublicInputs<FieldExtension>>],
+        lookup_challenges: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        main_tree: Arc<BatchedMerkleTree<Field>>,
+        main_root: Commitment,
+        lde_size: usize,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Send),
+    ) -> Result<
+        crate::proof::unified::UnifiedMultiProof<Field, FieldExtension>,
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        use crate::proof::unified::{
+            ColumnRange, TableOodData, UnifiedMultiProof, UnifiedQueryOpening,
+        };
+        use sha3::Digest;
+
+        let num_batched = batched_indices.len();
+        let blowup_factor = domain.blowup_factor;
+        let domain_size = domain.interpolation_domain_size;
+        let trace_length = domain_size;
+
+        // Build column layout for main
+        let mut layout: Vec<ColumnRange> = Vec::with_capacity(num_batched);
+        let mut main_col_offset = 0usize;
+        for lde in per_batched_main_lde.iter() {
+            let count = lde.len();
+            layout.push(ColumnRange {
+                main_start: main_col_offset,
+                main_count: count,
+                aux_start: 0,
+                aux_count: 0,
+                comp_start: 0,
+                comp_count: 0,
+            });
+            main_col_offset += count;
+        }
+        let total_main_cols = main_col_offset;
+
+        // Phase C: aux LDE + batch commit
+        let mut per_batched_aux_lde: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
+            Vec::with_capacity(num_batched);
+        let mut aux_col_offset = 0usize;
+
+        for (pos, &idx) in batched_indices.iter().enumerate() {
+            let (air, trace, _) = &air_trace_pairs[idx];
+            if air.has_aux_trace() {
+                let mut columns = trace.extract_columns_aux(lde_size);
+                Self::expand_columns_to_lde::<FieldExtension>(&mut columns, domain, twiddles);
+                let count = columns.len();
+                layout[pos].aux_start = aux_col_offset;
+                layout[pos].aux_count = count;
+                aux_col_offset += count;
+                per_batched_aux_lde.push(columns);
+            } else {
+                per_batched_aux_lde.push(Vec::new());
+            }
+        }
+
+        let total_aux_cols = aux_col_offset;
+        let (aux_tree, aux_root) = if total_aux_cols > 0 {
+            #[cfg(feature = "parallel")]
+            let iter = (0..lde_size).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = 0..lde_size;
+
+            let leaves: Vec<Commitment> = iter
+                .map(|row_idx| {
+                    let br = reverse_index(row_idx, lde_size as u64);
+                    let mut hasher = sha3::Keccak256::new();
+                    for table_cols in &per_batched_aux_lde {
+                        for col in table_cols {
+                            hasher.update(col[br].as_bytes());
+                        }
+                    }
+                    hasher.finalize().into()
+                })
+                .collect();
+            let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(leaves)
+                .ok_or(ProvingError::EmptyCommitment)?;
+            let root = tree.root;
+            (Some(Arc::new(tree)), Some(root))
+        } else {
+            (None, None)
+        };
+
+        if let Some(ref root) = aux_root {
+            transcript.append_bytes(root);
+        }
+        for bus in batched_bus_inputs {
+            if let Some(bpi) = bus {
+                transcript.append_field_element(&bpi.table_contribution);
+            }
+        }
+
+        // Round 2: constraint eval + batch comp commit
+        let beta: FieldElement<FieldExtension> = transcript.sample_field_element();
+        let mut per_batched_comp_lde: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
+            Vec::with_capacity(num_batched);
+        let mut comp_col_offset = 0usize;
+
+        for (pos, &idx) in batched_indices.iter().enumerate() {
+            let (air, _, pub_inputs) = &air_trace_pairs[idx];
+            let main_cols = std::mem::take(&mut per_batched_main_lde[pos]);
+            let aux_cols = std::mem::take(&mut per_batched_aux_lde[pos]);
+            let lde_trace =
+                LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), blowup_factor);
+
+            let evaluator = ConstraintEvaluator::new(
+                *air, *pub_inputs, lookup_challenges,
+                batched_bus_inputs[pos].as_ref(), trace_length,
+            );
+            let num_boundary = air
+                .boundary_constraints(
+                    *pub_inputs, lookup_challenges,
+                    batched_bus_inputs[pos].as_ref(), trace_length,
+                )
+                .constraints.len();
+            let num_transition = air.context().num_transition_constraints;
+            let mut coefficients: Vec<FieldElement<FieldExtension>> =
+                core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                    .take(num_boundary + num_transition)
+                    .collect();
+            let transition_coefficients: Vec<_> = coefficients.drain(..num_transition).collect();
+            let boundary_coefficients = coefficients;
+
+            let constraint_evaluations = evaluator.evaluate(
+                *air, &lde_trace, domain,
+                &transition_coefficients, &boundary_coefficients, lookup_challenges,
+            );
+            let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+            let comp_evals = if number_of_parts == 2 {
+                Self::decompose_and_extend_d2(&constraint_evaluations, domain)
+            } else if number_of_parts == 1 {
+                vec![constraint_evaluations]
+            } else {
+                let p = Polynomial::interpolate_offset_fft(
+                    &constraint_evaluations, &domain.coset_offset,
+                ).unwrap();
+                p.break_in_parts(number_of_parts).iter().map(|part| {
+                    evaluate_polynomial_on_lde_domain(part, blowup_factor, domain_size, &domain.coset_offset).unwrap()
+                }).collect()
+            };
+            let count = comp_evals.len();
+            layout[pos].comp_start = comp_col_offset;
+            layout[pos].comp_count = count;
+            comp_col_offset += count;
+            per_batched_comp_lde.push(comp_evals);
+
+            let (main_back, aux_back) = lde_trace.into_columns();
+            per_batched_main_lde[pos] = main_back;
+            per_batched_aux_lde[pos] = aux_back;
+        }
+
+        // Batch comp commit (pair-merged leaves)
+        let total_comp_cols = comp_col_offset;
+        let comp_lde_size = per_batched_comp_lde[0][0].len();
+        let num_comp_leaves = comp_lde_size / 2;
+        let comp_tree = {
+            #[cfg(feature = "parallel")]
+            let iter = (0..num_comp_leaves).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = 0..num_comp_leaves;
+            let leaves: Vec<Commitment> = iter
+                .map(|leaf_idx| {
+                    let br_0 = reverse_index(2 * leaf_idx, comp_lde_size as u64);
+                    let br_1 = reverse_index(2 * leaf_idx + 1, comp_lde_size as u64);
+                    let mut hasher = sha3::Keccak256::new();
+                    for parts in &per_batched_comp_lde {
+                        for part in parts { hasher.update(part[br_0].as_bytes()); }
+                    }
+                    for parts in &per_batched_comp_lde {
+                        for part in parts { hasher.update(part[br_1].as_bytes()); }
+                    }
+                    hasher.finalize().into()
+                })
+                .collect();
+            BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(leaves)
+                .ok_or(ProvingError::EmptyCommitment)?
+        };
+        let comp_root = comp_tree.root;
+        transcript.append_bytes(&comp_root);
+
+        // Round 3: shared z
+        let z: FieldElement<FieldExtension> = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+
+        let coset_points: Vec<FieldElement<Field>> = (0..domain_size)
+            .map(|i| domain.lde_roots_of_unity_coset[i * blowup_factor].clone())
+            .collect();
+        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(domain_size);
+        let domain_size_inv: FieldElement<Field> =
+            FieldElement::<Field>::from(domain_size as u64).inv().expect("power of two");
+        let g_n_inv: FieldElement<Field> = coset_offset_pow_n.inv().expect("non-zero");
+
+        let mut table_data: Vec<TableOodData<FieldExtension>> = Vec::with_capacity(num_batched);
+
+        for (pos, &idx) in batched_indices.iter().enumerate() {
+            let (air, _, _) = &air_trace_pairs[idx];
+            let main_cols = std::mem::take(&mut per_batched_main_lde[pos]);
+            let aux_cols = std::mem::take(&mut per_batched_aux_lde[pos]);
+            let lde_trace =
+                LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), blowup_factor);
+
+            let trace_ood = crate::trace::get_trace_evaluations_from_lde(
+                &lde_trace, domain, &z, &air.context().transition_offsets, air.step_size(),
+            );
+
+            let num_parts = layout[pos].comp_count;
+            let z_power = z.pow(num_parts);
+            let comp_z_pow_n = z_power.pow(domain_size);
+            let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
+            let comp_ood: Vec<_> = per_batched_comp_lde[pos].iter().map(|lde_evals| {
+                let evals: Vec<_> = (0..domain_size).map(|i| lde_evals[i * blowup_factor].clone()).collect();
+                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                    &comp_z_pow_n, &coset_offset_pow_n, &domain_size_inv, &g_n_inv,
+                    &coset_points, &evals, &comp_inv_denoms,
+                )
+            }).collect();
+
+            for col in trace_ood.columns().iter() {
+                for elem in col.iter() { transcript.append_field_element(elem); }
+            }
+            for elem in &comp_ood { transcript.append_field_element(elem); }
+
+            let num_main = lde_trace.num_main_cols();
+            let num_aux = lde_trace.num_aux_cols();
+            let (main_back, aux_back) = lde_trace.into_columns();
+            per_batched_main_lde[pos] = main_back;
+            per_batched_aux_lde[pos] = aux_back;
+
+            table_data.push(TableOodData {
+                trace_length,
+                num_main_cols: num_main,
+                num_aux_cols: num_aux,
+                num_precomputed_cols: 0,
+                trace_ood_evaluations: trace_ood,
+                composition_poly_parts_ood_evaluation: comp_ood,
+                bus_public_inputs: batched_bus_inputs[pos].clone(),
+            });
+        }
+
+        // Round 4: unified DEEP + single FRI
+        let gamma: FieldElement<FieldExtension> = transcript.sample_field_element();
+        let num_eval_points = 2;
+        let primitive_root = &domain.trace_primitive_root;
+        let z_shifted = [z.clone(), primitive_root * &z];
+
+        let per_table_z_power_k: Vec<FieldElement<FieldExtension>> =
+            layout.iter().map(|l| z.pow(l.comp_count)).collect();
+        let unique_z_powers: Vec<FieldElement<FieldExtension>> = {
+            let mut seen = Vec::new();
+            for zk in &per_table_z_power_k {
+                if !seen.contains(zk) { seen.push(zk.clone()); }
+            }
+            seen
+        };
+
+        let mut total_terms = 0usize;
+        for l in &layout {
+            total_terms += (l.main_count + l.aux_count) * num_eval_points + l.comp_count;
+        }
+        let gamma_powers: Vec<FieldElement<FieldExtension>> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(total_terms).collect();
+
+        let num_denom_groups = 2 + unique_z_powers.len();
+        let mut denoms: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(domain_size * num_denom_groups);
+        for i in 0..domain_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+            denoms.push(x_i - &z_shifted[0]);
+        }
+        for i in 0..domain_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+            denoms.push(x_i - &z_shifted[1]);
+        }
+        for zk in &unique_z_powers {
+            for i in 0..domain_size {
+                let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+                denoms.push(x_i - zk);
+            }
+        }
+        FieldElement::inplace_batch_inverse(&mut denoms).expect("non-zero");
+        let inv_t0 = &denoms[0..domain_size];
+        let inv_t1 = &denoms[domain_size..2 * domain_size];
+        let per_table_inv_h_idx: Vec<usize> = per_table_z_power_k.iter()
+            .map(|zk| unique_z_powers.iter().position(|u| u == zk).unwrap()).collect();
+        let inv_h_slices: Vec<&[FieldElement<FieldExtension>]> = (0..unique_z_powers.len())
+            .map(|g| &denoms[(2 + g) * domain_size..(3 + g) * domain_size]).collect();
+
+        #[cfg(feature = "parallel")]
+        let deep_iter = (0..domain_size).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let deep_iter = 0..domain_size;
+
+        let deep_evals: Vec<FieldElement<FieldExtension>> = deep_iter.map(|i| {
+            let row_idx = i * blowup_factor;
+            let mut result = FieldElement::<FieldExtension>::zero();
+            let mut term_idx = 0usize;
+            for pos in 0..num_batched {
+                let ood_cols = table_data[pos].trace_ood_evaluations.columns();
+                let main_lde = &per_batched_main_lde[pos];
+                let aux_lde = &per_batched_aux_lde[pos];
+                for j in 0..main_lde.len() {
+                    let t_val = &main_lde[j][row_idx];
+                    result += &gamma_powers[term_idx] * &(t_val - &ood_cols[j][0]) * &inv_t0[i];
+                    term_idx += 1;
+                    result += &gamma_powers[term_idx] * &(t_val - &ood_cols[j][1]) * &inv_t1[i];
+                    term_idx += 1;
+                }
+                let mc = main_lde.len();
+                for j in 0..aux_lde.len() {
+                    let t_val = &aux_lde[j][row_idx];
+                    result += &gamma_powers[term_idx] * &(t_val - &ood_cols[mc + j][0]) * &inv_t0[i];
+                    term_idx += 1;
+                    result += &gamma_powers[term_idx] * &(t_val - &ood_cols[mc + j][1]) * &inv_t1[i];
+                    term_idx += 1;
+                }
+                let inv_h_t = inv_h_slices[per_table_inv_h_idx[pos]];
+                let comp = &per_batched_comp_lde[pos];
+                let comp_ood = &table_data[pos].composition_poly_parts_ood_evaluation;
+                for p in 0..comp.len() {
+                    result += &gamma_powers[term_idx] * &(&comp[p][row_idx] - &comp_ood[p]) * &inv_h_t[i];
+                    term_idx += 1;
+                }
+            }
+            result
+        }).collect();
+
+        let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT");
+        let mut lde_deep = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(lde_size)).expect("FFT");
+        in_place_bit_reverse_permute(&mut lde_deep);
+
+        let coset_offset_u64 = air_trace_pairs[batched_indices[0]].0.context().proof_options.coset_offset;
+        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
+        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+            domain.root_order as usize, lde_deep, transcript, &coset_offset, lde_size,
+        );
+
+        let security_bits = air_trace_pairs[batched_indices[0]].0.context().proof_options.grinding_factor;
+        let mut nonce = None;
+        if security_bits > 0 {
+            let nonce_value = grinding::generate_nonce(&transcript.state(), security_bits).expect("nonce");
+            transcript.append_bytes(&nonce_value.to_be_bytes());
+            nonce = Some(nonce_value);
+        }
+
+        let number_of_queries = air_trace_pairs[batched_indices[0]].0.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let fri_layers_merkle_roots: Vec<Commitment> = fri_layers.iter().map(|l| l.merkle_tree.root).collect();
+
+        let query_openings: Vec<UnifiedQueryOpening<Field, FieldExtension>> = iotas.iter().map(|&iota| {
+            let index = iota * 2;
+            let index_sym = iota * 2 + 1;
+            let br = reverse_index(index, lde_size as u64);
+            let br_sym = reverse_index(index_sym, lde_size as u64);
+
+            let main_proof = main_tree.get_proof_by_pos(index).unwrap();
+            let main_proof_sym = main_tree.get_proof_by_pos(index_sym).unwrap();
+            let mut main_evals = Vec::with_capacity(total_main_cols);
+            let mut main_evals_sym = Vec::with_capacity(total_main_cols);
+            for tc in per_batched_main_lde.iter() {
+                for col in tc { main_evals.push(col[br].clone()); main_evals_sym.push(col[br_sym].clone()); }
+            }
+
+            let (aux_proof, aux_proof_sym, aux_evals, aux_evals_sym) = if let Some(ref tree) = aux_tree {
+                let p = tree.get_proof_by_pos(index).unwrap();
+                let ps = tree.get_proof_by_pos(index_sym).unwrap();
+                let mut e = Vec::with_capacity(total_aux_cols);
+                let mut es = Vec::with_capacity(total_aux_cols);
+                for tc in &per_batched_aux_lde {
+                    for col in tc { e.push(col[br].clone()); es.push(col[br_sym].clone()); }
+                }
+                (Some(p), Some(ps), e, es)
+            } else { (None, None, Vec::new(), Vec::new()) };
+
+            let comp_proof = comp_tree.get_proof_by_pos(iota).unwrap();
+            let comp_proof_sym = comp_proof.clone();
+            let cbr0 = reverse_index(iota * 2, comp_lde_size as u64);
+            let cbr1 = reverse_index(iota * 2 + 1, comp_lde_size as u64);
+            let mut ce = Vec::with_capacity(total_comp_cols);
+            let mut ces = Vec::with_capacity(total_comp_cols);
+            for parts in &per_batched_comp_lde {
+                for part in parts { ce.push(part[cbr0].clone()); ces.push(part[cbr1].clone()); }
+            }
+
+            UnifiedQueryOpening {
+                main_proof, main_proof_sym,
+                main_evaluations: main_evals, main_evaluations_sym: main_evals_sym,
+                aux_proof, aux_proof_sym,
+                aux_evaluations: aux_evals, aux_evaluations_sym: aux_evals_sym,
+                composition_proof: comp_proof, composition_proof_sym: comp_proof_sym,
+                composition_evaluations: ce, composition_evaluations_sym: ces,
+            }
+        }).collect();
+
+        Ok(UnifiedMultiProof {
+            main_trace_root: main_root,
+            aux_trace_root: aux_root,
+            composition_poly_root: comp_root,
+            precomputed_roots: Vec::new(),
+            table_data,
+            fri_layers_merkle_roots,
+            fri_last_value,
+            fri_query_list: query_list,
+            query_openings,
+            nonce,
+            column_layout: layout,
+        })
     }
 
     /// Generate a STARK proof for a single AIR/trace.
