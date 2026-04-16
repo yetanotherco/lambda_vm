@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
@@ -32,7 +31,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -375,6 +374,8 @@ pub trait IsStarkProver<
     /// where `br(i)` is the bit-reversal of `i`. This produces the same Merkle
     /// tree as the old clone + bit-reverse + columns2rows + batch_commit flow,
     /// but avoids allocating the cloned and transposed matrices entirely.
+    ///
+    /// The hasher feeds column bytes incrementally — no per-row Vec allocation.
     fn commit_columns_bit_reversed<E>(
         columns: &[Vec<FieldElement<E>>],
     ) -> Option<(BatchedMerkleTree<E>, Commitment)>
@@ -382,6 +383,8 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send,
         E: IsField,
     {
+        use sha3::Digest;
+
         if columns.is_empty() || columns[0].is_empty() {
             return None;
         }
@@ -397,10 +400,11 @@ pub trait IsStarkProver<
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+                let mut hasher = sha3::Keccak256::new();
+                for col_idx in 0..num_cols {
+                    hasher.update(columns[col_idx][br_idx].as_bytes());
+                }
+                hasher.finalize().into()
             })
             .collect();
 
@@ -721,16 +725,17 @@ pub trait IsStarkProver<
 
         let hashed_leaves: Vec<Commitment> = iter
             .map(|leaf_idx| {
+                use sha3::Digest;
                 let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
                 let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                let mut leaf = Vec::with_capacity(2 * num_parts);
+                let mut hasher = sha3::Keccak256::new();
                 for part in lde_composition_poly_parts_evaluations.iter() {
-                    leaf.push(part[br_0].clone());
+                    hasher.update(part[br_0].as_bytes());
                 }
                 for part in lde_composition_poly_parts_evaluations.iter() {
-                    leaf.push(part[br_1].clone());
+                    hasher.update(part[br_1].as_bytes());
                 }
-                BatchedMerkleTreeBackend::<FieldExtension>::hash_data(&leaf)
+                hasher.finalize().into()
             })
             .collect();
 
