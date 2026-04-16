@@ -329,10 +329,11 @@ fn test_bus_interactions_count() {
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
-    // - 3 IS_BYTE (register indices: RS1, RS2, RD; second argument 0)
+    // - 1 IS_BYTE for (RS1, RS2) paired
+    // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 12 = 56
-    assert_eq!(interactions.len(), 56);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 55
+    assert_eq!(interactions.len(), 55);
 }
 
 #[test]
