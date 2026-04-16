@@ -706,7 +706,7 @@ multiplicity = "STORE"
 [[constraints.mem]]
 kind = "arith"
 constraint = "$#`pc_double_read` => #`rs1` = 255$"
-poly = ["*", ["-", 1, "pc_double_read"], ["-", "rs1", 255]]
+poly = ["*", "pc_double_read", ["-", "rs1", 255]]
 
 [[constraints.mem]]
 kind = "template"
@@ -721,7 +721,7 @@ input = ["prev_pc_timestamp_borrow"]
 [[constraints.mem]]
 kind = "arith"
 constraint = "$#`pc_double_read` => #`prev_pc_timestamp_borrow` = 0$"
-poly = ["*", ["-", 1, "pc_double_read"], "prev_pc_timestamp_borrow"]
+poly = ["*", "pc_double_read", "prev_pc_timestamp_borrow"]
 
 [[constraints.mem]]
 kind = "interaction"
