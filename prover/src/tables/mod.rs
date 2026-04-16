@@ -59,11 +59,11 @@ pub use types::BusId;
 /// | CPU_BIT |  74  |  60 |    254    |  2^19    |
 /// | DVRM    |  34  |  34 |    136    |  2^19    |
 /// | MUL     |  26  |  16 |     74    |  2^20    |
-/// | LT      |  15  |   9 |     42    |  2^21    |
+/// | LT      |  15  |   9 |     42    |  2^20    |
 /// | SHIFT   |  27  |  15 |     72    |  2^20    |
-/// | LOAD    |  18  |   5 |     33    |  2^21    |
-/// | BRANCH  |  14  |   6 |     32    |  2^21    |
-/// | MEMW_R  |  10  |   7 |     31    |  2^21    |
+/// | LOAD    |  18  |   5 |     33    |  2^20    |
+/// | BRANCH  |  14  |   6 |     32    |  2^20    |
+/// | MEMW_R  |  10  |   7 |     31    |  2^20    |
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 206
     pub const CPU_BITWISE: usize = 1 << 19; // 524,288 — eff. width 254
@@ -71,11 +71,11 @@ pub mod max_rows {
     pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
     pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
-    pub const LT: usize = 1 << 21; // 2,097,152  — eff. width 42
+    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42
     pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
-    pub const LOAD: usize = 1 << 21; // 2,097,152 — eff. width 33
-    pub const BRANCH: usize = 1 << 21; // 2,097,152 — eff. width 32
-    pub const MEMW_R: usize = 1 << 21; // 2,097,152 — eff. width 31
+    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
+    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
+    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
 }
 
 /// Per-table maximum row limits, configurable for different environments.
