@@ -1909,3 +1909,9 @@ fn test_addiw_neg_immediate() {
     let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(result, "addiw with negative immediate should verify");
 }
+
+// =============================================================================
+// Unified prover tests (batched commitment + single FRI)
+// =============================================================================
+// Note: Unified prover tests using synthetic AIRs are in
+// crypto/stark/src/tests/unified_prover_tests.rs to avoid executor dependencies.
