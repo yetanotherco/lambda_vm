@@ -41,37 +41,25 @@ pub mod trace_builder;
 
 pub use types::BusId;
 
-/// Per-table maximum rows, sized so each chunk uses roughly the same memory.
-///
-/// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
-/// MEMW (effective width 127) at 2^19 is the baseline; other tables are scaled
-/// proportionally: max_rows = (127 × 2^19) / effective_width, rounded to 2^N.
-/// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
-///    benchmarks show better parallel throughput with smaller chunks.)
-///
-/// | Table   | Main | Bus | Eff.width | Max rows |
-/// |---------|------|-----|-----------|----------|
-/// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  74  |  40 |    194    |  2^19    |
-/// | DVRM    |  34  |  34 |    136    |  2^19    |
-/// | MUL     |  26  |  16 |     74    |  2^20    |
-/// | LT      |  15  |   9 |     42    |  2^20    |
-/// | SHIFT   |  27  |  15 |     72    |  2^20    |
-/// | LOAD    |  18  |   5 |     33    |  2^20    |
-/// | BRANCH  |  14  |   6 |     32    |  2^20    |
-/// | MEMW_R  |  10  |   7 |     31    |  2^20    |
+/// Per-table maximum rows. All tables use the same limit (2^20) to enable
+/// batched commitment: when all chunks share the same maximum height, their
+/// LDE domains are identical and columns can be committed in a single tree.
+/// All tables use the same max_rows (2^20) to enable batched commitment.
+/// When all chunks have the same maximum height, their LDE domains are
+/// identical, allowing all columns to be committed in a single Merkle tree.
 pub mod max_rows {
-    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
-    pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
-    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
-    pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
-    pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
-    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42
-    pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
-    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
-    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
-    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
+    pub const UNIFORM: usize = 1 << 20; // 1,048,576
+
+    pub const CPU: usize = UNIFORM;
+    pub const MEMW: usize = UNIFORM;
+    pub const MEMW_A: usize = UNIFORM;
+    pub const DVRM: usize = UNIFORM;
+    pub const MUL: usize = UNIFORM;
+    pub const LT: usize = UNIFORM;
+    pub const SHIFT: usize = UNIFORM;
+    pub const LOAD: usize = UNIFORM;
+    pub const BRANCH: usize = UNIFORM;
+    pub const MEMW_R: usize = UNIFORM;
 }
 
 /// Per-table maximum row limits, configurable for different environments.
