@@ -39,6 +39,18 @@ impl<F: PrimeCharacteristicRing> BaseAir<F> for P3FibonacciAir {
     }
 }
 
+/// One sequence's (local_left, local_right, next_left, next_right, a, b)
+/// snapshot extracted from an `AirBuilder`. Factored out to keep the
+/// `Air::eval` signature readable (clippy::type_complexity).
+type FibPairRow<AB> = (
+    <AB as AirBuilder>::Var,
+    <AB as AirBuilder>::Var,
+    <AB as AirBuilder>::Var,
+    <AB as AirBuilder>::Var,
+    <AB as AirBuilder>::PublicVar,
+    <AB as AirBuilder>::PublicVar,
+);
+
 impl<AB: AirBuilder> Air<AB> for P3FibonacciAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
@@ -47,14 +59,7 @@ impl<AB: AirBuilder> Air<AB> for P3FibonacciAir {
 
         // Collect (left, right, next_left, next_right, a, b) per sequence so that
         // `pis`'s borrow on `builder` can end before we mutate `builder`.
-        let rows: Vec<(
-            AB::Var,
-            AB::Var,
-            AB::Var,
-            AB::Var,
-            AB::PublicVar,
-            AB::PublicVar,
-        )> = {
+        let rows: Vec<FibPairRow<AB>> = {
             let pis = builder.public_values();
             (0..self.num_sequences)
                 .map(|seq| {

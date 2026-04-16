@@ -78,11 +78,7 @@ where
         1
     }
 
-    fn evaluate(
-        &self,
-        eval_ctx: &TransitionEvaluationContext<F, E>,
-        out: &mut [FieldElement<E>],
-    ) {
+    fn evaluate(&self, eval_ctx: &TransitionEvaluationContext<F, E>, out: &mut [FieldElement<E>]) {
         match eval_ctx {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let s0 = frame.get_evaluation_step(0);
@@ -151,11 +147,7 @@ where
         1
     }
 
-    fn evaluate(
-        &self,
-        eval_ctx: &TransitionEvaluationContext<F, E>,
-        out: &mut [FieldElement<E>],
-    ) {
+    fn evaluate(&self, eval_ctx: &TransitionEvaluationContext<F, E>, out: &mut [FieldElement<E>]) {
         match eval_ctx {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let s0 = frame.get_evaluation_step(0);

@@ -39,8 +39,7 @@ mod tests {
             .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
             .collect();
 
-        let mut trace =
-            lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, trace_length);
+        let mut trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, trace_length);
         let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
         let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
             &proof_options,
@@ -88,8 +87,7 @@ mod tests {
             .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
             .collect();
 
-        let mut trace =
-            lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
+        let mut trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
         let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
         let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
             &proof_options,
@@ -218,8 +216,9 @@ mod tests {
             results: SpanResults,
         }
 
-        impl<S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>>
-            tracing_subscriber::Layer<S> for P3TimingLayer
+        impl<
+            S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+        > tracing_subscriber::Layer<S> for P3TimingLayer
         {
             fn on_new_span(
                 &self,
@@ -249,8 +248,7 @@ mod tests {
                 id: tracing::span::Id,
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                if let Some((name, Some(start))) =
-                    self.spans.lock().unwrap().remove(&id.into_u64())
+                if let Some((name, Some(start))) = self.spans.lock().unwrap().remove(&id.into_u64())
                 {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
                     self.results.lock().unwrap().push((name, ms));
@@ -287,7 +285,12 @@ mod tests {
         span_data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         for (name, ms) in &span_data {
             if *ms >= 0.1 {
-                println!("  {:.<40} {:>8.1}ms  ({:.0}%)", name, ms, ms / total_ms * 100.0);
+                println!(
+                    "  {:.<40} {:>8.1}ms  ({:.0}%)",
+                    name,
+                    ms,
+                    ms / total_ms * 100.0
+                );
             }
         }
         let accounted: f64 = span_data.iter().map(|(_, ms)| ms).sum();
@@ -314,8 +317,7 @@ mod tests {
             .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
             .collect();
 
-        let lambda_trace =
-            lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
+        let lambda_trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
         let p3_trace = plonky3_fibonacci::generate_fibonacci_trace(num_sequences, rows);
 
         assert_eq!(p3_trace.width, 2 * num_sequences);

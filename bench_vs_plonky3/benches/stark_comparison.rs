@@ -47,9 +47,7 @@ fn lambda_initial_values() -> Vec<(FE, FE)> {
 
 fn bench_lambda_prove(c: &mut Criterion) {
     let mut group = c.benchmark_group("lambda_stark/prove");
-    group.throughput(Throughput::Elements(
-        (ROWS * 2 * NUM_SEQUENCES) as u64,
-    ));
+    group.throughput(Throughput::Elements((ROWS * 2 * NUM_SEQUENCES) as u64));
     let proof_options = benchmark_proof_options();
 
     group.bench_with_input(
@@ -59,16 +57,13 @@ fn bench_lambda_prove(c: &mut Criterion) {
             b.iter_with_setup(
                 || {
                     let initial_values = lambda_initial_values();
-                    let trace = lambda_fibonacci_pair::compute_trace::<F, E>(
-                        &initial_values,
-                        rows,
-                    );
-                    let pub_inputs =
-                        lambda_fibonacci_pair::create_public_inputs(initial_values);
-                    let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
-                        &proof_options,
-                        NUM_SEQUENCES,
-                    );
+                    let trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
+                    let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
+                    let air =
+                        lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
+                            &proof_options,
+                            NUM_SEQUENCES,
+                        );
                     (trace, pub_inputs, air)
                 },
                 |(mut trace, pub_inputs, air)| {
@@ -88,9 +83,7 @@ fn bench_lambda_prove(c: &mut Criterion) {
 
 fn bench_plonky3_prove(c: &mut Criterion) {
     let mut group = c.benchmark_group("plonky3_stark/prove");
-    group.throughput(Throughput::Elements(
-        (ROWS * 2 * NUM_SEQUENCES) as u64,
-    ));
+    group.throughput(Throughput::Elements((ROWS * 2 * NUM_SEQUENCES) as u64));
 
     group.bench_with_input(
         BenchmarkId::new("fibonacci", TRACE_LABEL),
@@ -102,8 +95,7 @@ fn bench_plonky3_prove(c: &mut Criterion) {
                     let air = plonky3_fibonacci::P3FibonacciAir {
                         num_sequences: NUM_SEQUENCES,
                     };
-                    let trace =
-                        plonky3_fibonacci::generate_fibonacci_trace(NUM_SEQUENCES, rows);
+                    let trace = plonky3_fibonacci::generate_fibonacci_trace(NUM_SEQUENCES, rows);
                     let pis = plonky3_fibonacci::public_values(NUM_SEQUENCES);
                     (config, air, trace, pis)
                 },
@@ -116,9 +108,7 @@ fn bench_plonky3_prove(c: &mut Criterion) {
 
 fn bench_lambda_verify(c: &mut Criterion) {
     let mut group = c.benchmark_group("lambda_stark/verify");
-    group.throughput(Throughput::Elements(
-        (ROWS * 2 * NUM_SEQUENCES) as u64,
-    ));
+    group.throughput(Throughput::Elements((ROWS * 2 * NUM_SEQUENCES) as u64));
     let proof_options = benchmark_proof_options();
 
     let initial_values = lambda_initial_values();
@@ -150,9 +140,7 @@ fn bench_lambda_verify(c: &mut Criterion) {
 
 fn bench_plonky3_verify(c: &mut Criterion) {
     let mut group = c.benchmark_group("plonky3_stark/verify");
-    group.throughput(Throughput::Elements(
-        (ROWS * 2 * NUM_SEQUENCES) as u64,
-    ));
+    group.throughput(Throughput::Elements((ROWS * 2 * NUM_SEQUENCES) as u64));
 
     let air = plonky3_fibonacci::P3FibonacciAir {
         num_sequences: NUM_SEQUENCES,
