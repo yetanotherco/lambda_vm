@@ -97,25 +97,19 @@ impl TableCounts {
 
     /// Validate that all required tables have at least one chunk.
     ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
+    /// Required tables (CPU, MEMW_R, BRANCH) must have >= 1 chunk.
+    /// Optional tables (MUL, DVRM, SHIFT, LOAD, MEMW, MEMW_A, LT) can be 0
+    /// when the program doesn't use those operations.
     pub fn validate(&self) -> Result<(), Error> {
-        let checks = [
+        let required = [
             ("cpu", self.cpu),
-            ("lt", self.lt),
-            ("memw", self.memw),
-            ("memw_aligned", self.memw_aligned),
-            ("load", self.load),
-            ("mul", self.mul),
-            ("dvrm", self.dvrm),
-            ("shift", self.shift),
             ("branch", self.branch),
             ("memw_register", self.memw_register),
         ];
-        for (name, count) in checks {
+        for (name, count) in required {
             if count == 0 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is 0 — every table must have at least 1 chunk"
+                    "{name} count is 0 — required table must have at least 1 chunk"
                 )));
             }
         }
@@ -329,19 +323,19 @@ impl VmAirs {
             )
         };
         let lts: Vec<_> = (0..table_counts.lt)
-            .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
+            .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{i}]")))
             .collect();
         let shifts: Vec<_> = (0..table_counts.shift)
-            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{i}]")))
             .collect();
         let memws: Vec<_> = (0..table_counts.memw)
-            .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
+            .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{i}]")))
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
-            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
+            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{i}]")))
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
-            .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
+            .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{i}]")))
             .collect();
         let decode = create_decode_air(proof_options).with_preprocessed(
             decode::commitment_from_elf(elf, proof_options)

@@ -1629,6 +1629,7 @@ pub struct Traces {
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
+/// Returns a non-empty Vec even when `ops` is empty (generates one dummy table).
 fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
@@ -1636,6 +1637,20 @@ fn chunk_and_generate<T>(
 ) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
     if ops.is_empty() {
         vec![generate(&[])]
+    } else {
+        ops.chunks(max_rows).map(generate).collect()
+    }
+}
+
+/// Like [`chunk_and_generate`] but returns an empty Vec when `ops` is empty.
+/// Used for optional tables that can be omitted entirely when unused.
+fn chunk_and_generate_optional<T>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if ops.is_empty() {
+        vec![]
     } else {
         ops.chunks(max_rows).map(generate).collect()
     }
@@ -1929,8 +1944,9 @@ impl Traces {
         let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let memw_aligneds = chunk_and_generate(
+        let memws =
+            chunk_and_generate_optional(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate_optional(
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
@@ -1940,11 +1956,14 @@ impl Traces {
             max_rows.memw_register,
             memw_register::generate_memw_register_trace,
         );
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let loads =
+            chunk_and_generate_optional(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate_optional(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts =
+            chunk_and_generate_optional(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let muls = chunk_and_generate_optional(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms =
+            chunk_and_generate_optional(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
             chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
@@ -2172,8 +2191,9 @@ impl Traces {
         let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let memw_aligneds = chunk_and_generate(
+        let memws =
+            chunk_and_generate_optional(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate_optional(
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
@@ -2183,11 +2203,14 @@ impl Traces {
             max_rows.memw_register,
             memw_register::generate_memw_register_trace,
         );
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let loads =
+            chunk_and_generate_optional(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate_optional(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts =
+            chunk_and_generate_optional(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let muls = chunk_and_generate_optional(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms =
+            chunk_and_generate_optional(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
             chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
