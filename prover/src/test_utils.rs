@@ -712,6 +712,99 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::tables::mul::cols;
+        use crate::tables::types::GoldilocksExtension;
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+        let sign_fill = FieldElement::<GoldilocksExtension>::from(0xFFFFu64);
+        let shift_16 = FieldElement::<GoldilocksExtension>::from(65536u64);
+
+        let lhs_signed = builder.main(0, cols::LHS_SIGNED);
+        let rhs_signed = builder.main(0, cols::RHS_SIGNED);
+        let lhs_is_neg = builder.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = builder.main(0, cols::RHS_IS_NEGATIVE);
+
+        // Constraint 0: LhsSign -- (1 - lhs_signed) * lhs_is_negative == 0
+        builder.assert_zero((&one - &lhs_signed) * &lhs_is_neg);
+
+        // Constraint 1: RhsSign -- (1 - rhs_signed) * rhs_is_negative == 0
+        builder.assert_zero((&one - &rhs_signed) * &rhs_is_neg);
+
+        // Build lhs_ext[0..8] and rhs_ext[0..8]
+        let lhs = [
+            builder.main(0, cols::LHS_0),
+            builder.main(0, cols::LHS_1),
+            builder.main(0, cols::LHS_2),
+            builder.main(0, cols::LHS_3),
+        ];
+        let rhs = [
+            builder.main(0, cols::RHS_0),
+            builder.main(0, cols::RHS_1),
+            builder.main(0, cols::RHS_2),
+            builder.main(0, cols::RHS_3),
+        ];
+
+        // lhs_ext[0..4] = lhs halfwords, lhs_ext[4..8] = SIGN_FILL * lhs_is_negative
+        let lhs_sign_ext = &sign_fill * &lhs_is_neg;
+        let lhs_ext = [
+            lhs[0].clone(),
+            lhs[1].clone(),
+            lhs[2].clone(),
+            lhs[3].clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+        ];
+
+        // rhs_ext[0..4] = rhs halfwords, rhs_ext[4..8] = SIGN_FILL * rhs_is_negative
+        let rhs_sign_ext = &sign_fill * &rhs_is_neg;
+        let rhs_ext = [
+            rhs[0].clone(),
+            rhs[1].clone(),
+            rhs[2].clone(),
+            rhs[3].clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+        ];
+
+        let raw_product_cols = [
+            cols::RAW_PRODUCT_0,
+            cols::RAW_PRODUCT_1,
+            cols::RAW_PRODUCT_2,
+            cols::RAW_PRODUCT_3,
+        ];
+
+        // Constraints 2-5: RawProduct(i) for i in 0..4
+        // raw_product[i] = sum_{k=0}^{1} 2^(16k) * sum_{j=0}^{2i+k} lhs_ext[j] * rhs_ext[2i+k-j]
+        for i in 0..4 {
+            let mut sum = FieldElement::<GoldilocksExtension>::zero();
+
+            for k in 0usize..=1 {
+                let idx = 2 * i + k;
+                if idx < 8 {
+                    let mut inner_sum = FieldElement::<GoldilocksExtension>::zero();
+                    for j in 0..=idx {
+                        if j < 8 && (idx - j) < 8 {
+                            inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                        }
+                    }
+                    if k == 0 {
+                        sum = &sum + &inner_sum;
+                    } else {
+                        sum = &sum + &(&inner_sum * &shift_16);
+                    }
+                }
+            }
+
+            let raw_product = builder.main(0, raw_product_cols[i]);
+            builder.assert_zero(raw_product - sum);
+        }
+    })
     .with_name("MUL")
 }
 
