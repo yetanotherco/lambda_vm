@@ -1052,14 +1052,19 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleRead
         match evaluation_context {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let pc_double_read = step
+                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+                    .clone();
                 let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
                 let val_255 = FieldElement::<GoldilocksField>::from(255u64);
-                transition_evaluations[self.idx] = (&pc_double_read * (rs1 - val_255)).to_extension();
+                transition_evaluations[self.idx] =
+                    (&pc_double_read * (rs1 - val_255)).to_extension();
             }
             TransitionEvaluationContext::Verifier { frame, .. } => {
                 let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let pc_double_read = step
+                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+                    .clone();
                 let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
                 let val_255 = FieldElement::<GoldilocksExtension>::from(255u64);
                 transition_evaluations[self.idx] = &pc_double_read * (rs1 - val_255);
@@ -1097,14 +1102,22 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleRead
         match evaluation_context {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                let pc_double_read = step
+                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+                    .clone();
+                let borrow = step
+                    .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
+                    .clone();
                 transition_evaluations[self.idx] = (&pc_double_read * borrow).to_extension();
             }
             TransitionEvaluationContext::Verifier { frame, .. } => {
                 let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                let pc_double_read = step
+                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+                    .clone();
+                let borrow = step
+                    .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
+                    .clone();
                 transition_evaluations[self.idx] = &pc_double_read * borrow;
             }
         }

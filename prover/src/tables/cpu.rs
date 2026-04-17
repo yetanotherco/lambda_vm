@@ -1742,39 +1742,97 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // Non-padding multiplicity: sum of all ALU selector flags
     let non_pad_mult = Multiplicity::Linear(vec![
-        LinearTerm::Column { coefficient: 1, column: cols::ADD },
-        LinearTerm::Column { coefficient: 1, column: cols::SUB },
-        LinearTerm::Column { coefficient: 1, column: cols::SLT },
-        LinearTerm::Column { coefficient: 1, column: cols::AND },
-        LinearTerm::Column { coefficient: 1, column: cols::OR },
-        LinearTerm::Column { coefficient: 1, column: cols::XOR },
-        LinearTerm::Column { coefficient: 1, column: cols::SHIFT },
-        LinearTerm::Column { coefficient: 1, column: cols::JALR },
-        LinearTerm::Column { coefficient: 1, column: cols::BEQ },
-        LinearTerm::Column { coefficient: 1, column: cols::BLT },
-        LinearTerm::Column { coefficient: 1, column: cols::LOAD },
-        LinearTerm::Column { coefficient: 1, column: cols::STORE },
-        LinearTerm::Column { coefficient: 1, column: cols::MUL },
-        LinearTerm::Column { coefficient: 1, column: cols::DIVREM },
-        LinearTerm::Column { coefficient: 1, column: cols::ECALL },
-        LinearTerm::Column { coefficient: 1, column: cols::EBREAK },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::ADD,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SUB,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SLT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::AND,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::OR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::XOR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SHIFT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::JALR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BEQ,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BLT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::LOAD,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::STORE,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MUL,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::DIVREM,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::ECALL,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::EBREAK,
+        },
     ]);
 
     // prev_ts_lo = timestamp - 3*(1 - pc_double_read) + 2^32 * borrow
     //            = timestamp - 3 + 3*pc_double_read + 2^32 * borrow
     let prev_ts_lo = BusValue::linear(vec![
-        LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::TIMESTAMP,
+        },
         LinearTerm::Constant(-3),
-        LinearTerm::Column { coefficient: 3, column: cols::PC_DOUBLE_READ },
-        LinearTerm::Column { coefficient: 1i64 << 32, column: cols::PREV_PC_TIMESTAMP_BORROW },
+        LinearTerm::Column {
+            coefficient: 3,
+            column: cols::PC_DOUBLE_READ,
+        },
+        LinearTerm::Column {
+            coefficient: 1i64 << 32,
+            column: cols::PREV_PC_TIMESTAMP_BORROW,
+        },
     ]);
 
     // prev_ts_hi = 0 - borrow
     // The -1 cancels the +2^32 added to prev_ts_lo when borrow fires, keeping the
     // 64-bit timestamp correct: (prev_ts_hi * 2^32 + prev_ts_lo) = timestamp - 3.
-    let prev_ts_hi = BusValue::linear(vec![
-        LinearTerm::Column { coefficient: -1, column: cols::PREV_PC_TIMESTAMP_BORROW },
-    ]);
+    let prev_ts_hi = BusValue::linear(vec![LinearTerm::Column {
+        coefficient: -1,
+        column: cols::PREV_PC_TIMESTAMP_BORROW,
+    }]);
 
     for i in 0..2u64 {
         // PC read (sender, +1): consume old token
@@ -1805,12 +1863,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(510 + i),
                 BusValue::constant(0),
                 BusValue::linear(vec![
-                    LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::TIMESTAMP,
+                    },
                     LinearTerm::Constant(1),
                 ]),
                 BusValue::constant(0),
                 BusValue::Packed {
-                    start_column: if i == 0 { cols::NEXT_PC_0 } else { cols::NEXT_PC_1 },
+                    start_column: if i == 0 {
+                        cols::NEXT_PC_0
+                    } else {
+                        cols::NEXT_PC_1
+                    },
                     packing: Packing::Direct,
                 },
             ],
