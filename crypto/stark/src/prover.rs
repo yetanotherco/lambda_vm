@@ -358,20 +358,6 @@ pub trait IsStarkProver<
     FieldElement<Field>: math::traits::WriteBytes,
     FieldElement<FieldExtension>: math::traits::WriteBytes,
 {
-    /// Returns the Merkle tree and the commitment to the vectors `vectors`.
-    fn batch_commit_extension(
-        vectors: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let tree = BatchedMerkleTree::build(vectors)?;
-
-        let commitment = tree.root;
-        Some((tree, commitment))
-    }
-
     /// Builds a Merkle tree commitment from column-major LDE evaluations with
     /// bit-reverse permutation, without cloning the full evaluation matrix.
     ///
@@ -402,8 +388,8 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
-        // Zero per-element heap allocations: write bytes directly from columns
-        // into a per-row buffer, then hash once.
+        // One allocation per row (was one per field element): write all columns
+        // into a single buffer, then hash once.
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
@@ -727,8 +713,8 @@ pub trait IsStarkProver<
 
         let byte_len = <FieldElement<FieldExtension> as WriteBytes>::BYTE_LEN;
 
-        // Zero per-element allocations: write bytes directly from column data.
-        // Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
+        // One allocation per leaf (was one per field element): write all parts
+        // into a single buffer. Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
         #[cfg(feature = "parallel")]
         let iter = (0..num_leaves).into_par_iter();
         #[cfg(not(feature = "parallel"))]
