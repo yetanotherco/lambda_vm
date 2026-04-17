@@ -67,7 +67,7 @@ The #keccak_rnd chip is comprised of #nr_variables variables that are expressed 
 
 #strong("Note on " + raw("start") + ".")
 `start` contains the state to which the permutation should be applied.
-It's three-dimensional array mimics the specification's three-dimensional state
+Its three-dimensional array mimics the specification's three-dimensional state
 #footnote("FIPS 202, NIST, Section 3.1 (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
 and orders the bits as prescribed.
 #footnote("FIPS 202, NIST, Section B.1, Algorithm 10 (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
