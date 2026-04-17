@@ -31,7 +31,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, Commitment};
+use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -373,7 +373,6 @@ pub trait IsStarkProver<
         E: IsField,
     {
         use math::traits::WriteBytes;
-        use sha3::Digest;
 
         if columns.is_empty() || columns[0].is_empty() {
             return None;
@@ -382,6 +381,11 @@ pub trait IsStarkProver<
         let num_rows = columns[0].len();
         let num_cols = columns.len();
         let byte_len = <FieldElement<E> as WriteBytes>::BYTE_LEN;
+
+        debug_assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index"
+        );
 
         #[cfg(feature = "parallel")]
         let iter = (0..num_rows).into_par_iter();
@@ -399,9 +403,7 @@ pub trait IsStarkProver<
                     columns[col_idx][br_idx]
                         .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
                 }
-                let mut hasher = sha3::Keccak256::new();
-                hasher.update(&buf);
-                hasher.finalize().into()
+                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
             })
             .collect();
 
@@ -694,7 +696,6 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::WriteBytes,
     {
         use math::traits::WriteBytes;
-        use sha3::Digest;
 
         let num_parts = lde_composition_poly_parts_evaluations.len();
         if num_parts == 0 {
@@ -735,9 +736,7 @@ pub trait IsStarkProver<
                     part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
                     offset += byte_len;
                 }
-                let mut hasher = sha3::Keccak256::new();
-                hasher.update(&buf);
-                hasher.finalize().into()
+                BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(&buf)
             })
             .collect();
 
