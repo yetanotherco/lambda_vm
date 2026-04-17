@@ -11,8 +11,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+OUT_DIR="/tmp/bench_timing_profile"
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"
 ELF_DIR="$ROOT_DIR/executor/program_artifacts/asm"
 
 GREEN='\033[0;32m'
@@ -92,12 +93,12 @@ for size in $PROGRAMS; do
     steps=$(suffix_to_steps "$size")
     echo -e "${GREEN}Running fib_iterative_${size}...${NC}"
 
-    STDERR="$TMP_DIR/${size}_stderr.txt"
-    "$CLI" prove "$ELF" -o "$TMP_DIR/proof.bin" 2>"$STDERR" >/dev/null
-    rm -f "$TMP_DIR/proof.bin"
+    STDERR="$OUT_DIR/${size}_stderr.txt"
+    "$CLI" prove "$ELF" -o "$OUT_DIR/proof.bin" 2>"$STDERR" >/dev/null
+    rm -f "$OUT_DIR/proof.bin"
 
-    echo "steps=$steps" > "$TMP_DIR/${size}_data.txt"
-    parse_timing "$STDERR" >> "$TMP_DIR/${size}_data.txt"
+    echo "steps=$steps" > "$OUT_DIR/${size}_data.txt"
+    parse_timing "$STDERR" >> "$OUT_DIR/${size}_data.txt"
 done
 
 # --- Display ---------------------------------------------------------------
@@ -123,7 +124,7 @@ print_section() {
         local key="${spec#*:}"
         printf "  %-30s" "$label"
         for size in $PROGRAMS; do
-            local DATA="$TMP_DIR/${size}_data.txt"
+            local DATA="$OUT_DIR/${size}_data.txt"
             local val
             val=$(get_val "$DATA" "$key")
             if [ -n "$val" ]; then
@@ -141,6 +142,7 @@ echo -e "${BOLD}=== TIMING PROFILE ACROSS SIZES ===${NC}"
 
 TABLE_K="${TABLE_PARALLELISM:-default (cores/3)}"
 echo -e "  TABLE_PARALLELISM=$TABLE_K"
+echo -e "  Results saved to: $OUT_DIR"
 
 print_section "Phase (wall time)" \
     "TOTAL:total" \
@@ -197,7 +199,7 @@ do
 
     PAIRS=""
     for size in $PROGRAMS; do
-        DATA="$TMP_DIR/${size}_data.txt"
+        DATA="$OUT_DIR/${size}_data.txt"
         [ -f "$DATA" ] || continue
         steps=$(get_val "$DATA" "steps")
         val=$(get_val "$DATA" "$key")
