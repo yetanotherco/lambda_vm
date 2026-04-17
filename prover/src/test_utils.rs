@@ -1008,6 +1008,152 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::dvrm::cols;
+        use crate::tables::types::{GoldilocksExtension, SHIFT_16};
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+        let shift_16 = FieldElement::<GoldilocksExtension>::from(SHIFT_16);
+        let inv_2_32 = FieldElement::<GoldilocksExtension>::from(INV_SHIFT_32);
+        let sign_fill = FieldElement::<GoldilocksExtension>::from(0xFFFFu64);
+
+        // Load all columns used across constraints
+        let signed = builder.main(0, cols::SIGNED);
+        let sign_n = builder.main(0, cols::SIGN_N);
+        let sign_d = builder.main(0, cols::SIGN_D);
+        let sign_r = builder.main(0, cols::SIGN_R);
+        let sign_q = builder.main(0, cols::SIGN_Q);
+        let sign_nsr = builder.main(0, cols::SIGN_N_SUB_R);
+        let overflow = builder.main(0, cols::OVERFLOW);
+        let div_by_zero = builder.main(0, cols::DIV_BY_ZERO);
+
+        let r0 = builder.main(0, cols::R_0);
+        let r1 = builder.main(0, cols::R_1);
+        let r2 = builder.main(0, cols::R_2);
+        let r3 = builder.main(0, cols::R_3);
+
+        let d0 = builder.main(0, cols::D_0);
+        let d1 = builder.main(0, cols::D_1);
+        let d2 = builder.main(0, cols::D_2);
+        let d3 = builder.main(0, cols::D_3);
+
+        let n0 = builder.main(0, cols::N_0);
+        let n1 = builder.main(0, cols::N_1);
+        let n2 = builder.main(0, cols::N_2);
+        let n3 = builder.main(0, cols::N_3);
+
+        let q0 = builder.main(0, cols::Q_0);
+        let q1 = builder.main(0, cols::Q_1);
+        let q2 = builder.main(0, cols::Q_2);
+        let q3 = builder.main(0, cols::Q_3);
+
+        let nsr0 = builder.main(0, cols::N_SUB_R_0);
+        let nsr1 = builder.main(0, cols::N_SUB_R_1);
+        let nsr2 = builder.main(0, cols::N_SUB_R_2);
+        let nsr3 = builder.main(0, cols::N_SUB_R_3);
+
+        let abs_r0 = builder.main(0, cols::ABS_R_0);
+        let abs_r1 = builder.main(0, cols::ABS_R_1);
+        let abs_d0 = builder.main(0, cols::ABS_D_0);
+        let abs_d1 = builder.main(0, cols::ABS_D_1);
+
+        // Constraint 0: DVRM-A3: signed * (1 - signed) = 0
+        assert_is_bit(builder, signed.clone());
+
+        // Constraint 1: DVRM-C1: (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n) = 0
+        let r_sum = &r0 + &r1 + &r2 + &r3;
+        builder.assert_zero(&r_sum * (&sign_r - &sign_n));
+
+        // Constraint 2: DVRM-C4.0: (1-sign_r) * (abs_r[0] - r::DWordWL[0]) = 0
+        // r::DWordWL[0] = r[0] + r[1]*2^16
+        let r_wl_0 = &r0 + &r1 * &shift_16;
+        builder.assert_zero((&one - &sign_r) * (&abs_r0 - &r_wl_0));
+
+        // Constraint 3: DVRM-C4.1: (1-sign_r) * (abs_r[1] - r::DWordWL[1]) = 0
+        // r::DWordWL[1] = r[2] + r[3]*2^16
+        let r_wl_1 = &r2 + &r3 * &shift_16;
+        builder.assert_zero((&one - &sign_r) * (&abs_r1 - &r_wl_1));
+
+        // Constraint 4: DVRM-C6.0: (1-sign_d) * (abs_d[0] - d::DWordWL[0]) = 0
+        let d_wl_0 = &d0 + &d1 * &shift_16;
+        builder.assert_zero((&one - &sign_d) * (&abs_d0 - &d_wl_0));
+
+        // Constraint 5: DVRM-C6.1: (1-sign_d) * (abs_d[1] - d::DWordWL[1]) = 0
+        let d_wl_1 = &d2 + &d3 * &shift_16;
+        builder.assert_zero((&one - &sign_d) * (&abs_d1 - &d_wl_1));
+
+        // Constraint 6: DVRM-C7: signed * (1-overflow) - sign_q = 0
+        builder.assert_zero(&signed * (&one - &overflow) - &sign_q);
+
+        // Constraints 7-10: DVRM-C12.i: carry[i] * (1 - carry[i]) = 0
+        // Build sign-extended QuadWL representations for n, r, n_sub_r
+        let sign_fill_word = &sign_fill + &sign_fill * &shift_16;
+
+        // ext_n: [n0+n1*2^16, n2+n3*2^16, sign_n*0xFFFFFFFF, sign_n*0xFFFFFFFF]
+        let ext_n = [
+            &n0 + &n1 * &shift_16,
+            &n2 + &n3 * &shift_16,
+            &sign_n * &sign_fill_word,
+            &sign_n * &sign_fill_word,
+        ];
+
+        // ext_r: [r0+r1*2^16, r2+r3*2^16, sign_r*0xFFFFFFFF, sign_r*0xFFFFFFFF]
+        let ext_r = [
+            r_wl_0,
+            r_wl_1,
+            &sign_r * &sign_fill_word,
+            &sign_r * &sign_fill_word,
+        ];
+
+        // ext_nsr: [nsr0+nsr1*2^16, nsr2+nsr3*2^16, sign_nsr*0xFFFFFFFF, sign_nsr*0xFFFFFFFF]
+        let ext_nsr = [
+            &nsr0 + &nsr1 * &shift_16,
+            &nsr2 + &nsr3 * &shift_16,
+            &sign_nsr * &sign_fill_word,
+            &sign_nsr * &sign_fill_word,
+        ];
+
+        // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) * inv_2_32
+        let carry_0 = (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32;
+        // Constraint 7: carry[0] * (1 - carry[0]) = 0
+        builder.assert_zero(carry_0.clone() * (&one - &carry_0));
+
+        // carry[1] = (ext_nsr[1] + ext_r[1] + carry[0] - ext_n[1]) * inv_2_32
+        let carry_1 = (&ext_nsr[1] + &ext_r[1] + &carry_0 - &ext_n[1]) * &inv_2_32;
+        // Constraint 8: carry[1] * (1 - carry[1]) = 0
+        builder.assert_zero(carry_1.clone() * (&one - &carry_1));
+
+        // carry[2] = (ext_nsr[2] + ext_r[2] + carry[1] - ext_n[2]) * inv_2_32
+        let carry_2 = (&ext_nsr[2] + &ext_r[2] + &carry_1 - &ext_n[2]) * &inv_2_32;
+        // Constraint 9: carry[2] * (1 - carry[2]) = 0
+        builder.assert_zero(carry_2.clone() * (&one - &carry_2));
+
+        // carry[3] = (ext_nsr[3] + ext_r[3] + carry[2] - ext_n[3]) * inv_2_32
+        let carry_3 = (&ext_nsr[3] + &ext_r[3] + &carry_2 - &ext_n[3]) * &inv_2_32;
+        // Constraint 10: carry[3] * (1 - carry[3]) = 0
+        builder.assert_zero(carry_3.clone() * (&one - &carry_3));
+
+        // Constraint 11: DVRM-C15: sign_n_sub_r * (1 - sign_n_sub_r) = 0
+        assert_is_bit(builder, sign_nsr);
+
+        // Constraint 12: DVRM-C18b: (1-signed) * sign_n = 0
+        builder.assert_zero((&one - &signed) * &sign_n);
+
+        // Constraint 13: DVRM-C19b: (1-signed) * sign_r = 0
+        builder.assert_zero((&one - &signed) * &sign_r);
+
+        // Constraint 14: DVRM-C20b: (1-signed) * sign_d = 0
+        builder.assert_zero((&one - &signed) * &sign_d);
+
+        // Constraints 15-18: DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
+        let q_cols = [q0, q1, q2, q3];
+        for q_val in &q_cols {
+            builder.assert_zero(&div_by_zero * (q_val - &sign_fill));
+        }
+    })
     .with_name("DVRM")
 }
 
