@@ -1671,43 +1671,64 @@ impl Traces {
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
 
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
         let mut total: u64 = 0;
-        for t in &self.cpus {
+        for t in cpus {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
-        total += (self.bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
-        for t in &self.lts {
+        total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        for t in lts {
             total += (t.num_rows() * LT_COLS) as u64;
         }
-        for t in &self.shifts {
+        for t in shifts {
             total += (t.num_rows() * SHIFT_COLS) as u64;
         }
-        for t in &self.memws {
+        for t in memws {
             total += (t.num_rows() * MEMW_COLS) as u64;
         }
-        for t in &self.memw_aligneds {
+        for t in memw_aligneds {
             total += (t.num_rows() * MEMW_A_COLS) as u64;
         }
-        for t in &self.loads {
+        for t in loads {
             total += (t.num_rows() * LOAD_COLS) as u64;
         }
-        total += (self.decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
-        for t in &self.muls {
+        total += (decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
+        for t in muls {
             total += (t.num_rows() * MUL_COLS) as u64;
         }
-        for t in &self.dvrms {
+        for t in dvrms {
             total += (t.num_rows() * DVRM_COLS) as u64;
         }
-        for t in &self.branches {
+        for t in branches {
             total += (t.num_rows() * BRANCH_COLS) as u64;
         }
-        total += (self.halt.num_rows() * HALT_COLS) as u64;
-        total += (self.commit.num_rows() * COMMIT_COLS) as u64;
-        total += (self.register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
-        for t in &self.pages {
+        total += (halt.num_rows() * HALT_COLS) as u64;
+        total += (commit.num_rows() * COMMIT_COLS) as u64;
+        total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
+        for t in pages {
             total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
         }
-        for t in &self.memw_registers {
+        for t in memw_registers {
             total += (t.num_rows() * MEMW_R_COLS) as u64;
         }
         total
@@ -1743,43 +1764,64 @@ impl Traces {
         let n_page = aux_cols(super::page::bus_interactions(0).len());
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
 
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
         let mut total: u64 = 0;
-        for t in &self.cpus {
+        for t in cpus {
             total += (t.num_rows() * n_cpu) as u64;
         }
-        total += (self.bitwise.num_rows() * n_bitwise) as u64;
-        for t in &self.lts {
+        total += (bitwise.num_rows() * n_bitwise) as u64;
+        for t in lts {
             total += (t.num_rows() * n_lt) as u64;
         }
-        for t in &self.shifts {
+        for t in shifts {
             total += (t.num_rows() * n_shift) as u64;
         }
-        for t in &self.memws {
+        for t in memws {
             total += (t.num_rows() * n_memw) as u64;
         }
-        for t in &self.memw_aligneds {
+        for t in memw_aligneds {
             total += (t.num_rows() * n_memw_a) as u64;
         }
-        for t in &self.loads {
+        for t in loads {
             total += (t.num_rows() * n_load) as u64;
         }
-        total += (self.decode.num_rows() * n_decode) as u64;
-        for t in &self.muls {
+        total += (decode.num_rows() * n_decode) as u64;
+        for t in muls {
             total += (t.num_rows() * n_mul) as u64;
         }
-        for t in &self.dvrms {
+        for t in dvrms {
             total += (t.num_rows() * n_dvrm) as u64;
         }
-        for t in &self.branches {
+        for t in branches {
             total += (t.num_rows() * n_branch) as u64;
         }
-        total += (self.halt.num_rows() * n_halt) as u64;
-        total += (self.commit.num_rows() * n_commit) as u64;
-        total += (self.register.num_rows() * n_register) as u64;
-        for t in &self.pages {
+        total += (halt.num_rows() * n_halt) as u64;
+        total += (commit.num_rows() * n_commit) as u64;
+        total += (register.num_rows() * n_register) as u64;
+        for t in pages {
             total += (t.num_rows() * n_page) as u64;
         }
-        for t in &self.memw_registers {
+        for t in memw_registers {
             total += (t.num_rows() * n_memw_r) as u64;
         }
         total
