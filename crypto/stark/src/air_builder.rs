@@ -7,26 +7,28 @@ use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 ///
 /// Constraints call `assert_zero(expr)` which internally accumulates
 /// alpha^i * expr into a running sum. No intermediate buffer, no vtable dispatch.
-pub trait AirBuilder {
-    type F: IsField;
-
+///
+/// Parameterized by field type `F` (not an associated type) so that `dyn AirBuilder<F>`
+/// is object-safe. This allows the AIR trait to remain dyn-compatible while supporting
+/// the builder pattern: `eval_constraints(&self, builder: &mut dyn AirBuilder<E>)`.
+pub trait AirBuilder<F: IsField> {
     /// Read main trace column at (row_offset, col). offset=0 is current row.
-    fn main(&self, offset: usize, col: usize) -> FieldElement<Self::F>;
+    fn main(&self, offset: usize, col: usize) -> FieldElement<F>;
 
     /// Read aux trace column at (row_offset, col).
-    fn aux(&self, offset: usize, col: usize) -> FieldElement<Self::F>;
+    fn aux(&self, offset: usize, col: usize) -> FieldElement<F>;
 
     /// Assert expr == 0. Internally: accumulator += alpha^constraint_idx * expr.
-    fn assert_zero(&mut self, expr: FieldElement<Self::F>);
+    fn assert_zero(&mut self, expr: FieldElement<F>);
 
     /// RAP challenge by index.
-    fn challenge(&self, idx: usize) -> &FieldElement<Self::F>;
+    fn challenge(&self, idx: usize) -> &FieldElement<F>;
 
     /// Pre-computed LogUp alpha powers.
-    fn logup_alpha_power(&self, idx: usize) -> &FieldElement<Self::F>;
+    fn logup_alpha_power(&self, idx: usize) -> &FieldElement<F>;
 
     /// LogUp table offset (L/N).
-    fn logup_table_offset(&self) -> &FieldElement<Self::F>;
+    fn logup_table_offset(&self) -> &FieldElement<F>;
 }
 
 pub struct ProverBuilder<'a, F: IsSubFieldOf<E> + IsFFTField, E: IsField> {
@@ -74,13 +76,11 @@ where
     }
 }
 
-impl<'a, F, E> AirBuilder for ProverBuilder<'a, F, E>
+impl<'a, F, E> AirBuilder<E> for ProverBuilder<'a, F, E>
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    type F = E;
-
     #[inline]
     fn main(&self, offset: usize, col: usize) -> FieldElement<E> {
         let lde_row = (self.row + offset * self.step_size) % self.num_rows;
@@ -146,9 +146,7 @@ impl<'a, E: IsField> VerifierBuilder<'a, E> {
     }
 }
 
-impl<'a, E: IsField> AirBuilder for VerifierBuilder<'a, E> {
-    type F = E;
-
+impl<'a, E: IsField> AirBuilder<E> for VerifierBuilder<'a, E> {
     #[inline]
     fn main(&self, offset: usize, col: usize) -> FieldElement<E> {
         self.frame

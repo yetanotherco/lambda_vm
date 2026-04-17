@@ -258,10 +258,13 @@ pub trait AIR: Send + Sync {
 
     /// Evaluate all transition constraints using the AirBuilder pattern.
     /// Override this (and uses_builder -> true) to use fused alpha combination.
-    fn eval_constraints_with_builder<AB: crate::air_builder::AirBuilder>(&self, _builder: &mut AB)
-    where
-        Self: Sized,
-    {
+    ///
+    /// Uses `&mut dyn AirBuilder<E>` (object-safe) so this method is dyn-compatible
+    /// and callable through `&dyn AIR` in the evaluator and verifier.
+    fn eval_constraints_with_builder(
+        &self,
+        _builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
+    ) {
         unimplemented!("Override eval_constraints_with_builder and uses_builder for this AIR")
     }
 
