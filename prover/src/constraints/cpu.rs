@@ -1033,6 +1033,19 @@ impl PcDoubleReadRs1Constraint {
     pub fn new(idx: usize) -> Self {
         Self { idx }
     }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let pc_double_read = step
+            .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+            .clone();
+        let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
+        let val_255 = FieldElement::<F>::from(255u64);
+        pc_double_read * (rs1 - val_255)
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadRs1Constraint {
@@ -1044,32 +1057,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleRead
         self.idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step
-                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-                    .clone();
-                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
-                let val_255 = FieldElement::<GoldilocksField>::from(255u64);
-                transition_evaluations[self.idx] =
-                    (&pc_double_read * (rs1 - val_255)).to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step
-                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-                    .clone();
-                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
-                let val_255 = FieldElement::<GoldilocksExtension>::from(255u64);
-                transition_evaluations[self.idx] = &pc_double_read * (rs1 - val_255);
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
@@ -1083,6 +1076,20 @@ impl PcDoubleReadBorrowConstraint {
     pub fn new(idx: usize) -> Self {
         Self { idx }
     }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let pc_double_read = step
+            .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
+            .clone();
+        let borrow = step
+            .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
+            .clone();
+        pc_double_read * borrow
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadBorrowConstraint {
@@ -1094,33 +1101,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleRead
         self.idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step
-                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-                    .clone();
-                let borrow = step
-                    .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
-                    .clone();
-                transition_evaluations[self.idx] = (&pc_double_read * borrow).to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step
-                    .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-                    .clone();
-                let borrow = step
-                    .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
-                    .clone();
-                transition_evaluations[self.idx] = &pc_double_read * borrow;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
@@ -1252,9 +1238,9 @@ pub fn create_all_cpu_constraints() -> (
     next_idx += 2;
 
     // Inline PC constraints
-    other.push(Box::new(PcDoubleReadRs1Constraint::new(next_idx)));
+    other.push(PcDoubleReadRs1Constraint::new(next_idx).boxed());
     next_idx += 1;
-    other.push(Box::new(PcDoubleReadBorrowConstraint::new(next_idx)));
+    other.push(PcDoubleReadBorrowConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     (is_bit, add_constraints, other, next_idx)
