@@ -136,7 +136,8 @@ enum Commands {
         #[arg(long)]
         cycles: bool,
 
-        /// Build traces and print total main-trace field elements (rows × columns summed across all tables)
+        /// Build traces and print total main-trace field elements (rows × columns summed across
+        /// all tables) and aux-trace field elements (committed EF columns × rows)
         #[arg(long)]
         elements: bool,
     },
@@ -160,7 +161,7 @@ enum Commands {
         time: bool,
     },
 
-    /// Count main-trace field elements (rows × columns, summed across all tables) without proving
+    /// Count main-trace and aux-trace field elements without proving
     CountElements {
         /// Path to the ELF file
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
