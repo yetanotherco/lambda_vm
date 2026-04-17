@@ -541,6 +541,114 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+        use crate::tables::shift::cols;
+        use crate::tables::types::{GoldilocksExtension, SHIFT_16};
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+        let shift_16_val = FieldElement::<GoldilocksExtension>::from(SHIFT_16);
+
+        let mu = builder.main(0, cols::MU);
+        let direction = builder.main(0, cols::DIRECTION);
+        let zbs = builder.main(0, cols::ZBS);
+        let is_negative = builder.main(0, cols::IS_NEGATIVE);
+        let left = &mu - &direction;
+
+        // Constraint 0: DirectionImpliesMu -- direction * (1 - mu) = 0
+        builder.assert_zero(&direction * (&one - &mu));
+
+        // Constraints 1-4: ZbsOverrideX(0..4) -- zbs * (X[i] - in[i] * left) = 0
+        for i in 0..4 {
+            let x_i = builder.main(0, cols::X[i]);
+            let in_i = builder.main(0, cols::IN[i]);
+            builder.assert_zero(&zbs * (x_i - in_i * &left));
+        }
+
+        // Constraint 5: ZbsOverrideX4 -- zbs * X[4] = 0
+        let x4 = builder.main(0, cols::X_4);
+        builder.assert_zero(&zbs * x4);
+
+        // Constraints 6-9: ZbsOverrideY(0..4) -- zbs * (Y[i] - in[i] * right) = 0
+        for i in 0..4 {
+            let y_i = builder.main(0, cols::Y[i]);
+            let in_i = builder.main(0, cols::IN[i]);
+            builder.assert_zero(&zbs * (y_i - in_i * &direction));
+        }
+
+        // Constraints 10-13: LimbShiftIsBit(0..4)
+        for i in 0..3 {
+            let ls = builder.main(0, cols::LIMB_SHIFT_RAW[i]);
+            assert_is_bit(builder, ls);
+        }
+        // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+        let ls_raw_0 = builder.main(0, cols::LIMB_SHIFT_RAW[0]);
+        let ls_raw_1 = builder.main(0, cols::LIMB_SHIFT_RAW[1]);
+        let ls_raw_2 = builder.main(0, cols::LIMB_SHIFT_RAW[2]);
+        let ls_3 = &one - &ls_raw_0 - &ls_raw_1 - &ls_raw_2;
+        assert_is_bit(builder, ls_3.clone());
+
+        // Constraints 14-15: OutputMatchesShifted(0..2)
+        // Extension = 65535 * is_negative
+        let extension = FieldElement::<GoldilocksExtension>::from(65535u64) * &is_negative;
+
+        let x = [
+            builder.main(0, cols::X[0]),
+            builder.main(0, cols::X[1]),
+            builder.main(0, cols::X[2]),
+            builder.main(0, cols::X[3]),
+            builder.main(0, cols::X[4]),
+        ];
+        let y = [
+            builder.main(0, cols::Y[0]),
+            builder.main(0, cols::Y[1]),
+            builder.main(0, cols::Y[2]),
+            builder.main(0, cols::Y[3]),
+        ];
+
+        let ls = [ls_raw_0, ls_raw_1, ls_raw_2, ls_3];
+
+        let mut shifted = Vec::with_capacity(4);
+        for i in 0..4usize {
+            let mut left_part = FieldElement::<GoldilocksExtension>::zero();
+            for j in 0..=i {
+                let k = i - j;
+                let intra_left_k = if k == 0 {
+                    x[0].clone()
+                } else {
+                    &x[k] + &y[k - 1]
+                };
+                left_part = left_part + &ls[j] * intra_left_k;
+            }
+            left_part = &left * left_part;
+
+            let mut right_shift_part = FieldElement::<GoldilocksExtension>::zero();
+            for j in 0..=(3 - i) {
+                let k = i + j;
+                let intra_right_k = &y[k] + &x[k + 1];
+                right_shift_part = right_shift_part + &ls[j] * intra_right_k;
+            }
+
+            let mut ext_sum = FieldElement::<GoldilocksExtension>::zero();
+            for j in (4 - i)..4 {
+                ext_sum = ext_sum + &ls[j];
+            }
+            let right_ext_part = &extension * ext_sum;
+
+            let right_part = &direction * (right_shift_part + right_ext_part);
+
+            shifted.push(left_part + right_part);
+        }
+
+        // OutputMatchesShifted(0): out[0] - (shifted[0] + shifted[1] * 2^16) = 0
+        let out_0 = builder.main(0, cols::OUT_0);
+        builder.assert_zero(out_0 - &shifted[0] - &shifted[1] * &shift_16_val);
+
+        // OutputMatchesShifted(1): out[1] - (shifted[2] + shifted[3] * 2^16) = 0
+        let out_1 = builder.main(0, cols::OUT_1);
+        builder.assert_zero(out_1 - &shifted[2] - &shifted[3] * &shift_16_val);
+    })
     .with_name("SHIFT")
 }
 
@@ -559,6 +667,40 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+        use crate::tables::memw::cols;
+        use crate::tables::types::GoldilocksExtension;
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+
+        let mu_read = builder.main(0, cols::MU_READ);
+        let mu_write = builder.main(0, cols::MU_WRITE);
+        let mu_sum = &mu_read + &mu_write;
+
+        // Constraint 0: IS_BIT<μ_sum> — mu_sum * (1 - mu_sum) = 0
+        builder.assert_zero(mu_sum.clone() * (&one - &mu_sum));
+
+        // Constraint 1: w2 => μ_sum — (write2 + write4 + write8) * (1 - mu_sum) = 0
+        let write2 = builder.main(0, cols::WRITE2);
+        let write4 = builder.main(0, cols::WRITE4);
+        let write8 = builder.main(0, cols::WRITE8);
+        let w2 = write2 + write4 + write8;
+        builder.assert_zero(w2 * (one - mu_sum));
+
+        // Constraint 2: IS_BIT<μ_read>
+        assert_is_bit(builder, mu_read);
+
+        // Constraint 3: IS_BIT<μ_write>
+        assert_is_bit(builder, mu_write);
+
+        // Constraints 4-10: IS_BIT for carry[0..6]
+        for &col in &cols::CARRY {
+            let carry = builder.main(0, col);
+            assert_is_bit(builder, carry);
+        }
+    })
     .with_name("MEMW")
 }
 
@@ -664,6 +806,47 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::tables::load::cols;
+        use crate::tables::types::GoldilocksExtension;
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+        let ff = FieldElement::<GoldilocksExtension>::from(255u64);
+
+        let mu = builder.main(0, cols::MU);
+        let read2 = builder.main(0, cols::READ2);
+        let read4 = builder.main(0, cols::READ4);
+        let read8 = builder.main(0, cols::READ8);
+        let signed = builder.main(0, cols::SIGNED);
+        let sign_bit = builder.main(0, cols::SIGN_BIT);
+
+        // Constraint 0: ReadImpliesMu — (read2 + read4 + read8) * (1 - μ) = 0
+        let read_sum = &read2 + &read4 + &read8;
+        builder.assert_zero(read_sum * (&one - &mu));
+
+        // Expected extension value
+        let expected = &signed * &sign_bit * &ff;
+
+        // Constraints 1-4: ExtensionHigh(4..8) — (1 - read8) * (res[i] - expected) = 0
+        let not_read8 = &one - &read8;
+        for i in 4..8 {
+            let res_i = builder.main(0, cols::RES[i]);
+            builder.assert_zero(&not_read8 * (&res_i - &expected));
+        }
+
+        // Constraints 5-6: ExtensionMid(2..4) — (1 - read4 - read8) * (res[i] - expected) = 0
+        let not_read4_8 = &one - &read4 - &read8;
+        for i in 2..4 {
+            let res_i = builder.main(0, cols::RES[i]);
+            builder.assert_zero(&not_read4_8 * (&res_i - &expected));
+        }
+
+        // Constraint 7: ExtensionLow — (1 - read2 - read4 - read8) * (res[1] - expected) = 0
+        let not_read2_4_8 = &one - &read2 - &read4 - &read8;
+        let res_1 = builder.main(0, cols::RES[1]);
+        builder.assert_zero(not_read2_4_8 * (res_1 - expected));
+    })
     .with_name("LOAD")
 }
 
@@ -933,6 +1116,81 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::commit::cols;
+        use crate::tables::types::GoldilocksExtension;
+        use math::field::element::FieldElement;
+
+        let one = FieldElement::<GoldilocksExtension>::one();
+        let inv_2_32 = FieldElement::<GoldilocksExtension>::from(INV_SHIFT_32);
+        let shift_16 = FieldElement::<GoldilocksExtension>::from(65536u64);
+
+        let first = builder.main(0, cols::FIRST);
+        let end = builder.main(0, cols::END);
+        let mu = builder.main(0, cols::MU);
+
+        // Constraint 0: IS_BIT(FIRST)
+        assert_is_bit(builder, first.clone());
+
+        // Constraint 1: IS_BIT(END)
+        assert_is_bit(builder, end.clone());
+
+        // Constraint 2: IS_BIT(MU)
+        assert_is_bit(builder, mu.clone());
+
+        // Constraint 3: (first + end) * (1 - mu) = 0
+        builder.assert_zero((&first + &end) * (&one - &mu));
+
+        // Constraint 4-5: ADD for address + 1 = address_incr (unconditional)
+        // lhs = address (DWordWL: cols 3,4)
+        // rhs = constant(1): lo=1, hi=0
+        // sum = address_incr (DWordHL: cols 5,6,7,8 -> DWordWL)
+        let addr_lo = builder.main(0, cols::ADDRESS_0);
+        let addr_hi = builder.main(0, cols::ADDRESS_1);
+        let rhs_lo = one.clone();
+        // sum_lo = addr_incr[0] + 2^16 * addr_incr[1]
+        let addr_incr_0 = builder.main(0, cols::ADDRESS_INCR_0);
+        let addr_incr_1 = builder.main(0, cols::ADDRESS_INCR_1);
+        let addr_incr_2 = builder.main(0, cols::ADDRESS_INCR_2);
+        let addr_incr_3 = builder.main(0, cols::ADDRESS_INCR_3);
+        let sum_lo = &addr_incr_0 + &addr_incr_1 * &shift_16;
+        let sum_hi = &addr_incr_2 + &addr_incr_3 * &shift_16;
+
+        // carry_0 = (addr_lo + 1 - sum_lo) * 2^(-32)
+        let carry_0 = (&addr_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+        // Constraint 4: carry_0 * (1 - carry_0) = 0
+        builder.assert_zero(carry_0.clone() * (&one - &carry_0));
+
+        // carry_1 = (addr_hi + 0 + carry_0 - sum_hi) * 2^(-32)
+        let carry_1 = (&addr_hi + &carry_0 - &sum_hi) * &inv_2_32;
+        // Constraint 5: carry_1 * (1 - carry_1) = 0
+        builder.assert_zero(carry_1.clone() * (&one - &carry_1));
+
+        // Constraint 6-7: SUB for count_decr + 1 = count (unconditional)
+        // lhs = count_decr (DWordHL: cols 11,12,13,14 -> DWordWL)
+        // rhs = constant(1): lo=1, hi=0
+        // sum = count (DWordWL: cols 9,10)
+        let cd_0 = builder.main(0, cols::COUNT_DECR_0);
+        let cd_1 = builder.main(0, cols::COUNT_DECR_1);
+        let cd_2 = builder.main(0, cols::COUNT_DECR_2);
+        let cd_3 = builder.main(0, cols::COUNT_DECR_3);
+        let lhs_lo = &cd_0 + &cd_1 * &shift_16;
+        let lhs_hi = &cd_2 + &cd_3 * &shift_16;
+        let count_lo = builder.main(0, cols::COUNT_0);
+        let count_hi = builder.main(0, cols::COUNT_1);
+
+        // carry_0 = (lhs_lo + 1 - count_lo) * 2^(-32)
+        let carry_0_sub = (&lhs_lo + &one - &count_lo) * &inv_2_32;
+        // Constraint 6: carry_0 * (1 - carry_0) = 0
+        builder.assert_zero(carry_0_sub.clone() * (&one - &carry_0_sub));
+
+        // carry_1 = (lhs_hi + carry_0 - count_hi) * 2^(-32)
+        let carry_1_sub = (&lhs_hi + &carry_0_sub - &count_hi) * &inv_2_32;
+        // Constraint 7: carry_1 * (1 - carry_1) = 0
+        builder.assert_zero(carry_1_sub.clone() * (&one - &carry_1_sub));
+    })
     .with_name("COMMIT")
 }
 
