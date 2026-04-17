@@ -76,10 +76,10 @@ parse_run() {
     /After execute/          { print "h_execute="      $(NF-1) }
     /After trace build/      { print "h_trace_build="  $(NF-1) }
     /After AIR/              { print "h_air="          $(NF-1) }
-    /after pool alloc/       { print "h_pool_alloc="   $(NF-1) }
-    /after main commits/     { print "h_main_commits=" $(NF-1) }
-    /after aux build/        { print "h_aux_build="    $(NF-1) }
-    /after aux commit/       { print "h_aux_commit="   $(NF-1) }
+    /After pool alloc/       { print "h_pool_alloc="   $(NF-1) }
+    /After main commits/     { print "h_main_commits=" $(NF-1) }
+    /After aux build/        { print "h_aux_build="    $(NF-1) }
+    /After aux commit/       { print "h_aux_commit="   $(NF-1) }
     ' "$stderr"
 
     grep -o 'Peak heap: [0-9]*' "$stdout" | awk '{print "peak=" $3}'

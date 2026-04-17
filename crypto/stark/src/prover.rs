@@ -1540,7 +1540,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after pool alloc") {
+        if let Some(s) = crate::instruments::snap("After pool alloc") {
             heap_snaps.push(s);
         }
 
@@ -1606,7 +1606,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after main commits") {
+        if let Some(s) = crate::instruments::snap("After main commits") {
             heap_snaps.push(s);
         }
 
@@ -1656,7 +1656,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux build") {
+        if let Some(s) = crate::instruments::snap("After aux build") {
             heap_snaps.push(s);
         }
 
@@ -1767,7 +1767,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("after aux commit") {
+        if let Some(s) = crate::instruments::snap("After aux commit") {
             heap_snaps.push(s);
         }
 
