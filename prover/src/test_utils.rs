@@ -595,6 +595,23 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+
+        let mu_read = builder.main(0, memw_register_cols::MU_READ);
+        let mu_write = builder.main(0, memw_register_cols::MU_WRITE);
+
+        // Constraint 0: IS_BIT(mu_read)
+        assert_is_bit(builder, mu_read.clone());
+        // Constraint 1: IS_BIT(mu_write)
+        assert_is_bit(builder, mu_write.clone());
+        // Constraint 2: (mu_read + mu_write) * (1 - mu_read - mu_write) == 0
+        let mu_sum = &mu_read + &mu_write;
+        builder.assert_zero(
+            mu_sum.clone()
+                * (math::field::element::FieldElement::<crate::tables::types::GoldilocksExtension>::one() - mu_sum),
+        );
+    })
     .with_name("MEMW_R")
 }
 

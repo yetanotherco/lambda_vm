@@ -93,6 +93,10 @@ pub(crate) fn compute_alpha_powers<E: IsField>(
 // These challenges MUST be shared across all AIRs in a multi-table proof for the
 // LogUp bus to balance correctly (sum of all fingerprints equals zero).
 
+/// Index of the `z` challenge in the LogUp challenges vector.
+/// Used as the fingerprint point: fp = z - linear_combination(row).
+pub const LOGUP_CHALLENGE_Z: usize = 0;
+
 /// Index of the `alpha` (α) challenge in the LogUp challenges vector.
 /// Used as the base for linear combination of row values.
 pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
@@ -804,6 +808,9 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Optional AirBuilder-based constraint evaluator.
+    /// When set, `uses_builder()` returns true and the fused builder path is used.
+    builder_fn: Option<Box<dyn Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync>>,
 }
 
 impl<
@@ -896,6 +903,7 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            builder_fn: None,
         }
     }
 
@@ -931,6 +939,21 @@ impl<
     /// making it easy to identify which table is contributing to bus imbalances.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Attach an AirBuilder constraint evaluator to this AIR.
+    ///
+    /// When set, `uses_builder()` returns `true` and the builder path (fused alpha
+    /// combination) is used instead of the old per-constraint buffer approach.
+    ///
+    /// The closure receives a `&mut dyn AirBuilder<E>` and must call `assert_zero`
+    /// in the same order as the table's `constraints()` function.
+    pub fn with_builder<CB>(mut self, f: CB) -> Self
+    where
+        CB: Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync + 'static,
+    {
+        self.builder_fn = Some(Box::new(f));
         self
     }
 }
@@ -994,6 +1017,101 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn uses_builder(&self) -> bool {
+        self.builder_fn.is_some()
+    }
+
+    fn eval_constraints_with_builder(
+        &self,
+        builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
+    ) {
+        // 1. Evaluate table-specific constraints via the user-provided closure.
+        if let Some(f) = &self.builder_fn {
+            f(builder);
+        }
+
+        // 2. Evaluate LogUp constraints (batched term + accumulated).
+        //    These are appended to transition_constraints by AirWithBuses::new() and must
+        //    be evaluated in the same order so the alpha^i coefficients match.
+        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
+        if num_interactions == 0 {
+            return;
+        }
+
+        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+        // z is the LogUp randomness challenge at index LOGUP_CHALLENGE_Z.
+        // Invariant: build_rap_challenges always provides at least 2 challenges for LogUp tables.
+        let z = builder.challenge(LOGUP_CHALLENGE_Z).clone();
+
+        // Build LogUp alpha powers slice from the builder.
+        // max_bus_elements is computed at AirWithBuses construction time.
+        let alpha_powers: Vec<FieldElement<E>> = (0..=self.max_bus_elements)
+            .map(|i| builder.logup_alpha_power(i).clone())
+            .collect();
+
+        // 2a. Batched term constraints (pairs of committed interactions).
+        for pair_idx in 0..num_committed_pairs {
+            let ia = &self.auxiliary_trace_build_data.interactions[pair_idx * 2];
+            let ib = &self.auxiliary_trace_build_data.interactions[pair_idx * 2 + 1];
+            let term_col = pair_idx; // aux column index
+
+            let c = builder.aux(0, term_col);
+            let m_a = compute_multiplicity_from_builder(builder, &ia.multiplicity);
+            let m_b = compute_multiplicity_from_builder(builder, &ib.multiplicity);
+            let fp_a = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
+            let fp_b = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers);
+
+            let term_a = m_a * &fp_b;
+            let term_a = if ia.is_sender { term_a } else { -term_a };
+            let term_b = m_b * &fp_a;
+            let term_b = if ib.is_sender { term_b } else { -term_b };
+
+            builder.assert_zero(c * &fp_a * &fp_b - term_a - term_b);
+        }
+
+        // 2b. Accumulated constraint.
+        let acc_col = num_committed_pairs; // accumulated column follows committed term columns
+        let acc_curr = builder.aux(0, acc_col);
+        let acc_next = builder.aux(1, acc_col);
+
+        // Sum of all committed term columns at the NEXT step.
+        let terms_sum: FieldElement<E> = (0..num_committed_pairs)
+            .map(|i| builder.aux(1, i))
+            .fold(FieldElement::<E>::zero(), |acc, v| acc + v);
+
+        let logup_offset = builder.logup_table_offset().clone();
+        let delta = acc_next - &acc_curr - &terms_sum + logup_offset;
+
+        let absorbed_start = num_interactions - absorbed_count;
+        match absorbed_count {
+            1 => {
+                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
+                let m = compute_multiplicity_from_builder(builder, &ia.multiplicity);
+                let f_fp = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
+                let sign = if ia.is_sender {
+                    FieldElement::<E>::one()
+                } else {
+                    -FieldElement::<E>::one()
+                };
+                builder.assert_zero(delta * &f_fp - m * sign);
+            }
+            2 => {
+                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
+                let ib = &self.auxiliary_trace_build_data.interactions[absorbed_start + 1];
+                let m1 = compute_multiplicity_from_builder(builder, &ia.multiplicity);
+                let m2 = compute_multiplicity_from_builder(builder, &ib.multiplicity);
+                let f1 = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
+                let f2 = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers);
+                let term1 = m1 * &f2;
+                let term1 = if ia.is_sender { term1 } else { -term1 };
+                let term2 = m2 * &f1;
+                let term2 = if ib.is_sender { term2 } else { -term2 };
+                builder.assert_zero(delta * &f1 * &f2 - term1 - term2);
+            }
+            _ => unreachable!("absorbed must be 1 or 2"),
+        }
     }
 
     fn build_auxiliary_trace(
@@ -1847,6 +1965,191 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
         );
     }
     z - &linear_combination
+}
+
+/// Computes a multiplicity value via an `AirBuilder`.
+///
+/// Mirrors `compute_multiplicity_from_step` but uses `builder.main(0, col)`.
+fn compute_multiplicity_from_builder<E: IsField>(
+    builder: &dyn crate::air_builder::AirBuilder<E>,
+    multiplicity: &Multiplicity,
+) -> FieldElement<E> {
+    match multiplicity {
+        Multiplicity::One => FieldElement::<E>::one(),
+        Multiplicity::Column(col) => builder.main(0, *col),
+        Multiplicity::Sum(col_a, col_b) => builder.main(0, *col_a) + builder.main(0, *col_b),
+        Multiplicity::Negated(col) => FieldElement::<E>::one() - builder.main(0, *col),
+        Multiplicity::Diff(col_a, col_b) => builder.main(0, *col_a) - builder.main(0, *col_b),
+        Multiplicity::Sum3(col_a, col_b, col_c) => {
+            builder.main(0, *col_a) + builder.main(0, *col_b) + builder.main(0, *col_c)
+        }
+        Multiplicity::Linear(terms) => {
+            let mut result = FieldElement::<E>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<E>::from(*value);
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Computes the fingerprint for an interaction via an `AirBuilder`.
+///
+/// Returns `z - (bus_id*α^0 + v[0]*α^1 + ...)`
+fn compute_fingerprint_from_builder<E: IsField>(
+    builder: &dyn crate::air_builder::AirBuilder<E>,
+    interaction: &BusInteraction,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+) -> FieldElement<E> {
+    let bus_id_fe = FieldElement::<E>::from(interaction.bus_id);
+    let mut linear_combination = bus_id_fe * &alpha_powers[0];
+    let mut alpha_idx = 1usize;
+    let shifts = PackingShifts::<E>::new();
+
+    for bv in &interaction.values {
+        let consumed = accumulate_bv_fingerprint_builder_inner(
+            bv,
+            builder,
+            alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+            &shifts,
+        );
+        alpha_idx += consumed;
+    }
+    z - &linear_combination
+}
+
+/// Inner helper: accumulates a `BusValue` fingerprint via builder, returning slots used.
+fn accumulate_bv_fingerprint_builder_inner<E: IsField>(
+    bv: &BusValue,
+    builder: &dyn crate::air_builder::AirBuilder<E>,
+    alpha_powers: &[FieldElement<E>],
+    alpha_offset: usize,
+    acc: &mut FieldElement<E>,
+    shifts: &PackingShifts<E>,
+) -> usize {
+    match bv {
+        BusValue::Packed {
+            start_column,
+            packing,
+        } => {
+            // Replicate packing.accumulate_fingerprint_with using builder.main()
+            let col = *start_column;
+            match packing {
+                Packing::Direct => {
+                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
+                    1
+                }
+                Packing::Word2L => {
+                    let combined =
+                        builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    *acc += combined * &alpha_powers[alpha_offset];
+                    1
+                }
+                Packing::Word4L => {
+                    let combined = builder.main(0, col)
+                        + builder.main(0, col + 1) * &shifts.shift_8
+                        + builder.main(0, col + 2) * &shifts.shift_16
+                        + builder.main(0, col + 3) * &shifts.shift_24;
+                    *acc += combined * &alpha_powers[alpha_offset];
+                    1
+                }
+                Packing::DWordWL => {
+                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
+                    *acc += builder.main(0, col + 1) * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordHHW => {
+                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
+                    let w = builder.main(0, col + 1) + builder.main(0, col + 2) * &shifts.shift_16;
+                    *acc += w * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordWHH => {
+                    let w = builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    *acc += w * &alpha_powers[alpha_offset];
+                    *acc += builder.main(0, col + 2) * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordHL => {
+                    let w0 = builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    *acc += w0 * &alpha_powers[alpha_offset];
+                    let w1 = builder.main(0, col + 2) + builder.main(0, col + 3) * &shifts.shift_16;
+                    *acc += w1 * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordBL => {
+                    let w0 = builder.main(0, col)
+                        + builder.main(0, col + 1) * &shifts.shift_8
+                        + builder.main(0, col + 2) * &shifts.shift_16
+                        + builder.main(0, col + 3) * &shifts.shift_24;
+                    *acc += w0 * &alpha_powers[alpha_offset];
+                    let w1 = builder.main(0, col + 4)
+                        + builder.main(0, col + 5) * &shifts.shift_8
+                        + builder.main(0, col + 6) * &shifts.shift_16
+                        + builder.main(0, col + 7) * &shifts.shift_24;
+                    *acc += w1 * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::QuadHL => {
+                    for i in 0..4 {
+                        let c = col + i * 2;
+                        let w = builder.main(0, c) + builder.main(0, c + 1) * &shifts.shift_16;
+                        *acc += w * &alpha_powers[alpha_offset + i];
+                    }
+                    4
+                }
+                Packing::QuadWL => {
+                    for i in 0..4 {
+                        *acc += builder.main(0, col + i) * &alpha_powers[alpha_offset + i];
+                    }
+                    4
+                }
+            }
+        }
+        BusValue::Linear(terms) => {
+            let mut result = FieldElement::<E>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<E>::from(*value);
+                    }
+                }
+            }
+            *acc += result * &alpha_powers[alpha_offset];
+            1
+        }
+    }
 }
 
 /// Constraint for a batched pair of interactions sharing one aux column.
