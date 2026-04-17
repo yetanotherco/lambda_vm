@@ -3,14 +3,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-static HEAP_READER: OnceLock<fn() -> usize> = OnceLock::new();
+static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
 
-pub fn set_heap_reader(f: fn() -> usize) {
+pub fn set_heap_reader(f: fn() -> Option<usize>) {
     let _ = HEAP_READER.set(f);
 }
 
 pub fn heap_bytes() -> Option<usize> {
-    HEAP_READER.get().map(|f| f())
+    HEAP_READER.get().and_then(|f| f())
 }
 
 pub type HeapSnapshot = (&'static str, usize);

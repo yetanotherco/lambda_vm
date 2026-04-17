@@ -265,7 +265,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
     stark::instruments::set_heap_reader(|| {
         tikv_jemalloc_ctl::epoch::advance().ok();
-        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+        tikv_jemalloc_ctl::stats::allocated::read().ok()
     });
 
     let start = Instant::now();
