@@ -12,6 +12,8 @@ use crate::field::{
 use crate::traits::{AsBytes, ByteConversion};
 
 impl ByteConversion for [FpE; 2] {
+    const BYTE_LEN: usize = 16;
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         unimplemented!()
@@ -38,6 +40,8 @@ impl ByteConversion for [FpE; 2] {
 }
 
 impl ByteConversion for [FpE; 3] {
+    const BYTE_LEN: usize = 24;
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         let mut bytes = ByteConversion::to_bytes_be(&self[2]);
@@ -470,6 +474,17 @@ impl Fp3E {
 // =====================================================
 
 impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
+    const BYTE_LEN: usize = 24;
+
+    #[inline(always)]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= 24);
+        let components = self.value();
+        components[0].write_bytes_be(&mut buf[0..8]);
+        components[1].write_bytes_be(&mut buf[8..16]);
+        components[2].write_bytes_be(&mut buf[16..24]);
+    }
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
@@ -553,4 +568,28 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
 #[inline(always)]
 fn mul_by_7(a: &FpE) -> FpE {
     FpE::from_raw(mul_by_7_raw(*a.value()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ByteConversion;
+
+    #[test]
+    fn write_bytes_be_matches_as_bytes() {
+        let cases = [
+            FieldElement::<Degree3GoldilocksExtensionField>::zero(),
+            FieldElement::<Degree3GoldilocksExtensionField>::one(),
+            FieldElement::<Degree3GoldilocksExtensionField>::new([
+                FpE::from(1u64),
+                FpE::from(2u64),
+                FpE::from(3u64),
+            ]),
+        ];
+        for elem in &cases {
+            let mut buf = [0u8; 24];
+            elem.write_bytes_be(&mut buf);
+            assert_eq!(&buf[..], elem.as_bytes().as_slice());
+        }
+    }
 }
