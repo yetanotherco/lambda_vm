@@ -250,6 +250,21 @@ pub trait AIR: Send + Sync {
             .for_each(|c| c.evaluate(evaluation_context, evaluations));
     }
 
+    /// Whether this AIR uses the AirBuilder pattern for constraint evaluation.
+    /// Tables override to return true after migrating to eval_constraints_with_builder().
+    fn uses_builder(&self) -> bool {
+        false
+    }
+
+    /// Evaluate all transition constraints using the AirBuilder pattern.
+    /// Override this (and uses_builder -> true) to use fused alpha combination.
+    fn eval_constraints_with_builder<AB: crate::air_builder::AirBuilder>(&self, _builder: &mut AB)
+    where
+        Self: Sized,
+    {
+        unimplemented!("Override eval_constraints_with_builder and uses_builder for this AIR")
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
