@@ -5,7 +5,10 @@ use crate::errors::ByteConversionError;
 /// for getting an element from its byte representation in big-endian or
 /// little-endian order.
 pub trait ByteConversion {
-    /// Returns the byte representation of the element in big-endian order.}
+    /// Byte length of the big-endian representation.
+    const BYTE_LEN: usize;
+
+    /// Returns the byte representation of the element in big-endian order.
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8>;
 
@@ -22,6 +25,14 @@ pub trait ByteConversion {
     fn from_bytes_le(bytes: &[u8]) -> Result<Self, ByteConversionError>
     where
         Self: Sized;
+
+    /// Write big-endian bytes into `buf[..BYTE_LEN]`.
+    /// Override for zero-allocation performance in hot paths.
+    #[cfg(feature = "alloc")]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        let bytes = self.to_bytes_be();
+        buf[..bytes.len()].copy_from_slice(&bytes);
+    }
 }
 
 /// Serialize function without args
@@ -30,18 +41,6 @@ pub trait ByteConversion {
 pub trait AsBytes {
     /// Default serialize without args
     fn as_bytes(&self) -> alloc::vec::Vec<u8>;
-}
-
-/// Zero-allocation byte serialization for Merkle tree hashing.
-///
-/// Unlike `AsBytes::as_bytes()` which returns `Vec<u8>` (heap allocation per call),
-/// this trait writes bytes directly into a caller-provided buffer. For Merkle trees
-/// with millions of field elements, this eliminates millions of 8-byte allocations.
-pub trait WriteBytes {
-    /// Byte length of this element's big-endian representation.
-    const BYTE_LEN: usize;
-    /// Write big-endian bytes into `buf[..BYTE_LEN]`.
-    fn write_bytes_be(&self, buf: &mut [u8]);
 }
 
 #[cfg(feature = "alloc")]
@@ -59,6 +58,8 @@ impl AsBytes for u64 {
 }
 
 impl ByteConversion for u64 {
+    const BYTE_LEN: usize = 8;
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         self.to_be_bytes().to_vec()

@@ -63,8 +63,8 @@ impl<
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
 where
-    FieldElement<Field>: math::traits::WriteBytes,
-    FieldElement<FieldExtension>: math::traits::WriteBytes,
+    FieldElement<Field>: math::traits::ByteConversion,
+    FieldElement<FieldExtension>: math::traits::ByteConversion,
 {
 }
 
@@ -355,8 +355,8 @@ pub trait IsStarkProver<
     FieldExtension: Send + Sync + IsField,
     PI,
 > where
-    FieldElement<Field>: math::traits::WriteBytes,
-    FieldElement<FieldExtension>: math::traits::WriteBytes,
+    FieldElement<Field>: math::traits::ByteConversion,
+    FieldElement<FieldExtension>: math::traits::ByteConversion,
 {
     /// Builds a Merkle tree commitment from column-major LDE evaluations with
     /// bit-reverse permutation, without cloning the full evaluation matrix.
@@ -369,10 +369,10 @@ pub trait IsStarkProver<
         columns: &[Vec<FieldElement<E>>],
     ) -> Option<(BatchedMerkleTree<E>, Commitment)>
     where
-        FieldElement<E>: AsBytes + Sync + Send + math::traits::WriteBytes,
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
-        use math::traits::WriteBytes;
+        use math::traits::ByteConversion;
 
         if columns.is_empty() || columns[0].is_empty() {
             return None;
@@ -380,7 +380,7 @@ pub trait IsStarkProver<
 
         let num_rows = columns[0].len();
         let num_cols = columns.len();
-        let byte_len = <FieldElement<E> as WriteBytes>::BYTE_LEN;
+        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
 
         debug_assert!(
             num_rows.is_power_of_two(),
@@ -693,9 +693,9 @@ pub trait IsStarkProver<
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::WriteBytes,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
-        use math::traits::WriteBytes;
+        use math::traits::ByteConversion;
 
         let num_parts = lde_composition_poly_parts_evaluations.len();
         if num_parts == 0 {
@@ -712,7 +712,7 @@ pub trait IsStarkProver<
             "num_rows must be a power of two for reverse_index"
         );
 
-        let byte_len = <FieldElement<FieldExtension> as WriteBytes>::BYTE_LEN;
+        let byte_len = <FieldElement<FieldExtension> as ByteConversion>::BYTE_LEN;
 
         // One allocation per leaf (was one per field element): write all parts
         // into a single buffer. Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
