@@ -1,8 +1,6 @@
 use embedded_alloc::TlsfHeap as Heap;
 use riscv as _;
 
-use crate::syscalls::print_string;
-
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
