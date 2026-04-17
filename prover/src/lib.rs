@@ -559,8 +559,8 @@ pub fn prove_with_options(
             trace_build_elapsed,
             air_elapsed,
             total_start.elapsed(),
-            heap_before,
             &stark::instruments::ProveHeapProfile {
+                before: heap_before,
                 after_execute: heap_after_execute,
                 after_trace_build: heap_after_trace,
                 after_air: heap_after_air,

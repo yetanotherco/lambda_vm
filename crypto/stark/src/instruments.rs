@@ -20,6 +20,7 @@ pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
 }
 
 pub struct ProveHeapProfile {
+    pub before: Option<usize>,
     pub after_execute: Option<usize>,
     pub after_trace_build: Option<usize>,
     pub after_air: Option<usize>,
