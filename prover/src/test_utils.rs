@@ -485,7 +485,437 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(cpu_builder_fn)
     .with_name("CPU")
+}
+
+/// AirBuilder constraint evaluator for the CPU table (66 constraints).
+///
+/// Constraints are emitted in the exact same order as create_all_cpu_constraints():
+/// 1. IS_BIT (32): one per BIT_FLAG_COLUMNS entry
+/// 2. ADD carries (8): ADD+LOAD(2), STORE(2), SUB+BEQ(2), JALR(2)
+/// 3. OTHER (26): BranchCond, Ebreak, RegNotRead(6), Arg1(2), Arg2(2),
+///    Rvd(2), SltResZero(7), ExtBitZero(3), NextPcAdd(2)
+fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExtension>) {
+    use crate::constraints::cpu::BIT_FLAG_COLUMNS;
+    use crate::constraints::helpers::assert_is_bit;
+    use crate::constraints::templates::INV_SHIFT_32;
+    use crate::tables::cpu::cols;
+    use math::field::element::FieldElement;
+
+    type FE = FieldElement<GoldilocksExtension>;
+
+    let one = FE::one();
+    let two = FE::from(2u64);
+    let inv_2_32 = FE::from(INV_SHIFT_32);
+    let shift_8 = FE::from(1u64 << 8);
+    let shift_16 = FE::from(1u64 << 16);
+    let shift_24 = FE::from(1u64 << 24);
+    let mask_32 = FE::from((1u64 << 32) - 1);
+
+    // Helper: pack 4 byte values into a 32-bit word (inner fn, no builder capture).
+    #[inline]
+    fn pack(b0: FE, b1: FE, b2: FE, b3: FE, s8: &FE, s16: &FE, s24: &FE) -> FE {
+        &b0 + &b1 * s8 + &b2 * s16 + &b3 * s24
+    }
+
+    // =================================================================
+    // IS_BIT constraints (32)
+    // =================================================================
+    for &col in BIT_FLAG_COLUMNS {
+        let x = builder.main(0, col);
+        assert_is_bit(builder, x);
+    }
+
+    // =================================================================
+    // ADD constraints (8)
+    // =================================================================
+
+    // ADD + LOAD (2): arg1 + arg2 = res (all DWordBL)
+    {
+        let ll = pack(
+            builder.main(0, cols::ARG1_0),
+            builder.main(0, cols::ARG1_1),
+            builder.main(0, cols::ARG1_2),
+            builder.main(0, cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = pack(
+            builder.main(0, cols::ARG2_0),
+            builder.main(0, cols::ARG2_1),
+            builder.main(0, cols::ARG2_2),
+            builder.main(0, cols::ARG2_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sl = pack(
+            builder.main(0, cols::RES_0),
+            builder.main(0, cols::RES_0 + 1),
+            builder.main(0, cols::RES_0 + 2),
+            builder.main(0, cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main(0, cols::ARG1_4),
+            builder.main(0, cols::ARG1_5),
+            builder.main(0, cols::ARG1_6),
+            builder.main(0, cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rh = pack(
+            builder.main(0, cols::ARG2_4),
+            builder.main(0, cols::ARG2_5),
+            builder.main(0, cols::ARG2_6),
+            builder.main(0, cols::ARG2_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main(0, cols::RES_0 + 4),
+            builder.main(0, cols::RES_0 + 5),
+            builder.main(0, cols::RES_0 + 6),
+            builder.main(0, cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = &builder.main(0, cols::ADD) + &builder.main(0, cols::LOAD);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero(&cond * &c1 * (&one - &c1));
+    }
+
+    // STORE (2): arg1 + imm = res
+    {
+        let ll = pack(
+            builder.main(0, cols::ARG1_0),
+            builder.main(0, cols::ARG1_1),
+            builder.main(0, cols::ARG1_2),
+            builder.main(0, cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main(0, cols::ARG1_4),
+            builder.main(0, cols::ARG1_5),
+            builder.main(0, cols::ARG1_6),
+            builder.main(0, cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = builder.main(0, cols::IMM_0);
+        let rh = builder.main(0, cols::IMM_1);
+        let sl = pack(
+            builder.main(0, cols::RES_0),
+            builder.main(0, cols::RES_0 + 1),
+            builder.main(0, cols::RES_0 + 2),
+            builder.main(0, cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main(0, cols::RES_0 + 4),
+            builder.main(0, cols::RES_0 + 5),
+            builder.main(0, cols::RES_0 + 6),
+            builder.main(0, cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = builder.main(0, cols::STORE);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero(&cond * &c1 * (&one - &c1));
+    }
+
+    // SUB + BEQ (2): arg2 + res = arg1
+    {
+        let ll = pack(
+            builder.main(0, cols::ARG2_0),
+            builder.main(0, cols::ARG2_1),
+            builder.main(0, cols::ARG2_2),
+            builder.main(0, cols::ARG2_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main(0, cols::ARG2_4),
+            builder.main(0, cols::ARG2_5),
+            builder.main(0, cols::ARG2_6),
+            builder.main(0, cols::ARG2_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = pack(
+            builder.main(0, cols::RES_0),
+            builder.main(0, cols::RES_0 + 1),
+            builder.main(0, cols::RES_0 + 2),
+            builder.main(0, cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rh = pack(
+            builder.main(0, cols::RES_0 + 4),
+            builder.main(0, cols::RES_0 + 5),
+            builder.main(0, cols::RES_0 + 6),
+            builder.main(0, cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sl = pack(
+            builder.main(0, cols::ARG1_0),
+            builder.main(0, cols::ARG1_1),
+            builder.main(0, cols::ARG1_2),
+            builder.main(0, cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main(0, cols::ARG1_4),
+            builder.main(0, cols::ARG1_5),
+            builder.main(0, cols::ARG1_6),
+            builder.main(0, cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = &builder.main(0, cols::SUB) + &builder.main(0, cols::BEQ);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero(&cond * &c1 * (&one - &c1));
+    }
+
+    // JALR (2): pc + instr_size = res; instr_size = 4 - 2*c_type
+    {
+        let ll = builder.main(0, cols::PC_0);
+        let lh = builder.main(0, cols::PC_1);
+        let rl = FE::from(4u64) - &two * builder.main(0, cols::C_TYPE_INSTRUCTION);
+        let sl = pack(
+            builder.main(0, cols::RES_0),
+            builder.main(0, cols::RES_0 + 1),
+            builder.main(0, cols::RES_0 + 2),
+            builder.main(0, cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main(0, cols::RES_0 + 4),
+            builder.main(0, cols::RES_0 + 5),
+            builder.main(0, cols::RES_0 + 6),
+            builder.main(0, cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = builder.main(0, cols::JALR);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero(&cond * &c1 * (&one - &c1));
+    }
+
+    // =================================================================
+    // OTHER constraints (26)
+    // =================================================================
+
+    // BranchCondConstraint (1)
+    {
+        let jalr = builder.main(0, cols::JALR);
+        let blt = builder.main(0, cols::BLT);
+        let beq = builder.main(0, cols::BEQ);
+        let mp = builder.main(0, cols::MP_SELECTOR);
+        let r0 = builder.main(0, cols::RES_0);
+        let ieq = builder.main(0, cols::IS_EQUAL);
+        let bc = builder.main(0, cols::BRANCH_COND);
+        let res_xor_mp = &r0 + &mp - &two * &r0 * &mp;
+        let eq_xor_mp = &ieq + &mp - &two * &ieq * &mp;
+        builder.assert_zero(bc - (jalr + &blt * res_xor_mp + &beq * eq_xor_mp));
+    }
+
+    // EbreakConstraint (1)
+    builder.assert_zero(builder.main(0, cols::EBREAK));
+
+    // RegNotReadIsZero rv1 (3)
+    {
+        let rr = builder.main(0, cols::READ_REGISTER1);
+        for &c in &[cols::RV1_0, cols::RV1_1, cols::RV1_2] {
+            builder.assert_zero((&one - &rr) * builder.main(0, c));
+        }
+    }
+
+    // RegNotReadIsZero rv2 (3)
+    {
+        let rr = builder.main(0, cols::READ_REGISTER2);
+        for &c in &[cols::RV2_0, cols::RV2_1, cols::RV2_2] {
+            builder.assert_zero((&one - &rr) * builder.main(0, c));
+        }
+    }
+
+    // Arg1LowerConstraint (1)
+    {
+        let a1lo = pack(
+            builder.main(0, cols::ARG1_0),
+            builder.main(0, cols::ARG1_1),
+            builder.main(0, cols::ARG1_2),
+            builder.main(0, cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv1lo = &builder.main(0, cols::RV1_0) + &builder.main(0, cols::RV1_1) * &shift_16;
+        builder.assert_zero(a1lo - rv1lo);
+    }
+
+    // Arg1UpperConstraint (1)
+    {
+        let a1hi = pack(
+            builder.main(0, cols::ARG1_4),
+            builder.main(0, cols::ARG1_5),
+            builder.main(0, cols::ARG1_6),
+            builder.main(0, cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv1u = builder.main(0, cols::RV1_2);
+        let wi = builder.main(0, cols::WORD_INSTR);
+        let si = builder.main(0, cols::SIGNED);
+        let eb = builder.main(0, cols::RV1_EXT_BIT);
+        builder.assert_zero(a1hi - (&rv1u * (&one - &wi) + &mask_32 * &eb * &si));
+    }
+
+    // Arg2LowerConstraint (1)
+    {
+        let a2lo = pack(
+            builder.main(0, cols::ARG2[0]),
+            builder.main(0, cols::ARG2[1]),
+            builder.main(0, cols::ARG2[2]),
+            builder.main(0, cols::ARG2[3]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv2lo = &builder.main(0, cols::RV2_0) + &builder.main(0, cols::RV2_1) * &shift_16;
+        let imm0 = builder.main(0, cols::IMM_0);
+        let ld = builder.main(0, cols::LOAD);
+        let st = builder.main(0, cols::STORE);
+        let beq = builder.main(0, cols::BEQ);
+        let blt = builder.main(0, cols::BLT);
+        let expected = (&one - &ld) * &rv2lo + (&one - &beq - &blt - &st) * &imm0;
+        builder.assert_zero(a2lo - expected);
+    }
+
+    // Arg2UpperConstraint (1)
+    {
+        let a2hi = pack(
+            builder.main(0, cols::ARG2[4]),
+            builder.main(0, cols::ARG2[5]),
+            builder.main(0, cols::ARG2[6]),
+            builder.main(0, cols::ARG2[7]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv2u = builder.main(0, cols::RV2_2);
+        let imm1 = builder.main(0, cols::IMM_1);
+        let ld = builder.main(0, cols::LOAD);
+        let st = builder.main(0, cols::STORE);
+        let beq = builder.main(0, cols::BEQ);
+        let blt = builder.main(0, cols::BLT);
+        let wi = builder.main(0, cols::WORD_INSTR);
+        let si = builder.main(0, cols::SIGNED);
+        let eb = builder.main(0, cols::RV2_EXT_BIT);
+        let rv2_term = (&one - &wi) * &rv2u + &si * &eb * &mask_32;
+        let expected = (&one - &ld) * &rv2_term + (&one - &beq - &blt - &st) * &imm1;
+        builder.assert_zero(a2hi - expected);
+    }
+
+    // RvdLowerConstraint (1)
+    {
+        let rvd0 = builder.main(0, cols::RVD_0);
+        let rlo = pack(
+            builder.main(0, cols::RES[0]),
+            builder.main(0, cols::RES[1]),
+            builder.main(0, cols::RES[2]),
+            builder.main(0, cols::RES[3]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let ld = builder.main(0, cols::LOAD);
+        builder.assert_zero((&one - &ld) * (&rvd0 - &rlo));
+    }
+
+    // RvdUpperConstraint (1)
+    {
+        let rvd1 = builder.main(0, cols::RVD_1);
+        let rhi = pack(
+            builder.main(0, cols::RES[4]),
+            builder.main(0, cols::RES[5]),
+            builder.main(0, cols::RES[6]),
+            builder.main(0, cols::RES[7]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let ld = builder.main(0, cols::LOAD);
+        let wi = builder.main(0, cols::WORD_INSTR);
+        let reb = builder.main(0, cols::RES_EXT_BIT);
+        let expected = (&one - &wi) * &rhi + &reb * &mask_32;
+        builder.assert_zero((&one - &ld) * (&rvd1 - &expected));
+    }
+
+    // SltResZeroConstraint (7)
+    {
+        let sb = &builder.main(0, cols::SLT) + &builder.main(0, cols::BLT);
+        for i in 1..8usize {
+            builder.assert_zero(&sb * &builder.main(0, cols::RES[i]));
+        }
+    }
+
+    // ExtBitZeroConstraint (3)
+    {
+        let nw = &one - &builder.main(0, cols::WORD_INSTR);
+        builder.assert_zero(&nw * &builder.main(0, cols::RV1_EXT_BIT));
+        builder.assert_zero(&nw * &builder.main(0, cols::RV2_EXT_BIT));
+        builder.assert_zero(&nw * &builder.main(0, cols::RES_EXT_BIT));
+    }
+
+    // NextPcAddConstraint (2)
+    {
+        let plo = builder.main(0, cols::PC_0);
+        let phi = builder.main(0, cols::PC_1);
+        let nlo = builder.main(0, cols::NEXT_PC_0);
+        let nhi = builder.main(0, cols::NEXT_PC_1);
+        let ct = builder.main(0, cols::C_TYPE_INSTRUCTION);
+        let bc = builder.main(0, cols::BRANCH_COND);
+        let isz = FE::from(4u64) - &two * ct;
+        let nb = &one - &bc;
+        let c0 = (&plo + &isz - &nlo) * &inv_2_32;
+        builder.assert_zero(&nb * &c0 * (&one - &c0));
+        let c1 = (&phi + &c0 - &nhi) * &inv_2_32;
+        builder.assert_zero(&nb * &c1 * (&one - &c1));
+    }
 }
 
 /// Create Bitwise AIR with bus interactions.
