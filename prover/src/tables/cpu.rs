@@ -901,7 +901,7 @@ pub fn generate_cpu_trace_from_logs(
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
-            (i as u64) * 4,
+            (i as u64) * 4 + 3,
             instruction,
         ));
     }
@@ -930,7 +930,7 @@ pub fn collect_bitwise_ops_from_logs(
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
-            (i as u64) * 4,
+            (i as u64) * 4 + 3,
             instruction,
         ));
     }
@@ -1766,10 +1766,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
         LinearTerm::Constant(-3),
         LinearTerm::Column { coefficient: 3, column: cols::PC_DOUBLE_READ },
-        LinearTerm::Column { coefficient: 1 << 32, column: cols::PREV_PC_TIMESTAMP_BORROW },
+        LinearTerm::Column { coefficient: 1i64 << 32, column: cols::PREV_PC_TIMESTAMP_BORROW },
     ]);
 
     // prev_ts_hi = 0 - borrow
+    // The -1 cancels the +2^32 added to prev_ts_lo when borrow fires, keeping the
+    // 64-bit timestamp correct: (prev_ts_hi * 2^32 + prev_ts_lo) = timestamp - 3.
     let prev_ts_hi = BusValue::linear(vec![
         LinearTerm::Column { coefficient: -1, column: cols::PREV_PC_TIMESTAMP_BORROW },
     ]);

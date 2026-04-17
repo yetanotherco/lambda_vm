@@ -289,10 +289,12 @@ fn collect_cpu_ops(
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
-    // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
+    // Timestamps start at 3 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location (where old_timestamp=0).
+    // Exactly 3 so that inline PC's prev_ts = timestamp - 3 = 0 on the first row,
+    // matching the REGISTER table's initial PC token at timestamp 0.
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = (i as u64) * 4 + 3;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()

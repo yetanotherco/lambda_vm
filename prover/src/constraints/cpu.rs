@@ -1015,6 +1015,103 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 }
 
 // =========================================================================
+// Inline PC Constraints
+// =========================================================================
+
+/// Constraint: pc_double_read * (rs1 - 255) = 0
+/// When pc_double_read is set, rs1 must be 255 (AUIPC/JAL reading PC).
+///
+/// The reverse direction (rs1=255 ∧ read_register1=1 → pc_double_read=1) is enforced
+/// by the LogUp memory bus: setting pc_double_read=0 on an AUIPC/JAL row would produce
+/// prev_ts = timestamp - 3 instead of timestamp, creating a token mismatch that the
+/// bus balance catches with overwhelming probability (1 - 1/p).
+pub struct PcDoubleReadRs1Constraint {
+    idx: usize,
+}
+
+impl PcDoubleReadRs1Constraint {
+    pub fn new(idx: usize) -> Self {
+        Self { idx }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadRs1Constraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.idx
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
+                let val_255 = FieldElement::<GoldilocksField>::from(255u64);
+                transition_evaluations[self.idx] = (&pc_double_read * (rs1 - val_255)).to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
+                let val_255 = FieldElement::<GoldilocksExtension>::from(255u64);
+                transition_evaluations[self.idx] = &pc_double_read * (rs1 - val_255);
+            }
+        }
+    }
+}
+
+/// Constraint: pc_double_read * prev_pc_timestamp_borrow = 0
+/// When pc_double_read is set, borrow must be 0 (no subtraction needed).
+pub struct PcDoubleReadBorrowConstraint {
+    idx: usize,
+}
+
+impl PcDoubleReadBorrowConstraint {
+    pub fn new(idx: usize) -> Self {
+        Self { idx }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadBorrowConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.idx
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                transition_evaluations[self.idx] = (&pc_double_read * borrow).to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                transition_evaluations[self.idx] = &pc_double_read * borrow;
+            }
+        }
+    }
+}
+
+// =========================================================================
 // Constraint Summary
 // =========================================================================
 
@@ -1148,96 +1245,4 @@ pub fn create_all_cpu_constraints() -> (
     next_idx += 1;
 
     (is_bit, add_constraints, other, next_idx)
-}
-
-// =========================================================================
-// Inline PC Constraints
-// =========================================================================
-
-/// Constraint: pc_double_read * (rs1 - 255) = 0
-/// When pc_double_read is set, rs1 must be 255 (AUIPC/JAL reading PC).
-pub struct PcDoubleReadRs1Constraint {
-    idx: usize,
-}
-
-impl PcDoubleReadRs1Constraint {
-    pub fn new(idx: usize) -> Self {
-        Self { idx }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadRs1Constraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.idx
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
-                let val_255 = FieldElement::<GoldilocksField>::from(255u64);
-                transition_evaluations[self.idx] = (&pc_double_read * (rs1 - val_255)).to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
-                let val_255 = FieldElement::<GoldilocksExtension>::from(255u64);
-                transition_evaluations[self.idx] = &pc_double_read * (rs1 - val_255);
-            }
-        }
-    }
-}
-
-/// Constraint: pc_double_read * prev_pc_timestamp_borrow = 0
-/// When pc_double_read is set, borrow must be 0 (no subtraction needed).
-pub struct PcDoubleReadBorrowConstraint {
-    idx: usize,
-}
-
-impl PcDoubleReadBorrowConstraint {
-    pub fn new(idx: usize) -> Self {
-        Self { idx }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadBorrowConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.idx
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
-                transition_evaluations[self.idx] = (&pc_double_read * borrow).to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
-                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
-                transition_evaluations[self.idx] = &pc_double_read * borrow;
-            }
-        }
-    }
 }
