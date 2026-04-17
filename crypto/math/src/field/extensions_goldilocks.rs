@@ -556,6 +556,17 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
     }
 }
 
+// =====================================================
+// HELPER FUNCTIONS
+// =====================================================
+
+/// Multiply a field element by 7 (the quadratic non-residue).
+/// Wraps the raw u64 implementation for use with FieldElement types.
+#[inline(always)]
+fn mul_by_7(a: &FpE) -> FpE {
+    FpE::from_raw(mul_by_7_raw(*a.value()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,15 +589,4 @@ mod tests {
             assert_eq!(&buf[..], elem.as_bytes().as_slice());
         }
     }
-}
-
-// =====================================================
-// HELPER FUNCTIONS
-// =====================================================
-
-/// Multiply a field element by 7 (the quadratic non-residue).
-/// Wraps the raw u64 implementation for use with FieldElement types.
-#[inline(always)]
-fn mul_by_7(a: &FpE) -> FpE {
-    FpE::from_raw(mul_by_7_raw(*a.value()))
 }
