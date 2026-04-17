@@ -72,7 +72,10 @@ fn main() {
                         let chip = &shard.opened_values.chips[idx];
                         let rows = 1usize << chip.log_degree;
                         // permutation.local.len() = permutation_width × 4; divide by 4 to get EF cols.
-                        (chip.permutation.local.len() / 4) * rows
+                        // D=4 is BabyBear's quartic extension degree (flatten_to_base() invariant).
+                        let perm_len = chip.permutation.local.len();
+                        debug_assert_eq!(perm_len % 4, 0, "SP1 v5 permutation width must be a multiple of 4 (D=4)");
+                        (perm_len / 4) * rows
                     })
                     .sum::<usize>()
             })

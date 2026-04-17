@@ -106,8 +106,11 @@ format_ratio() {
         return
     fi
     python3 -c "
-r = $num / $den
-print(f'+{r:.1f}x' if r >= 1 else f'-{1/r:.1f}x')
+den = $den
+if den == 0: print('n/a')
+else:
+    r = $num / den
+    print(f'+{r:.1f}x' if r >= 1 else f'-{1/r:.1f}x')
 "
 }
 
