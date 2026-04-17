@@ -91,6 +91,9 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     // Computed flags
     cols::IS_EQUAL,
     cols::BRANCH_COND,
+    // Inline PC columns
+    cols::PREV_PC_TIMESTAMP_BORROW,
+    cols::PC_DOUBLE_READ,
 ];
 
 /// Creates all IS_BIT constraints for CPU flag columns.
@@ -1036,9 +1039,9 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 66 constraints (32 IS_BIT + 8 ADD + 26 other)
+/// Total: 70 constraints (34 IS_BIT + 8 ADD + 28 other)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    32 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1138,5 +1141,103 @@ pub fn create_all_cpu_constraints() -> (
     other.push(next_pc_1.boxed());
     next_idx += 2;
 
+    // Inline PC constraints
+    other.push(Box::new(PcDoubleReadRs1Constraint::new(next_idx)));
+    next_idx += 1;
+    other.push(Box::new(PcDoubleReadBorrowConstraint::new(next_idx)));
+    next_idx += 1;
+
     (is_bit, add_constraints, other, next_idx)
+}
+
+// =========================================================================
+// Inline PC Constraints
+// =========================================================================
+
+/// Constraint: pc_double_read * (rs1 - 255) = 0
+/// When pc_double_read is set, rs1 must be 255 (AUIPC/JAL reading PC).
+pub struct PcDoubleReadRs1Constraint {
+    idx: usize,
+}
+
+impl PcDoubleReadRs1Constraint {
+    pub fn new(idx: usize) -> Self {
+        Self { idx }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadRs1Constraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.idx
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
+                let val_255 = FieldElement::<GoldilocksField>::from(255u64);
+                transition_evaluations[self.idx] = (&pc_double_read * (rs1 - val_255)).to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
+                let val_255 = FieldElement::<GoldilocksExtension>::from(255u64);
+                transition_evaluations[self.idx] = &pc_double_read * (rs1 - val_255);
+            }
+        }
+    }
+}
+
+/// Constraint: pc_double_read * prev_pc_timestamp_borrow = 0
+/// When pc_double_read is set, borrow must be 0 (no subtraction needed).
+pub struct PcDoubleReadBorrowConstraint {
+    idx: usize,
+}
+
+impl PcDoubleReadBorrowConstraint {
+    pub fn new(idx: usize) -> Self {
+        Self { idx }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadBorrowConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.idx
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                transition_evaluations[self.idx] = (&pc_double_read * borrow).to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let step = frame.get_evaluation_step(0);
+                let pc_double_read = step.get_main_evaluation_element(0, cols::PC_DOUBLE_READ).clone();
+                let borrow = step.get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW).clone();
+                transition_evaluations[self.idx] = &pc_double_read * borrow;
+            }
+        }
+    }
 }

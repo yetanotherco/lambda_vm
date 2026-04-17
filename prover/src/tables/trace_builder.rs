@@ -591,20 +591,9 @@ fn collect_register_ops_from_cpu(
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
-    // CM54: PC register read-write at timestamp+1
-    // Every non-padding CPU row sends a MEMW for x255 (address 510).
-    // old = pc (current), value = next_pc (new).
-    {
-        let pc_value = pack_register_value(op.decode.pc);
-        let next_pc_value = pack_register_value(op.next_pc);
-        let (_old_val, old_ts) = register_state.read_pc();
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
-            .with_old(pc_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write_pc(op.next_pc, op.timestamp + 1);
-    }
+    // PC register state update (needed for M1 reads when rs1=255, i.e. AUIPC/JAL).
+    // The actual PC read/write is now inline in the CPU via memory bus interactions.
+    register_state.write_pc(op.next_pc, op.timestamp + 1);
 
     memw_ops
 }

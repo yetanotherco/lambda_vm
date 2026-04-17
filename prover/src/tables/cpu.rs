@@ -232,8 +232,14 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 73;
 
+    /// prev_pc_timestamp_borrow: Borrow bit for 64-bit subtraction timestamp - 3
+    pub const PREV_PC_TIMESTAMP_BORROW: usize = 74;
+
+    /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
+    pub const PC_DOUBLE_READ: usize = 75;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 74;
+    pub const NUM_COLUMNS: usize = 76;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -851,6 +857,17 @@ pub fn generate_cpu_trace(
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+
+        // Inline PC columns
+        let pc_double_read = (d.read_register1 && d.rs1 == 255) as u64;
+        let ts_lo = op.timestamp & 0xFFFF_FFFF;
+        let prev_pc_ts_borrow = if pc_double_read == 0 && ts_lo < 3 {
+            1u64
+        } else {
+            0u64
+        };
+        data[base + cols::PC_DOUBLE_READ] = FE::from(pc_double_read);
+        data[base + cols::PREV_PC_TIMESTAMP_BORROW] = FE::from(prev_pc_ts_borrow);
     }
 
     // Padding rows: per spec, padding uses pc=1 (odd address, unreachable during
@@ -1717,137 +1734,86 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // -------------------------------------------------------------------------
-    // CM54: MEMW[pc; 1, 510, next_pc, timestamp+1, 1, 0, 0] | 1 - pad
-    // -------------------------------------------------------------------------
-    // PC register read-write via MEMW. Format: 24 elements (with old)
-    // [old[8], is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
-    //
-    // Every non-padding CPU row reads pc and writes next_pc to register x255 (address 510).
-    // Multiplicity = sum of all ALU flags = 1 for non-padding rows, 0 for padding.
-    interactions.push(BusInteraction::sender(
-        BusId::Memw,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADD,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::SUB,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::SLT,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::AND,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::OR,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::XOR,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::SHIFT,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::JALR,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::BEQ,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::BLT,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::LOAD,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::STORE,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::MUL,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::DIVREM,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ECALL,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::EBREAK,
-            },
-        ]),
-        vec![
-            // old[0] = PC_0 (low word of current pc)
-            BusValue::Packed {
-                start_column: cols::PC_0,
-                packing: Packing::Direct,
-            },
-            // old[1] = PC_1 (high word of current pc)
-            BusValue::Packed {
-                start_column: cols::PC_1,
-                packing: Packing::Direct,
-            },
-            // old[2..7] = 0 (unconstrained for registers)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // is_register = 1
-            BusValue::constant(1),
-            // base_address = [510, 0] (register x255)
-            BusValue::constant(510),
-            BusValue::constant(0),
-            // value[0] = NEXT_PC_0 (low word of next_pc)
-            BusValue::Packed {
-                start_column: cols::NEXT_PC_0,
-                packing: Packing::Direct,
-            },
-            // value[1] = NEXT_PC_1 (high word of next_pc)
-            BusValue::Packed {
-                start_column: cols::NEXT_PC_1,
-                packing: Packing::Direct,
-            },
-            // value[2..7] = 0 (unconstrained for registers)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            // timestamp[0] = timestamp + 1, timestamp[1] = 0
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::TIMESTAMP,
+    // =========================================================================
+    // Inline PC memory interactions (replaces CM54 MEMW interaction)
+    // =========================================================================
+    // CPU directly talks to the low-level memory bus for PC register (x255,
+    // addresses 510 and 511), bypassing MEMW_R.
+
+    // Non-padding multiplicity: sum of all ALU selector flags
+    let non_pad_mult = Multiplicity::Linear(vec![
+        LinearTerm::Column { coefficient: 1, column: cols::ADD },
+        LinearTerm::Column { coefficient: 1, column: cols::SUB },
+        LinearTerm::Column { coefficient: 1, column: cols::SLT },
+        LinearTerm::Column { coefficient: 1, column: cols::AND },
+        LinearTerm::Column { coefficient: 1, column: cols::OR },
+        LinearTerm::Column { coefficient: 1, column: cols::XOR },
+        LinearTerm::Column { coefficient: 1, column: cols::SHIFT },
+        LinearTerm::Column { coefficient: 1, column: cols::JALR },
+        LinearTerm::Column { coefficient: 1, column: cols::BEQ },
+        LinearTerm::Column { coefficient: 1, column: cols::BLT },
+        LinearTerm::Column { coefficient: 1, column: cols::LOAD },
+        LinearTerm::Column { coefficient: 1, column: cols::STORE },
+        LinearTerm::Column { coefficient: 1, column: cols::MUL },
+        LinearTerm::Column { coefficient: 1, column: cols::DIVREM },
+        LinearTerm::Column { coefficient: 1, column: cols::ECALL },
+        LinearTerm::Column { coefficient: 1, column: cols::EBREAK },
+    ]);
+
+    // prev_ts_lo = timestamp - 3*(1 - pc_double_read) + 2^32 * borrow
+    //            = timestamp - 3 + 3*pc_double_read + 2^32 * borrow
+    let prev_ts_lo = BusValue::linear(vec![
+        LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+        LinearTerm::Constant(-3),
+        LinearTerm::Column { coefficient: 3, column: cols::PC_DOUBLE_READ },
+        LinearTerm::Column { coefficient: 1 << 32, column: cols::PREV_PC_TIMESTAMP_BORROW },
+    ]);
+
+    // prev_ts_hi = 0 - borrow
+    let prev_ts_hi = BusValue::linear(vec![
+        LinearTerm::Column { coefficient: -1, column: cols::PREV_PC_TIMESTAMP_BORROW },
+    ]);
+
+    for i in 0..2u64 {
+        // PC read (sender, +1): consume old token
+        // memory[1, 510+i, 0, prev_ts_lo, prev_ts_hi, pc[i]]
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            non_pad_mult.clone(),
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(510 + i),
+                BusValue::constant(0),
+                prev_ts_lo.clone(),
+                prev_ts_hi.clone(),
+                BusValue::Packed {
+                    start_column: if i == 0 { cols::PC_0 } else { cols::PC_1 },
+                    packing: Packing::Direct,
                 },
-                LinearTerm::Constant(1),
-            ]),
-            BusValue::constant(0),
-            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
-            BusValue::constant(1),
-            BusValue::constant(0),
-            BusValue::constant(0),
-        ],
-    ));
+            ],
+        ));
+
+        // PC write (receiver, -1): emit new token
+        // memory[1, 510+i, 0, timestamp+1, 0, next_pc[i]]
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            non_pad_mult.clone(),
+            vec![
+                BusValue::constant(1),
+                BusValue::constant(510 + i),
+                BusValue::constant(0),
+                BusValue::linear(vec![
+                    LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+                    LinearTerm::Constant(1),
+                ]),
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: if i == 0 { cols::NEXT_PC_0 } else { cols::NEXT_PC_1 },
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // BRANCH interaction (for branch/jump target calculation)
