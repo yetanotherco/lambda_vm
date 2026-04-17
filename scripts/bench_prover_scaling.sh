@@ -66,8 +66,8 @@ parse_run() {
     /Aux trace build/        { v = secs(); if (v) print "t_aux_build="   v }
     /Aux trace commit/       { v = secs(); if (v) print "t_aux_commit="  v }
     /Rounds 2/               { v = secs(); if (v) print "t_rounds24="    v }
-    /Main expand_pool_to_lde/{ v = secs(); if (v) print "t_main_lde="    v }
-    /Aux expand_pool_to_lde/ { v = secs(); if (v) print "t_aux_lde="     v }
+    /Main expand_columns_to_lde/{ v = secs(); if (v) print "t_main_lde=" v }
+    /Aux expand_columns_to_lde/ { v = secs(); if (v) print "t_aux_lde="  v }
     /Main commit \(Merkle\)/ { v = secs(); if (v) print "t_main_merkle=" v }
     /Aux commit \(Merkle\)/  { v = secs(); if (v) print "t_aux_merkle="  v }
     /^  Total FFT/           { v = secs(); if (v) print "t_total_fft="   v }
