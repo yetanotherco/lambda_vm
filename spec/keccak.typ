@@ -16,13 +16,15 @@
 #show: book-page(chip.name)
 #let keccak = raw(chip.name)
 
-The #keccak chip applies the keccak permutation $kappa$ to a given memory range.
+The #keccak chip applies the keccak permutation $kappa$ to a given memory range;
+other aspects of keccak hashing (such as repeated permutation invocation, 
+input padding and state initialization) fall outside the scope of this accelerator.
 
 This permutation $kappa: FF_2^1600 -> FF_2^1600$ operates on 1600 bits and is composed of 24 applications of round-permutation $Lambda: FF_2^1600 times NN -> FF_2^1600$, where the additional parameter is the round constant.
 $Lambda$ is defined as the composition $iota compose chi compose pi compose rho compose theta$, where only $iota$ depends on the round constant.
 #footnote("More details on the KECCAK permutation: FIPS 202, NIST, " + link("https://csrc.nist.gov/pubs/fips/202/final"))
 
-The keccak accelerator comprises two chips: a core chip that interacts with the memory, and a round chip that applies the round permutation.
+The keccak accelerator comprises two chips: a core chip that interacts with the memory --- loading the input and writing the output, and a round chip that applies the round permutation.
 
 
 = Core chip
@@ -63,11 +65,17 @@ The #keccak table can be padded to the next power of two with the following valu
 The #keccak_rnd chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(round_chip, config)
 
+#strong("Note on " + raw("start") + ".")
+`start` contains the state to which the permutation should be applied.
+It's three-dimensional array mimics the specification's three-dimensional state
+#footnote("FIPS 202, NIST, Section 3.1 (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
+and orders the bits as prescribed.
+#footnote("FIPS 202, NIST, Section B.1, Algorithm 10 (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
 
 #strong("Note on " + raw("rnc") + " and " + raw("rbc") + ".")
 Rho rotates every lane by a rotation offset in $[0, 64)$.
 These offsets are identical for every round.
-#footnote("See FIPS 202, NIST, Table 2 on page 13 for the exact offsets (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
+#footnote("FIPS 202, NIST, page 13, Table 2 (" + link("https://csrc.nist.gov/pubs/fips/202/final") + ")")
 We decompose each offset in three components: the lower nibble (4 bits) are represented by `rnc`, while the upper two bits are represented by as `Bit`s in `rbc`.
 That is, $#`rho_offset[x][y]` = #`rnc[x][y]` + 16 dot #`rbc[x][y][0]` + 32 dot #`rbc[x][y][1]`$.
 
