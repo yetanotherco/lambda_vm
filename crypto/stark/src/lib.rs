@@ -1,3 +1,4 @@
+pub mod air_builder;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;
