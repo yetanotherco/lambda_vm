@@ -1,10 +1,12 @@
 #!/bin/bash
 # Prover scaling benchmark across fib_iterative sizes.
-# Shows how per-phase timing and heap grow with program size, plus linear regression.
+# Shows how per-phase timing or heap grows with program size, plus linear regression.
 #
-# Usage: bench_prover_scaling.sh [--sizes "500k 1M 2M 4M"] [--runs N]
+# Usage: bench_prover_scaling.sh <time|heap> [--sizes "500k 1M 2M 4M"] [--runs N]
 #
-# Requires: instruments + jemalloc-stats features.
+# time mode: builds with `instruments` only (clean timings, no heap data).
+# heap mode: builds with `instruments,jemalloc-stats` (timings + per-phase heap;
+#            jemalloc-stats adds a few percent of timing overhead).
 
 set -euo pipefail
 
@@ -16,6 +18,17 @@ ELF_DIR="$ROOT_DIR/executor/program_artifacts/asm"
 GREEN='\033[0;32m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <time|heap> [--sizes \"...\"] [--runs N]" >&2
+    exit 1
+fi
+MODE=$1; shift
+case $MODE in
+    time) FEATURES="instruments" ;;
+    heap) FEATURES="instruments,jemalloc-stats" ;;
+    *) echo "Unknown mode: $MODE (expected time|heap)" >&2; exit 1 ;;
+esac
 
 SIZES="500k 1M 2M 4M"
 RUNS=1
@@ -40,8 +53,8 @@ suffix_to_steps() {
 
 rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR"
 
-echo -e "${GREEN}Building CLI with jemalloc-stats + instruments...${NC}"
-cargo build --release -p cli --features jemalloc-stats,instruments \
+echo -e "${GREEN}Building CLI with features: ${FEATURES}...${NC}"
+cargo build --release -p cli --features "$FEATURES" \
     --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
 CLI="$ROOT_DIR/target/release/cli"
 
@@ -184,17 +197,19 @@ print_row "Total FFT (all rounds)" t_total_fft   s
 print_row "Total Merkle"           t_total_merkle s
 print_row "TOTAL"                  t_total       s
 
-echo ""
-echo -e "${BOLD}=== HEAP (MB absolute) ===${NC}"
-print_header
-print_row "After execute"          h_execute      mb
-print_row "After trace build"      h_trace_build  mb
-print_row "After AIR construction" h_air          mb
-print_row "After pool alloc"       h_pool_alloc   mb
-print_row "After main commits"     h_main_commits mb
-print_row "After aux build"        h_aux_build    mb
-print_row "After aux commit"       h_aux_commit   mb
-print_row "Peak heap"              peak           mb
+if [[ "$MODE" == "heap" ]]; then
+    echo ""
+    echo -e "${BOLD}=== HEAP (MB absolute) ===${NC}"
+    print_header
+    print_row "After execute"          h_execute      mb
+    print_row "After trace build"      h_trace_build  mb
+    print_row "After AIR construction" h_air          mb
+    print_row "After pool alloc"       h_pool_alloc   mb
+    print_row "After main commits"     h_main_commits mb
+    print_row "After aux build"        h_aux_build    mb
+    print_row "After aux commit"       h_aux_commit   mb
+    print_row "Peak heap"              peak           mb
+fi
 
 # ---------------------------------------------------------------------------
 # Linear regression per metric: y = a + b * (steps / 1M)
@@ -247,16 +262,18 @@ regress "Total FFT"        t_total_fft   s
 regress "Total Merkle"     t_total_merkle s
 regress "TOTAL"            t_total       s
 
-echo ""
-echo -e "${BOLD}=== HEAP GROWTH (per 1M steps) ===${NC}"
-regress "After execute"          h_execute      mb
-regress "After trace build"      h_trace_build  mb
-regress "After AIR construction" h_air          mb
-regress "After pool alloc"       h_pool_alloc   mb
-regress "After main commits"     h_main_commits mb
-regress "After aux build"        h_aux_build    mb
-regress "After aux commit"       h_aux_commit   mb
-regress "Peak heap"              peak           mb
+if [[ "$MODE" == "heap" ]]; then
+    echo ""
+    echo -e "${BOLD}=== HEAP GROWTH (per 1M steps) ===${NC}"
+    regress "After execute"          h_execute      mb
+    regress "After trace build"      h_trace_build  mb
+    regress "After AIR construction" h_air          mb
+    regress "After pool alloc"       h_pool_alloc   mb
+    regress "After main commits"     h_main_commits mb
+    regress "After aux build"        h_aux_build    mb
+    regress "After aux commit"       h_aux_commit   mb
+    regress "Peak heap"              peak           mb
+fi
 
 echo ""
 echo "Raw data: $TMP_DIR/"
