@@ -49,8 +49,10 @@ where
         num_periodic: usize,
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
+        composition_alpha: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
+        let use_builder = air.uses_builder();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
@@ -96,6 +98,24 @@ where
                         )
                     },
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                        if use_builder {
+                            let mut builder = crate::air_builder::ProverBuilder::new(
+                                lde_trace,
+                                i,
+                                composition_alpha,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                logup_table_offset,
+                            );
+                            air.eval_constraints_with_builder(&mut builder);
+                            let acc = if is_uniform {
+                                zerofier_data.get_uniform(i) * &builder.finish()
+                            } else {
+                                panic!("AirBuilder requires uniform zerofiers")
+                            };
+                            return acc + boundary;
+                        }
+
                         frame.fill_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
@@ -148,6 +168,24 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
+                    if use_builder {
+                        let mut builder = crate::air_builder::ProverBuilder::new(
+                            lde_trace,
+                            i,
+                            composition_alpha,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                        );
+                        air.eval_constraints_with_builder(&mut builder);
+                        let acc = if is_uniform {
+                            zerofier_data.get_uniform(i) * &builder.finish()
+                        } else {
+                            panic!("AirBuilder requires uniform zerofiers")
+                        };
+                        return acc + boundary;
+                    }
+
                     frame.fill_from_lde(lde_trace, i, offsets);
 
                     for (j, col) in lde_periodic_columns.iter().enumerate() {
@@ -315,6 +353,14 @@ where
         let num_periodic = lde_periodic_columns.len();
         let offsets = &air.context().transition_offsets;
 
+        // Extract the raw composition alpha (β) from the pre-computed powers [1, β, β², ...].
+        // The ProverBuilder generates its own powers internally via assert_zero().
+        let composition_alpha = if transition_coefficients.len() >= 2 {
+            transition_coefficients[1].clone()
+        } else {
+            FieldElement::one()
+        };
+
         Self::evaluate_transitions(
             air,
             lde_trace,
@@ -327,6 +373,7 @@ where
             num_periodic,
             offsets,
             &self.logup_table_offset,
+            &composition_alpha,
         )
     }
 }
