@@ -577,6 +577,40 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit;
+
+        let mu_read = builder.main(0, memw_aligned_cols::MU_READ);
+        let mu_write = builder.main(0, memw_aligned_cols::MU_WRITE);
+        let mu_sum = &mu_read + &mu_write;
+
+        // Constraint 0: IS_BIT<mu_sum>: mu_sum * (1 - mu_sum) == 0
+        builder.assert_zero(
+            mu_sum.clone()
+                * (math::field::element::FieldElement::<
+                    crate::tables::types::GoldilocksExtension,
+                >::one()
+                    - mu_sum.clone()),
+        );
+
+        // Constraint 1: w2 => mu_sum: (write2 + write4 + write8) * (1 - mu_sum) == 0
+        let write2 = builder.main(0, memw_aligned_cols::WRITE2);
+        let write4 = builder.main(0, memw_aligned_cols::WRITE4);
+        let write8 = builder.main(0, memw_aligned_cols::WRITE8);
+        let w2 = write2 + write4 + write8;
+        builder.assert_zero(
+            w2 * (math::field::element::FieldElement::<
+                crate::tables::types::GoldilocksExtension,
+            >::one()
+                - mu_sum),
+        );
+
+        // Constraint 2: IS_BIT<mu_read>: mu_read * (1 - mu_read) == 0
+        assert_is_bit(builder, mu_read);
+
+        // Constraint 3: IS_BIT<mu_write>: mu_write * (1 - mu_write) == 0
+        assert_is_bit(builder, mu_write);
+    })
     .with_name("MEMW_A")
 }
 
@@ -722,6 +756,54 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_builder(|builder| {
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::branch::cols;
+        use crate::tables::types::{GoldilocksExtension, SHIFT_16};
+        use math::field::element::FieldElement;
+
+        let shift_8 = FieldElement::<GoldilocksExtension>::from(1u64 << 8);
+        let shift_16 = FieldElement::<GoldilocksExtension>::from(SHIFT_16);
+        let inv_2_32 = FieldElement::<GoldilocksExtension>::from(INV_SHIFT_32);
+        let one = FieldElement::<GoldilocksExtension>::one();
+
+        let jalr = builder.main(0, cols::JALR);
+        let pc_0 = builder.main(0, cols::PC_0);
+        let pc_1 = builder.main(0, cols::PC_1);
+        let offset_0 = builder.main(0, cols::OFFSET_0);
+        let offset_1 = builder.main(0, cols::OFFSET_1);
+        let register_0 = builder.main(0, cols::REGISTER_0);
+        let register_1 = builder.main(0, cols::REGISTER_1);
+        let unmasked_low_byte = builder.main(0, cols::UNMASKED_LOW_BYTE);
+        let next_pc_low_1 = builder.main(0, cols::NEXT_PC_LOW_1);
+        let next_pc_high_0 = builder.main(0, cols::NEXT_PC_HIGH_0);
+        let next_pc_high_1 = builder.main(0, cols::NEXT_PC_HIGH_1);
+        let next_pc_high_2 = builder.main(0, cols::NEXT_PC_HIGH_2);
+
+        // Reconstruct next_pc_unmasked as DWordWL:
+        // unmasked_0 = unmasked_low_byte + 2^8 * next_pc_low_1 + 2^16 * next_pc_high_0
+        // unmasked_1 = next_pc_high_1 + 2^16 * next_pc_high_2
+        let unmasked_0 =
+            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+
+        // Constraint 0: PcCarry0IsBit — (1 - JALR) * carry_0_pc * (1 - carry_0_pc) = 0
+        let carry_0_pc = (&pc_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+        let cond_pc = &one - &jalr;
+        builder.assert_zero(&cond_pc * &carry_0_pc * (&one - &carry_0_pc));
+
+        // Constraint 1: PcCarry1IsBit — (1 - JALR) * carry_1_pc * (1 - carry_1_pc) = 0
+        let carry_1_pc = (&pc_1 + &offset_1 + &carry_0_pc - &unmasked_1) * &inv_2_32;
+        builder.assert_zero(&cond_pc * &carry_1_pc * (&one - &carry_1_pc));
+
+        // Constraint 2: RegCarry0IsBit — JALR * carry_0_reg * (1 - carry_0_reg) = 0
+        let carry_0_reg = (&register_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+        builder.assert_zero(&jalr * &carry_0_reg * (&one - &carry_0_reg));
+
+        // Constraint 3: RegCarry1IsBit — JALR * carry_1_reg * (1 - carry_1_reg) = 0
+        let carry_1_reg = (&register_1 + &offset_1 + &carry_0_reg - &unmasked_1) * &inv_2_32;
+        builder.assert_zero(&jalr * &carry_1_reg * (&one - &carry_1_reg));
+    })
     .with_name("BRANCH")
 }
 
