@@ -11,6 +11,8 @@ use crate::traits::ByteConversion;
 pub struct U32Field<const MODULUS: u32>;
 
 impl ByteConversion for u32 {
+    const BYTE_LEN: usize = 4;
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         unimplemented!()
