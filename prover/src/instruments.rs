@@ -77,11 +77,11 @@ pub fn print_report(
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
         row_top("Round 1", round1, total);
         row_sub("  Main trace commits", mp.main_commits, total);
-        row_sub("    expand_pool_to_lde", mp.round1_sub.main_lde, total);
+        row_sub("    expand_columns_to_lde", mp.round1_sub.main_lde, total);
         row_sub("    commit (Merkle)", mp.round1_sub.main_merkle, total);
         row_sub("  Aux trace build (parallel)", mp.aux_build, total);
         row_sub("  Aux trace commit", mp.aux_commit, total);
-        row_sub("    expand_pool_to_lde", mp.round1_sub.aux_lde, total);
+        row_sub("    expand_columns_to_lde", mp.round1_sub.aux_lde, total);
         row_sub("    commit (Merkle)", mp.round1_sub.aux_merkle, total);
         row_top("Rounds 2\u{2013}4", mp.rounds_2_4, total);
 
@@ -98,7 +98,6 @@ pub fn print_report(
             entry.total_dur += *dur;
             entry.total_rows += rows;
             entry.count += 1;
-            entry.sub_ops.trace_lde += sub_ops.trace_lde;
             entry.sub_ops.constraints += sub_ops.constraints;
             entry.sub_ops.comp_decompose += sub_ops.comp_decompose;
             entry.sub_ops.comp_commit += sub_ops.comp_commit;
@@ -136,7 +135,6 @@ pub fn print_report(
         }
 
         // Sub-operation totals across all tables
-        let mut total_trace_lde = Duration::ZERO;
         let mut total_constraints = Duration::ZERO;
         let mut total_comp_decompose = Duration::ZERO;
         let mut total_comp_commit = Duration::ZERO;
@@ -146,7 +144,6 @@ pub fn print_report(
         let mut total_fri_commit = Duration::ZERO;
         let mut total_queries = Duration::ZERO;
         for (_, t) in &sorted {
-            total_trace_lde += t.sub_ops.trace_lde;
             total_constraints += t.sub_ops.constraints;
             total_comp_decompose += t.sub_ops.comp_decompose;
             total_comp_commit += t.sub_ops.comp_commit;
@@ -157,8 +154,7 @@ pub fn print_report(
             total_queries += t.sub_ops.queries;
         }
 
-        let sub_ops_sum = total_trace_lde
-            + total_constraints
+        let sub_ops_sum = total_constraints
             + total_comp_decompose
             + total_comp_commit
             + total_ood
@@ -168,7 +164,6 @@ pub fn print_report(
             + total_queries;
         if sub_ops_sum > Duration::ZERO {
             let mut sub_ops: Vec<(&str, Duration)> = vec![
-                ("R1  expand_pool_to_lde", total_trace_lde),
                 ("R2  evaluate", total_constraints),
                 ("R2  decompose_and_extend_d2", total_comp_decompose),
                 ("R2  commit_composition_poly", total_comp_commit),
@@ -188,7 +183,6 @@ pub fn print_report(
         // Cross-round totals: all FFT work and all Merkle work
         let total_fft = mp.round1_sub.main_lde
             + mp.round1_sub.aux_lde
-            + total_trace_lde
             + total_comp_decompose
             + total_deep_extend;
         let total_merkle = mp.round1_sub.main_merkle
