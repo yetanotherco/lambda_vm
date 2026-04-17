@@ -1646,11 +1646,16 @@ impl Traces {
     ///
     /// Counts only the main (base-field) trace columns — equivalent to SP1's
     /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    ///
+    /// Preprocessed columns (committed in a separate PCS round during setup, not at
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (2), PAGE (2).
     pub fn total_field_elements(&self) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
@@ -1660,7 +1665,9 @@ impl Traces {
         use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
         use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
         use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
         use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
 
@@ -1668,7 +1675,7 @@ impl Traces {
         for t in &self.cpus {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
-        total += (self.bitwise.num_rows() * BITWISE_COLS) as u64;
+        total += (self.bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
         for t in &self.lts {
             total += (t.num_rows() * LT_COLS) as u64;
         }
@@ -1684,7 +1691,7 @@ impl Traces {
         for t in &self.loads {
             total += (t.num_rows() * LOAD_COLS) as u64;
         }
-        total += (self.decode.num_rows() * DECODE_COLS) as u64;
+        total += (self.decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
         for t in &self.muls {
             total += (t.num_rows() * MUL_COLS) as u64;
         }
@@ -1696,9 +1703,9 @@ impl Traces {
         }
         total += (self.halt.num_rows() * HALT_COLS) as u64;
         total += (self.commit.num_rows() * COMMIT_COLS) as u64;
-        total += (self.register.num_rows() * REGISTER_COLS) as u64;
+        total += (self.register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
         for t in &self.pages {
-            total += (t.num_rows() * PAGE_COLS) as u64;
+            total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
         }
         for t in &self.memw_registers {
             total += (t.num_rows() * MEMW_R_COLS) as u64;
