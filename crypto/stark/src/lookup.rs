@@ -808,8 +808,9 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
-    /// Optional AirBuilder-based constraint evaluator.
-    /// When set, `uses_builder()` returns true and the fused builder path is used.
+    /// Optional AirBuilder-based constraint evaluator for table-specific constraints.
+    /// When set, the closure is called first in `eval_constraints_with_builder()`,
+    /// followed by the LogUp constraints.
     builder_fn: Option<Box<dyn Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync>>,
 }
 
@@ -942,13 +943,11 @@ impl<
         self
     }
 
-    /// Attach an AirBuilder constraint evaluator to this AIR.
-    ///
-    /// When set, `uses_builder()` returns `true` and the builder path (fused alpha
-    /// combination) is used instead of the old per-constraint buffer approach.
+    /// Attach an AirBuilder constraint evaluator for table-specific constraints.
     ///
     /// The closure receives a `&mut dyn AirBuilder<E>` and must call `assert_zero`
     /// in the same order as the table's `constraints()` function.
+    /// LogUp constraints are automatically appended after the table constraints.
     pub fn with_builder<CB>(mut self, f: CB) -> Self
     where
         CB: Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync + 'static,
@@ -1019,10 +1018,6 @@ where
         &self.transition_constraints
     }
 
-    fn uses_builder(&self) -> bool {
-        self.builder_fn.is_some()
-    }
-
     fn eval_constraints_with_builder(
         &self,
         builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
@@ -1046,8 +1041,8 @@ where
         let z = builder.challenge(LOGUP_CHALLENGE_Z).clone();
 
         // Build LogUp alpha powers slice from the builder.
-        // max_bus_elements is computed at AirWithBuses construction time.
-        let alpha_powers: Vec<FieldElement<E>> = (0..=self.max_bus_elements)
+        // max_bus_elements is the max number of alpha powers needed (indices 0..max_bus_elements-1).
+        let alpha_powers: Vec<FieldElement<E>> = (0..self.max_bus_elements)
             .map(|i| builder.logup_alpha_power(i).clone())
             .collect();
 
@@ -1058,10 +1053,10 @@ where
             let term_col = pair_idx; // aux column index
 
             let c = builder.aux(0, term_col);
-            let m_a = compute_multiplicity_from_builder(builder, &ia.multiplicity);
-            let m_b = compute_multiplicity_from_builder(builder, &ib.multiplicity);
-            let fp_a = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
-            let fp_b = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers);
+            let m_a = compute_multiplicity_from_builder(builder, &ia.multiplicity, 0);
+            let m_b = compute_multiplicity_from_builder(builder, &ib.multiplicity, 0);
+            let fp_a = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 0);
+            let fp_b = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 0);
 
             let term_a = m_a * &fp_b;
             let term_a = if ia.is_sender { term_a } else { -term_a };
@@ -1088,8 +1083,8 @@ where
         match absorbed_count {
             1 => {
                 let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
-                let m = compute_multiplicity_from_builder(builder, &ia.multiplicity);
-                let f_fp = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
+                let m = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
+                let f_fp = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
                 let sign = if ia.is_sender {
                     FieldElement::<E>::one()
                 } else {
@@ -1100,10 +1095,10 @@ where
             2 => {
                 let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
                 let ib = &self.auxiliary_trace_build_data.interactions[absorbed_start + 1];
-                let m1 = compute_multiplicity_from_builder(builder, &ia.multiplicity);
-                let m2 = compute_multiplicity_from_builder(builder, &ib.multiplicity);
-                let f1 = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers);
-                let f2 = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers);
+                let m1 = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
+                let m2 = compute_multiplicity_from_builder(builder, &ib.multiplicity, 1);
+                let f1 = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
+                let f2 = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 1);
                 let term1 = m1 * &f2;
                 let term1 = if ia.is_sender { term1 } else { -term1 };
                 let term2 = m2 * &f1;
@@ -1973,15 +1968,22 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 fn compute_multiplicity_from_builder<E: IsField>(
     builder: &dyn crate::air_builder::AirBuilder<E>,
     multiplicity: &Multiplicity,
+    offset: usize,
 ) -> FieldElement<E> {
     match multiplicity {
         Multiplicity::One => FieldElement::<E>::one(),
-        Multiplicity::Column(col) => builder.main(0, *col),
-        Multiplicity::Sum(col_a, col_b) => builder.main(0, *col_a) + builder.main(0, *col_b),
-        Multiplicity::Negated(col) => FieldElement::<E>::one() - builder.main(0, *col),
-        Multiplicity::Diff(col_a, col_b) => builder.main(0, *col_a) - builder.main(0, *col_b),
+        Multiplicity::Column(col) => builder.main(offset, *col),
+        Multiplicity::Sum(col_a, col_b) => {
+            builder.main(offset, *col_a) + builder.main(offset, *col_b)
+        }
+        Multiplicity::Negated(col) => FieldElement::<E>::one() - builder.main(offset, *col),
+        Multiplicity::Diff(col_a, col_b) => {
+            builder.main(offset, *col_a) - builder.main(offset, *col_b)
+        }
         Multiplicity::Sum3(col_a, col_b, col_c) => {
-            builder.main(0, *col_a) + builder.main(0, *col_b) + builder.main(0, *col_c)
+            builder.main(offset, *col_a)
+                + builder.main(offset, *col_b)
+                + builder.main(offset, *col_c)
         }
         Multiplicity::Linear(terms) => {
             let mut result = FieldElement::<E>::zero();
@@ -1991,13 +1993,15 @@ fn compute_multiplicity_from_builder<E: IsField>(
                         coefficient,
                         column,
                     } => {
-                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                        result +=
+                            builder.main(offset, *column) * FieldElement::<E>::from(*coefficient);
                     }
                     LinearTerm::ColumnUnsigned {
                         coefficient,
                         column,
                     } => {
-                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                        result +=
+                            builder.main(offset, *column) * FieldElement::<E>::from(*coefficient);
                     }
                     LinearTerm::Constant(value) => {
                         result += FieldElement::<E>::from(*value);
@@ -2017,6 +2021,7 @@ fn compute_fingerprint_from_builder<E: IsField>(
     interaction: &BusInteraction,
     z: &FieldElement<E>,
     alpha_powers: &[FieldElement<E>],
+    offset: usize,
 ) -> FieldElement<E> {
     let bus_id_fe = FieldElement::<E>::from(interaction.bus_id);
     let mut linear_combination = bus_id_fe * &alpha_powers[0];
@@ -2031,6 +2036,7 @@ fn compute_fingerprint_from_builder<E: IsField>(
             alpha_idx,
             &mut linear_combination,
             &shifts,
+            offset,
         );
         alpha_idx += consumed;
     }
@@ -2045,81 +2051,86 @@ fn accumulate_bv_fingerprint_builder_inner<E: IsField>(
     alpha_offset: usize,
     acc: &mut FieldElement<E>,
     shifts: &PackingShifts<E>,
+    row_offset: usize,
 ) -> usize {
     match bv {
         BusValue::Packed {
             start_column,
             packing,
         } => {
-            // Replicate packing.accumulate_fingerprint_with using builder.main()
             let col = *start_column;
             match packing {
                 Packing::Direct => {
-                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
+                    *acc += builder.main(row_offset, col) * &alpha_powers[alpha_offset];
                     1
                 }
                 Packing::Word2L => {
-                    let combined =
-                        builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    let combined = builder.main(row_offset, col)
+                        + builder.main(row_offset, col + 1) * &shifts.shift_16;
                     *acc += combined * &alpha_powers[alpha_offset];
                     1
                 }
                 Packing::Word4L => {
-                    let combined = builder.main(0, col)
-                        + builder.main(0, col + 1) * &shifts.shift_8
-                        + builder.main(0, col + 2) * &shifts.shift_16
-                        + builder.main(0, col + 3) * &shifts.shift_24;
+                    let combined = builder.main(row_offset, col)
+                        + builder.main(row_offset, col + 1) * &shifts.shift_8
+                        + builder.main(row_offset, col + 2) * &shifts.shift_16
+                        + builder.main(row_offset, col + 3) * &shifts.shift_24;
                     *acc += combined * &alpha_powers[alpha_offset];
                     1
                 }
                 Packing::DWordWL => {
-                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
-                    *acc += builder.main(0, col + 1) * &alpha_powers[alpha_offset + 1];
+                    *acc += builder.main(row_offset, col) * &alpha_powers[alpha_offset];
+                    *acc += builder.main(row_offset, col + 1) * &alpha_powers[alpha_offset + 1];
                     2
                 }
                 Packing::DWordHHW => {
-                    *acc += builder.main(0, col) * &alpha_powers[alpha_offset];
-                    let w = builder.main(0, col + 1) + builder.main(0, col + 2) * &shifts.shift_16;
+                    *acc += builder.main(row_offset, col) * &alpha_powers[alpha_offset];
+                    let w = builder.main(row_offset, col + 1)
+                        + builder.main(row_offset, col + 2) * &shifts.shift_16;
                     *acc += w * &alpha_powers[alpha_offset + 1];
                     2
                 }
                 Packing::DWordWHH => {
-                    let w = builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    let w = builder.main(row_offset, col)
+                        + builder.main(row_offset, col + 1) * &shifts.shift_16;
                     *acc += w * &alpha_powers[alpha_offset];
-                    *acc += builder.main(0, col + 2) * &alpha_powers[alpha_offset + 1];
+                    *acc += builder.main(row_offset, col + 2) * &alpha_powers[alpha_offset + 1];
                     2
                 }
                 Packing::DWordHL => {
-                    let w0 = builder.main(0, col) + builder.main(0, col + 1) * &shifts.shift_16;
+                    let w0 = builder.main(row_offset, col)
+                        + builder.main(row_offset, col + 1) * &shifts.shift_16;
                     *acc += w0 * &alpha_powers[alpha_offset];
-                    let w1 = builder.main(0, col + 2) + builder.main(0, col + 3) * &shifts.shift_16;
+                    let w1 = builder.main(row_offset, col + 2)
+                        + builder.main(row_offset, col + 3) * &shifts.shift_16;
                     *acc += w1 * &alpha_powers[alpha_offset + 1];
                     2
                 }
                 Packing::DWordBL => {
-                    let w0 = builder.main(0, col)
-                        + builder.main(0, col + 1) * &shifts.shift_8
-                        + builder.main(0, col + 2) * &shifts.shift_16
-                        + builder.main(0, col + 3) * &shifts.shift_24;
+                    let w0 = builder.main(row_offset, col)
+                        + builder.main(row_offset, col + 1) * &shifts.shift_8
+                        + builder.main(row_offset, col + 2) * &shifts.shift_16
+                        + builder.main(row_offset, col + 3) * &shifts.shift_24;
                     *acc += w0 * &alpha_powers[alpha_offset];
-                    let w1 = builder.main(0, col + 4)
-                        + builder.main(0, col + 5) * &shifts.shift_8
-                        + builder.main(0, col + 6) * &shifts.shift_16
-                        + builder.main(0, col + 7) * &shifts.shift_24;
+                    let w1 = builder.main(row_offset, col + 4)
+                        + builder.main(row_offset, col + 5) * &shifts.shift_8
+                        + builder.main(row_offset, col + 6) * &shifts.shift_16
+                        + builder.main(row_offset, col + 7) * &shifts.shift_24;
                     *acc += w1 * &alpha_powers[alpha_offset + 1];
                     2
                 }
                 Packing::QuadHL => {
                     for i in 0..4 {
                         let c = col + i * 2;
-                        let w = builder.main(0, c) + builder.main(0, c + 1) * &shifts.shift_16;
+                        let w = builder.main(row_offset, c)
+                            + builder.main(row_offset, c + 1) * &shifts.shift_16;
                         *acc += w * &alpha_powers[alpha_offset + i];
                     }
                     4
                 }
                 Packing::QuadWL => {
                     for i in 0..4 {
-                        *acc += builder.main(0, col + i) * &alpha_powers[alpha_offset + i];
+                        *acc += builder.main(row_offset, col + i) * &alpha_powers[alpha_offset + i];
                     }
                     4
                 }
@@ -2133,13 +2144,15 @@ fn accumulate_bv_fingerprint_builder_inner<E: IsField>(
                         coefficient,
                         column,
                     } => {
-                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                        result += builder.main(row_offset, *column)
+                            * FieldElement::<E>::from(*coefficient);
                     }
                     LinearTerm::ColumnUnsigned {
                         coefficient,
                         column,
                     } => {
-                        result += builder.main(0, *column) * FieldElement::<E>::from(*coefficient);
+                        result += builder.main(row_offset, *column)
+                            * FieldElement::<E>::from(*coefficient);
                     }
                     LinearTerm::Constant(value) => {
                         result += FieldElement::<E>::from(*value);

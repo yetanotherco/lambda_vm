@@ -250,14 +250,12 @@ pub trait AIR: Send + Sync {
             .for_each(|c| c.evaluate(evaluation_context, evaluations));
     }
 
-    /// Whether this AIR uses the AirBuilder pattern for constraint evaluation.
-    /// Tables override to return true after migrating to eval_constraints_with_builder().
-    fn uses_builder(&self) -> bool {
-        false
-    }
-
     /// Evaluate all transition constraints using the AirBuilder pattern.
-    /// Override this (and uses_builder -> true) to use fused alpha combination.
+    ///
+    /// This is the standard constraint evaluation entry point used by both the
+    /// prover (via `ProverBuilder`) and verifier (via `VerifierBuilder`).
+    /// Each AIR implementation must override this method and call
+    /// `builder.assert_zero(expr)` for each constraint expression.
     ///
     /// Uses `&mut dyn AirBuilder<E>` (object-safe) so this method is dyn-compatible
     /// and callable through `&dyn AIR` in the evaluator and verifier.
@@ -265,7 +263,7 @@ pub trait AIR: Send + Sync {
         &self,
         _builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
     ) {
-        unimplemented!("Override eval_constraints_with_builder and uses_builder for this AIR")
+        unimplemented!("Override eval_constraints_with_builder for this AIR")
     }
 
     fn boundary_constraints(
