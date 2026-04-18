@@ -485,6 +485,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(cpu_main_builder_fn)
     .with_builder(cpu_builder_fn)
     .with_name("CPU")
 }
@@ -918,6 +919,431 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
     }
 }
 
+/// MainAirBuilder (base-field) constraint evaluator for the CPU table (66 constraints).
+///
+/// Same constraint order as `cpu_builder_fn`, but uses base-field types for 2x speedup.
+fn cpu_main_builder_fn(
+    builder: &mut dyn stark::air_builder::MainAirBuilder<GoldilocksField, GoldilocksExtension>,
+) {
+    use crate::constraints::cpu::BIT_FLAG_COLUMNS;
+    use crate::constraints::helpers::assert_is_bit_base;
+    use crate::constraints::templates::INV_SHIFT_32;
+    use crate::tables::cpu::cols;
+
+    type FE = FieldElement<GoldilocksField>;
+
+    let one = FE::one();
+    let two = FE::from(2u64);
+    let inv_2_32 = FE::from(INV_SHIFT_32);
+    let shift_8 = FE::from(1u64 << 8);
+    let shift_16 = FE::from(1u64 << 16);
+    let shift_24 = FE::from(1u64 << 24);
+    let mask_32 = FE::from((1u64 << 32) - 1);
+
+    #[inline]
+    fn pack(b0: FE, b1: FE, b2: FE, b3: FE, s8: &FE, s16: &FE, s24: &FE) -> FE {
+        &b0 + &b1 * s8 + &b2 * s16 + &b3 * s24
+    }
+
+    // =================================================================
+    // IS_BIT constraints (32)
+    // =================================================================
+    for &col in BIT_FLAG_COLUMNS {
+        let x = builder.main_base(col);
+        assert_is_bit_base(builder, x);
+    }
+
+    // =================================================================
+    // ADD constraints (8)
+    // =================================================================
+
+    // ADD + LOAD (2)
+    {
+        let ll = pack(
+            builder.main_base(cols::ARG1_0),
+            builder.main_base(cols::ARG1_1),
+            builder.main_base(cols::ARG1_2),
+            builder.main_base(cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = pack(
+            builder.main_base(cols::ARG2_0),
+            builder.main_base(cols::ARG2_1),
+            builder.main_base(cols::ARG2_2),
+            builder.main_base(cols::ARG2_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sl = pack(
+            builder.main_base(cols::RES_0),
+            builder.main_base(cols::RES_0 + 1),
+            builder.main_base(cols::RES_0 + 2),
+            builder.main_base(cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main_base(cols::ARG1_4),
+            builder.main_base(cols::ARG1_5),
+            builder.main_base(cols::ARG1_6),
+            builder.main_base(cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rh = pack(
+            builder.main_base(cols::ARG2_4),
+            builder.main_base(cols::ARG2_5),
+            builder.main_base(cols::ARG2_6),
+            builder.main_base(cols::ARG2_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main_base(cols::RES_0 + 4),
+            builder.main_base(cols::RES_0 + 5),
+            builder.main_base(cols::RES_0 + 6),
+            builder.main_base(cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = &builder.main_base(cols::ADD) + &builder.main_base(cols::LOAD);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+    }
+
+    // STORE (2)
+    {
+        let ll = pack(
+            builder.main_base(cols::ARG1_0),
+            builder.main_base(cols::ARG1_1),
+            builder.main_base(cols::ARG1_2),
+            builder.main_base(cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main_base(cols::ARG1_4),
+            builder.main_base(cols::ARG1_5),
+            builder.main_base(cols::ARG1_6),
+            builder.main_base(cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = builder.main_base(cols::IMM_0);
+        let rh = builder.main_base(cols::IMM_1);
+        let sl = pack(
+            builder.main_base(cols::RES_0),
+            builder.main_base(cols::RES_0 + 1),
+            builder.main_base(cols::RES_0 + 2),
+            builder.main_base(cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main_base(cols::RES_0 + 4),
+            builder.main_base(cols::RES_0 + 5),
+            builder.main_base(cols::RES_0 + 6),
+            builder.main_base(cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = builder.main_base(cols::STORE);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+    }
+
+    // SUB + BEQ (2)
+    {
+        let ll = pack(
+            builder.main_base(cols::ARG2_0),
+            builder.main_base(cols::ARG2_1),
+            builder.main_base(cols::ARG2_2),
+            builder.main_base(cols::ARG2_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let lh = pack(
+            builder.main_base(cols::ARG2_4),
+            builder.main_base(cols::ARG2_5),
+            builder.main_base(cols::ARG2_6),
+            builder.main_base(cols::ARG2_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rl = pack(
+            builder.main_base(cols::RES_0),
+            builder.main_base(cols::RES_0 + 1),
+            builder.main_base(cols::RES_0 + 2),
+            builder.main_base(cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rh = pack(
+            builder.main_base(cols::RES_0 + 4),
+            builder.main_base(cols::RES_0 + 5),
+            builder.main_base(cols::RES_0 + 6),
+            builder.main_base(cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sl = pack(
+            builder.main_base(cols::ARG1_0),
+            builder.main_base(cols::ARG1_1),
+            builder.main_base(cols::ARG1_2),
+            builder.main_base(cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main_base(cols::ARG1_4),
+            builder.main_base(cols::ARG1_5),
+            builder.main_base(cols::ARG1_6),
+            builder.main_base(cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = &builder.main_base(cols::SUB) + &builder.main_base(cols::BEQ);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+    }
+
+    // JALR (2)
+    {
+        let ll = builder.main_base(cols::PC_0);
+        let lh = builder.main_base(cols::PC_1);
+        let rl = FE::from(4u64) - &two * builder.main_base(cols::C_TYPE_INSTRUCTION);
+        let sl = pack(
+            builder.main_base(cols::RES_0),
+            builder.main_base(cols::RES_0 + 1),
+            builder.main_base(cols::RES_0 + 2),
+            builder.main_base(cols::RES_0 + 3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let sh = pack(
+            builder.main_base(cols::RES_0 + 4),
+            builder.main_base(cols::RES_0 + 5),
+            builder.main_base(cols::RES_0 + 6),
+            builder.main_base(cols::RES_0 + 7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let cond = builder.main_base(cols::JALR);
+        let c0 = (&ll + &rl - &sl) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
+        let c1 = (&lh + &c0 - &sh) * &inv_2_32;
+        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+    }
+
+    // =================================================================
+    // OTHER constraints (26)
+    // =================================================================
+
+    // BranchCondConstraint (1)
+    {
+        let jalr = builder.main_base(cols::JALR);
+        let blt = builder.main_base(cols::BLT);
+        let beq = builder.main_base(cols::BEQ);
+        let mp = builder.main_base(cols::MP_SELECTOR);
+        let r0 = builder.main_base(cols::RES_0);
+        let ieq = builder.main_base(cols::IS_EQUAL);
+        let bc = builder.main_base(cols::BRANCH_COND);
+        let res_xor_mp = &r0 + &mp - &two * &r0 * &mp;
+        let eq_xor_mp = &ieq + &mp - &two * &ieq * &mp;
+        builder.assert_zero_base(bc - (jalr + &blt * res_xor_mp + &beq * eq_xor_mp));
+    }
+
+    // EbreakConstraint (1)
+    builder.assert_zero_base(builder.main_base(cols::EBREAK));
+
+    // RegNotReadIsZero rv1 (3)
+    {
+        let rr = builder.main_base(cols::READ_REGISTER1);
+        for &c in &[cols::RV1_0, cols::RV1_1, cols::RV1_2] {
+            builder.assert_zero_base((&one - &rr) * builder.main_base(c));
+        }
+    }
+
+    // RegNotReadIsZero rv2 (3)
+    {
+        let rr = builder.main_base(cols::READ_REGISTER2);
+        for &c in &[cols::RV2_0, cols::RV2_1, cols::RV2_2] {
+            builder.assert_zero_base((&one - &rr) * builder.main_base(c));
+        }
+    }
+
+    // Arg1LowerConstraint (1)
+    {
+        let a1lo = pack(
+            builder.main_base(cols::ARG1_0),
+            builder.main_base(cols::ARG1_1),
+            builder.main_base(cols::ARG1_2),
+            builder.main_base(cols::ARG1_3),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv1lo = &builder.main_base(cols::RV1_0) + &builder.main_base(cols::RV1_1) * &shift_16;
+        builder.assert_zero_base(a1lo - rv1lo);
+    }
+
+    // Arg1UpperConstraint (1)
+    {
+        let a1hi = pack(
+            builder.main_base(cols::ARG1_4),
+            builder.main_base(cols::ARG1_5),
+            builder.main_base(cols::ARG1_6),
+            builder.main_base(cols::ARG1_7),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv1u = builder.main_base(cols::RV1_2);
+        let wi = builder.main_base(cols::WORD_INSTR);
+        let si = builder.main_base(cols::SIGNED);
+        let eb = builder.main_base(cols::RV1_EXT_BIT);
+        builder.assert_zero_base(a1hi - (&rv1u * (&one - &wi) + &mask_32 * &eb * &si));
+    }
+
+    // Arg2LowerConstraint (1)
+    {
+        let a2lo = pack(
+            builder.main_base(cols::ARG2[0]),
+            builder.main_base(cols::ARG2[1]),
+            builder.main_base(cols::ARG2[2]),
+            builder.main_base(cols::ARG2[3]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv2lo = &builder.main_base(cols::RV2_0) + &builder.main_base(cols::RV2_1) * &shift_16;
+        let imm0 = builder.main_base(cols::IMM_0);
+        let ld = builder.main_base(cols::LOAD);
+        let st = builder.main_base(cols::STORE);
+        let beq = builder.main_base(cols::BEQ);
+        let blt = builder.main_base(cols::BLT);
+        let expected = (&one - &ld) * &rv2lo + (&one - &beq - &blt - &st) * &imm0;
+        builder.assert_zero_base(a2lo - expected);
+    }
+
+    // Arg2UpperConstraint (1)
+    {
+        let a2hi = pack(
+            builder.main_base(cols::ARG2[4]),
+            builder.main_base(cols::ARG2[5]),
+            builder.main_base(cols::ARG2[6]),
+            builder.main_base(cols::ARG2[7]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let rv2u = builder.main_base(cols::RV2_2);
+        let imm1 = builder.main_base(cols::IMM_1);
+        let ld = builder.main_base(cols::LOAD);
+        let st = builder.main_base(cols::STORE);
+        let beq = builder.main_base(cols::BEQ);
+        let blt = builder.main_base(cols::BLT);
+        let wi = builder.main_base(cols::WORD_INSTR);
+        let si = builder.main_base(cols::SIGNED);
+        let eb = builder.main_base(cols::RV2_EXT_BIT);
+        let rv2_term = (&one - &wi) * &rv2u + &si * &eb * &mask_32;
+        let expected = (&one - &ld) * &rv2_term + (&one - &beq - &blt - &st) * &imm1;
+        builder.assert_zero_base(a2hi - expected);
+    }
+
+    // RvdLowerConstraint (1)
+    {
+        let rvd0 = builder.main_base(cols::RVD_0);
+        let rlo = pack(
+            builder.main_base(cols::RES[0]),
+            builder.main_base(cols::RES[1]),
+            builder.main_base(cols::RES[2]),
+            builder.main_base(cols::RES[3]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let ld = builder.main_base(cols::LOAD);
+        builder.assert_zero_base((&one - &ld) * (&rvd0 - &rlo));
+    }
+
+    // RvdUpperConstraint (1)
+    {
+        let rvd1 = builder.main_base(cols::RVD_1);
+        let rhi = pack(
+            builder.main_base(cols::RES[4]),
+            builder.main_base(cols::RES[5]),
+            builder.main_base(cols::RES[6]),
+            builder.main_base(cols::RES[7]),
+            &shift_8,
+            &shift_16,
+            &shift_24,
+        );
+        let ld = builder.main_base(cols::LOAD);
+        let wi = builder.main_base(cols::WORD_INSTR);
+        let reb = builder.main_base(cols::RES_EXT_BIT);
+        let expected = (&one - &wi) * &rhi + &reb * &mask_32;
+        builder.assert_zero_base((&one - &ld) * (&rvd1 - &expected));
+    }
+
+    // SltResZeroConstraint (7)
+    {
+        let sb = &builder.main_base(cols::SLT) + &builder.main_base(cols::BLT);
+        for i in 1..8usize {
+            builder.assert_zero_base(&sb * &builder.main_base(cols::RES[i]));
+        }
+    }
+
+    // ExtBitZeroConstraint (3)
+    {
+        let nw = &one - &builder.main_base(cols::WORD_INSTR);
+        builder.assert_zero_base(&nw * &builder.main_base(cols::RV1_EXT_BIT));
+        builder.assert_zero_base(&nw * &builder.main_base(cols::RV2_EXT_BIT));
+        builder.assert_zero_base(&nw * &builder.main_base(cols::RES_EXT_BIT));
+    }
+
+    // NextPcAddConstraint (2)
+    {
+        let plo = builder.main_base(cols::PC_0);
+        let phi = builder.main_base(cols::PC_1);
+        let nlo = builder.main_base(cols::NEXT_PC_0);
+        let nhi = builder.main_base(cols::NEXT_PC_1);
+        let ct = builder.main_base(cols::C_TYPE_INSTRUCTION);
+        let bc = builder.main_base(cols::BRANCH_COND);
+        let isz = FE::from(4u64) - &two * ct;
+        let nb = &one - &bc;
+        let c0 = (&plo + &isz - &nlo) * &inv_2_32;
+        builder.assert_zero_base(&nb * &c0 * (&one - &c0));
+        let c1 = (&phi + &c0 - &nhi) * &inv_2_32;
+        builder.assert_zero_base(&nb * &c1 * (&one - &c1));
+    }
+}
+
 /// Create Bitwise AIR with bus interactions.
 pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
@@ -971,6 +1397,111 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+        use crate::tables::shift::cols;
+        use crate::tables::types::SHIFT_16;
+
+        let one = FieldElement::<GoldilocksField>::one();
+        let shift_16_val = FieldElement::<GoldilocksField>::from(SHIFT_16);
+
+        let mu = builder.main_base(cols::MU);
+        let direction = builder.main_base(cols::DIRECTION);
+        let zbs = builder.main_base(cols::ZBS);
+        let is_negative = builder.main_base(cols::IS_NEGATIVE);
+        let left = &mu - &direction;
+
+        // Constraint 0: DirectionImpliesMu
+        builder.assert_zero_base(&direction * (&one - &mu));
+
+        // Constraints 1-4: ZbsOverrideX(0..4)
+        for i in 0..4 {
+            let x_i = builder.main_base(cols::X[i]);
+            let in_i = builder.main_base(cols::IN[i]);
+            builder.assert_zero_base(&zbs * (x_i - in_i * &left));
+        }
+
+        // Constraint 5: ZbsOverrideX4
+        let x4 = builder.main_base(cols::X_4);
+        builder.assert_zero_base(&zbs * x4);
+
+        // Constraints 6-9: ZbsOverrideY(0..4)
+        for i in 0..4 {
+            let y_i = builder.main_base(cols::Y[i]);
+            let in_i = builder.main_base(cols::IN[i]);
+            builder.assert_zero_base(&zbs * (y_i - in_i * &direction));
+        }
+
+        // Constraints 10-13: LimbShiftIsBit(0..4)
+        for i in 0..3 {
+            let ls = builder.main_base(cols::LIMB_SHIFT_RAW[i]);
+            assert_is_bit_base(builder, ls);
+        }
+        let ls_raw_0 = builder.main_base(cols::LIMB_SHIFT_RAW[0]);
+        let ls_raw_1 = builder.main_base(cols::LIMB_SHIFT_RAW[1]);
+        let ls_raw_2 = builder.main_base(cols::LIMB_SHIFT_RAW[2]);
+        let ls_3 = &one - &ls_raw_0 - &ls_raw_1 - &ls_raw_2;
+        assert_is_bit_base(builder, ls_3.clone());
+
+        // Constraints 14-15: OutputMatchesShifted(0..2)
+        let extension = FieldElement::<GoldilocksField>::from(65535u64) * &is_negative;
+
+        let x = [
+            builder.main_base(cols::X[0]),
+            builder.main_base(cols::X[1]),
+            builder.main_base(cols::X[2]),
+            builder.main_base(cols::X[3]),
+            builder.main_base(cols::X_4),
+        ];
+        let y = [
+            builder.main_base(cols::Y[0]),
+            builder.main_base(cols::Y[1]),
+            builder.main_base(cols::Y[2]),
+            builder.main_base(cols::Y[3]),
+        ];
+
+        let ls = [ls_raw_0, ls_raw_1, ls_raw_2, ls_3];
+
+        let mut shifted = Vec::with_capacity(4);
+        for i in 0..4usize {
+            let mut left_part = FieldElement::<GoldilocksField>::zero();
+            for j in 0..=i {
+                let k = i - j;
+                let intra_left_k = if k == 0 {
+                    x[0].clone()
+                } else {
+                    &x[k] + &y[k - 1]
+                };
+                left_part = left_part + &ls[j] * intra_left_k;
+            }
+            left_part = &left * left_part;
+
+            let mut right_shift_part = FieldElement::<GoldilocksField>::zero();
+            for j in 0..=(3 - i) {
+                let k = i + j;
+                let intra_right_k = &y[k] + &x[k + 1];
+                right_shift_part = right_shift_part + &ls[j] * intra_right_k;
+            }
+
+            let mut ext_sum = FieldElement::<GoldilocksField>::zero();
+            for j in (4 - i)..4 {
+                ext_sum = ext_sum + &ls[j];
+            }
+            let right_ext_part = &extension * ext_sum;
+
+            let right_part = &direction * (right_shift_part + right_ext_part);
+
+            shifted.push(left_part + right_part);
+        }
+
+        // OutputMatchesShifted(0)
+        let out_0 = builder.main_base(cols::OUT_0);
+        builder.assert_zero_base(out_0 - &shifted[0] - &shifted[1] * &shift_16_val);
+
+        // OutputMatchesShifted(1)
+        let out_1 = builder.main_base(cols::OUT_1);
+        builder.assert_zero_base(out_1 - &shifted[2] - &shifted[3] * &shift_16_val);
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
         use crate::tables::shift::cols;
@@ -1097,6 +1628,38 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+        use crate::tables::memw::cols;
+
+        let one = FieldElement::<GoldilocksField>::one();
+
+        let mu_read = builder.main_base(cols::MU_READ);
+        let mu_write = builder.main_base(cols::MU_WRITE);
+        let mu_sum = &mu_read + &mu_write;
+
+        // Constraint 0: IS_BIT<mu_sum>
+        builder.assert_zero_base(mu_sum.clone() * (&one - &mu_sum));
+
+        // Constraint 1: w2 => mu_sum
+        let write2 = builder.main_base(cols::WRITE2);
+        let write4 = builder.main_base(cols::WRITE4);
+        let write8 = builder.main_base(cols::WRITE8);
+        let w2 = write2 + write4 + write8;
+        builder.assert_zero_base(w2 * (one - mu_sum));
+
+        // Constraint 2: IS_BIT<mu_read>
+        assert_is_bit_base(builder, mu_read);
+
+        // Constraint 3: IS_BIT<mu_write>
+        assert_is_bit_base(builder, mu_write);
+
+        // Constraints 4-10: IS_BIT for carry[0..6]
+        for &col in &cols::CARRY {
+            let carry = builder.main_base(col);
+            assert_is_bit_base(builder, carry);
+        }
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
         use crate::tables::memw::cols;
@@ -1149,6 +1712,31 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+
+        let mu_read = builder.main_base(memw_aligned_cols::MU_READ);
+        let mu_write = builder.main_base(memw_aligned_cols::MU_WRITE);
+        let mu_sum = &mu_read + &mu_write;
+
+        // Constraint 0: IS_BIT<mu_sum>
+        builder.assert_zero_base(
+            mu_sum.clone() * (FieldElement::<GoldilocksField>::one() - mu_sum.clone()),
+        );
+
+        // Constraint 1: w2 => mu_sum
+        let write2 = builder.main_base(memw_aligned_cols::WRITE2);
+        let write4 = builder.main_base(memw_aligned_cols::WRITE4);
+        let write8 = builder.main_base(memw_aligned_cols::WRITE8);
+        let w2 = write2 + write4 + write8;
+        builder.assert_zero_base(w2 * (FieldElement::<GoldilocksField>::one() - mu_sum));
+
+        // Constraint 2: IS_BIT<mu_read>
+        assert_is_bit_base(builder, mu_read);
+
+        // Constraint 3: IS_BIT<mu_write>
+        assert_is_bit_base(builder, mu_write);
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
 
@@ -1201,6 +1789,23 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+
+        let mu_read = builder.main_base(memw_register_cols::MU_READ);
+        let mu_write = builder.main_base(memw_register_cols::MU_WRITE);
+
+        // Constraint 0: IS_BIT(mu_read)
+        assert_is_bit_base(builder, mu_read.clone());
+        // Constraint 1: IS_BIT(mu_write)
+        assert_is_bit_base(builder, mu_write.clone());
+        // Constraint 2: (mu_read + mu_write) * (1 - mu_read - mu_write) == 0
+        let mu_sum = &mu_read + &mu_write;
+        builder.assert_zero_base(
+            mu_sum.clone()
+                * (FieldElement::<GoldilocksField>::one() - mu_sum),
+        );
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
 
@@ -1236,6 +1841,44 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::tables::load::cols;
+
+        let one = FieldElement::<GoldilocksField>::one();
+        let ff = FieldElement::<GoldilocksField>::from(255u64);
+
+        let mu = builder.main_base(cols::MU);
+        let read2 = builder.main_base(cols::READ2);
+        let read4 = builder.main_base(cols::READ4);
+        let read8 = builder.main_base(cols::READ8);
+        let signed = builder.main_base(cols::SIGNED);
+        let sign_bit = builder.main_base(cols::SIGN_BIT);
+
+        // Constraint 0: ReadImpliesMu
+        let read_sum = &read2 + &read4 + &read8;
+        builder.assert_zero_base(read_sum * (&one - &mu));
+
+        let expected = &signed * &sign_bit * &ff;
+
+        // Constraints 1-4: ExtensionHigh(4..8)
+        let not_read8 = &one - &read8;
+        for i in 4..8 {
+            let res_i = builder.main_base(cols::RES[i]);
+            builder.assert_zero_base(&not_read8 * (&res_i - &expected));
+        }
+
+        // Constraints 5-6: ExtensionMid(2..4)
+        let not_read4_8 = &one - &read4 - &read8;
+        for i in 2..4 {
+            let res_i = builder.main_base(cols::RES[i]);
+            builder.assert_zero_base(&not_read4_8 * (&res_i - &expected));
+        }
+
+        // Constraint 7: ExtensionLow
+        let not_read2_4_8 = &one - &read2 - &read4 - &read8;
+        let res_1 = builder.main_base(cols::RES[1]);
+        builder.assert_zero_base(not_read2_4_8 * (res_1 - expected));
+    })
     .with_builder(|builder| {
         use crate::tables::load::cols;
         use crate::tables::types::GoldilocksExtension;
@@ -1325,6 +1968,93 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::tables::mul::cols;
+
+        let one = FieldElement::<GoldilocksField>::one();
+        let sign_fill = FieldElement::<GoldilocksField>::from(0xFFFFu64);
+        let shift_16 = FieldElement::<GoldilocksField>::from(65536u64);
+
+        let lhs_signed = builder.main_base(cols::LHS_SIGNED);
+        let rhs_signed = builder.main_base(cols::RHS_SIGNED);
+        let lhs_is_neg = builder.main_base(cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = builder.main_base(cols::RHS_IS_NEGATIVE);
+
+        // Constraint 0: LhsSign
+        builder.assert_zero_base((&one - &lhs_signed) * &lhs_is_neg);
+
+        // Constraint 1: RhsSign
+        builder.assert_zero_base((&one - &rhs_signed) * &rhs_is_neg);
+
+        let lhs = [
+            builder.main_base(cols::LHS_0),
+            builder.main_base(cols::LHS_1),
+            builder.main_base(cols::LHS_2),
+            builder.main_base(cols::LHS_3),
+        ];
+        let rhs = [
+            builder.main_base(cols::RHS_0),
+            builder.main_base(cols::RHS_1),
+            builder.main_base(cols::RHS_2),
+            builder.main_base(cols::RHS_3),
+        ];
+
+        let lhs_sign_ext = &sign_fill * &lhs_is_neg;
+        let lhs_ext = [
+            lhs[0].clone(),
+            lhs[1].clone(),
+            lhs[2].clone(),
+            lhs[3].clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+            lhs_sign_ext.clone(),
+        ];
+
+        let rhs_sign_ext = &sign_fill * &rhs_is_neg;
+        let rhs_ext = [
+            rhs[0].clone(),
+            rhs[1].clone(),
+            rhs[2].clone(),
+            rhs[3].clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+            rhs_sign_ext.clone(),
+        ];
+
+        let raw_product_cols = [
+            cols::RAW_PRODUCT_0,
+            cols::RAW_PRODUCT_1,
+            cols::RAW_PRODUCT_2,
+            cols::RAW_PRODUCT_3,
+        ];
+
+        // Constraints 2-5: RawProduct(i) for i in 0..4
+        for i in 0..4 {
+            let mut sum = FieldElement::<GoldilocksField>::zero();
+
+            for k in 0usize..=1 {
+                let idx = 2 * i + k;
+                if idx < 8 {
+                    let mut inner_sum = FieldElement::<GoldilocksField>::zero();
+                    for j in 0..=idx {
+                        if j < 8 && (idx - j) < 8 {
+                            inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                        }
+                    }
+                    if k == 0 {
+                        sum = &sum + &inner_sum;
+                    } else {
+                        sum = &sum + &(&inner_sum * &shift_16);
+                    }
+                }
+            }
+
+            let raw_product = builder.main_base(raw_product_cols[i]);
+            builder.assert_zero_base(raw_product - sum);
+        }
+    })
     .with_builder(|builder| {
         use crate::tables::mul::cols;
         use crate::tables::types::GoldilocksExtension;
@@ -1438,6 +2168,136 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::dvrm::cols;
+        use crate::tables::types::SHIFT_16;
+
+        let one = FieldElement::<GoldilocksField>::one();
+        let shift_16 = FieldElement::<GoldilocksField>::from(SHIFT_16);
+        let inv_2_32 = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let sign_fill = FieldElement::<GoldilocksField>::from(0xFFFFu64);
+
+        let signed = builder.main_base(cols::SIGNED);
+        let sign_n = builder.main_base(cols::SIGN_N);
+        let sign_d = builder.main_base(cols::SIGN_D);
+        let sign_r = builder.main_base(cols::SIGN_R);
+        let sign_q = builder.main_base(cols::SIGN_Q);
+        let sign_nsr = builder.main_base(cols::SIGN_N_SUB_R);
+        let overflow = builder.main_base(cols::OVERFLOW);
+        let div_by_zero = builder.main_base(cols::DIV_BY_ZERO);
+
+        let r0 = builder.main_base(cols::R_0);
+        let r1 = builder.main_base(cols::R_1);
+        let r2 = builder.main_base(cols::R_2);
+        let r3 = builder.main_base(cols::R_3);
+
+        let d0 = builder.main_base(cols::D_0);
+        let d1 = builder.main_base(cols::D_1);
+        let d2 = builder.main_base(cols::D_2);
+        let d3 = builder.main_base(cols::D_3);
+
+        let n0 = builder.main_base(cols::N_0);
+        let n1 = builder.main_base(cols::N_1);
+        let n2 = builder.main_base(cols::N_2);
+        let n3 = builder.main_base(cols::N_3);
+
+        let q0 = builder.main_base(cols::Q_0);
+        let q1 = builder.main_base(cols::Q_1);
+        let q2 = builder.main_base(cols::Q_2);
+        let q3 = builder.main_base(cols::Q_3);
+
+        let nsr0 = builder.main_base(cols::N_SUB_R_0);
+        let nsr1 = builder.main_base(cols::N_SUB_R_1);
+        let nsr2 = builder.main_base(cols::N_SUB_R_2);
+        let nsr3 = builder.main_base(cols::N_SUB_R_3);
+
+        let abs_r0 = builder.main_base(cols::ABS_R_0);
+        let abs_r1 = builder.main_base(cols::ABS_R_1);
+        let abs_d0 = builder.main_base(cols::ABS_D_0);
+        let abs_d1 = builder.main_base(cols::ABS_D_1);
+
+        // Constraint 0: DVRM-A3
+        assert_is_bit_base(builder, signed.clone());
+
+        // Constraint 1: DVRM-C1
+        let r_sum = &r0 + &r1 + &r2 + &r3;
+        builder.assert_zero_base(&r_sum * (&sign_r - &sign_n));
+
+        // Constraint 2: DVRM-C4.0
+        let r_wl_0 = &r0 + &r1 * &shift_16;
+        builder.assert_zero_base((&one - &sign_r) * (&abs_r0 - &r_wl_0));
+
+        // Constraint 3: DVRM-C4.1
+        let r_wl_1 = &r2 + &r3 * &shift_16;
+        builder.assert_zero_base((&one - &sign_r) * (&abs_r1 - &r_wl_1));
+
+        // Constraint 4: DVRM-C6.0
+        let d_wl_0 = &d0 + &d1 * &shift_16;
+        builder.assert_zero_base((&one - &sign_d) * (&abs_d0 - &d_wl_0));
+
+        // Constraint 5: DVRM-C6.1
+        let d_wl_1 = &d2 + &d3 * &shift_16;
+        builder.assert_zero_base((&one - &sign_d) * (&abs_d1 - &d_wl_1));
+
+        // Constraint 6: DVRM-C7
+        builder.assert_zero_base(&signed * (&one - &overflow) - &sign_q);
+
+        // Constraints 7-10: carries
+        let sign_fill_word = &sign_fill + &sign_fill * &shift_16;
+
+        let ext_n = [
+            &n0 + &n1 * &shift_16,
+            &n2 + &n3 * &shift_16,
+            &sign_n * &sign_fill_word,
+            &sign_n * &sign_fill_word,
+        ];
+
+        let ext_r = [
+            r_wl_0,
+            r_wl_1,
+            &sign_r * &sign_fill_word,
+            &sign_r * &sign_fill_word,
+        ];
+
+        let ext_nsr = [
+            &nsr0 + &nsr1 * &shift_16,
+            &nsr2 + &nsr3 * &shift_16,
+            &sign_nsr * &sign_fill_word,
+            &sign_nsr * &sign_fill_word,
+        ];
+
+        let carry_0 = (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32;
+        builder.assert_zero_base(carry_0.clone() * (&one - &carry_0));
+
+        let carry_1 = (&ext_nsr[1] + &ext_r[1] + &carry_0 - &ext_n[1]) * &inv_2_32;
+        builder.assert_zero_base(carry_1.clone() * (&one - &carry_1));
+
+        let carry_2 = (&ext_nsr[2] + &ext_r[2] + &carry_1 - &ext_n[2]) * &inv_2_32;
+        builder.assert_zero_base(carry_2.clone() * (&one - &carry_2));
+
+        let carry_3 = (&ext_nsr[3] + &ext_r[3] + &carry_2 - &ext_n[3]) * &inv_2_32;
+        builder.assert_zero_base(carry_3.clone() * (&one - &carry_3));
+
+        // Constraint 11: DVRM-C15
+        assert_is_bit_base(builder, sign_nsr);
+
+        // Constraint 12: DVRM-C18b
+        builder.assert_zero_base((&one - &signed) * &sign_n);
+
+        // Constraint 13: DVRM-C19b
+        builder.assert_zero_base((&one - &signed) * &sign_r);
+
+        // Constraint 14: DVRM-C20b
+        builder.assert_zero_base((&one - &signed) * &sign_d);
+
+        // Constraints 15-18: DVRM-C16.i
+        let q_cols = [q0, q1, q2, q3];
+        for q_val in &q_cols {
+            builder.assert_zero_base(&div_by_zero * (q_val - &sign_fill));
+        }
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
         use crate::constraints::templates::INV_SHIFT_32;
@@ -1608,6 +2468,50 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::branch::cols;
+        use crate::tables::types::SHIFT_16;
+
+        let shift_8 = FieldElement::<GoldilocksField>::from(1u64 << 8);
+        let shift_16 = FieldElement::<GoldilocksField>::from(SHIFT_16);
+        let inv_2_32 = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let one = FieldElement::<GoldilocksField>::one();
+
+        let jalr = builder.main_base(cols::JALR);
+        let pc_0 = builder.main_base(cols::PC_0);
+        let pc_1 = builder.main_base(cols::PC_1);
+        let offset_0 = builder.main_base(cols::OFFSET_0);
+        let offset_1 = builder.main_base(cols::OFFSET_1);
+        let register_0 = builder.main_base(cols::REGISTER_0);
+        let register_1 = builder.main_base(cols::REGISTER_1);
+        let unmasked_low_byte = builder.main_base(cols::UNMASKED_LOW_BYTE);
+        let next_pc_low_1 = builder.main_base(cols::NEXT_PC_LOW_1);
+        let next_pc_high_0 = builder.main_base(cols::NEXT_PC_HIGH_0);
+        let next_pc_high_1 = builder.main_base(cols::NEXT_PC_HIGH_1);
+        let next_pc_high_2 = builder.main_base(cols::NEXT_PC_HIGH_2);
+
+        let unmasked_0 =
+            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+
+        // Constraint 0: PcCarry0IsBit
+        let carry_0_pc = (&pc_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+        let cond_pc = &one - &jalr;
+        builder.assert_zero_base(&cond_pc * &carry_0_pc * (&one - &carry_0_pc));
+
+        // Constraint 1: PcCarry1IsBit
+        let carry_1_pc = (&pc_1 + &offset_1 + &carry_0_pc - &unmasked_1) * &inv_2_32;
+        builder.assert_zero_base(&cond_pc * &carry_1_pc * (&one - &carry_1_pc));
+
+        // Constraint 2: RegCarry0IsBit
+        let carry_0_reg = (&register_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+        builder.assert_zero_base(&jalr * &carry_0_reg * (&one - &carry_0_reg));
+
+        // Constraint 3: RegCarry1IsBit
+        let carry_1_reg = (&register_1 + &offset_1 + &carry_0_reg - &unmasked_1) * &inv_2_32;
+        builder.assert_zero_base(&jalr * &carry_1_reg * (&one - &carry_1_reg));
+    })
     .with_builder(|builder| {
         use crate::constraints::templates::INV_SHIFT_32;
         use crate::tables::branch::cols;
@@ -1692,6 +2596,68 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_main_builder(|builder| {
+        use crate::constraints::helpers::assert_is_bit_base;
+        use crate::constraints::templates::INV_SHIFT_32;
+        use crate::tables::commit::cols;
+
+        let one = FieldElement::<GoldilocksField>::one();
+        let inv_2_32 = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let shift_16 = FieldElement::<GoldilocksField>::from(65536u64);
+
+        let first = builder.main_base(cols::FIRST);
+        let end = builder.main_base(cols::END);
+        let mu = builder.main_base(cols::MU);
+
+        // Constraint 0: IS_BIT(FIRST)
+        assert_is_bit_base(builder, first.clone());
+
+        // Constraint 1: IS_BIT(END)
+        assert_is_bit_base(builder, end.clone());
+
+        // Constraint 2: IS_BIT(MU)
+        assert_is_bit_base(builder, mu.clone());
+
+        // Constraint 3: (first + end) * (1 - mu) = 0
+        builder.assert_zero_base((&first + &end) * (&one - &mu));
+
+        // Constraint 4-5: ADD for address + 1 = address_incr
+        let addr_lo = builder.main_base(cols::ADDRESS_0);
+        let addr_hi = builder.main_base(cols::ADDRESS_1);
+        let rhs_lo = one.clone();
+        let addr_incr_0 = builder.main_base(cols::ADDRESS_INCR_0);
+        let addr_incr_1 = builder.main_base(cols::ADDRESS_INCR_1);
+        let addr_incr_2 = builder.main_base(cols::ADDRESS_INCR_2);
+        let addr_incr_3 = builder.main_base(cols::ADDRESS_INCR_3);
+        let sum_lo = &addr_incr_0 + &addr_incr_1 * &shift_16;
+        let sum_hi = &addr_incr_2 + &addr_incr_3 * &shift_16;
+
+        let carry_0 = (&addr_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+        // Constraint 4
+        builder.assert_zero_base(carry_0.clone() * (&one - &carry_0));
+
+        let carry_1 = (&addr_hi + &carry_0 - &sum_hi) * &inv_2_32;
+        // Constraint 5
+        builder.assert_zero_base(carry_1.clone() * (&one - &carry_1));
+
+        // Constraint 6-7: SUB for count_decr + 1 = count
+        let cd_0 = builder.main_base(cols::COUNT_DECR_0);
+        let cd_1 = builder.main_base(cols::COUNT_DECR_1);
+        let cd_2 = builder.main_base(cols::COUNT_DECR_2);
+        let cd_3 = builder.main_base(cols::COUNT_DECR_3);
+        let lhs_lo = &cd_0 + &cd_1 * &shift_16;
+        let lhs_hi = &cd_2 + &cd_3 * &shift_16;
+        let count_lo = builder.main_base(cols::COUNT_0);
+        let count_hi = builder.main_base(cols::COUNT_1);
+
+        let carry_0_sub = (&lhs_lo + &one - &count_lo) * &inv_2_32;
+        // Constraint 6
+        builder.assert_zero_base(carry_0_sub.clone() * (&one - &carry_0_sub));
+
+        let carry_1_sub = (&lhs_hi + &carry_0_sub - &count_hi) * &inv_2_32;
+        // Constraint 7
+        builder.assert_zero_base(carry_1_sub.clone() * (&one - &carry_1_sub));
+    })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
         use crate::constraints::templates::INV_SHIFT_32;
