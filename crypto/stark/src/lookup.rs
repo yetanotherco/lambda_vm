@@ -811,6 +811,7 @@ pub struct AirWithBuses<
     /// Optional AirBuilder-based constraint evaluator for table-specific constraints.
     /// When set, the closure is called first in `eval_constraints_with_builder()`,
     /// followed by the LogUp constraints.
+    #[allow(clippy::type_complexity)]
     builder_fn: Option<Box<dyn Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync>>,
 }
 
