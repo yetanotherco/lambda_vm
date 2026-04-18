@@ -2,10 +2,18 @@
 //!
 //! These helpers provide common constraint patterns that are frequently used
 //! across multiple tables, reducing code duplication and improving readability.
+//!
+//! Two sets of helpers are provided:
+//! - Extension-field versions (`assert_is_bit`, etc.) for `AirBuilder<F>` (E*E, verifier + prover)
+//! - Base-field versions (`assert_is_bit_base`, etc.) for `MainAirBuilder<F, E>` (F*E, 3 base muls, prover only)
 
 use math::field::element::FieldElement;
-use math::field::traits::IsField;
-use stark::air_builder::AirBuilder;
+use math::field::traits::{IsField, IsSubFieldOf};
+use stark::air_builder::{AirBuilder, MainAirBuilder};
+
+// =============================================================================
+// Extension-field helpers (AirBuilder<F>) - used by verifier + prover fallback
+// =============================================================================
 
 /// IS_BIT: x*(1-x) == 0
 ///
@@ -88,4 +96,18 @@ pub fn assert_eq_when_off<F: IsField>(
     right: FieldElement<F>,
 ) {
     builder.assert_zero((FieldElement::<F>::one() - flag) * (left - right));
+}
+
+// =============================================================================
+// Base-field helpers (MainAirBuilder<F, E>) - used for prover main trace constraints
+// =============================================================================
+
+/// IS_BIT in base field: x*(1-x) == 0
+#[inline]
+pub fn assert_is_bit_base<F: IsSubFieldOf<E> + IsField, E: IsField>(
+    builder: &mut dyn MainAirBuilder<F, E>,
+    x: FieldElement<F>,
+) {
+    let one = FieldElement::<F>::one();
+    builder.assert_zero_base(x.clone() * (one - x));
 }

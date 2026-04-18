@@ -61,42 +61,63 @@ where
                 Vec::new()
             };
 
+        let num_main_cols = lde_trace.num_main_cols();
+        let use_dual_path = air.has_main_builder();
+
         #[cfg(feature = "parallel")]
         {
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
                 .enumerate()
-                .map(|(i, boundary)| {
-                    let mut builder = crate::air_builder::ProverBuilder::new(
-                        lde_trace,
-                        i,
-                        composition_alpha,
-                        rap_challenges,
-                        &logup_alpha_powers,
-                        logup_table_offset,
-                    );
-                    air.eval_constraints_with_builder(&mut builder);
-                    zerofier_data.get_uniform(i) * &builder.finish() + boundary
-                })
+                .map_init(
+                    || vec![FieldElement::<Field>::zero(); num_main_cols],
+                    |row_cache, (i, boundary)| {
+                        let mut builder = crate::air_builder::ProverBuilder::new_with_cache(
+                            lde_trace,
+                            i,
+                            composition_alpha,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                            row_cache,
+                        );
+                        if use_dual_path {
+                            // Base-field main constraints (F*E, 3 base muls) + LogUp only
+                            air.eval_main_constraints(&mut builder);
+                            air.eval_logup_with_builder(&mut builder);
+                        } else {
+                            // All constraints in extension field (E*E, 6 base muls)
+                            air.eval_constraints_with_builder(&mut builder);
+                        }
+                        zerofier_data.get_uniform(i) * &builder.finish() + boundary
+                    },
+                )
                 .collect();
             evaluations_t
         }
 
         #[cfg(not(feature = "parallel"))]
         {
+            let mut row_cache = vec![FieldElement::<Field>::zero(); num_main_cols];
             boundary_evaluation
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    let mut builder = crate::air_builder::ProverBuilder::new(
+                    let mut builder = crate::air_builder::ProverBuilder::new_with_cache(
                         lde_trace,
                         i,
                         composition_alpha,
                         rap_challenges,
                         &logup_alpha_powers,
                         logup_table_offset,
+                        &mut row_cache,
                     );
-                    air.eval_constraints_with_builder(&mut builder);
+                    if use_dual_path {
+                        air.eval_main_constraints(&mut builder);
+                        air.eval_logup_with_builder(&mut builder);
+                    } else {
+                        air.eval_constraints_with_builder(&mut builder);
+                    }
                     zerofier_data.get_uniform(i) * &builder.finish() + boundary
                 })
                 .collect()
