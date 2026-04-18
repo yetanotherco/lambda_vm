@@ -102,6 +102,13 @@ where
                 Vec::new()
             };
 
+        // Pre-compute composition alpha powers [1, α, α², ...] for ALL constraints.
+        // This avoids an E×E multiply per constraint per LDE point in the hot loop.
+        // Use a generous count: main constraints + LogUp aux constraints.
+        // Over-allocating is cheap (one-time cost); under-allocating would panic.
+        let total_constraints = air.num_transition_constraints() * 2 + 64;
+        let composition_alpha_powers = compute_alpha_powers(composition_alpha, total_constraints);
+
         let num_main_cols = lde_trace.num_main_cols();
         let use_dual_path = air.has_main_builder();
 
@@ -116,7 +123,7 @@ where
                         let mut builder = crate::air_builder::ProverBuilder::new_with_cache(
                             lde_trace,
                             i,
-                            composition_alpha,
+                            &composition_alpha_powers,
                             rap_challenges,
                             &logup_alpha_powers,
                             logup_table_offset,
@@ -147,7 +154,7 @@ where
                     let mut builder = crate::air_builder::ProverBuilder::new_with_cache(
                         lde_trace,
                         i,
-                        composition_alpha,
+                        &composition_alpha_powers,
                         rap_challenges,
                         &logup_alpha_powers,
                         logup_table_offset,
