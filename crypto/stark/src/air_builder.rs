@@ -99,8 +99,8 @@ where
         if row_cache.len() < num_main_cols {
             row_cache.resize(num_main_cols, FieldElement::zero());
         }
-        for col in 0..num_main_cols {
-            row_cache[col] = lde_trace.get_main(row, col).clone();
+        for (col, slot) in row_cache.iter_mut().enumerate().take(num_main_cols) {
+            *slot = lde_trace.get_main(row, col).clone();
         }
         Self {
             lde_trace,
@@ -117,6 +117,29 @@ where
             logup_table_offset_val: logup_table_offset,
             main_row_cache: row_cache.as_slice(),
         }
+    }
+
+    /// Get the pre-fetched main trace row cache (for direct closure evaluation).
+    #[inline]
+    pub fn main_row_cache(&self) -> &[FieldElement<F>] {
+        self.main_row_cache
+    }
+
+    /// Get mutable access to the base-field constraint evaluation buffer.
+    #[inline]
+    pub fn base_evals_mut(&mut self) -> &mut [FieldElement<F>] {
+        self.base_evals
+    }
+
+    /// Set the base constraint count (for direct closure evaluation).
+    ///
+    /// When main constraints are evaluated via `eval_main_constraints_direct`,
+    /// they write directly to `base_evals` without going through `assert_zero_base`.
+    /// This method tells `finish()` how many base constraints were written so it
+    /// offsets the alpha powers correctly for subsequent extension constraints.
+    #[inline]
+    pub fn set_base_count(&mut self, count: usize) {
+        self.base_count = count;
     }
 
     /// Accumulate all buffered constraint evaluations and return the result.
@@ -288,8 +311,8 @@ impl<'a, E: IsField> MainAirBuilder<E, E> for VerifierBuilder<'a, E> {
 
 /// Adapter that wraps `&mut dyn AirBuilder<E>` as `MainAirBuilder<E, E>`.
 ///
-/// Used by `eval_constraints_with_builder` (verifier path) to call `main_builder_fn`
-/// closures typed as `Fn(&mut dyn MainAirBuilder<F, E>)`. When F = E (verifier),
+/// Used by `eval_constraints_with_builder` (verifier path) to call `builder_fn`
+/// closures that use `MainAirBuilder<E, E>`. When F = E (verifier),
 /// the adapter delegates `main_base` to `main(0, col)` and `assert_zero_base` to `assert_zero`.
 pub struct AirBuilderAsMain<'a, E: IsField> {
     inner: &'a mut dyn AirBuilder<E>,

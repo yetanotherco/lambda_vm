@@ -284,19 +284,21 @@ pub trait AIR: Send + Sync {
         false
     }
 
-    /// Evaluate main trace transition constraints in base field.
+    /// Evaluate main trace transition constraints directly into a buffer.
     ///
-    /// Uses `MainAirBuilder` for F*E accumulation (3 base muls vs 6 for E*E).
-    /// Table-specific constraints that only touch the main trace should be emitted
-    /// here for optimal performance. LogUp constraints remain in `eval_logup_with_builder`.
+    /// The closure receives `(main_row, evals)` where `main_row` is the pre-fetched
+    /// main trace row and `evals` is the output buffer. This eliminates all vtable
+    /// dispatch — column reads are `main_row[col]` (direct indexed) and constraint
+    /// writes are `evals[idx] = expr` (direct indexed).
     ///
     /// Called by the prover's evaluator (not the verifier). The verifier uses
     /// `eval_constraints_with_builder` which includes main + LogUp in extension field.
     ///
     /// Default: no main constraints (lookup-only tables).
-    fn eval_main_constraints(
+    fn eval_main_constraints_direct(
         &self,
-        _builder: &mut dyn crate::air_builder::MainAirBuilder<Self::Field, Self::FieldExtension>,
+        _main_row: &[FieldElement<Self::Field>],
+        _evals: &mut [FieldElement<Self::Field>],
     ) {
         // Default: no main constraints
     }
