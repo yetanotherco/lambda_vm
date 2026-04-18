@@ -55,8 +55,10 @@ pub struct ProverBuilder<'a, F: IsSubFieldOf<E> + IsFFTField, E: IsField> {
     step_size: usize,
     num_rows: usize,
     accumulator: FieldElement<E>,
-    alpha: FieldElement<E>,
-    alpha_power: FieldElement<E>,
+    /// Pre-computed composition alpha powers [1, α, α², ...].
+    /// Indexed by constraint_idx to avoid E×E multiply per constraint.
+    alpha_powers: &'a [FieldElement<E>],
+    constraint_idx: usize,
     rap_challenges: &'a [FieldElement<E>],
     logup_alpha_powers: &'a [FieldElement<E>],
     logup_table_offset_val: &'a FieldElement<E>,
@@ -73,7 +75,7 @@ where
     pub fn new(
         lde_trace: &'a LDETraceTable<F, E>,
         row: usize,
-        alpha: &FieldElement<E>,
+        alpha_powers: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -84,8 +86,8 @@ where
             step_size: lde_trace.lde_step_size,
             num_rows: lde_trace.num_rows(),
             accumulator: FieldElement::zero(),
-            alpha: alpha.clone(),
-            alpha_power: FieldElement::one(),
+            alpha_powers,
+            constraint_idx: 0,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset_val: logup_table_offset,
@@ -101,7 +103,7 @@ where
     pub fn new_with_cache(
         lde_trace: &'a LDETraceTable<F, E>,
         row: usize,
-        alpha: &FieldElement<E>,
+        alpha_powers: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -120,8 +122,8 @@ where
             step_size: lde_trace.lde_step_size,
             num_rows: lde_trace.num_rows(),
             accumulator: FieldElement::zero(),
-            alpha: alpha.clone(),
-            alpha_power: FieldElement::one(),
+            alpha_powers,
+            constraint_idx: 0,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset_val: logup_table_offset,
@@ -142,7 +144,6 @@ where
     #[inline]
     fn main(&self, offset: usize, col: usize) -> FieldElement<E> {
         if offset == 0 && !self.main_row_cache.is_empty() {
-            // Use contiguous pre-fetched cache (avoids random column-major access)
             self.main_row_cache[col].clone().to_extension()
         } else {
             let lde_row = (self.row + offset * self.step_size) % self.num_rows;
@@ -158,8 +159,9 @@ where
 
     #[inline]
     fn assert_zero(&mut self, expr: FieldElement<E>) {
-        self.accumulator = &self.accumulator + &self.alpha_power * &expr;
-        self.alpha_power = &self.alpha_power * &self.alpha;
+        // Use pre-computed alpha power — no E×E multiply per constraint
+        self.accumulator = &self.accumulator + &self.alpha_powers[self.constraint_idx] * &expr;
+        self.constraint_idx += 1;
     }
 
     fn challenge(&self, idx: usize) -> &FieldElement<E> {
@@ -187,17 +189,17 @@ where
 
     #[inline]
     fn assert_zero_base(&mut self, expr: FieldElement<F>) {
-        // F*E multiplication: 3 base muls (vs 6 for E*E)
-        self.accumulator = &self.accumulator + &expr * &self.alpha_power;
-        self.alpha_power = &self.alpha_power * &self.alpha;
+        // F×E multiplication (3 base muls) with pre-computed alpha power (no E×E)
+        self.accumulator = &self.accumulator + &expr * &self.alpha_powers[self.constraint_idx];
+        self.constraint_idx += 1;
     }
 }
 
 pub struct VerifierBuilder<'a, E: IsField> {
     frame: &'a Frame<E, E>,
     accumulator: FieldElement<E>,
-    alpha: FieldElement<E>,
-    alpha_power: FieldElement<E>,
+    alpha_powers: &'a [FieldElement<E>],
+    constraint_idx: usize,
     rap_challenges: &'a [FieldElement<E>],
     logup_alpha_powers: &'a [FieldElement<E>],
     logup_table_offset_val: &'a FieldElement<E>,
@@ -206,7 +208,7 @@ pub struct VerifierBuilder<'a, E: IsField> {
 impl<'a, E: IsField> VerifierBuilder<'a, E> {
     pub fn new(
         frame: &'a Frame<E, E>,
-        alpha: &FieldElement<E>,
+        alpha_powers: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -214,8 +216,8 @@ impl<'a, E: IsField> VerifierBuilder<'a, E> {
         Self {
             frame,
             accumulator: FieldElement::zero(),
-            alpha: alpha.clone(),
-            alpha_power: FieldElement::one(),
+            alpha_powers,
+            constraint_idx: 0,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset_val: logup_table_offset,
@@ -246,8 +248,8 @@ impl<'a, E: IsField> AirBuilder<E> for VerifierBuilder<'a, E> {
 
     #[inline]
     fn assert_zero(&mut self, expr: FieldElement<E>) {
-        self.accumulator = &self.accumulator + &self.alpha_power * &expr;
-        self.alpha_power = &self.alpha_power * &self.alpha;
+        self.accumulator = &self.accumulator + &self.alpha_powers[self.constraint_idx] * &expr;
+        self.constraint_idx += 1;
     }
 
     fn challenge(&self, idx: usize) -> &FieldElement<E> {
@@ -275,9 +277,9 @@ impl<'a, E: IsField> MainAirBuilder<E, E> for VerifierBuilder<'a, E> {
 
     #[inline]
     fn assert_zero_base(&mut self, expr: FieldElement<E>) {
-        // E*E (same as assert_zero for verifier)
-        self.accumulator = &self.accumulator + &self.alpha_power * &expr;
-        self.alpha_power = &self.alpha_power * &self.alpha;
+        // Use pre-computed alpha power (same indexing as assert_zero)
+        self.accumulator = &self.accumulator + &self.alpha_powers[self.constraint_idx] * &expr;
+        self.constraint_idx += 1;
     }
 }
 
