@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::assign_op_pattern)]
 //! Shared utilities for tests and benchmarks.
 //!
 //! This module contains common helper functions used across:
@@ -517,7 +518,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
     // Helper: pack 4 byte values into a 32-bit word (inner fn, no builder capture).
     #[inline]
     fn pack(b0: FE, b1: FE, b2: FE, b3: FE, s8: &FE, s16: &FE, s24: &FE) -> FE {
-        &b0 + &b1 * s8 + &b2 * s16 + &b3 * s24
+        b0 + b1 * s8 + b2 * s16 + b3 * s24
     }
 
     // =================================================================
@@ -588,11 +589,11 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_16,
             &shift_24,
         );
-        let cond = &builder.main(0, cols::ADD) + &builder.main(0, cols::LOAD);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero(&cond * &c1 * (&one - &c1));
+        let cond = builder.main(0, cols::ADD) + builder.main(0, cols::LOAD);
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero(cond * c1 * (one - c1));
     }
 
     // STORE (2): arg1 + imm = res
@@ -636,10 +637,10 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_24,
         );
         let cond = builder.main(0, cols::STORE);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero(&cond * &c1 * (&one - &c1));
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero(cond * c1 * (one - c1));
     }
 
     // SUB + BEQ (2): arg2 + res = arg1
@@ -698,18 +699,18 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_16,
             &shift_24,
         );
-        let cond = &builder.main(0, cols::SUB) + &builder.main(0, cols::BEQ);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero(&cond * &c1 * (&one - &c1));
+        let cond = builder.main(0, cols::SUB) + builder.main(0, cols::BEQ);
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero(cond * c1 * (one - c1));
     }
 
     // JALR (2): pc + instr_size = res; instr_size = 4 - 2*c_type
     {
         let ll = builder.main(0, cols::PC_0);
         let lh = builder.main(0, cols::PC_1);
-        let rl = FE::from(4u64) - &two * builder.main(0, cols::C_TYPE_INSTRUCTION);
+        let rl = FE::from(4u64) - two * builder.main(0, cols::C_TYPE_INSTRUCTION);
         let sl = pack(
             builder.main(0, cols::RES_0),
             builder.main(0, cols::RES_0 + 1),
@@ -729,10 +730,10 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_24,
         );
         let cond = builder.main(0, cols::JALR);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero(&cond * &c1 * (&one - &c1));
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero(cond * c0 * (one - c0));
+        let c1 = (lh + c0 - sh) * inv_2_32;
+        builder.assert_zero(cond * c1 * (one - c1));
     }
 
     // =================================================================
@@ -748,9 +749,9 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
         let r0 = builder.main(0, cols::RES_0);
         let ieq = builder.main(0, cols::IS_EQUAL);
         let bc = builder.main(0, cols::BRANCH_COND);
-        let res_xor_mp = &r0 + &mp - &two * &r0 * &mp;
-        let eq_xor_mp = &ieq + &mp - &two * &ieq * &mp;
-        builder.assert_zero(bc - (jalr + &blt * res_xor_mp + &beq * eq_xor_mp));
+        let res_xor_mp = r0 + mp - two * r0 * mp;
+        let eq_xor_mp = ieq + mp - two * ieq * mp;
+        builder.assert_zero(bc - (jalr + blt * res_xor_mp + beq * eq_xor_mp));
     }
 
     // EbreakConstraint (1)
@@ -760,7 +761,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
     {
         let rr = builder.main(0, cols::READ_REGISTER1);
         for &c in &[cols::RV1_0, cols::RV1_1, cols::RV1_2] {
-            builder.assert_zero((&one - &rr) * builder.main(0, c));
+            builder.assert_zero((one - rr) * builder.main(0, c));
         }
     }
 
@@ -768,7 +769,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
     {
         let rr = builder.main(0, cols::READ_REGISTER2);
         for &c in &[cols::RV2_0, cols::RV2_1, cols::RV2_2] {
-            builder.assert_zero((&one - &rr) * builder.main(0, c));
+            builder.assert_zero((one - rr) * builder.main(0, c));
         }
     }
 
@@ -783,7 +784,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_16,
             &shift_24,
         );
-        let rv1lo = &builder.main(0, cols::RV1_0) + &builder.main(0, cols::RV1_1) * &shift_16;
+        let rv1lo = builder.main(0, cols::RV1_0) + builder.main(0, cols::RV1_1) * shift_16;
         builder.assert_zero(a1lo - rv1lo);
     }
 
@@ -802,7 +803,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
         let wi = builder.main(0, cols::WORD_INSTR);
         let si = builder.main(0, cols::SIGNED);
         let eb = builder.main(0, cols::RV1_EXT_BIT);
-        builder.assert_zero(a1hi - (&rv1u * (&one - &wi) + &mask_32 * &eb * &si));
+        builder.assert_zero(a1hi - (rv1u * (one - wi) + mask_32 * eb * si));
     }
 
     // Arg2LowerConstraint (1)
@@ -816,13 +817,13 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_16,
             &shift_24,
         );
-        let rv2lo = &builder.main(0, cols::RV2_0) + &builder.main(0, cols::RV2_1) * &shift_16;
+        let rv2lo = builder.main(0, cols::RV2_0) + builder.main(0, cols::RV2_1) * shift_16;
         let imm0 = builder.main(0, cols::IMM_0);
         let ld = builder.main(0, cols::LOAD);
         let st = builder.main(0, cols::STORE);
         let beq = builder.main(0, cols::BEQ);
         let blt = builder.main(0, cols::BLT);
-        let expected = (&one - &ld) * &rv2lo + (&one - &beq - &blt - &st) * &imm0;
+        let expected = (one - ld) * rv2lo + (one - beq - blt - st) * imm0;
         builder.assert_zero(a2lo - expected);
     }
 
@@ -846,8 +847,8 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
         let wi = builder.main(0, cols::WORD_INSTR);
         let si = builder.main(0, cols::SIGNED);
         let eb = builder.main(0, cols::RV2_EXT_BIT);
-        let rv2_term = (&one - &wi) * &rv2u + &si * &eb * &mask_32;
-        let expected = (&one - &ld) * &rv2_term + (&one - &beq - &blt - &st) * &imm1;
+        let rv2_term = (one - wi) * rv2u + si * eb * mask_32;
+        let expected = (one - ld) * rv2_term + (one - beq - blt - st) * imm1;
         builder.assert_zero(a2hi - expected);
     }
 
@@ -864,7 +865,7 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
             &shift_24,
         );
         let ld = builder.main(0, cols::LOAD);
-        builder.assert_zero((&one - &ld) * (&rvd0 - &rlo));
+        builder.assert_zero((one - ld) * (rvd0 - rlo));
     }
 
     // RvdUpperConstraint (1)
@@ -882,24 +883,24 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
         let ld = builder.main(0, cols::LOAD);
         let wi = builder.main(0, cols::WORD_INSTR);
         let reb = builder.main(0, cols::RES_EXT_BIT);
-        let expected = (&one - &wi) * &rhi + &reb * &mask_32;
-        builder.assert_zero((&one - &ld) * (&rvd1 - &expected));
+        let expected = (one - wi) * rhi + reb * mask_32;
+        builder.assert_zero((one - ld) * (rvd1 - expected));
     }
 
     // SltResZeroConstraint (7)
     {
-        let sb = &builder.main(0, cols::SLT) + &builder.main(0, cols::BLT);
+        let sb = builder.main(0, cols::SLT) + builder.main(0, cols::BLT);
         for i in 1..8usize {
-            builder.assert_zero(&sb * &builder.main(0, cols::RES[i]));
+            builder.assert_zero(sb * builder.main(0, cols::RES[i]));
         }
     }
 
     // ExtBitZeroConstraint (3)
     {
-        let nw = &one - &builder.main(0, cols::WORD_INSTR);
-        builder.assert_zero(&nw * &builder.main(0, cols::RV1_EXT_BIT));
-        builder.assert_zero(&nw * &builder.main(0, cols::RV2_EXT_BIT));
-        builder.assert_zero(&nw * &builder.main(0, cols::RES_EXT_BIT));
+        let nw = one - builder.main(0, cols::WORD_INSTR);
+        builder.assert_zero(nw * builder.main(0, cols::RV1_EXT_BIT));
+        builder.assert_zero(nw * builder.main(0, cols::RV2_EXT_BIT));
+        builder.assert_zero(nw * builder.main(0, cols::RES_EXT_BIT));
     }
 
     // NextPcAddConstraint (2)
@@ -910,12 +911,12 @@ fn cpu_builder_fn(builder: &mut dyn stark::air_builder::AirBuilder<GoldilocksExt
         let nhi = builder.main(0, cols::NEXT_PC_1);
         let ct = builder.main(0, cols::C_TYPE_INSTRUCTION);
         let bc = builder.main(0, cols::BRANCH_COND);
-        let isz = FE::from(4u64) - &two * ct;
-        let nb = &one - &bc;
-        let c0 = (&plo + &isz - &nlo) * &inv_2_32;
-        builder.assert_zero(&nb * &c0 * (&one - &c0));
-        let c1 = (&phi + &c0 - &nhi) * &inv_2_32;
-        builder.assert_zero(&nb * &c1 * (&one - &c1));
+        let isz = FE::from(4u64) - two * ct;
+        let nb = one - bc;
+        let c0 = (plo + isz - nlo) * inv_2_32;
+        builder.assert_zero(nb * c0 * (one - c0));
+        let c1 = (phi + c0 - nhi) * inv_2_32;
+        builder.assert_zero(nb * c1 * (one - c1));
     }
 }
 
@@ -942,7 +943,7 @@ fn cpu_main_builder_fn(
 
     #[inline]
     fn pack(b0: FE, b1: FE, b2: FE, b3: FE, s8: &FE, s16: &FE, s24: &FE) -> FE {
-        &b0 + &b1 * s8 + &b2 * s16 + &b3 * s24
+        b0 + b1 * s8 + b2 * s16 + b3 * s24
     }
 
     // =================================================================
@@ -1013,11 +1014,11 @@ fn cpu_main_builder_fn(
             &shift_16,
             &shift_24,
         );
-        let cond = &builder.main_base(cols::ADD) + &builder.main_base(cols::LOAD);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+        let cond = builder.main_base(cols::ADD) + builder.main_base(cols::LOAD);
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero_base(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero_base(cond * c1 * (one - c1));
     }
 
     // STORE (2)
@@ -1061,10 +1062,10 @@ fn cpu_main_builder_fn(
             &shift_24,
         );
         let cond = builder.main_base(cols::STORE);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero_base(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero_base(cond * c1 * (one - c1));
     }
 
     // SUB + BEQ (2)
@@ -1123,18 +1124,18 @@ fn cpu_main_builder_fn(
             &shift_16,
             &shift_24,
         );
-        let cond = &builder.main_base(cols::SUB) + &builder.main_base(cols::BEQ);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &rh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+        let cond = builder.main_base(cols::SUB) + builder.main_base(cols::BEQ);
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero_base(cond * c0 * (one - c0));
+        let c1 = (lh + rh + c0 - sh) * inv_2_32;
+        builder.assert_zero_base(cond * c1 * (one - c1));
     }
 
     // JALR (2)
     {
         let ll = builder.main_base(cols::PC_0);
         let lh = builder.main_base(cols::PC_1);
-        let rl = FE::from(4u64) - &two * builder.main_base(cols::C_TYPE_INSTRUCTION);
+        let rl = FE::from(4u64) - two * builder.main_base(cols::C_TYPE_INSTRUCTION);
         let sl = pack(
             builder.main_base(cols::RES_0),
             builder.main_base(cols::RES_0 + 1),
@@ -1154,10 +1155,10 @@ fn cpu_main_builder_fn(
             &shift_24,
         );
         let cond = builder.main_base(cols::JALR);
-        let c0 = (&ll + &rl - &sl) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c0 * (&one - &c0));
-        let c1 = (&lh + &c0 - &sh) * &inv_2_32;
-        builder.assert_zero_base(&cond * &c1 * (&one - &c1));
+        let c0 = (ll + rl - sl) * inv_2_32;
+        builder.assert_zero_base(cond * c0 * (one - c0));
+        let c1 = (lh + c0 - sh) * inv_2_32;
+        builder.assert_zero_base(cond * c1 * (one - c1));
     }
 
     // =================================================================
@@ -1173,9 +1174,9 @@ fn cpu_main_builder_fn(
         let r0 = builder.main_base(cols::RES_0);
         let ieq = builder.main_base(cols::IS_EQUAL);
         let bc = builder.main_base(cols::BRANCH_COND);
-        let res_xor_mp = &r0 + &mp - &two * &r0 * &mp;
-        let eq_xor_mp = &ieq + &mp - &two * &ieq * &mp;
-        builder.assert_zero_base(bc - (jalr + &blt * res_xor_mp + &beq * eq_xor_mp));
+        let res_xor_mp = r0 + mp - two * r0 * mp;
+        let eq_xor_mp = ieq + mp - two * ieq * mp;
+        builder.assert_zero_base(bc - (jalr + blt * res_xor_mp + beq * eq_xor_mp));
     }
 
     // EbreakConstraint (1)
@@ -1185,7 +1186,7 @@ fn cpu_main_builder_fn(
     {
         let rr = builder.main_base(cols::READ_REGISTER1);
         for &c in &[cols::RV1_0, cols::RV1_1, cols::RV1_2] {
-            builder.assert_zero_base((&one - &rr) * builder.main_base(c));
+            builder.assert_zero_base((one - rr) * builder.main_base(c));
         }
     }
 
@@ -1193,7 +1194,7 @@ fn cpu_main_builder_fn(
     {
         let rr = builder.main_base(cols::READ_REGISTER2);
         for &c in &[cols::RV2_0, cols::RV2_1, cols::RV2_2] {
-            builder.assert_zero_base((&one - &rr) * builder.main_base(c));
+            builder.assert_zero_base((one - rr) * builder.main_base(c));
         }
     }
 
@@ -1208,7 +1209,7 @@ fn cpu_main_builder_fn(
             &shift_16,
             &shift_24,
         );
-        let rv1lo = &builder.main_base(cols::RV1_0) + &builder.main_base(cols::RV1_1) * &shift_16;
+        let rv1lo = builder.main_base(cols::RV1_0) + builder.main_base(cols::RV1_1) * shift_16;
         builder.assert_zero_base(a1lo - rv1lo);
     }
 
@@ -1227,7 +1228,7 @@ fn cpu_main_builder_fn(
         let wi = builder.main_base(cols::WORD_INSTR);
         let si = builder.main_base(cols::SIGNED);
         let eb = builder.main_base(cols::RV1_EXT_BIT);
-        builder.assert_zero_base(a1hi - (&rv1u * (&one - &wi) + &mask_32 * &eb * &si));
+        builder.assert_zero_base(a1hi - (rv1u * (one - wi) + mask_32 * eb * si));
     }
 
     // Arg2LowerConstraint (1)
@@ -1241,13 +1242,13 @@ fn cpu_main_builder_fn(
             &shift_16,
             &shift_24,
         );
-        let rv2lo = &builder.main_base(cols::RV2_0) + &builder.main_base(cols::RV2_1) * &shift_16;
+        let rv2lo = builder.main_base(cols::RV2_0) + builder.main_base(cols::RV2_1) * shift_16;
         let imm0 = builder.main_base(cols::IMM_0);
         let ld = builder.main_base(cols::LOAD);
         let st = builder.main_base(cols::STORE);
         let beq = builder.main_base(cols::BEQ);
         let blt = builder.main_base(cols::BLT);
-        let expected = (&one - &ld) * &rv2lo + (&one - &beq - &blt - &st) * &imm0;
+        let expected = (one - ld) * rv2lo + (one - beq - blt - st) * imm0;
         builder.assert_zero_base(a2lo - expected);
     }
 
@@ -1271,8 +1272,8 @@ fn cpu_main_builder_fn(
         let wi = builder.main_base(cols::WORD_INSTR);
         let si = builder.main_base(cols::SIGNED);
         let eb = builder.main_base(cols::RV2_EXT_BIT);
-        let rv2_term = (&one - &wi) * &rv2u + &si * &eb * &mask_32;
-        let expected = (&one - &ld) * &rv2_term + (&one - &beq - &blt - &st) * &imm1;
+        let rv2_term = (one - wi) * rv2u + si * eb * mask_32;
+        let expected = (one - ld) * rv2_term + (one - beq - blt - st) * imm1;
         builder.assert_zero_base(a2hi - expected);
     }
 
@@ -1289,7 +1290,7 @@ fn cpu_main_builder_fn(
             &shift_24,
         );
         let ld = builder.main_base(cols::LOAD);
-        builder.assert_zero_base((&one - &ld) * (&rvd0 - &rlo));
+        builder.assert_zero_base((one - ld) * (rvd0 - rlo));
     }
 
     // RvdUpperConstraint (1)
@@ -1307,24 +1308,24 @@ fn cpu_main_builder_fn(
         let ld = builder.main_base(cols::LOAD);
         let wi = builder.main_base(cols::WORD_INSTR);
         let reb = builder.main_base(cols::RES_EXT_BIT);
-        let expected = (&one - &wi) * &rhi + &reb * &mask_32;
-        builder.assert_zero_base((&one - &ld) * (&rvd1 - &expected));
+        let expected = (one - wi) * rhi + reb * mask_32;
+        builder.assert_zero_base((one - ld) * (rvd1 - expected));
     }
 
     // SltResZeroConstraint (7)
     {
-        let sb = &builder.main_base(cols::SLT) + &builder.main_base(cols::BLT);
+        let sb = builder.main_base(cols::SLT) + builder.main_base(cols::BLT);
         for i in 1..8usize {
-            builder.assert_zero_base(&sb * &builder.main_base(cols::RES[i]));
+            builder.assert_zero_base(sb * builder.main_base(cols::RES[i]));
         }
     }
 
     // ExtBitZeroConstraint (3)
     {
-        let nw = &one - &builder.main_base(cols::WORD_INSTR);
-        builder.assert_zero_base(&nw * &builder.main_base(cols::RV1_EXT_BIT));
-        builder.assert_zero_base(&nw * &builder.main_base(cols::RV2_EXT_BIT));
-        builder.assert_zero_base(&nw * &builder.main_base(cols::RES_EXT_BIT));
+        let nw = one - builder.main_base(cols::WORD_INSTR);
+        builder.assert_zero_base(nw * builder.main_base(cols::RV1_EXT_BIT));
+        builder.assert_zero_base(nw * builder.main_base(cols::RV2_EXT_BIT));
+        builder.assert_zero_base(nw * builder.main_base(cols::RES_EXT_BIT));
     }
 
     // NextPcAddConstraint (2)
@@ -1335,12 +1336,12 @@ fn cpu_main_builder_fn(
         let nhi = builder.main_base(cols::NEXT_PC_1);
         let ct = builder.main_base(cols::C_TYPE_INSTRUCTION);
         let bc = builder.main_base(cols::BRANCH_COND);
-        let isz = FE::from(4u64) - &two * ct;
-        let nb = &one - &bc;
-        let c0 = (&plo + &isz - &nlo) * &inv_2_32;
-        builder.assert_zero_base(&nb * &c0 * (&one - &c0));
-        let c1 = (&phi + &c0 - &nhi) * &inv_2_32;
-        builder.assert_zero_base(&nb * &c1 * (&one - &c1));
+        let isz = FE::from(4u64) - two * ct;
+        let nb = one - bc;
+        let c0 = (plo + isz - nlo) * inv_2_32;
+        builder.assert_zero_base(nb * c0 * (one - c0));
+        let c1 = (phi + c0 - nhi) * inv_2_32;
+        builder.assert_zero_base(nb * c1 * (one - c1));
     }
 }
 
@@ -1409,27 +1410,27 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         let direction = builder.main_base(cols::DIRECTION);
         let zbs = builder.main_base(cols::ZBS);
         let is_negative = builder.main_base(cols::IS_NEGATIVE);
-        let left = &mu - &direction;
+        let left = mu - direction;
 
         // Constraint 0: DirectionImpliesMu
-        builder.assert_zero_base(&direction * (&one - &mu));
+        builder.assert_zero_base(direction * (one - mu));
 
         // Constraints 1-4: ZbsOverrideX(0..4)
         for i in 0..4 {
             let x_i = builder.main_base(cols::X[i]);
             let in_i = builder.main_base(cols::IN[i]);
-            builder.assert_zero_base(&zbs * (x_i - in_i * &left));
+            builder.assert_zero_base(zbs * (x_i - in_i * left));
         }
 
         // Constraint 5: ZbsOverrideX4
         let x4 = builder.main_base(cols::X_4);
-        builder.assert_zero_base(&zbs * x4);
+        builder.assert_zero_base(zbs * x4);
 
         // Constraints 6-9: ZbsOverrideY(0..4)
         for i in 0..4 {
             let y_i = builder.main_base(cols::Y[i]);
             let in_i = builder.main_base(cols::IN[i]);
-            builder.assert_zero_base(&zbs * (y_i - in_i * &direction));
+            builder.assert_zero_base(zbs * (y_i - in_i * direction));
         }
 
         // Constraints 10-13: LimbShiftIsBit(0..4)
@@ -1440,11 +1441,11 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         let ls_raw_0 = builder.main_base(cols::LIMB_SHIFT_RAW[0]);
         let ls_raw_1 = builder.main_base(cols::LIMB_SHIFT_RAW[1]);
         let ls_raw_2 = builder.main_base(cols::LIMB_SHIFT_RAW[2]);
-        let ls_3 = &one - &ls_raw_0 - &ls_raw_1 - &ls_raw_2;
-        assert_is_bit_base(builder, ls_3.clone());
+        let ls_3 = one - ls_raw_0 - ls_raw_1 - ls_raw_2;
+        assert_is_bit_base(builder, ls_3);
 
         // Constraints 14-15: OutputMatchesShifted(0..2)
-        let extension = FieldElement::<GoldilocksField>::from(65535u64) * &is_negative;
+        let extension = FieldElement::<GoldilocksField>::from(65535u64) * is_negative;
 
         let x = [
             builder.main_base(cols::X[0]),
@@ -1467,40 +1468,36 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
             let mut left_part = FieldElement::<GoldilocksField>::zero();
             for j in 0..=i {
                 let k = i - j;
-                let intra_left_k = if k == 0 {
-                    x[0].clone()
-                } else {
-                    &x[k] + &y[k - 1]
-                };
-                left_part = left_part + &ls[j] * intra_left_k;
+                let intra_left_k = if k == 0 { x[0] } else { x[k] + y[k - 1] };
+                left_part += ls[j] * intra_left_k;
             }
-            left_part = &left * left_part;
+            left_part = left * left_part;
 
             let mut right_shift_part = FieldElement::<GoldilocksField>::zero();
             for j in 0..=(3 - i) {
                 let k = i + j;
-                let intra_right_k = &y[k] + &x[k + 1];
-                right_shift_part = right_shift_part + &ls[j] * intra_right_k;
+                let intra_right_k = y[k] + x[k + 1];
+                right_shift_part += ls[j] * intra_right_k;
             }
 
             let mut ext_sum = FieldElement::<GoldilocksField>::zero();
             for j in (4 - i)..4 {
-                ext_sum = ext_sum + &ls[j];
+                ext_sum += ls[j];
             }
-            let right_ext_part = &extension * ext_sum;
+            let right_ext_part = extension * ext_sum;
 
-            let right_part = &direction * (right_shift_part + right_ext_part);
+            let right_part = direction * (right_shift_part + right_ext_part);
 
             shifted.push(left_part + right_part);
         }
 
         // OutputMatchesShifted(0)
         let out_0 = builder.main_base(cols::OUT_0);
-        builder.assert_zero_base(out_0 - &shifted[0] - &shifted[1] * &shift_16_val);
+        builder.assert_zero_base(out_0 - shifted[0] - shifted[1] * shift_16_val);
 
         // OutputMatchesShifted(1)
         let out_1 = builder.main_base(cols::OUT_1);
-        builder.assert_zero_base(out_1 - &shifted[2] - &shifted[3] * &shift_16_val);
+        builder.assert_zero_base(out_1 - shifted[2] - shifted[3] * shift_16_val);
     })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
@@ -1515,27 +1512,27 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         let direction = builder.main(0, cols::DIRECTION);
         let zbs = builder.main(0, cols::ZBS);
         let is_negative = builder.main(0, cols::IS_NEGATIVE);
-        let left = &mu - &direction;
+        let left = mu - direction;
 
         // Constraint 0: DirectionImpliesMu -- direction * (1 - mu) = 0
-        builder.assert_zero(&direction * (&one - &mu));
+        builder.assert_zero(direction * (one - mu));
 
         // Constraints 1-4: ZbsOverrideX(0..4) -- zbs * (X[i] - in[i] * left) = 0
         for i in 0..4 {
             let x_i = builder.main(0, cols::X[i]);
             let in_i = builder.main(0, cols::IN[i]);
-            builder.assert_zero(&zbs * (x_i - in_i * &left));
+            builder.assert_zero(zbs * (x_i - in_i * left));
         }
 
         // Constraint 5: ZbsOverrideX4 -- zbs * X[4] = 0
         let x4 = builder.main(0, cols::X_4);
-        builder.assert_zero(&zbs * x4);
+        builder.assert_zero(zbs * x4);
 
         // Constraints 6-9: ZbsOverrideY(0..4) -- zbs * (Y[i] - in[i] * right) = 0
         for i in 0..4 {
             let y_i = builder.main(0, cols::Y[i]);
             let in_i = builder.main(0, cols::IN[i]);
-            builder.assert_zero(&zbs * (y_i - in_i * &direction));
+            builder.assert_zero(zbs * (y_i - in_i * direction));
         }
 
         // Constraints 10-13: LimbShiftIsBit(0..4)
@@ -1547,12 +1544,12 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         let ls_raw_0 = builder.main(0, cols::LIMB_SHIFT_RAW[0]);
         let ls_raw_1 = builder.main(0, cols::LIMB_SHIFT_RAW[1]);
         let ls_raw_2 = builder.main(0, cols::LIMB_SHIFT_RAW[2]);
-        let ls_3 = &one - &ls_raw_0 - &ls_raw_1 - &ls_raw_2;
-        assert_is_bit(builder, ls_3.clone());
+        let ls_3 = one - ls_raw_0 - ls_raw_1 - ls_raw_2;
+        assert_is_bit(builder, ls_3);
 
         // Constraints 14-15: OutputMatchesShifted(0..2)
         // Extension = 65535 * is_negative
-        let extension = FieldElement::<GoldilocksExtension>::from(65535u64) * &is_negative;
+        let extension = FieldElement::<GoldilocksExtension>::from(65535u64) * is_negative;
 
         let x = [
             builder.main(0, cols::X[0]),
@@ -1575,40 +1572,36 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
             let mut left_part = FieldElement::<GoldilocksExtension>::zero();
             for j in 0..=i {
                 let k = i - j;
-                let intra_left_k = if k == 0 {
-                    x[0].clone()
-                } else {
-                    &x[k] + &y[k - 1]
-                };
-                left_part = left_part + &ls[j] * intra_left_k;
+                let intra_left_k = if k == 0 { x[0] } else { x[k] + y[k - 1] };
+                left_part += ls[j] * intra_left_k;
             }
-            left_part = &left * left_part;
+            left_part = left * left_part;
 
             let mut right_shift_part = FieldElement::<GoldilocksExtension>::zero();
             for j in 0..=(3 - i) {
                 let k = i + j;
-                let intra_right_k = &y[k] + &x[k + 1];
-                right_shift_part = right_shift_part + &ls[j] * intra_right_k;
+                let intra_right_k = y[k] + x[k + 1];
+                right_shift_part += ls[j] * intra_right_k;
             }
 
             let mut ext_sum = FieldElement::<GoldilocksExtension>::zero();
             for j in (4 - i)..4 {
-                ext_sum = ext_sum + &ls[j];
+                ext_sum += ls[j];
             }
-            let right_ext_part = &extension * ext_sum;
+            let right_ext_part = extension * ext_sum;
 
-            let right_part = &direction * (right_shift_part + right_ext_part);
+            let right_part = direction * (right_shift_part + right_ext_part);
 
             shifted.push(left_part + right_part);
         }
 
         // OutputMatchesShifted(0): out[0] - (shifted[0] + shifted[1] * 2^16) = 0
         let out_0 = builder.main(0, cols::OUT_0);
-        builder.assert_zero(out_0 - &shifted[0] - &shifted[1] * &shift_16_val);
+        builder.assert_zero(out_0 - shifted[0] - shifted[1] * shift_16_val);
 
         // OutputMatchesShifted(1): out[1] - (shifted[2] + shifted[3] * 2^16) = 0
         let out_1 = builder.main(0, cols::OUT_1);
-        builder.assert_zero(out_1 - &shifted[2] - &shifted[3] * &shift_16_val);
+        builder.assert_zero(out_1 - shifted[2] - shifted[3] * shift_16_val);
     })
     .with_name("SHIFT")
 }
@@ -1636,10 +1629,10 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
 
         let mu_read = builder.main_base(cols::MU_READ);
         let mu_write = builder.main_base(cols::MU_WRITE);
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
 
         // Constraint 0: IS_BIT<mu_sum>
-        builder.assert_zero_base(mu_sum.clone() * (&one - &mu_sum));
+        builder.assert_zero_base(mu_sum * (one - mu_sum));
 
         // Constraint 1: w2 => mu_sum
         let write2 = builder.main_base(cols::WRITE2);
@@ -1670,10 +1663,10 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
 
         let mu_read = builder.main(0, cols::MU_READ);
         let mu_write = builder.main(0, cols::MU_WRITE);
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
 
         // Constraint 0: IS_BIT<μ_sum> — mu_sum * (1 - mu_sum) = 0
-        builder.assert_zero(mu_sum.clone() * (&one - &mu_sum));
+        builder.assert_zero(mu_sum * (one - mu_sum));
 
         // Constraint 1: w2 => μ_sum — (write2 + write4 + write8) * (1 - mu_sum) = 0
         let write2 = builder.main(0, cols::WRITE2);
@@ -1717,12 +1710,10 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
 
         let mu_read = builder.main_base(memw_aligned_cols::MU_READ);
         let mu_write = builder.main_base(memw_aligned_cols::MU_WRITE);
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
 
         // Constraint 0: IS_BIT<mu_sum>
-        builder.assert_zero_base(
-            mu_sum.clone() * (FieldElement::<GoldilocksField>::one() - mu_sum.clone()),
-        );
+        builder.assert_zero_base(mu_sum * (FieldElement::<GoldilocksField>::one() - mu_sum));
 
         // Constraint 1: w2 => mu_sum
         let write2 = builder.main_base(memw_aligned_cols::WRITE2);
@@ -1742,15 +1733,15 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
 
         let mu_read = builder.main(0, memw_aligned_cols::MU_READ);
         let mu_write = builder.main(0, memw_aligned_cols::MU_WRITE);
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
 
         // Constraint 0: IS_BIT<mu_sum>: mu_sum * (1 - mu_sum) == 0
         builder.assert_zero(
-            mu_sum.clone()
+            mu_sum
                 * (math::field::element::FieldElement::<
                     crate::tables::types::GoldilocksExtension,
                 >::one()
-                    - mu_sum.clone()),
+                    - mu_sum),
         );
 
         // Constraint 1: w2 => mu_sum: (write2 + write4 + write8) * (1 - mu_sum) == 0
@@ -1796,13 +1787,13 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         let mu_write = builder.main_base(memw_register_cols::MU_WRITE);
 
         // Constraint 0: IS_BIT(mu_read)
-        assert_is_bit_base(builder, mu_read.clone());
+        assert_is_bit_base(builder, mu_read);
         // Constraint 1: IS_BIT(mu_write)
-        assert_is_bit_base(builder, mu_write.clone());
+        assert_is_bit_base(builder, mu_write);
         // Constraint 2: (mu_read + mu_write) * (1 - mu_read - mu_write) == 0
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
         builder.assert_zero_base(
-            mu_sum.clone()
+            mu_sum
                 * (FieldElement::<GoldilocksField>::one() - mu_sum),
         );
     })
@@ -1813,13 +1804,13 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         let mu_write = builder.main(0, memw_register_cols::MU_WRITE);
 
         // Constraint 0: IS_BIT(mu_read)
-        assert_is_bit(builder, mu_read.clone());
+        assert_is_bit(builder, mu_read);
         // Constraint 1: IS_BIT(mu_write)
-        assert_is_bit(builder, mu_write.clone());
+        assert_is_bit(builder, mu_write);
         // Constraint 2: (mu_read + mu_write) * (1 - mu_read - mu_write) == 0
-        let mu_sum = &mu_read + &mu_write;
+        let mu_sum = mu_read + mu_write;
         builder.assert_zero(
-            mu_sum.clone()
+            mu_sum
                 * (math::field::element::FieldElement::<crate::tables::types::GoldilocksExtension>::one() - mu_sum),
         );
     })
@@ -1855,27 +1846,27 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         let sign_bit = builder.main_base(cols::SIGN_BIT);
 
         // Constraint 0: ReadImpliesMu
-        let read_sum = &read2 + &read4 + &read8;
-        builder.assert_zero_base(read_sum * (&one - &mu));
+        let read_sum = read2 + read4 + read8;
+        builder.assert_zero_base(read_sum * (one - mu));
 
-        let expected = &signed * &sign_bit * &ff;
+        let expected = signed * sign_bit * ff;
 
         // Constraints 1-4: ExtensionHigh(4..8)
-        let not_read8 = &one - &read8;
+        let not_read8 = one - read8;
         for i in 4..8 {
             let res_i = builder.main_base(cols::RES[i]);
-            builder.assert_zero_base(&not_read8 * (&res_i - &expected));
+            builder.assert_zero_base(not_read8 * (res_i - expected));
         }
 
         // Constraints 5-6: ExtensionMid(2..4)
-        let not_read4_8 = &one - &read4 - &read8;
+        let not_read4_8 = one - read4 - read8;
         for i in 2..4 {
             let res_i = builder.main_base(cols::RES[i]);
-            builder.assert_zero_base(&not_read4_8 * (&res_i - &expected));
+            builder.assert_zero_base(not_read4_8 * (res_i - expected));
         }
 
         // Constraint 7: ExtensionLow
-        let not_read2_4_8 = &one - &read2 - &read4 - &read8;
+        let not_read2_4_8 = one - read2 - read4 - read8;
         let res_1 = builder.main_base(cols::RES[1]);
         builder.assert_zero_base(not_read2_4_8 * (res_1 - expected));
     })
@@ -1895,28 +1886,28 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         let sign_bit = builder.main(0, cols::SIGN_BIT);
 
         // Constraint 0: ReadImpliesMu — (read2 + read4 + read8) * (1 - μ) = 0
-        let read_sum = &read2 + &read4 + &read8;
-        builder.assert_zero(read_sum * (&one - &mu));
+        let read_sum = read2 + read4 + read8;
+        builder.assert_zero(read_sum * (one - mu));
 
         // Expected extension value
-        let expected = &signed * &sign_bit * &ff;
+        let expected = signed * sign_bit * ff;
 
         // Constraints 1-4: ExtensionHigh(4..8) — (1 - read8) * (res[i] - expected) = 0
-        let not_read8 = &one - &read8;
+        let not_read8 = one - read8;
         for i in 4..8 {
             let res_i = builder.main(0, cols::RES[i]);
-            builder.assert_zero(&not_read8 * (&res_i - &expected));
+            builder.assert_zero(not_read8 * (res_i - expected));
         }
 
         // Constraints 5-6: ExtensionMid(2..4) — (1 - read4 - read8) * (res[i] - expected) = 0
-        let not_read4_8 = &one - &read4 - &read8;
+        let not_read4_8 = one - read4 - read8;
         for i in 2..4 {
             let res_i = builder.main(0, cols::RES[i]);
-            builder.assert_zero(&not_read4_8 * (&res_i - &expected));
+            builder.assert_zero(not_read4_8 * (res_i - expected));
         }
 
         // Constraint 7: ExtensionLow — (1 - read2 - read4 - read8) * (res[1] - expected) = 0
-        let not_read2_4_8 = &one - &read2 - &read4 - &read8;
+        let not_read2_4_8 = one - read2 - read4 - read8;
         let res_1 = builder.main(0, cols::RES[1]);
         builder.assert_zero(not_read2_4_8 * (res_1 - expected));
     })
@@ -1981,10 +1972,10 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         let rhs_is_neg = builder.main_base(cols::RHS_IS_NEGATIVE);
 
         // Constraint 0: LhsSign
-        builder.assert_zero_base((&one - &lhs_signed) * &lhs_is_neg);
+        builder.assert_zero_base((one - lhs_signed) * lhs_is_neg);
 
         // Constraint 1: RhsSign
-        builder.assert_zero_base((&one - &rhs_signed) * &rhs_is_neg);
+        builder.assert_zero_base((one - rhs_signed) * rhs_is_neg);
 
         let lhs = [
             builder.main_base(cols::LHS_0),
@@ -1999,28 +1990,28 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
             builder.main_base(cols::RHS_3),
         ];
 
-        let lhs_sign_ext = &sign_fill * &lhs_is_neg;
+        let lhs_sign_ext = sign_fill * lhs_is_neg;
         let lhs_ext = [
-            lhs[0].clone(),
-            lhs[1].clone(),
-            lhs[2].clone(),
-            lhs[3].clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
+            lhs[0],
+            lhs[1],
+            lhs[2],
+            lhs[3],
+            lhs_sign_ext,
+            lhs_sign_ext,
+            lhs_sign_ext,
+            lhs_sign_ext,
         ];
 
-        let rhs_sign_ext = &sign_fill * &rhs_is_neg;
+        let rhs_sign_ext = sign_fill * rhs_is_neg;
         let rhs_ext = [
-            rhs[0].clone(),
-            rhs[1].clone(),
-            rhs[2].clone(),
-            rhs[3].clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
+            rhs[0],
+            rhs[1],
+            rhs[2],
+            rhs[3],
+            rhs_sign_ext,
+            rhs_sign_ext,
+            rhs_sign_ext,
+            rhs_sign_ext,
         ];
 
         let raw_product_cols = [
@@ -2040,13 +2031,13 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
                     let mut inner_sum = FieldElement::<GoldilocksField>::zero();
                     for j in 0..=idx {
                         if j < 8 && (idx - j) < 8 {
-                            inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                            inner_sum = inner_sum + (lhs_ext[j] * rhs_ext[idx - j]);
                         }
                     }
                     if k == 0 {
-                        sum = &sum + &inner_sum;
+                        sum += inner_sum;
                     } else {
-                        sum = &sum + &(&inner_sum * &shift_16);
+                        sum = sum + (inner_sum * shift_16);
                     }
                 }
             }
@@ -2070,10 +2061,10 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         let rhs_is_neg = builder.main(0, cols::RHS_IS_NEGATIVE);
 
         // Constraint 0: LhsSign -- (1 - lhs_signed) * lhs_is_negative == 0
-        builder.assert_zero((&one - &lhs_signed) * &lhs_is_neg);
+        builder.assert_zero((one - lhs_signed) * lhs_is_neg);
 
         // Constraint 1: RhsSign -- (1 - rhs_signed) * rhs_is_negative == 0
-        builder.assert_zero((&one - &rhs_signed) * &rhs_is_neg);
+        builder.assert_zero((one - rhs_signed) * rhs_is_neg);
 
         // Build lhs_ext[0..8] and rhs_ext[0..8]
         let lhs = [
@@ -2090,29 +2081,29 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         ];
 
         // lhs_ext[0..4] = lhs halfwords, lhs_ext[4..8] = SIGN_FILL * lhs_is_negative
-        let lhs_sign_ext = &sign_fill * &lhs_is_neg;
+        let lhs_sign_ext = sign_fill * lhs_is_neg;
         let lhs_ext = [
-            lhs[0].clone(),
-            lhs[1].clone(),
-            lhs[2].clone(),
-            lhs[3].clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
-            lhs_sign_ext.clone(),
+            lhs[0],
+            lhs[1],
+            lhs[2],
+            lhs[3],
+            lhs_sign_ext,
+            lhs_sign_ext,
+            lhs_sign_ext,
+            lhs_sign_ext,
         ];
 
         // rhs_ext[0..4] = rhs halfwords, rhs_ext[4..8] = SIGN_FILL * rhs_is_negative
-        let rhs_sign_ext = &sign_fill * &rhs_is_neg;
+        let rhs_sign_ext = sign_fill * rhs_is_neg;
         let rhs_ext = [
-            rhs[0].clone(),
-            rhs[1].clone(),
-            rhs[2].clone(),
-            rhs[3].clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
-            rhs_sign_ext.clone(),
+            rhs[0],
+            rhs[1],
+            rhs[2],
+            rhs[3],
+            rhs_sign_ext,
+            rhs_sign_ext,
+            rhs_sign_ext,
+            rhs_sign_ext,
         ];
 
         let raw_product_cols = [
@@ -2133,13 +2124,13 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
                     let mut inner_sum = FieldElement::<GoldilocksExtension>::zero();
                     for j in 0..=idx {
                         if j < 8 && (idx - j) < 8 {
-                            inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                            inner_sum = inner_sum + (lhs_ext[j] * rhs_ext[idx - j]);
                         }
                     }
                     if k == 0 {
-                        sum = &sum + &inner_sum;
+                        sum += inner_sum;
                     } else {
-                        sum = &sum + &(&inner_sum * &shift_16);
+                        sum = sum + (inner_sum * shift_16);
                     }
                 }
             }
@@ -2219,83 +2210,83 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         let abs_d1 = builder.main_base(cols::ABS_D_1);
 
         // Constraint 0: DVRM-A3
-        assert_is_bit_base(builder, signed.clone());
+        assert_is_bit_base(builder, signed);
 
         // Constraint 1: DVRM-C1
-        let r_sum = &r0 + &r1 + &r2 + &r3;
-        builder.assert_zero_base(&r_sum * (&sign_r - &sign_n));
+        let r_sum = r0 + r1 + r2 + r3;
+        builder.assert_zero_base(r_sum * (sign_r - sign_n));
 
         // Constraint 2: DVRM-C4.0
-        let r_wl_0 = &r0 + &r1 * &shift_16;
-        builder.assert_zero_base((&one - &sign_r) * (&abs_r0 - &r_wl_0));
+        let r_wl_0 = r0 + r1 * shift_16;
+        builder.assert_zero_base((one - sign_r) * (abs_r0 - r_wl_0));
 
         // Constraint 3: DVRM-C4.1
-        let r_wl_1 = &r2 + &r3 * &shift_16;
-        builder.assert_zero_base((&one - &sign_r) * (&abs_r1 - &r_wl_1));
+        let r_wl_1 = r2 + r3 * shift_16;
+        builder.assert_zero_base((one - sign_r) * (abs_r1 - r_wl_1));
 
         // Constraint 4: DVRM-C6.0
-        let d_wl_0 = &d0 + &d1 * &shift_16;
-        builder.assert_zero_base((&one - &sign_d) * (&abs_d0 - &d_wl_0));
+        let d_wl_0 = d0 + d1 * shift_16;
+        builder.assert_zero_base((one - sign_d) * (abs_d0 - d_wl_0));
 
         // Constraint 5: DVRM-C6.1
-        let d_wl_1 = &d2 + &d3 * &shift_16;
-        builder.assert_zero_base((&one - &sign_d) * (&abs_d1 - &d_wl_1));
+        let d_wl_1 = d2 + d3 * shift_16;
+        builder.assert_zero_base((one - sign_d) * (abs_d1 - d_wl_1));
 
         // Constraint 6: DVRM-C7
-        builder.assert_zero_base(&signed * (&one - &overflow) - &sign_q);
+        builder.assert_zero_base(signed * (one - overflow) - sign_q);
 
         // Constraints 7-10: carries
-        let sign_fill_word = &sign_fill + &sign_fill * &shift_16;
+        let sign_fill_word = sign_fill + sign_fill * shift_16;
 
         let ext_n = [
-            &n0 + &n1 * &shift_16,
-            &n2 + &n3 * &shift_16,
-            &sign_n * &sign_fill_word,
-            &sign_n * &sign_fill_word,
+            n0 + n1 * shift_16,
+            n2 + n3 * shift_16,
+            sign_n * sign_fill_word,
+            sign_n * sign_fill_word,
         ];
 
         let ext_r = [
             r_wl_0,
             r_wl_1,
-            &sign_r * &sign_fill_word,
-            &sign_r * &sign_fill_word,
+            sign_r * sign_fill_word,
+            sign_r * sign_fill_word,
         ];
 
         let ext_nsr = [
-            &nsr0 + &nsr1 * &shift_16,
-            &nsr2 + &nsr3 * &shift_16,
-            &sign_nsr * &sign_fill_word,
-            &sign_nsr * &sign_fill_word,
+            nsr0 + nsr1 * shift_16,
+            nsr2 + nsr3 * shift_16,
+            sign_nsr * sign_fill_word,
+            sign_nsr * sign_fill_word,
         ];
 
-        let carry_0 = (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32;
-        builder.assert_zero_base(carry_0.clone() * (&one - &carry_0));
+        let carry_0 = (ext_nsr[0] + ext_r[0] - ext_n[0]) * inv_2_32;
+        builder.assert_zero_base(carry_0 * (one - carry_0));
 
-        let carry_1 = (&ext_nsr[1] + &ext_r[1] + &carry_0 - &ext_n[1]) * &inv_2_32;
-        builder.assert_zero_base(carry_1.clone() * (&one - &carry_1));
+        let carry_1 = (ext_nsr[1] + ext_r[1] + carry_0 - ext_n[1]) * inv_2_32;
+        builder.assert_zero_base(carry_1 * (one - carry_1));
 
-        let carry_2 = (&ext_nsr[2] + &ext_r[2] + &carry_1 - &ext_n[2]) * &inv_2_32;
-        builder.assert_zero_base(carry_2.clone() * (&one - &carry_2));
+        let carry_2 = (ext_nsr[2] + ext_r[2] + carry_1 - ext_n[2]) * inv_2_32;
+        builder.assert_zero_base(carry_2 * (one - carry_2));
 
-        let carry_3 = (&ext_nsr[3] + &ext_r[3] + &carry_2 - &ext_n[3]) * &inv_2_32;
-        builder.assert_zero_base(carry_3.clone() * (&one - &carry_3));
+        let carry_3 = (ext_nsr[3] + ext_r[3] + carry_2 - ext_n[3]) * inv_2_32;
+        builder.assert_zero_base(carry_3 * (one - carry_3));
 
         // Constraint 11: DVRM-C15
         assert_is_bit_base(builder, sign_nsr);
 
         // Constraint 12: DVRM-C18b
-        builder.assert_zero_base((&one - &signed) * &sign_n);
+        builder.assert_zero_base((one - signed) * sign_n);
 
         // Constraint 13: DVRM-C19b
-        builder.assert_zero_base((&one - &signed) * &sign_r);
+        builder.assert_zero_base((one - signed) * sign_r);
 
         // Constraint 14: DVRM-C20b
-        builder.assert_zero_base((&one - &signed) * &sign_d);
+        builder.assert_zero_base((one - signed) * sign_d);
 
         // Constraints 15-18: DVRM-C16.i
         let q_cols = [q0, q1, q2, q3];
         for q_val in &q_cols {
-            builder.assert_zero_base(&div_by_zero * (q_val - &sign_fill));
+            builder.assert_zero_base(div_by_zero * (q_val - sign_fill));
         }
     })
     .with_builder(|builder| {
@@ -2351,97 +2342,97 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         let abs_d1 = builder.main(0, cols::ABS_D_1);
 
         // Constraint 0: DVRM-A3: signed * (1 - signed) = 0
-        assert_is_bit(builder, signed.clone());
+        assert_is_bit(builder, signed);
 
         // Constraint 1: DVRM-C1: (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n) = 0
-        let r_sum = &r0 + &r1 + &r2 + &r3;
-        builder.assert_zero(&r_sum * (&sign_r - &sign_n));
+        let r_sum = r0 + r1 + r2 + r3;
+        builder.assert_zero(r_sum * (sign_r - sign_n));
 
         // Constraint 2: DVRM-C4.0: (1-sign_r) * (abs_r[0] - r::DWordWL[0]) = 0
         // r::DWordWL[0] = r[0] + r[1]*2^16
-        let r_wl_0 = &r0 + &r1 * &shift_16;
-        builder.assert_zero((&one - &sign_r) * (&abs_r0 - &r_wl_0));
+        let r_wl_0 = r0 + r1 * shift_16;
+        builder.assert_zero((one - sign_r) * (abs_r0 - r_wl_0));
 
         // Constraint 3: DVRM-C4.1: (1-sign_r) * (abs_r[1] - r::DWordWL[1]) = 0
         // r::DWordWL[1] = r[2] + r[3]*2^16
-        let r_wl_1 = &r2 + &r3 * &shift_16;
-        builder.assert_zero((&one - &sign_r) * (&abs_r1 - &r_wl_1));
+        let r_wl_1 = r2 + r3 * shift_16;
+        builder.assert_zero((one - sign_r) * (abs_r1 - r_wl_1));
 
         // Constraint 4: DVRM-C6.0: (1-sign_d) * (abs_d[0] - d::DWordWL[0]) = 0
-        let d_wl_0 = &d0 + &d1 * &shift_16;
-        builder.assert_zero((&one - &sign_d) * (&abs_d0 - &d_wl_0));
+        let d_wl_0 = d0 + d1 * shift_16;
+        builder.assert_zero((one - sign_d) * (abs_d0 - d_wl_0));
 
         // Constraint 5: DVRM-C6.1: (1-sign_d) * (abs_d[1] - d::DWordWL[1]) = 0
-        let d_wl_1 = &d2 + &d3 * &shift_16;
-        builder.assert_zero((&one - &sign_d) * (&abs_d1 - &d_wl_1));
+        let d_wl_1 = d2 + d3 * shift_16;
+        builder.assert_zero((one - sign_d) * (abs_d1 - d_wl_1));
 
         // Constraint 6: DVRM-C7: signed * (1-overflow) - sign_q = 0
-        builder.assert_zero(&signed * (&one - &overflow) - &sign_q);
+        builder.assert_zero(signed * (one - overflow) - sign_q);
 
         // Constraints 7-10: DVRM-C12.i: carry[i] * (1 - carry[i]) = 0
         // Build sign-extended QuadWL representations for n, r, n_sub_r
-        let sign_fill_word = &sign_fill + &sign_fill * &shift_16;
+        let sign_fill_word = sign_fill + sign_fill * shift_16;
 
         // ext_n: [n0+n1*2^16, n2+n3*2^16, sign_n*0xFFFFFFFF, sign_n*0xFFFFFFFF]
         let ext_n = [
-            &n0 + &n1 * &shift_16,
-            &n2 + &n3 * &shift_16,
-            &sign_n * &sign_fill_word,
-            &sign_n * &sign_fill_word,
+            n0 + n1 * shift_16,
+            n2 + n3 * shift_16,
+            sign_n * sign_fill_word,
+            sign_n * sign_fill_word,
         ];
 
         // ext_r: [r0+r1*2^16, r2+r3*2^16, sign_r*0xFFFFFFFF, sign_r*0xFFFFFFFF]
         let ext_r = [
             r_wl_0,
             r_wl_1,
-            &sign_r * &sign_fill_word,
-            &sign_r * &sign_fill_word,
+            sign_r * sign_fill_word,
+            sign_r * sign_fill_word,
         ];
 
         // ext_nsr: [nsr0+nsr1*2^16, nsr2+nsr3*2^16, sign_nsr*0xFFFFFFFF, sign_nsr*0xFFFFFFFF]
         let ext_nsr = [
-            &nsr0 + &nsr1 * &shift_16,
-            &nsr2 + &nsr3 * &shift_16,
-            &sign_nsr * &sign_fill_word,
-            &sign_nsr * &sign_fill_word,
+            nsr0 + nsr1 * shift_16,
+            nsr2 + nsr3 * shift_16,
+            sign_nsr * sign_fill_word,
+            sign_nsr * sign_fill_word,
         ];
 
         // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) * inv_2_32
-        let carry_0 = (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32;
+        let carry_0 = (ext_nsr[0] + ext_r[0] - ext_n[0]) * inv_2_32;
         // Constraint 7: carry[0] * (1 - carry[0]) = 0
-        builder.assert_zero(carry_0.clone() * (&one - &carry_0));
+        builder.assert_zero(carry_0 * (one - carry_0));
 
         // carry[1] = (ext_nsr[1] + ext_r[1] + carry[0] - ext_n[1]) * inv_2_32
-        let carry_1 = (&ext_nsr[1] + &ext_r[1] + &carry_0 - &ext_n[1]) * &inv_2_32;
+        let carry_1 = (ext_nsr[1] + ext_r[1] + carry_0 - ext_n[1]) * inv_2_32;
         // Constraint 8: carry[1] * (1 - carry[1]) = 0
-        builder.assert_zero(carry_1.clone() * (&one - &carry_1));
+        builder.assert_zero(carry_1 * (one - carry_1));
 
         // carry[2] = (ext_nsr[2] + ext_r[2] + carry[1] - ext_n[2]) * inv_2_32
-        let carry_2 = (&ext_nsr[2] + &ext_r[2] + &carry_1 - &ext_n[2]) * &inv_2_32;
+        let carry_2 = (ext_nsr[2] + ext_r[2] + carry_1 - ext_n[2]) * inv_2_32;
         // Constraint 9: carry[2] * (1 - carry[2]) = 0
-        builder.assert_zero(carry_2.clone() * (&one - &carry_2));
+        builder.assert_zero(carry_2 * (one - carry_2));
 
         // carry[3] = (ext_nsr[3] + ext_r[3] + carry[2] - ext_n[3]) * inv_2_32
-        let carry_3 = (&ext_nsr[3] + &ext_r[3] + &carry_2 - &ext_n[3]) * &inv_2_32;
+        let carry_3 = (ext_nsr[3] + ext_r[3] + carry_2 - ext_n[3]) * inv_2_32;
         // Constraint 10: carry[3] * (1 - carry[3]) = 0
-        builder.assert_zero(carry_3.clone() * (&one - &carry_3));
+        builder.assert_zero(carry_3 * (one - carry_3));
 
         // Constraint 11: DVRM-C15: sign_n_sub_r * (1 - sign_n_sub_r) = 0
         assert_is_bit(builder, sign_nsr);
 
         // Constraint 12: DVRM-C18b: (1-signed) * sign_n = 0
-        builder.assert_zero((&one - &signed) * &sign_n);
+        builder.assert_zero((one - signed) * sign_n);
 
         // Constraint 13: DVRM-C19b: (1-signed) * sign_r = 0
-        builder.assert_zero((&one - &signed) * &sign_r);
+        builder.assert_zero((one - signed) * sign_r);
 
         // Constraint 14: DVRM-C20b: (1-signed) * sign_d = 0
-        builder.assert_zero((&one - &signed) * &sign_d);
+        builder.assert_zero((one - signed) * sign_d);
 
         // Constraints 15-18: DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
         let q_cols = [q0, q1, q2, q3];
         for q_val in &q_cols {
-            builder.assert_zero(&div_by_zero * (q_val - &sign_fill));
+            builder.assert_zero(div_by_zero * (q_val - sign_fill));
         }
     })
     .with_name("DVRM")
@@ -2491,26 +2482,25 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         let next_pc_high_1 = builder.main_base(cols::NEXT_PC_HIGH_1);
         let next_pc_high_2 = builder.main_base(cols::NEXT_PC_HIGH_2);
 
-        let unmasked_0 =
-            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
-        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+        let unmasked_0 = unmasked_low_byte + next_pc_low_1 * shift_8 + next_pc_high_0 * shift_16;
+        let unmasked_1 = next_pc_high_1 + next_pc_high_2 * shift_16;
 
         // Constraint 0: PcCarry0IsBit
-        let carry_0_pc = (&pc_0 + &offset_0 - &unmasked_0) * &inv_2_32;
-        let cond_pc = &one - &jalr;
-        builder.assert_zero_base(&cond_pc * &carry_0_pc * (&one - &carry_0_pc));
+        let carry_0_pc = (pc_0 + offset_0 - unmasked_0) * inv_2_32;
+        let cond_pc = one - jalr;
+        builder.assert_zero_base(cond_pc * carry_0_pc * (one - carry_0_pc));
 
         // Constraint 1: PcCarry1IsBit
-        let carry_1_pc = (&pc_1 + &offset_1 + &carry_0_pc - &unmasked_1) * &inv_2_32;
-        builder.assert_zero_base(&cond_pc * &carry_1_pc * (&one - &carry_1_pc));
+        let carry_1_pc = (pc_1 + offset_1 + carry_0_pc - unmasked_1) * inv_2_32;
+        builder.assert_zero_base(cond_pc * carry_1_pc * (one - carry_1_pc));
 
         // Constraint 2: RegCarry0IsBit
-        let carry_0_reg = (&register_0 + &offset_0 - &unmasked_0) * &inv_2_32;
-        builder.assert_zero_base(&jalr * &carry_0_reg * (&one - &carry_0_reg));
+        let carry_0_reg = (register_0 + offset_0 - unmasked_0) * inv_2_32;
+        builder.assert_zero_base(jalr * carry_0_reg * (one - carry_0_reg));
 
         // Constraint 3: RegCarry1IsBit
-        let carry_1_reg = (&register_1 + &offset_1 + &carry_0_reg - &unmasked_1) * &inv_2_32;
-        builder.assert_zero_base(&jalr * &carry_1_reg * (&one - &carry_1_reg));
+        let carry_1_reg = (register_1 + offset_1 + carry_0_reg - unmasked_1) * inv_2_32;
+        builder.assert_zero_base(jalr * carry_1_reg * (one - carry_1_reg));
     })
     .with_builder(|builder| {
         use crate::constraints::templates::INV_SHIFT_32;
@@ -2539,26 +2529,25 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         // Reconstruct next_pc_unmasked as DWordWL:
         // unmasked_0 = unmasked_low_byte + 2^8 * next_pc_low_1 + 2^16 * next_pc_high_0
         // unmasked_1 = next_pc_high_1 + 2^16 * next_pc_high_2
-        let unmasked_0 =
-            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
-        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+        let unmasked_0 = unmasked_low_byte + next_pc_low_1 * shift_8 + next_pc_high_0 * shift_16;
+        let unmasked_1 = next_pc_high_1 + next_pc_high_2 * shift_16;
 
         // Constraint 0: PcCarry0IsBit — (1 - JALR) * carry_0_pc * (1 - carry_0_pc) = 0
-        let carry_0_pc = (&pc_0 + &offset_0 - &unmasked_0) * &inv_2_32;
-        let cond_pc = &one - &jalr;
-        builder.assert_zero(&cond_pc * &carry_0_pc * (&one - &carry_0_pc));
+        let carry_0_pc = (pc_0 + offset_0 - unmasked_0) * inv_2_32;
+        let cond_pc = one - jalr;
+        builder.assert_zero(cond_pc * carry_0_pc * (one - carry_0_pc));
 
         // Constraint 1: PcCarry1IsBit — (1 - JALR) * carry_1_pc * (1 - carry_1_pc) = 0
-        let carry_1_pc = (&pc_1 + &offset_1 + &carry_0_pc - &unmasked_1) * &inv_2_32;
-        builder.assert_zero(&cond_pc * &carry_1_pc * (&one - &carry_1_pc));
+        let carry_1_pc = (pc_1 + offset_1 + carry_0_pc - unmasked_1) * inv_2_32;
+        builder.assert_zero(cond_pc * carry_1_pc * (one - carry_1_pc));
 
         // Constraint 2: RegCarry0IsBit — JALR * carry_0_reg * (1 - carry_0_reg) = 0
-        let carry_0_reg = (&register_0 + &offset_0 - &unmasked_0) * &inv_2_32;
-        builder.assert_zero(&jalr * &carry_0_reg * (&one - &carry_0_reg));
+        let carry_0_reg = (register_0 + offset_0 - unmasked_0) * inv_2_32;
+        builder.assert_zero(jalr * carry_0_reg * (one - carry_0_reg));
 
         // Constraint 3: RegCarry1IsBit — JALR * carry_1_reg * (1 - carry_1_reg) = 0
-        let carry_1_reg = (&register_1 + &offset_1 + &carry_0_reg - &unmasked_1) * &inv_2_32;
-        builder.assert_zero(&jalr * &carry_1_reg * (&one - &carry_1_reg));
+        let carry_1_reg = (register_1 + offset_1 + carry_0_reg - unmasked_1) * inv_2_32;
+        builder.assert_zero(jalr * carry_1_reg * (one - carry_1_reg));
     })
     .with_name("BRANCH")
 }
@@ -2610,53 +2599,53 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         let mu = builder.main_base(cols::MU);
 
         // Constraint 0: IS_BIT(FIRST)
-        assert_is_bit_base(builder, first.clone());
+        assert_is_bit_base(builder, first);
 
         // Constraint 1: IS_BIT(END)
-        assert_is_bit_base(builder, end.clone());
+        assert_is_bit_base(builder, end);
 
         // Constraint 2: IS_BIT(MU)
-        assert_is_bit_base(builder, mu.clone());
+        assert_is_bit_base(builder, mu);
 
         // Constraint 3: (first + end) * (1 - mu) = 0
-        builder.assert_zero_base((&first + &end) * (&one - &mu));
+        builder.assert_zero_base((first + end) * (one - mu));
 
         // Constraint 4-5: ADD for address + 1 = address_incr
         let addr_lo = builder.main_base(cols::ADDRESS_0);
         let addr_hi = builder.main_base(cols::ADDRESS_1);
-        let rhs_lo = one.clone();
+        let rhs_lo = one;
         let addr_incr_0 = builder.main_base(cols::ADDRESS_INCR_0);
         let addr_incr_1 = builder.main_base(cols::ADDRESS_INCR_1);
         let addr_incr_2 = builder.main_base(cols::ADDRESS_INCR_2);
         let addr_incr_3 = builder.main_base(cols::ADDRESS_INCR_3);
-        let sum_lo = &addr_incr_0 + &addr_incr_1 * &shift_16;
-        let sum_hi = &addr_incr_2 + &addr_incr_3 * &shift_16;
+        let sum_lo = addr_incr_0 + addr_incr_1 * shift_16;
+        let sum_hi = addr_incr_2 + addr_incr_3 * shift_16;
 
-        let carry_0 = (&addr_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+        let carry_0 = (addr_lo + rhs_lo - sum_lo) * inv_2_32;
         // Constraint 4
-        builder.assert_zero_base(carry_0.clone() * (&one - &carry_0));
+        builder.assert_zero_base(carry_0 * (one - carry_0));
 
-        let carry_1 = (&addr_hi + &carry_0 - &sum_hi) * &inv_2_32;
+        let carry_1 = (addr_hi + carry_0 - sum_hi) * inv_2_32;
         // Constraint 5
-        builder.assert_zero_base(carry_1.clone() * (&one - &carry_1));
+        builder.assert_zero_base(carry_1 * (one - carry_1));
 
         // Constraint 6-7: SUB for count_decr + 1 = count
         let cd_0 = builder.main_base(cols::COUNT_DECR_0);
         let cd_1 = builder.main_base(cols::COUNT_DECR_1);
         let cd_2 = builder.main_base(cols::COUNT_DECR_2);
         let cd_3 = builder.main_base(cols::COUNT_DECR_3);
-        let lhs_lo = &cd_0 + &cd_1 * &shift_16;
-        let lhs_hi = &cd_2 + &cd_3 * &shift_16;
+        let lhs_lo = cd_0 + cd_1 * shift_16;
+        let lhs_hi = cd_2 + cd_3 * shift_16;
         let count_lo = builder.main_base(cols::COUNT_0);
         let count_hi = builder.main_base(cols::COUNT_1);
 
-        let carry_0_sub = (&lhs_lo + &one - &count_lo) * &inv_2_32;
+        let carry_0_sub = (lhs_lo + one - count_lo) * inv_2_32;
         // Constraint 6
-        builder.assert_zero_base(carry_0_sub.clone() * (&one - &carry_0_sub));
+        builder.assert_zero_base(carry_0_sub * (one - carry_0_sub));
 
-        let carry_1_sub = (&lhs_hi + &carry_0_sub - &count_hi) * &inv_2_32;
+        let carry_1_sub = (lhs_hi + carry_0_sub - count_hi) * inv_2_32;
         // Constraint 7
-        builder.assert_zero_base(carry_1_sub.clone() * (&one - &carry_1_sub));
+        builder.assert_zero_base(carry_1_sub * (one - carry_1_sub));
     })
     .with_builder(|builder| {
         use crate::constraints::helpers::assert_is_bit;
@@ -2674,16 +2663,16 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         let mu = builder.main(0, cols::MU);
 
         // Constraint 0: IS_BIT(FIRST)
-        assert_is_bit(builder, first.clone());
+        assert_is_bit(builder, first);
 
         // Constraint 1: IS_BIT(END)
-        assert_is_bit(builder, end.clone());
+        assert_is_bit(builder, end);
 
         // Constraint 2: IS_BIT(MU)
-        assert_is_bit(builder, mu.clone());
+        assert_is_bit(builder, mu);
 
         // Constraint 3: (first + end) * (1 - mu) = 0
-        builder.assert_zero((&first + &end) * (&one - &mu));
+        builder.assert_zero((first + end) * (one - mu));
 
         // Constraint 4-5: ADD for address + 1 = address_incr (unconditional)
         // lhs = address (DWordWL: cols 3,4)
@@ -2691,24 +2680,24 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         // sum = address_incr (DWordHL: cols 5,6,7,8 -> DWordWL)
         let addr_lo = builder.main(0, cols::ADDRESS_0);
         let addr_hi = builder.main(0, cols::ADDRESS_1);
-        let rhs_lo = one.clone();
+        let rhs_lo = one;
         // sum_lo = addr_incr[0] + 2^16 * addr_incr[1]
         let addr_incr_0 = builder.main(0, cols::ADDRESS_INCR_0);
         let addr_incr_1 = builder.main(0, cols::ADDRESS_INCR_1);
         let addr_incr_2 = builder.main(0, cols::ADDRESS_INCR_2);
         let addr_incr_3 = builder.main(0, cols::ADDRESS_INCR_3);
-        let sum_lo = &addr_incr_0 + &addr_incr_1 * &shift_16;
-        let sum_hi = &addr_incr_2 + &addr_incr_3 * &shift_16;
+        let sum_lo = addr_incr_0 + addr_incr_1 * shift_16;
+        let sum_hi = addr_incr_2 + addr_incr_3 * shift_16;
 
         // carry_0 = (addr_lo + 1 - sum_lo) * 2^(-32)
-        let carry_0 = (&addr_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+        let carry_0 = (addr_lo + rhs_lo - sum_lo) * inv_2_32;
         // Constraint 4: carry_0 * (1 - carry_0) = 0
-        builder.assert_zero(carry_0.clone() * (&one - &carry_0));
+        builder.assert_zero(carry_0 * (one - carry_0));
 
         // carry_1 = (addr_hi + 0 + carry_0 - sum_hi) * 2^(-32)
-        let carry_1 = (&addr_hi + &carry_0 - &sum_hi) * &inv_2_32;
+        let carry_1 = (addr_hi + carry_0 - sum_hi) * inv_2_32;
         // Constraint 5: carry_1 * (1 - carry_1) = 0
-        builder.assert_zero(carry_1.clone() * (&one - &carry_1));
+        builder.assert_zero(carry_1 * (one - carry_1));
 
         // Constraint 6-7: SUB for count_decr + 1 = count (unconditional)
         // lhs = count_decr (DWordHL: cols 11,12,13,14 -> DWordWL)
@@ -2718,20 +2707,20 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         let cd_1 = builder.main(0, cols::COUNT_DECR_1);
         let cd_2 = builder.main(0, cols::COUNT_DECR_2);
         let cd_3 = builder.main(0, cols::COUNT_DECR_3);
-        let lhs_lo = &cd_0 + &cd_1 * &shift_16;
-        let lhs_hi = &cd_2 + &cd_3 * &shift_16;
+        let lhs_lo = cd_0 + cd_1 * shift_16;
+        let lhs_hi = cd_2 + cd_3 * shift_16;
         let count_lo = builder.main(0, cols::COUNT_0);
         let count_hi = builder.main(0, cols::COUNT_1);
 
         // carry_0 = (lhs_lo + 1 - count_lo) * 2^(-32)
-        let carry_0_sub = (&lhs_lo + &one - &count_lo) * &inv_2_32;
+        let carry_0_sub = (lhs_lo + one - count_lo) * inv_2_32;
         // Constraint 6: carry_0 * (1 - carry_0) = 0
-        builder.assert_zero(carry_0_sub.clone() * (&one - &carry_0_sub));
+        builder.assert_zero(carry_0_sub * (one - carry_0_sub));
 
         // carry_1 = (lhs_hi + carry_0 - count_hi) * 2^(-32)
-        let carry_1_sub = (&lhs_hi + &carry_0_sub - &count_hi) * &inv_2_32;
+        let carry_1_sub = (lhs_hi + carry_0_sub - count_hi) * inv_2_32;
         // Constraint 7: carry_1 * (1 - carry_1) = 0
-        builder.assert_zero(carry_1_sub.clone() * (&one - &carry_1_sub));
+        builder.assert_zero(carry_1_sub * (one - carry_1_sub));
     })
     .with_name("COMMIT")
 }
