@@ -2,9 +2,11 @@ use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
-use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
+use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
-use crate::traits::{AIR, ZerofierEvaluations};
+use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
+use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
+use math::fft::errors::FFTError;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
@@ -33,9 +35,9 @@ where
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
-    /// Uses the AirBuilder pattern: each AIR's `eval_constraints_with_builder()`
-    /// accumulates constraint evaluations with alpha powers into a single sum,
-    /// which is then multiplied by the uniform zerofier.
+    /// Uses the AirBuilder pattern when the AIR has a builder, otherwise falls back
+    /// to the old frame-based `compute_transition` path for test/example AIRs.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_transitions(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
@@ -44,12 +46,51 @@ where
         boundary_evaluation: Vec<FieldElement<FieldExtension>>,
         logup_table_offset: &FieldElement<FieldExtension>,
         composition_alpha: &FieldElement<FieldExtension>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
     ) -> Vec<FieldElement<FieldExtension>> {
-        assert!(
-            zerofier_data.is_uniform(),
-            "AirBuilder requires uniform zerofiers"
-        );
+        let use_builder = air.has_any_builder();
 
+        if use_builder {
+            // AirBuilder path: uniform zerofiers required
+            assert!(
+                zerofier_data.is_uniform(),
+                "AirBuilder requires uniform zerofiers"
+            );
+            Self::evaluate_transitions_builder(
+                air,
+                lde_trace,
+                rap_challenges,
+                zerofier_data,
+                boundary_evaluation,
+                logup_table_offset,
+                composition_alpha,
+            )
+        } else {
+            // Old frame-based path for test/example AIRs
+            Self::evaluate_transitions_legacy(
+                air,
+                lde_trace,
+                rap_challenges,
+                zerofier_data,
+                boundary_evaluation,
+                logup_table_offset,
+                transition_coefficients,
+                domain,
+            )
+        }
+    }
+
+    /// AirBuilder-based transition evaluation (for VM tables with builders).
+    fn evaluate_transitions_builder(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        zerofier_data: &ZerofierEvaluations<Field>,
+        boundary_evaluation: Vec<FieldElement<FieldExtension>>,
+        logup_table_offset: &FieldElement<FieldExtension>,
+        composition_alpha: &FieldElement<FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>> {
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
@@ -119,6 +160,173 @@ where
                         air.eval_constraints_with_builder(&mut builder);
                     }
                     zerofier_data.get_uniform(i) * &builder.finish() + boundary
+                })
+                .collect()
+        }
+    }
+
+    /// Legacy frame-based transition evaluation for test/example AIRs.
+    ///
+    /// Handles both uniform and non-uniform zerofiers.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_transitions_legacy(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        zerofier_data: &ZerofierEvaluations<Field>,
+        boundary_evaluation: Vec<FieldElement<FieldExtension>>,
+        logup_table_offset: &FieldElement<FieldExtension>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
+    ) -> Vec<FieldElement<FieldExtension>> {
+        let is_uniform = zerofier_data.is_uniform();
+
+        // Pre-compute LogUp alpha powers once for all LDE domain points.
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(
+                    &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
+            } else {
+                Vec::new()
+            };
+
+        // Precompute packing shift constants once for all LDE domain points.
+        let packing_shifts = PackingShifts::<Field>::new();
+
+        // Pre-compute periodic column evaluations on LDE domain.
+        let trace_length = domain.interpolation_domain_size;
+        let lde_periodic_columns: Vec<Vec<FieldElement<Field>>> = air
+            .get_periodic_column_polynomials(trace_length)
+            .iter()
+            .map(|poly| {
+                evaluate_polynomial_on_lde_domain(
+                    poly,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                )
+            })
+            .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
+            .unwrap();
+
+        let num_transition = air.num_transition_constraints();
+        let num_periodic = lde_periodic_columns.len();
+        let offsets = &air.context().transition_offsets;
+
+        let blowup_factor = lde_trace.blowup_factor;
+        let lde_step_size = lde_trace.lde_step_size;
+        let rows_per_step = lde_step_size / blowup_factor;
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
+        let num_offsets = offsets.len();
+
+        #[cfg(feature = "parallel")]
+        {
+            let evaluations_t: Vec<_> = boundary_evaluation
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                            vec![FieldElement::<Field>::zero(); num_periodic],
+                            Frame::preallocate(
+                                num_offsets,
+                                rows_per_step,
+                                num_main_cols,
+                                num_aux_cols,
+                            ),
+                        )
+                    },
+                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                        frame.fill_from_lde(lde_trace, i, offsets);
+
+                        for (j, col) in lde_periodic_columns.iter().enumerate() {
+                            periodic_buf[j] = col[i].clone();
+                        }
+
+                        let ctx = TransitionEvaluationContext::new_prover(
+                            frame,
+                            periodic_buf,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                            &packing_shifts,
+                        );
+                        air.compute_transition_into(&ctx, transition_buf);
+
+                        let acc_transition = if is_uniform {
+                            // All constraints share one zerofier: factor it out of the sum.
+                            let z = zerofier_data.get_uniform(i);
+                            let sum = transition_buf
+                                .iter()
+                                .zip(transition_coefficients)
+                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                            z * &sum
+                        } else {
+                            transition_buf
+                                .iter()
+                                .enumerate()
+                                .zip(transition_coefficients)
+                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
+                                    acc + zerofier_data.get(c_idx, i) * eval * beta
+                                })
+                        };
+
+                        acc_transition + boundary
+                    },
+                )
+                .collect();
+            evaluations_t
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
+            let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
+            let mut frame =
+                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
+
+            boundary_evaluation
+                .into_iter()
+                .enumerate()
+                .map(|(i, boundary)| {
+                    frame.fill_from_lde(lde_trace, i, offsets);
+
+                    for (j, col) in lde_periodic_columns.iter().enumerate() {
+                        periodic_buf[j] = col[i].clone();
+                    }
+
+                    let ctx = TransitionEvaluationContext::new_prover(
+                        &frame,
+                        &periodic_buf,
+                        rap_challenges,
+                        &logup_alpha_powers,
+                        logup_table_offset,
+                        &packing_shifts,
+                    );
+                    air.compute_transition_into(&ctx, &mut transition_buf);
+
+                    let acc_transition = if is_uniform {
+                        let z = zerofier_data.get_uniform(i);
+                        let sum = transition_buf
+                            .iter()
+                            .zip(transition_coefficients)
+                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                        z * &sum
+                    } else {
+                        transition_buf
+                            .iter()
+                            .enumerate()
+                            .zip(transition_coefficients)
+                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
+                                acc + zerofier_data.get(c_idx, i) * eval * beta
+                            })
+                    };
+
+                    acc_transition + boundary
                 })
                 .collect()
         }
@@ -246,6 +454,8 @@ where
             boundary_evaluation,
             &self.logup_table_offset,
             &composition_alpha,
+            transition_coefficients,
+            domain,
         )
     }
 }

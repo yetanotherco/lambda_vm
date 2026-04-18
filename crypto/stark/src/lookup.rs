@@ -1120,6 +1120,10 @@ where
         &self.transition_constraints
     }
 
+    fn has_any_builder(&self) -> bool {
+        self.builder_fn.is_some() || self.main_builder_fn.is_some()
+    }
+
     fn has_main_builder(&self) -> bool {
         self.main_builder_fn.is_some()
     }
