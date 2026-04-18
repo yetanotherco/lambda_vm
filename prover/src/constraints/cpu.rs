@@ -236,6 +236,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 // =========================================================================
@@ -298,6 +312,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -375,6 +403,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -458,6 +500,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 // =========================================================================
@@ -532,6 +588,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -623,6 +693,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ExtBitZeroCo
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -758,6 +842,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 // =========================================================================
@@ -838,6 +936,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -923,6 +1035,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 // =========================================================================
@@ -985,6 +1111,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }
@@ -1055,6 +1195,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 // =========================================================================
@@ -1122,6 +1276,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
             }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
         }
     }
 }

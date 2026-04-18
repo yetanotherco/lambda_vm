@@ -282,6 +282,37 @@ pub trait AIR: Send + Sync {
         self.context().num_transition_constraints
     }
 
+    /// Number of transition constraints that produce base-field evaluations.
+    ///
+    /// Constraints `0..num_base` write to the base-field buffer via `evaluate_prover`.
+    /// Constraints `num_base..num_total` write to the extension buffer.
+    /// Default: 0 (all E×E, backward compatible).
+    fn num_base_transition_constraints(&self) -> usize {
+        0
+    }
+
+    /// Evaluate all transition constraints into split base/extension buffers.
+    ///
+    /// Base-field constraints write to `base_evaluations` (length = `num_base_transition_constraints()`).
+    /// Extension-field constraints write to `ext_evaluations` (length = `num_transition_constraints()`).
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evaluations: &mut [FieldElement<Self::Field>],
+        ext_evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        let num_base = base_evaluations.len();
+        for e in base_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for e in ext_evaluations[num_base..].iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate_prover(evaluation_context, base_evaluations, ext_evaluations));
+    }
+
     fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
         vec![]
     }
