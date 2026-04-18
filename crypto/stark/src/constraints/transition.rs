@@ -36,6 +36,22 @@ where
         transition_evaluations: &mut [FieldElement<E>],
     );
 
+    /// Prover-only: evaluate into a base-field buffer for F×E accumulation.
+    ///
+    /// Override this for constraints that can produce base-field results (all main
+    /// trace constraints). The default delegates to `evaluate()` into `ext_evaluations`,
+    /// used by LogUp constraints that inherently operate in the extension field.
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        base_evaluations: &mut [FieldElement<F>],
+        ext_evaluations: &mut [FieldElement<E>],
+    ) {
+        // Default: write to extension buffer (for LogUp constraints)
+        let _ = base_evaluations;
+        self.evaluate(evaluation_context, ext_evaluations);
+    }
+
     /// The periodicity the constraint is applied over the trace.
     ///
     /// Default value is 1, meaning that the constraint is applied to every

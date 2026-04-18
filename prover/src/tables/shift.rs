@@ -808,6 +808,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            }
+            _ => unreachable!("evaluate_prover called in verifier context"),
+        }
+    }
 }
 
 /// Number of polynomial constraints in the SHIFT table.

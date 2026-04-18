@@ -804,6 +804,9 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Number of table-specific (base-field) transition constraints.
+    /// LogUp constraints are extension-field and come after these.
+    num_base_constraints: usize,
 }
 
 impl<
@@ -832,6 +835,7 @@ impl<
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let num_base_constraints = transition_constraints.len();
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
@@ -896,6 +900,7 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            num_base_constraints,
         }
     }
 
@@ -988,6 +993,13 @@ where
 
     fn context(&self) -> &AirContext {
         &self.context
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        // All table-specific constraints are base-field.
+        // LogUp constraints (batched term + accumulated) are extension-field
+        // and are appended after the table-specific ones.
+        self.num_base_constraints
     }
 
     fn transition_constraints(
