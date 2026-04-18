@@ -2,14 +2,13 @@ use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
-use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
+use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::trace::LDETraceTable;
-use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
-use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
+use crate::traits::{AIR, ZerofierEvaluations};
+use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
 use math::polynomial::Polynomial;
-use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
 use rayon::{
     iter::IndexedParallelIterator,
@@ -34,25 +33,22 @@ where
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
-    /// Uses `map_init` for per-thread buffer reuse (transition evaluations + periodic values)
-    /// and `ZerofierEvaluations` for deduplicated zerofier access.
-    #[allow(clippy::too_many_arguments)]
+    /// Uses the AirBuilder pattern: each AIR's `eval_constraints_with_builder()`
+    /// accumulates constraint evaluations with alpha powers into a single sum,
+    /// which is then multiplied by the uniform zerofier.
     fn evaluate_transitions(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
-        lde_periodic_columns: &[Vec<FieldElement<Field>>],
         rap_challenges: &[FieldElement<FieldExtension>],
         zerofier_data: &ZerofierEvaluations<Field>,
-        transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_evaluation: Vec<FieldElement<FieldExtension>>,
-        num_transition: usize,
-        num_periodic: usize,
-        offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
         composition_alpha: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
-        let is_uniform = zerofier_data.is_uniform();
-        let use_builder = air.uses_builder();
+        assert!(
+            zerofier_data.is_uniform(),
+            "AirBuilder requires uniform zerofiers"
+        );
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
@@ -65,161 +61,43 @@ where
                 Vec::new()
             };
 
-        // Precompute packing shift constants once for all LDE domain points.
-        let packing_shifts = PackingShifts::<Field>::new();
-
-        // Per-thread buffers via map_init: each Rayon worker allocates once,
-        // then reuses for all iterations assigned to that thread.
-        // The Frame is pre-allocated and filled in-place to avoid Vec allocations
-        // on every LDE point (a significant fraction of total CPU time).
-        let blowup_factor = lde_trace.blowup_factor;
-        let lde_step_size = lde_trace.lde_step_size;
-        let rows_per_step = lde_step_size / blowup_factor;
-        let num_main_cols = lde_trace.num_main_cols();
-        let num_aux_cols = lde_trace.num_aux_cols();
-        let num_offsets = offsets.len();
-
         #[cfg(feature = "parallel")]
         {
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
                 .enumerate()
-                .map_init(
-                    || {
-                        (
-                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
-                            vec![FieldElement::<Field>::zero(); num_periodic],
-                            Frame::preallocate(
-                                num_offsets,
-                                rows_per_step,
-                                num_main_cols,
-                                num_aux_cols,
-                            ),
-                        )
-                    },
-                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
-                        if use_builder {
-                            let mut builder = crate::air_builder::ProverBuilder::new(
-                                lde_trace,
-                                i,
-                                composition_alpha,
-                                rap_challenges,
-                                &logup_alpha_powers,
-                                logup_table_offset,
-                            );
-                            air.eval_constraints_with_builder(&mut builder);
-                            let acc = if is_uniform {
-                                zerofier_data.get_uniform(i) * &builder.finish()
-                            } else {
-                                panic!("AirBuilder requires uniform zerofiers")
-                            };
-                            return acc + boundary;
-                        }
-
-                        frame.fill_from_lde(lde_trace, i, offsets);
-
-                        for (j, col) in lde_periodic_columns.iter().enumerate() {
-                            periodic_buf[j] = col[i].clone();
-                        }
-
-                        let ctx = TransitionEvaluationContext::new_prover(
-                            frame,
-                            periodic_buf,
-                            rap_challenges,
-                            &logup_alpha_powers,
-                            logup_table_offset,
-                            &packing_shifts,
-                        );
-                        air.compute_transition_into(&ctx, transition_buf);
-
-                        let acc_transition = if is_uniform {
-                            // All constraints share one zerofier: factor it out of the sum.
-                            let z = zerofier_data.get_uniform(i);
-                            let sum = transition_buf
-                                .iter()
-                                .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                            z * &sum
-                        } else {
-                            transition_buf
-                                .iter()
-                                .enumerate()
-                                .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                })
-                        };
-
-                        acc_transition + boundary
-                    },
-                )
+                .map(|(i, boundary)| {
+                    let mut builder = crate::air_builder::ProverBuilder::new(
+                        lde_trace,
+                        i,
+                        composition_alpha,
+                        rap_challenges,
+                        &logup_alpha_powers,
+                        logup_table_offset,
+                    );
+                    air.eval_constraints_with_builder(&mut builder);
+                    zerofier_data.get_uniform(i) * &builder.finish() + boundary
+                })
                 .collect();
             evaluations_t
         }
 
         #[cfg(not(feature = "parallel"))]
         {
-            let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
-            let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
-            let mut frame =
-                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
-
             boundary_evaluation
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    if use_builder {
-                        let mut builder = crate::air_builder::ProverBuilder::new(
-                            lde_trace,
-                            i,
-                            composition_alpha,
-                            rap_challenges,
-                            &logup_alpha_powers,
-                            logup_table_offset,
-                        );
-                        air.eval_constraints_with_builder(&mut builder);
-                        let acc = if is_uniform {
-                            zerofier_data.get_uniform(i) * &builder.finish()
-                        } else {
-                            panic!("AirBuilder requires uniform zerofiers")
-                        };
-                        return acc + boundary;
-                    }
-
-                    frame.fill_from_lde(lde_trace, i, offsets);
-
-                    for (j, col) in lde_periodic_columns.iter().enumerate() {
-                        periodic_buf[j] = col[i].clone();
-                    }
-
-                    let ctx = TransitionEvaluationContext::new_prover(
-                        &frame,
-                        &periodic_buf,
+                    let mut builder = crate::air_builder::ProverBuilder::new(
+                        lde_trace,
+                        i,
+                        composition_alpha,
                         rap_challenges,
                         &logup_alpha_powers,
                         logup_table_offset,
-                        &packing_shifts,
                     );
-                    air.compute_transition_into(&ctx, &mut transition_buf);
-
-                    let acc_transition = if is_uniform {
-                        let z = zerofier_data.get_uniform(i);
-                        let sum = transition_buf
-                            .iter()
-                            .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                        z * &sum
-                    } else {
-                        transition_buf
-                            .iter()
-                            .enumerate()
-                            .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                acc + zerofier_data.get(c_idx, i) * eval * beta
-                            })
-                    };
-
-                    acc_transition + boundary
+                    air.eval_constraints_with_builder(&mut builder);
+                    zerofier_data.get_uniform(i) * &builder.finish() + boundary
                 })
                 .collect()
         }
@@ -238,6 +116,7 @@ where
         // Compute logup_table_offset = table_contribution / trace_length
         let logup_table_offset = match bus_public_inputs {
             Some(bpi) => {
+                // trace_length is always a power of two >= 2, so inv() cannot fail
                 let n_inv = FieldElement::<Field>::from(trace_length as u64)
                     .inv()
                     .unwrap();
@@ -290,24 +169,9 @@ where
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
 
-        let trace_length = domain.interpolation_domain_size;
-        let lde_periodic_columns = air
-            .get_periodic_column_polynomials(trace_length)
-            .iter()
-            .map(|poly| {
-                evaluate_polynomial_on_lde_domain(
-                    poly,
-                    domain.blowup_factor,
-                    domain.interpolation_domain_size,
-                    &domain.coset_offset,
-                )
-            })
-            .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
-            .unwrap();
-
         // Fused boundary evaluation: compute (trace[col] - value) on-the-fly
         // instead of pre-computing all boundary_polys_evaluations.
-        // This eliminates N_constraints × LDE_size intermediate allocations.
+        // This eliminates N_constraints x LDE_size intermediate allocations.
         #[cfg(feature = "parallel")]
         let boundary_eval_iter = (0..domain.lde_roots_of_unity_coset.len()).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -345,15 +209,7 @@ where
 
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
 
-        // Iterate over all LDE domain and compute the part of the composition polynomial
-        // related to the transition constraints and add it to the already computed part of the
-        // boundary constraints.
-
-        let num_transition = air.num_transition_constraints();
-        let num_periodic = lde_periodic_columns.len();
-        let offsets = &air.context().transition_offsets;
-
-        // Extract the raw composition alpha (β) from the pre-computed powers [1, β, β², ...].
+        // Extract the raw composition alpha from the pre-computed powers [1, beta, beta^2, ...].
         // The ProverBuilder generates its own powers internally via assert_zero().
         let composition_alpha = if transition_coefficients.len() >= 2 {
             transition_coefficients[1].clone()
@@ -364,14 +220,9 @@ where
         Self::evaluate_transitions(
             air,
             lde_trace,
-            &lde_periodic_columns,
             rap_challenges,
             &zerofier_data,
-            transition_coefficients,
             boundary_evaluation,
-            num_transition,
-            num_periodic,
-            offsets,
             &self.logup_table_offset,
             &composition_alpha,
         )

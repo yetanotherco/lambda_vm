@@ -1,16 +1,12 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
-    domain::VerifierDomain,
-    fri::fri_decommit::FriDecommitment,
-    grinding,
-    proof::stark::StarkProof,
-    traits::{AIR, TransitionEvaluationContext},
+    config::BatchedMerkleTreeBackend, domain::VerifierDomain, fri::fri_decommit::FriDecommitment,
+    grinding, proof::stark::StarkProof, traits::AIR,
 };
 use crate::{
     air_builder::VerifierBuilder,
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
+    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -308,12 +304,6 @@ pub trait IsStarkVerifier<
                 .map(|((num, den), beta)| num * den * beta)
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
-        let periodic_values = air
-            .get_periodic_column_polynomials(trace_length)
-            .iter()
-            .map(|poly| poly.evaluate(&challenges.z))
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
@@ -341,59 +331,32 @@ pub trait IsStarkVerifier<
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
 
-        let transition_c_i_evaluations_sum = if air.uses_builder() {
-            // New AirBuilder path: fused alpha combination, then divide by uniform zerofier.
-            // All constraints use the uniform zerofier Z(z) = z^n - 1 (period=1, offset=0,
-            // end_exemptions=0), so we apply one inverse at the end.
-            let alpha = &challenges.transition_coeffs[1];
-            let mut builder = VerifierBuilder::new(
-                &ood_frame,
-                alpha,
-                &challenges.rap_challenges,
-                &logup_alpha_powers,
-                &logup_table_offset,
-            );
-            air.eval_constraints_with_builder(&mut builder);
-            let sum = builder.finish();
-
-            // Compute z^n - 1 and invert it
-            let z_pow_n = challenges.z.pow(trace_length as u64);
-            let zerofier = z_pow_n - FieldElement::one();
-            let zerofier_inv = match zerofier.inv() {
-                Ok(inv) => inv,
-                Err(_) => return false, // z is on the trace domain, invalid OOD point
-            };
-            sum * zerofier_inv
+        // AirBuilder path: fused alpha combination, then divide by uniform zerofier.
+        // All constraints use the uniform zerofier Z(z) = z^n - 1 (period=1, offset=0,
+        // end_exemptions=0), so we apply one inverse at the end.
+        let alpha = if challenges.transition_coeffs.len() >= 2 {
+            challenges.transition_coeffs[1].clone()
         } else {
-            // Legacy path: per-constraint zerofier denominators.
-            let packing_shifts = PackingShifts::<FieldExtension>::new();
-            let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
-                &ood_frame,
-                &periodic_values,
-                &challenges.rap_challenges,
-                &logup_alpha_powers,
-                &logup_table_offset,
-                &packing_shifts,
-            );
-            let transition_ood_frame_evaluations =
-                air.compute_transition(&transition_evaluation_context);
-
-            let mut denominators =
-                vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-            air.transition_constraints().iter().for_each(|c| {
-                denominators[c.constraint_idx()] =
-                    c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
-            });
-
-            itertools::izip!(
-                transition_ood_frame_evaluations,
-                &challenges.transition_coeffs,
-                denominators
-            )
-            .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-                acc + beta * eval * &denominator
-            })
+            FieldElement::one()
         };
+        let mut builder = VerifierBuilder::new(
+            &ood_frame,
+            &alpha,
+            &challenges.rap_challenges,
+            &logup_alpha_powers,
+            &logup_table_offset,
+        );
+        air.eval_constraints_with_builder(&mut builder);
+        let sum = builder.finish();
+
+        // Compute z^n - 1 and invert it
+        let z_pow_n = challenges.z.pow(trace_length as u64);
+        let zerofier = z_pow_n - FieldElement::one();
+        let zerofier_inv = match zerofier.inv() {
+            Ok(inv) => inv,
+            Err(_) => return false, // z is on the trace domain, invalid OOD point
+        };
+        let transition_c_i_evaluations_sum = sum * zerofier_inv;
 
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
