@@ -259,6 +259,15 @@ pub trait AIR: Send + Sync {
     ///
     /// Uses `&mut dyn AirBuilder<E>` (object-safe) so this method is dyn-compatible
     /// and callable through `&dyn AIR` in the evaluator and verifier.
+    /// Returns true if this AIR has an AirBuilder-based constraint evaluator.
+    ///
+    /// When false, the evaluator and verifier fall back to the old frame-based
+    /// `compute_transition` + `transition_constraints()` path. This allows test
+    /// AIRs that haven't been migrated to the builder pattern to still work.
+    fn has_any_builder(&self) -> bool {
+        false
+    }
+
     fn eval_constraints_with_builder(
         &self,
         _builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
