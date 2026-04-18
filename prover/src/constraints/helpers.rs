@@ -99,7 +99,7 @@ pub fn assert_eq_when_off<F: IsField>(
 }
 
 // =============================================================================
-// Base-field helpers (MainAirBuilder<F, E>) - used for prover main trace constraints
+// Base-field helpers (MainAirBuilder<F, E>) - used by verifier path only
 // =============================================================================
 
 /// IS_BIT in base field: x*(1-x) == 0
@@ -110,4 +110,16 @@ pub fn assert_is_bit_base<F: IsSubFieldOf<E> + IsField, E: IsField>(
 ) {
     let one = FieldElement::<F>::one();
     builder.assert_zero_base(x.clone() * (one - x));
+}
+
+// =============================================================================
+// Direct-evaluation helpers - used for prover main trace constraints
+// =============================================================================
+// These helpers compute constraint values directly without any trait dispatch.
+// They return the constraint value to be stored in the evals buffer.
+
+/// IS_BIT: x*(1-x). Returns the constraint value.
+#[inline]
+pub fn is_bit<F: IsField>(x: &FieldElement<F>) -> FieldElement<F> {
+    x * &(FieldElement::<F>::one() - x)
 }

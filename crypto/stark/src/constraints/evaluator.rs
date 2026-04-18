@@ -82,6 +82,7 @@ where
     }
 
     /// AirBuilder-based transition evaluation (for VM tables with builders).
+    #[allow(clippy::needless_range_loop)]
     fn evaluate_transitions_builder(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
@@ -130,24 +131,43 @@ where
                         )
                     },
                     |(row_cache, base_buf, ext_buf), (i, boundary)| {
-                        let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
-                            lde_trace,
-                            i,
-                            &composition_alpha_powers,
-                            rap_challenges,
-                            &logup_alpha_powers,
-                            logup_table_offset,
-                            row_cache,
-                            base_buf,
-                            ext_buf,
-                        );
                         if use_dual_path {
-                            air.eval_main_constraints(&mut builder);
+                            // Fill row cache from LDE trace
+                            for col in 0..num_main_cols {
+                                row_cache[col] = lde_trace.get_main(i, col).clone();
+                            }
+                            // Direct closure: ONE dyn call, zero vtable inside
+                            air.eval_main_constraints_direct(row_cache, base_buf);
+                            // Create builder with base_count pre-set for LogUp only
+                            let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
+                                lde_trace,
+                                i,
+                                &composition_alpha_powers,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                logup_table_offset,
+                                row_cache,
+                                base_buf,
+                                ext_buf,
+                            );
+                            builder.set_base_count(num_base_constraints);
                             air.eval_logup_with_builder(&mut builder);
+                            zerofier_data.get_uniform(i) * &builder.finish() + boundary
                         } else {
+                            let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
+                                lde_trace,
+                                i,
+                                &composition_alpha_powers,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                logup_table_offset,
+                                row_cache,
+                                base_buf,
+                                ext_buf,
+                            );
                             air.eval_constraints_with_builder(&mut builder);
+                            zerofier_data.get_uniform(i) * &builder.finish() + boundary
                         }
-                        zerofier_data.get_uniform(i) * &builder.finish() + boundary
                     },
                 )
                 .collect();
@@ -163,24 +183,43 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
-                        lde_trace,
-                        i,
-                        &composition_alpha_powers,
-                        rap_challenges,
-                        &logup_alpha_powers,
-                        logup_table_offset,
-                        &mut row_cache,
-                        &mut base_buf,
-                        &mut ext_buf,
-                    );
                     if use_dual_path {
-                        air.eval_main_constraints(&mut builder);
+                        // Fill row cache from LDE trace
+                        for col in 0..num_main_cols {
+                            row_cache[col] = lde_trace.get_main(i, col).clone();
+                        }
+                        // Direct closure: ONE dyn call, zero vtable inside
+                        air.eval_main_constraints_direct(&row_cache, &mut base_buf);
+                        // Create builder with base_count pre-set for LogUp only
+                        let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
+                            lde_trace,
+                            i,
+                            &composition_alpha_powers,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                            &mut row_cache,
+                            &mut base_buf,
+                            &mut ext_buf,
+                        );
+                        builder.set_base_count(num_base_constraints);
                         air.eval_logup_with_builder(&mut builder);
+                        zerofier_data.get_uniform(i) * &builder.finish() + boundary
                     } else {
+                        let mut builder = crate::air_builder::ProverBuilder::new_with_buffers(
+                            lde_trace,
+                            i,
+                            &composition_alpha_powers,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            logup_table_offset,
+                            &mut row_cache,
+                            &mut base_buf,
+                            &mut ext_buf,
+                        );
                         air.eval_constraints_with_builder(&mut builder);
+                        zerofier_data.get_uniform(i) * &builder.finish() + boundary
                     }
-                    zerofier_data.get_uniform(i) * &builder.finish() + boundary
                 })
                 .collect()
         }

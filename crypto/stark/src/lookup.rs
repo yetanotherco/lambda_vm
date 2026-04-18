@@ -813,12 +813,13 @@ pub struct AirWithBuses<
     /// When set, the closure is called in `eval_constraints_with_builder()`.
     #[allow(clippy::type_complexity)]
     builder_fn: Option<Box<dyn Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync>>,
-    /// Optional MainAirBuilder-based constraint evaluator for main trace constraints.
-    /// Uses base-field arithmetic (F*E multiply, 3 base muls vs 6 for E*E).
-    /// When set, the closure is called in `eval_main_constraints()`.
+    /// Direct closure for main trace constraint evaluation.
+    /// Takes (row_slice, evals_buffer) — zero vtable dispatch inside.
+    /// Each call does ONE Box<dyn Fn> dispatch; all column reads are `row[col]`
+    /// and all constraint writes are `evals[idx] = expr`.
     #[allow(clippy::type_complexity)]
-    main_builder_fn:
-        Option<Box<dyn Fn(&mut dyn crate::air_builder::MainAirBuilder<F, E>) + Send + Sync>>,
+    main_constraint_fn:
+        Option<Box<dyn Fn(&[FieldElement<F>], &mut [FieldElement<F>]) + Send + Sync>>,
 }
 
 impl<
@@ -912,7 +913,7 @@ impl<
             name: None,
             max_bus_elements,
             builder_fn: None,
-            main_builder_fn: None,
+            main_constraint_fn: None,
         }
     }
 
@@ -964,19 +965,23 @@ impl<
         self
     }
 
-    /// Attach a MainAirBuilder constraint evaluator for main trace constraints.
+    /// Attach a direct constraint closure for main trace constraints.
     ///
-    /// The closure receives a `&mut dyn MainAirBuilder<F, E>` and must call
-    /// `assert_zero_base` in the same order as the table's constraints.
-    /// This evaluates constraints in base field F, accumulating into the
-    /// extension-field sum via F*E multiplication (3 base muls vs 6 for E*E).
+    /// The closure receives `(row: &[FieldElement<F>], evals: &mut [FieldElement<F>])`
+    /// where `row` contains the pre-fetched main trace row and `evals` is the output
+    /// buffer sized to `num_transition_constraints()`.
+    ///
+    /// Inside the closure, use `row[col]` for column reads (direct indexed access)
+    /// and `evals[idx] = expr` for constraint writes (direct indexed write).
+    /// This eliminates all vtable dispatch inside the closure — ONE Box<dyn Fn> call
+    /// per LDE point instead of ~200+ vtable calls for large tables like CPU.
     ///
     /// LogUp constraints are automatically appended after the main constraints.
-    pub fn with_main_builder<CB>(mut self, f: CB) -> Self
+    pub fn with_main_constraints<CB>(mut self, f: CB) -> Self
     where
-        CB: Fn(&mut dyn crate::air_builder::MainAirBuilder<F, E>) + Send + Sync + 'static,
+        CB: Fn(&[FieldElement<F>], &mut [FieldElement<F>]) + Send + Sync + 'static,
     {
-        self.main_builder_fn = Some(Box::new(f));
+        self.main_constraint_fn = Some(Box::new(f));
         self
     }
 
@@ -1121,19 +1126,20 @@ where
     }
 
     fn has_any_builder(&self) -> bool {
-        self.builder_fn.is_some() || self.main_builder_fn.is_some()
+        self.builder_fn.is_some() || self.main_constraint_fn.is_some()
     }
 
     fn has_main_builder(&self) -> bool {
-        self.main_builder_fn.is_some()
+        self.main_constraint_fn.is_some()
     }
 
-    fn eval_main_constraints(
+    fn eval_main_constraints_direct(
         &self,
-        builder: &mut dyn crate::air_builder::MainAirBuilder<Self::Field, Self::FieldExtension>,
+        main_row: &[FieldElement<Self::Field>],
+        evals: &mut [FieldElement<Self::Field>],
     ) {
-        if let Some(f) = &self.main_builder_fn {
-            f(builder);
+        if let Some(f) = &self.main_constraint_fn {
+            f(main_row, evals);
         }
     }
 
