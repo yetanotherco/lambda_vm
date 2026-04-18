@@ -808,11 +808,17 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
-    /// Optional AirBuilder-based constraint evaluator for table-specific constraints.
-    /// When set, the closure is called first in `eval_constraints_with_builder()`,
-    /// followed by the LogUp constraints.
+    /// Optional AirBuilder-based constraint evaluator for table-specific constraints
+    /// that require extension field arithmetic (e.g., constraints mixing main and aux columns).
+    /// When set, the closure is called in `eval_constraints_with_builder()`.
     #[allow(clippy::type_complexity)]
     builder_fn: Option<Box<dyn Fn(&mut dyn crate::air_builder::AirBuilder<E>) + Send + Sync>>,
+    /// Optional MainAirBuilder-based constraint evaluator for main trace constraints.
+    /// Uses base-field arithmetic (F*E multiply, 3 base muls vs 6 for E*E).
+    /// When set, the closure is called in `eval_main_constraints()`.
+    #[allow(clippy::type_complexity)]
+    main_builder_fn:
+        Option<Box<dyn Fn(&mut dyn crate::air_builder::MainAirBuilder<F, E>) + Send + Sync>>,
 }
 
 impl<
@@ -906,6 +912,7 @@ impl<
             name: None,
             max_bus_elements,
             builder_fn: None,
+            main_builder_fn: None,
         }
     }
 
@@ -956,12 +963,106 @@ impl<
         self.builder_fn = Some(Box::new(f));
         self
     }
+
+    /// Attach a MainAirBuilder constraint evaluator for main trace constraints.
+    ///
+    /// The closure receives a `&mut dyn MainAirBuilder<F, E>` and must call
+    /// `assert_zero_base` in the same order as the table's constraints.
+    /// This evaluates constraints in base field F, accumulating into the
+    /// extension-field sum via F*E multiplication (3 base muls vs 6 for E*E).
+    ///
+    /// LogUp constraints are automatically appended after the main constraints.
+    pub fn with_main_builder<CB>(mut self, f: CB) -> Self
+    where
+        CB: Fn(&mut dyn crate::air_builder::MainAirBuilder<F, E>) + Send + Sync + 'static,
+    {
+        self.main_builder_fn = Some(Box::new(f));
+        self
+    }
+
+    /// Evaluate only LogUp constraints (batched term + accumulated).
+    /// This is the common LogUp evaluation code shared by both
+    /// `eval_constraints_with_builder` and `eval_logup_with_builder`.
+    fn eval_logup_constraints(&self, builder: &mut dyn crate::air_builder::AirBuilder<E>) {
+        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
+        if num_interactions == 0 {
+            return;
+        }
+
+        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+        let z = builder.challenge(LOGUP_CHALLENGE_Z).clone();
+
+        let alpha_powers: Vec<FieldElement<E>> = (0..self.max_bus_elements)
+            .map(|i| builder.logup_alpha_power(i).clone())
+            .collect();
+
+        // Batched term constraints (pairs of committed interactions).
+        for pair_idx in 0..num_committed_pairs {
+            let ia = &self.auxiliary_trace_build_data.interactions[pair_idx * 2];
+            let ib = &self.auxiliary_trace_build_data.interactions[pair_idx * 2 + 1];
+            let term_col = pair_idx;
+
+            let c = builder.aux(0, term_col);
+            let m_a = compute_multiplicity_from_builder(builder, &ia.multiplicity, 0);
+            let m_b = compute_multiplicity_from_builder(builder, &ib.multiplicity, 0);
+            let fp_a = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 0);
+            let fp_b = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 0);
+
+            let term_a = m_a * &fp_b;
+            let term_a = if ia.is_sender { term_a } else { -term_a };
+            let term_b = m_b * &fp_a;
+            let term_b = if ib.is_sender { term_b } else { -term_b };
+
+            builder.assert_zero(c * &fp_a * &fp_b - term_a - term_b);
+        }
+
+        // Accumulated constraint.
+        let acc_col = num_committed_pairs;
+        let acc_curr = builder.aux(0, acc_col);
+        let acc_next = builder.aux(1, acc_col);
+
+        let terms_sum: FieldElement<E> = (0..num_committed_pairs)
+            .map(|i| builder.aux(1, i))
+            .fold(FieldElement::<E>::zero(), |acc, v| acc + v);
+
+        let logup_offset = builder.logup_table_offset().clone();
+        let delta = acc_next - &acc_curr - &terms_sum + logup_offset;
+
+        let absorbed_start = num_interactions - absorbed_count;
+        match absorbed_count {
+            1 => {
+                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
+                let m = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
+                let f_fp = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
+                let sign = if ia.is_sender {
+                    FieldElement::<E>::one()
+                } else {
+                    -FieldElement::<E>::one()
+                };
+                builder.assert_zero(delta * &f_fp - m * sign);
+            }
+            2 => {
+                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
+                let ib = &self.auxiliary_trace_build_data.interactions[absorbed_start + 1];
+                let m1 = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
+                let m2 = compute_multiplicity_from_builder(builder, &ib.multiplicity, 1);
+                let f1 = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
+                let f2 = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 1);
+                let term1 = m1 * &f2;
+                let term1 = if ia.is_sender { term1 } else { -term1 };
+                let term2 = m2 * &f1;
+                let term2 = if ib.is_sender { term2 } else { -term2 };
+                builder.assert_zero(delta * &f1 * &f2 - term1 - term2);
+            }
+            _ => unreachable!("absorbed must be 1 or 2"),
+        }
+    }
 }
 
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
 {
@@ -1019,95 +1120,39 @@ where
         &self.transition_constraints
     }
 
+    fn has_main_builder(&self) -> bool {
+        self.main_builder_fn.is_some()
+    }
+
+    fn eval_main_constraints(
+        &self,
+        builder: &mut dyn crate::air_builder::MainAirBuilder<Self::Field, Self::FieldExtension>,
+    ) {
+        if let Some(f) = &self.main_builder_fn {
+            f(builder);
+        }
+    }
+
+    fn eval_logup_with_builder(
+        &self,
+        builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
+    ) {
+        // Evaluate only LogUp constraints (skip builder_fn).
+        self.eval_logup_constraints(builder);
+    }
+
     fn eval_constraints_with_builder(
         &self,
         builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
     ) {
         // 1. Evaluate table-specific constraints via the user-provided closure.
+        // This is used by the verifier (which does not call eval_main_constraints).
         if let Some(f) = &self.builder_fn {
             f(builder);
         }
 
         // 2. Evaluate LogUp constraints (batched term + accumulated).
-        //    These are appended to transition_constraints by AirWithBuses::new() and must
-        //    be evaluated in the same order so the alpha^i coefficients match.
-        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
-        if num_interactions == 0 {
-            return;
-        }
-
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
-        // z is the LogUp randomness challenge at index LOGUP_CHALLENGE_Z.
-        // Invariant: build_rap_challenges always provides at least 2 challenges for LogUp tables.
-        let z = builder.challenge(LOGUP_CHALLENGE_Z).clone();
-
-        // Build LogUp alpha powers slice from the builder.
-        // max_bus_elements is the max number of alpha powers needed (indices 0..max_bus_elements-1).
-        let alpha_powers: Vec<FieldElement<E>> = (0..self.max_bus_elements)
-            .map(|i| builder.logup_alpha_power(i).clone())
-            .collect();
-
-        // 2a. Batched term constraints (pairs of committed interactions).
-        for pair_idx in 0..num_committed_pairs {
-            let ia = &self.auxiliary_trace_build_data.interactions[pair_idx * 2];
-            let ib = &self.auxiliary_trace_build_data.interactions[pair_idx * 2 + 1];
-            let term_col = pair_idx; // aux column index
-
-            let c = builder.aux(0, term_col);
-            let m_a = compute_multiplicity_from_builder(builder, &ia.multiplicity, 0);
-            let m_b = compute_multiplicity_from_builder(builder, &ib.multiplicity, 0);
-            let fp_a = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 0);
-            let fp_b = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 0);
-
-            let term_a = m_a * &fp_b;
-            let term_a = if ia.is_sender { term_a } else { -term_a };
-            let term_b = m_b * &fp_a;
-            let term_b = if ib.is_sender { term_b } else { -term_b };
-
-            builder.assert_zero(c * &fp_a * &fp_b - term_a - term_b);
-        }
-
-        // 2b. Accumulated constraint.
-        let acc_col = num_committed_pairs; // accumulated column follows committed term columns
-        let acc_curr = builder.aux(0, acc_col);
-        let acc_next = builder.aux(1, acc_col);
-
-        // Sum of all committed term columns at the NEXT step.
-        let terms_sum: FieldElement<E> = (0..num_committed_pairs)
-            .map(|i| builder.aux(1, i))
-            .fold(FieldElement::<E>::zero(), |acc, v| acc + v);
-
-        let logup_offset = builder.logup_table_offset().clone();
-        let delta = acc_next - &acc_curr - &terms_sum + logup_offset;
-
-        let absorbed_start = num_interactions - absorbed_count;
-        match absorbed_count {
-            1 => {
-                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
-                let m = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
-                let f_fp = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
-                let sign = if ia.is_sender {
-                    FieldElement::<E>::one()
-                } else {
-                    -FieldElement::<E>::one()
-                };
-                builder.assert_zero(delta * &f_fp - m * sign);
-            }
-            2 => {
-                let ia = &self.auxiliary_trace_build_data.interactions[absorbed_start];
-                let ib = &self.auxiliary_trace_build_data.interactions[absorbed_start + 1];
-                let m1 = compute_multiplicity_from_builder(builder, &ia.multiplicity, 1);
-                let m2 = compute_multiplicity_from_builder(builder, &ib.multiplicity, 1);
-                let f1 = compute_fingerprint_from_builder(builder, ia, &z, &alpha_powers, 1);
-                let f2 = compute_fingerprint_from_builder(builder, ib, &z, &alpha_powers, 1);
-                let term1 = m1 * &f2;
-                let term1 = if ia.is_sender { term1 } else { -term1 };
-                let term2 = m2 * &f1;
-                let term2 = if ib.is_sender { term2 } else { -term2 };
-                builder.assert_zero(delta * &f1 * &f2 - term1 - term2);
-            }
-            _ => unreachable!("absorbed must be 1 or 2"),
-        }
+        self.eval_logup_constraints(builder);
     }
 
     fn build_auxiliary_trace(

@@ -266,6 +266,48 @@ pub trait AIR: Send + Sync {
         unimplemented!("Override eval_constraints_with_builder for this AIR")
     }
 
+    /// Returns true if this AIR has a base-field main constraint evaluator.
+    ///
+    /// When true, the prover's evaluator calls `eval_main_constraints` (base field)
+    /// followed by `eval_logup_with_builder` (LogUp only). When false, the evaluator
+    /// calls `eval_constraints_with_builder` (all constraints in extension field).
+    fn has_main_builder(&self) -> bool {
+        false
+    }
+
+    /// Evaluate main trace transition constraints in base field.
+    ///
+    /// Uses `MainAirBuilder` for F*E accumulation (3 base muls vs 6 for E*E).
+    /// Table-specific constraints that only touch the main trace should be emitted
+    /// here for optimal performance. LogUp constraints remain in `eval_logup_with_builder`.
+    ///
+    /// Called by the prover's evaluator (not the verifier). The verifier uses
+    /// `eval_constraints_with_builder` which includes main + LogUp in extension field.
+    ///
+    /// Default: no main constraints (lookup-only tables).
+    fn eval_main_constraints(
+        &self,
+        _builder: &mut dyn crate::air_builder::MainAirBuilder<Self::Field, Self::FieldExtension>,
+    ) {
+        // Default: no main constraints
+    }
+
+    /// Evaluate only LogUp constraints in extension field.
+    ///
+    /// Called by the prover's evaluator after `eval_main_constraints` to avoid
+    /// double-counting main trace constraints. The default implementation calls
+    /// `eval_constraints_with_builder` (which includes all constraints).
+    ///
+    /// `AirWithBuses` overrides this to skip the table-specific `builder_fn` closure,
+    /// evaluating only the LogUp batched term + accumulated constraints.
+    fn eval_logup_with_builder(
+        &self,
+        builder: &mut dyn crate::air_builder::AirBuilder<Self::FieldExtension>,
+    ) {
+        // Default: fall back to full constraint evaluation
+        self.eval_constraints_with_builder(builder);
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
