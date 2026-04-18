@@ -54,16 +54,20 @@ pub struct ProverBuilder<'a, F: IsSubFieldOf<E> + IsFFTField, E: IsField> {
     row: usize,
     step_size: usize,
     num_rows: usize,
-    accumulator: FieldElement<E>,
     /// Pre-computed composition alpha powers [1, α, α², ...].
-    /// Indexed by constraint_idx to avoid E×E multiply per constraint.
     alpha_powers: &'a [FieldElement<E>],
-    constraint_idx: usize,
+    /// Buffer for base-field constraint evaluations (written by assert_zero_base).
+    /// Accumulated into the result in finish() via a tight F×E loop.
+    base_evals: &'a mut [FieldElement<F>],
+    base_count: usize,
+    /// Buffer for extension-field constraint evaluations (written by assert_zero).
+    /// Accumulated into the result in finish() via a tight E×E loop.
+    ext_evals: &'a mut [FieldElement<E>],
+    ext_count: usize,
     rap_challenges: &'a [FieldElement<E>],
     logup_alpha_powers: &'a [FieldElement<E>],
     logup_table_offset_val: &'a FieldElement<E>,
     /// Pre-fetched main trace row for base-field access (contiguous in memory).
-    /// Populated by `new_with_cache` to avoid per-iteration allocation.
     main_row_cache: &'a [FieldElement<F>],
 }
 
@@ -72,35 +76,13 @@ where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    pub fn new(
-        lde_trace: &'a LDETraceTable<F, E>,
-        row: usize,
-        alpha_powers: &'a [FieldElement<E>],
-        rap_challenges: &'a [FieldElement<E>],
-        logup_alpha_powers: &'a [FieldElement<E>],
-        logup_table_offset: &'a FieldElement<E>,
-    ) -> Self {
-        Self {
-            lde_trace,
-            row,
-            step_size: lde_trace.lde_step_size,
-            num_rows: lde_trace.num_rows(),
-            accumulator: FieldElement::zero(),
-            alpha_powers,
-            constraint_idx: 0,
-            rap_challenges,
-            logup_alpha_powers,
-            logup_table_offset_val: logup_table_offset,
-            main_row_cache: &[],
-        }
-    }
-
-    /// Create a ProverBuilder with a pre-allocated row cache buffer.
+    /// Create a ProverBuilder with pre-allocated buffers.
     ///
-    /// The `row_cache` buffer is filled with the current row's main trace values.
-    /// This avoids allocating a new Vec per LDE domain point in the hot loop.
-    /// The buffer must have length >= `lde_trace.num_main_cols()`.
-    pub fn new_with_cache(
+    /// - `row_cache`: filled with current row's main trace values (contiguous)
+    /// - `base_evals`: buffer for base-field constraint results (reused per LDE point)
+    /// - `ext_evals`: buffer for extension-field constraint results (reused per LDE point)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_buffers(
         lde_trace: &'a LDETraceTable<F, E>,
         row: usize,
         alpha_powers: &'a [FieldElement<E>],
@@ -108,6 +90,8 @@ where
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
         row_cache: &'a mut Vec<FieldElement<F>>,
+        base_evals: &'a mut [FieldElement<F>],
+        ext_evals: &'a mut [FieldElement<E>],
     ) -> Self {
         // Fill the cache with the current row's main trace values (contiguous writes).
         let num_main_cols = lde_trace.num_main_cols();
@@ -121,9 +105,11 @@ where
             row,
             step_size: lde_trace.lde_step_size,
             num_rows: lde_trace.num_rows(),
-            accumulator: FieldElement::zero(),
             alpha_powers,
-            constraint_idx: 0,
+            base_evals,
+            base_count: 0,
+            ext_evals,
+            ext_count: 0,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset_val: logup_table_offset,
@@ -131,8 +117,23 @@ where
         }
     }
 
+    /// Accumulate all buffered constraint evaluations and return the result.
+    ///
+    /// Two tight loops: F×E for base constraints, E×E for extension constraints.
+    /// This is faster than fused accumulation because the loops have no serial
+    /// dependency between iterations (each multiply is independent).
     pub fn finish(self) -> FieldElement<E> {
-        self.accumulator
+        let mut sum = FieldElement::<E>::zero();
+        // F×E accumulation: 3 base muls per term
+        for i in 0..self.base_count {
+            sum = &sum + &self.base_evals[i] * &self.alpha_powers[i];
+        }
+        // E×E accumulation: 6 base muls per term
+        let base_offset = self.base_count;
+        for i in 0..self.ext_count {
+            sum = &sum + &self.alpha_powers[base_offset + i] * &self.ext_evals[i];
+        }
+        sum
     }
 }
 
@@ -159,9 +160,9 @@ where
 
     #[inline]
     fn assert_zero(&mut self, expr: FieldElement<E>) {
-        // Use pre-computed alpha power — no E×E multiply per constraint
-        self.accumulator = &self.accumulator + &self.alpha_powers[self.constraint_idx] * &expr;
-        self.constraint_idx += 1;
+        // Write to buffer — accumulation happens in finish()
+        self.ext_evals[self.ext_count] = expr;
+        self.ext_count += 1;
     }
 
     fn challenge(&self, idx: usize) -> &FieldElement<E> {
@@ -189,9 +190,9 @@ where
 
     #[inline]
     fn assert_zero_base(&mut self, expr: FieldElement<F>) {
-        // F×E multiplication (3 base muls) with pre-computed alpha power (no E×E)
-        self.accumulator = &self.accumulator + &expr * &self.alpha_powers[self.constraint_idx];
-        self.constraint_idx += 1;
+        // Write to base buffer — F×E accumulation happens in finish()
+        self.base_evals[self.base_count] = expr;
+        self.base_count += 1;
     }
 }
 

@@ -336,10 +336,18 @@ pub trait IsStarkVerifier<
             // AirBuilder path: fused alpha combination, then divide by uniform zerofier.
             // All constraints use the uniform zerofier Z(z) = z^n - 1 (period=1, offset=0,
             // end_exemptions=0), so we apply one inverse at the end.
-            // Use pre-computed transition coefficients as alpha powers
+            // Extend transition coefficients to cover LogUp constraints too.
+            // transition_coeffs has num_transition entries; LogUp adds more assert_zero calls.
+            let alpha = if challenges.transition_coeffs.len() >= 2 {
+                challenges.transition_coeffs[1].clone()
+            } else {
+                FieldElement::one()
+            };
+            let total_constraints = air.num_transition_constraints() * 2 + 64;
+            let alpha_powers = compute_alpha_powers(&alpha, total_constraints);
             let mut builder = VerifierBuilder::new(
                 &ood_frame,
-                &challenges.transition_coeffs,
+                &alpha_powers,
                 &challenges.rap_challenges,
                 &logup_alpha_powers,
                 &logup_table_offset,
