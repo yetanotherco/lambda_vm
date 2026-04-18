@@ -93,12 +93,14 @@ where
         base_evals: &'a mut [FieldElement<F>],
         ext_evals: &'a mut [FieldElement<E>],
     ) -> Self {
-        // Fill the cache with the current row's main trace values (contiguous writes).
+        // Fill the cache with the current row's main trace values (in-place overwrites).
         let num_main_cols = lde_trace.num_main_cols();
-        row_cache.clear();
-        row_cache.reserve(num_main_cols);
+        // Ensure buffer is pre-sized (first call), then overwrite in-place (no capacity checks).
+        if row_cache.len() < num_main_cols {
+            row_cache.resize(num_main_cols, FieldElement::zero());
+        }
         for col in 0..num_main_cols {
-            row_cache.push(lde_trace.get_main(row, col).clone());
+            row_cache[col] = lde_trace.get_main(row, col).clone();
         }
         Self {
             lde_trace,
