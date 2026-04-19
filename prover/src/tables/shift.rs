@@ -631,6 +631,20 @@ impl ShiftConstraint {
         }
     }
 
+    /// Returns the constraint index.
+    pub fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    /// Public wrapper for `compute()`, used by the monolithic evaluator.
+    pub fn compute_monolithic<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+
     /// Compute the `shifted` virtual column at index `half_idx` (0..4).
     fn compute_shifted_half<F, E>(half_idx: usize, step: &TableView<F, E>) -> FieldElement<F>
     where

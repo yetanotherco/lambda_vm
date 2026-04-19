@@ -486,6 +486,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("CPU")
+    .with_monolithic_eval(crate::constraints::monolithic::cpu_eval)
 }
 
 /// Create Bitwise AIR with bus interactions.
@@ -542,6 +543,7 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("SHIFT")
+    .with_monolithic_eval(crate::constraints::monolithic::shift_eval)
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
@@ -560,6 +562,7 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW")
+    .with_monolithic_eval(crate::constraints::monolithic::memw_eval)
 }
 
 /// Create MEMW_A (aligned) AIR with constraints and bus interactions.
@@ -578,6 +581,7 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW_A")
+    .with_monolithic_eval(crate::constraints::monolithic::memw_aligned_eval)
 }
 
 /// Create MEMW_R (register) AIR with constraints and bus interactions.
@@ -596,6 +600,7 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW_R")
+    .with_monolithic_eval(crate::constraints::monolithic::memw_register_eval)
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
@@ -614,6 +619,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("LOAD")
+    .with_monolithic_eval(crate::constraints::monolithic::load_eval)
 }
 
 /// Create DECODE AIR with bus interactions.
@@ -682,6 +688,7 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("DVRM")
+    .with_monolithic_eval(crate::constraints::monolithic::dvrm_eval)
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.
@@ -706,6 +713,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("BRANCH")
+    .with_monolithic_eval(crate::constraints::monolithic::branch_eval)
 }
 
 /// Create HALT AIR with bus interactions (no transition constraints).
@@ -742,6 +750,7 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("COMMIT")
+    .with_monolithic_eval(crate::constraints::monolithic::commit_eval)
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.
