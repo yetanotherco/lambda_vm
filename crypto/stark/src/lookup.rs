@@ -807,6 +807,11 @@ pub struct AirWithBuses<
     /// Number of table-specific (base-field) transition constraints.
     /// LogUp constraints are extension-field and come after these.
     num_base_constraints: usize,
+    /// Optional monolithic evaluator for all base-field constraints.
+    /// When set, evaluates ALL base constraints in ONE function call instead of N vtable calls.
+    #[allow(clippy::type_complexity)]
+    monolithic_eval_fn:
+        Option<Box<dyn Fn(&crate::table::TableView<F, E>, &mut [FieldElement<F>]) + Send + Sync>>,
 }
 
 impl<
@@ -901,6 +906,7 @@ impl<
             name: None,
             max_bus_elements,
             num_base_constraints,
+            monolithic_eval_fn: None,
         }
     }
 
@@ -936,6 +942,21 @@ impl<
     /// making it easy to identify which table is contributing to bus imbalances.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Set a monolithic evaluator for all base-field constraints.
+    ///
+    /// The closure evaluates ALL base-field constraints in a single function call,
+    /// avoiding N vtable calls through `Box<dyn TransitionConstraint>::evaluate_prover()`.
+    /// The compiler can inline and optimize across all constraint expressions.
+    ///
+    /// LogUp constraints (extension-field) are still dispatched individually.
+    pub fn with_monolithic_eval<CB>(mut self, f: CB) -> Self
+    where
+        CB: Fn(&crate::table::TableView<F, E>, &mut [FieldElement<F>]) + Send + Sync + 'static,
+    {
+        self.monolithic_eval_fn = Some(Box::new(f));
         self
     }
 }
@@ -1000,6 +1021,19 @@ where
         // LogUp constraints (batched term + accumulated) are extension-field
         // and are appended after the table-specific ones.
         self.num_base_constraints
+    }
+
+    fn eval_all_base_constraints(
+        &self,
+        step: &crate::table::TableView<Self::Field, Self::FieldExtension>,
+        evals: &mut [FieldElement<Self::Field>],
+    ) -> bool {
+        if let Some(ref f) = self.monolithic_eval_fn {
+            f(step, evals);
+            true
+        } else {
+            false
+        }
     }
 
     fn transition_constraints(

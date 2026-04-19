@@ -295,6 +295,10 @@ pub trait AIR: Send + Sync {
     ///
     /// Base-field constraints write to `base_evaluations` (length = `num_base_transition_constraints()`).
     /// Extension-field constraints write to `ext_evaluations` (length = `num_transition_constraints()`).
+    ///
+    /// When a monolithic evaluator is available (`eval_all_base_constraints` returns true),
+    /// all base-field constraints are evaluated in ONE function call instead of N vtable calls.
+    /// LogUp constraints (extension-field) always use per-constraint dispatch.
     fn compute_transition_prover(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
@@ -308,9 +312,32 @@ pub trait AIR: Send + Sync {
         for e in ext_evaluations[num_base..].iter_mut() {
             *e = FieldElement::zero();
         }
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate_prover(evaluation_context, base_evaluations, ext_evaluations));
+
+        // Try monolithic evaluation for base constraints (ONE call for all)
+        let step = match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => Some(frame.get_evaluation_step(0)),
+            _ => None,
+        };
+
+        let used_monolithic = if let Some(step) = step {
+            self.eval_all_base_constraints(step, base_evaluations)
+        } else {
+            false
+        };
+
+        if used_monolithic {
+            // Monolithic handled base constraints. Only dispatch LogUp (extension):
+            for c in self.transition_constraints().iter() {
+                if c.constraint_idx() >= num_base {
+                    c.evaluate_prover(evaluation_context, base_evaluations, ext_evaluations);
+                }
+            }
+        } else {
+            // Fallback: per-constraint dispatch for ALL constraints
+            self.transition_constraints().iter().for_each(|c| {
+                c.evaluate_prover(evaluation_context, base_evaluations, ext_evaluations)
+            });
+        }
     }
 
     fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
@@ -335,6 +362,21 @@ pub trait AIR: Send + Sync {
             result.push(poly);
         }
         result
+    }
+
+    /// Evaluate ALL base-field transition constraints in a single function call.
+    ///
+    /// Returns `true` if this AIR has a monolithic evaluator (overrides individual dispatch).
+    /// When `true`, the evaluator calls this instead of per-constraint `evaluate_prover()`.
+    /// LogUp constraints are still dispatched individually (they're in extension field).
+    ///
+    /// Default: `false` (no monolithic evaluator, use per-constraint dispatch).
+    fn eval_all_base_constraints(
+        &self,
+        _step: &crate::table::TableView<Self::Field, Self::FieldExtension>,
+        _evals: &mut [FieldElement<Self::Field>],
+    ) -> bool {
+        false
     }
 
     fn transition_constraints(

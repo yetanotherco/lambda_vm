@@ -1008,6 +1008,20 @@ impl DvrmConstraint {
         }
     }
 
+    /// Returns the constraint index.
+    pub fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    /// Public wrapper for `compute()`, used by the monolithic evaluator.
+    pub fn compute_monolithic<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+
     /// Compute the constraint value.
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
