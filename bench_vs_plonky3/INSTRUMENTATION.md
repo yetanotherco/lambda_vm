@@ -10,14 +10,6 @@ El test que imprime el breakdown se llama `instruments_breakdown`. Hay que
 compilar con la feature `instruments` y pasar `--nocapture` porque la salida
 va a stdout (si no, `cargo test` se la come).
 
-**M1 (100% scalar, fairest):**
-
-```bash
-RUSTFLAGS="-C target-feature=-sha3" \
-cargo test -p bench-vs-plonky3 --features instruments --release -- \
-  instruments_breakdown --nocapture
-```
-
 **x86 (Goldilocks scalar, SSE2 Keccak residual en P3):**
 
 ```bash
@@ -189,15 +181,9 @@ timings y aparecen en logs distintos.
    tiempo fuera de `multi_prove` (construcción de AIR, setup).
 4. Los porcentajes de Plonky3 se calculan contra **`p3_prove_dur`** (solo el
    `prove`, sin setup).
-5. El benchmark usa **degree 3** para la extensión de Plonky3 *sólo* si el
-   root `Cargo.toml` mantiene:
-   ```toml
-   [patch.crates-io]
-   p3-goldilocks = { path = "bench_vs_plonky3/p3-goldilocks-patched" }
-   ```
-   (línea 26). Sin ese patch, P3 usa la extensión degree 2 de upstream y la
-   comparación deja de ser fair.
-6. Plataforma:
-   - M1: `RUSTFLAGS="-C target-feature=-sha3"` → scalar en ambos lados.
-   - x86: `RUSTFLAGS="-C target-feature=-avx2,-avx512f"` → Goldilocks scalar,
-     residual SSE2 en Keccak de P3 (~7%).
+5. El benchmark usa **degree 3** para la extensión de Plonky3 vía git deps a
+   la rama `feat/goldilocks_deg3` del fork `yetanotherco/Plonky3` (ver
+   `bench_vs_plonky3/Cargo.toml`), que provee `BinomiallyExtendable<3>`
+   para Goldilocks con el mismo irreducible `x^3 - 2` que Lambda.
+6. Plataforma: x86 con `RUSTFLAGS="-C target-feature=-avx2,-avx512f"` →
+   Goldilocks scalar, residual SSE2 en Keccak de P3 (~7%).

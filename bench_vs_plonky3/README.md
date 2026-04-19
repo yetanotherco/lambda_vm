@@ -36,16 +36,16 @@ test.
 
 - Rust stable (the crate builds with `cargo build --release`).
 - No SP1 toolchain needed — there's no VM guest compilation.
-- For `--no-p3-patch` mode: a network-reachable crates.io (the script pulls
-  vanilla `p3-goldilocks 0.5.2` on demand).
-- For default mode (with the degree-3 patch): the vendored crate at
-  `bench_vs_plonky3/p3-goldilocks-patched/` and the root `[patch.crates-io]`
-  entry pointing at it.
+- Read access to `https://github.com/yetanotherco/Plonky3.git` (branch
+  `feat/goldilocks_deg3`). Cargo clones it into `~/.cargo/git/db` on the
+  first build and `Cargo.lock` pins the SHA. The branch provides
+  `BinomiallyExtendable<3>` for Goldilocks (`x^3 - 2`, matching Lambda's
+  `Degree3GoldilocksExtensionField`).
 
 ## Usage
 
 ```bash
-# Default: log-rows=19, num-sequences=16, runs=3, with degree-3 patch, no scalar
+# Default: log-rows=19, num-sequences=16, runs=3, cubic extension, no scalar
 ./bench_vs_plonky3/run.sh
 
 # Size sweep
@@ -55,8 +55,8 @@ test.
 ./bench_vs_plonky3/run.sh --lambda-only
 ./bench_vs_plonky3/run.sh --p3-only
 
-# Nightly-equivalent (vanilla P3 degree-2, scalar on both sides)
-./bench_vs_plonky3/run.sh --no-p3-patch --scalar
+# Scalar mode on both sides (x86_64 only — disables AVX2/AVX-512)
+./bench_vs_plonky3/run.sh --scalar
 
 # Write machine-readable artifacts
 ./bench_vs_plonky3/run.sh --report-dir /tmp/p3_report --no-color
@@ -71,8 +71,7 @@ test.
 | `--runs N` | `3` | Runs per `(size, prover)`; median is reported. |
 | `--lambda-only` / `--p3-only` | both | Restrict to a single prover. |
 | `--report-dir DIR` | — | Write TSV + metrics + raw stdouts. |
-| `--no-p3-patch` | off | Comment the root `[patch.crates-io]` before building and restore on exit. Plonky3 compiles against vanilla crates.io `p3-goldilocks 0.5.2` (`BinomialExtensionField<Val, 2>`). Lambda still runs degree 3 — the extension fields differ across sides but the AIRs stay identical. |
-| `--scalar` | off | Pin `RUSTFLAGS` to disable SIMD on both sides. On `x86_64` drops AVX2 and AVX-512 (Goldilocks + most of Keccak go scalar, SSE2 residual on `p3-keccak`). On `aarch64` drops the `sha3` ISA extension (Keccak accelerator). |
+| `--scalar` | off | Pin `RUSTFLAGS="-C target-feature=-avx2,-avx512f"` so Goldilocks (and most of Keccak) run scalar on both sides. x86_64 only; on other archs the flag is ignored with a warning. Residual SSE2 on `p3-keccak` remains (~7% of total prove time). |
 | `--no-color` | off | Disable ANSI colors. |
 | `-h` / `--help` | — | Print usage. |
 
@@ -85,7 +84,7 @@ Stdout (without `--report-dir`):
   log-rows:       19
   num-sequences:  16  (columns = 32)
   runs/size:      3  (median reported)
-  p3 extension:   degree 2 (vanilla, no patch)
+  p3 extension:   degree 3 (forked p3-goldilocks, matches Lambda)
   scalar mode:    on  (arch=x86_64, RUSTFLAGS="-C target-feature=-avx2,-avx512f")
 
 [build] prove_bench
@@ -125,7 +124,6 @@ bash ./bench_vs_plonky3/run.sh \
   --log-rows 19 \
   --num-sequences 16 \
   --runs 3 \
-  --no-p3-patch \
   --scalar \
   --report-dir bench_vs_p3_artifacts \
   --no-color
@@ -144,11 +142,6 @@ side, and the per-span breakdown on the Plonky3 side), run the
 ```bash
 # x86_64 (server), Goldilocks scalar:
 RUSTFLAGS="-C target-feature=-avx2,-avx512f" \
-cargo test -p bench-vs-plonky3 --features instruments --release -- \
-  instruments_breakdown --nocapture
-
-# aarch64 (M1), 100% scalar:
-RUSTFLAGS="-C target-feature=-sha3" \
 cargo test -p bench-vs-plonky3 --features instruments --release -- \
   instruments_breakdown --nocapture
 ```
@@ -178,18 +171,16 @@ pollute the historical wall-clock numbers.
 
 ## Notes on fairness
 
-- **Extension field**: default mode uses the vendored `p3-goldilocks-patched`
-  (`BinomiallyExtendable<3>`, same `x^3 - 2` as Lambda). `--no-p3-patch` falls
-  back to upstream degree-2 — Lambda still runs degree-3, so the sides differ.
-  The nightly runs in the degree-2 mode to track the "shipped P3 vs shipped
-  Lambda" comparison.
+- **Extension field**: Plonky3 runs `BinomialExtensionField<Goldilocks, 3>`
+  with the same `x^3 - 2` irreducible as Lambda's
+  `Degree3GoldilocksExtensionField`. Both sides use the same cubic extension.
 - **Parallelism**: both provers are multi-threaded by default. Lambda pulls
   rayon via `stark/parallel`; Plonky3 pulls rayon via
   `p3-uni-stark` / `p3-dft` (hardcoded `features = ["parallel"]`, always on).
 - **SIMD**: without `--scalar`, each side uses whatever target-features the
-  compiler decides from the host CPU. `--scalar` equalises Goldilocks on
-  `x86_64` (no AVX2/AVX-512) or disables the ARMv8.4 SHA3 Keccak extension on
-  `aarch64`. `p3-keccak`'s SSE2 path on x86 is not disabled.
+  compiler decides from the host CPU. `--scalar` (x86_64 only) disables AVX2
+  and AVX-512 so Goldilocks arithmetic is scalar on both sides. `p3-keccak`'s
+  SSE2 path on x86 is not disabled.
 - **Queries / grinding**: same `blowup=2`, `queries=219`, `grinding=0` on both
   sides. Security models differ (Lambda: Johnson-bound, ~108 bits; P3:
   conjectured, ~192 bits) — the compute work is equivalent, the claimed

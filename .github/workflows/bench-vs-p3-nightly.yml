@@ -35,7 +35,6 @@ jobs:
             --log-rows 19 \
             --num-sequences 16 \
             --runs 3 \
-            --no-p3-patch \
             --scalar \
             --report-dir bench_vs_p3_artifacts \
             --no-color

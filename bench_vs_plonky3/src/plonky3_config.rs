@@ -11,19 +11,10 @@ use p3_uni_stark::StarkConfig;
 
 pub type Val = Goldilocks;
 
-/// Cubic extension (default, `p3-degree3` feature): matches Lambda's
-/// `Degree3GoldilocksExtensionField`, irreducible x^3 - 2. Needs the vendored
-/// `p3-goldilocks-patched` crate (enabled via root `[patch.crates-io]`).
-#[cfg(feature = "p3-degree3")]
+/// Cubic extension matching Lambda's `Degree3GoldilocksExtensionField`
+/// (irreducible x^3 - 2). Provided by the forked `p3-goldilocks` via
+/// `BinomiallyExtendable<3>`.
 pub type Challenge = BinomialExtensionField<Val, 3>;
-
-/// Quadratic extension (vanilla upstream p3-goldilocks 0.5.2). Compiled when
-/// `p3-degree3` is disabled, typically together with commenting the root
-/// `[patch.crates-io]` block. Lambda still runs degree 3, so this is NOT a
-/// fair comparison on the extension field — it is used for nightly tracking
-/// against the off-the-shelf P3 config.
-#[cfg(not(feature = "p3-degree3"))]
-pub type Challenge = BinomialExtensionField<Val, 2>;
 
 type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
@@ -85,7 +76,7 @@ pub fn plonky3_benchmark_config() -> P3Config {
     let dft = Dft::default();
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
-    let fri_params = p3_fri::create_benchmark_fri_params(challenge_mmcs);
+    let fri_params = FriParameters::new_benchmark(challenge_mmcs);
 
     let pcs = Pcs::new(dft, val_mmcs, fri_params);
     P3Config::new(pcs, challenger)

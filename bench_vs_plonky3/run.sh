@@ -5,15 +5,14 @@
 # Usage:
 #   ./bench_vs_plonky3/run.sh [--log-rows K ...] [--num-sequences N] [--runs N]
 #                             [--lambda-only | --p3-only] [--report-dir DIR]
-#                             [--no-p3-patch] [--scalar] [--no-color]
+#                             [--scalar] [--no-color]
 #
 # Defaults: --log-rows 19, --num-sequences 16, --runs 3.
 # With multiple --log-rows values, prints one median row per size.
 #
-# --scalar: disables SIMD at the target-feature level. On x86_64 drops AVX2
-# and AVX-512 (Goldilocks + most of Keccak go scalar, residual SSE2 in
-# p3-keccak). On aarch64 drops the SHA3 NEON extension. Triggers a rebuild
-# when toggling; subsequent runs with the same RUSTFLAGS are cached.
+# --scalar: on x86_64 drops AVX2 / AVX-512 so Goldilocks (and most of Keccak)
+# run scalar; residual SSE2 in p3-keccak remains. Triggers a rebuild when
+# toggling; subsequent runs with the same RUSTFLAGS are cached.
 
 set -euo pipefail
 
@@ -22,7 +21,6 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="/tmp/bench_p3"
 REPORT_DIR=""
 NO_COLOR=false
-NO_P3_PATCH=false
 SCALAR=false
 
 RED='\033[0;31m'
@@ -69,10 +67,6 @@ while [[ $# -gt 0 ]]; do
             if [[ $# -lt 2 ]]; then echo "--report-dir requires an argument"; exit 1; fi
             REPORT_DIR=$2
             shift 2
-            ;;
-        --no-p3-patch)
-            NO_P3_PATCH=true
-            shift
             ;;
         --scalar)
             SCALAR=true
@@ -122,78 +116,23 @@ if [ -n "$REPORT_DIR" ]; then
     mkdir -p "$REPORT_DIR/raw"
 fi
 
-# --- Patch toggle -----------------------------------------------------------
-# The root Cargo.toml has a [patch.crates-io] block pointing at the vendored
-# p3-goldilocks-patched (adds BinomiallyExtendable<3>, disables NEON). For the
-# nightly we build against vanilla crates.io p3-goldilocks — we comment the
-# block out and drop the `p3-degree3` feature.
-#
-# Both Cargo.toml AND Cargo.lock are backed up before the build: dropping the
-# patch makes cargo re-resolve p3-goldilocks against crates.io, which rewrites
-# Cargo.lock. The trap restores both so the working tree is clean on exit.
-CARGO_TOML="$ROOT_DIR/Cargo.toml"
-CARGO_LOCK="$ROOT_DIR/Cargo.lock"
-CARGO_TOML_BAK=""
-CARGO_LOCK_BAK=""
-BUILD_FEATURE_FLAGS=()
-if $NO_P3_PATCH; then
-    CARGO_TOML_BAK="$CARGO_TOML.bak.p3bench.$$"
-    cp "$CARGO_TOML" "$CARGO_TOML_BAK"
-    if [ -f "$CARGO_LOCK" ]; then
-        CARGO_LOCK_BAK="$CARGO_LOCK.bak.p3bench.$$"
-        cp "$CARGO_LOCK" "$CARGO_LOCK_BAK"
-    fi
-    # Comment the [patch.crates-io] block and its entries (until the next blank
-    # line or next [section]).
-    python3 - "$CARGO_TOML" <<'PY'
-import sys, pathlib
-path = pathlib.Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-out = []
-in_patch = False
-for ln in lines:
-    stripped = ln.strip()
-    if stripped == "[patch.crates-io]":
-        in_patch = True
-        out.append("# " + ln if not ln.startswith("#") else ln)
-        continue
-    if in_patch:
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_patch = False
-            out.append(ln)
-            continue
-        if stripped == "":
-            in_patch = False
-            out.append(ln)
-            continue
-        out.append("# " + ln if not ln.startswith("#") else ln)
-    else:
-        out.append(ln)
-path.write_text("".join(out))
-PY
-    trap 'if [ -n "$CARGO_TOML_BAK" ] && [ -f "$CARGO_TOML_BAK" ]; then mv "$CARGO_TOML_BAK" "$CARGO_TOML"; fi; if [ -n "$CARGO_LOCK_BAK" ] && [ -f "$CARGO_LOCK_BAK" ]; then mv "$CARGO_LOCK_BAK" "$CARGO_LOCK"; fi' EXIT INT TERM
-    BUILD_FEATURE_FLAGS=(--no-default-features --features parallel)
-fi
-
 # --- Scalar (no SIMD) toggle ------------------------------------------------
-# When --scalar is on, disable vector instruction sets for the build so both
-# provers run against the same scalar baseline. p3-keccak keeps SSE2 residual
-# on x86 — acceptable per the bench workstream (contribution is ~7%).
-#   x86_64   → -avx2,-avx512f         (Goldilocks + most of Keccak go scalar)
-#   aarch64  → -sha3                   (drops Keccak NEON SHA3 extension)
+# When --scalar is on, disable AVX2/AVX-512 so Goldilocks (and most of Keccak)
+# run scalar for an apples-to-apples comparison against Lambda STARK. The
+# residual SSE2 path on p3-keccak is intentionally left enabled — its
+# contribution to total prove time is ~7%.
 # Cargo caches per-RUSTFLAGS, so toggling scalar vs vector triggers a rebuild
 # on first use but is cached afterwards.
 SCALAR_RUSTFLAGS=""
+SCALAR_ACTIVE=false
 if $SCALAR; then
     case "$(uname -m)" in
         x86_64|amd64)
             SCALAR_RUSTFLAGS="-C target-feature=-avx2,-avx512f"
-            ;;
-        arm64|aarch64)
-            SCALAR_RUSTFLAGS="-C target-feature=-sha3"
+            SCALAR_ACTIVE=true
             ;;
         *)
-            echo "warning: --scalar: unknown arch $(uname -m); not pinning RUSTFLAGS" >&2
+            echo "warning: --scalar: only supported on x86_64; host is $(uname -m), not pinning RUSTFLAGS" >&2
             ;;
     esac
     if [ -n "$SCALAR_RUSTFLAGS" ]; then
@@ -210,24 +149,19 @@ echo -e "${BOLD}=== STARK prove benchmark: Lambda vs Plonky3 ===${NC}"
 echo -e "  log-rows:       ${YELLOW}${LOG_ROWS[*]}${NC}"
 echo -e "  num-sequences:  ${YELLOW}${NUM_SEQUENCES}${NC}  (columns = $((2 * NUM_SEQUENCES)))"
 echo -e "  runs/size:      ${YELLOW}${RUNS}${NC}  (median reported)"
-if $NO_P3_PATCH; then
-    echo -e "  p3 extension:   ${YELLOW}degree 2 (vanilla, no patch)${NC}"
-else
-    echo -e "  p3 extension:   ${YELLOW}degree 3 (patched, matches Lambda)${NC}"
-fi
-if $SCALAR; then
+echo -e "  p3 extension:   ${YELLOW}degree 3 (forked p3-goldilocks, matches Lambda)${NC}"
+if $SCALAR_ACTIVE; then
     echo -e "  scalar mode:    ${YELLOW}on${NC}  (arch=$(uname -m), RUSTFLAGS=\"${RUSTFLAGS:-}\")"
+elif $SCALAR; then
+    echo -e "  scalar mode:    ${YELLOW}requested (unsupported on $(uname -m))${NC}  (SIMD enabled, compiler default)"
 else
     echo -e "  scalar mode:    ${YELLOW}off${NC}  (SIMD enabled, compiler default)"
 fi
 echo ""
 
 echo -e "${GREEN}[build]${NC} prove_bench"
-# Use the `${arr[@]+...}` expansion so `set -u` doesn't blow up when the
-# feature-flag array is empty (bash 3 on macOS).
 cargo build --release -p bench-vs-plonky3 --bin prove_bench \
-    --manifest-path "$ROOT_DIR/Cargo.toml" \
-    ${BUILD_FEATURE_FLAGS[@]+"${BUILD_FEATURE_FLAGS[@]}"} 2>&1 | tail -5
+    --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 
 # Resolve the actual target directory via cargo metadata so we find the binary
 # whether cargo used ./target/ (default) or a custom CARGO_TARGET_DIR.
@@ -378,10 +312,6 @@ echo ""
 if $RUN_LAMBDA && $RUN_P3; then
     echo -e "Timing window: single-shot end-to-end prove."
 fi
-if $NO_P3_PATCH; then
-    echo -e "${YELLOW}Note:${NC} Plonky3 was built without the degree-3 patch; Challenge type is degree-2."
-    echo -e "      Lambda keeps degree-3 — extension fields differ across sides."
-fi
 
 # --- Machine-readable report ------------------------------------------------
 
@@ -428,10 +358,14 @@ if [ -n "$REPORT_DIR" ]; then
         echo "fri_queries=219"
         echo "grinding=0"
         echo "runs_per_size=$RUNS"
-        echo "p3_extension=$($NO_P3_PATCH && echo 'degree2_vanilla' || echo 'degree3_patched')"
-        echo "scalar=$($SCALAR && echo on || echo off)"
-        if $SCALAR && [ -n "$SCALAR_RUSTFLAGS" ]; then
+        echo "p3_extension=degree3_fork"
+        if $SCALAR_ACTIVE; then
+            echo "scalar=on"
             echo "rustflags=$SCALAR_RUSTFLAGS"
+        elif $SCALAR; then
+            echo "scalar=requested_unsupported"
+        else
+            echo "scalar=off"
         fi
         echo "timing_window=single_shot_end_to_end_prove_no_verify"
         echo "log_rows_series=$(join_slash "${RESULT_LOG_ROWS[@]}")"
