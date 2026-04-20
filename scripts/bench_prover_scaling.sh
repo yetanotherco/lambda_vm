@@ -95,8 +95,8 @@ parse_run() {
     /After aux commit/       { print "h_aux_commit="   $(NF-1) }
     ' "$stderr"
 
-    grep -o 'Peak heap: [0-9]*' "$stdout" | awk '{print "peak=" $3}'
-    grep -o 'Proving time: [0-9.]*' "$stdout" | awk '{print "wall=" $3}'
+    awk '/Peak heap:/ { print "peak=" $(NF-1) }' "$stdout"
+    awk '/Proving time:/ { sub(/s$/, "", $NF); print "wall=" $NF }' "$stdout"
 }
 
 get_val() {
