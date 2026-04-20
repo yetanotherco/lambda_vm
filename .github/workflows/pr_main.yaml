@@ -198,6 +198,10 @@ jobs:
           restore-keys: |
             rust-elf-artifacts-
 
+      - name: Setup Rust Environment
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup-rust
+
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
@@ -255,6 +259,10 @@ jobs:
           key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**') }}
           restore-keys: |
             rust-elf-artifacts-
+
+      - name: Setup Rust Environment
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup-rust
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
