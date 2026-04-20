@@ -83,29 +83,25 @@ impl<F: IsField> Table<F> {
             .collect()
     }
 
-    /// Extract columns directly into pre-allocated output buffers.
+    /// Extract columns as owned vectors, with each allocated at `capacity`.
     ///
-    /// Each `output[col_idx]` is cleared and filled with the column data.
-    /// When `output[col_idx].capacity() >= height`, no heap allocation occurs.
-    /// This eliminates the T1 transpose allocation that `columns()` performs.
-    pub fn extract_columns_into(&self, output: &mut [Vec<FieldElement<F>>]) {
-        debug_assert!(
-            output.len() >= self.width,
-            "output has {} buffers but table has {} columns",
-            output.len(),
-            self.width
-        );
+    /// `capacity` is a hint sized for downstream LDE expansion so the FFT grows
+    /// in place without a second allocation. Avoids the T1 transpose `columns()`
+    /// performs.
+    pub fn extract_columns(&self, capacity: usize) -> Vec<Vec<FieldElement<F>>> {
+        let capacity = capacity.max(self.height);
         #[cfg(feature = "parallel")]
-        let iter = output[..self.width].par_iter_mut().enumerate();
+        let iter = (0..self.width).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let iter = output[..self.width].iter_mut().enumerate();
-        iter.for_each(|(col_idx, buf)| {
-            buf.clear();
-            buf.reserve(self.height.saturating_sub(buf.capacity()));
+        let iter = 0..self.width;
+        iter.map(|col_idx| {
+            let mut buf = Vec::with_capacity(capacity);
             for row_idx in 0..self.height {
                 buf.push(self.data[row_idx * self.width + col_idx].clone());
             }
-        });
+            buf
+        })
+        .collect()
     }
 
     /// Given row and column indexes, returns the stored field element in that position of the table.

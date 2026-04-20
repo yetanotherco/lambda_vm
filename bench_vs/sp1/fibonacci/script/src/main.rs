@@ -58,6 +58,7 @@ fn main() {
     };
     println!("Elements: {}", total_elements);
 
+
     // Verify (outside the timer, same as Lambda).
     client
         .verify(&proof, pk.verifying_key(), None)
