@@ -87,7 +87,30 @@ pub struct TableProofData<F: IsField, E: IsField, PI> {
     pub trace_ood_evaluations: Table<E>,
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
+    /// Number of composition poly parts for this table.
+    pub num_composition_parts: usize,
     _phantom: core::marker::PhantomData<F>,
+}
+
+impl<F: IsField, E: IsField, PI> TableProofData<F, E, PI> {
+    pub fn new(
+        trace_length: usize,
+        public_inputs: PI,
+        trace_ood_evaluations: Table<E>,
+        composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
+        bus_public_inputs: Option<BusPublicInputs<E>>,
+        num_composition_parts: usize,
+    ) -> Self {
+        Self {
+            trace_length,
+            public_inputs,
+            trace_ood_evaluations,
+            composition_poly_parts_ood_evaluation,
+            bus_public_inputs,
+            num_composition_parts,
+            _phantom: core::marker::PhantomData,
+        }
+    }
 }
 
 /// Per-query opening from all shared Merkle trees.
