@@ -32,16 +32,6 @@ with `plonky3_config::matched_params_config`. Both AIRs are **cell-by-cell
 equivalent** — this is asserted by the `lambda_pair_trace_matches_plonky3_trace`
 test.
 
-## Prerequisites
-
-- Rust stable (the crate builds with `cargo build --release`).
-- No SP1 toolchain needed — there's no VM guest compilation.
-- Read access to `https://github.com/yetanotherco/Plonky3.git` (branch
-  `feat/goldilocks_deg3`). Cargo clones it into `~/.cargo/git/db` on the
-  first build and `Cargo.lock` pins the SHA. The branch provides
-  `BinomiallyExtendable<3>` for Goldilocks (`x^3 - 2`, matching Lambda's
-  `Degree3GoldilocksExtensionField`).
-
 ## Usage
 
 ```bash
@@ -163,9 +153,6 @@ cargo test -p bench-vs-plonky3 --features instruments --release -- \
     Spans nest (e.g. `prove ⊃ compute_quotient_values`), so Σspans > total is
     expected and not a bug. `(unaccounted)` can be negative from nesting.
 
-Details of every timer (which method it wraps, where it lives) are in
-[`INSTRUMENTATION.md`](INSTRUMENTATION.md).
-
 The nightly does **not** activate this path — it would add ~1 % overhead and
 pollute the historical wall-clock numbers.
 
@@ -182,6 +169,7 @@ pollute the historical wall-clock numbers.
   and AVX-512 so Goldilocks arithmetic is scalar on both sides. `p3-keccak`'s
   SSE2 path on x86 is not disabled.
 - **Queries / grinding**: same `blowup=2`, `queries=219`, `grinding=0` on both
-  sides. Security models differ (Lambda: Johnson-bound, ~108 bits; P3:
-  conjectured, ~192 bits) — the compute work is equivalent, the claimed
-  soundness is not. See `ANALYSIS_LOG.md` for the full fairness audit.
+  sides. Security models differ (Lambda: Johnson-bound, ~108 bits proven;
+  P3: conjectured, 219 queries × 1 bit = 219 bits, capped at 192 by the
+  cubic extension field) — the compute work is equivalent, the claimed
+  soundness is not.
