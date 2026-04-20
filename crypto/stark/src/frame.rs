@@ -1,4 +1,7 @@
-use crate::{table::TableView, trace::LDETraceTable};
+use crate::{
+    table::TableView,
+    trace::{LDETraceTable, RowMajorLDETrace},
+};
 use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -101,6 +104,44 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
             })
             .collect();
         Frame { steps }
+    }
+
+    /// Fill a pre-allocated frame from a row-major LDE view, without allocating.
+    ///
+    /// Each row read is a contiguous slice copy instead of `num_cols` random column
+    /// reads. The frame must have been created with `preallocate` with matching dimensions.
+    pub(crate) fn fill_from_row_major(
+        &mut self,
+        row_major: &RowMajorLDETrace<F, E>,
+        row: usize,
+        offsets: &[usize],
+    ) {
+        let blowup_factor = row_major.blowup_factor;
+        let num_rows = row_major.num_rows();
+        let step_size = row_major.lde_step_size;
+        let num_aux_cols = row_major.num_aux_cols;
+
+        for (step_idx, &offset) in offsets.iter().enumerate() {
+            let initial_step_row = row + offset * step_size;
+            let end_step_row = initial_step_row + step_size;
+            let step = &mut self.steps[step_idx];
+
+            let mut sub_row_idx = 0;
+            let mut step_row = initial_step_row;
+            while step_row < end_step_row {
+                let step_row_idx = step_row % num_rows;
+
+                step.data[sub_row_idx].clone_from_slice(row_major.get_main_row(step_row_idx));
+
+                if num_aux_cols > 0 {
+                    step.aux_data[sub_row_idx]
+                        .clone_from_slice(row_major.get_aux_row(step_row_idx));
+                }
+
+                sub_row_idx += 1;
+                step_row += blowup_factor;
+            }
+        }
     }
 
     /// Fill a pre-allocated frame from LDE data, without allocating.

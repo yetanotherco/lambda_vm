@@ -1261,6 +1261,7 @@ pub trait IsStarkProver<
                 let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
                 let mut trace_sum = FieldElement::<FieldExtension>::zero();
 
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..num_main_cols {
                     // base × ext via IsSubFieldOf: [a*g0, a*g1, a*g2] — 3 base muls
                     trace_sum += lde_trace.get_main(row_idx, j) * &trace_terms_gammas[j][k];
@@ -1308,7 +1309,10 @@ pub trait IsStarkProver<
 
         let eval_at = |raw_idx: usize| -> Vec<FieldElement<FieldExtension>> {
             (0..num_parts)
-                .map(|p| lde_composition_poly_evaluations[p][reverse_index(raw_idx, part_len as u64)].clone())
+                .map(|p| {
+                    lde_composition_poly_evaluations[p][reverse_index(raw_idx, part_len as u64)]
+                        .clone()
+                })
                 .collect()
         };
 

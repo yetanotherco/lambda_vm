@@ -2,7 +2,9 @@ use sha3::Keccak256;
 
 use super::{
     field_element::FieldElementBackend,
-    field_element_vector::{FieldElementPairBackend, FieldElementQuadBackend, FieldElementVectorBackend},
+    field_element_vector::{
+        FieldElementPairBackend, FieldElementQuadBackend, FieldElementVectorBackend,
+    },
 };
 
 // Field element backend definitions

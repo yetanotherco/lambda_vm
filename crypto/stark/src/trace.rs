@@ -295,6 +295,74 @@ where
     pub fn step_to_row(&self, step: usize) -> usize {
         self.lde_step_size * step
     }
+
+    /// Transpose the column-major LDE trace into a flat row-major buffer.
+    ///
+    /// Reads each source column sequentially (cache-friendly), scattering elements
+    /// into strided positions in the output. The one-time O(n·m) cost amortizes over
+    /// the 2N repeated row reads during constraint evaluation.
+    pub(crate) fn to_row_major(&self) -> RowMajorLDETrace<F, E> {
+        let n = self.num_rows();
+        let nm = self.num_main_cols();
+        let na = self.num_aux_cols();
+
+        let mut main = vec![FieldElement::<F>::zero(); n * nm];
+        for col in 0..nm {
+            for row in 0..n {
+                main[row * nm + col] = self.main_columns[col][row].clone();
+            }
+        }
+
+        let mut aux = vec![FieldElement::<E>::zero(); n * na];
+        for col in 0..na {
+            for row in 0..n {
+                aux[row * na + col] = self.aux_columns[col][row].clone();
+            }
+        }
+
+        RowMajorLDETrace {
+            main,
+            aux,
+            num_main_cols: nm,
+            num_aux_cols: na,
+            lde_step_size: self.lde_step_size,
+            blowup_factor: self.blowup_factor,
+            num_rows: n,
+        }
+    }
+}
+
+/// Row-major view of LDE trace data for cache-friendly constraint evaluation.
+///
+/// Built once by `LDETraceTable::to_row_major()` before the hot constraint loop.
+/// Accessing row `i` is a single contiguous slice read vs `num_cols` random column
+/// reads from the column-major `LDETraceTable`.
+pub(crate) struct RowMajorLDETrace<F: IsSubFieldOf<E>, E: IsField> {
+    main: Vec<FieldElement<F>>,
+    aux: Vec<FieldElement<E>>,
+    pub(crate) num_main_cols: usize,
+    pub(crate) num_aux_cols: usize,
+    pub(crate) lde_step_size: usize,
+    pub(crate) blowup_factor: usize,
+    num_rows: usize,
+}
+
+impl<F: IsSubFieldOf<E>, E: IsField> RowMajorLDETrace<F, E> {
+    #[inline]
+    pub(crate) fn get_main_row(&self, row: usize) -> &[FieldElement<F>] {
+        let start = row * self.num_main_cols;
+        &self.main[start..start + self.num_main_cols]
+    }
+
+    #[inline]
+    pub(crate) fn get_aux_row(&self, row: usize) -> &[FieldElement<E>] {
+        let start = row * self.num_aux_cols;
+        &self.aux[start..start + self.num_aux_cols]
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
 }
 
 /// Given a slice of trace polynomials, an evaluation point `x`, the frame offsets
