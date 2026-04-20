@@ -293,8 +293,8 @@ where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// Evaluations of the composition polynomial parts over the LDE domain.
-    pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
+    /// Evaluations of the composition polynomial parts over the LDE domain (2N points each).
+    pub(crate) composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
@@ -745,18 +745,12 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
-    /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
-    /// extend each half to the full LDE domain. This replaces the expensive
-    /// iFFT(2N) + break_in_parts + FFT(2N)×2 pipeline with:
-    ///   O(N) pointwise ops + iFFT(N)×2 + FFT(2N)×2
+    /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset,
+    /// returning N evaluations of each part on the squared coset {g²·θ^i}.
     ///
-    /// The identity used:
-    ///   H₀(x²) = (H(x) + H(-x)) / 2
-    ///   H₁(x²) = (H(x) - H(-x)) / (2x)
-    ///
-    /// On the LDE coset {g·ω^i | i=0..2N-1}, we have -g·ω^i = g·ω^{i+N}
-    /// since ω^N = -1 for a 2N-th root of unity ω.
-    fn decompose_and_extend_d2(
+    /// No iFFT or FFT is performed — only O(N) pointwise arithmetic.
+    /// The caller is responsible for extending these to 2N LDE points if needed.
+    fn decompose_d2(
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
@@ -809,48 +803,7 @@ pub trait IsStarkProver<
             }
         };
 
-        // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
-        // The squared coset offset is g² (= coset_offset²).
-        let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
-
-        #[cfg(feature = "parallel")]
-        let (lde_h0, lde_h1) = rayon::join(
-            || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
-
-        #[cfg(not(feature = "parallel"))]
-        let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
-
-        vec![lde_h0, lde_h1]
-    }
-
-    /// Given N evaluations of a degree-<N polynomial on the g²-coset,
-    /// extend to 2N evaluations on the g-coset (the full LDE domain).
-    /// This is: iFFT(N, offset=g²) → coefficients → FFT(2N, offset=g).
-    fn extend_half_to_lde(
-        half_evals: &[FieldElement<FieldExtension>],
-        squared_offset: &FieldElement<Field>,
-        domain: &Domain<Field>,
-    ) -> Vec<FieldElement<FieldExtension>>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        // iFFT on the N-point squared coset to get coefficients
-        let poly = Polynomial::interpolate_offset_fft(half_evals, squared_offset)
-            .expect("iFFT should succeed");
-        // Evaluate on the full LDE domain (2N points on the g-coset)
-        evaluate_polynomial_on_lde_domain(
-            &poly,
-            domain.blowup_factor,
-            domain.interpolation_domain_size,
-            &domain.coset_offset,
-        )
-        .expect("LDE evaluation should succeed")
+        vec![h0_evals, h1_evals]
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
@@ -893,12 +846,28 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
-            // Direct quotient decomposition: avoid full-size iFFT by algebraically
-            // splitting H(x) = H₀(x²) + x·H₁(x²) using:
-            //   H₀(x²) = (H(x) + H(-x)) / 2
-            //   H₁(x²) = (H(x) - H(-x)) / (2x)
-            // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain)
+            // Decompose H(x) = H₀(x²) + x·H₁(x²) via O(N) pointwise ops,
+            // then extend each part from the N-point squared coset (g²) to the
+            // 2N-point LDE domain (g) via iFFT(N) + FFT(2N) per part.
+            {
+                let parts = Self::decompose_d2(&constraint_evaluations, domain);
+                let coset_offset_sq = &domain.coset_offset * &domain.coset_offset;
+                parts
+                    .into_iter()
+                    .map(|sq_evals| {
+                        let poly =
+                            Polynomial::interpolate_offset_fft(&sq_evals, &coset_offset_sq)
+                                .expect("iFFT on squared-coset evaluations");
+                        evaluate_polynomial_on_lde_domain(
+                            &poly,
+                            domain.blowup_factor,
+                            domain.interpolation_domain_size,
+                            &domain.coset_offset,
+                        )
+                        .expect("LDE evaluation")
+                    })
+                    .collect()
+            }
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -938,7 +907,7 @@ pub trait IsStarkProver<
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
         Ok(Round2 {
-            lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
+            composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
         })
@@ -956,19 +925,16 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
-        // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
-        // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
+        // All paths produce 2N-point LDE evaluations. Extract at stride for barycentric OOD.
         let coset_points: Vec<FieldElement<Field>> = (0..domain_size)
             .map(|i| domain.lde_roots_of_unity_coset[i * blowup_factor].clone())
             .collect();
-        // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
-        // functions use F×E→E mixed arithmetic, avoiding field conversions.
         let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(domain_size);
         let domain_size_inv: FieldElement<Field> = FieldElement::<Field>::from(domain_size as u64)
             .inv()
@@ -976,16 +942,13 @@ pub trait IsStarkProver<
         let g_n_inv: FieldElement<Field> = coset_offset_pow_n
             .inv()
             .expect("coset_offset_pow_n is non-zero");
-
-        // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
         let comp_z_pow_n = z_power.pow(domain_size);
         let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
 
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .lde_composition_poly_evaluations
+            .composition_poly_evaluations
             .iter()
             .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
                 let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
                     .map(|i| lde_evals[i * blowup_factor].clone())
                     .collect();
@@ -1037,7 +1000,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let n_terms_composition_poly = round_2_result.composition_poly_evaluations.len();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
 
@@ -1057,10 +1020,10 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        // Compute full DEEP polynomial at N trace-coset points.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        let deep_evals = Self::compute_deep_with_composition(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1074,8 +1037,6 @@ pub trait IsStarkProver<
         let other_dur_1 = t_sub.elapsed();
 
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
-        // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
-        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -1087,7 +1048,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
-        // FRI commit phase from pre-computed evaluations (no initial FFT)
+        // FRI commit phase (no injection needed — composition is in the DEEP polynomial)
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let (fri_last_value, fri_layers) =
@@ -1152,16 +1113,10 @@ pub trait IsStarkProver<
             .collect::<Vec<usize>>()
     }
 
-    /// Computes the DEEP composition polynomial as evaluations on the trace-size coset.
-    ///
-    /// Evaluates `deep(x_i)` at N points (every bf-th point of the LDE coset).
-    /// The caller extends to the full 2N-point LDE domain before feeding to FRI.
-    ///
-    /// The DEEP polynomial is:
-    ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
-    ///           + Σ_{j,k} γ'_{j,k} * (t_j(X) - t_j(z·w^k)) / (X - z·w^k)
+    /// Computes DEEP polynomial with both trace and composition terms.
+    /// Reads composition values from the Round 2 LDE evaluations at stride.
     #[allow(clippy::too_many_arguments)]
-    fn compute_deep_composition_poly_evaluations(
+    fn compute_deep_with_composition(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
@@ -1177,17 +1132,15 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
-        let z_power = z.pow(num_parts); // pole for H terms
+        let num_parts = round_2_result.composition_poly_evaluations.len();
+        let z_power = z.pow(num_parts);
 
-        // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
         let num_eval_points = if trace_terms_gammas.is_empty() {
             0
         } else {
             trace_terms_gammas[0].len()
         };
 
-        // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points
         let mut z_shifted = Vec::with_capacity(num_eval_points);
         let mut current_z = z.clone();
         for _ in 0..num_eval_points {
@@ -1195,64 +1148,50 @@ pub trait IsStarkProver<
             current_z = primitive_root * &current_z;
         }
 
-        // Number of main and aux columns in the LDE trace
         let num_main_cols = lde_trace.num_main_cols();
         let num_aux_cols = lde_trace.num_aux_cols();
 
-        // Precompute all inverse denominators via batch inversion.
         let num_denoms = domain_size * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
-
-        // H-term denominators: x_i - z^K
         for i in 0..domain_size {
             let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
             denoms.push(x_i - &z_power);
         }
-
-        // Trace-term denominators: x_i - z_shifted[k]
         for z_k in z_shifted.iter().take(num_eval_points) {
             for i in 0..domain_size {
                 let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
                 denoms.push(x_i - z_k);
             }
         }
-
         FieldElement::inplace_batch_inverse(&mut denoms)
-            .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
+            .expect("Denominators should be non-zero");
 
         let inv_h = &denoms[0..domain_size];
-
-        // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
 
-        // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
         let iter = (0..domain_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = 0..domain_size;
 
         iter.map(|i| {
-            let row_idx = i * blowup_factor; // LDE row index
-
-            // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
+            let row_idx = i * blowup_factor;
             let mut result = FieldElement::<FieldExtension>::zero();
+
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_val = &round_2_result.composition_poly_evaluations[j][row_idx];
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
             let num_total_cols = num_main_cols + num_aux_cols;
             for j in 0..num_total_cols {
                 let gammas_j = &trace_terms_gammas[j];
                 let ood_evals_j = &trace_ood_columns[j];
-
                 for k in 0..num_eval_points {
                     let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-
                     let t_j_ood = &ood_evals_j[k];
                     let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
                         lde_trace.get_main(row_idx, j) - t_j_ood
@@ -1262,7 +1201,6 @@ pub trait IsStarkProver<
                     result += &gammas_j[k] * numerator * inv_t_k_i;
                 }
             }
-
             result
         })
         .collect()
@@ -1273,7 +1211,7 @@ pub trait IsStarkProver<
     /// element.
     fn open_composition_poly(
         composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
-        lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
+        composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
     ) -> PolynomialOpenings<FieldExtension>
     where
@@ -1284,29 +1222,22 @@ pub trait IsStarkProver<
             .get_proof_by_pos(index)
             .unwrap();
 
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
+        let num_evals = composition_poly_evaluations[0].len();
+        let evaluations: Vec<_> = composition_poly_evaluations
             .iter()
-            .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
-            })
+            .map(|part| part[reverse_index(index * 2, num_evals as u64)].clone())
+            .collect();
+
+        let evaluations_sym: Vec<_> = composition_poly_evaluations
+            .iter()
+            .map(|part| part[reverse_index(index * 2 + 1, num_evals as u64)].clone())
             .collect();
 
         PolynomialOpenings {
             proof: proof.clone(),
             proof_sym: proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
-                .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
-                .collect(),
+            evaluations,
+            evaluations_sym,
         }
     }
 
@@ -1449,7 +1380,7 @@ pub trait IsStarkProver<
 
             let composition_openings = Self::open_composition_poly(
                 &round_2_result.composition_poly_merkle_tree,
-                &round_2_result.lde_composition_poly_evaluations,
+                &round_2_result.composition_poly_evaluations,
                 *index,
             );
 

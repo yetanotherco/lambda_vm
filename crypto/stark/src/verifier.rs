@@ -652,18 +652,15 @@ pub trait IsStarkVerifier<
         // Reconstruct p₁(𝜐²)
         let mut v =
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+
         let mut index = iota;
 
         // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
             return v == proof.fri_last_value;
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
+        // For each FRI layer: verify pᵢ(−𝜐^(2ⁱ)) and pᵢ(𝜐^(2ⁱ)), compute pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
         fri_layers_merkle_roots
             .iter()
             .enumerate()
@@ -714,11 +711,11 @@ pub trait IsStarkVerifier<
         let num_queries = challenges.iotas.len();
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let primitive_root =
                 &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
             let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
             if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
                 evaluations.extend(
@@ -742,16 +739,7 @@ pub trait IsStarkVerifier<
             }
 
             let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
-            deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
-                proof,
-                &evaluation_point,
-                primitive_root,
-                challenges,
-                &evaluations,
-                &proof.deep_poly_openings[i].composition_poly.evaluations,
-            ));
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
             let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
             if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
                 evaluations_sym.extend(
@@ -774,26 +762,71 @@ pub trait IsStarkVerifier<
                 evaluations_sym.extend_from_slice(&aux_trace_polys.evaluations_sym);
             }
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
-            deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
-                proof,
-                &evaluation_point,
-                primitive_root,
-                challenges,
-                &evaluations_sym,
-                &proof.deep_poly_openings[i].composition_poly.evaluations_sym,
-            ));
+            let evaluation_point_sym =
+                Self::query_challenge_to_evaluation_point_sym(*iota, domain);
+
+            {
+                deep_poly_evaluations.push(Self::reconstruct_full_deep_evaluation(
+                    proof,
+                    &evaluation_point,
+                    primitive_root,
+                    challenges,
+                    &evaluations,
+                    &proof.deep_poly_openings[i].composition_poly.evaluations,
+                ));
+                deep_poly_evaluations_sym.push(Self::reconstruct_full_deep_evaluation(
+                    proof,
+                    &evaluation_point_sym,
+                    primitive_root,
+                    challenges,
+                    &evaluations_sym,
+                    &proof.deep_poly_openings[i].composition_poly.evaluations_sym,
+                ));
+            }
         }
         (deep_poly_evaluations, deep_poly_evaluations_sym)
     }
 
-    fn reconstruct_deep_composition_poly_evaluation(
+    /// Reconstructs the full DEEP polynomial (trace + composition) at a query point.
+    /// Used for the non-injection path (number_of_parts != 2).
+    fn reconstruct_full_deep_evaluation(
         proof: &StarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         lde_trace_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let trace_term = Self::reconstruct_trace_deep_evaluation(
+            proof,
+            evaluation_point,
+            primitive_root,
+            challenges,
+            lde_trace_evaluations,
+        );
+
+        let number_of_parts = lde_composition_poly_parts_evaluation.len();
+        let z_pow = &challenges.z.pow(number_of_parts);
+        let denom_composition = (evaluation_point - z_pow).inv().unwrap();
+        let mut h_terms = FieldElement::zero();
+        for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
+            let h_i_zpower = &proof.composition_poly_parts_ood_evaluation[j];
+            let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
+            h_terms += h_i_term;
+        }
+        h_terms *= denom_composition;
+
+        trace_term + h_terms
+    }
+
+    /// Reconstructs the trace-only DEEP polynomial at a query point.
+    /// Composition terms are NOT included — they enter via FRI injection.
+    fn reconstruct_trace_deep_evaluation(
+        proof: &StarkProof<Field, FieldExtension, PI>,
+        evaluation_point: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        challenges: &Challenges<FieldExtension>,
+        lde_trace_evaluations: &[FieldElement<FieldExtension>],
     ) -> FieldElement<FieldExtension> {
         let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
         let ood_evaluations_table_width = proof.trace_ood_evaluations.width;
@@ -811,7 +844,7 @@ pub trait IsStarkVerifier<
         }
         FieldElement::inplace_batch_inverse(&mut denoms_trace).unwrap();
 
-        let trace_term = (0..ood_evaluations_table_width)
+        (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
                 let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
@@ -824,21 +857,31 @@ pub trait IsStarkVerifier<
                     },
                 );
                 trace_terms + trace_i
-            });
+            })
+    }
 
-        let number_of_parts = lde_composition_poly_parts_evaluation.len();
+    /// Computes the composition DEEP injection value at a squared-coset query point.
+    ///
+    /// This is: Σ_j γ_j * (H_j(v²) - H_j(z²)) / (v² - z²)
+    ///
+    /// The evaluation_point here is v² (the squared evaluation point after FRI's first fold).
+    fn compute_composition_injection_value(
+        proof: &StarkProof<Field, FieldExtension, PI>,
+        evaluation_point_sq: &FieldElement<FieldExtension>,
+        challenges: &Challenges<FieldExtension>,
+        composition_poly_evaluations: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let number_of_parts = composition_poly_evaluations.len();
         let z_pow = &challenges.z.pow(number_of_parts);
 
-        let denom_composition = (evaluation_point - z_pow).inv().unwrap();
+        let denom_composition = (evaluation_point_sq - z_pow).inv().unwrap();
         let mut h_terms = FieldElement::zero();
-        for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
-            let h_i_zpower = &proof.composition_poly_parts_ood_evaluation[j];
-            let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
-            h_terms += h_i_term;
+        for (j, h_j_val) in composition_poly_evaluations.iter().enumerate() {
+            let h_j_zpower = &proof.composition_poly_parts_ood_evaluation[j];
+            let h_j_term = (h_j_val - h_j_zpower) * &challenges.gammas[j];
+            h_terms += h_j_term;
         }
-        h_terms *= denom_composition;
-
-        trace_term + h_terms
+        h_terms * denom_composition
     }
 
     /// Verifies one or more STARK proofs with their corresponding AIRs.

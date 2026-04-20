@@ -85,6 +85,89 @@ where
     (last_value, fri_layer_list)
 }
 
+/// FRI commit phase with optional injection after the first fold.
+///
+/// After the first fold reduces 2N evaluations to N, the `injection` vector
+/// (if provided) is added elementwise. This allows committing auxiliary
+/// polynomials (e.g. composition DEEP quotient) at a smaller domain size
+/// without extending them to the full LDE domain.
+///
+/// The injection vector must be in bit-reversed order on the squared coset,
+/// matching the output order of the first fold.
+pub fn commit_phase_from_evaluations_with_injection<
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+>(
+    number_layers: usize,
+    mut evals: Vec<FieldElement<E>>,
+    injection: Option<Vec<FieldElement<E>>>,
+    transcript: &mut impl IsStarkTranscript<E, F>,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> (
+    FieldElement<E>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+)
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+
+    let mut fri_layer_list = Vec::with_capacity(number_layers);
+    let mut current_coset_offset = coset_offset.clone();
+    let mut current_domain_size = domain_size;
+    let mut first_fold = true;
+
+    for _ in 1..number_layers {
+        let zeta = transcript.sample_field_element();
+        current_coset_offset = current_coset_offset.square();
+        current_domain_size /= 2;
+
+        fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+
+        // After the first fold, inject composition DEEP values if provided.
+        if first_fold {
+            if let Some(ref inj) = injection {
+                debug_assert_eq!(
+                    evals.len(),
+                    inj.len(),
+                    "Injection vector size must match folded evaluation size"
+                );
+                for (e, v) in evals.iter_mut().zip(inj.iter()) {
+                    *e = &*e + v;
+                }
+            }
+            first_fold = false;
+        }
+
+        let leaves: Vec<[FieldElement<E>; 2]> = evals
+            .chunks_exact(2)
+            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .collect();
+        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+            .expect("FRI commit: Merkle tree construction must succeed");
+        let root = merkle_tree.root;
+        fri_layer_list.push(FriLayer::new(
+            &evals,
+            merkle_tree,
+            current_coset_offset.clone().to_extension(),
+            current_domain_size,
+        ));
+
+        transcript.append_bytes(&root);
+        update_twiddles_in_place(&mut inv_twiddles);
+    }
+
+    let zeta = transcript.sample_field_element();
+    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+
+    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
+    transcript.append_field_element(&last_value);
+
+    (last_value, fri_layer_list)
+}
+
 pub fn query_phase<F: IsField>(
     fri_layers: &Vec<FriLayer<F, FriLayerMerkleTreeBackend<F>>>,
     iotas: &[usize],

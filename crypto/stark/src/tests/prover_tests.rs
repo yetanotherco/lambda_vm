@@ -206,21 +206,31 @@ fn test_decompose_and_extend_d2_matches_original() {
         .collect();
     assert_eq!(constraint_evaluations.len(), two_n);
 
-    // --- Original path: iFFT(2N) + break_in_parts(2) + FFT(2N) each ---
+    // --- Original path: iFFT(2N) + break_in_parts(2) to get N-point evals on squared coset ---
     let composition_poly =
         Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
             .expect("interpolation failed");
     let parts = composition_poly.break_in_parts(2);
+    // Evaluate each part on the squared coset (N points with offset g²)
+    let coset_offset_sq = &domain.coset_offset * &domain.coset_offset;
     let original: Vec<Vec<Felt>> = parts
         .iter()
         .map(|part| {
-            evaluate_polynomial_on_lde_domain(part, blowup_factor, n, &domain.coset_offset)
-                .expect("LDE evaluation failed")
+            let primitive_root =
+                GoldilocksField::get_primitive_root_of_unity((n as u64).trailing_zeros() as u64)
+                    .expect("root exists");
+            let mut evals = Vec::with_capacity(n);
+            let mut point = coset_offset_sq.clone();
+            for _ in 0..n {
+                evals.push(part.evaluate(&point));
+                point = &point * &primitive_root;
+            }
+            evals
         })
         .collect();
 
-    // --- New path: algebraic decomposition ---
-    let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
+    // --- New path: eval-form decomposition (no extension) ---
+    let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_d2(
         &constraint_evaluations,
         &domain,
     );
