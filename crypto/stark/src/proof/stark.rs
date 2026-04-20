@@ -78,3 +78,48 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
 }
+
+/// Per-table data in a batched proof (OOD evaluations + public inputs).
+#[derive(Debug, Clone)]
+pub struct TableProofData<F: IsField, E: IsField, PI> {
+    pub trace_length: usize,
+    pub public_inputs: PI,
+    pub trace_ood_evaluations: Table<E>,
+    pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
+    pub bus_public_inputs: Option<BusPublicInputs<E>>,
+    _phantom: core::marker::PhantomData<F>,
+}
+
+/// Per-query opening from all shared Merkle trees.
+#[derive(Debug, Clone)]
+pub struct BatchedQueryOpening<F: IsField, E: IsField> {
+    /// Main trace: opened row and symmetric row + Merkle proofs.
+    pub main_trace: PolynomialOpenings<F>,
+    /// Aux trace: opened row and symmetric row + Merkle proofs (if any table has aux).
+    pub aux_trace: Option<PolynomialOpenings<E>>,
+    /// Composition poly: opened values + Merkle proof.
+    pub composition_poly: PolynomialOpenings<E>,
+}
+
+/// Proof format with shared Merkle trees across all tables.
+#[derive(Debug, Clone)]
+pub struct BatchedProof<F: IsField, E: IsField, PI> {
+    /// Shared Merkle root for all tables' main trace columns.
+    pub main_merkle_root: Commitment,
+    /// Shared Merkle root for all tables' aux trace columns.
+    pub aux_merkle_root: Option<Commitment>,
+    /// Shared Merkle root for all tables' composition poly evaluations.
+    pub composition_merkle_root: Commitment,
+    /// Per-table OOD data and public inputs.
+    pub tables: Vec<TableProofData<F, E, PI>>,
+    /// Shared FRI layer roots.
+    pub fri_layers_merkle_roots: Vec<Commitment>,
+    /// Shared FRI last value.
+    pub fri_last_value: FieldElement<E>,
+    /// Shared FRI decommitments (one per query).
+    pub query_list: Vec<FriDecommitment<E>>,
+    /// Per-query openings from the shared trees.
+    pub query_openings: Vec<BatchedQueryOpening<F, E>>,
+    /// Grinding nonce.
+    pub nonce: Option<u64>,
+}
