@@ -11,10 +11,18 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct PolynomialOpenings<F: IsField> {
+    /// Openings at the 4 positions of the arity-4 orbit: index, index^1, index^2, index^3.
+    /// For trace trees: 4 independent Merkle proofs (one per row).
+    /// For the composition poly tree (pair-leaf): proof and proof_sym cover {0,1} and {2,3}
+    /// respectively, so proof == proof for positions 0&1, proof_sym for positions 2&3.
     pub proof: Proof<Commitment>,
     pub proof_sym: Proof<Commitment>,
+    pub proof_2: Proof<Commitment>,
+    pub proof_3: Proof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_2: Vec<FieldElement<F>>,
+    pub evaluations_3: Vec<FieldElement<F>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
