@@ -439,6 +439,31 @@ pub trait IsStarkProver<
         Ok((tree, root, layout))
     }
 
+    /// Commit all tables' composition poly parts into a shared N-point Merkle tree.
+    /// The parts are the output of `decompose_d2` — N evaluations on the squared coset.
+    /// This commits at half the domain size, skipping the 2N-point extension FFTs.
+    fn commit_composition_polys_batched(
+        per_table_parts: &[Vec<Vec<FieldElement<FieldExtension>>>],
+        trace_length: usize,
+    ) -> Result<(BatchedMerkleTree<FieldExtension>, Commitment, BatchedLayout), ProvingError>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        let column_counts: Vec<usize> = per_table_parts.iter().map(|parts| parts.len()).collect();
+        let layout = BatchedLayout::new(&column_counts, trace_length);
+
+        let all_columns: Vec<Vec<FieldElement<FieldExtension>>> = per_table_parts
+            .iter()
+            .flat_map(|parts| parts.iter().cloned())
+            .collect();
+
+        let (tree, root) = Self::commit_columns_bit_reversed(&all_columns)
+            .ok_or(ProvingError::EmptyCommitment)?;
+
+        Ok((tree, root, layout))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,

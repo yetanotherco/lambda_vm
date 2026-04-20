@@ -43,3 +43,53 @@ fn test_batched_main_trace_commit_and_open() {
         .collect();
     assert!(proof.verify::<BatchedMerkleTreeBackend<GoldilocksField>>(&root, 0, &opened_row));
 }
+
+#[test]
+fn test_batched_composition_commit_n_point() {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    type FeltExt = FieldElement<Degree3GoldilocksExtensionField>;
+
+    // Create fake composition parts for 2 tables (each has 2 parts of N=8 evals)
+    let n = 8usize;
+    let table0_parts: Vec<Vec<FeltExt>> = (0..2)
+        .map(|p| {
+            (0..n)
+                .map(|i| FeltExt::from((p * 100 + i) as u64))
+                .collect()
+        })
+        .collect();
+    let table1_parts: Vec<Vec<FeltExt>> = (0..2)
+        .map(|p| {
+            (0..n)
+                .map(|i| FeltExt::from((p * 200 + i) as u64))
+                .collect()
+        })
+        .collect();
+
+    let per_table = vec![table0_parts.clone(), table1_parts.clone()];
+    let (tree, root, layout) =
+        Prover::<GoldilocksField, Degree3GoldilocksExtensionField, ()>::commit_composition_polys_batched(
+            &per_table, n,
+        )
+        .expect("Commit should succeed");
+
+    // Layout: 2 + 2 = 4 total columns, domain_size = N (not 2N)
+    assert_eq!(layout.total_columns, 4);
+    assert_eq!(layout.domain_size, n);
+    assert_eq!(layout.table_ranges, vec![(0, 2), (2, 4)]);
+
+    // Open at index 0 and verify the Merkle proof
+    let proof = tree
+        .get_proof_by_pos(0)
+        .expect("Should get proof at index 0");
+    let br_0 = math::fft::cpu::bit_reversing::reverse_index(0, n as u64);
+    let opened_row: Vec<FeltExt> = vec![
+        table0_parts[0][br_0].clone(),
+        table0_parts[1][br_0].clone(),
+        table1_parts[0][br_0].clone(),
+        table1_parts[1][br_0].clone(),
+    ];
+    assert!(proof.verify::<BatchedMerkleTreeBackend<Degree3GoldilocksExtensionField>>(
+        &root, 0, &opened_row
+    ));
+}
