@@ -1,6 +1,30 @@
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
+
+pub fn set_heap_reader(f: fn() -> Option<usize>) {
+    let _ = HEAP_READER.set(f);
+}
+
+pub fn heap_bytes() -> Option<usize> {
+    HEAP_READER.get().and_then(|f| f())
+}
+
+pub type HeapSnapshot = (&'static str, usize);
+
+pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
+    heap_bytes().map(|b| (label, b))
+}
+
+pub struct ProveHeapProfile {
+    pub before: Option<usize>,
+    pub after_execute: Option<usize>,
+    pub after_trace_build: Option<usize>,
+    pub after_air: Option<usize>,
+}
 
 /// Sub-operation timing breakdown for a single table in Rounds 2-4.
 #[derive(Clone, Debug, Default)]
@@ -49,6 +73,7 @@ pub struct MultiProveTiming {
     pub round1_sub: Round1SubOps,
     /// (name, rows, duration, sub_ops) per table for rounds 2-4.
     pub table_timings: Vec<(String, usize, Duration, TableSubOps)>,
+    pub heap_snapshots: Vec<HeapSnapshot>,
 }
 
 /// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.

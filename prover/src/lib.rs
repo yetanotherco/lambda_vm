@@ -511,6 +511,8 @@ pub fn prove_with_options_and_inputs(
 ) -> Result<VmProof, Error> {
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
@@ -525,6 +527,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_execute = stark::instruments::heap_bytes();
 
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
@@ -545,6 +549,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_trace = stark::instruments::heap_bytes();
 
     // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
@@ -561,6 +567,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_air = stark::instruments::heap_bytes();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
@@ -578,6 +586,12 @@ pub fn prove_with_options_and_inputs(
             trace_build_elapsed,
             air_elapsed,
             total_start.elapsed(),
+            &stark::instruments::ProveHeapProfile {
+                before: heap_before,
+                after_execute: heap_after_execute,
+                after_trace_build: heap_after_trace,
+                after_air: heap_after_air,
+            },
         );
     }
 

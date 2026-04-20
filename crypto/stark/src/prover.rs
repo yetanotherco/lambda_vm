@@ -1523,6 +1523,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
+        #[cfg(feature = "instruments")]
+        let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
 
         let num_airs = air_trace_pairs.len();
 
@@ -1604,6 +1606,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After pool alloc") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1736,6 +1742,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After main commits") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1787,6 +1797,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux build") {
+            heap_snaps.push(s);
+        }
 
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork and pool set.
@@ -1940,6 +1954,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux commit") {
+            heap_snaps.push(s);
+        }
 
         #[cfg(feature = "debug-checks")]
         {
@@ -1983,8 +2001,6 @@ pub trait IsStarkProver<
             // Barrier: wait for async spill writes to complete and populate
             // each table's mmap_backing. After this loop all reads from
             // spilled_ldes are safe.
-            #[cfg(feature = "instruments")]
-            let t_resolve = Instant::now();
             for slot in spilled_ldes.iter_mut() {
                 if let Some(lde) = slot.as_mut() {
                     lde.resolve_pending_spills().map_err(|e| {
@@ -1994,8 +2010,6 @@ pub trait IsStarkProver<
                     })?;
                 }
             }
-            #[cfg(feature = "instruments")]
-            crate::instruments::accum_r1_lde_spill(t_resolve.elapsed());
 
             for chunk_start in (0..num_airs).step_by(k) {
                 let chunk_end = (chunk_start + k).min(num_airs);
@@ -2048,6 +2062,7 @@ pub trait IsStarkProver<
 
                         // Collect per-table sub-op timing via TLS.
                         #[cfg(feature = "instruments")]
+                        #[allow(clippy::needless_return)]
                         {
                             let sub_ops =
                                 crate::instruments::take_round_sub_ops().unwrap_or_default();
@@ -2194,6 +2209,7 @@ pub trait IsStarkProver<
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
+                heap_snapshots: heap_snaps,
             });
         }
 

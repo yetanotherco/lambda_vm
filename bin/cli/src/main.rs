@@ -350,6 +350,12 @@ fn cmd_prove(
         eprintln!("Disk-spill: enabled");
     }
 
+    #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
+    stark::instruments::set_heap_reader(|| {
+        tikv_jemalloc_ctl::epoch::advance().ok();
+        tikv_jemalloc_ctl::stats::allocated::read().ok()
+    });
+
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
