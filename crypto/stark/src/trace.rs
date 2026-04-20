@@ -178,22 +178,22 @@ where
         self.aux_table.extract_columns(capacity)
     }
 }
-/// Flat row-major LDE trace for the STARK prover.
+/// Column-major LDE trace table.
 ///
-/// Main and auxiliary evaluations are stored in two flat buffers laid out as
-/// `[row0_col0, row0_col1, ..., row0_colN, row1_col0, ...]`. This gives the
-/// constraint evaluator a single contiguous slice read per frame row instead of
-/// one random memory access per column.
+/// Stores LDE evaluations as separate column vectors rather than a row-major Table.
+/// This eliminates the expensive T2 transpose (col→row) that `Table::from_columns`
+/// performs, significantly reducing allocation and element clones.
+///
+/// Trade-off: row access requires gathering from columns (74 random reads per row),
+/// but this is negligible vs constraint evaluation cost. Column access (used by
+/// `get_main`/`get_aux`, barycentric eval, DEEP poly) is sequential and cache-friendly.
 pub struct LDETraceTable<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    main_flat: Vec<FieldElement<F>>,
-    aux_flat: Vec<FieldElement<E>>,
-    num_main: usize,
-    num_aux: usize,
-    nrows: usize,
+    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
+    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
 }
@@ -203,117 +203,87 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    /// Build a row-major LDETraceTable by consuming the column vectors from the LDE
-    /// step. Columns are scattered into the flat buffer one at a time so each source
-    /// column's allocation is freed as soon as its elements are copied.
+    /// Creates a column-major LDETraceTable by consuming column vectors directly.
+    /// No transpose is performed — columns are stored as-is.
     pub fn from_columns(
         main_columns: Vec<Vec<FieldElement<F>>>,
         aux_columns: Vec<Vec<FieldElement<E>>>,
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
-        let nrows = main_columns.first().map(|c| c.len()).unwrap_or(0);
-        let num_main = main_columns.len();
-        let num_aux = aux_columns.len();
         let lde_step_size = trace_step_size * blowup_factor;
 
-        let mut main_flat = vec![FieldElement::<F>::zero(); nrows * num_main];
-        for (col_idx, col) in main_columns.into_iter().enumerate() {
-            for (row, val) in col.into_iter().enumerate() {
-                main_flat[row * num_main + col_idx] = val;
-            }
-        }
-
-        let mut aux_flat = vec![FieldElement::<E>::zero(); nrows * num_aux];
-        for (col_idx, col) in aux_columns.into_iter().enumerate() {
-            for (row, val) in col.into_iter().enumerate() {
-                aux_flat[row * num_aux + col_idx] = val;
-            }
-        }
-
         Self {
-            main_flat,
-            aux_flat,
-            num_main,
-            num_aux,
-            nrows,
+            main_columns,
+            aux_columns,
             lde_step_size,
             blowup_factor,
         }
     }
 
-    /// Consume self and return owned column vectors (un-transpose).
+    /// Consume self and return the owned column vectors.
     #[allow(clippy::type_complexity)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
-        let mut main_columns = vec![Vec::with_capacity(self.nrows); self.num_main];
-        for row in 0..self.nrows {
-            let row_slice = &self.main_flat[row * self.num_main..(row + 1) * self.num_main];
-            for (col, val) in row_slice.iter().enumerate() {
-                main_columns[col].push(val.clone());
-            }
-        }
-        let mut aux_columns = vec![Vec::with_capacity(self.nrows); self.num_aux];
-        for row in 0..self.nrows {
-            let row_slice = &self.aux_flat[row * self.num_aux..(row + 1) * self.num_aux];
-            for (col, val) in row_slice.iter().enumerate() {
-                aux_columns[col].push(val.clone());
-            }
-        }
-        (main_columns, aux_columns)
+        (self.main_columns, self.aux_columns)
     }
 
     pub fn num_main_cols(&self) -> usize {
-        self.num_main
+        self.main_columns.len()
     }
 
     pub fn num_aux_cols(&self) -> usize {
-        self.num_aux
+        self.aux_columns.len()
     }
 
     pub fn num_rows(&self) -> usize {
-        self.nrows
+        if self.main_columns.is_empty() {
+            0
+        } else {
+            self.main_columns[0].len()
+        }
     }
 
+    /// Get a single main-trace element by (row, col).
     #[inline]
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
-        &self.main_flat[row * self.num_main + col]
+        &self.main_columns[col][row]
     }
 
+    /// Get a single aux-trace element by (row, col).
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux_flat[row * self.num_aux + col]
+        &self.aux_columns[col][row]
     }
 
-    /// Borrow a full main-trace row as a contiguous slice.
-    #[inline]
-    pub(crate) fn main_row(&self, row: usize) -> &[FieldElement<F>] {
-        let start = row * self.num_main;
-        &self.main_flat[start..start + self.num_main]
-    }
-
-    /// Borrow a full aux-trace row as a contiguous slice.
-    #[inline]
-    pub(crate) fn aux_row(&self, row: usize) -> &[FieldElement<E>] {
-        let start = row * self.num_aux;
-        &self.aux_flat[start..start + self.num_aux]
-    }
-
+    /// Gather a full main-trace row into an owned Vec.
+    /// Used by `open_trace_polys` (called ~30 times per table, allocation is negligible).
     pub fn gather_main_row(&self, row_idx: usize) -> Vec<FieldElement<F>> {
-        self.main_row(row_idx).to_vec()
+        self.main_columns
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
     }
 
+    /// Gather a range of main-trace columns for a given row.
+    /// Used by `open_trace_polys_with_columns` for preprocessed table openings.
     pub fn gather_main_row_range(
         &self,
         row_idx: usize,
         col_start: usize,
         col_end: usize,
     ) -> Vec<FieldElement<F>> {
-        let start = row_idx * self.num_main + col_start;
-        self.main_flat[start..start + (col_end - col_start)].to_vec()
+        self.main_columns[col_start..col_end]
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
     }
 
+    /// Gather a full aux-trace row into an owned Vec.
     pub fn gather_aux_row(&self, row_idx: usize) -> Vec<FieldElement<E>> {
-        self.aux_row(row_idx).to_vec()
+        self.aux_columns
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
     }
 
     pub fn num_steps(&self) -> usize {
@@ -324,6 +294,74 @@ where
 
     pub fn step_to_row(&self, step: usize) -> usize {
         self.lde_step_size * step
+    }
+
+    /// Transpose the column-major LDE trace into a flat row-major buffer.
+    ///
+    /// Reads each source column sequentially (cache-friendly), scattering elements
+    /// into strided positions in the output. The one-time O(n·m) cost amortizes over
+    /// the 2N repeated row reads during constraint evaluation.
+    pub(crate) fn to_row_major(&self) -> RowMajorLDETrace<F, E> {
+        let n = self.num_rows();
+        let nm = self.num_main_cols();
+        let na = self.num_aux_cols();
+
+        let mut main = vec![FieldElement::<F>::zero(); n * nm];
+        for col in 0..nm {
+            for row in 0..n {
+                main[row * nm + col] = self.main_columns[col][row].clone();
+            }
+        }
+
+        let mut aux = vec![FieldElement::<E>::zero(); n * na];
+        for col in 0..na {
+            for row in 0..n {
+                aux[row * na + col] = self.aux_columns[col][row].clone();
+            }
+        }
+
+        RowMajorLDETrace {
+            main,
+            aux,
+            num_main_cols: nm,
+            num_aux_cols: na,
+            lde_step_size: self.lde_step_size,
+            blowup_factor: self.blowup_factor,
+            num_rows: n,
+        }
+    }
+}
+
+/// Row-major view of LDE trace data for cache-friendly constraint evaluation.
+///
+/// Built once by `LDETraceTable::to_row_major()` before the hot constraint loop.
+/// Accessing row `i` is a single contiguous slice read vs `num_cols` random column
+/// reads from the column-major `LDETraceTable`.
+pub(crate) struct RowMajorLDETrace<F: IsSubFieldOf<E>, E: IsField> {
+    main: Vec<FieldElement<F>>,
+    aux: Vec<FieldElement<E>>,
+    pub(crate) num_main_cols: usize,
+    pub(crate) num_aux_cols: usize,
+    pub(crate) lde_step_size: usize,
+    pub(crate) blowup_factor: usize,
+    num_rows: usize,
+}
+
+impl<F: IsSubFieldOf<E>, E: IsField> RowMajorLDETrace<F, E> {
+    #[inline]
+    pub(crate) fn get_main_row(&self, row: usize) -> &[FieldElement<F>] {
+        let start = row * self.num_main_cols;
+        &self.main[start..start + self.num_main_cols]
+    }
+
+    #[inline]
+    pub(crate) fn get_aux_row(&self, row: usize) -> &[FieldElement<E>] {
+        let start = row * self.num_aux_cols;
+        &self.aux[start..start + self.num_aux_cols]
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
     }
 }
 
