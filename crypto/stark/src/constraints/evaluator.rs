@@ -50,7 +50,6 @@ where
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
-        let row_major = lde_trace.to_row_major();
         let is_uniform = zerofier_data.is_uniform();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
@@ -97,7 +96,7 @@ where
                         )
                     },
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
-                        frame.fill_from_row_major(&row_major, i, offsets);
+                        frame.fill_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
                             periodic_buf[j] = col[i].clone();
@@ -149,7 +148,7 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    frame.fill_from_row_major(&row_major, i, offsets);
+                    frame.fill_from_lde(lde_trace, i, offsets);
 
                     for (j, col) in lde_periodic_columns.iter().enumerate() {
                         periodic_buf[j] = col[i].clone();
