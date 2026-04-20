@@ -68,16 +68,3 @@ pub fn matched_params_config() -> P3Config {
     let pcs = Pcs::new(dft, val_mmcs, fri_params);
     P3Config::new(pcs, challenger)
 }
-
-/// Creates a Plonky3 STARK config with Plonky3's standard benchmark parameters:
-/// blowup=2, 100 FRI queries, 16-bit query PoW.
-pub fn plonky3_benchmark_config() -> P3Config {
-    let (val_mmcs, challenge_mmcs, byte_hash) = build_mmcs();
-    let dft = Dft::default();
-    let challenger = Challenger::from_hasher(vec![], byte_hash);
-
-    let fri_params = FriParameters::new_benchmark(challenge_mmcs);
-
-    let pcs = Pcs::new(dft, val_mmcs, fri_params);
-    P3Config::new(pcs, challenger)
-}

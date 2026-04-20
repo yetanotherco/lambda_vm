@@ -18,20 +18,20 @@ math = { path = "../crypto/math", features = [
 # the same git source + ref; declaring any of them as a crates.io dep would
 # pull in a second incompatible p3-field. cargo clones the fork once into
 # ~/.cargo/git/db and Cargo.lock pins the branch HEAD at fetch time.
-p3-air = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-field = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-goldilocks = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-matrix = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-commit = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-challenger = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-symmetric = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-merkle-tree = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-keccak = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-fri = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-uni-stark = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
+p3-air = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-field = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-goldilocks = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-matrix = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-commit = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-challenger = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-symmetric = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-merkle-tree = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-keccak = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-fri = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
+p3-uni-stark = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
     "parallel",
 ] }
-p3-dft = { git = "ssh://git@github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
+p3-dft = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
     "parallel",
 ] }
 

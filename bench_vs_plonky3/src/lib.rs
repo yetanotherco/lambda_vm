@@ -76,8 +76,9 @@ mod tests {
     }
 
     /// Lambda prove with instruments breakdown + P3 span-based breakdown.
-    /// Run: cargo test -p bench-vs-plonky3 --features instruments --release -- instruments_breakdown --nocapture
+    /// Run: cargo test -p bench-vs-plonky3 --features instruments --release -- instruments_breakdown --ignored --nocapture
     #[test]
+    #[ignore = "heavy: run with --release -- instruments_breakdown --ignored --nocapture"]
     fn instruments_breakdown() {
         let num_sequences = 16;
         let rows = 1 << 19;
@@ -211,8 +212,14 @@ mod tests {
 
         type SpanResults = Arc<Mutex<Vec<(String, f64)>>>;
 
+        struct SpanState {
+            name: String,
+            active_since: Option<std::time::Instant>,
+            accumulated: std::time::Duration,
+        }
+
         struct P3TimingLayer {
-            spans: Mutex<HashMap<u64, (String, Option<std::time::Instant>)>>,
+            spans: Mutex<HashMap<u64, SpanState>>,
             results: SpanResults,
         }
 
@@ -227,19 +234,39 @@ mod tests {
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
                 let name = attrs.metadata().name().to_string();
-                self.spans
-                    .lock()
-                    .unwrap()
-                    .insert(id.into_u64(), (name, None));
+                self.spans.lock().unwrap().insert(
+                    id.into_u64(),
+                    SpanState {
+                        name,
+                        active_since: None,
+                        accumulated: std::time::Duration::ZERO,
+                    },
+                );
             }
 
+            // Rayon can re-enter a span across threads, so only start timing on
+            // the first enter after each exit; accumulate every interval.
             fn on_enter(
                 &self,
                 id: &tracing::span::Id,
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
-                    entry.1 = Some(std::time::Instant::now());
+                if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
+                    && entry.active_since.is_none()
+                {
+                    entry.active_since = Some(std::time::Instant::now());
+                }
+            }
+
+            fn on_exit(
+                &self,
+                id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
+                    && let Some(start) = entry.active_since.take()
+                {
+                    entry.accumulated += start.elapsed();
                 }
             }
 
@@ -248,10 +275,15 @@ mod tests {
                 id: tracing::span::Id,
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                if let Some((name, Some(start))) = self.spans.lock().unwrap().remove(&id.into_u64())
-                {
-                    let ms = start.elapsed().as_secs_f64() * 1000.0;
-                    self.results.lock().unwrap().push((name, ms));
+                if let Some(entry) = self.spans.lock().unwrap().remove(&id.into_u64()) {
+                    // If we never saw on_exit (span closed while active), include
+                    // the dangling interval.
+                    let mut total = entry.accumulated;
+                    if let Some(start) = entry.active_since {
+                        total += start.elapsed();
+                    }
+                    let ms = total.as_secs_f64() * 1000.0;
+                    self.results.lock().unwrap().push((entry.name, ms));
                 }
             }
         }

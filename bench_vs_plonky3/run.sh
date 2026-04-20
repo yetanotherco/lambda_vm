@@ -18,7 +18,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_DIR="/tmp/bench_p3"
+TMP_DIR="$(mktemp -d -t bench_p3.XXXXXX)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 REPORT_DIR=""
 NO_COLOR=false
 SCALAR=false
@@ -108,9 +109,6 @@ if $NO_COLOR; then
     BOLD=''
     NC=''
 fi
-
-mkdir -p "$TMP_DIR"
-rm -rf "$TMP_DIR"/*
 
 if [ -n "$REPORT_DIR" ]; then
     mkdir -p "$REPORT_DIR/raw"
