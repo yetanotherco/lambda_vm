@@ -167,6 +167,26 @@ impl<F: IsField> Table<F> {
             .collect()
     }
 
+    /// Extract columns as owned vectors, with each allocated at `capacity`.
+    ///
+    /// `capacity` is a hint sized for downstream LDE expansion so the FFT grows
+    /// in place without a second allocation.
+    pub fn extract_columns(&self, capacity: usize) -> Vec<Vec<FieldElement<F>>> {
+        let capacity = capacity.max(self.height);
+        #[cfg(feature = "parallel")]
+        let iter = (0..self.width).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..self.width;
+        iter.map(|col_idx| {
+            let mut buf = Vec::with_capacity(capacity);
+            for row_idx in 0..self.height {
+                buf.push(self.get(row_idx, col_idx).clone());
+            }
+            buf
+        })
+        .collect()
+    }
+
     /// Extract columns directly into pre-allocated output buffers.
     ///
     /// Each `output[col_idx]` is cleared and filled with the column data.
