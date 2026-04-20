@@ -25,11 +25,10 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -567,71 +566,40 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
 /// Creates all constraints for the LOAD table.
-pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
         Vec::new();
 
     let mut idx = 0;
 
     // (read2 + read4 + read8) => μ
-    constraints.push(Box::new(LoadConstraint::new(
-        LoadConstraintKind::ReadImpliesMu,
-        idx,
-    )));
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx).boxed());
     idx += 1;
 
     // Extension constraints for high bytes (4..8): !read8 => res[i] = extended
     for i in 4..8 {
-        constraints.push(Box::new(LoadConstraint::new(
-            LoadConstraintKind::ExtensionHigh(i),
-            idx,
-        )));
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionHigh(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraints for mid bytes (2..4): !(read4 + read8) => res[i] = extended
     for i in 2..4 {
-        constraints.push(Box::new(LoadConstraint::new(
-            LoadConstraintKind::ExtensionMid(i),
-            idx,
-        )));
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionMid(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraint for low byte (1): !(read2 + read4 + read8) => res[1] = extended
-    constraints.push(Box::new(LoadConstraint::new(
-        LoadConstraintKind::ExtensionLow,
-        idx,
-    )));
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx).boxed());
 
     constraints
 }

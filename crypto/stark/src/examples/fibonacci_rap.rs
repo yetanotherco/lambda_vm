@@ -3,7 +3,7 @@ use std::{marker::PhantomData, ops::Div};
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -30,7 +30,7 @@ impl<F: IsFFTField> FibConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -48,7 +48,7 @@ where
         3 + 32 - 16 - 1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -95,7 +95,7 @@ impl<F: IsFFTField> PermutationConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for PermutationConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for PermutationConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -111,7 +111,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -153,7 +153,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +181,7 @@ where
 
     fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
-            Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
         > = vec![
             Box::new(FibConstraint::new()),
             Box::new(PermutationConstraint::new()),
@@ -265,7 +265,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
 
