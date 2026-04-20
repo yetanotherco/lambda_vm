@@ -1219,6 +1219,17 @@ pub trait IsStarkProver<
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+        let num_total_cols = num_main_cols + num_aux_cols;
+
+        // Precompute ood_correction[k] = Σ_j γ'_{j,k} · t_j(z·w^k).
+        // This is constant across all domain points so we hoist it out of the domain loop.
+        let ood_correction: Vec<FieldElement<FieldExtension>> = (0..num_eval_points)
+            .map(|k| {
+                (0..num_total_cols).fold(FieldElement::zero(), |acc, j| {
+                    acc + &trace_terms_gammas[j][k] * &trace_ood_columns[j][k]
+                })
+            })
+            .collect();
 
         // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
@@ -1238,23 +1249,26 @@ pub trait IsStarkProver<
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
-            let num_total_cols = num_main_cols + num_aux_cols;
-            for j in 0..num_total_cols {
-                let gammas_j = &trace_terms_gammas[j];
-                let ood_evals_j = &trace_ood_columns[j];
+            // Trace terms: k-outer loop so inv_denom is applied once per k rather than
+            // once per (j,k). Main-column values are base field, so gamma * trace_val
+            // uses IsSubFieldOf::mul (3 base muls instead of 9 for a full ext×ext mul).
+            for k in 0..num_eval_points {
+                let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
+                let mut trace_sum = FieldElement::<FieldExtension>::zero();
 
-                for k in 0..num_eval_points {
-                    let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-
-                    let t_j_ood = &ood_evals_j[k];
-                    let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j) - t_j_ood
-                    } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
-                    };
-                    result += &gammas_j[k] * numerator * inv_t_k_i;
+                for j in 0..num_main_cols {
+                    // base × ext via IsSubFieldOf: [a*g0, a*g1, a*g2] — 3 base muls
+                    trace_sum += lde_trace.get_main(row_idx, j) * &trace_terms_gammas[j][k];
                 }
+
+                for j in 0..num_aux_cols {
+                    // aux is already ext field: full ext×ext mul (unavoidable)
+                    trace_sum +=
+                        &trace_terms_gammas[num_main_cols + j][k] * lde_trace.get_aux(row_idx, j);
+                }
+
+                // One ext×ext mul per k (not per (j,k)) to apply the denominator
+                result += (trace_sum - &ood_correction[k]) * inv_t_k_i;
             }
 
             result
