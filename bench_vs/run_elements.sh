@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Compare main-trace field elements: Lambda VM vs SP1 v6 vs SP1 v5 — Fibonacci.
 #
 # "Field elements to prove" = sum over all AIR tables of (padded_rows × num_columns).
