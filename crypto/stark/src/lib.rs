@@ -14,6 +14,8 @@ pub mod instruments;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
+#[cfg(feature = "disk-spill")]
+pub(crate) mod spill_worker;
 pub mod table;
 pub mod trace;
 pub mod traits;

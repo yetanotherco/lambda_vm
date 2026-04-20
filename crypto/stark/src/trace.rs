@@ -221,6 +221,10 @@ where
     /// of `main_columns`/`aux_columns` (which are empty after spill).
     #[cfg(feature = "disk-spill")]
     pub(crate) mmap_backing: Option<MmapBacking>,
+    /// Pending async spill submissions. Populated between submit and
+    /// `resolve_pending_spills()`; must be `None` before reads.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) pending_spill: Option<PendingSpill>,
 }
 
 /// File-backed mmap storage for LDE column data (column-major layout).
@@ -230,6 +234,19 @@ where
 pub(crate) struct MmapBacking {
     main_mmap: memmap2::Mmap,
     aux_mmap: Option<memmap2::Mmap>,
+    num_rows: usize,
+    num_main_cols: usize,
+    num_aux_cols: usize,
+    main_elem_size: usize,
+    aux_elem_size: usize,
+}
+
+/// Handles for in-flight spill writes plus geometry needed to construct
+/// the final `MmapBacking` once the writes complete.
+#[cfg(feature = "disk-spill")]
+pub(crate) struct PendingSpill {
+    main_handle: Option<crate::spill_worker::SpillHandle>,
+    aux_handle: Option<crate::spill_worker::SpillHandle>,
     num_rows: usize,
     num_main_cols: usize,
     num_aux_cols: usize,
@@ -259,6 +276,8 @@ where
             blowup_factor,
             #[cfg(feature = "disk-spill")]
             mmap_backing: None,
+            #[cfg(feature = "disk-spill")]
+            pending_spill: None,
         }
     }
 
@@ -274,6 +293,10 @@ where
         if let Some(ref backing) = self.mmap_backing {
             return backing.num_main_cols;
         }
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref pending) = self.pending_spill {
+            return pending.num_main_cols;
+        }
         self.main_columns.len()
     }
 
@@ -282,6 +305,10 @@ where
         if let Some(ref backing) = self.mmap_backing {
             return backing.num_aux_cols;
         }
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref pending) = self.pending_spill {
+            return pending.num_aux_cols;
+        }
         self.aux_columns.len()
     }
 
@@ -289,6 +316,10 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             return backing.num_rows;
+        }
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref pending) = self.pending_spill {
+            return pending.num_rows;
         }
         if self.main_columns.is_empty() {
             0
@@ -381,8 +412,10 @@ where
         self.lde_step_size * step
     }
 
-    /// Write pool column data to a temp file and return an mmap-backed
-    /// LDETraceTable. Pool buffers keep their capacity for reuse.
+    /// Copy pool column data into a contiguous `Box<[u8]>` and submit the
+    /// write to the async spill worker. Returns an `LDETraceTable` whose
+    /// `mmap_backing` is filled in later by `resolve_pending_spills()`.
+    /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_from_pool(
         main_pool: &[Vec<FieldElement<F>>],
@@ -397,8 +430,9 @@ where
         };
 
         let main_elem_size = std::mem::size_of::<FieldElement<F>>();
-        let main_mmap =
-            Self::write_pool_columns_to_mmap(&main_pool[..num_main_cols], main_elem_size)?;
+        let main_bytes =
+            Self::copy_pool_columns_to_boxed(&main_pool[..num_main_cols], main_elem_size)?;
+        let main_handle = crate::spill_worker::SpillWorker::global().submit(main_bytes);
 
         let lde_step_size = trace_step_size * blowup_factor;
         let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
@@ -408,9 +442,10 @@ where
             aux_columns: Vec::new(),
             lde_step_size,
             blowup_factor,
-            mmap_backing: Some(MmapBacking {
-                main_mmap,
-                aux_mmap: None,
+            mmap_backing: None,
+            pending_spill: Some(PendingSpill {
+                main_handle: Some(main_handle),
+                aux_handle: None,
                 num_rows,
                 num_main_cols,
                 num_aux_cols: 0,
@@ -420,10 +455,11 @@ where
         })
     }
 
-    /// Add aux LDE columns from the pool to an already-spilled LDETraceTable.
+    /// Submit the aux LDE write to the async spill worker.
     ///
-    /// Used during Phase B to attach aux data to a table whose main LDE was
-    /// already spilled in Phase A.
+    /// Used during Phase C to attach aux data to a table whose main LDE was
+    /// already submitted in Phase A. The aux handle is resolved alongside
+    /// the main handle by `resolve_pending_spills()`.
     #[cfg(feature = "disk-spill")]
     pub fn add_aux_from_pool(
         &mut self,
@@ -435,29 +471,54 @@ where
         }
 
         let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
-        let aux_mmap = Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
+        let aux_bytes = Self::copy_pool_columns_to_boxed(&aux_pool[..num_aux_cols], aux_elem_size)?;
+        let aux_handle = crate::spill_worker::SpillWorker::global().submit(aux_bytes);
 
-        let backing = self
-            .mmap_backing
+        let pending = self
+            .pending_spill
             .as_mut()
-            .expect("add_aux_from_pool requires main already spilled");
-        backing.aux_mmap = Some(aux_mmap);
-        backing.num_aux_cols = num_aux_cols;
+            .expect("add_aux_from_pool requires pending main spill");
+        pending.aux_handle = Some(aux_handle);
+        pending.num_aux_cols = num_aux_cols;
 
         Ok(())
     }
 
-    /// Write pool columns to a temp file and return the mmap.
-    /// The file descriptor is closed before returning; the mapping keeps
-    /// its own reference to the underlying object.
+    /// Wait on all pending spill writes and populate `mmap_backing`.
+    /// After this call `pending_spill` is `None` and reads from
+    /// `main_mmap`/`aux_mmap` are safe.
+    #[cfg(feature = "disk-spill")]
+    pub fn resolve_pending_spills(&mut self) -> std::io::Result<()> {
+        let Some(pending) = self.pending_spill.take() else {
+            return Ok(());
+        };
+
+        let main_mmap = pending
+            .main_handle
+            .expect("pending spill must have a main handle")
+            .wait()?;
+        let aux_mmap = pending.aux_handle.map(|h| h.wait()).transpose()?;
+
+        self.mmap_backing = Some(MmapBacking {
+            main_mmap,
+            aux_mmap,
+            num_rows: pending.num_rows,
+            num_main_cols: pending.num_main_cols,
+            num_aux_cols: pending.num_aux_cols,
+            main_elem_size: pending.main_elem_size,
+            aux_elem_size: pending.aux_elem_size,
+        });
+
+        Ok(())
+    }
+
+    /// Copy pool columns into a contiguous `Box<[u8]>` for async spill.
     /// Pool buffers keep their capacity for reuse.
     #[cfg(feature = "disk-spill")]
-    fn write_pool_columns_to_mmap<T>(
+    fn copy_pool_columns_to_boxed<T>(
         columns: &[Vec<T>],
         elem_size: usize,
-    ) -> std::io::Result<memmap2::Mmap> {
-        use std::io::Write;
-
+    ) -> std::io::Result<Box<[u8]>> {
         debug_assert_eq!(
             elem_size,
             std::mem::size_of::<T>(),
@@ -470,39 +531,34 @@ where
             columns.iter().all(|c| c.len() == num_rows),
             "all columns must have the same length"
         );
-        let total_bytes = (num_cols as u64)
+        let total_bytes_u64 = (num_cols as u64)
             .checked_mul(num_rows as u64)
             .and_then(|n| n.checked_mul(elem_size as u64))
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "write_pool_columns_to_mmap: byte count overflows u64",
+                    "copy_pool_columns_to_boxed: byte count overflows u64",
                 )
             })?;
+        let total_bytes = usize::try_from(total_bytes_u64).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "copy_pool_columns_to_boxed: byte count overflows usize",
+            )
+        })?;
 
-        let file = tempfile::tempfile()?;
-        file.set_len(total_bytes)?;
-        {
-            let mut writer = std::io::BufWriter::with_capacity(crypto::SPILL_BUF_CAPACITY, &file);
-            for col in columns {
-                // SAFETY: T is a FieldElement which is #[repr(transparent)],
-                // so the Vec has the same byte layout as a contiguous array.
-                // `col.len() * elem_size` fits in usize because Vec allocations
-                // are bounded by isize::MAX bytes.
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
-                };
-                writer.write_all(bytes)?;
-            }
-            writer.flush()?;
+        let mut buf: Vec<u8> = Vec::with_capacity(total_bytes);
+        for col in columns {
+            // SAFETY: T is a FieldElement which is #[repr(transparent)],
+            // so the Vec has the same byte layout as a contiguous array.
+            // `col.len() * elem_size` fits in usize because Vec allocations
+            // are bounded by isize::MAX bytes.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
+            };
+            buf.extend_from_slice(bytes);
         }
-        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
-        // so no other process can open or modify it.
-        // The mapping keeps its own reference to the underlying object
-        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
-        // `file` local can drop at end of scope without invalidating it.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Ok(mmap)
+        Ok(buf.into_boxed_slice())
     }
 }
 
@@ -716,10 +772,12 @@ mod disk_spill_tests {
             })
             .collect();
 
-        let lde = LDETraceTable::<F, E>::spill_main_from_pool(
+        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(
             &pool, num_cols, /*trace_step_size=*/ 1, /*blowup_factor=*/ 1,
         )
         .expect("spill_main_from_pool failed");
+        lde.resolve_pending_spills()
+            .expect("resolve_pending_spills failed");
 
         assert_eq!(lde.num_main_cols(), num_cols);
         assert_eq!(lde.num_rows(), num_rows);
@@ -768,6 +826,8 @@ mod disk_spill_tests {
 
         lde.add_aux_from_pool(&aux_pool, num_aux)
             .expect("add_aux_from_pool failed");
+        lde.resolve_pending_spills()
+            .expect("resolve_pending_spills failed");
 
         assert_eq!(lde.num_main_cols(), num_main);
         assert_eq!(lde.num_aux_cols(), num_aux);

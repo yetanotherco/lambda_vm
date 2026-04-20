@@ -1980,6 +1980,23 @@ pub trait IsStarkProver<
         // ----- disk-spill path: read from spilled LDEs -----
         #[cfg(feature = "disk-spill")]
         {
+            // Barrier: wait for async spill writes to complete and populate
+            // each table's mmap_backing. After this loop all reads from
+            // spilled_ldes are safe.
+            #[cfg(feature = "instruments")]
+            let t_resolve = Instant::now();
+            for slot in spilled_ldes.iter_mut() {
+                if let Some(lde) = slot.as_mut() {
+                    lde.resolve_pending_spills().map_err(|e| {
+                        ProvingError::WrongParameter(format!(
+                            "disk-spill resolve pending spill: {e}"
+                        ))
+                    })?;
+                }
+            }
+            #[cfg(feature = "instruments")]
+            crate::instruments::accum_r1_lde_spill(t_resolve.elapsed());
+
             for chunk_start in (0..num_airs).step_by(k) {
                 let chunk_end = (chunk_start + k).min(num_airs);
 
