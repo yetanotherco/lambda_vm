@@ -5,8 +5,6 @@ use std::time::Duration;
 /// Sub-operation timing breakdown for a single table in Rounds 2-4.
 #[derive(Clone, Debug, Default)]
 pub struct TableSubOps {
-    /// reconstruct_round1 (expand_pool_to_lde)
-    pub trace_lde: Duration,
     /// evaluator.evaluate()
     pub constraints: Duration,
     /// decompose_and_extend_d2
