@@ -1566,7 +1566,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "parallel")]
             let spill_iter = air_trace_pairs.par_iter_mut();
             #[cfg(not(feature = "parallel"))]
-            let spill_iter = air_trace_pairs.iter_mut();
+            let mut spill_iter = air_trace_pairs.iter_mut();
             spill_iter.try_for_each(|(_, trace, _)| {
                 trace.main_table.spill_to_disk().map_err(|e| {
                     ProvingError::WrongParameter(format!("disk-spill early main: {e}"))
@@ -1688,7 +1688,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "parallel")]
             let spill_iter = air_trace_pairs.par_iter_mut();
             #[cfg(not(feature = "parallel"))]
-            let spill_iter = air_trace_pairs.iter_mut();
+            let mut spill_iter = air_trace_pairs.iter_mut();
             spill_iter.try_for_each(|(air, trace, _)| {
                 if air.has_aux_trace() {
                     trace.spill_aux_to_disk().map_err(|e| {
