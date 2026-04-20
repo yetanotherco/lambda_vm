@@ -1,4 +1,5 @@
 pub mod air_tests;
+pub mod batched_tests;
 pub mod boundary_tests;
 pub mod bus_tests;
 pub mod fri_tests;

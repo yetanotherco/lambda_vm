@@ -24,6 +24,7 @@ use rayon::prelude::{
 
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
+use crate::batched_layout::BatchedLayout;
 use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
@@ -410,6 +411,32 @@ pub trait IsStarkProver<
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
+    }
+
+
+    /// Commit all tables' main trace columns into a single shared Merkle tree.
+    /// Columns from all tables are concatenated: [table0_col0, table0_col1, ..., table1_col0, ...].
+    /// Returns the tree, root, and a layout mapping tables to column ranges.
+    fn commit_main_traces_batched(
+        per_table_columns: &[Vec<Vec<FieldElement<Field>>>],
+        lde_size: usize,
+    ) -> Result<(BatchedMerkleTree<Field>, Commitment, BatchedLayout), ProvingError>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+    {
+        let column_counts: Vec<usize> = per_table_columns.iter().map(|cols| cols.len()).collect();
+        let layout = BatchedLayout::new(&column_counts, lde_size);
+
+        // Flatten all tables' columns into one contiguous Vec
+        let all_columns: Vec<Vec<FieldElement<Field>>> = per_table_columns
+            .iter()
+            .flat_map(|cols| cols.iter().cloned())
+            .collect();
+
+        let (tree, root) = Self::commit_columns_bit_reversed(&all_columns)
+            .ok_or(ProvingError::EmptyCommitment)?;
+
+        Ok((tree, root, layout))
     }
 
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
