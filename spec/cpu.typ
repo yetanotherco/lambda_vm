@@ -65,7 +65,11 @@ so for performance reasons, we inline its memory interactions directly into the 
 The timestamps are ensured to be disjoint for disjoint memory locations.
 One consequence of that is that `next_pc` is written at `timestamp + 1`
 to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction.
-#rj[We can try to do a bit more, and move `double_pc_read` into decoding, so that `AUIPC` could set `read_register1 = 0`.]
+Constraints on `pc_double_read` corresponding to an `AUIPC` instruction are not necessary,
+as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp,
+and the integrity of the memory argument therefor ensures the correctness of this bit.
+
+#bold[Potential optimization: ] `double_pc_read` could be integrated into decoding, so that `AUIPC` could set `read_register1 = 0` and no extra MEMW access for `rv1` is needed at this point.
 
 #render_constraint_table(chip, config, groups: "mem")
 

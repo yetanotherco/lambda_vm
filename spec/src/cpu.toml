@@ -704,11 +704,6 @@ input = [0, ["cast", "res", "DWordWL"], ["cast", "arg2", ["Byte", 8]], ["+", "ti
 multiplicity = "STORE"
 
 [[constraints.mem]]
-kind = "arith"
-constraint = "$#`pc_double_read` => #`rs1` = 255$"
-poly = ["*", "pc_double_read", ["-", "rs1", 255]]
-
-[[constraints.mem]]
 kind = "template"
 tag = "IS_BIT"
 input = ["pc_double_read"]
@@ -717,11 +712,6 @@ input = ["pc_double_read"]
 kind = "template"
 tag = "IS_BIT"
 input = ["prev_pc_timestamp_borrow"]
-
-[[constraints.mem]]
-kind = "arith"
-constraint = "$#`pc_double_read` => #`prev_pc_timestamp_borrow` = 0$"
-poly = ["*", "pc_double_read", "prev_pc_timestamp_borrow"]
 
 [[constraints.mem]]
 kind = "interaction"
