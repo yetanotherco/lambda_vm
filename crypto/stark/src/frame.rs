@@ -1,7 +1,4 @@
-use crate::{
-    table::TableView,
-    trace::{LDETraceTable, RowMajorLDETrace},
-};
+use crate::{table::TableView, trace::LDETraceTable};
 use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -30,16 +27,10 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
         &self.steps[step]
     }
 
-    /// Build a Frame by gathering row data from a column-major LDETraceTable.
-    ///
-    /// Each step gathers elements from columns into owned Vecs. For the typical
-    /// case (2 offsets, step_size=1), this gathers 2 rows of ~74 main + aux elements.
     pub fn read_from_lde(lde_trace: &LDETraceTable<F, E>, row: usize, offsets: &[usize]) -> Self {
         let blowup_factor = lde_trace.blowup_factor;
         let num_rows = lde_trace.num_rows();
         let step_size = lde_trace.lde_step_size;
-        let num_main_cols = lde_trace.num_main_cols();
-        let num_aux_cols = lde_trace.num_aux_cols();
 
         let lde_steps = offsets
             .iter()
@@ -51,18 +42,10 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
                         .step_by(blowup_factor)
                         .map(|step_row| {
                             let step_row_idx = step_row % num_rows;
-
-                            // Gather main row from columns
-                            let main_row: Vec<_> = (0..num_main_cols)
-                                .map(|col| lde_trace.get_main(step_row_idx, col).clone())
-                                .collect();
-
-                            // Gather aux row from columns
-                            let aux_row: Vec<_> = (0..num_aux_cols)
-                                .map(|col| lde_trace.get_aux(step_row_idx, col).clone())
-                                .collect();
-
-                            (main_row, aux_row)
+                            (
+                                lde_trace.main_row(step_row_idx).to_vec(),
+                                lde_trace.aux_row(step_row_idx).to_vec(),
+                            )
                         })
                         .unzip();
 
@@ -106,44 +89,6 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
         Frame { steps }
     }
 
-    /// Fill a pre-allocated frame from a row-major LDE view, without allocating.
-    ///
-    /// Each row read is a contiguous slice copy instead of `num_cols` random column
-    /// reads. The frame must have been created with `preallocate` with matching dimensions.
-    pub(crate) fn fill_from_row_major(
-        &mut self,
-        row_major: &RowMajorLDETrace<F, E>,
-        row: usize,
-        offsets: &[usize],
-    ) {
-        let blowup_factor = row_major.blowup_factor;
-        let num_rows = row_major.num_rows();
-        let step_size = row_major.lde_step_size;
-        let num_aux_cols = row_major.num_aux_cols;
-
-        for (step_idx, &offset) in offsets.iter().enumerate() {
-            let initial_step_row = row + offset * step_size;
-            let end_step_row = initial_step_row + step_size;
-            let step = &mut self.steps[step_idx];
-
-            let mut sub_row_idx = 0;
-            let mut step_row = initial_step_row;
-            while step_row < end_step_row {
-                let step_row_idx = step_row % num_rows;
-
-                step.data[sub_row_idx].clone_from_slice(row_major.get_main_row(step_row_idx));
-
-                if num_aux_cols > 0 {
-                    step.aux_data[sub_row_idx]
-                        .clone_from_slice(row_major.get_aux_row(step_row_idx));
-                }
-
-                sub_row_idx += 1;
-                step_row += blowup_factor;
-            }
-        }
-    }
-
     /// Fill a pre-allocated frame from LDE data, without allocating.
     ///
     /// The frame must have been created with `preallocate` with matching dimensions.
@@ -156,7 +101,6 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
         let blowup_factor = lde_trace.blowup_factor;
         let num_rows = lde_trace.num_rows();
         let step_size = lde_trace.lde_step_size;
-        let num_main_cols = lde_trace.num_main_cols();
         let num_aux_cols = lde_trace.num_aux_cols();
 
         for (step_idx, &offset) in offsets.iter().enumerate() {
@@ -169,14 +113,10 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
             while step_row < end_step_row {
                 let step_row_idx = step_row % num_rows;
 
-                // Overwrite main row elements
-                for col in 0..num_main_cols {
-                    step.data[sub_row_idx][col] = lde_trace.get_main(step_row_idx, col).clone();
-                }
+                step.data[sub_row_idx].clone_from_slice(lde_trace.main_row(step_row_idx));
 
-                // Overwrite aux row elements
-                for col in 0..num_aux_cols {
-                    step.aux_data[sub_row_idx][col] = lde_trace.get_aux(step_row_idx, col).clone();
+                if num_aux_cols > 0 {
+                    step.aux_data[sub_row_idx].clone_from_slice(lde_trace.aux_row(step_row_idx));
                 }
 
                 sub_row_idx += 1;
