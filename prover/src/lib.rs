@@ -479,8 +479,14 @@ pub(crate) fn compute_expected_commit_bus_balance(
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(
+    prove_with_inputs(elf_bytes, &[])
+}
+
+/// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
+pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(
         elf_bytes,
+        private_inputs,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
@@ -492,6 +498,17 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(elf_bytes, &[], proof_options, max_rows)
+}
+
+/// Prove an ELF binary execution with custom proof options, max rows config,
+/// and explicit private inputs.
+pub fn prove_with_options_and_inputs(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<VmProof, Error> {
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
 
@@ -500,7 +517,8 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;

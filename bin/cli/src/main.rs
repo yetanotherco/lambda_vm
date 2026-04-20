@@ -101,6 +101,10 @@ enum Commands {
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
 
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+
         /// Generate flamegraph folded stacks to file
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
@@ -116,13 +120,21 @@ enum Commands {
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
 
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+
         /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
         #[arg(long)]
         blowup: Option<u8>,
 
-        /// Print timing breakdown
+        /// Print proving time
         #[arg(long)]
         time: bool,
+
+        /// Execute one pre-pass outside the timer and print dynamic instruction count
+        #[arg(long)]
+        cycles: bool,
     },
 
     /// Verify a proof bundle
@@ -149,13 +161,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Execute { elf, flamegraph } => cmd_execute(elf, flamegraph),
+        Commands::Execute {
+            elf,
+            private_input,
+            flamegraph,
+        } => cmd_execute(elf, private_input, flamegraph),
         Commands::Prove {
             elf,
             output,
+            private_input,
             blowup,
             time,
-        } => cmd_prove(elf, output, blowup, time),
+            cycles,
+        } => cmd_prove(elf, output, private_input, blowup, time, cycles),
         Commands::Verify {
             proof,
             elf,
@@ -165,7 +183,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode {
+fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
+    match path {
+        Some(path) => {
+            eprintln!("Reading private input file...");
+            std::fs::read(path).map_err(|e| format!("Failed to read private input file: {e}"))
+        }
+        None => Ok(vec![]),
+    }
+}
+
+fn cmd_execute(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    flamegraph_path: Option<PathBuf>,
+) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -182,7 +214,15 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
         }
     };
 
-    let mut executor = match Executor::new(&program, vec![]) {
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut executor = match Executor::new(&program, private_inputs) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Failed to create executor: {:?}", e);
@@ -249,7 +289,14 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
+fn cmd_prove(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    blowup: Option<u8>,
+    time: bool,
+    cycles: bool,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -257,6 +304,43 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
             eprintln!("Failed to read ELF file: {}", e);
             return ExitCode::FAILURE;
         }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Pre-pass: execute once outside the timer to count dynamic instructions.
+    // Mirrors SP1's cycle-count pass so both provers report the same kind of
+    // number without inflating the measured proving time.
+    let cycle_count = if cycles {
+        let program = match Elf::load(&elf_data) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to load ELF for cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+        let executor = match Executor::new(&program, private_inputs.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to create executor for cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+        match executor.run() {
+            Ok(result) => Some(result.logs.len() as u64),
+            Err(e) => {
+                eprintln!("Execution failed during cycle count: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
     };
 
     #[cfg(feature = "jemalloc-stats")]
@@ -280,11 +364,16 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
                 "Generating proof (blowup={b}, queries={})...",
                 opts.fri_number_of_queries
             );
-            prover::prove_with_options(&elf_data, &opts, &Default::default())
+            prover::prove_with_options_and_inputs(
+                &elf_data,
+                &private_inputs,
+                &opts,
+                &Default::default(),
+            )
         }
         None => {
             eprintln!("Generating proof...");
-            prover::prove(&elf_data)
+            prover::prove_with_inputs(&elf_data, &private_inputs)
         }
     };
     let prove_elapsed = start.elapsed();
@@ -320,6 +409,9 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     }
 
     eprintln!("Proof written to {:?}", output_path);
+    if let Some(c) = cycle_count {
+        println!("Cycles: {}", c);
+    }
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
     }
