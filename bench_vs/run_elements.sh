@@ -90,8 +90,8 @@ extract_elements() {
 }
 
 extract_aux_elements() {
-    sed -nE '/Aux elements: [0-9]+/ {
-        s/.*Aux elements: ([0-9]+).*/\1/
+    sed -nE '/Aux elements \(EF-cols\): [0-9]+/ {
+        s/.*Aux elements \(EF-cols\): ([0-9]+).*/\1/
         p
         q
     }'
@@ -208,7 +208,7 @@ for n in "${SERIES[@]}"; do
         if [ -z "$lambda_aux" ]; then
             lambda_aux="n/a"
         else
-            echo -e "  Lambda VM: ${BOLD}${lambda_aux}${NC} aux elements"
+            echo -e "  Lambda VM: ${BOLD}${lambda_aux}${NC} aux elements (EF-cols)"
         fi
     else
         echo -e "  ${RED}[Lambda VM] FAILED${NC}"
@@ -249,7 +249,7 @@ for n in "${SERIES[@]}"; do
         if [ -z "$sp1v5_aux" ]; then
             sp1v5_aux="n/a"
         else
-            echo -e "  SP1 v5:    ${BOLD}${sp1v5_aux}${NC} aux elements"
+            echo -e "  SP1 v5:    ${BOLD}${sp1v5_aux}${NC} aux elements (EF-cols)"
         fi
     else
         echo -e "  ${RED}[SP1 v5] FAILED${NC}"

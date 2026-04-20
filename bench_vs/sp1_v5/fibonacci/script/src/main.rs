@@ -24,7 +24,7 @@ fn main() {
 
     // Timed window: setup + core proof only.
     let start = Instant::now();
-    let (pk, _vk) = client.setup(&elf);
+    let (pk, vk) = client.setup(&elf);
     let proof = client
         .prove(&pk, &stdin)
         .core()
@@ -74,7 +74,7 @@ fn main() {
                         // permutation.local.len() = permutation_width × 4; divide by 4 to get EF cols.
                         // D=4 is BabyBear's quartic extension degree (flatten_to_base() invariant).
                         let perm_len = chip.permutation.local.len();
-                        debug_assert_eq!(perm_len % 4, 0, "SP1 v5 permutation width must be a multiple of 4 (D=4)");
+                        assert_eq!(perm_len % 4, 0, "SP1 v5 permutation width must be a multiple of 4 (D=4)");
                         (perm_len / 4) * rows
                     })
                     .sum::<usize>()
@@ -82,5 +82,9 @@ fn main() {
             .sum(),
         _ => 0,
     };
-    println!("Aux elements: {}", aux_elements);
+    println!("Aux elements (EF-cols): {}", aux_elements);
+
+    // Verify (outside the timer, same as Lambda and v6).
+    client.verify(&proof, &vk).expect("verify failed");
+    println!("Proof verified successfully");
 }

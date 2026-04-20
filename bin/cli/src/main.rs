@@ -442,7 +442,7 @@ fn cmd_prove(
     }
     if let Some((main, aux)) = element_count {
         println!("Elements: {}", main);
-        println!("Aux elements: {}", aux);
+        println!("Aux elements (EF-cols): {}", aux);
     }
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
@@ -538,7 +538,7 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
     match prover::count_elements(&elf_data, &private_inputs) {
         Ok((main, aux)) => {
             println!("Elements: {}", main);
-            println!("Aux elements: {}", aux);
+            println!("Aux elements (EF-cols): {}", aux);
             ExitCode::SUCCESS
         }
         Err(e) => {
