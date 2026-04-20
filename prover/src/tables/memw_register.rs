@@ -402,7 +402,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwRegister
 /// - IS_BIT(MU_READ) -- unconditional
 /// - IS_BIT(MU_WRITE) -- unconditional
 /// - IS_BIT(mu_sum) = (mu_read + mu_write) * (1 - mu_read - mu_write) = 0
-pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     use crate::constraints::templates::IsBitConstraint;
 
     vec![

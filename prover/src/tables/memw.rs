@@ -933,9 +933,11 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 /// - IS_BIT<μ_read> (1)
 /// - IS_BIT<μ_write> (1)
 /// - IS_BIT for carry[0..6] (7)
-pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     let mut idx = 0;
 

@@ -162,7 +162,9 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> = vec![
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![
             Box::new(FibTransition1::new()),
             Box::new(FibTransition2::new()),
         ];

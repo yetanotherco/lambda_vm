@@ -13,10 +13,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::{
-    constraints::transition::TransitionConstraint,
-    table::TableView,
-};
+use stark::{constraints::transition::TransitionConstraint, table::TableView};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -78,7 +75,6 @@ impl IsBitConstraint {
             constraint_idx,
         }
     }
-
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstraint {
@@ -473,11 +469,7 @@ impl AddConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
     fn degree(&self) -> usize {
-        if self.cond_cols.is_empty() {
-            2
-        } else {
-            3
-        }
+        if self.cond_cols.is_empty() { 2 } else { 3 }
     }
 
     fn constraint_idx(&self) -> usize {

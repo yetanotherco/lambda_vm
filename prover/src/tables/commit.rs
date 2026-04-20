@@ -750,8 +750,9 @@ pub fn create_constraints(
     Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::with_capacity(8);
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::with_capacity(8);
     let mut idx = constraint_idx_start;
 
     // 0-2: IS_BIT for first, end, mu

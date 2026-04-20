@@ -135,8 +135,9 @@ impl AIR for BitFlagsAIR {
     fn new(proof_options: &ProofOptions) -> Self {
         let bit_constraint = Box::new(BitConstraint::new());
         let flag_constraint = Box::new(ZeroFlagConstraint::new());
-        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> =
-            vec![bit_constraint, flag_constraint];
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![bit_constraint, flag_constraint];
 
         let num_transition_constraints = constraints.len();
 
