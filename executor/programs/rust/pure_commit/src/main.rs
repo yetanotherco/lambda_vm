@@ -21,18 +21,18 @@ pub extern "C" fn main() -> ! {
     unsafe {
         asm!(
             "ecall",
-            in("a0") 1usize,          // fd = stdout
+            inlateout("a0") 1usize => _, // fd = stdout; ecall overwrites a0
             in("a1") buf.as_ptr(),
             in("a2") 4usize,
-            in("a7") 64usize,         // Commit
+            in("a7") 64usize,            // Commit
         );
     }
     // Halt
     unsafe {
         asm!(
             "ecall",
-            in("a0") 0usize,          // exit_code = 0
-            in("a7") 93usize,         // Halt
+            inlateout("a0") 0usize => _, // exit_code = 0; ecall overwrites a0
+            in("a7") 93usize,            // Halt
         );
     }
     loop {}

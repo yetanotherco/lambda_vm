@@ -1922,7 +1922,7 @@ fn test_prove_allocator_minimal_reproducer() {
         .to_path_buf();
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
-            .unwrap();
+            .expect("allocator.elf not found — run `make compile-programs-rust`");
     let proof = crate::prove(&elf_bytes).expect("prove should succeed");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify should not error"),
@@ -1941,7 +1941,7 @@ fn test_pure_commit_rust() {
         .to_path_buf();
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
-            .unwrap();
+            .expect("pure_commit.elf not found — run `make compile-programs-rust`");
     let proof = crate::prove(&elf_bytes).expect("prove should succeed");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify should not error"),
