@@ -1784,12 +1784,31 @@ where
     let trace_len = term_columns[0].len();
 
     // Compute L = sum of all terms across all rows
-    let mut table_contribution = FieldElement::<E>::zero();
-    for row in 0..trace_len {
-        for col in term_columns {
-            table_contribution = &table_contribution + &col[row];
+    #[cfg(feature = "parallel")]
+    let table_contribution: FieldElement<E> = {
+        use rayon::prelude::*;
+        (0..trace_len)
+            .into_par_iter()
+            .map(|row| {
+                let mut row_sum = FieldElement::<E>::zero();
+                for col in term_columns {
+                    row_sum = row_sum + &col[row];
+                }
+                row_sum
+            })
+            .reduce(FieldElement::zero, |a, b| a + b)
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let table_contribution = {
+        let mut total = FieldElement::<E>::zero();
+        for row in 0..trace_len {
+            for col in term_columns {
+                total = &total + &col[row];
+            }
         }
-    }
+        total
+    };
 
     // offset_per_row = L / N
     let n = FieldElement::<E>::from(trace_len as u64);
