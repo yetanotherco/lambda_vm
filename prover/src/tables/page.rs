@@ -297,8 +297,7 @@ pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions
 ///
 /// ## Bus Interactions
 ///
-/// - PAGE-C1: IS_BYTE[init, 0] - sender, multiplicity 1 (range check)
-/// - PAGE-C2: IS_BYTE[fini, 0] - sender, multiplicity 1 (range check)
+/// - PAGE-C1+C2: IS_BYTE[init, fini] - sender, multiplicity 1 (batched range check)
 /// - PAGE-C3: memory[0, address, 0, init] - receiver, multiplicity -1
 /// - PAGE-C4: memory[0, address, timestamp, fini] - sender, multiplicity 1
 ///
@@ -322,7 +321,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // PAGE-C1: IS_BYTE[init, 0] - range check initial value
+        // PAGE-C1+C2: IS_BYTE[init, fini] - range check both byte values in one interaction
         BusInteraction::sender(
             BusId::IsByte,
             Multiplicity::One,
@@ -331,22 +330,13 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                     start_column: cols::INIT,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(0),
-            ],
-        ),
-        // PAGE-C2: IS_BYTE[fini, 0] - range check final value
-        BusInteraction::sender(
-            BusId::IsByte,
-            Multiplicity::One,
-            vec![
                 BusValue::Packed {
                     start_column: cols::FINI,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(0),
             ],
         ),
-        // PAGE-C3: memory[0, address, 0, init] - receive initial token
+        // PAGE-C3: memory[0, address, 0, init] - receive initial memory token
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -517,7 +507,7 @@ mod tests {
     #[test]
     fn test_bus_interactions() {
         let interactions = bus_interactions(0x1000); // page_base
-        assert_eq!(interactions.len(), 4); // C1, C2, C3, C4
+        assert_eq!(interactions.len(), 3); // C1+C2 (batched IS_BYTE), C3, C4
     }
 
     #[test]
@@ -525,6 +515,6 @@ mod tests {
         // Test with high address like stack region
         let stack_page = STACK_TOP & !(DEFAULT_PAGE_SIZE as u64 - 1);
         let interactions = bus_interactions(stack_page);
-        assert_eq!(interactions.len(), 4);
+        assert_eq!(interactions.len(), 3);
     }
 }

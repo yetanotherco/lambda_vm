@@ -1397,15 +1397,10 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1: IS_BYTE[init, 0]
-            bitwise_ops.push(BitwiseOperation::single_byte(
+            // C1+C2: IS_BYTE[init, fini] — batched range check for both bytes
+            bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
                 init,
-            ));
-
-            // C2: IS_BYTE[fini, 0]
-            bitwise_ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
                 fini,
             ));
         }
