@@ -49,9 +49,11 @@ fn compile_ptx(src: &str, out_name: &str) {
 }
 
 fn main() {
-    // Header is not compiled; emit rerun-if-changed so edits trigger rebuilds.
+    // Headers are not compiled; emit rerun-if-changed so edits trigger rebuilds.
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
+    println!("cargo:rerun-if-changed=kernels/ext3.cuh");
     compile_ptx("arith.cu", "arith.ptx");
     compile_ptx("ntt.cu", "ntt.ptx");
     compile_ptx("keccak.cu", "keccak.ptx");
+    compile_ptx("barycentric.cu", "barycentric.ptx");
 }

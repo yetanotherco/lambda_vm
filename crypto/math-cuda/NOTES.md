@@ -41,9 +41,21 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 1. **Ext3 arithmetic on GPU**. Full `ext3 × ext3` multiplication (currently
    we only use `base × ext3` in the NTT butterflies). Required for OOD and
    deep-composition barycentric kernels. ~100 lines of CUDA plus parity tests.
+   **✅ LANDED** — `kernels/ext3.cuh` has add/sub/neg/mul_base/mul with the
+   `dot3` helper; parity tested in `tests/ext3.rs`.
 2. **Barycentric at a point** kernel. O(N) reduction per column, M columns
    in parallel. Addresses OOD (5.94 s) + deep-composition (2.32 s). ~8 s of
    aggregate work ≈ ~0.5–1 s wall savings with rayon.
+   **✅ LANDED (unwired)** — `kernels/barycentric.cu` +
+   `src/barycentric.rs` + parity test `tests/barycentric.rs` all work. The
+   R3-OOD wiring in `get_trace_evaluations_from_lde` was **reverted** after
+   benchmarking: in the current prover the CPU is idle during R3 (the GPU
+   is busy on LDE/Merkle streams), so routing R3 OOD to the GPU only adds
+   queue contention without freeing wall time — fib_iterative_1M went
+   13.09 s → 14.20 s, and fib_iterative_4M went 33.67 s → 36.03 s, both
+   regressions. The kernels stay here as a building block for future
+   workloads where the GPU has idle windows during R3 (single-table or
+   very-large-trace proofs).
 3. **R2 constraint evaluation on GPU**. Per-AIR pointwise kernels over the
    LDE domain. Biggest engineering lift (each AIR has its own constraint
    logic). Could save 5 s aggregate ≈ 0.3–0.5 s wall.
@@ -54,6 +66,17 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 None of these are trivial; individually each is hours to a day. Collectively
 they'd probably push the 1M-fib proof under 10 s (matching Zisk/Airbender-
 class wins).
+
+### Lesson from the R3-OOD attempt
+
+Aggregate CPU time (as reported by the `instruments` feature) overstates
+the real wall-time cost of a phase whenever rayon already parallelises
+it. R3 OOD's 5.94 s "aggregate" number was misleading: on a 46-core box
+with ~7 tables running in parallel, rayon reduces that to ≈0.15 s wall,
+which is *less than* one H2D round-trip of the 500 MB of column data the
+GPU kernel would need. The GPU-resident LDE refactor (item 4 above) is
+the unlock here — without it, the CPU barycentric is already close to a
+lower bound for this workload.
 
 ### What's on the GPU now
 

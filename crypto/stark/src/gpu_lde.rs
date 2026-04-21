@@ -8,6 +8,9 @@
 
 use core::any::type_name;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
@@ -669,4 +672,284 @@ where
     )
     .expect("GPU batched ext3 coset LDE failed");
     true
+}
+
+// ============================================================================
+// GPU barycentric OOD evaluation
+// ============================================================================
+//
+// Infrastructure for future use: these wrappers drive
+// `math_cuda::barycentric::barycentric_{base,ext3}` and apply the trailing ext3
+// scalar on host. See the CPU reference in
+// `crypto/math/src/polynomial/mod.rs::interpolate_coset_eval_*_with_g_n_inv`.
+//
+// NOT currently wired into the prover — a benchmark on fib_iterative_{1M, 4M}
+// showed the CPU path (rayon over ~50 columns) already finishes in <1 ms wall
+// because the GPU is busy with LDE and Merkle on parallel streams, so moving
+// R3 OOD to the GPU just serialises work without freeing CPU wall time.
+// Kept here and covered by parity tests in `crypto/math-cuda/tests/barycentric.rs`
+// because it remains a net win for single-table or very-large-trace workloads.
+//
+// The GPU kernel returns the unscaled sum
+//     S = Σ_i point_i · eval_i · inv_denom_i
+// per column; the final barycentric value is
+//     f(z) = scalar · (z^N − g^N) · S
+// with `scalar = n_inv · g_n_inv` kept in the base field.
+
+static GPU_BARY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_bary_calls() -> u64 {
+    GPU_BARY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Below this (trace-size) barycentric length we stay on CPU — the rayon path
+/// already completes in well under a millisecond and PCIe round-trip would
+/// dominate.
+#[allow(dead_code)]
+const DEFAULT_GPU_BARY_THRESHOLD: usize = 1 << 14;
+
+#[allow(dead_code)]
+fn gpu_bary_threshold() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_BARY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GPU_BARY_THRESHOLD)
+    })
+}
+
+/// One ext3 scalar `(n_inv · g_n_inv) · (z^N − g^N)`; caller reads as `[u64;3]`.
+#[allow(dead_code)]
+fn ood_ext3_scalar<F, E>(
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+) -> [u64; 3]
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    // (z^N − g^N) in E — done via sub_subfield (E − F → E).
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
+    let base_scalar = n_inv * g_n_inv; // F × F → F
+    let scalar_ext3: FieldElement<E> = &base_scalar * &vanishing; // F × E → E
+    // SAFETY: E == Degree3Goldilocks; backing is `[FieldElement<Gl>; 3]`
+    // which is memory-equivalent to `[u64; 3]`.
+    let ptr = &scalar_ext3 as *const FieldElement<E> as *const u64;
+    unsafe { [*ptr, *ptr.add(1), *ptr.add(2)] }
+}
+
+/// Multiply each raw GPU ext3 sum by the host-computed ext3 scalar.
+/// `sums_raw` is `3 * num_cols` u64s (interleaved).
+#[allow(dead_code)]
+fn apply_ext3_scalar<E>(
+    sums_raw: &[u64],
+    scalar: [u64; 3],
+    num_cols: usize,
+) -> Vec<FieldElement<E>>
+where
+    E: IsField,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+    type Gl = GoldilocksField;
+    type Ext3 = Degree3GoldilocksExtensionField;
+
+    debug_assert_eq!(sums_raw.len(), 3 * num_cols);
+    debug_assert_eq!(type_name::<E>(), type_name::<Ext3>());
+
+    let scalar_e: FieldElement<Ext3> = FieldElement::<Ext3>::new([
+        FieldElement::<Gl>::from_raw(scalar[0]),
+        FieldElement::<Gl>::from_raw(scalar[1]),
+        FieldElement::<Gl>::from_raw(scalar[2]),
+    ]);
+
+    let mut out: Vec<FieldElement<E>> = Vec::with_capacity(num_cols);
+    for c in 0..num_cols {
+        let s: FieldElement<Ext3> = FieldElement::<Ext3>::new([
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3]),
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 1]),
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 2]),
+        ]);
+        let final_ext3 = &s * &scalar_e;
+        // SAFETY: E == Ext3 at runtime; same layout.
+        let final_e: FieldElement<E> = unsafe {
+            core::mem::transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&final_ext3)
+        };
+        out.push(final_e);
+    }
+    out
+}
+
+/// Batched barycentric OOD evaluation over M base-field columns at a single
+/// ext3 evaluation point. Returns `Some(vec_of_M_ext3)` on GPU dispatch, or
+/// `None` if the caller should fall back to CPU.
+#[allow(dead_code)]
+pub(crate) fn try_barycentric_base_ood_gpu<F, E>(
+    columns: &[Vec<FieldElement<F>>],
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let num_cols = columns.len();
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = columns[0].len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if coset_points.len() != n || inv_denoms.len() != n {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    // All columns must share the same length `n`.
+    for c in columns.iter() {
+        if c.len() != n {
+            return None;
+        }
+    }
+
+    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Pack columns contiguously: column c at offset c*n. Skip the zero-fill
+    // prologue — we overwrite every byte below. `set_len` before write is
+    // safe because `u64` has no drop glue.
+    let total = num_cols * n;
+    let mut columns_flat: Vec<u64> = Vec::with_capacity(total);
+    unsafe { columns_flat.set_len(total) };
+    {
+        // Parallel pack: each column's slab is independent.
+        let flat_ptr = columns_flat.as_mut_ptr() as usize;
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_cols;
+        iter.for_each(|c| {
+            // SAFETY: disjoint slabs; no two `c`s overlap. F == Goldilocks.
+            unsafe {
+                let dst = (flat_ptr as *mut u64).add(c * n);
+                let src = columns[c].as_ptr() as *const u64;
+                core::ptr::copy_nonoverlapping(src, dst, n);
+            }
+        });
+    }
+    let points_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
+
+    let sums_raw = math_cuda::barycentric::barycentric_base(
+        &columns_flat,
+        n,
+        points_raw,
+        inv_denoms_raw,
+        n,
+        num_cols,
+    )
+    .expect("GPU barycentric_base failed");
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+/// Batched barycentric OOD evaluation over M ext3 columns at a single ext3
+/// evaluation point. Same contract as [`try_barycentric_base_ood_gpu`].
+#[allow(dead_code)]
+pub(crate) fn try_barycentric_ext3_ood_gpu<F, E>(
+    columns: &[Vec<FieldElement<E>>],
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let num_cols = columns.len();
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = columns[0].len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if coset_points.len() != n || inv_denoms.len() != n {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    for c in columns.iter() {
+        if c.len() != n {
+            return None;
+        }
+    }
+
+    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // De-interleaved layout: slab (c*3 + k) at offset (c*3+k)*n. Skip
+    // zero-fill (we overwrite every byte). Parallelise the de-interleave.
+    let total = num_cols * 3 * n;
+    let mut columns_flat: Vec<u64> = Vec::with_capacity(total);
+    unsafe { columns_flat.set_len(total) };
+    {
+        let flat_ptr = columns_flat.as_mut_ptr() as usize;
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_cols;
+        iter.for_each(|c| {
+            // SAFETY: E == Ext3 whose BaseType is [FieldElement<Gl>;3] =
+            // contiguous [u64;3] at runtime; disjoint per-c slabs.
+            unsafe {
+                let src = columns[c].as_ptr() as *const u64;
+                let base = flat_ptr as *mut u64;
+                let slab0 = base.add((c * 3) * n);
+                let slab1 = base.add((c * 3 + 1) * n);
+                let slab2 = base.add((c * 3 + 2) * n);
+                for r in 0..n {
+                    *slab0.add(r) = *src.add(r * 3);
+                    *slab1.add(r) = *src.add(r * 3 + 1);
+                    *slab2.add(r) = *src.add(r * 3 + 2);
+                }
+            }
+        });
+    }
+    let points_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
+
+    let sums_raw = math_cuda::barycentric::barycentric_ext3(
+        &columns_flat,
+        n,
+        points_raw,
+        inv_denoms_raw,
+        n,
+        num_cols,
+    )
+    .expect("GPU barycentric_ext3 failed");
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
 }

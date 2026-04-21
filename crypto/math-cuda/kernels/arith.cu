@@ -3,6 +3,7 @@
 // are bit-identical to the CPU path.
 
 #include "goldilocks.cuh"
+#include "ext3.cuh"
 
 using goldilocks::add;
 using goldilocks::sub;
@@ -46,4 +47,37 @@ extern "C" __global__ void gl_neg_kernel(const uint64_t *a,
                                          uint64_t n) {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n) c[tid] = neg(a[tid]);
+}
+
+// ---------------------------------------------------------------------------
+// Ext3 (Goldilocks cubic extension) test kernels.
+// Input/output arrays are interleaved [a_0, b_0, c_0, a_1, b_1, c_1, ...].
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void ext3_mul_kernel(const uint64_t *a_int,
+                                           const uint64_t *b_int,
+                                           uint64_t *c_int,
+                                           uint64_t n) {
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    ext3::Fe3 a = ext3::make(a_int[tid*3 + 0], a_int[tid*3 + 1], a_int[tid*3 + 2]);
+    ext3::Fe3 b = ext3::make(b_int[tid*3 + 0], b_int[tid*3 + 1], b_int[tid*3 + 2]);
+    ext3::Fe3 r = ext3::mul(a, b);
+    c_int[tid*3 + 0] = r.a;
+    c_int[tid*3 + 1] = r.b;
+    c_int[tid*3 + 2] = r.c;
+}
+
+extern "C" __global__ void ext3_add_kernel(const uint64_t *a_int,
+                                           const uint64_t *b_int,
+                                           uint64_t *c_int,
+                                           uint64_t n) {
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    ext3::Fe3 a = ext3::make(a_int[tid*3 + 0], a_int[tid*3 + 1], a_int[tid*3 + 2]);
+    ext3::Fe3 b = ext3::make(b_int[tid*3 + 0], b_int[tid*3 + 1], b_int[tid*3 + 2]);
+    ext3::Fe3 r = ext3::add(a, b);
+    c_int[tid*3 + 0] = r.a;
+    c_int[tid*3 + 1] = r.b;
+    c_int[tid*3 + 2] = r.c;
 }

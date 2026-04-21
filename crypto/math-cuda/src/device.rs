@@ -96,6 +96,7 @@ impl Drop for PinnedStaging {
 const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
 const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
 const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
+const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -125,6 +126,8 @@ pub struct Backend {
     pub gl_sub: CudaFunction,
     pub gl_mul: CudaFunction,
     pub gl_neg: CudaFunction,
+    pub ext3_mul: CudaFunction,
+    pub ext3_add: CudaFunction,
 
     // ntt.ptx
     pub bit_reverse_permute: CudaFunction,
@@ -141,6 +144,10 @@ pub struct Backend {
     // keccak.ptx
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
+
+    // barycentric.ptx
+    pub barycentric_base_batched: CudaFunction,
+    pub barycentric_ext3_batched: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -159,6 +166,7 @@ impl Backend {
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
+        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -180,6 +188,8 @@ impl Backend {
             gl_sub: arith.load_function("gl_sub_kernel")?,
             gl_mul: arith.load_function("gl_mul_kernel")?,
             gl_neg: arith.load_function("gl_neg_kernel")?,
+            ext3_mul: arith.load_function("ext3_mul_kernel")?,
+            ext3_add: arith.load_function("ext3_add_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
@@ -192,6 +202,8 @@ impl Backend {
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
+            barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
+            barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
