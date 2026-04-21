@@ -40,9 +40,12 @@ use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
 ///
-/// `#[repr(transparent)]` is required by the disk-spill code in
-/// `crypto/stark` (`table.rs`, `trace.rs`), which casts mmap bytes to
-/// `FieldElement<F>`.
+/// # Layout invariant
+///
+/// `#[repr(transparent)]` is load-bearing: the `disk-spill` feature in
+/// `crypto/stark` casts raw mmap bytes to `*const FieldElement<F>`
+/// (see `table.rs::get`, `trace.rs`). Changing the `repr`, adding
+/// fields, or introducing padding silently makes those casts UB.
 #[allow(clippy::derived_hash_with_manual_eq)]
 #[repr(transparent)]
 #[derive(Debug, Clone, Hash, Copy)]
