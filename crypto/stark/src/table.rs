@@ -22,16 +22,6 @@ pub(crate) struct TableMmapBacking {
     elem_size: usize,
 }
 
-// Table<F> derives Clone, which requires all fields to implement Clone.
-// TableMmapBacking implements Clone to satisfy this, but panics because
-// mmap-backed data cannot be cloned.
-#[cfg(feature = "disk-spill")]
-impl Clone for TableMmapBacking {
-    fn clone(&self) -> Self {
-        panic!("TableMmapBacking cannot be cloned — spilled tables should not be cloned")
-    }
-}
-
 #[cfg(feature = "disk-spill")]
 impl std::fmt::Debug for TableMmapBacking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,7 +38,7 @@ impl std::fmt::Debug for TableMmapBacking {
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
-#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -57,6 +47,37 @@ pub struct Table<F: IsField> {
     #[cfg(feature = "disk-spill")]
     #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
+}
+
+/// Cloning a spilled table reads its mmap bytes into a fresh heap `Vec`
+/// and returns an unspilled clone. This is cold — callers pay the full
+/// materialization cost — but avoids the runtime panic a derived impl
+/// would produce on `TableMmapBacking`.
+impl<F: IsField> Clone for Table<F> {
+    fn clone(&self) -> Self {
+        #[cfg(feature = "disk-spill")]
+        if self.mmap_backing.is_some() {
+            let mut data = Vec::with_capacity(self.width * self.height);
+            for row in 0..self.height {
+                for col in 0..self.width {
+                    data.push(self.get(row, col).clone());
+                }
+            }
+            return Self {
+                data,
+                width: self.width,
+                height: self.height,
+                mmap_backing: None,
+            };
+        }
+        Self {
+            data: self.data.clone(),
+            width: self.width,
+            height: self.height,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        }
+    }
 }
 
 /// Element-wise comparison via `get()`, so spilled tables compare by field
@@ -260,6 +281,13 @@ impl<F: IsField> Table<F> {
     /// No-op if the table is empty or already spilled.
     #[cfg(feature = "disk-spill")]
     pub fn spill_to_disk(&mut self) -> std::io::Result<()> {
+        const {
+            assert!(
+                std::mem::size_of::<FieldElement<F>>()
+                    .is_multiple_of(std::mem::align_of::<FieldElement<F>>()),
+                "FieldElement<F> size must be a multiple of its alignment for mmap interior reads to be aligned"
+            )
+        }
         use std::io::Write;
 
         if self.data.is_empty() || self.mmap_backing.is_some() {
@@ -317,7 +345,11 @@ impl<F: IsField> Table<F> {
     /// Advise the kernel to drop mmap pages from the page cache.
     /// Call after reading spilled data into pool buffers so the same
     /// data doesn't occupy RAM in both places.
-    #[cfg(feature = "disk-spill")]
+    ///
+    /// Unix-only: `madvise(MADV_DONTNEED)` has no direct Windows equivalent,
+    /// so this is a no-op on non-Unix targets (callers rely on natural
+    /// page-cache reclaim there).
+    #[cfg(all(feature = "disk-spill", unix))]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
             // SAFETY: pointer and length are from a valid mmap.
@@ -331,6 +363,9 @@ impl<F: IsField> Table<F> {
             }
         }
     }
+
+    #[cfg(all(feature = "disk-spill", not(unix)))]
+    pub fn advise_drop_cache(&self) {}
 
     /// Given a step size, converts the given table into a `Frame`.
     /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
@@ -465,5 +500,26 @@ mod disk_spill_tests {
         // Still readable
         assert_eq!(table.get(0, 0), &FieldElement::<F>::from(0u64));
         assert_eq!(table.get(3, 3), &FieldElement::<F>::from(15u64));
+    }
+
+    /// Cloning a spilled table materializes bytes into a fresh heap Vec,
+    /// yielding an unspilled clone with the same element values.
+    #[test]
+    fn test_clone_spilled_table_materializes_to_heap() {
+        let width = 4;
+        let height = 8;
+        let data: Vec<FieldElement<F>> = (0..width * height)
+            .map(|i| FieldElement::<F>::from(i as u64))
+            .collect();
+
+        let mut table = Table::new(data, width);
+        table.spill_to_disk().expect("spill_to_disk failed");
+        assert!(table.is_spilled());
+
+        let cloned = table.clone();
+        assert!(!cloned.is_spilled(), "clone should not be spilled");
+        assert_eq!(cloned.width, width);
+        assert_eq!(cloned.height, height);
+        assert_eq!(cloned, table, "clone must equal source element-wise");
     }
 }
