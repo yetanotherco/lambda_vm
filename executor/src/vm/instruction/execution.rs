@@ -66,8 +66,12 @@ impl Instruction {
                 }
             }
             Instruction::ArithImmW { dst, src, imm, op } => {
-                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits
-                let op1 = registers.read(src)? as i32;
+                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits.
+                // Log must store the RAW register value in src1_val (full 64 bits)
+                // for the prover's MEMW register chain. The truncation to i32 is only
+                // for the ALU computation.
+                let raw_src = registers.read(src)?;
+                let op1 = raw_src as i32;
                 if matches!(op, ArithOp::Sub) {
                     return Err(ExecutionError::SubImmNotSupported);
                 }
@@ -77,7 +81,7 @@ impl Instruction {
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
-                    src1_val: op1 as u64,
+                    src1_val: raw_src,
                     src2_val: 0,
                     dst_val: res,
                 }
@@ -247,17 +251,21 @@ impl Instruction {
                 src2,
                 op,
             } => {
-                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits
-                let a = registers.read(src1)? as i32;
-                let b = registers.read(src2)? as i32;
+                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits.
+                // Log must store RAW register values (full 64 bits) for the prover's
+                // MEMW register chain. Truncation to i32 is only for ALU computation.
+                let raw_src1 = registers.read(src1)?;
+                let raw_src2 = registers.read(src2)?;
+                let a = raw_src1 as i32;
+                let b = raw_src2 as i32;
                 let res32 = op.apply_word(a, b)?;
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
-                    src1_val: a as u64,
-                    src2_val: b as u64,
+                    src1_val: raw_src1,
+                    src2_val: raw_src2,
                     dst_val: res,
                 }
             }
