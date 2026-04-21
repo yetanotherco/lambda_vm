@@ -5,5 +5,6 @@ runs:
   using: "composite"
   steps:
     - name: Remove .NET, Android SDK, Haskell
+      if: runner.environment == 'github-hosted'
       shell: bash
       run: sudo rm -rf /usr/share/dotnet/ /usr/local/lib/android /opt/ghc /usr/local/.ghcup
