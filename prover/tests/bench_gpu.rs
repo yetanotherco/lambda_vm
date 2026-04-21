@@ -31,7 +31,9 @@ fn bench_prove(name: &str, trials: u32) {
     #[cfg(feature = "cuda")]
     {
         let calls = stark::gpu_lde::gpu_lde_calls();
+        let eh = stark::gpu_lde::gpu_extend_halves_calls();
         println!("  GPU LDE calls across {trials} proves: {calls}");
+        println!("  GPU extend_two_halves calls: {eh}");
     }
 }
 

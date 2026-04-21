@@ -826,6 +826,18 @@ pub trait IsStarkProver<
         // The squared coset offset is g² (= coset_offset²).
         let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
 
+        // GPU fast path: batch both halves into one ext3 LDE call. Requires
+        // `cuda` feature and a qualifying size; falls through to CPU when not.
+        #[cfg(feature = "cuda")]
+        if let Some((lde_h0, lde_h1)) = crate::gpu_lde::try_extend_two_halves_gpu(
+            &h0_evals,
+            &h1_evals,
+            &coset_offset_squared,
+            domain,
+        ) {
+            return vec![lde_h0, lde_h1];
+        }
+
         #[cfg(feature = "parallel")]
         let (lde_h0, lde_h1) = rayon::join(
             || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),

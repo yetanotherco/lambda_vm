@@ -11,7 +11,9 @@ use core::any::type_name;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
-use math::field::traits::IsField;
+use math::field::traits::{IsField, IsSubFieldOf};
+
+use crate::domain::Domain;
 
 /// Break-even LDE size. Below this, the CPU `coset_lde_full_expand` completes
 /// in a few hundred microseconds and the GPU's ~37 kernel launches plus
@@ -43,6 +45,12 @@ pub fn gpu_lde_calls() -> u64 {
 
 pub fn reset_gpu_lde_calls() {
     GPU_LDE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) static GPU_EXTEND_HALVES_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_extend_halves_calls() -> u64 {
+    GPU_EXTEND_HALVES_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Try to GPU-batch all columns in one pass.
@@ -143,6 +151,103 @@ where
     )
     .expect("GPU batched coset LDE failed");
     true
+}
+
+/// GPU path for `Prover::extend_half_to_lde`.
+///
+/// Inside `decompose_and_extend_d2` (R2 quotient decomposition) the prover
+/// does `rayon::join` of two calls: `iFFT(N on g²-coset) → FFT(2N on g-coset)`
+/// over ext3 halves H0 and H1. They share the same domain/offset and sizes,
+/// so we batch them into a single GPU call with M=2 ext3 columns.
+///
+/// Weights = `[1/N, g^(-1)/N, g^(-2)/N, …, g^(-(N-1))/N]`. This bakes the
+/// `(g²)^(-k)` input-coset-undo from `interpolate_offset_fft` together with
+/// the `g^k` forward-coset-shift from `evaluate_polynomial_on_lde_domain` —
+/// net is `g^(-k)` — plus the `1/N` iFFT normalisation.
+///
+/// Returns `None` when the GPU path doesn't apply (too small, or CPU path
+/// should be used); in that case the caller runs its existing rayon::join.
+pub(crate) fn try_extend_two_halves_gpu<F, E>(
+    h0: &[FieldElement<E>],
+    h1: &[FieldElement<E>],
+    squared_offset: &FieldElement<F>,
+    domain: &Domain<F>,
+) -> Option<(Vec<FieldElement<E>>, Vec<FieldElement<E>>)>
+where
+    F: math::field::traits::IsFFTField + IsField,
+    E: IsField,
+    F: IsSubFieldOf<E>,
+{
+    if h0.len() != h1.len() {
+        return None;
+    }
+    let n = h0.len();
+    let blowup = 2; // extend_half_to_lde extends N → 2N always
+    let lde_size = n * blowup;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    GPU_EXTEND_HALVES_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // squared_offset should be `g²`. We recover `g` as `domain.coset_offset`
+    // and use it to build the `g^(-k) / N` weights.
+    let _ = squared_offset; // unused (we derive weights from domain)
+
+    // Flatten ext3 slices to raw 3*n u64 buffers.
+    let to_u64 = |col: &[FieldElement<E>]| -> Vec<u64> {
+        let len = col.len() * 3;
+        let ptr = col.as_ptr() as *const u64;
+        unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+    };
+    let h0_raw = to_u64(h0);
+    let h1_raw = to_u64(h1);
+
+    // weights[k] = g^(-k) / N as a u64.
+    let inv_n = FieldElement::<F>::from(n as u64)
+        .inv()
+        .expect("N nonzero");
+    let g = &domain.coset_offset;
+    let g_inv = g.inv().expect("g nonzero");
+    let mut weights_u64 = Vec::with_capacity(n);
+    let mut w = inv_n.clone();
+    for _ in 0..n {
+        // F == GoldilocksField by type_name check above, so value is u64.
+        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
+        weights_u64.push(v);
+        w = w * &g_inv;
+    }
+
+    // Pre-allocate outputs.
+    let mut lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
+    let mut lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
+
+    GPU_LDE_CALLS.fetch_add(6, std::sync::atomic::Ordering::Relaxed); // 2 ext3 cols × 3 components
+    {
+        let inputs: [&[u64]; 2] = [&h0_raw, &h1_raw];
+        // View each output Vec<FieldElement<E>> as &mut [u64] of length 3*lde_size.
+        let out0_ptr = lde_h0.as_mut_ptr() as *mut u64;
+        let out1_ptr = lde_h1.as_mut_ptr() as *mut u64;
+        // SAFETY: ext3 FieldElement is [u64; 3] in memory, and the Vec has len
+        // = lde_size so the backing is 3*lde_size u64s.
+        let out0_slice = unsafe { core::slice::from_raw_parts_mut(out0_ptr, 3 * lde_size) };
+        let out1_slice = unsafe { core::slice::from_raw_parts_mut(out1_ptr, 3 * lde_size) };
+        let mut outputs: [&mut [u64]; 2] = [out0_slice, out1_slice];
+        math_cuda::lde::coset_lde_batch_ext3_into(
+            &inputs,
+            n,
+            blowup,
+            &weights_u64,
+            &mut outputs,
+        )
+        .expect("GPU extend_half_to_lde failed");
+    }
+
+    Some((lde_h0, lde_h1))
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
