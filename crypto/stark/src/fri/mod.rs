@@ -8,6 +8,8 @@ use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
@@ -49,12 +51,15 @@ where
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
+        // Hash leaves directly from evals pairs (no intermediate Vec allocation).
+        // Each leaf = hash(evals[2i] || evals[2i+1]).
+        let hashed_leaves: Vec<_> = evals
             .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .map(|chunk| FriLayerMerkleTreeBackend::<E>::hash_data(
+                &[chunk[0].clone(), chunk[1].clone()],
+            ))
             .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        let merkle_tree = FriLayerMerkleTree::build_from_hashed_leaves(hashed_leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
