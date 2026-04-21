@@ -1524,10 +1524,9 @@ pub trait IsStarkProver<
         // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor).
         // Many tables share the same domain size (e.g., 7+ tables at 2^20).
         // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
-        let mut domain_cache: std::collections::HashMap<
-            (usize, usize),
-            (Arc<Domain<Field>>, Arc<LdeTwiddles<Field>>),
-        > = std::collections::HashMap::new();
+        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+        let mut domain_cache: std::collections::HashMap<(usize, usize), DomainEntry<Field>> =
+            std::collections::HashMap::new();
 
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);

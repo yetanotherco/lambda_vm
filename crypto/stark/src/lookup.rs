@@ -1978,7 +1978,7 @@ where
     // Finally write the accumulated column to trace (sequential, since set_aux takes &mut).
     #[cfg(feature = "parallel")]
     let accumulated_col = {
-        let num_chunks = (trace_len + LOGUP_CHUNK_SIZE - 1) / LOGUP_CHUNK_SIZE;
+        let num_chunks = trace_len.div_ceil(LOGUP_CHUNK_SIZE);
 
         // Phase 1: Compute chunk-local prefix sums
         let chunk_data: Vec<(Vec<FieldElement<E>>, FieldElement<E>)> = (0..num_chunks)
@@ -1989,8 +1989,8 @@ where
 
                 let mut local_prefix = Vec::with_capacity(end - start);
                 let mut acc = FieldElement::<E>::zero();
-                for row in start..end {
-                    acc = &acc + &row_sums[row] - &offset_per_row;
+                for rs in &row_sums[start..end] {
+                    acc = &acc + rs - &offset_per_row;
                     local_prefix.push(acc.clone());
                 }
                 let chunk_total = acc;
