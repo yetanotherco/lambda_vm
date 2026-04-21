@@ -424,6 +424,7 @@ where
 /// LDE parts, builds the R2 composition-polynomial Merkle tree on device
 /// (row-pair Keccak leaves + pair-hash inner tree). Returns both the parts
 /// (still needed downstream for R4 openings) and the finished tree.
+#[allow(dead_code)]
 pub(crate) fn try_evaluate_parts_on_lde_and_commit_gpu<F, E, B>(
     parts_coefs: &[&[FieldElement<E>]],
     blowup_factor: usize,
@@ -519,6 +520,56 @@ where
     }
     let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((outputs, tree))
+}
+
+/// Build a FRI-layer Merkle tree from already-folded evaluations using the
+/// GPU pair-leaf kernel + pair-hash inner tree.
+///
+/// Not currently wired — benchmarking showed the win per layer (GPU tree
+/// vs rayon tree) is eaten by the H2D of each layer's eval slab since the
+/// evals are in pageable CPU Vec form at call time. A fused on-device FRI
+/// (fold + leaves + tree all staying on device across layers) would flip
+/// this but is deferred to the "LDE on GPU across rounds" item.
+#[allow(dead_code)]
+pub(crate) fn try_build_fri_layer_tree_gpu<E, B>(
+    evals: &[FieldElement<E>],
+) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
+where
+    E: IsField,
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    let num_evals = evals.len();
+    if num_evals < 2 || !num_evals.is_power_of_two() {
+        return None;
+    }
+    let num_leaves = num_evals / 2;
+    // Higher threshold than the generic LDE path because each FRI layer
+    // H2Ds a fresh eval slab; tiny layers can't amortise that.
+    if num_leaves < gpu_fri_tree_threshold() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: E == Ext3 whose BaseType is [FieldElement<Gl>; 3] =
+    // contiguous [u64; 3] at runtime.
+    let evals_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, num_evals * 3) };
+    let nodes_bytes = math_cuda::merkle::build_fri_layer_tree_from_evals_ext3(evals_raw)
+        .expect("GPU FRI layer tree build failed");
+
+    let tight_total_nodes = 2 * num_leaves - 1;
+    debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
+    for i in 0..tight_total_nodes {
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
+        nodes.push(n);
+    }
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
 }
 
 /// Build the R2 composition-polynomial Merkle tree from already-computed
@@ -855,6 +906,7 @@ where
 /// Decomposes each ext3 column into three base slabs, runs the LDE + Keccak
 /// ext3 kernel in one on-device pipeline, re-interleaves LDE output back to
 /// ext3 layout, and returns hashed leaves.
+#[allow(dead_code)]
 pub(crate) fn try_expand_and_leaf_hash_batched_ext3<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -1046,6 +1098,22 @@ pub fn gpu_bary_calls() -> u64 {
 static GPU_MERKLE_TREE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn gpu_merkle_tree_calls() -> u64 {
     GPU_MERKLE_TREE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FRI layers shrink by 2× each round; the last few layers are tiny. Below
+/// this leaf count, keep the tree build on CPU.
+#[allow(dead_code)]
+const DEFAULT_GPU_FRI_TREE_THRESHOLD: usize = 1 << 19;
+
+#[allow(dead_code)]
+fn gpu_fri_tree_threshold() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_FRI_TREE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GPU_FRI_TREE_THRESHOLD)
+    })
 }
 
 /// Build a Merkle tree from already-hashed leaves using the GPU pair-hash

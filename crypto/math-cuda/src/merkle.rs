@@ -316,6 +316,78 @@ pub fn build_comp_poly_tree_from_evals_ext3(
     Ok(out)
 }
 
+/// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval
+/// vector. Each leaf hashes two consecutive ext3 values; `num_leaves =
+/// evals.len() / 6` (since each ext3 is 3 u64s).
+///
+/// Returns the `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
+pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
+    assert!(evals.len() % 6 == 0, "evals must hold whole pair-leaves");
+    let num_evals = evals.len() / 3;
+    let num_leaves = num_evals / 2;
+    assert!(num_leaves.is_power_of_two() && num_leaves >= 1);
+    let tight_total_nodes = 2 * num_leaves - 1;
+    if tight_total_nodes == 0 {
+        return Ok(Vec::new());
+    }
+
+    let be = backend();
+    let stream = be.next_stream();
+
+    let evals_dev = stream.clone_htod(evals)?;
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+
+    // Leaf kernel: num_leaves threads, one leaf each.
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let num_leaves_u64 = num_leaves as u64;
+        let grid = ((num_leaves as u32) + 128 - 1) / 128;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_fri_leaves_ext3)
+                .arg(&evals_dev)
+                .arg(&num_leaves_u64)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+
+    // Inner tree levels — identical to the R2 version.
+    {
+        let mut level_begin: u64 = (num_leaves - 1) as u64;
+        while level_begin != 0 {
+            let new_begin = level_begin / 2;
+            let n_pairs = level_begin - new_begin;
+            let grid = ((n_pairs as u32) + 128 - 1) / 128;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&be.keccak_merkle_level)
+                    .arg(&mut nodes_dev)
+                    .arg(&new_begin)
+                    .arg(&n_pairs)
+                    .launch(cfg)?;
+            }
+            level_begin = new_begin;
+        }
+    }
+
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 pub(crate) fn launch_keccak_ext3(
     stream: &CudaStream,
     cols_dev: &CudaSlice<u64>,

@@ -271,6 +271,42 @@ extern "C" __global__ void keccak_comp_poly_leaves_ext3(
 }
 
 // ---------------------------------------------------------------------------
+// FRI layer leaf hashing.
+//
+// Each leaf hashes 2 consecutive ext3 values: Keccak256 over
+//   evals[2j].to_bytes_be() ++ evals[2j+1].to_bytes_be()
+// = 48 BE bytes = 6 u64 BE lanes. No bit reversal; no column slab layout —
+// the input is a single interleaved ext3 eval vector `[a0,a1,a2,b0,b1,b2,...]`.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak_fri_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_evals u64s (ext3 interleaved)
+    uint64_t num_leaves,                 // = num_evals / 2
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+    uint32_t rate_pos = 0;
+
+    const uint64_t *left = evals_interleaved + 2 * tid * 3;  // 3 u64s
+    const uint64_t *right = left + 3;
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        uint64_t canon = goldilocks::canonical(left[i]);
+        absorb_lane(st, rate_pos, bswap64(canon));
+    }
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        uint64_t canon = goldilocks::canonical(right[i]);
+        absorb_lane(st, rate_pos, bswap64(canon));
+    }
+
+    finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
 // Merkle inner-tree pair hash: one level of the inner Merkle tree.
 //
 // `nodes` is the full Merkle node buffer (length `2*leaves_len - 1`, each
