@@ -701,6 +701,88 @@ pub fn gpu_bary_calls() -> u64 {
     GPU_BARY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ============================================================================
+// GPU Merkle inner-tree construction
+// ============================================================================
+//
+// After the GPU keccak leaf-hash kernels produce a flat `[u8; 32]` leaf vec,
+// the inner tree construction on CPU via `build_from_hashed_leaves` is a
+// rayon-parallel pair-hash scan that still takes ~50-100 ms per table on a
+// 46-core host. Delegating it to `math_cuda::merkle::build_merkle_tree_on_device`
+// pushes it below 10 ms — the leaf buffer is already on host (it came out of
+// `try_expand_and_leaf_hash_batched`), we H2D it once, the GPU does ~log₂(N)
+// small kernel launches, and we D2H the full `2*leaves_len - 1` node array.
+
+static GPU_MERKLE_TREE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_merkle_tree_calls() -> u64 {
+    GPU_MERKLE_TREE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build a Merkle tree from already-hashed leaves using the GPU pair-hash
+/// kernel. Returns the filled `MerkleTree` in the same layout as the CPU
+/// `build_from_hashed_leaves` would produce — plug straight in anywhere the
+/// prover expected that.
+///
+/// Returns `None` if the GPU path is disabled by threshold (`leaves_len <
+/// GPU_MERKLE_TREE_THRESHOLD`), falling back to the caller's CPU path.
+///
+/// Currently unwired in the prover: benchmarking showed the savings from
+/// the GPU pair-hash are eaten by the H2D of leaves + D2H of the tree
+/// because the leaves are in pageable memory (they're the caller's Vec from
+/// `try_expand_and_leaf_hash_batched`). A proper fusion would keep the
+/// leaf buffer on device and run the tree kernel immediately on the GPU
+/// copy — left as future work.
+#[allow(dead_code)]
+pub(crate) fn try_build_merkle_tree_gpu<B>(
+    hashed_leaves: &[B::Node],
+) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
+where
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    let leaves_len = hashed_leaves.len();
+    if leaves_len < gpu_merkle_tree_threshold() || !leaves_len.is_power_of_two() || leaves_len < 2 {
+        return None;
+    }
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Flatten host-side leaves into a contiguous byte buffer for the GPU
+    // kernel. SAFETY: `[u8; 32]` is POD and the slice is contiguous.
+    let leaves_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(hashed_leaves.as_ptr() as *const u8, leaves_len * 32)
+    };
+    let nodes_bytes = math_cuda::merkle::build_merkle_tree_on_device(leaves_bytes)
+        .expect("GPU merkle tree build failed");
+
+    let total_nodes = 2 * leaves_len - 1;
+    debug_assert_eq!(nodes_bytes.len(), total_nodes * 32);
+
+    // Re-chunk into `Vec<[u8; 32]>` without re-allocating. We'd need an
+    // explicit copy because Vec<u8> and Vec<[u8; 32]> have different
+    // layouts in the allocator metadata (align differs on some platforms).
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
+    for i in 0..total_nodes {
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
+        nodes.push(n);
+    }
+
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
+/// Below this (tree size), stay on CPU — rayon pair-hash is already well
+/// under a millisecond for small N and would lose to any PCIe round-trip.
+const DEFAULT_GPU_MERKLE_TREE_THRESHOLD: usize = 1 << 15;
+
+fn gpu_merkle_tree_threshold() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_MERKLE_TREE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GPU_MERKLE_TREE_THRESHOLD)
+    })
+}
+
 /// Below this (trace-size) barycentric length we stay on CPU — the rayon path
 /// already completes in well under a millisecond and PCIe round-trip would
 /// dominate.

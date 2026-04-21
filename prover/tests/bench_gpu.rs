@@ -36,12 +36,14 @@ fn bench_prove(name: &str, trials: u32) {
         let parts = stark::gpu_lde::gpu_parts_lde_calls();
         let leaf = stark::gpu_lde::gpu_leaf_hash_calls();
         let bary = stark::gpu_lde::gpu_bary_calls();
+        let mtree = stark::gpu_lde::gpu_merkle_tree_calls();
         println!("  GPU LDE calls across {trials} proves: {calls}");
         println!("  GPU extend_two_halves calls: {eh}");
         println!("  GPU R4 deep-poly LDE calls: {r4}");
         println!("  GPU R2 parts LDE calls: {parts}");
         println!("  GPU leaf-hash calls: {leaf}");
         println!("  GPU barycentric OOD calls: {bary}");
+        println!("  GPU Merkle inner-tree calls: {mtree}");
     }
 }
 
