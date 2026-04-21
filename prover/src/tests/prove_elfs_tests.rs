@@ -1382,57 +1382,58 @@ fn test_debug_memory_tokens_sb_sh() {
         println!("Found {} imbalanced memory tokens", imbalanced);
     }
 
-    // === Count IS_BYTE lookups from PAGE (C1 init + C2 fini) ===
+    // === Count IS_BYTE lookups from PAGE (batched [init, fini] per row) ===
     println!("\n=== IS_BYTE Lookup Counts (from PAGE tables) ===");
-    let mut is_byte_from_page = [0u64; 256];
+    let mut page_pair_counts: HashMap<(u8, u8), u64> = HashMap::new();
     let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
     for (page_idx, page_trace) in traces.pages.iter().enumerate() {
         let page_size = traces.page_configs[page_idx].page_size;
         for row in 0..page_trace.num_rows().min(page_size) {
-            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as usize;
-            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as usize;
-            is_byte_from_page[init] += 1; // C1
-            is_byte_from_page[fini] += 1; // C2
+            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as u8;
+            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as u8;
+            *page_pair_counts.entry((init, fini)).or_insert(0) += 1;
         }
     }
+    let page_is_byte_total: u64 = page_pair_counts.values().sum();
     println!(
-        "Total PAGE rows: {}, Expected IS_BYTE: {} (2 per row)",
-        total_page_rows,
-        total_page_rows * 2
+        "Total PAGE rows: {}, Expected IS_BYTE (1 per row): {}",
+        total_page_rows, total_page_rows,
     );
     println!(
-        "IS_BYTE[0, 0]: {} lookups (most bytes are 0)",
-        is_byte_from_page[0]
+        "IS_BYTE[0, 0] from PAGE: {} lookups (most rows are (0,0))",
+        page_pair_counts.get(&(0, 0)).copied().unwrap_or(0)
     );
 
-    // Check if bitwise table has matching multiplicities for IS_BYTE
-    // Single-byte IS_BYTE uses rows 0..255 with Y=0, MU_IS_BYTE is column 17
+    // BITWISE row for IS_BYTE[X, Y] at Z=0 is X + 256*Y. We only sum
+    // multiplicity at the (X, Y) pairs PAGE actually touches. Other senders
+    // (e.g. CPU's paired IS_BYTE checks) also bump this same MU_IS_BYTE
+    // column and may hit the same (X, Y) rows, so this is a coarse sanity
+    // check (BITWISE mult >= PAGE's contribution), not an exact balance.
     use crate::tables::bitwise::cols as bitwise_cols;
-    let bitwise_is_byte_mult: u64 = (0..256usize)
-        .map(|byte_val| {
-            // IS_BYTE lookup is at row with X=byte_val, Y=0, Z=0
-            // Row index = X + Y*256 + Z*256*256 = X (for Y=0, Z=0)
+    let bitwise_is_byte_mult_over_page_pairs: u64 = page_pair_counts
+        .keys()
+        .map(|&(x, y)| {
+            let row = x as usize + 256 * y as usize;
             traces
                 .bitwise
                 .main_table
-                .get(byte_val, bitwise_cols::MU_IS_BYTE)
+                .get(row, bitwise_cols::MU_IS_BYTE)
                 .to_raw()
         })
         .sum();
     println!(
-        "Bitwise IS_BYTE total multiplicity: {}",
-        bitwise_is_byte_mult
+        "Bitwise IS_BYTE mult summed over PAGE (init, fini) rows: {}",
+        bitwise_is_byte_mult_over_page_pairs
     );
-
-    // Also count total IS_BYTE lookups expected from collect_bitwise_from_page
-    let is_byte_total_from_page: u64 = is_byte_from_page.iter().sum();
     println!(
         "Total IS_BYTE lookups from PAGE (counted): {}",
-        is_byte_total_from_page
+        page_is_byte_total
     );
+    // Note: this can be >= 0 because CPU byte-pair IS_BYTE senders may also
+    // hit some of the same (init, fini) rows. It should never be negative.
     println!(
-        "Difference: {} (should be 0 if PAGE IS_BYTE matches Bitwise)",
-        bitwise_is_byte_mult as i64 - is_byte_total_from_page as i64
+        "Difference: {} (>= 0 expected; PAGE pairs may also receive from CPU)",
+        bitwise_is_byte_mult_over_page_pairs as i64 - page_is_byte_total as i64
     );
 
     // === Verify PAGE AIR uses correct page_base ===

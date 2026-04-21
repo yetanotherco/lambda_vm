@@ -26,10 +26,9 @@
 //!
 //! | Tag | Bus | Signature | Multiplicity |
 //! |-----|-----|-----------|--------------|
-//! | PAGE-C1 | IS_BYTE | `[init]` | 1 (sender) |
-//! | PAGE-C2 | IS_BYTE | `[fini]` | 1 (sender) |
-//! | PAGE-C3 | Memory | `[0, address, 0, init]` | -1 (receiver) |
-//! | PAGE-C4 | Memory | `[0, address, timestamp, fini]` | 1 (sender) |
+//! | PAGE-C1+C2 | IS_BYTE | `[init, fini]` | 1 (sender) |
+//! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
+//! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

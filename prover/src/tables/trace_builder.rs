@@ -1339,9 +1339,8 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
-/// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init, 0] for initialization range check
-/// - C2: IS_BYTE[fini, 0] for finalization range check
+/// Each PAGE row generates 1 batched IS_BYTE lookup:
+/// - C1+C2: IS_BYTE[init, fini] — range-checks both bytes in one interaction
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
 fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
@@ -1819,7 +1818,7 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+    // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
     if let Some(elf) = elf {
         bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state));
     }
