@@ -436,6 +436,7 @@ pub fn gpu_parts_lde_calls() -> u64 {
 /// On success: resizes each `columns[c]` to `lde_size` with the LDE output,
 /// and returns `Vec<Commitment>` — the Keccak-256 hashed leaves in natural
 /// row order, ready to pass to `BatchedMerkleTree::build_from_hashed_leaves`.
+#[allow(dead_code)]
 pub(crate) fn try_expand_and_leaf_hash_batched<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -519,6 +520,181 @@ pub(crate) static GPU_LEAF_HASH_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fused variant: LDE + leaf-hash + Merkle tree build, all on device. Skips
+/// the pinned→pageable→pinned leaf dance of the separate-step pipeline.
+/// Returns the filled `MerkleTree<B>` alongside populating `columns` with
+/// the LDE-expanded evaluations.
+pub(crate) fn try_expand_leaf_and_tree_batched<F, E, B>(
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
+where
+    F: IsField,
+    E: IsField,
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if columns.is_empty() {
+        return None;
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if columns.iter().any(|c| c.len() != n) {
+        return None;
+    }
+    // Tree layout needs `2*lde_size - 1` nodes; must be a power-of-two leaf
+    // count. LDE size is always pow2 here (checked above).
+    if lde_size < 2 {
+        return None;
+    }
+
+    let raw_columns: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|col| {
+            col.iter()
+                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+                .collect()
+        })
+        .collect();
+    let weights_u64: Vec<u64> = weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect();
+
+    for col in columns.iter_mut() {
+        debug_assert!(col.capacity() >= lde_size);
+        unsafe { col.set_len(lde_size) };
+    }
+    let mut raw_outputs: Vec<&mut [u64]> = columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len();
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect();
+
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+
+    let total_nodes = 2 * lde_size - 1;
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
+    // SAFETY: every byte is written by the D2H below.
+    unsafe { nodes.set_len(total_nodes) };
+    let nodes_bytes: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32)
+    };
+
+    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree(
+        &slices,
+        blowup_factor,
+        &weights_u64,
+        &mut raw_outputs,
+        nodes_bytes,
+    )
+    .expect("GPU LDE+leaf-hash+tree failed");
+
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
+/// Ext3 variant of [`try_expand_leaf_and_tree_batched`]. Same fused flow
+/// (LDE → leaf-hash → tree build) but over ext3 columns via the three-slab
+/// decomposition; `B::Node = [u8; 32]` by construction for
+/// `BatchKeccak256Backend<Ext3>`.
+pub(crate) fn try_expand_leaf_and_tree_batched_ext3<F, E, B>(
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
+where
+    F: IsField,
+    E: IsField,
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if columns.is_empty() {
+        return None;
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if lde_size < 2 {
+        return None;
+    }
+
+    // SAFETY: `E == Degree3Goldilocks`; each `FieldElement<E>` is
+    // memory-equivalent to `[u64; 3]`. Copy out a Vec<u64> view per column.
+    let raw_columns: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|col| {
+            let len = col.len() * 3;
+            let ptr = col.as_ptr() as *const u64;
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+        })
+        .collect();
+    let weights_u64: Vec<u64> = weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect();
+
+    for col in columns.iter_mut() {
+        debug_assert!(col.capacity() >= lde_size);
+        unsafe { col.set_len(lde_size) };
+    }
+    let mut raw_outputs: Vec<&mut [u64]> = columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len() * 3;
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect();
+
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+
+    let total_nodes = 2 * lde_size - 1;
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
+    unsafe { nodes.set_len(total_nodes) };
+    let nodes_bytes: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32)
+    };
+
+    GPU_LDE_CALLS.fetch_add((columns.len() * 3) as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree(
+        &slices,
+        n,
+        blowup_factor,
+        &weights_u64,
+        &mut raw_outputs,
+        nodes_bytes,
+    )
+    .expect("GPU ext3 LDE+leaf-hash+tree failed");
+
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
 }
 
 /// Ext3 variant of [`try_expand_and_leaf_hash_batched`] for the aux trace.

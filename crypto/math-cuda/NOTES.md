@@ -5,11 +5,12 @@ context loss between sessions. Update as you go.
 
 ## Current state (2026-04-21, 5 commits on branch `cuda/batched-ntt`)
 
-### End-to-end speedup (with GPU Keccak-256 Merkle leaf hashing)
+### End-to-end speedup (with GPU Keccak-256 Merkle leaf hashing + fused tree build)
 
 | Program | CPU rayon (46 cores) | CUDA | Delta |
 |---|---|---|---|
-| fib_iterative_1M (median of 5) | **18.269 s** | **13.127 s** | **1.39× (28.1% faster)** |
+| fib_iterative_1M (avg of 3×5) | **18.269 s** | **12.906 s** | **1.42× (29.4% faster)** |
+| fib_iterative_4M (avg of 3)   | **≈45 s**    | **32.931 s** | (range check) |
 
 Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 
@@ -17,8 +18,8 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 
 | Hook | What it does | Kernel(s) |
 |---|---|---|
-| Main trace LDE + Merkle commit | Base-field LDE, then Keccak-256 leaf hash on device, then D2H both | `ntt_*_batched` + `keccak256_leaves_base_batched` |
-| Aux trace LDE + Merkle commit | Ext3 LDE via 3× base decomposition, then ext3 Keccak leaf hash | `ntt_*_batched` + `keccak256_leaves_ext3_batched` |
+| Main trace LDE + Merkle commit | Base-field LDE → leaf-hash → **full Merkle tree** on device, D2H only the LDE and the 2N−1 tree nodes | `ntt_*_batched` + `keccak256_leaves_base_batched` + `keccak_merkle_level` |
+| Aux trace LDE + Merkle commit | Ext3 LDE via 3× base decomposition → ext3 leaf-hash → **full Merkle tree** | `ntt_*_batched` + `keccak256_leaves_ext3_batched` + `keccak_merkle_level` |
 | R2 composition-parts LDE | `number_of_parts > 2` branch: batched ext3 evaluate-on-coset | `ntt_*_batched` (no iFFT variant) |
 | R4 DEEP-poly LDE | Standard ext3 LDE with uniform 1/N weights | `ntt_*_batched` via ext3 decomposition |
 | R2 `extend_half_to_lde` | Dormant — only hit by tiny tables below threshold | Infrastructure in place |

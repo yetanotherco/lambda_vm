@@ -543,30 +543,29 @@ pub trait IsStarkProver<
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
 
-        // GPU combined path: expand LDE + compute Merkle leaf hashes in one
-        // on-device pipeline, avoiding the second H2D a standalone GPU
-        // Merkle commit would require. Falls through when the `cuda`
-        // feature is off or the table doesn't qualify.
+        // GPU combined path: expand LDE + Merkle leaf hashing + Merkle tree
+        // build, all in one on-device pipeline. Only D2Hs the LDE
+        // evaluations and the final `2*lde_size - 1` tree nodes; the leaf
+        // hashes themselves never leave the device, so we skip one full
+        // lde_size × 32 B pinned→pageable→pinned round-trip vs. the
+        // separate-step pipeline.
         #[cfg(feature = "cuda")]
         {
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            if let Some(hashed_leaves) =
-                crate::gpu_lde::try_expand_and_leaf_hash_batched::<Field, Field>(
-                    &mut columns,
-                    domain.blowup_factor,
-                    &twiddles.coset_weights,
-                )
+            if let Some(tree) = crate::gpu_lde::try_expand_leaf_and_tree_batched::<
+                Field,
+                Field,
+                BatchedMerkleTreeBackend<Field>,
+            >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
             {
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 #[cfg(feature = "instruments")]
-                let t_sub = Instant::now();
-                let tree = BatchedMerkleTree::<Field>::build_from_hashed_leaves(hashed_leaves)
-                    .ok_or(ProvingError::EmptyCommitment)?;
+                let zero = std::time::Duration::from_secs(0);
                 let root = tree.root;
                 #[cfg(feature = "instruments")]
-                crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+                crate::instruments::accum_r1_main(main_lde_dur, zero);
                 return Ok((tree, root, None, None, 0, columns));
             }
         }
@@ -1788,14 +1787,19 @@ pub trait IsStarkProver<
                         let mut columns = trace.extract_columns_aux(lde_size);
 
                         // GPU combined path: ext3 LDE + Keccak-256 leaf
-                        // hashing in one on-device pipeline. Falls through to
-                        // CPU when `cuda` is off or the table is too small.
+                        // hashing + Merkle tree build in one on-device
+                        // pipeline. Falls through to CPU when `cuda` is off
+                        // or the table is too small.
                         #[cfg(feature = "cuda")]
                         {
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
-                            if let Some(hashed_leaves) =
-                                crate::gpu_lde::try_expand_and_leaf_hash_batched_ext3::<Field, FieldExtension>(
+                            if let Some(tree) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3::<
+                                    Field,
+                                    FieldExtension,
+                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                >(
                                     &mut columns,
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
@@ -1804,12 +1808,10 @@ pub trait IsStarkProver<
                                 #[cfg(feature = "instruments")]
                                 let aux_lde_dur = t_sub.elapsed();
                                 #[cfg(feature = "instruments")]
-                                let t_sub = Instant::now();
-                                let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)
-                                    .ok_or(ProvingError::EmptyCommitment)?;
+                                let zero = std::time::Duration::from_secs(0);
                                 let root = tree.root;
                                 #[cfg(feature = "instruments")]
-                                crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                                crate::instruments::accum_r1_aux(aux_lde_dur, zero);
                                 return Ok((Some(Arc::new(tree)), Some(root), columns));
                             }
                         }
