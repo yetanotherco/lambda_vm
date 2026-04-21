@@ -321,6 +321,11 @@ impl<F: IsField> Table<F> {
             writer.write_all(bytes)?;
             writer.flush()?;
         }
+        // Flush dirty pages to disk so the subsequent mmap reads the data
+        // that was written, not the zero-filled holes left by `set_len`.
+        // Under memory pressure, unsynced pages can be evicted from the
+        // page cache before readback, producing partially-zeroed reads.
+        file.sync_all()?;
 
         // SAFETY: tempfile() creates an anonymous file with no filesystem path,
         // so no other process can open or modify it.
