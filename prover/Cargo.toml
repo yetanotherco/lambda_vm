@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+cuda = ["stark/cuda"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 
@@ -20,6 +21,7 @@ rayon = { version = "1.8.0", optional = true }
 [dev-dependencies]
 env_logger = "*"
 criterion = { version = "0.5", default-features = false }
+stark = { path = "../crypto/stark" }
 
 [[bench]]
 name = "vm_prover_benchmark"

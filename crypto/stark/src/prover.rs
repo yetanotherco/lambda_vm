@@ -489,6 +489,19 @@ pub trait IsStarkProver<
             return;
         }
 
+        // GPU batched fast path: all columns at once in one pipeline on one
+        // stream. Falls through to per-column rayon when the table is too
+        // small, the element type isn't Goldilocks, or the `cuda` feature is
+        // off.
+        #[cfg(feature = "cuda")]
+        if crate::gpu_lde::try_expand_columns_batched::<Field, E>(
+            columns,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+        ) {
+            return;
+        }
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
