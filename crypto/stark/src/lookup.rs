@@ -1798,40 +1798,30 @@ where
 
             // Phase 1: Compute fingerprints for both interactions in this chunk.
             // Layout: [fp_a[0..chunk_len], fp_b[0..chunk_len]]
-            let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * chunk_len);
+            let compute_chunk_fingerprints = |interaction: &BusInteraction,
+                                              bus_id_f: &FieldElement<F>,
+                                              fps: &mut Vec<FieldElement<E>>| {
+                for row in chunk_start..chunk_start + chunk_len {
+                    let mut lc = bus_id_f * &alpha_powers[0];
+                    let mut alpha_offset = 1;
+                    for bv in &interaction.values {
+                        let consumed = bv.accumulate_fingerprint(
+                            main_segment_cols,
+                            row,
+                            &alpha_powers,
+                            alpha_offset,
+                            &mut lc,
+                            &shifts,
+                        );
+                        alpha_offset += consumed;
+                    }
+                    fps.push(z - &lc);
+                }
+            };
 
-            for row in chunk_start..chunk_start + chunk_len {
-                let mut lc_a = &bus_id_a * &alpha_powers[0];
-                let mut alpha_offset = 1;
-                for bv in &interaction_a.values {
-                    let consumed = bv.accumulate_fingerprint(
-                        main_segment_cols,
-                        row,
-                        &alpha_powers,
-                        alpha_offset,
-                        &mut lc_a,
-                        &shifts,
-                    );
-                    alpha_offset += consumed;
-                }
-                fingerprints.push(z - &lc_a);
-            }
-            for row in chunk_start..chunk_start + chunk_len {
-                let mut lc_b = &bus_id_b * &alpha_powers[0];
-                let mut alpha_offset = 1;
-                for bv in &interaction_b.values {
-                    let consumed = bv.accumulate_fingerprint(
-                        main_segment_cols,
-                        row,
-                        &alpha_powers,
-                        alpha_offset,
-                        &mut lc_b,
-                        &shifts,
-                    );
-                    alpha_offset += consumed;
-                }
-                fingerprints.push(z - &lc_b);
-            }
+            let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * chunk_len);
+            compute_chunk_fingerprints(interaction_a, &bus_id_a, &mut fingerprints);
+            compute_chunk_fingerprints(interaction_b, &bus_id_b, &mut fingerprints);
 
             // Phase 2: Batch-invert all fingerprints in this chunk
             FieldElement::inplace_batch_inverse(&mut fingerprints)
