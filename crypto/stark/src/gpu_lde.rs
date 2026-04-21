@@ -518,6 +518,86 @@ pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Ext3 variant of [`try_expand_and_leaf_hash_batched`] for the aux trace.
+/// Decomposes each ext3 column into three base slabs, runs the LDE + Keccak
+/// ext3 kernel in one on-device pipeline, re-interleaves LDE output back to
+/// ext3 layout, and returns hashed leaves.
+pub(crate) fn try_expand_and_leaf_hash_batched_ext3<F, E>(
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<Vec<[u8; 32]>>
+where
+    F: IsField,
+    E: IsField,
+{
+    if columns.is_empty() {
+        return Some(Vec::new());
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if columns.iter().any(|c| c.len() != n) {
+        return None;
+    }
+
+    let raw_columns: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|col| {
+            let len = col.len() * 3;
+            let ptr = col.as_ptr() as *const u64;
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+        })
+        .collect();
+    let weights_u64: Vec<u64> = weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect();
+
+    for col in columns.iter_mut() {
+        debug_assert!(col.capacity() >= lde_size);
+        unsafe { col.set_len(lde_size) };
+    }
+    let mut raw_outputs: Vec<&mut [u64]> = columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len() * 3;
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect();
+
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(lde_size);
+    unsafe { leaves.set_len(lde_size) };
+    let hashed_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(leaves.as_mut_ptr() as *mut u8, lde_size * 32)
+    };
+
+    GPU_LDE_CALLS.fetch_add((columns.len() * 3) as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    math_cuda::lde::coset_lde_batch_ext3_into_with_leaf_hash(
+        &slices,
+        n,
+        blowup_factor,
+        &weights_u64,
+        &mut raw_outputs,
+        hashed_bytes,
+    )
+    .expect("GPU ext3 LDE+leaf-hash failed");
+
+    Some(leaves)
+}
+
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
 /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
 fn try_expand_columns_batched_ext3<F, E>(

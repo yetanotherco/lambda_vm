@@ -1786,6 +1786,34 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
                         let mut columns = trace.extract_columns_aux(lde_size);
+
+                        // GPU combined path: ext3 LDE + Keccak-256 leaf
+                        // hashing in one on-device pipeline. Falls through to
+                        // CPU when `cuda` is off or the table is too small.
+                        #[cfg(feature = "cuda")]
+                        {
+                            #[cfg(feature = "instruments")]
+                            let t_sub = Instant::now();
+                            if let Some(hashed_leaves) =
+                                crate::gpu_lde::try_expand_and_leaf_hash_batched_ext3::<Field, FieldExtension>(
+                                    &mut columns,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
+                                )
+                            {
+                                #[cfg(feature = "instruments")]
+                                let aux_lde_dur = t_sub.elapsed();
+                                #[cfg(feature = "instruments")]
+                                let t_sub = Instant::now();
+                                let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)
+                                    .ok_or(ProvingError::EmptyCommitment)?;
+                                let root = tree.root;
+                                #[cfg(feature = "instruments")]
+                                crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                                return Ok((Some(Arc::new(tree)), Some(root), columns));
+                            }
+                        }
+
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_columns_to_lde::<FieldExtension>(

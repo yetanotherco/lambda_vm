@@ -34,10 +34,12 @@ fn bench_prove(name: &str, trials: u32) {
         let eh = stark::gpu_lde::gpu_extend_halves_calls();
         let r4 = stark::gpu_lde::gpu_r4_lde_calls();
         let parts = stark::gpu_lde::gpu_parts_lde_calls();
+        let leaf = stark::gpu_lde::gpu_leaf_hash_calls();
         println!("  GPU LDE calls across {trials} proves: {calls}");
         println!("  GPU extend_two_halves calls: {eh}");
         println!("  GPU R4 deep-poly LDE calls: {r4}");
         println!("  GPU R2 parts LDE calls: {parts}");
+        println!("  GPU leaf-hash calls: {leaf}");
     }
 }
 
