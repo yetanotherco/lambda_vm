@@ -1,6 +1,7 @@
 #[cfg(feature = "debug-checks")]
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::{
     constraints::{
@@ -782,6 +783,58 @@ impl BusValue {
 // AirWithBuses
 // =============================================================================
 
+/// Thin wrapper that implements `TransitionConstraint` by delegating to an Arc.
+///
+/// Used to share a constraint between `compiled_evals` closures (which capture
+/// an `Arc::clone`) and the `transition_constraints` metadata vector (which
+/// stores `Box<dyn TransitionConstraint>`).
+struct ArcConstraint<F, E>(Arc<dyn TransitionConstraint<F, E>>)
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync;
+
+impl<F, E> TransitionConstraint<F, E> for ArcConstraint<F, E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn degree(&self) -> usize {
+        self.0.degree()
+    }
+    fn constraint_idx(&self) -> usize {
+        self.0.constraint_idx()
+    }
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        self.0.evaluate(evaluation_context, transition_evaluations);
+    }
+    fn period(&self) -> usize {
+        self.0.period()
+    }
+    fn offset(&self) -> usize {
+        self.0.offset()
+    }
+    fn exemptions_period(&self) -> Option<usize> {
+        self.0.exemptions_period()
+    }
+    fn periodic_exemptions_offset(&self) -> Option<usize> {
+        self.0.periodic_exemptions_offset()
+    }
+    fn end_exemptions(&self) -> usize {
+        self.0.end_exemptions()
+    }
+}
+
+/// Type alias for a compiled constraint evaluation closure.
+///
+/// Each entry in `compiled_evals` directly calls one constraint's `evaluate`
+/// via an Arc capture, avoiding repeated vtable dispatch through trait objects.
+type CompiledEvalFn<F, E> =
+    Box<dyn Fn(&TransitionEvaluationContext<F, E>, &mut [FieldElement<E>]) + Send + Sync>;
+
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
@@ -793,6 +846,7 @@ pub struct AirWithBuses<
     step_size: usize,
     trace_layout: (usize, usize),
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    compiled_evals: Vec<CompiledEvalFn<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -829,7 +883,7 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+        transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
@@ -838,28 +892,49 @@ impl<
         let absorbed =
             auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
 
+        // Convert external constraints to Arc so they can be shared between the
+        // metadata vector and the compiled-closure vector without cloning.
+        let mut arcs: Vec<Arc<dyn TransitionConstraint<F, E>>> =
+            transition_constraints.into_iter().map(Arc::from).collect();
+
         // Create batched term constraints for committed pairs only
         for pair_idx in 0..num_committed_pairs {
             let constraint = LookupBatchedTermConstraint::new(
                 auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
                 auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
                 pair_idx,
-                transition_constraints.len(),
+                arcs.len(),
             );
-            transition_constraints.push(Box::new(constraint));
+            arcs.push(Arc::new(constraint));
         }
 
         let num_term_columns = num_committed_pairs;
 
         // Add the accumulated constraint with absorbed interactions
         if num_interactions > 0 {
-            let accumulated_constraint = LookupAccumulatedConstraint::new(
-                transition_constraints.len(),
-                num_term_columns,
-                absorbed,
-            );
-            transition_constraints.push(Box::new(accumulated_constraint));
+            let accumulated_constraint =
+                LookupAccumulatedConstraint::new(arcs.len(), num_term_columns, absorbed);
+            arcs.push(Arc::new(accumulated_constraint));
         }
+
+        // Build compiled_evals: one direct-call closure per constraint.
+        // Each closure captures an Arc clone, avoiding vtable dispatch on the
+        // outer AIR and inlining each constraint body at the call site.
+        let compiled_evals: Vec<CompiledEvalFn<F, E>> = arcs
+            .iter()
+            .map(|arc| {
+                let c = Arc::clone(arc);
+                let f: CompiledEvalFn<F, E> = Box::new(move |ctx, buf| c.evaluate(ctx, buf));
+                f
+            })
+            .collect();
+
+        // Build transition_constraints (metadata) by wrapping each Arc in a
+        // thin ArcConstraint adapter so the return type matches the AIR trait.
+        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = arcs
+            .into_iter()
+            .map(|arc| Box::new(ArcConstraint(arc)) as Box<dyn TransitionConstraint<F, E>>)
+            .collect();
 
         // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
@@ -890,6 +965,7 @@ impl<
             step_size,
             trace_layout,
             transition_constraints,
+            compiled_evals,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -1116,6 +1192,19 @@ where
             transcript.sample_field_element(), // alpha
         ]
     }
+    fn compute_transition_into(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for f in &self.compiled_evals {
+            f(evaluation_context, evaluations);
+        }
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
@@ -1856,6 +1945,7 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
 ///
 /// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
+#[derive(Clone)]
 struct LookupBatchedTermConstraint {
     interaction_a: BusInteraction,
     interaction_b: BusInteraction,
@@ -1981,6 +2071,7 @@ where
 ///
 /// For 2 absorbed interactions:
 ///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
+#[derive(Clone)]
 struct LookupAccumulatedConstraint {
     constraint_idx: usize,
     /// Number of committed term columns (excludes absorbed interactions)

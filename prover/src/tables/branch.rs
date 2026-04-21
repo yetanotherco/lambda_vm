@@ -375,6 +375,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 ///
 /// The carries are computed from degree-1 operands (pc or register, not both),
 /// so carry is degree 1 and the full constraint is degree 3.
+#[derive(Clone)]
 pub struct BranchConstraint {
     /// Unique constraint identifier
     constraint_idx: usize,

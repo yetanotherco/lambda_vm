@@ -47,6 +47,7 @@ fn inv_2_32<F: IsField>() -> FieldElement<F> {
 /// Two modes:
 /// - Conditional: `cond * X * (1-X) = 0` (degree 3)
 /// - Unconditional: `X * (1-X) = 0` (degree 2)
+#[derive(Clone)]
 pub struct IsBitConstraint {
     /// Column index for the condition (None = unconditional)
     cond_col: Option<usize>,
@@ -391,6 +392,7 @@ impl AddOperand {
 ///
 /// Assumptions (must be verified via bus lookups):
 /// - lhs_lo, lhs_hi, rhs_lo, rhs_hi, sum_lo, sum_hi are all valid 32-bit words
+#[derive(Clone)]
 pub struct AddConstraint {
     /// Column indices for condition flags (constraint active when sum > 0)
     cond_cols: Vec<usize>,

@@ -493,6 +493,7 @@ pub enum LoadConstraintKind {
 }
 
 /// LOAD table constraint.
+#[derive(Clone)]
 pub struct LoadConstraint {
     constraint_idx: usize,
     kind: LoadConstraintKind,

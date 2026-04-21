@@ -157,6 +157,7 @@ pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 ///             + BEQ * (is_equal XOR mp_selector)
 ///
 /// Where XOR is computed as: a XOR b = a + b - 2*a*b
+#[derive(Clone)]
 pub struct BranchCondConstraint {
     constraint_idx: usize,
 }
@@ -245,6 +246,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
 /// Constraint that EBREAK must be 0 (unprovable trap).
 ///
 /// From spec: !EBREAK (we treat EBREAK as an unprovable trap)
+#[derive(Clone)]
 pub struct EbreakConstraint {
     constraint_idx: usize,
 }
@@ -312,6 +314,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
 /// arg1[:4] as word = rv1[0] + rv1[1] * 2^16 (two halves make a word)
 ///
 /// Spec (CPU-CE54): arg1::DWordWL[0] - rv1::DWordWL[0] = 0
+#[derive(Clone)]
 pub struct Arg1LowerConstraint {
     constraint_idx: usize,
 }
@@ -382,6 +385,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
 /// Constraint: arg1[4:8] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_ext_bit * signed
 ///
 /// Upper 32 bits of arg1 depends on word_instr and sign extension.
+#[derive(Clone)]
 pub struct Arg1UpperConstraint {
     constraint_idx: usize,
 }
@@ -467,6 +471,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
 /// Constraint: when SLT + BLT = 1, res[i] = 0 for i in 1..8
 ///
 /// The LT result is a single bit stored in res[0], upper bytes must be zero.
+#[derive(Clone)]
 pub struct SltResZeroConstraint {
     /// Which byte index (1-7) this constraint applies to
     byte_idx: usize,
@@ -557,6 +562,7 @@ pub fn create_slt_res_zero_constraints(
 /// (1 - word_instr) * ext_bit = 0
 ///
 /// One instance per extension bit (rv1_ext_bit, rv2_ext_bit, res_ext_bit).
+#[derive(Clone)]
 pub struct ExtBitZeroConstraint {
     constraint_idx: usize,
     ext_bit_col: usize,
@@ -638,6 +644,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ExtBitZeroCo
 ///
 /// Uses the same carry-based approach as AddConstraint but with
 /// condition `(1 - branch_cond)` instead of a column value.
+#[derive(Clone)]
 pub struct NextPcAddConstraint {
     /// Which carry constraint this is (0 or 1)
     carry_idx: usize,
@@ -767,6 +774,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
 /// Constraint: arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
 ///
 /// arg2 lower 32 bits comes from either rv2 or imm depending on instruction type.
+#[derive(Clone)]
 pub struct Arg2LowerConstraint {
     constraint_idx: usize,
 }
@@ -845,6 +853,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
 /// Constraint: arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*rv2_ext_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
 ///
 /// arg2 upper 32 bits with sign extension logic.
+#[derive(Clone)]
 pub struct Arg2UpperConstraint {
     constraint_idx: usize,
 }
@@ -934,6 +943,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
 /// When not LOAD, rvd lower 32 bits equals res lower 32 bits.
 /// For LOAD: rvd is the loaded value, not res (which is the address).
 /// For non-LOAD ops (including STORE): rvd must equal res in the trace.
+#[derive(Clone)]
 pub struct RvdLowerConstraint {
     constraint_idx: usize,
 }
@@ -994,6 +1004,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
 /// When not LOAD, rvd upper 32 bits equals res upper with sign extension.
 /// For LOAD: rvd is the loaded value, not res (which is the address).
 /// For non-LOAD ops (including STORE): rvd must equal res in the trace.
+#[derive(Clone)]
 pub struct RvdUpperConstraint {
     constraint_idx: usize,
 }
@@ -1071,6 +1082,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
 ///   so it must be forced to zero by a polynomial constraint.
 /// - CPU-CM50.i: `(1 - read_register2) * rv2[i] = 0` for i ∈ [0, 2]
 ///   Same logic for rv2 when read_register2 = 0 (I-type instructions).
+#[derive(Clone)]
 pub struct RegNotReadIsZeroConstraint {
     flag_col: usize,
     value_col: usize,
