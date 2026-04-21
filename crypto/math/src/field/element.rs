@@ -71,6 +71,25 @@ impl<F: IsField> FieldElement<F> {
         Ok(())
     }
 
+    /// Parallel batch inverse: splits into chunks, one Montgomery inversion per chunk.
+    /// Cost: K extra field inversions (one per chunk) but O(N/K) sequential work per thread.
+    /// Falls back to sequential for small inputs.
+    #[cfg(feature = "parallel")]
+    pub fn par_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError>
+    where
+        Self: Send + Sync,
+    {
+        if numbers.len() < 1024 {
+            return Self::inplace_batch_inverse(numbers);
+        }
+        use rayon::prelude::*;
+        let num_chunks = rayon::current_num_threads().min(numbers.len() / 256);
+        let chunk_size = (numbers.len() + num_chunks - 1) / num_chunks;
+        numbers
+            .par_chunks_mut(chunk_size)
+            .try_for_each(|chunk| Self::inplace_batch_inverse(chunk))
+    }
+
     #[inline(always)]
     pub fn to_subfield_vec<S>(self) -> alloc::vec::Vec<FieldElement<S>>
     where

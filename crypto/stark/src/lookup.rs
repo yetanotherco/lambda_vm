@@ -1526,6 +1526,10 @@ where
         );
     }
 
+    #[cfg(feature = "parallel")]
+    FieldElement::par_batch_inverse(&mut fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+    #[cfg(not(feature = "parallel"))]
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
@@ -1726,6 +1730,10 @@ where
     all_fingerprints.extend(fingerprints_b);
 
     // Single batch inversion for all 2*N fingerprints
+    #[cfg(feature = "parallel")]
+    FieldElement::par_batch_inverse(&mut all_fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+    #[cfg(not(feature = "parallel"))]
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
