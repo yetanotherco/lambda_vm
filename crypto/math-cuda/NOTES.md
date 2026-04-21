@@ -10,7 +10,8 @@ context loss between sessions. Update as you go.
 | Program | CPU rayon (46 cores) | CUDA | Delta |
 |---|---|---|---|
 | fib_iterative_1M (avg of 3×5) | **18.269 s** | **12.906 s** | **1.42× (29.4% faster)** |
-| fib_iterative_4M (avg of 3)   | **≈45 s**    | **32.931 s** | (range check) |
+| fib_iterative_2M (avg of 5)   |               | **17.881 s** | (range check) |
+| fib_iterative_4M (avg of 3)   |               | **32.931 s** | (range check) |
 
 Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 
