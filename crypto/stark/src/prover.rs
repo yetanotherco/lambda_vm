@@ -387,42 +387,25 @@ pub trait IsStarkProver<
             "num_rows must be a power of two for reverse_index"
         );
 
-        let total_bytes = num_cols * byte_len;
-
-        // Use map_init to allocate one byte buffer per thread (reused across rows).
-        // Eliminates 2M heap allocations for typical CPU table (74 cols × 2^21 rows).
         #[cfg(feature = "parallel")]
-        let hashed_leaves: Vec<Commitment> = (0..num_rows)
-            .into_par_iter()
-            .map_init(
-                || vec![0u8; total_bytes],
-                |buf, row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    for col_idx in 0..num_cols {
-                        columns[col_idx][br_idx].write_bytes_be(
-                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
-                        );
-                    }
-                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
-                },
-            )
-            .collect();
-
+        let iter = (0..num_rows).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let hashed_leaves: Vec<Commitment> = {
-            let mut buf = vec![0u8; total_bytes];
-            (0..num_rows)
-                .map(|row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    for col_idx in 0..num_cols {
-                        columns[col_idx][br_idx].write_bytes_be(
-                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
-                        );
-                    }
-                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-                })
-                .collect()
-        };
+        let iter = 0..num_rows;
+
+        // One allocation per row (was one per field element): write all columns
+        // into a single buffer, then hash once.
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let br_idx = reverse_index(row_idx, num_rows as u64);
+                let total_bytes = num_cols * byte_len;
+                let mut buf = vec![0u8; total_bytes];
+                for col_idx in 0..num_cols {
+                    columns[col_idx][br_idx]
+                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                }
+                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+            })
+            .collect();
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -738,50 +721,24 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_leaves;
 
-        let total_bytes = 2 * num_parts * byte_len;
-
-        #[cfg(feature = "parallel")]
-        let hashed_leaves: Vec<Commitment> = (0..num_leaves)
-            .into_par_iter()
-            .map_init(
-                || vec![0u8; total_bytes],
-                |buf, leaf_idx| {
-                    let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-                    let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                    let mut offset = 0;
-                    for part in lde_composition_poly_parts_evaluations.iter() {
-                        part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                        offset += byte_len;
-                    }
-                    for part in lde_composition_poly_parts_evaluations.iter() {
-                        part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                        offset += byte_len;
-                    }
-                    BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(buf)
-                },
-            )
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|leaf_idx| {
+                let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+                let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+                let total_bytes = 2 * num_parts * byte_len;
+                let mut buf = vec![0u8; total_bytes];
+                let mut offset = 0;
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+                    offset += byte_len;
+                }
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+                    offset += byte_len;
+                }
+                BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(&buf)
+            })
             .collect();
-
-        #[cfg(not(feature = "parallel"))]
-        let hashed_leaves: Vec<Commitment> = {
-            let mut buf = vec![0u8; total_bytes];
-            (0..num_leaves)
-                .map(|leaf_idx| {
-                    let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-                    let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                    let mut offset = 0;
-                    for part in lde_composition_poly_parts_evaluations.iter() {
-                        part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                        offset += byte_len;
-                    }
-                    for part in lde_composition_poly_parts_evaluations.iter() {
-                        part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                        offset += byte_len;
-                    }
-                    BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(&buf)
-                })
-                .collect()
-        };
 
         let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
