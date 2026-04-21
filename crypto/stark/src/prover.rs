@@ -1104,10 +1104,28 @@ pub trait IsStarkProver<
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
+        // GPU fast path: the deep-poly extension is an N → domain_size ext3
+        // LDE with uniform weights `1/N` (no coset shift). Falls through if
+        // the `cuda` feature is off, the type isn't ext3, or the size is
+        // below the threshold.
+        #[cfg(feature = "cuda")]
+        let mut lde_evals = if let Some(evals) =
+            crate::gpu_lde::try_r4_deep_poly_lde_gpu(&deep_evals, domain_size)
+        {
+            evals
+        } else {
+            let deep_poly =
+                Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
+            Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
+                .expect("FFT should succeed")
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mut lde_evals = {
+            let deep_poly =
+                Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
+            Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
+                .expect("FFT should succeed")
+        };
         in_place_bit_reverse_permute(&mut lde_evals);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();

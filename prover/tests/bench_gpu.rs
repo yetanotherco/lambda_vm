@@ -32,8 +32,10 @@ fn bench_prove(name: &str, trials: u32) {
     {
         let calls = stark::gpu_lde::gpu_lde_calls();
         let eh = stark::gpu_lde::gpu_extend_halves_calls();
+        let r4 = stark::gpu_lde::gpu_r4_lde_calls();
         println!("  GPU LDE calls across {trials} proves: {calls}");
         println!("  GPU extend_two_halves calls: {eh}");
+        println!("  GPU R4 deep-poly LDE calls: {r4}");
     }
 }
 

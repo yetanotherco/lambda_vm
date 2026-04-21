@@ -250,6 +250,89 @@ where
     Some((lde_h0, lde_h1))
 }
 
+/// GPU path for Round 4's DEEP-poly LDE extension.
+///
+/// The CPU pipeline at `prover.rs:1107` is
+/// ```ignore
+/// let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals)?;
+/// let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))?;
+/// in_place_bit_reverse_permute(&mut lde_evals);
+/// ```
+///
+/// That is an iFFT over `N = deep_evals.len()` ext3 elements followed by an
+/// FFT evaluation on `domain_size` points — the **standard** (non-coset) LDE
+/// on the extension field with weights `[1/N, ..., 1/N]`. We reuse
+/// `coset_lde_batch_ext3_into` with a uniform `1/N` weight vector; the
+/// single ext3 column is handled internally as 3 base-field slabs. The
+/// caller keeps its trailing `in_place_bit_reverse_permute`, so output
+/// order is unchanged.
+pub(crate) fn try_r4_deep_poly_lde_gpu<E>(
+    deep_evals: &[FieldElement<E>],
+    domain_size: usize,
+) -> Option<Vec<FieldElement<E>>>
+where
+    E: IsField,
+{
+    let n = deep_evals.len();
+    if n == 0 || !n.is_power_of_two() {
+        return None;
+    }
+    if domain_size < n || !domain_size.is_power_of_two() {
+        return None;
+    }
+    let blowup = domain_size / n;
+    if blowup < 2 {
+        return None;
+    }
+    if domain_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+
+    GPU_R4_LDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Uniform weights = 1/N (no coset shift, just iFFT normalisation).
+    let inv_n_u64 = {
+        let fe = FieldElement::<GoldilocksField>::from(n as u64)
+            .inv()
+            .expect("N non-zero");
+        *fe.value()
+    };
+    let weights = vec![inv_n_u64; n];
+
+    // Input: single ext3 column, 3n u64s.
+    let input_raw: Vec<u64> = {
+        let len = n * 3;
+        let ptr = deep_evals.as_ptr() as *const u64;
+        unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+    };
+    let inputs: [&[u64]; 1] = [&input_raw];
+
+    let mut out_vec = vec![FieldElement::<E>::zero(); domain_size];
+    {
+        let out_ptr = out_vec.as_mut_ptr() as *mut u64;
+        let out_slice = unsafe { core::slice::from_raw_parts_mut(out_ptr, 3 * domain_size) };
+        let mut outputs: [&mut [u64]; 1] = [out_slice];
+        math_cuda::lde::coset_lde_batch_ext3_into(
+            &inputs,
+            n,
+            blowup,
+            &weights,
+            &mut outputs,
+        )
+        .expect("GPU R4 deep-poly LDE failed");
+    }
+    Some(out_vec)
+}
+
+pub(crate) static GPU_R4_LDE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_r4_lde_calls() -> u64 {
+    GPU_R4_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
 /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
 fn try_expand_columns_batched_ext3<F, E>(
