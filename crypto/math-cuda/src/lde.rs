@@ -436,6 +436,7 @@ pub fn coset_lde_batch_base_into(
 
     // Parallel copy pinned → caller outputs. Caller's Vecs may still fault
     // on first write; we spread that cost across rayon cores.
+    #[allow(unused_imports)]
     use rayon::prelude::*;
     let pinned_ptr = pinned.as_ptr() as usize;
     outputs
@@ -450,6 +451,221 @@ pub fn coset_lde_batch_base_into(
             };
             dst.copy_from_slice(src);
         });
+    drop(staging);
+    Ok(())
+}
+
+/// Batched coset LDE for Goldilocks **cubic extension** columns.
+///
+/// A degree-3 extension element is `(a, b, c)` in memory (three contiguous
+/// u64s). The NTT butterfly multiplies `v = (a, b, c)` by a base-field
+/// twiddle `t`: `t * v = (t*a, t*b, t*c)`. Addition is componentwise. So an
+/// NTT over M ext3 columns is algebraically equivalent to **3M parallel
+/// base-field NTTs** sharing the same twiddles and coset weights. We
+/// exploit this to reuse the base-field kernels with no modification:
+///
+/// 1. Host pack de-interleaves each ext3 column into 3 consecutive
+///    base-field slabs inside the pinned staging buffer (slab 0 has all the
+///    a-components, slab 1 all the b's, slab 2 all the c's — 3M base slabs
+///    in total).
+/// 2. Existing `bit_reverse_permute_batched` / `ntt_dit_*_batched` /
+///    `pointwise_mul_batched` run over those 3M base slabs on device.
+/// 3. D2H, then re-interleave 3 slabs per output ext3 column.
+///
+/// Input/output layout: each slice is 3*n or 3*n*blowup u64s, packed as
+/// `[a0, b0, c0, a1, b1, c1, ...]` — the natural `[FieldElement<Ext3>]`
+/// memory representation.
+pub fn coset_lde_batch_ext3_into(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<()> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let m = columns.len();
+    assert_eq!(outputs.len(), m, "outputs must match columns count");
+    assert!(n.is_power_of_two(), "n must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    for c in columns.iter() {
+        assert_eq!(c.len(), 3 * n, "each ext3 column must be 3*n u64s");
+    }
+    let lde_size = n * blowup_factor;
+    for o in outputs.iter() {
+        assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    // 3 base slabs per ext3 column; slab index `c*3 + k` holds component `k`.
+    let mb = 3 * m;
+
+    let be = backend();
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+
+    // Pack: for each ext3 column, write 3 base slabs into pinned. The slab
+    // for column c, component k lives at `pinned[(c*3 + k)*n .. (c*3+k)*n + n]`.
+    // We de-interleave from the interleaved `[a, b, c, a, b, c, ...]` input.
+    use rayon::prelude::*;
+    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
+    columns.par_iter().enumerate().for_each(|(c, col)| {
+        // SAFETY: disjoint regions per c; staging lock held.
+        let slab_a = unsafe {
+            std::slice::from_raw_parts_mut(
+                (pinned_ptr_u as *mut u64).add((c * 3 + 0) * n),
+                n,
+            )
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts_mut(
+                (pinned_ptr_u as *mut u64).add((c * 3 + 1) * n),
+                n,
+            )
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts_mut(
+                (pinned_ptr_u as *mut u64).add((c * 3 + 2) * n),
+                n,
+            )
+        };
+        for i in 0..n {
+            slab_a[i] = col[i * 3 + 0];
+            slab_b[i] = col[i * 3 + 1];
+            slab_c[i] = col[i * 3 + 2];
+        }
+    });
+
+    // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    // H2D: slab by slab into the first N slots of each `lde_size`-slab.
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    }
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let mb_u32 = mb as u32;
+
+    // === Butterflies: identical to the base-field batched path, but with
+    // grid.y = 3M instead of M. ===
+    {
+        let grid_x = (n as u32).div_ceil(256);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, mb_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute_batched)
+                .arg(&mut buf)
+                .arg(&n_u64)
+                .arg(&log_n)
+                .arg(&col_stride_u64)
+                .launch(cfg)?;
+        }
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    {
+        let grid_x = (n as u32).div_ceil(256);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, mb_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.pointwise_mul_batched)
+                .arg(&mut buf)
+                .arg(&weights_dev)
+                .arg(&n_u64)
+                .arg(&col_stride_u64)
+                .launch(cfg)?;
+        }
+    }
+    {
+        let grid_x = (lde_size as u32).div_ceil(256);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, mb_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute_batched)
+                .arg(&mut buf)
+                .arg(&lde_u64)
+                .arg(&log_lde)
+                .arg(&col_stride_u64)
+                .launch(cfg)?;
+        }
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+
+    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+    stream.synchronize()?;
+
+    // Unpack: for each output column, re-interleave 3 slabs back into the
+    // ext3-per-element layout.
+    let pinned_const = pinned.as_ptr() as usize;
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        let slab_a = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 0) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
+                lde_size,
+            )
+        };
+        for i in 0..lde_size {
+            dst[i * 3 + 0] = slab_a[i];
+            dst[i * 3 + 1] = slab_b[i];
+            dst[i * 3 + 2] = slab_c[i];
+        }
+    });
     drop(staging);
     Ok(())
 }

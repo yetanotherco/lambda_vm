@@ -9,6 +9,7 @@
 use core::any::type_name;
 
 use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
 
@@ -75,12 +76,21 @@ where
     if type_name::<F>() != type_name::<GoldilocksField>() {
         return false;
     }
-    if type_name::<E>() != type_name::<GoldilocksField>() {
-        return false;
-    }
     // All columns within one call must be the same size (invariant of the
     // caller), but double-check before unsafe extraction.
     if columns.iter().any(|c| c.len() != n) {
+        return false;
+    }
+
+    // Ext3 fast path: decompose each ext3 column into its 3 base components
+    // and dispatch to the base-field batched NTT with 3×M logical columns.
+    // Butterflies with a base-field twiddle act componentwise on ext3, so
+    // this is exactly equivalent to running the NTT in the extension field.
+    if type_name::<E>() == type_name::<Degree3GoldilocksExtensionField>() {
+        return try_expand_columns_batched_ext3::<F, E>(columns, blowup_factor, weights);
+    }
+
+    if type_name::<E>() != type_name::<GoldilocksField>() {
         return false;
     }
 
@@ -132,5 +142,78 @@ where
         &mut raw_outputs,
     )
     .expect("GPU batched coset LDE failed");
+    true
+}
+
+/// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
+/// `Degree3GoldilocksExtensionField` by type_name match at the caller.
+fn try_expand_columns_batched_ext3<F, E>(
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> bool
+where
+    F: IsField,
+    E: IsField,
+{
+    if columns.is_empty() {
+        return true;
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+
+    // SAFETY: caller confirmed `E == Degree3GoldilocksExtensionField` via
+    // type_name. That means `FieldElement<E>` wraps `[FieldElement<Gl>; 3]`,
+    // which is memory-equivalent to `[u64; 3]`. A `&[FieldElement<E>]` of
+    // length `n` is therefore a contiguous `3 * n * 8` byte buffer.
+    let raw_columns: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|col| {
+            let len = col.len() * 3;
+            let ptr = col.as_ptr() as *const u64;
+            // Copy rather than borrow: the caller still owns `col` and will
+            // reuse its backing storage after we resize + rewrite below.
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+        })
+        .collect();
+    // F is `type_name::<F>() == GoldilocksField` by caller precondition;
+    // `F::BaseType == u64`, so we can read each `w.value()` as a `*const u64`.
+    let weights_u64: Vec<u64> = weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect();
+
+    // Pre-size each ext3 column to lde_size so its backing Vec has the right
+    // length for the output re-interleave. Capacity must already be >=
+    // lde_size (caller's `extract_columns_main(lde_size)` ensures this).
+    for col in columns.iter_mut() {
+        debug_assert!(col.capacity() >= lde_size);
+        // SAFETY: overwritten fully by the GPU path below.
+        unsafe { col.set_len(lde_size) };
+    }
+
+    // View each column's backing memory as a `&mut [u64]` of length
+    // `3*lde_size`. Safe because ext3 elements are `[u64; 3]` layouts.
+    let mut raw_outputs: Vec<&mut [u64]> = columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len() * 3;
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect();
+
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+    // Account each ext3 column as 3 logical GPU LDE "calls" (base-field
+    // components) so the counter matches the base-field batched path.
+    GPU_LDE_CALLS.fetch_add((columns.len() * 3) as u64, std::sync::atomic::Ordering::Relaxed);
+    math_cuda::lde::coset_lde_batch_ext3_into(
+        &slices,
+        n,
+        blowup_factor,
+        &weights_u64,
+        &mut raw_outputs,
+    )
+    .expect("GPU batched ext3 coset LDE failed");
     true
 }
