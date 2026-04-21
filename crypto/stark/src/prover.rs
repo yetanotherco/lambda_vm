@@ -1521,13 +1521,30 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
+        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        let mut domain_cache: std::collections::HashMap<
+            (usize, usize),
+            (Arc<Domain<Field>>, Arc<LdeTwiddles<Field>>),
+        > = std::collections::HashMap::new();
+
         let mut domains = Vec::with_capacity(num_airs);
-        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
-            let domain = new_domain(*air, trace_length);
-            let twiddles = LdeTwiddles::new(&domain);
+            let blowup = air.options().blowup_factor as usize;
+            let key = (trace_length, blowup);
+
+            let (domain, twiddles) = domain_cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let d = new_domain(*air, trace_length);
+                    let t = LdeTwiddles::new(&d);
+                    (Arc::new(d), Arc::new(t))
+                })
+                .clone();
 
             domains.push(domain);
             twiddle_caches.push(twiddles);
