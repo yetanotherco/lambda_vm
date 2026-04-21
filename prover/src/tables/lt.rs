@@ -377,7 +377,6 @@ pub fn compute_carries(lhs: u64, rhs: u64, lhs_sub_rhs: u64) -> (u64, u64) {
 /// 2. LT formula: lt = signed * (A*(1-B) + A*C + (1-B)*C) + (1-signed) * unsigned_lt
 ///
 /// Where A = lhs_msb, B = rhs_msb, C = carry[1], unsigned_lt = carry[1]
-#[derive(Clone)]
 pub struct LtConstraint {
     /// Unique constraint identifier
     constraint_idx: usize,

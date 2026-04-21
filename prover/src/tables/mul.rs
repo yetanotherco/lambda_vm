@@ -688,7 +688,6 @@ pub enum MulConstraintKind {
 }
 
 /// MUL table constraint.
-#[derive(Clone)]
 pub struct MulConstraint {
     constraint_idx: usize,
     kind: MulConstraintKind,

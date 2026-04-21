@@ -618,7 +618,6 @@ pub enum ShiftConstraintKind {
     OutputMatchesShifted(usize),
 }
 
-#[derive(Clone)]
 pub struct ShiftConstraint {
     constraint_idx: usize,
     kind: ShiftConstraintKind,

@@ -1,7 +1,5 @@
 use crypto::merkle_tree::{
-    backends::types::{
-        BatchKeccak256Backend, Keccak256Backend, PairKeccak256Backend, QuadKeccak256Backend,
-    },
+    backends::types::{BatchKeccak256Backend, Keccak256Backend, PairKeccak256Backend, QuadKeccak256Backend},
     merkle::MerkleTree,
 };
 

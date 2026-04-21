@@ -871,7 +871,6 @@ pub enum MemwConstraintKind {
 }
 
 /// MEMW table constraint.
-#[derive(Clone)]
 pub struct MemwConstraint {
     constraint_idx: usize,
     kind: MemwConstraintKind,

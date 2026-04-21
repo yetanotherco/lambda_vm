@@ -808,7 +808,6 @@ enum CommitConstraintKind {
 }
 
 /// A constraint for the COMMIT table.
-#[derive(Clone)]
 struct CommitConstraint {
     kind: CommitConstraintKind,
     constraint_idx: usize,

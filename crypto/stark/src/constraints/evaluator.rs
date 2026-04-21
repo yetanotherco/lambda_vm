@@ -37,8 +37,8 @@ where
     /// Uses `map_init` for per-thread buffer reuse (transition evaluations + periodic values)
     /// and `ZerofierEvaluations` for deduplicated zerofier access.
     #[allow(clippy::too_many_arguments)]
-    fn evaluate_transitions<A>(
-        air: &A,
+    fn evaluate_transitions(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         lde_periodic_columns: &[Vec<FieldElement<Field>>],
         rap_challenges: &[FieldElement<FieldExtension>],
@@ -49,10 +49,7 @@ where
         num_periodic: usize,
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
-    ) -> Vec<FieldElement<FieldExtension>>
-    where
-        A: AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI> + ?Sized,
-    {
+    ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
@@ -190,16 +187,13 @@ where
         }
     }
 
-    pub fn new<A>(
-        air: &A,
+    pub fn new(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
         bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
         trace_length: usize,
-    ) -> Self
-    where
-        A: AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI> + ?Sized,
-    {
+    ) -> Self {
         let boundary_constraints =
             air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
@@ -221,18 +215,15 @@ where
         }
     }
 
-    pub(crate) fn evaluate<A>(
+    pub(crate) fn evaluate(
         &self,
-        air: &A,
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
         rap_challenges: &[FieldElement<FieldExtension>],
-    ) -> Vec<FieldElement<FieldExtension>>
-    where
-        A: AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI> + ?Sized,
-    {
+    ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
         let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =

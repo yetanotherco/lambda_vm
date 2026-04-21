@@ -994,7 +994,6 @@ pub enum DvrmConstraintKind {
 }
 
 /// DVRM table constraint.
-#[derive(Clone)]
 pub struct DvrmConstraint {
     constraint_idx: usize,
     kind: DvrmConstraintKind,

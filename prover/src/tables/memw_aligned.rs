@@ -668,7 +668,6 @@ pub enum MemwAlignedConstraintKind {
     W2ImpliesMuSum,
 }
 
-#[derive(Clone)]
 pub struct MemwAlignedConstraint {
     constraint_idx: usize,
     kind: MemwAlignedConstraintKind,
