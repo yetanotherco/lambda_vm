@@ -26,11 +26,11 @@ pub struct TableSubOps {
 /// Sub-operation breakdown for Round 1 aux commit pass.
 #[derive(Clone, Debug, Default)]
 pub struct Round1SubOps {
-    /// Main trace: expand_pool_to_lde (LDE/FFT)
+    /// Main trace: expand_columns_to_lde (LDE/FFT)
     pub main_lde: Duration,
     /// Main trace: commit_columns_bit_reversed (Merkle)
     pub main_merkle: Duration,
-    /// Aux trace: expand_pool_to_lde (LDE/FFT)
+    /// Aux trace: expand_columns_to_lde (LDE/FFT)
     pub aux_lde: Duration,
     /// Aux trace: commit_columns_bit_reversed (Merkle)
     pub aux_merkle: Duration,
