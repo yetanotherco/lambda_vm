@@ -542,6 +542,35 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+
+        // GPU combined path: expand LDE + compute Merkle leaf hashes in one
+        // on-device pipeline, avoiding the second H2D a standalone GPU
+        // Merkle commit would require. Falls through when the `cuda`
+        // feature is off or the table doesn't qualify.
+        #[cfg(feature = "cuda")]
+        {
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            if let Some(hashed_leaves) =
+                crate::gpu_lde::try_expand_and_leaf_hash_batched::<Field, Field>(
+                    &mut columns,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
+            {
+                #[cfg(feature = "instruments")]
+                let main_lde_dur = t_sub.elapsed();
+                #[cfg(feature = "instruments")]
+                let t_sub = Instant::now();
+                let tree = BatchedMerkleTree::<Field>::build_from_hashed_leaves(hashed_leaves)
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                let root = tree.root;
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+                return Ok((tree, root, None, None, 0, columns));
+            }
+        }
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);

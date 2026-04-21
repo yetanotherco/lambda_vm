@@ -423,6 +423,101 @@ pub fn gpu_parts_lde_calls() -> u64 {
     GPU_PARTS_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Combined GPU LDE + Merkle leaf hash for the base-field main trace.
+///
+/// Keeps LDE output on device, runs Keccak-256 on the device buffer directly,
+/// D2Hs both LDE columns (for Round 2-4 reuse) and hashed leaves (for tree
+/// construction). Avoids the second H2D that a separate GPU Merkle commit
+/// path would require.
+///
+/// On success: resizes each `columns[c]` to `lde_size` with the LDE output,
+/// and returns `Vec<Commitment>` — the Keccak-256 hashed leaves in natural
+/// row order, ready to pass to `BatchedMerkleTree::build_from_hashed_leaves`.
+pub(crate) fn try_expand_and_leaf_hash_batched<F, E>(
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<Vec<[u8; 32]>>
+where
+    F: IsField,
+    E: IsField,
+{
+    if columns.is_empty() {
+        return Some(Vec::new());
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if columns.iter().any(|c| c.len() != n) {
+        return None;
+    }
+
+    let raw_columns: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|col| {
+            col.iter()
+                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+                .collect()
+        })
+        .collect();
+    let weights_u64: Vec<u64> = weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect();
+
+    for col in columns.iter_mut() {
+        debug_assert!(col.capacity() >= lde_size);
+        unsafe { col.set_len(lde_size) };
+    }
+    let mut raw_outputs: Vec<&mut [u64]> = columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len();
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect();
+
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+
+    // Allocate as Vec<[u8; 32]> directly so we both skip the zero-fill pass
+    // AND avoid re-chunking afterwards. Fresh pages still fault on first
+    // write (inside the GPU-side memcpy), but only once each.
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(lde_size);
+    // SAFETY: we fill every byte via memcpy_dtoh below.
+    unsafe { leaves.set_len(lde_size) };
+    let hashed_bytes_ptr = leaves.as_mut_ptr() as *mut u8;
+    let hashed_bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(hashed_bytes_ptr, lde_size * 32) };
+
+    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    math_cuda::lde::coset_lde_batch_base_into_with_leaf_hash(
+        &slices,
+        blowup_factor,
+        &weights_u64,
+        &mut raw_outputs,
+        hashed_bytes,
+    )
+    .expect("GPU LDE+leaf-hash failed");
+
+    Some(leaves)
+}
+
+pub(crate) static GPU_LEAF_HASH_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_leaf_hash_calls() -> u64 {
+    GPU_LEAF_HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
 /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
 fn try_expand_columns_batched_ext3<F, E>(

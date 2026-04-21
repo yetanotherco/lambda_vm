@@ -14,6 +14,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
+use crate::merkle::{launch_keccak_base, launch_keccak_ext3};
 use crate::ntt::run_ntt_body;
 
 pub fn coset_lde_base(
@@ -451,6 +452,198 @@ pub fn coset_lde_batch_base_into(
             };
             dst.copy_from_slice(src);
         });
+    drop(staging);
+    Ok(())
+}
+
+/// Variant of `coset_lde_batch_base_into` that also emits the Keccak-256
+/// Merkle leaf hashes from the LDE output — all on GPU, no second H2D of
+/// the LDE data. Leaves are computed reading columns at bit-reversed rows
+/// (matching `commit_columns_bit_reversed` on the CPU side).
+///
+/// `hashed_leaves_out` must be `lde_size * 32` bytes (one 32-byte digest
+/// per output row, in natural row order).
+pub fn coset_lde_batch_base_into_with_leaf_hash(
+    columns: &[&[u64]],
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    hashed_leaves_out: &mut [u8],
+) -> Result<()> {
+    if columns.is_empty() {
+        assert_eq!(outputs.len(), 0);
+        return Ok(());
+    }
+    let m = columns.len();
+    assert_eq!(outputs.len(), m);
+    let n = columns[0].len();
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    for o in outputs.iter() {
+        assert_eq!(o.len(), lde_size);
+    }
+    assert_eq!(hashed_leaves_out.len(), lde_size * 32);
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let be = backend();
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(m * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
+
+    use rayon::prelude::*;
+    let pinned_base_ptr = pinned.as_mut_ptr() as usize;
+    columns.par_iter().enumerate().for_each(|(c, col)| {
+        // SAFETY: disjoint regions per c, outer staging lock held.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n)
+        };
+        dst.copy_from_slice(col);
+    });
+
+    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    for c in 0..m {
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+    }
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let m_u32 = m as u32;
+
+    // iNTT
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute_batched)
+            .arg(&mut buf)
+            .arg(&n_u64)
+            .arg(&log_n)
+            .arg(&col_stride_u64)
+            .launch(LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
+    // pointwise coset scale
+    unsafe {
+        stream
+            .launch_builder(&be.pointwise_mul_batched)
+            .arg(&mut buf)
+            .arg(&weights_dev)
+            .arg(&n_u64)
+            .arg(&col_stride_u64)
+            .launch(LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    // forward NTT on full LDE slab
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute_batched)
+            .arg(&mut buf)
+            .arg(&lde_u64)
+            .arg(&log_lde)
+            .arg(&col_stride_u64)
+            .launch(LaunchConfig {
+                grid_dim: ((lde_size as u32).div_ceil(256), m_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
+
+    // Keccak-256 leaf hashing directly on the device LDE buffer.
+    let mut hashes_dev = stream.alloc_zeros::<u8>(lde_size * 32)?;
+    launch_keccak_base(
+        stream.as_ref(),
+        &buf,
+        col_stride_u64,
+        m as u64,
+        lde_u64,
+        &mut hashes_dev,
+    )?;
+
+    // D2H the LDE into the pinned LDE staging and the hashes into a
+    // dedicated pinned hash staging, in parallel on the same stream. Both
+    // at pinned PCIe line-rate — pageable D2H of the 128 MB hash buffer
+    // would otherwise cost ~100 ms per main-trace commit.
+    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+    let hashes_u64_len = (lde_size * 32 + 7) / 8;
+    let hashes_staging_slot = be.pinned_hashes();
+    let mut hashes_staging = hashes_staging_slot.lock().unwrap();
+    hashes_staging.ensure_capacity(hashes_u64_len, &be.ctx)?;
+    let hashes_pinned = unsafe { hashes_staging.as_mut_slice(hashes_u64_len) };
+    // `memcpy_dtoh` needs a byte slice. Reinterpret the u64 pinned buffer
+    // as bytes — same allocation, just typed differently.
+    let hashes_pinned_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            hashes_pinned.as_mut_ptr() as *mut u8,
+            lde_size * 32,
+        )
+    };
+    stream.memcpy_dtoh(&hashes_dev, hashes_pinned_bytes)?;
+    stream.synchronize()?;
+
+    // Copy pinned → caller outputs in parallel with the hash memcpy.
+    let pinned_ptr = pinned.as_ptr() as usize;
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_ptr as *const u64).add(c * lde_size),
+                lde_size,
+            )
+        };
+        dst.copy_from_slice(src);
+    });
+    // Rayon-parallel memcpy of 128 MB from pinned → caller. Single-threaded
+    // `copy_from_slice` faults virgin pageable pages one at a time; the
+    // mm_struct rwsem serialises them into ~100 ms at 1M-fib scale. Chunk
+    // the slice so ~N cores pre-fault+write in parallel.
+    const CHUNK: usize = 64 * 1024; // 64 KiB ≈ 16 pages per chunk
+    let pinned_hash_ptr = hashes_pinned_bytes.as_ptr() as usize;
+    hashed_leaves_out
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    (pinned_hash_ptr as *const u8).add(i * CHUNK),
+                    dst.len(),
+                )
+            };
+            dst.copy_from_slice(src);
+        });
+    drop(hashes_staging);
     drop(staging);
     Ok(())
 }

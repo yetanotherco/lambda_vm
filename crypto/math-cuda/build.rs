@@ -53,4 +53,5 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
     compile_ptx("arith.cu", "arith.ptx");
     compile_ptx("ntt.cu", "ntt.ptx");
+    compile_ptx("keccak.cu", "keccak.ptx");
 }
