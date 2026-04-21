@@ -151,6 +151,7 @@ extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
     x[row] = tile[threadIdx.x];
 }
 
+
 /// Batched pointwise multiply: first n elements of each column multiplied by
 /// the SHARED weight vector `w` (size n). Used for coset scaling — every
 /// column of a table sees the same `g^i / N` weights.

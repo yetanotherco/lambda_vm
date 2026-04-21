@@ -176,29 +176,36 @@ fn bench_lde_batched_prover_scale() {
     }
 
     let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
-    let mut gpu_ns = u128::MAX;
-    for _ in 0..5 {
+    let mut gpu_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
         let t0 = Instant::now();
         let _ = math_cuda::lde::coset_lde_batch_base(&slices, blowup, &weights).unwrap();
-        gpu_ns = gpu_ns.min(t0.elapsed().as_nanos());
+        gpu_samples.push(t0.elapsed().as_nanos());
     }
+    gpu_samples.sort();
+    let gpu_ns = gpu_samples[gpu_samples.len() / 2]; // median
 
-    let mut cpu_bufs: Vec<Vec<Fp>> = columns
-        .iter()
-        .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
-        .collect();
-    let t0 = Instant::now();
-    cpu_bufs.par_iter_mut().for_each(|buf| {
-        Polynomial::coset_lde_full_expand::<GoldilocksField>(
-            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
-        )
-        .unwrap();
-    });
-    let cpu_ns = t0.elapsed().as_nanos();
+    let mut cpu_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let mut cpu_bufs: Vec<Vec<Fp>> = columns
+            .iter()
+            .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
+            .collect();
+        let t0 = Instant::now();
+        cpu_bufs.par_iter_mut().for_each(|buf| {
+            Polynomial::coset_lde_full_expand::<GoldilocksField>(
+                buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+            )
+            .unwrap();
+        });
+        cpu_samples.push(t0.elapsed().as_nanos());
+    }
+    cpu_samples.sort();
+    let cpu_ns = cpu_samples[cpu_samples.len() / 2]; // median
 
     let ratio = cpu_ns as f64 / gpu_ns as f64;
     println!(
-        "prover-scale batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x",
+        "prover-scale batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x (median of 10)",
     );
 }
 
