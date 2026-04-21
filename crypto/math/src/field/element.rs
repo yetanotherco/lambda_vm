@@ -40,8 +40,6 @@ use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
 ///
-/// # Layout invariant
-///
 /// `#[repr(transparent)]` is load-bearing: the `disk-spill` feature in
 /// `crypto/stark` casts raw mmap bytes to `*const FieldElement<F>`
 /// (see `table.rs::get`, `trace.rs`). Changing the `repr`, adding
