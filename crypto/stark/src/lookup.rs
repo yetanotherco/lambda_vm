@@ -1791,33 +1791,36 @@ where
     // Output: one FieldElement<E> per row
     let mut result = vec![FieldElement::<E>::zero(); trace_len];
 
-    result.par_chunks_mut(LOGUP_CHUNK_SIZE).enumerate().for_each(
-        |(chunk_idx, result_chunk)| {
+    result
+        .par_chunks_mut(LOGUP_CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(chunk_idx, result_chunk)| {
             let chunk_start = chunk_idx * LOGUP_CHUNK_SIZE;
             let chunk_len = result_chunk.len();
 
             // Phase 1: Compute fingerprints for both interactions in this chunk.
             // Layout: [fp_a[0..chunk_len], fp_b[0..chunk_len]]
-            let compute_chunk_fingerprints = |interaction: &BusInteraction,
-                                              bus_id_f: &FieldElement<F>,
-                                              fps: &mut Vec<FieldElement<E>>| {
-                for row in chunk_start..chunk_start + chunk_len {
-                    let mut lc = bus_id_f * &alpha_powers[0];
-                    let mut alpha_offset = 1;
-                    for bv in &interaction.values {
-                        let consumed = bv.accumulate_fingerprint(
-                            main_segment_cols,
-                            row,
-                            &alpha_powers,
-                            alpha_offset,
-                            &mut lc,
-                            &shifts,
-                        );
-                        alpha_offset += consumed;
+            let compute_chunk_fingerprints =
+                |interaction: &BusInteraction,
+                 bus_id_f: &FieldElement<F>,
+                 fps: &mut Vec<FieldElement<E>>| {
+                    for row in chunk_start..chunk_start + chunk_len {
+                        let mut lc = bus_id_f * &alpha_powers[0];
+                        let mut alpha_offset = 1;
+                        for bv in &interaction.values {
+                            let consumed = bv.accumulate_fingerprint(
+                                main_segment_cols,
+                                row,
+                                &alpha_powers,
+                                alpha_offset,
+                                &mut lc,
+                                &shifts,
+                            );
+                            alpha_offset += consumed;
+                        }
+                        fps.push(z - &lc);
                     }
-                    fps.push(z - &lc);
-                }
-            };
+                };
 
             let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * chunk_len);
             compute_chunk_fingerprints(interaction_a, &bus_id_a, &mut fingerprints);
@@ -1833,8 +1836,16 @@ where
                 let fp_a_inv = &fingerprints[i];
                 let fp_b_inv = &fingerprints[chunk_len + i];
 
-                let m_a = compute_multiplicity_for_row(&interaction_a.multiplicity, main_segment_cols, row);
-                let m_b = compute_multiplicity_for_row(&interaction_b.multiplicity, main_segment_cols, row);
+                let m_a = compute_multiplicity_for_row(
+                    &interaction_a.multiplicity,
+                    main_segment_cols,
+                    row,
+                );
+                let m_b = compute_multiplicity_for_row(
+                    &interaction_b.multiplicity,
+                    main_segment_cols,
+                    row,
+                );
 
                 let term_a = &m_a * fp_a_inv;
                 let term_b = &m_b * fp_b_inv;
@@ -1842,8 +1853,7 @@ where
                 let term_b = if negate_b { -term_b } else { term_b };
                 *result_elem = term_a + term_b;
             }
-        },
-    );
+        });
 
     result
 }
@@ -1877,8 +1887,10 @@ where
 
     let mut result = vec![FieldElement::<E>::zero(); trace_len];
 
-    result.par_chunks_mut(LOGUP_CHUNK_SIZE).enumerate().for_each(
-        |(chunk_idx, result_chunk)| {
+    result
+        .par_chunks_mut(LOGUP_CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(chunk_idx, result_chunk)| {
             let chunk_start = chunk_idx * LOGUP_CHUNK_SIZE;
             let chunk_len = result_chunk.len();
 
@@ -1909,12 +1921,12 @@ where
             // Phase 3: Compute terms: ±(m * fp_inv)
             for (i, result_elem) in result_chunk.iter_mut().enumerate() {
                 let row = chunk_start + i;
-                let m = compute_multiplicity_for_row(&interaction.multiplicity, main_segment_cols, row);
+                let m =
+                    compute_multiplicity_for_row(&interaction.multiplicity, main_segment_cols, row);
                 let term = &m * &fingerprints[i];
                 *result_elem = if negate { -term } else { term };
             }
-        },
-    );
+        });
 
     result
 }
@@ -1959,7 +1971,8 @@ where
         .cloned()
         .reduce(FieldElement::zero, |a, b| a + b);
     #[cfg(not(feature = "parallel"))]
-    let table_contribution: FieldElement<E> = row_sums.iter().fold(FieldElement::zero(), |a, b| a + b);
+    let table_contribution: FieldElement<E> =
+        row_sums.iter().fold(FieldElement::zero(), |a, b| a + b);
 
     // offset_per_row = L / N
     let n = FieldElement::<E>::from(trace_len as u64);
