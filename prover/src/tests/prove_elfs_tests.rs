@@ -1900,6 +1900,57 @@ fn test_verify_rejects_inflated_table_counts() {
     );
 }
 
+/// Proves a program that uses W-suffix instructions (ADDIW, SRLIW) on a
+/// register holding a 64-bit value with non-zero upper 32 bits.
+/// Verifies that the full 64-bit value is preserved in the MEMW_R chain.
+#[test]
+fn test_prove_wsuffix_64bit() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_wsuffix_64bit");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
+    assert!(result, "W-suffix 64-bit register test should verify");
+}
+
+/// Proves a minimal Rust std program that uses `init_allocator()` and
+/// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
+/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
+/// the Rust toolchain, and the allocator's memory access patterns.
+#[test]
+fn test_prove_allocator_minimal_reproducer() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
+            .expect("allocator.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "allocator.elf should verify"
+    );
+    assert_eq!(proof.public_output, b"Hello World");
+}
+
+/// Minimal Rust program that proves: no_std, no_main, no allocator, no
+/// syscalls crate. Only Commit + Halt ecalls (both have receivers).
+#[test]
+fn test_pure_commit_rust() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
+            .expect("pure_commit.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "pure_commit.elf should verify"
+    );
+    assert_eq!(proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
 /// Regression test: addiw with negative immediate must verify.
 /// arg2_sign_bit is the sign bit of rv2 (bit 31), not of arg2, per spec
 /// constraint CPU-CE61: MSB16[arg2_sign_bit; rv2[1]].
