@@ -19,5 +19,6 @@ main:
 	bnez	a0, .loop		# loop if n != 0
 
 	mv	a0, t1			# result = b
+	li	a0, 0
 	li	a7, 93
 	ecall				# halt with result in a0
