@@ -2661,7 +2661,10 @@ mod keccak_tests {
     #[test]
     fn test_keccak_column_counts() {
         assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
-        assert_eq!(rnd_cols::NUM_COLUMNS, 1775, "KECCAK_RND columns");
+        assert_eq!(
+            rnd_cols::NUM_COLUMNS, 1500,
+            "KECCAK_RND columns (rnc/rbc inlined as constants; pi virtual)"
+        );
         assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
     }
 
@@ -2671,7 +2674,10 @@ mod keccak_tests {
         assert_eq!(core_constraints.len(), 50, "KECCAK core: 25 ADD pairs");
 
         let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
-        assert_eq!(rnd_constraints.len(), 275, "KECCAK_RND: 200 pi + 50 IS_BIT rbc + 25 rnc equality");
+        assert_eq!(
+            rnd_constraints.len(), 0,
+            "KECCAK_RND: no polynomial constraints (pi virtual, rnc/rbc inlined)"
+        );
     }
 }
 

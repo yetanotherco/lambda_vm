@@ -147,6 +147,17 @@ pub fn generate_keccak_trace(
         data[base + cols::MU] = FE::one();
     }
 
+    // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
+    // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
+    // mu = 0 gates all bus interactions and the ADD constraint, so these values
+    // only need to satisfy the pad requirement, not reconstruct a real address.
+    for row_idx in n..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        for lane_idx in 0..25 {
+            data[base + cols::state_ptr(lane_idx, 0)] = FE::from((lane_idx as u64) * 8);
+        }
+    }
+
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
@@ -160,8 +171,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(160);
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
-    // Format: [ts_lo, ts_hi, syscall_lo32, syscall_hi32]
-    // Syscall number: lo32 = 2^32-2, hi32 = 2^32-1
+    // Format: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] (DWordWL convention).
+    //
+    // Spec keccak.toml:51 has `["arr", 2^32-1, 2^32-2]` which flattens to
+    // [hi, lo] — inconsistent with HALT/COMMIT which use `["cast", N, "DWordWL"]`
+    // → [lo, hi]. The CPU ECALL sender (cpu.rs) is shared across all three
+    // receivers and uses [lo, hi], so applying the spec's keccak ordering
+    // literally desbalances the LogUp bus.
+    //
+    // Upstream spec needs to change keccak.toml:51 to `["cast", -2, "DWordWL"]`.
+    // See docs/keccak-spec-deviations.md #7.
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::Column(cols::MU),
@@ -225,6 +244,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 2. Keccak bus: send (timestamp, 0, input_state[200])
+    // Per spec keccak.toml: input = ["timestamp", 0, "input_state"] where
+    // input_state is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own
+    // bus element (no packing).
     {
         let mut values = vec![
             BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
@@ -233,14 +255,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ];
         for x in 0..5 {
             for y in 0..5 {
-                values.push(BusValue::Packed {
-                    start_column: cols::input_state(x, y, 0),
-                    packing: Packing::Word4L,
-                });
-                values.push(BusValue::Packed {
-                    start_column: cols::input_state(x, y, 4),
-                    packing: Packing::Word4L,
-                });
+                for b in 0..8 {
+                    values.push(BusValue::Packed {
+                        start_column: cols::input_state(x, y, b),
+                        packing: Packing::Direct,
+                    });
+                }
             }
         }
         interactions.push(BusInteraction::sender(
@@ -259,14 +279,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ];
         for x in 0..5 {
             for y in 0..5 {
-                values.push(BusValue::Packed {
-                    start_column: cols::output_state(x, y, 0),
-                    packing: Packing::Word4L,
-                });
-                values.push(BusValue::Packed {
-                    start_column: cols::output_state(x, y, 4),
-                    packing: Packing::Word4L,
-                });
+                for b in 0..8 {
+                    values.push(BusValue::Packed {
+                        start_column: cols::output_state(x, y, b),
+                        packing: Packing::Direct,
+                    });
+                }
             }
         }
         interactions.push(BusInteraction::receiver(

@@ -22,18 +22,15 @@
 //! | chi            |  200 | State after χ [5][5][8]                       |
 //! | rc             |    8 | Round constant bytes                          |
 //! | iota           |    8 | χ[0][0] ⊕ rc                                  |
-//! | rnc            |   25 | ρ rotation nibble constant [5][5]             |
-//! | rbc            |   50 | ρ rotation byte count bits [5][5][2]          |
 //! | mu             |    1 | Multiplicity (1 for real, 0 for padding)      |
+//!
+//! Note: spec [[variables.constant]] `rnc` and `rbc` are inlined as compile-time
+//! constants derived from `KECCAK_RHO[x][y]`, not materialized as columns.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -70,31 +67,26 @@ pub mod cols {
     // rot_right[5][5][8] = 200 bytes
     pub const ROT_RIGHT: usize = ROT_LEFT + 200; // 883
 
-    // pi[5][5][8] = 200 bytes — state after π∘ρ (materialized virtual)
-    pub const PI: usize = ROT_RIGHT + 200; // 1083
-
     // chi_ands[5][5][8] = 200 bytes
-    pub const CHI_ANDS: usize = PI + 200; // 1283
+    // (pi is a spec [[variables.virtual]] — inlined as rot_left + rot_right at
+    // compile-resolved offsets, not materialized as columns.)
+    pub const CHI_ANDS: usize = ROT_RIGHT + 200; // 1083
 
     // chi[5][5][8] = 200 bytes — state after χ
-    pub const CHI: usize = CHI_ANDS + 200; // 1483
+    pub const CHI: usize = CHI_ANDS + 200; // 1283
 
     // rc[8] — round constant bytes
-    pub const RC: usize = CHI + 200; // 1683
+    pub const RC: usize = CHI + 200; // 1483
 
     // iota[8] — χ[0][0] ⊕ rc
-    pub const IOTA: usize = RC + 8; // 1691
+    pub const IOTA: usize = RC + 8; // 1491
 
-    // rnc[5][5] — ρ rotation nibble constant (spec: [[variables.constant]])
-    pub const RNC: usize = IOTA + 8; // 1699
+    // mu — multiplicity flag.
+    // rnc and rbc (spec [[variables.constant]]) are inlined as compile-time
+    // constants from KECCAK_RHO, not allocated as columns.
+    pub const MU: usize = IOTA + 8; // 1499
 
-    // rbc[5][5][2] — ρ rotation byte count bits (spec: [[variables.constant]])
-    pub const RBC: usize = RNC + 25; // 1724
-
-    // mu — multiplicity flag
-    pub const MU: usize = RBC + 50; // 1774
-
-    pub const NUM_COLUMNS: usize = MU + 1; // 1775
+    pub const NUM_COLUMNS: usize = MU + 1; // 1500
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -148,10 +140,23 @@ pub mod cols {
         ROT_RIGHT + (x + 5 * y) * 8 + byte
     }
 
-    /// Index into pi[x][y][byte]
+    /// Resolve pi[x][y][z] (spec virtual) to the (rot_left_col, rot_right_col)
+    /// pair whose sum equals pi[x][y][z]. rbc is compile-time constant.
     #[inline]
-    pub const fn pi(x: usize, y: usize, byte: usize) -> usize {
-        PI + (x + 5 * y) * 8 + byte
+    pub fn pi_src_cols(x: usize, y: usize, z: usize) -> (usize, usize) {
+        use executor::vm::instruction::execution::KECCAK_RHO;
+        let sx = (x + 3 * y) % 5;
+        let sy = x;
+        let rho_offset = KECCAK_RHO[sx][sy] as usize;
+        let rbc_val = rho_offset / 16;
+        let (l_byte, r_byte) = match rbc_val {
+            0 => (z, (z + 6) % 8),
+            1 => ((z + 6) % 8, (z + 4) % 8),
+            2 => ((z + 4) % 8, (z + 2) % 8),
+            3 => ((z + 2) % 8, z),
+            _ => unreachable!(),
+        };
+        (rot_left(sx, sy, l_byte), rot_right(sx, sy, r_byte))
     }
 
     /// Index into chi_ands[x][y][byte]
@@ -176,18 +181,6 @@ pub mod cols {
     #[inline]
     pub const fn iota(byte: usize) -> usize {
         IOTA + byte
-    }
-
-    /// Index into rnc[x][y]
-    #[inline]
-    pub const fn rnc(x: usize, y: usize) -> usize {
-        RNC + x + 5 * y
-    }
-
-    /// Index into rbc[x][y][bit]
-    #[inline]
-    pub const fn rbc(x: usize, y: usize, bit: usize) -> usize {
-        RBC + (x + 5 * y) * 2 + bit
     }
 }
 
@@ -291,6 +284,9 @@ pub fn generate_keccak_rnd_trace(
             // HWSL shifts each halfword independently. The carry from halfword k
             // propagates to halfword (k+1)%4, which is a 2-byte offset:
             //   rotated_Cxz[z] = Cxz_left[z] + Cxz_right[(z-2) mod 8]
+            // Spec keccak_round.toml says (z-1) mod 8 — that is a spec bug:
+            // HWSL's SLLC is a u16 at bytes [2k, 2k+1] of Cxz_right, so the
+            // carry propagates by 2 bytes, not 1. See docs/keccak-spec-deviations.md.
             let mut cxz_left_bytes = [[0u8; 8]; 5];
             let mut cxz_right_bytes = [[0u8; 8]; 5];
             let mut rotated_c = [[0u8; 8]; 5];
@@ -344,23 +340,14 @@ pub fn generate_keccak_rnd_trace(
 
             // === ρ (rho) ===
             // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
-            // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1]
-            // HWSL handles the sub-16-bit rotation on each halfword.
-            // The byte-level shift (rbc) is handled by the pi column reconstruction.
+            // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1].
+            // rnc and rbc are inlined as compile-time constants per spec
+            // [[variables.constant]]; only HWSL outputs are stored in the trace.
             for x in 0..5 {
                 for y in 0..5 {
                     let rho_offset = KECCAK_RHO[x][y] as usize;
                     let rnc_val = (rho_offset % 16) as u8;
-                    let rbc_val = rho_offset / 16; // 0..3
-                    let rbc0 = (rbc_val & 1) as u8;
-                    let rbc1 = ((rbc_val >> 1) & 1) as u8;
-
-                    data[base + cols::rnc(x, y)] = FE::from(rnc_val as u64);
-                    data[base + cols::rbc(x, y, 0)] = FE::from(rbc0 as u64);
-                    data[base + cols::rbc(x, y, 1)] = FE::from(rbc1 as u64);
-
                     let theta_lane = theta_lanes[x + 5 * y];
-                    // HWSL on each halfword with shift = rnc_val
                     for hw in 0..4 {
                         let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
                         let (shifted, carry) = hwsl(halfword, rnc_val);
@@ -377,27 +364,20 @@ pub fn generate_keccak_rnd_trace(
             }
 
             // === π (pi) ===
-            // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta
-            // rho[x'][y'] is reconstructed from rot_left/rot_right using rbc mux:
-            //   rho[byte] = mux(rbc, rot_left[byte - 2*rbc_val] + rot_right[byte - 2*rbc_val - 1])
-            // But it's simpler to just compute the full rotation and store pi directly.
+            // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta.
+            // pi is a spec [[variables.virtual]] — not stored as trace columns.
+            // It's reconstructed inline in chi bus interactions as
+            //   pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
+            // with (sx, sy) = ((x+3y)%5, x) and (l_byte, r_byte) resolved from
+            // the compile-time rbc constant. pi_lanes is still computed here
+            // for the chi step below.
             let mut pi_lanes = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
-                    // rho rotation of theta[x][y]
                     let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
-                    // π permutation: b[y][(2x+3y)%5] = rotated
                     let dst_x = y;
                     let dst_y = (2 * x + 3 * y) % 5;
                     pi_lanes[dst_x + 5 * dst_y] = rotated;
-                }
-            }
-            for x in 0..5 {
-                for y in 0..5 {
-                    for b in 0..8 {
-                        data[base + cols::pi(x, y, b)] =
-                            FE::from(byte_of(pi_lanes[x + 5 * y], b) as u64);
-                    }
                 }
             }
 
@@ -443,12 +423,15 @@ pub fn generate_keccak_rnd_trace(
 // Bus interactions (1,411 total)
 // =========================================================================
 
+#[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(1420);
 
     // --- IO group (3) ---
 
     // 1. KECCAK bus: receive (timestamp, round, start[200])
+    // Per spec keccak_round.toml: input = ["timestamp", "round", "start"] where
+    // start is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own bus element.
     {
         let mut values = vec![
             BusValue::Packed {
@@ -464,18 +447,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
         ];
-        // Pack state as 25 DWordBL = 50 bus elements
         for x in 0..5 {
             for y in 0..5 {
-                // Word4L packing: 4 consecutive byte columns → 1 bus element
-                values.push(BusValue::Packed {
-                    start_column: cols::start(x, y, 0),
-                    packing: Packing::Word4L,
-                });
-                values.push(BusValue::Packed {
-                    start_column: cols::start(x, y, 4),
-                    packing: Packing::Word4L,
-                });
+                for b in 0..8 {
+                    values.push(BusValue::Packed {
+                        start_column: cols::start(x, y, b),
+                        packing: Packing::Direct,
+                    });
+                }
             }
         }
         interactions.push(BusInteraction::receiver(
@@ -507,25 +486,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ];
         for x in 0..5 {
             for y in 0..5 {
-                if x == 0 && y == 0 {
-                    // Lane [0][0] uses iota columns
+                for b in 0..8 {
+                    let col = if x == 0 && y == 0 {
+                        cols::IOTA + b
+                    } else {
+                        cols::chi(x, y, b)
+                    };
                     values.push(BusValue::Packed {
-                        start_column: cols::IOTA,
-                        packing: Packing::Word4L,
-                    });
-                    values.push(BusValue::Packed {
-                        start_column: cols::IOTA + 4,
-                        packing: Packing::Word4L,
-                    });
-                } else {
-                    // Other lanes use chi columns
-                    values.push(BusValue::Packed {
-                        start_column: cols::chi(x, y, 0),
-                        packing: Packing::Word4L,
-                    });
-                    values.push(BusValue::Packed {
-                        start_column: cols::chi(x, y, 4),
-                        packing: Packing::Word4L,
+                        start_column: col,
+                        packing: Packing::Direct,
                     });
                 }
             }
@@ -637,7 +606,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // --- Theta: Dxz XOR_BYTE (40) ---
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
-    // rotated_C[x'][b] = Cxz_left[x'][b] + Cxz_right[x'][(b-1)%8] (virtual)
+    // rotated_C[x'][b] = Cxz_left[x'][b] + Cxz_right[x'][(b-2)%8] (virtual).
+    // Spec has (b-1)%8 — see docs/keccak-spec-deviations.md for why HWSL carry
+    // needs a 2-byte offset, not 1.
     for x in 0..5 {
         for b in 0..8 {
             interactions.push(BusInteraction::sender(
@@ -675,8 +646,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // --- Rho: HWSL (100) ---
     // HWSL(theta[x][y] halfword[hw], rnc[x][y]) → (rot_left, rot_right)
+    // rnc is inlined as a constant: KECCAK_RHO[x][y] % 16.
     for x in 0..5 {
         for y in 0..5 {
+            let rnc_val = (KECCAK_RHO[x][y] % 16) as u64;
             for hw in 0..4 {
                 interactions.push(BusInteraction::sender(
                     BusId::Hwsl,
@@ -686,7 +659,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             LinearTerm::Column { coefficient: 1, column: cols::theta(x, y, hw * 2) },
                             LinearTerm::Column { coefficient: 256, column: cols::theta(x, y, hw * 2 + 1) },
                         ]),
-                        BusValue::Packed { start_column: cols::rnc(x, y), packing: Packing::Direct },
+                        BusValue::constant(rnc_val),
                         BusValue::linear(vec![
                             LinearTerm::Column { coefficient: 1, column: cols::rot_left(x, y, hw * 2) },
                             LinearTerm::Column { coefficient: 256, column: cols::rot_left(x, y, hw * 2 + 1) },
@@ -721,18 +694,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // --- Chi: AND_BYTE (200) ---
     // chi_ands[x][y][b] = (255 - pi[(x+1)%5][y][b]) AND pi[(x+2)%5][y][b]
+    // pi is virtual: pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
+    // with src lane (sx,sy) = ((x+3y)%5, x) and byte offsets from KECCAK_RHO.
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
+                let (p1_l, p1_r) = cols::pi_src_cols((x + 1) % 5, y, b);
+                let (p2_l, p2_r) = cols::pi_src_cols((x + 2) % 5, y, b);
                 interactions.push(BusInteraction::sender(
                     BusId::AndByte,
                     Multiplicity::Column(cols::MU),
                     vec![
                         BusValue::linear(vec![
                             LinearTerm::Constant(255),
-                            LinearTerm::Column { coefficient: -1, column: cols::pi((x + 1) % 5, y, b) },
+                            LinearTerm::Column { coefficient: -1, column: p1_l },
+                            LinearTerm::Column { coefficient: -1, column: p1_r },
                         ]),
-                        BusValue::Packed { start_column: cols::pi((x + 2) % 5, y, b), packing: Packing::Direct },
+                        BusValue::linear(vec![
+                            LinearTerm::Column { coefficient: 1, column: p2_l },
+                            LinearTerm::Column { coefficient: 1, column: p2_r },
+                        ]),
                         BusValue::Packed { start_column: cols::chi_ands(x, y, b), packing: Packing::Direct },
                     ],
                 ));
@@ -741,15 +722,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // --- Chi: XOR_BYTE (200) ---
-    // chi[x][y][b] = pi[x][y][b] XOR chi_ands[x][y][b]
+    // chi[x][y][b] = pi[x][y][b] XOR chi_ands[x][y][b] (pi virtual).
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
+                let (p_l, p_r) = cols::pi_src_cols(x, y, b);
                 interactions.push(BusInteraction::sender(
                     BusId::XorByte,
                     Multiplicity::Column(cols::MU),
                     vec![
-                        BusValue::Packed { start_column: cols::pi(x, y, b), packing: Packing::Direct },
+                        BusValue::linear(vec![
+                            LinearTerm::Column { coefficient: 1, column: p_l },
+                            LinearTerm::Column { coefficient: 1, column: p_r },
+                        ]),
                         BusValue::Packed { start_column: cols::chi_ands(x, y, b), packing: Packing::Direct },
                         BusValue::Packed { start_column: cols::chi(x, y, b), packing: Packing::Direct },
                     ],
@@ -776,257 +761,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints: Pi verification (200 degree-3 polynomial constraints)
+// Constraints
 // =========================================================================
 
-/// Constraint verifying pi[x][y][z] = rho[(x+3y)%5][x][z].
+/// KECCAK_RND has no main-trace polynomial constraints.
 ///
-/// rho is reconstructed from rot_left/rot_right using the rbc mux:
-///   rho[z] = (1-b0)(1-b1)(L[z]+R[(z-2)%8]) + b0(1-b1)(L[(z-2)%8]+R[(z-4)%8])
-///          + (1-b0)b1(L[(z-4)%8]+R[(z-6)%8]) + b0*b1(L[(z-6)%8]+R[z])
+/// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
+/// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
 ///
-/// where (L,R) = (rot_left, rot_right) at the source lane, and
-/// b0 = rbc[src_x][src_y][0], b1 = rbc[src_x][src_y][1].
-pub struct PiConstraint {
-    constraint_idx: usize,
-    /// Destination coordinates in pi
-    x: usize,
-    y: usize,
-    z: usize,
-    /// Source coordinates: (sx, sy) = ((x + 3y) % 5, x)
-    sx: usize,
-    sy: usize,
-}
-
-impl PiConstraint {
-    pub fn new(constraint_idx: usize, x: usize, y: usize, z: usize) -> Self {
-        let sx = (x + 3 * y) % 5;
-        let sy = x;
-        Self {
-            constraint_idx,
-            x,
-            y,
-            z,
-            sx,
-            sy,
-        }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let z = self.z;
-
-        // Source lane rbc bits
-        let b0 = step
-            .get_main_evaluation_element(0, cols::rbc(self.sx, self.sy, 0))
-            .clone();
-        let b1 = step
-            .get_main_evaluation_element(0, cols::rbc(self.sx, self.sy, 1))
-            .clone();
-
-        let not_b0 = &one - &b0;
-        let not_b1 = &one - &b1;
-
-        // Helper to get rot_left/rot_right at source lane with byte index
-        let l = |byte_idx: usize| {
-            step.get_main_evaluation_element(0, cols::rot_left(self.sx, self.sy, byte_idx))
-                .clone()
-        };
-        let r = |byte_idx: usize| {
-            step.get_main_evaluation_element(0, cols::rot_right(self.sx, self.sy, byte_idx))
-                .clone()
-        };
-
-        // Corrected offsets: (z-2k) mod 8 for rbc case k
-        let case0 = &not_b0 * &not_b1 * (l(z) + r((z + 6) % 8));
-        let case1 = &b0 * &not_b1 * (l((z + 6) % 8) + r((z + 4) % 8));
-        let case2 = &not_b0 * &b1 * (l((z + 4) % 8) + r((z + 2) % 8));
-        let case3 = &b0 * &b1 * (l((z + 2) % 8) + r(z));
-
-        let expected = case0 + case1 + case2 + case3;
-
-        let pi_val = step
-            .get_main_evaluation_element(0, cols::pi(self.x, self.y, self.z))
-            .clone();
-
-        // pi - expected = 0 (degree 3: b0 * b1 * column)
-        // No mu guard needed: on padding rows all columns are zero,
-        // so expected=0 and pi=0, satisfying the constraint.
-        pi_val - expected
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PiConstraint {
-    fn degree(&self) -> usize {
-        // b0 * b1 * (L + R) has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-}
-
-/// Create all pi verification constraints (200 total: 5×5×8).
-/// Constraint: mu * (rnc[x][y] - CONSTANT) = 0
-///
-/// Forces rnc to equal the compile-time rotation nibble on active rows.
-/// Per spec: rnc is [[variables.constant]].
-pub struct RncConstantConstraint {
-    constraint_idx: usize,
-    col: usize,
-    expected: u64,
-}
-
-impl RncConstantConstraint {
-    pub fn new(constraint_idx: usize, x: usize, y: usize) -> Self {
-        let rho_offset = KECCAK_RHO[x][y] as u64;
-        Self {
-            constraint_idx,
-            col: cols::rnc(x, y),
-            expected: rho_offset % 16,
-        }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let rnc = step.get_main_evaluation_element(0, self.col).clone();
-        let expected = FieldElement::<F>::from(self.expected);
-        mu * (rnc - expected)
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RncConstantConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let v = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = v.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let v = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = v;
-            }
-        }
-    }
-}
-
-/// Create all keccak round constraints:
-/// - 200 pi verification (degree-3)
-/// - 50 IS_BIT for rbc (degree-2, per spec: rbc type is Bit)
-/// - 25 rnc equality (degree-2, per spec: rnc is constant)
-/// Total: 275 constraints
+/// All other checks (XOR, AND, HWSL, IS_BYTE, IS_HALF, KECCAK, KECCAK_RC) are
+/// enforced via bus interactions against the BITWISE/KECCAK_RC chips.
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
     Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    use crate::constraints::templates::IsBitConstraint;
-
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
-        Vec::with_capacity(275);
-    let mut idx = constraint_idx_start;
-
-    // 200 pi verification constraints (degree-3)
-    for x in 0..5 {
-        for y in 0..5 {
-            for z in 0..8 {
-                constraints.push(Box::new(PiConstraint::new(idx, x, y, z)));
-                idx += 1;
-            }
-        }
-    }
-
-    // 50 IS_BIT constraints for rbc[x][y][bit] (degree-2, unconditional)
-    // Safe on padding: rbc=0 on padding rows, 0*(1-0)=0 ✓
-    for x in 0..5 {
-        for y in 0..5 {
-            for bit in 0..2 {
-                constraints.push(Box::new(IsBitConstraint::unconditional(
-                    cols::rbc(x, y, bit),
-                    idx,
-                )));
-                idx += 1;
-            }
-        }
-    }
-
-    // 25 rnc equality constraints: mu * (rnc[x][y] - KECCAK_RHO[x][y] % 16) = 0
-    for x in 0..5 {
-        for y in 0..5 {
-            constraints.push(Box::new(RncConstantConstraint::new(idx, x, y)));
-            idx += 1;
-        }
-    }
-
-    (constraints, idx)
+    (Vec::new(), constraint_idx_start)
 }
 
 #[cfg(test)]
@@ -1034,49 +785,52 @@ mod tests {
     use super::*;
     use executor::vm::instruction::execution::keccak_f1600;
 
+    /// pi is a spec virtual variable. Verify the inlined expression
+    /// (rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]) matches the byte of
+    /// rho(theta) for a non-trivial state. Uses mu=0 padding rows as a trivial
+    /// sanity check (all zeros), then a non-zero-input round as the real test.
     #[test]
-    fn test_pi_constraint_values() {
-        let input = [0u64; 25];
+    fn test_pi_virtual_matches_rotate() {
+        // Use a non-zero input so theta_lanes are non-trivial.
+        let input = [0x0102030405060708u64; 25];
         let mut output = input;
         keccak_f1600(&mut output);
         let op = KeccakRoundOperation { timestamp: 42, input, output };
         let trace = generate_keccak_rnd_trace(&[op]);
+        let base = 0;
 
-        // Check pi constraint on round 0
+        // Recompute theta for round 0 in u64 to compare against virtual pi.
+        let mut c = [0u64; 5];
+        for x in 0..5 {
+            c[x] = input[x] ^ input[x + 5] ^ input[x + 10] ^ input[x + 15] ^ input[x + 20];
+        }
+        let mut d = [0u64; 5];
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        let mut theta_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                theta_lanes[x + 5 * y] = input[x + 5 * y] ^ d[x];
+            }
+        }
+
         for x in 0..5 {
             for y in 0..5 {
                 let sx = (x + 3 * y) % 5;
                 let sy = x;
-                let rho_offset = KECCAK_RHO[sx][sy] as usize;
-                let rbc_val = rho_offset / 16;
-                let b0 = (rbc_val & 1) as u64;
-                let b1 = ((rbc_val >> 1) & 1) as u64;
-
+                let rotated = theta_lanes[sx + 5 * sy].rotate_left(KECCAK_RHO[sx][sy]);
                 for z in 0..8 {
-                    let base = 0 * cols::NUM_COLUMNS;
-                    let pi_val = &trace.main_table.data[base + cols::pi(x, y, z)];
-
-                    // Reconstruct expected from rot_left/rot_right
-                    let l = |bz: usize| &trace.main_table.data[base + cols::rot_left(sx, sy, bz)];
-                    let r = |bz: usize| &trace.main_table.data[base + cols::rot_right(sx, sy, bz)];
-
-                    let expected = if b0 == 0 && b1 == 0 {
-                        l(z) + r((z + 6) % 8)
-                    } else if b0 == 1 && b1 == 0 {
-                        l((z + 6) % 8) + r((z + 4) % 8)
-                    } else if b0 == 0 && b1 == 1 {
-                        l((z + 4) % 8) + r((z + 2) % 8)
-                    } else {
-                        l((z + 2) % 8) + r(z)
-                    };
-
+                    let (l_col, r_col) = cols::pi_src_cols(x, y, z);
+                    let virtual_pi = &trace.main_table.data[base + l_col]
+                        + &trace.main_table.data[base + r_col];
+                    let expected = FE::from(((rotated >> (z * 8)) & 0xFF) as u64);
                     assert_eq!(
-                        pi_val, &expected,
-                        "Pi mismatch at ({x},{y},{z}): src=({sx},{sy}), rbc=({b0},{b1}), rho_offset={rho_offset}, pi={pi_val:?}, expected={expected:?}"
+                        virtual_pi, expected,
+                        "virtual pi mismatch at ({x},{y},{z}): sx={sx}, sy={sy}"
                     );
                 }
             }
         }
-        println!("All pi constraints verified for round 0 ✓");
     }
 }
