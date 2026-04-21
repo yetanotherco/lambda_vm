@@ -72,6 +72,10 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
+    /// typically out of disk space, fd exhaustion, or mmap failure.
+    #[cfg(feature = "disk-spill")]
+    DiskSpill(String),
 }
 
 /// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
@@ -548,9 +552,8 @@ pub trait IsStarkProver<
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
         #[cfg(feature = "disk-spill")]
-        tree.spill_nodes_to_disk().map_err(|e| {
-            ProvingError::WrongParameter(format!("disk-spill main Merkle tree: {e}"))
-        })?;
+        tree.spill_nodes_to_disk()
+            .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
 
         Ok((tree, root, None, None, 0, columns))
     }
@@ -609,12 +612,12 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "disk-spill")]
         {
-            precomputed_tree.spill_nodes_to_disk().map_err(|e| {
-                ProvingError::WrongParameter(format!("disk-spill precomputed Merkle tree: {e}"))
-            })?;
-            mult_tree.spill_nodes_to_disk().map_err(|e| {
-                ProvingError::WrongParameter(format!("disk-spill main Merkle tree: {e}"))
-            })?;
+            precomputed_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}")))?;
+            mult_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
         }
 
         Ok((
@@ -1568,9 +1571,10 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "parallel"))]
             let mut spill_iter = air_trace_pairs.iter_mut();
             spill_iter.try_for_each(|(_, trace, _)| {
-                trace.main_table.spill_to_disk().map_err(|e| {
-                    ProvingError::WrongParameter(format!("disk-spill early main: {e}"))
-                })
+                trace
+                    .main_table
+                    .spill_to_disk()
+                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
             })?;
         }
 
@@ -1691,9 +1695,9 @@ pub trait IsStarkProver<
             let mut spill_iter = air_trace_pairs.iter_mut();
             spill_iter.try_for_each(|(air, trace, _)| {
                 if air.has_aux_trace() {
-                    trace.spill_aux_to_disk().map_err(|e| {
-                        ProvingError::WrongParameter(format!("disk-spill aux trace: {e}"))
-                    })?;
+                    trace
+                        .spill_aux_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
                 }
                 Ok(())
             })?;
@@ -1765,7 +1769,7 @@ pub trait IsStarkProver<
 
                         #[cfg(feature = "disk-spill")]
                         tree.spill_nodes_to_disk().map_err(|e| {
-                            ProvingError::WrongParameter(format!("disk-spill aux Merkle tree: {e}"))
+                            ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
                         })?;
 
                         Ok((Some(Arc::new(tree)), Some(root), columns))
