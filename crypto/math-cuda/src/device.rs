@@ -144,6 +144,7 @@ pub struct Backend {
     // keccak.ptx
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
+    pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
 
     // barycentric.ptx
@@ -203,6 +204,7 @@ impl Backend {
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
+            keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,

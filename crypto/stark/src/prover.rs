@@ -1005,10 +1005,22 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let Some((composition_poly_merkle_tree, composition_poly_root)) =
-            Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
-        else {
-            return Err(ProvingError::EmptyCommitment);
+        #[cfg(feature = "cuda")]
+        let gpu_tree = crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+            FieldExtension,
+            BatchedMerkleTreeBackend<FieldExtension>,
+        >(&lde_composition_poly_parts_evaluations);
+        #[cfg(not(feature = "cuda"))]
+        let gpu_tree: Option<BatchedMerkleTree<FieldExtension>> = None;
+
+        let (composition_poly_merkle_tree, composition_poly_root) = if let Some(tree) = gpu_tree {
+            let root = tree.root;
+            (tree, root)
+        } else {
+            match Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations) {
+                Some(pair) => pair,
+                None => return Err(ProvingError::EmptyCommitment),
+            }
         };
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();

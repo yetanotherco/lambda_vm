@@ -1500,6 +1500,244 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     Ok(())
 }
 
+/// Fused variant of [`evaluate_poly_coset_batch_ext3_into`]: in addition to
+/// the LDE output, builds the R2 composition-polynomial Merkle tree on device
+/// (row-pair Keccak leaves at bit-reversed indices + pair-hash inner tree).
+///
+/// `merkle_nodes_out` must have byte length `(2 * lde_size - 1) * 32`.
+/// Requires `lde_size >= 2`.
+pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
+    coefs: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    merkle_nodes_out: &mut [u8],
+) -> Result<()> {
+    if coefs.is_empty() {
+        return Ok(());
+    }
+    let m = coefs.len();
+    assert_eq!(outputs.len(), m);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    for c in coefs.iter() {
+        assert_eq!(c.len(), 3 * n);
+    }
+    let lde_size = n * blowup_factor;
+    for o in outputs.iter() {
+        assert_eq!(o.len(), 3 * lde_size);
+    }
+    assert!(lde_size >= 2);
+    let total_nodes = 2 * lde_size - 1;
+    assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
+    if n == 0 {
+        return Ok(());
+    }
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let mb = 3 * m;
+    let be = backend();
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+
+    use rayon::prelude::*;
+    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
+    coefs.par_iter().enumerate().for_each(|(c, col)| {
+        let slab_a = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
+        };
+        for i in 0..n {
+            slab_a[i] = col[i * 3];
+            slab_b[i] = col[i * 3 + 1];
+            slab_c[i] = col[i * 3 + 2];
+        }
+    });
+
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    }
+
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let mb_u32 = mb as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&be.pointwise_mul_batched)
+            .arg(&mut buf)
+            .arg(&weights_dev)
+            .arg(&n_u64)
+            .arg(&col_stride_u64)
+            .launch(LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute_batched)
+            .arg(&mut buf)
+            .arg(&lde_u64)
+            .arg(&log_lde)
+            .arg(&col_stride_u64)
+            .launch(LaunchConfig {
+                grid_dim: ((lde_size as u32).div_ceil(256), mb_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+
+    // Build the row-pair Merkle tree on device.
+    //
+    // Row-pair commit: each leaf hashes 2 rows (bit-reversed indices) →
+    // num_leaves = lde_size / 2. Tree size: 2*num_leaves - 1 = lde_size - 1.
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let log_num_rows = log_lde;
+        let num_parts_u64 = m as u64;
+        let grid = ((num_leaves as u32) + 128 - 1) / 128;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .arg(&buf)
+                .arg(&col_stride_u64)
+                .arg(&num_parts_u64)
+                .arg(&lde_u64)
+                .arg(&log_num_rows)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+    {
+        let mut level_begin: u64 = (num_leaves - 1) as u64;
+        while level_begin != 0 {
+            let new_begin = level_begin / 2;
+            let n_pairs = level_begin - new_begin;
+            let grid = ((n_pairs as u32) + 128 - 1) / 128;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&be.keccak_merkle_level)
+                    .arg(&mut nodes_dev)
+                    .arg(&new_begin)
+                    .arg(&n_pairs)
+                    .launch(cfg)?;
+            }
+            level_begin = new_begin;
+        }
+    }
+
+    // D2H LDE and tree.
+    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+    let tree_u64_len = (tight_total_nodes * 32 + 7) / 8;
+    let tree_staging_slot = be.pinned_hashes();
+    let mut tree_staging = tree_staging_slot.lock().unwrap();
+    tree_staging.ensure_capacity(tree_u64_len, &be.ctx)?;
+    let tree_pinned = unsafe { tree_staging.as_mut_slice(tree_u64_len) };
+    let tree_pinned_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            tree_pinned.as_mut_ptr() as *mut u8,
+            tight_total_nodes * 32,
+        )
+    };
+    stream.memcpy_dtoh(&nodes_dev, tree_pinned_bytes)?;
+    stream.synchronize()?;
+
+    // Re-interleave pinned → caller ext3 outputs.
+    let pinned_const = pinned.as_ptr() as usize;
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        let slab_a = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
+                lde_size,
+            )
+        };
+        for i in 0..lde_size {
+            dst[i * 3] = slab_a[i];
+            dst[i * 3 + 1] = slab_b[i];
+            dst[i * 3 + 2] = slab_c[i];
+        }
+    });
+
+    // Copy pinned tree → caller nodes_out. `merkle_nodes_out.len() ==
+    // total_nodes * 32` is oversized relative to our tight tree; we write
+    // only the first `tight_total_nodes * 32` bytes and the caller trims.
+    // Expose the tight byte count via the slice length so the caller can
+    // construct the MerkleTree with the right node count.
+    assert!(merkle_nodes_out.len() >= tight_total_nodes * 32);
+    const CHUNK: usize = 64 * 1024;
+    let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
+    merkle_nodes_out[..tight_total_nodes * 32]
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    (pinned_tree_ptr as *const u8).add(i * CHUNK),
+                    dst.len(),
+                )
+            };
+            dst.copy_from_slice(src);
+        });
+    drop(tree_staging);
+    drop(staging);
+    Ok(())
+}
+
 /// Batched coset LDE for Goldilocks **cubic extension** columns.
 ///
 /// A degree-3 extension element is `(a, b, c)` in memory (three contiguous

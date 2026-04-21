@@ -219,6 +219,58 @@ extern "C" __global__ void keccak256_leaves_ext3_batched(
 }
 
 // ---------------------------------------------------------------------------
+// R2 composition-polynomial leaf hashing.
+//
+// Each leaf hashes `2 * num_parts` ext3 values taken from bit-reversed rows
+// `br_0 = reverse_index(2*leaf_idx)` and `br_1 = reverse_index(2*leaf_idx+1)`
+// across all `num_parts` parts, in (br_0 row: part 0..K-1) then (br_1 row:
+// part 0..K-1) order. Each ext3 value is 3 base components × 8 BE bytes.
+//
+// Columns arrive in the de-interleaved 3-slab layout: part `p` component
+// `k` is at `parts_base_ptr[(p*3 + k) * col_stride + row]`.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak_comp_poly_leaves_ext3(
+    const uint64_t *parts_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_parts,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    // First row (br_0): part 0..K-1 × 3 components each.
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            uint64_t v = parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_0];
+            uint64_t canon = goldilocks::canonical(v);
+            absorb_lane(st, rate_pos, bswap64(canon));
+        }
+    }
+    // Second row (br_1).
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            uint64_t v = parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_1];
+            uint64_t canon = goldilocks::canonical(v);
+            absorb_lane(st, rate_pos, bswap64(canon));
+        }
+    }
+
+    finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
 // Merkle inner-tree pair hash: one level of the inner Merkle tree.
 //
 // `nodes` is the full Merkle node buffer (length `2*leaves_len - 1`, each

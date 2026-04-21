@@ -420,6 +420,160 @@ where
     Some(outputs)
 }
 
+/// Fused variant of [`try_evaluate_parts_on_lde_gpu`]: in addition to the
+/// LDE parts, builds the R2 composition-polynomial Merkle tree on device
+/// (row-pair Keccak leaves + pair-hash inner tree). Returns both the parts
+/// (still needed downstream for R4 openings) and the finished tree.
+pub(crate) fn try_evaluate_parts_on_lde_and_commit_gpu<F, E, B>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Option<(
+    Vec<Vec<FieldElement<E>>>,
+    crypto::merkle_tree::merkle::MerkleTree<B>,
+)>
+where
+    F: math::field::traits::IsFFTField + IsField,
+    E: IsField,
+    F: IsSubFieldOf<E>,
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if parts_coefs.is_empty() {
+        return None;
+    }
+    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
+        return None;
+    }
+    let lde_size = domain_size * blowup_factor;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if lde_size < 2 {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    let m = parts_coefs.len();
+
+    GPU_PARTS_LDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Weights: `offset^k`.
+    let mut weights_u64 = Vec::with_capacity(domain_size);
+    let mut w = FieldElement::<F>::one();
+    for _ in 0..domain_size {
+        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
+        weights_u64.push(v);
+        w = w * offset;
+    }
+
+    // Pack parts into per-part 3*domain_size u64 buffers (zero-padded).
+    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
+    for part in parts_coefs.iter() {
+        let mut buf = vec![0u64; 3 * domain_size];
+        let len = part.len().min(domain_size);
+        let src_ptr = part.as_ptr() as *const u64;
+        let src_len = len * 3;
+        let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+        buf[..src_len].copy_from_slice(src);
+        part_bufs.push(buf);
+    }
+    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
+
+    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
+        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+        .collect();
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+    let mut nodes_bytes = vec![0u8; tight_total_nodes * 32];
+    {
+        let mut out_slices: Vec<&mut [u64]> = outputs
+            .iter_mut()
+            .map(|o| {
+                let ptr = o.as_mut_ptr() as *mut u64;
+                unsafe { core::slice::from_raw_parts_mut(ptr, 3 * lde_size) }
+            })
+            .collect();
+        math_cuda::lde::evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
+            &input_slices,
+            domain_size,
+            blowup_factor,
+            &weights_u64,
+            &mut out_slices,
+            &mut nodes_bytes,
+        )
+        .expect("GPU ext3 evaluate+commit failed");
+    }
+
+    // Build the MerkleTree from the device-produced nodes.
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
+    for i in 0..tight_total_nodes {
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
+        nodes.push(n);
+    }
+    let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    Some((outputs, tree))
+}
+
+/// Build the R2 composition-polynomial Merkle tree from already-computed
+/// LDE parts using the GPU row-pair leaf kernel + pair-hash inner tree.
+/// Takes H2D for every call — only worth doing when the tree is large enough
+/// that CPU rayon Merkle build exceeds the round-trip cost.
+pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
+    lde_parts: &[Vec<FieldElement<E>>],
+) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
+where
+    E: IsField,
+    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if lde_parts.is_empty() {
+        return None;
+    }
+    let lde_size = lde_parts[0].len();
+    if !lde_size.is_power_of_two() || lde_size < 2 {
+        return None;
+    }
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    // All parts same length.
+    if lde_parts.iter().any(|p| p.len() != lde_size) {
+        return None;
+    }
+
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: E == Ext3 whose BaseType is [FieldElement<Gl>; 3] =
+    // contiguous [u64; 3] at runtime.
+    let raw_parts: Vec<&[u64]> = lde_parts
+        .iter()
+        .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const u64, p.len() * 3) })
+        .collect();
+
+    let nodes_bytes = math_cuda::merkle::build_comp_poly_tree_from_evals_ext3(&raw_parts)
+        .expect("GPU comp-poly tree build failed");
+
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+    debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
+    for i in 0..tight_total_nodes {
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
+        nodes.push(n);
+    }
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
 pub(crate) static GPU_PARTS_LDE_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub fn gpu_parts_lde_calls() -> u64 {

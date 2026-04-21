@@ -187,6 +187,135 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Row-pair Keccak leaf + Merkle tree build for R2 composition-polynomial
+/// commit. `parts_interleaved` is `num_parts` slices, each holding an ext3
+/// LDE column interleaved as `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`.
+///
+/// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
+/// layout (root at byte offset 0, leaves in the tail).
+pub fn build_comp_poly_tree_from_evals_ext3(
+    parts_interleaved: &[&[u64]],
+) -> Result<Vec<u8>> {
+    assert!(!parts_interleaved.is_empty());
+    let m = parts_interleaved.len();
+    let ext3_elems = parts_interleaved[0].len() / 3;
+    assert_eq!(
+        parts_interleaved[0].len(),
+        3 * ext3_elems,
+        "ext3 buffer length must be 3 * lde_size"
+    );
+    for p in parts_interleaved.iter() {
+        assert_eq!(p.len(), 3 * ext3_elems);
+    }
+    let lde_size = ext3_elems;
+    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+
+    let be = backend();
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    // Stage: de-interleave each part into 3 base slabs in pinned memory.
+    let mb = 3 * m;
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+
+    use rayon::prelude::*;
+    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
+    parts_interleaved
+        .par_iter()
+        .enumerate()
+        .for_each(|(c, col)| {
+            let slab_a = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (pinned_ptr_u as *mut u64).add((c * 3) * lde_size),
+                    lde_size,
+                )
+            };
+            let slab_b = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (pinned_ptr_u as *mut u64).add((c * 3 + 1) * lde_size),
+                    lde_size,
+                )
+            };
+            let slab_c = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (pinned_ptr_u as *mut u64).add((c * 3 + 2) * lde_size),
+                    lde_size,
+                )
+            };
+            for i in 0..lde_size {
+                slab_a[i] = col[i * 3];
+                slab_b[i] = col[i * 3 + 1];
+                slab_c[i] = col[i * 3 + 2];
+            }
+        });
+
+    // H2D the de-interleaved parts.
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+
+    // Leaves into tail of a tight node buffer.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let col_stride_u64 = lde_size as u64;
+        let num_parts_u64 = m as u64;
+        let num_rows_u64 = lde_size as u64;
+        let log_num_rows = lde_size.trailing_zeros() as u64;
+        let grid = ((num_leaves as u32) + 128 - 1) / 128;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .arg(&buf)
+                .arg(&col_stride_u64)
+                .arg(&num_parts_u64)
+                .arg(&num_rows_u64)
+                .arg(&log_num_rows)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+
+    // Inner tree.
+    {
+        let mut level_begin: u64 = (num_leaves - 1) as u64;
+        while level_begin != 0 {
+            let new_begin = level_begin / 2;
+            let n_pairs = level_begin - new_begin;
+            let grid = ((n_pairs as u32) + 128 - 1) / 128;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&be.keccak_merkle_level)
+                    .arg(&mut nodes_dev)
+                    .arg(&new_begin)
+                    .arg(&n_pairs)
+                    .launch(cfg)?;
+            }
+            level_begin = new_begin;
+        }
+    }
+
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    drop(staging);
+    Ok(out)
+}
+
 pub(crate) fn launch_keccak_ext3(
     stream: &CudaStream,
     cols_dev: &CudaSlice<u64>,
