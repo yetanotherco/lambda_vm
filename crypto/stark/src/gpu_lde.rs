@@ -333,6 +333,96 @@ pub fn gpu_r4_lde_calls() -> u64 {
     GPU_R4_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// GPU path for the composition-polynomial LDE in the `number_of_parts > 2`
+/// branch of `round_2_compute_composition_polynomial` (prover.rs:920). The
+/// caller already has the polynomial parts; we batch their evaluations at
+/// the `domain_size × blowup_factor` coset in a single GPU call.
+///
+/// Each part is padded to `domain_size` coefficients. Weights = `offset^k`
+/// (coset shift, no 1/N normalisation — input is coefficients).
+pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: math::field::traits::IsFFTField + IsField,
+    E: IsField,
+    F: IsSubFieldOf<E>,
+{
+    if parts_coefs.is_empty() {
+        return Some(Vec::new());
+    }
+    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
+        return None;
+    }
+    let lde_size = domain_size * blowup_factor;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    let m = parts_coefs.len();
+
+    GPU_PARTS_LDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Weights: `offset^k` for k in 0..domain_size. F == Goldilocks.
+    let mut weights_u64 = Vec::with_capacity(domain_size);
+    let mut w = FieldElement::<F>::one();
+    for _ in 0..domain_size {
+        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
+        weights_u64.push(v);
+        w = w * offset;
+    }
+
+    // Pack each part into a 3*domain_size u64 buffer, zero-padded.
+    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
+    for part in parts_coefs.iter() {
+        let mut buf = vec![0u64; 3 * domain_size];
+        let len = part.len().min(domain_size);
+        // Copy the real part coefficients; the rest stays zero (padding).
+        let src_ptr = part.as_ptr() as *const u64;
+        let src_len = len * 3;
+        let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+        buf[..src_len].copy_from_slice(src);
+        part_bufs.push(buf);
+    }
+    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
+
+    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
+        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+        .collect();
+    {
+        let mut out_slices: Vec<&mut [u64]> = outputs
+            .iter_mut()
+            .map(|o| {
+                let ptr = o.as_mut_ptr() as *mut u64;
+                unsafe { core::slice::from_raw_parts_mut(ptr, 3 * lde_size) }
+            })
+            .collect();
+        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
+            &input_slices,
+            domain_size,
+            blowup_factor,
+            &weights_u64,
+            &mut out_slices,
+        )
+        .expect("GPU parts LDE failed");
+    }
+    Some(outputs)
+}
+
+pub(crate) static GPU_PARTS_LDE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_parts_lde_calls() -> u64 {
+    GPU_PARTS_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
 /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
 fn try_expand_columns_batched_ext3<F, E>(

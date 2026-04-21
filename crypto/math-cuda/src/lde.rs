@@ -455,6 +455,168 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
+/// Batched ext3 polynomial → coset evaluation.
+///
+/// Input: M ext3 columns of `n` coefficients each (interleaved, 3n u64).
+/// Output: M ext3 columns of `n * blowup_factor` evaluations each at the
+/// offset-coset.
+///
+/// Skips the iFFT stage of [`coset_lde_batch_ext3_into`] (input is
+/// coefficients, not evaluations). Weights encode the coset shift:
+/// `weights[k] = offset^k` (NO 1/N because iFFT normalisation doesn't apply).
+///
+/// Used by the stark prover to GPU-accelerate
+/// `evaluate_polynomial_on_lde_domain` calls inside the
+/// `number_of_parts > 2` branch of the composition-polynomial LDE.
+pub fn evaluate_poly_coset_batch_ext3_into(
+    coefs: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<()> {
+    if coefs.is_empty() {
+        return Ok(());
+    }
+    let m = coefs.len();
+    assert_eq!(outputs.len(), m);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    for c in coefs.iter() {
+        assert_eq!(c.len(), 3 * n);
+    }
+    let lde_size = n * blowup_factor;
+    for o in outputs.iter() {
+        assert_eq!(o.len(), 3 * lde_size);
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let mb = 3 * m;
+    let be = backend();
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+
+    use rayon::prelude::*;
+    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
+    coefs.par_iter().enumerate().for_each(|(c, col)| {
+        let slab_a = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 0) * n), n)
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
+        };
+        for i in 0..n {
+            slab_a[i] = col[i * 3 + 0];
+            slab_b[i] = col[i * 3 + 1];
+            slab_c[i] = col[i * 3 + 2];
+        }
+    });
+
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    }
+
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let mb_u32 = mb as u32;
+
+    // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
+    {
+        let grid_x = (n as u32).div_ceil(256);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, mb_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.pointwise_mul_batched)
+                .arg(&mut buf)
+                .arg(&weights_dev)
+                .arg(&n_u64)
+                .arg(&col_stride_u64)
+                .launch(cfg)?;
+        }
+    }
+
+    // Bit-reverse full lde_size slab, then forward DIT NTT.
+    {
+        let grid_x = (lde_size as u32).div_ceil(256);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, mb_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute_batched)
+                .arg(&mut buf)
+                .arg(&lde_u64)
+                .arg(&log_lde)
+                .arg(&col_stride_u64)
+                .launch(cfg)?;
+        }
+    }
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+
+    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+    stream.synchronize()?;
+
+    let pinned_const = pinned.as_ptr() as usize;
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        let slab_a = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 0) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
+                lde_size,
+            )
+        };
+        for i in 0..lde_size {
+            dst[i * 3 + 0] = slab_a[i];
+            dst[i * 3 + 1] = slab_b[i];
+            dst[i * 3 + 2] = slab_c[i];
+        }
+    });
+    drop(staging);
+    Ok(())
+}
+
 /// Batched coset LDE for Goldilocks **cubic extension** columns.
 ///
 /// A degree-3 extension element is `(a, b, c)` in memory (three contiguous

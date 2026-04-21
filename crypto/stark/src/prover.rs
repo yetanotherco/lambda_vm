@@ -933,18 +933,44 @@ pub trait IsStarkProver<
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
                     .unwrap();
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
-            composition_poly_parts
-                .iter()
-                .map(|part| {
-                    evaluate_polynomial_on_lde_domain(
-                        part,
-                        domain.blowup_factor,
-                        domain.interpolation_domain_size,
-                        &domain.coset_offset,
-                    )
-                    .unwrap()
-                })
-                .collect()
+
+            // GPU fast path: batch all parts' LDEs into a single call. Parts
+            // share offset/size so a one-shot ext3 evaluate-on-coset saves
+            // one kernel pipeline per part. Falls through to CPU when the
+            // `cuda` feature is off or the size is below the GPU threshold.
+            #[cfg(feature = "cuda")]
+            let gpu_result = {
+                let parts_slices: Vec<&[FieldElement<FieldExtension>]> =
+                    composition_poly_parts
+                        .iter()
+                        .map(|p| p.coefficients.as_slice())
+                        .collect();
+                crate::gpu_lde::try_evaluate_parts_on_lde_gpu::<Field, FieldExtension>(
+                    &parts_slices,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                )
+            };
+            #[cfg(not(feature = "cuda"))]
+            let gpu_result: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+
+            if let Some(results) = gpu_result {
+                results
+            } else {
+                composition_poly_parts
+                    .iter()
+                    .map(|part| {
+                        evaluate_polynomial_on_lde_domain(
+                            part,
+                            domain.blowup_factor,
+                            domain.interpolation_domain_size,
+                            &domain.coset_offset,
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            }
         };
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
