@@ -300,14 +300,19 @@ pub fn generate_keccak_rnd_trace(
                     cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
                     cxz_right_bytes[x][hw * 2] = (carry & 0xFF) as u8;
                     cxz_right_bytes[x][hw * 2 + 1] = (carry >> 8) as u8;
-                    data[base + cols::cxz_left(x, hw * 2)] = FE::from(cxz_left_bytes[x][hw * 2] as u64);
-                    data[base + cols::cxz_left(x, hw * 2 + 1)] = FE::from(cxz_left_bytes[x][hw * 2 + 1] as u64);
-                    data[base + cols::cxz_right(x, hw * 2)] = FE::from(cxz_right_bytes[x][hw * 2] as u64);
-                    data[base + cols::cxz_right(x, hw * 2 + 1)] = FE::from(cxz_right_bytes[x][hw * 2 + 1] as u64);
+                    data[base + cols::cxz_left(x, hw * 2)] =
+                        FE::from(cxz_left_bytes[x][hw * 2] as u64);
+                    data[base + cols::cxz_left(x, hw * 2 + 1)] =
+                        FE::from(cxz_left_bytes[x][hw * 2 + 1] as u64);
+                    data[base + cols::cxz_right(x, hw * 2)] =
+                        FE::from(cxz_right_bytes[x][hw * 2] as u64);
+                    data[base + cols::cxz_right(x, hw * 2 + 1)] =
+                        FE::from(cxz_right_bytes[x][hw * 2 + 1] as u64);
                 }
                 // Reconstruct: left[z] + right[(z-2) mod 8]
                 for b in 0..8 {
-                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(cxz_right_bytes[x][(b + 6) % 8]);
+                    rotated_c[x][b] =
+                        cxz_left_bytes[x][b].wrapping_add(cxz_right_bytes[x][(b + 6) % 8]);
                 }
             }
 
@@ -390,8 +395,7 @@ pub fn generate_keccak_rnd_trace(
                     let and_val = not_next & next2;
                     chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
                     for b in 0..8 {
-                        data[base + cols::chi_ands(x, y, b)] =
-                            FE::from(byte_of(and_val, b) as u64);
+                        data[base + cols::chi_ands(x, y, b)] = FE::from(byte_of(and_val, b) as u64);
                         data[base + cols::chi(x, y, b)] =
                             FE::from(byte_of(chi_lanes[x + 5 * y], b) as u64);
                     }
@@ -533,9 +537,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusId::XorByte,
                 Multiplicity::Column(cols::MU),
                 vec![
-                    BusValue::Packed { start_column: cols::start(x, 0, b), packing: Packing::Direct },
-                    BusValue::Packed { start_column: cols::start(x, 1, b), packing: Packing::Direct },
-                    BusValue::Packed { start_column: cols::cxz(x, 0, b), packing: Packing::Direct },
+                    BusValue::Packed {
+                        start_column: cols::start(x, 0, b),
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::start(x, 1, b),
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::cxz(x, 0, b),
+                        packing: Packing::Direct,
+                    },
                 ],
             ));
         }
@@ -549,9 +562,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     BusId::XorByte,
                     Multiplicity::Column(cols::MU),
                     vec![
-                        BusValue::Packed { start_column: cols::cxz(x, stage - 1, b), packing: Packing::Direct },
-                        BusValue::Packed { start_column: cols::start(x, y, b), packing: Packing::Direct },
-                        BusValue::Packed { start_column: cols::cxz(x, stage, b), packing: Packing::Direct },
+                        BusValue::Packed {
+                            start_column: cols::cxz(x, stage - 1, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::start(x, y, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::cxz(x, stage, b),
+                            packing: Packing::Direct,
+                        },
                     ],
                 ));
             }
@@ -568,20 +590,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 vec![
                     // Input halfword: Cxz[x][3][hw*2] + 256 * Cxz[x][3][hw*2+1]
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz(x, 3, hw * 2) },
-                        LinearTerm::Column { coefficient: 256, column: cols::cxz(x, 3, hw * 2 + 1) },
+                        LinearTerm::Column {
+                            coefficient: 1,
+                            column: cols::cxz(x, 3, hw * 2),
+                        },
+                        LinearTerm::Column {
+                            coefficient: 256,
+                            column: cols::cxz(x, 3, hw * 2 + 1),
+                        },
                     ]),
                     // Shift amount = 1
                     BusValue::constant(1),
                     // Output: shifted
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz_left(x, hw * 2) },
-                        LinearTerm::Column { coefficient: 256, column: cols::cxz_left(x, hw * 2 + 1) },
+                        LinearTerm::Column {
+                            coefficient: 1,
+                            column: cols::cxz_left(x, hw * 2),
+                        },
+                        LinearTerm::Column {
+                            coefficient: 256,
+                            column: cols::cxz_left(x, hw * 2 + 1),
+                        },
                     ]),
                     // Output: carry
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz_right(x, hw * 2) },
-                        LinearTerm::Column { coefficient: 256, column: cols::cxz_right(x, hw * 2 + 1) },
+                        LinearTerm::Column {
+                            coefficient: 1,
+                            column: cols::cxz_right(x, hw * 2),
+                        },
+                        LinearTerm::Column {
+                            coefficient: 256,
+                            column: cols::cxz_right(x, hw * 2 + 1),
+                        },
                     ]),
                 ],
             ));
@@ -594,12 +634,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             interactions.push(BusInteraction::sender(
                 BusId::IsByte,
                 Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed { start_column: cols::cxz_left(x, b), packing: Packing::Direct }],
+                vec![BusValue::Packed {
+                    start_column: cols::cxz_left(x, b),
+                    packing: Packing::Direct,
+                }],
             ));
             interactions.push(BusInteraction::sender(
                 BusId::IsByte,
                 Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed { start_column: cols::cxz_right(x, b), packing: Packing::Direct }],
+                vec![BusValue::Packed {
+                    start_column: cols::cxz_right(x, b),
+                    packing: Packing::Direct,
+                }],
             ));
         }
     }
@@ -615,12 +661,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusId::XorByte,
                 Multiplicity::Column(cols::MU),
                 vec![
-                    BusValue::Packed { start_column: cols::cxz((x + 4) % 5, 3, b), packing: Packing::Direct },
+                    BusValue::Packed {
+                        start_column: cols::cxz((x + 4) % 5, 3, b),
+                        packing: Packing::Direct,
+                    },
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz_left((x + 1) % 5, b) },
-                        LinearTerm::Column { coefficient: 1, column: cols::cxz_right((x + 1) % 5, (b + 6) % 8) },
+                        LinearTerm::Column {
+                            coefficient: 1,
+                            column: cols::cxz_left((x + 1) % 5, b),
+                        },
+                        LinearTerm::Column {
+                            coefficient: 1,
+                            column: cols::cxz_right((x + 1) % 5, (b + 6) % 8),
+                        },
                     ]),
-                    BusValue::Packed { start_column: cols::dxz(x, b), packing: Packing::Direct },
+                    BusValue::Packed {
+                        start_column: cols::dxz(x, b),
+                        packing: Packing::Direct,
+                    },
                 ],
             ));
         }
@@ -635,9 +693,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     BusId::XorByte,
                     Multiplicity::Column(cols::MU),
                     vec![
-                        BusValue::Packed { start_column: cols::start(x, y, b), packing: Packing::Direct },
-                        BusValue::Packed { start_column: cols::dxz(x, b), packing: Packing::Direct },
-                        BusValue::Packed { start_column: cols::theta(x, y, b), packing: Packing::Direct },
+                        BusValue::Packed {
+                            start_column: cols::start(x, y, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::dxz(x, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::theta(x, y, b),
+                            packing: Packing::Direct,
+                        },
                     ],
                 ));
             }
@@ -656,17 +723,35 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     Multiplicity::Column(cols::MU),
                     vec![
                         BusValue::linear(vec![
-                            LinearTerm::Column { coefficient: 1, column: cols::theta(x, y, hw * 2) },
-                            LinearTerm::Column { coefficient: 256, column: cols::theta(x, y, hw * 2 + 1) },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: cols::theta(x, y, hw * 2),
+                            },
+                            LinearTerm::Column {
+                                coefficient: 256,
+                                column: cols::theta(x, y, hw * 2 + 1),
+                            },
                         ]),
                         BusValue::constant(rnc_val),
                         BusValue::linear(vec![
-                            LinearTerm::Column { coefficient: 1, column: cols::rot_left(x, y, hw * 2) },
-                            LinearTerm::Column { coefficient: 256, column: cols::rot_left(x, y, hw * 2 + 1) },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: cols::rot_left(x, y, hw * 2),
+                            },
+                            LinearTerm::Column {
+                                coefficient: 256,
+                                column: cols::rot_left(x, y, hw * 2 + 1),
+                            },
                         ]),
                         BusValue::linear(vec![
-                            LinearTerm::Column { coefficient: 1, column: cols::rot_right(x, y, hw * 2) },
-                            LinearTerm::Column { coefficient: 256, column: cols::rot_right(x, y, hw * 2 + 1) },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: cols::rot_right(x, y, hw * 2),
+                            },
+                            LinearTerm::Column {
+                                coefficient: 256,
+                                column: cols::rot_right(x, y, hw * 2 + 1),
+                            },
                         ]),
                     ],
                 ));
@@ -681,12 +766,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 interactions.push(BusInteraction::sender(
                     BusId::IsByte,
                     Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed { start_column: cols::rot_left(x, y, b), packing: Packing::Direct }],
+                    vec![BusValue::Packed {
+                        start_column: cols::rot_left(x, y, b),
+                        packing: Packing::Direct,
+                    }],
                 ));
                 interactions.push(BusInteraction::sender(
                     BusId::IsByte,
                     Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed { start_column: cols::rot_right(x, y, b), packing: Packing::Direct }],
+                    vec![BusValue::Packed {
+                        start_column: cols::rot_right(x, y, b),
+                        packing: Packing::Direct,
+                    }],
                 ));
             }
         }
@@ -707,14 +798,29 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     vec![
                         BusValue::linear(vec![
                             LinearTerm::Constant(255),
-                            LinearTerm::Column { coefficient: -1, column: p1_l },
-                            LinearTerm::Column { coefficient: -1, column: p1_r },
+                            LinearTerm::Column {
+                                coefficient: -1,
+                                column: p1_l,
+                            },
+                            LinearTerm::Column {
+                                coefficient: -1,
+                                column: p1_r,
+                            },
                         ]),
                         BusValue::linear(vec![
-                            LinearTerm::Column { coefficient: 1, column: p2_l },
-                            LinearTerm::Column { coefficient: 1, column: p2_r },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: p2_l,
+                            },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: p2_r,
+                            },
                         ]),
-                        BusValue::Packed { start_column: cols::chi_ands(x, y, b), packing: Packing::Direct },
+                        BusValue::Packed {
+                            start_column: cols::chi_ands(x, y, b),
+                            packing: Packing::Direct,
+                        },
                     ],
                 ));
             }
@@ -732,11 +838,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     Multiplicity::Column(cols::MU),
                     vec![
                         BusValue::linear(vec![
-                            LinearTerm::Column { coefficient: 1, column: p_l },
-                            LinearTerm::Column { coefficient: 1, column: p_r },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: p_l,
+                            },
+                            LinearTerm::Column {
+                                coefficient: 1,
+                                column: p_r,
+                            },
                         ]),
-                        BusValue::Packed { start_column: cols::chi_ands(x, y, b), packing: Packing::Direct },
-                        BusValue::Packed { start_column: cols::chi(x, y, b), packing: Packing::Direct },
+                        BusValue::Packed {
+                            start_column: cols::chi_ands(x, y, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::chi(x, y, b),
+                            packing: Packing::Direct,
+                        },
                     ],
                 ));
             }
@@ -750,9 +868,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::XorByte,
             Multiplicity::Column(cols::MU),
             vec![
-                BusValue::Packed { start_column: cols::chi(0, 0, b), packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::rc(b), packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::iota(b), packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::chi(0, 0, b),
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::rc(b),
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::iota(b),
+                    packing: Packing::Direct,
+                },
             ],
         ));
     }
@@ -795,7 +922,11 @@ mod tests {
         let input = [0x0102030405060708u64; 25];
         let mut output = input;
         keccak_f1600(&mut output);
-        let op = KeccakRoundOperation { timestamp: 42, input, output };
+        let op = KeccakRoundOperation {
+            timestamp: 42,
+            input,
+            output,
+        };
         let trace = generate_keccak_rnd_trace(&[op]);
         let base = 0;
 
@@ -822,9 +953,9 @@ mod tests {
                 let rotated = theta_lanes[sx + 5 * sy].rotate_left(KECCAK_RHO[sx][sy]);
                 for z in 0..8 {
                     let (l_col, r_col) = cols::pi_src_cols(x, y, z);
-                    let virtual_pi = &trace.main_table.data[base + l_col]
-                        + &trace.main_table.data[base + r_col];
-                    let expected = FE::from(((rotated >> (z * 8)) & 0xFF) as u64);
+                    let virtual_pi =
+                        &trace.main_table.data[base + l_col] + &trace.main_table.data[base + r_col];
+                    let expected = FE::from((rotated >> (z * 8)) & 0xFF);
                     assert_eq!(
                         virtual_pi, expected,
                         "virtual pi mismatch at ({x},{y},{z}): sx={sx}, sy={sy}"

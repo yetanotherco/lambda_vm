@@ -20,8 +20,8 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{AddConstraint, AddOperand};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::constraints::templates::{AddConstraint, AddOperand};
 
 // =========================================================================
 // Column indices
@@ -204,22 +204,48 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     {
         // addr as DWordWL from DWordBL bytes: lo32 = sum(addr[0..4] * 256^i), hi32 = sum(addr[4..8] * 256^i)
         let addr_lo = BusValue::linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::addr(0) },
-            LinearTerm::Column { coefficient: 256, column: cols::addr(1) },
-            LinearTerm::Column { coefficient: 65536, column: cols::addr(2) },
-            LinearTerm::Column { coefficient: 16777216, column: cols::addr(3) },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::addr(0),
+            },
+            LinearTerm::Column {
+                coefficient: 256,
+                column: cols::addr(1),
+            },
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::addr(2),
+            },
+            LinearTerm::Column {
+                coefficient: 16777216,
+                column: cols::addr(3),
+            },
         ]);
         let addr_hi = BusValue::linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::addr(4) },
-            LinearTerm::Column { coefficient: 256, column: cols::addr(5) },
-            LinearTerm::Column { coefficient: 65536, column: cols::addr(6) },
-            LinearTerm::Column { coefficient: 16777216, column: cols::addr(7) },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::addr(4),
+            },
+            LinearTerm::Column {
+                coefficient: 256,
+                column: cols::addr(5),
+            },
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::addr(6),
+            },
+            LinearTerm::Column {
+                coefficient: 16777216,
+                column: cols::addr(7),
+            },
         ]);
         let mut values = Vec::with_capacity(24);
         // old[0..7] = addr as WL + 6 zeros
         values.push(addr_lo.clone());
         values.push(addr_hi.clone());
-        for _ in 2..8 { values.push(BusValue::constant(0)); }
+        for _ in 2..8 {
+            values.push(BusValue::constant(0));
+        }
         // is_register = 1
         values.push(BusValue::constant(1));
         // base_address = 2*10 = 20 (register x10)
@@ -228,10 +254,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // value[0..7] = same as old (read)
         values.push(addr_lo);
         values.push(addr_hi);
-        for _ in 2..8 { values.push(BusValue::constant(0)); }
+        for _ in 2..8 {
+            values.push(BusValue::constant(0));
+        }
         // timestamp
-        values.push(BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct });
-        values.push(BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct });
+        values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_0,
+            packing: Packing::Direct,
+        });
+        values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_1,
+            packing: Packing::Direct,
+        });
         // write2=1, write4=0, write8=0 (register access)
         values.push(BusValue::constant(1));
         values.push(BusValue::constant(0));
@@ -249,8 +283,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // bus element (no packing).
     {
         let mut values = vec![
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
             BusValue::constant(0), // round = 0
         ];
         for x in 0..5 {
@@ -273,8 +313,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // 3. Keccak bus: receive (timestamp, 24, output_state[200])
     {
         let mut values = vec![
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
             BusValue::constant(24), // round = 24
         ];
         for x in 0..5 {
@@ -317,12 +363,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
         // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
         let addr_lo = BusValue::linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::state_ptr(lane_idx, 0) },
-            LinearTerm::Column { coefficient: 65536, column: cols::state_ptr(lane_idx, 1) },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::state_ptr(lane_idx, 0),
+            },
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::state_ptr(lane_idx, 1),
+            },
         ]);
         let addr_hi = BusValue::linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::state_ptr(lane_idx, 2) },
-            LinearTerm::Column { coefficient: 65536, column: cols::state_ptr(lane_idx, 3) },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::state_ptr(lane_idx, 2),
+            },
+            LinearTerm::Column {
+                coefficient: 65536,
+                column: cols::state_ptr(lane_idx, 3),
+            },
         ]);
 
         let mut values = Vec::with_capacity(24);

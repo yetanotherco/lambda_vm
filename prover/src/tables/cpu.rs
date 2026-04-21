@@ -819,10 +819,8 @@ pub fn generate_cpu_trace(
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
         data[base + cols::ECALL_KECCAK] = FE::from(op.ecall_keccak as u64);
-        data[base + cols::KECCAK_STATE_ADDR_0] =
-            FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
-        data[base + cols::KECCAK_STATE_ADDR_1] =
-            FE::from(op.keccak_state_addr >> 32);
+        data[base + cols::KECCAK_STATE_ADDR_0] = FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
+        data[base + cols::KECCAK_STATE_ADDR_1] = FE::from(op.keccak_state_addr >> 32);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns

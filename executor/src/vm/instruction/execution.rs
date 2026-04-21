@@ -585,8 +585,7 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         let mut b = [0u64; 25];
         for x in 0..5 {
             for y in 0..5 {
-                b[y + 5 * ((2 * x + 3 * y) % 5)] =
-                    state[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = state[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
             }
         }
 

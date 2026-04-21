@@ -44,8 +44,12 @@ use crate::tables::dvrm::{
 };
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
-use crate::tables::keccak_rc::{bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols};
-use crate::tables::keccak_rnd::{bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols};
+use crate::tables::keccak_rc::{
+    bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
+};
+use crate::tables::keccak_rnd::{
+    bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
+};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
