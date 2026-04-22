@@ -237,7 +237,7 @@ pub struct LdeTwiddles<F: IsFFTField> {
 
 impl<F: IsFFTField> LdeTwiddles<F> {
     /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
-    fn new(domain: &Domain<F>) -> Self {
+    pub(crate) fn new(domain: &Domain<F>) -> Self {
         let domain_size = domain.interpolation_domain_size;
         let lde_size = domain_size * domain.blowup_factor;
 
@@ -759,6 +759,7 @@ pub trait IsStarkProver<
     fn decompose_and_extend_d2(
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -809,23 +810,49 @@ pub trait IsStarkProver<
             }
         };
 
-        // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
-        // The squared coset offset is g² (= coset_offset²).
-        let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
+        // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset
+        // using coset_lde_full_expand with cross-coset weights.
+        //
+        // The weight w[i] converts g²-coset iFFT output to g-coset FFT input:
+        //   w[i] = n_inv * g^{-i}  (= n_inv / g^i)
+        // This combines: (1) undo g²-coset factor, (2) apply g-coset factor.
+        let g_inv = domain.coset_offset.inv().expect("coset offset nonzero");
+        let n_inv = FieldElement::<Field>::from(n as u64)
+            .inv()
+            .expect("trace length nonzero");
+        let cross_coset_weights: Vec<FieldElement<Field>> = {
+            let mut w = Vec::with_capacity(n);
+            let mut power = n_inv;
+            for _ in 0..n {
+                w.push(power.clone());
+                power = &power * &g_inv;
+            }
+            w
+        };
+
+        let mut h0_buf = h0_evals;
+        let mut h1_buf = h1_evals;
+
+        let expand = |buf: &mut Vec<FieldElement<FieldExtension>>| {
+            Polynomial::coset_lde_full_expand::<Field>(
+                buf,
+                domain.blowup_factor,
+                &cross_coset_weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+            .expect("cross-coset LDE expansion")
+        };
 
         #[cfg(feature = "parallel")]
-        let (lde_h0, lde_h1) = rayon::join(
-            || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
-
+        rayon::join(|| expand(&mut h0_buf), || expand(&mut h1_buf));
         #[cfg(not(feature = "parallel"))]
-        let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
+        {
+            expand(&mut h0_buf);
+            expand(&mut h1_buf);
+        }
 
-        vec![lde_h0, lde_h1]
+        vec![h0_buf, h1_buf]
     }
 
     /// Given N evaluations of a degree-<N polynomial on the g²-coset,
@@ -861,6 +888,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -898,7 +926,7 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain)
+            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -1019,6 +1047,7 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the fourth round of the STARK Prove protocol.
+    #[allow(clippy::too_many_arguments)]
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
@@ -1027,6 +1056,7 @@ pub trait IsStarkProver<
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Round4<Field, FieldExtension>
     where
         FieldElement<FieldExtension>: AsBytes,
@@ -1079,10 +1109,22 @@ pub trait IsStarkProver<
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        // Use cached twiddles from LdeTwiddles (avoids regenerating ~2M twiddle factors).
         let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
+            math::fft::polynomial::interpolate_fft_with_twiddles::<Field, FieldExtension>(
+                &deep_evals,
+                &twiddles.inv,
+            )
+            .expect("iFFT should succeed");
+        // Zero-pad to LDE size and FFT with cached forward twiddles.
+        let mut coeffs = deep_poly.coefficients().to_vec();
+        coeffs.resize(domain_size, FieldElement::zero());
+        let mut lde_evals = math::fft::polynomial::evaluate_fft_with_twiddles::<
+            Field,
+            FieldExtension,
+        >(&coeffs, &twiddles.fwd)
+        .expect("FFT should succeed");
+        drop(coeffs);
         in_place_bit_reverse_permute(&mut lde_evals);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
@@ -1825,6 +1867,7 @@ pub trait IsStarkProver<
                         &round_1_result,
                         table_transcript,
                         domain,
+                        &twiddle_caches[idx],
                     )?;
 
                     #[cfg(feature = "instruments")]
@@ -1902,6 +1945,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1945,6 +1989,7 @@ pub trait IsStarkProver<
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            twiddles,
         )?;
 
         // >>>> Send commitments: [H₁], [H₂]
@@ -2000,6 +2045,7 @@ pub trait IsStarkProver<
             &round_3_result,
             &z,
             transcript,
+            twiddles,
         );
 
         #[cfg(feature = "instruments")]

@@ -322,6 +322,46 @@ where
     Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
 
+/// Forward FFT using pre-computed twiddles. Avoids regenerating twiddle factors.
+pub fn evaluate_fft_with_twiddles<F, E>(
+    coeffs: &[FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = coeffs.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let mut result = coeffs.to_vec();
+    dispatch_fft(&mut result, twiddles)?;
+    in_place_bit_reverse_permute(&mut result);
+    Ok(result)
+}
+
+/// Inverse FFT using pre-computed inverse twiddles. Avoids regenerating twiddle factors.
+pub fn interpolate_fft_with_twiddles<F, E>(
+    fft_evals: &[FieldElement<E>],
+    inv_twiddles: &LayerTwiddles<F>,
+) -> Result<Polynomial<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = fft_evals.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let mut coeffs = fft_evals.to_vec();
+    in_place_bit_reverse_permute(&mut coeffs);
+    dispatch_ifft(&mut coeffs, inv_twiddles)?;
+
+    let scale_factor = FieldElement::from(n as u64).inv().unwrap();
+    Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
+}
+
 #[cfg(test)]
 impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Multiplies two polynomials using FFT.

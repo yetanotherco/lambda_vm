@@ -220,9 +220,11 @@ fn test_decompose_and_extend_d2_matches_original() {
         .collect();
 
     // --- New path: algebraic decomposition ---
+    let twiddles = crate::prover::LdeTwiddles::new(&domain);
     let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
         &constraint_evaluations,
         &domain,
+        &twiddles,
     );
 
     assert_eq!(new_result.len(), 2);
