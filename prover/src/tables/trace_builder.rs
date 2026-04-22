@@ -1364,7 +1364,11 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     }
     if !private_input.is_empty() {
         let len_bytes = (private_input.len() as u32).to_le_bytes();
-        let all_bytes: Vec<u8> = len_bytes.iter().chain(private_input.iter()).copied().collect();
+        let all_bytes: Vec<u8> = len_bytes
+            .iter()
+            .chain(private_input.iter())
+            .copied()
+            .collect();
         for (i, &b) in all_bytes.iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
             let page_base = page::page_base_for_address(addr, page_size);
@@ -1378,7 +1382,11 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     init_page_data
 }
 
-fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState, private_input: &[u8]) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_page(
+    elf: &Elf,
+    memory_state: &MemoryState,
+    private_input: &[u8],
+) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;

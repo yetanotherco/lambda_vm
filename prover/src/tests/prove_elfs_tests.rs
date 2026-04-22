@@ -731,7 +731,8 @@ fn test_prove_elfs_test_commit_4() {
         "Public output should match committed bytes"
     );
 
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -756,7 +757,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs
     let table_counts = traces.table_counts();
@@ -1477,7 +1479,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1499,7 +1502,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1536,7 +1540,8 @@ fn test_deep_stack_missing_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
@@ -1614,7 +1619,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1640,7 +1646,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1954,8 +1961,8 @@ fn test_pure_commit_rust() {
 #[test]
 fn test_prove_with_input_empty() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
-    let result = crate::prove_with_inputs(&elf_bytes, &[])
-        .expect("prove_with_inputs should succeed on sub");
+    let result =
+        crate::prove_with_inputs(&elf_bytes, &[]).expect("prove_with_inputs should succeed on sub");
     assert!(
         crate::verify(&result, &elf_bytes).expect("verify should not error"),
         "prove_with_inputs(empty) proof should verify"
@@ -1967,8 +1974,8 @@ fn test_prove_with_input_empty() {
 fn test_prove_private_input_xpage() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let proof = crate::prove_with_inputs(&elf_bytes, &input)
-        .expect("prove_with_inputs should succeed");
+    let proof =
+        crate::prove_with_inputs(&elf_bytes, &input).expect("prove_with_inputs should succeed");
     assert!(
         crate::verify_with_inputs(&proof, &elf_bytes, &input).expect("verify should not error"),
         "proof should verify"
@@ -1981,8 +1988,8 @@ fn test_prove_private_input_xpage() {
 fn test_prove_private_input_different_values() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = vec![
-        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        0x99, 0x00,
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+        0x00,
     ];
     let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
     assert!(

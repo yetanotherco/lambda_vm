@@ -610,8 +610,11 @@ pub fn verify_with_options(
     vm_proof.table_counts.validate()?;
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges, private_inputs);
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &vm_proof.runtime_page_ranges,
+        private_inputs,
+    );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
