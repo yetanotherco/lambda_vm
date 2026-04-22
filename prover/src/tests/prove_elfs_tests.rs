@@ -1585,20 +1585,21 @@ fn test_deep_stack_missing_pages_rejected() {
 // Heap allocation tests (runtime page detection)
 // =============================================================================
 
-/// heap_alloc writes to 4 pages (0x80000..0x83000) far from ELF segments and
+/// heap_alloc writes to addresses 0x80000..0x83000 far from ELF segments and
 /// stack, plus a stack write. Tests that MemoryState-based page detection
 /// discovers all heap and stack pages, and run-length encodes them.
+/// With 256KB pages, all 4 writes (0x80000..0x83000) fit in a single page.
 #[test]
 fn test_heap_alloc_passes() {
     let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
-    // Verify runtime_page_ranges encodes the heap pages as a contiguous range
+    // Verify runtime_page_ranges includes the heap page
     let ranges = traces.runtime_page_ranges();
-    // 4 contiguous heap pages (0x80000..0x83000) should be one range
+    // With 256KB pages, all 4 writes land on one page containing 0x80000
     assert!(
-        ranges.iter().any(|r| r.base == 0x80000 && r.count == 4),
-        "Expected contiguous heap range (0x80000, 4), got {:?}",
+        ranges.iter().any(|r| r.base == 0x80000 && r.count == 1),
+        "Expected heap range (0x80000, 1), got {:?}",
         ranges
     );
 
@@ -1625,11 +1626,11 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
 
-    // Should have a range covering heap pages 0x80000..0x83000
+    // With 256KB pages, all heap writes fit in 1 page + 1 stack page
     let total_pages: u64 = runtime_page_ranges.iter().map(|r| r.count).sum();
     assert!(
-        total_pages >= 5,
-        "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",
+        total_pages >= 2,
+        "Expected at least 2 runtime pages (1 heap + 1 stack), got {}",
         total_pages
     );
 
