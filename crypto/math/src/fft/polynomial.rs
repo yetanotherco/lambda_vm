@@ -80,6 +80,37 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         evaluate_fft_cpu::<F, E>(&coeffs)
     }
 
+    /// Same as `evaluate_fft` but returns the evaluations in bit-reversed order,
+    /// skipping the final natural-order permutation. Use when the consumer expects
+    /// bit-reversed input (e.g. FRI commit phase, which pairs consecutive values as
+    /// {f(x), f(-x)}).
+    pub fn evaluate_fft_bit_reversed<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let domain_size = domain_size.unwrap_or(0);
+        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
+        }
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
+        }
+
+        let mut coeffs = poly.coefficients().to_vec();
+        coeffs.resize(len, FieldElement::zero());
+
+        let order = len.trailing_zeros() as u64;
+        let layer_twiddles =
+            LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
+        dispatch_fft(&mut coeffs, &layer_twiddles)?;
+        Ok(coeffs)
+    }
+
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
     /// (so the results are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
