@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -25,7 +25,7 @@ impl<F: IsFFTField> QuadraticConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for QuadraticConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for QuadraticConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -41,7 +41,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -78,7 +78,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,8 +102,9 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
-            vec![Box::new(QuadraticConstraint::new())];
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![Box::new(QuadraticConstraint::new())];
 
         let context = AirContext {
             proof_options: proof_options.clone(),
@@ -132,7 +133,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.constraints
     }
 
