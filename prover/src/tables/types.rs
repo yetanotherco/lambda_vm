@@ -680,7 +680,13 @@ impl DecodeEntry {
             }
 
             Instruction::CSR { .. } => {
-                // CSR instructions not yet supported in prover
+                // CSR instructions are executed as no-ops by the VM (see
+                // executor Instruction::CSR arm returning dst_val: 0,
+                // src1/2_val: 0). Mirror that here by treating them as
+                // `ADDI x0, x0, 0` — same pattern as `Fence`. This sets
+                // `op_add=true` so CM54's multiplicity is non-zero and the
+                // CPU's PC-update Memw sender fires.
+                entry.op_add = true;
             }
 
             Instruction::EcallEbreak => {
