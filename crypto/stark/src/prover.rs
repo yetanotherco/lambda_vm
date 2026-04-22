@@ -1079,21 +1079,17 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
-        // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
-        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
+        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
+        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
+        let mut lde_evals = deep_evals;
         in_place_bit_reverse_permute(&mut lde_evals);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
-        // FRI commit phase from pre-computed evaluations (no initial FFT)
+        // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let (fri_last_value, fri_layers) =
@@ -1158,10 +1154,11 @@ pub trait IsStarkProver<
             .collect::<Vec<usize>>()
     }
 
-    /// Computes the DEEP composition polynomial as evaluations on the trace-size coset.
+    /// Computes the DEEP composition polynomial at all 2N LDE points (Plonky3-style).
     ///
-    /// Evaluates `deep(x_i)` at N points (every bf-th point of the LDE coset).
-    /// The caller extends to the full 2N-point LDE domain before feeding to FRI.
+    /// Evaluates directly on the full LDE domain, eliminating the iFFT(N)+FFT(2N)
+    /// extension that was needed when computing at only N trace-coset points.
+    /// The result is ready for FRI after bit-reversal — no FFT needed.
     ///
     /// The DEEP polynomial is:
     ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
@@ -1205,20 +1202,21 @@ pub trait IsStarkProver<
         let num_main_cols = lde_trace.num_main_cols();
         let num_aux_cols = lde_trace.num_aux_cols();
 
-        // Precompute all inverse denominators via batch inversion.
-        let num_denoms = domain_size * (1 + num_eval_points);
+        // Precompute all inverse denominators at ALL LDE points via batch inversion.
+        let lde_size = domain.lde_roots_of_unity_coset.len();
+        let num_denoms = lde_size * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
-        // H-term denominators: x_i - z^K
-        for i in 0..domain_size {
-            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+        // H-term denominators: x_i - z^K (all 2N LDE points)
+        for i in 0..lde_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i];
             denoms.push(x_i - &z_power);
         }
 
-        // Trace-term denominators: x_i - z_shifted[k]
+        // Trace-term denominators: x_i - z_shifted[k] (all 2N LDE points)
         for z_k in z_shifted.iter().take(num_eval_points) {
-            for i in 0..domain_size {
-                let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+            for i in 0..lde_size {
+                let x_i = &domain.lde_roots_of_unity_coset[i];
                 denoms.push(x_i - z_k);
             }
         }
@@ -1226,7 +1224,7 @@ pub trait IsStarkProver<
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
-        let inv_h = &denoms[0..domain_size];
+        let inv_h = &denoms[0..lde_size];
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
@@ -1250,11 +1248,10 @@ pub trait IsStarkProver<
             }
         }
 
-        // Compressed traces: for each eval point k, build compressed_k[i] for all i.
-        // Parallelized over rows: each thread computes the full column sum for its rows.
+        // Compressed traces at ALL 2N LDE points (Plonky3-style).
+        // Eliminates the iFFT(N)+FFT(2N) extension by computing directly at LDE size.
         let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
             .map(|k| {
-                // Collect gammas for this eval point
                 let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
                     .map(|j| &trace_terms_gammas[j][k])
                     .collect();
@@ -1263,20 +1260,17 @@ pub trait IsStarkProver<
                     .collect();
 
                 #[cfg(feature = "parallel")]
-                let iter = (0..domain_size).into_par_iter();
+                let iter = (0..lde_size).into_par_iter();
                 #[cfg(not(feature = "parallel"))]
-                let iter = 0..domain_size;
+                let iter = 0..lde_size;
 
                 iter.map(|i| {
-                    let row_idx = i * blowup_factor;
                     let mut sum = FieldElement::<FieldExtension>::zero();
-                    // Main columns: F × E → E (3 base muls each)
                     for (j, gamma) in main_gammas.iter().enumerate() {
-                        sum += lde_trace.get_main(row_idx, j) * *gamma;
+                        sum += lde_trace.get_main(i, j) * *gamma;
                     }
-                    // Aux columns: E × E → E (9 base muls each)
                     for (j, gamma) in aux_gammas.iter().enumerate() {
-                        sum += lde_trace.get_aux(row_idx, j) * *gamma;
+                        sum += lde_trace.get_aux(i, j) * *gamma;
                     }
                     sum
                 })
@@ -1284,29 +1278,26 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // === Phase 2: Hot loop — only K=2 ext ops per row for trace terms ===
+        // Hot loop at all 2N LDE points — no FFT extension needed.
         #[cfg(feature = "parallel")]
-        let iter = (0..domain_size).into_par_iter();
+        let iter = (0..lde_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let iter = 0..domain_size;
+        let iter = 0..lde_size;
 
         iter.map(|i| {
-            let row_idx = i * blowup_factor; // LDE row index
-
-            // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
+
+            // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
                 let h_j_ood = &h_ood[j];
-                let numerator = h_j_val - h_j_ood;
-                result += &composition_poly_gammas[j] * numerator * &inv_h[i];
+                result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
 
-            // Trace terms: Σ_k inv_denom_k[i] * (compressed_k[i] - ood_compressed_k)
+            // Trace terms (compressed)
             for k in 0..num_eval_points {
-                let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-                let numerator = &compressed[k][i] - &ood_compressed[k];
-                result += inv_t_k_i * numerator;
+                let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
+                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
             }
 
             result
