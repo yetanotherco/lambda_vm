@@ -492,6 +492,28 @@ pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmPr
     )
 }
 
+/// Count the total number of main-trace and auxiliary-trace field elements without
+/// running the STARK proof step.
+///
+/// Returns `(main_elements, aux_elements)` where `main_elements` is the sum of
+/// `rows × columns` over all main (base-field) trace columns, and `aux_elements`
+/// is the sum of `rows × ⌈bus_interactions/2⌉` over all tables — i.e. the number
+/// of committed extension-field columns times rows (LogUp batching packs two
+/// interactions per column).
+pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u64), Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let traces = Traces::from_elf_and_logs(&program, &result.logs, &MaxRowsConfig::default())?;
+    Ok((
+        traces.total_field_elements(),
+        traces.total_auxiliary_field_elements(),
+    ))
+}
+
 /// Prove an ELF binary execution with custom proof options and max rows config.
 pub fn prove_with_options(
     elf_bytes: &[u8],
@@ -511,6 +533,8 @@ pub fn prove_with_options_and_inputs(
 ) -> Result<VmProof, Error> {
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
@@ -525,6 +549,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_execute = stark::instruments::heap_bytes();
 
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
@@ -536,6 +562,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_trace = stark::instruments::heap_bytes();
 
     // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
@@ -552,6 +580,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
+    #[cfg(feature = "instruments")]
+    let heap_after_air = stark::instruments::heap_bytes();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
@@ -569,6 +599,12 @@ pub fn prove_with_options_and_inputs(
             trace_build_elapsed,
             air_elapsed,
             total_start.elapsed(),
+            &stark::instruments::ProveHeapProfile {
+                before: heap_before,
+                after_execute: heap_after_execute,
+                after_trace_build: heap_after_trace,
+                after_air: heap_after_air,
+            },
         );
     }
 
