@@ -1231,8 +1231,56 @@ pub trait IsStarkProver<
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+        let num_total_cols = num_main_cols + num_aux_cols;
 
-        // Compute deep(x_i) for each trace-size coset point
+        // === Phase 1: Column compression (Plonky3-style) ===
+        // Instead of iterating all ~95 columns per row in the hot loop, we precompute:
+        //   compressed_k[i] = Σ_j gamma[j][k] * trace_col_j[i * bf]
+        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k]
+        // This moves the column sum outside the hot loop.
+
+        // Precompute OOD compressed values (one per eval point)
+        let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::zero(); num_eval_points];
+        for j in 0..num_total_cols {
+            let ood_evals_j = &trace_ood_columns[j];
+            let gammas_j = &trace_terms_gammas[j];
+            for k in 0..num_eval_points {
+                ood_compressed[k] += &gammas_j[k] * &ood_evals_j[k];
+            }
+        }
+
+        // Compressed traces: for each eval point k, build compressed_k[i] for all i.
+        // Accumulate column-by-column (sequential column access on column-major storage).
+        let mut compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|_| vec![FieldElement::zero(); domain_size])
+            .collect();
+
+        // Main columns: F × E multiplication (3 base muls per element)
+        for j in 0..num_main_cols {
+            let col = &lde_trace.main_columns[j];
+            for k in 0..num_eval_points {
+                let gamma_jk = &trace_terms_gammas[j][k];
+                let compressed_k = &mut compressed[k];
+                for i in 0..domain_size {
+                    compressed_k[i] += &col[i * blowup_factor] * gamma_jk;
+                }
+            }
+        }
+
+        // Aux columns: E × E multiplication (9 base muls per element)
+        for j in 0..num_aux_cols {
+            let col = &lde_trace.aux_columns[j];
+            for k in 0..num_eval_points {
+                let gamma_jk = &trace_terms_gammas[num_main_cols + j][k];
+                let compressed_k = &mut compressed[k];
+                for i in 0..domain_size {
+                    compressed_k[i] += gamma_jk * &col[i * blowup_factor];
+                }
+            }
+        }
+
+        // === Phase 2: Hot loop — only K=2 ext ops per row for trace terms ===
         #[cfg(feature = "parallel")]
         let iter = (0..domain_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -1250,23 +1298,11 @@ pub trait IsStarkProver<
                 result += &composition_poly_gammas[j] * numerator * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
-            let num_total_cols = num_main_cols + num_aux_cols;
-            for j in 0..num_total_cols {
-                let gammas_j = &trace_terms_gammas[j];
-                let ood_evals_j = &trace_ood_columns[j];
-
-                for k in 0..num_eval_points {
-                    let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-
-                    let t_j_ood = &ood_evals_j[k];
-                    let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j) - t_j_ood
-                    } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
-                    };
-                    result += &gammas_j[k] * numerator * inv_t_k_i;
-                }
+            // Trace terms: Σ_k inv_denom_k[i] * (compressed_k[i] - ood_compressed_k)
+            for k in 0..num_eval_points {
+                let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
+                let numerator = &compressed[k][i] - &ood_compressed[k];
+                result += inv_t_k_i * numerator;
             }
 
             result
