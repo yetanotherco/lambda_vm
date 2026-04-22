@@ -7,7 +7,7 @@ use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-#[cfg(not(feature = "parallel"))]
+#[cfg(all(debug_assertions, not(feature = "parallel")))]
 use math::polynomial::Polynomial;
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
