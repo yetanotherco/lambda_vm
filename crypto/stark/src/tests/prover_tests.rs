@@ -163,8 +163,28 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         step_size,
     );
 
+    // Precompute shared barycentric scalars
+    let n = domain.interpolation_domain_size;
+    let bf = domain.blowup_factor;
+    let coset_points: Vec<Felt> = (0..n)
+        .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+        .collect();
+    let coset_offset_pow_n: Felt = domain.coset_offset.pow(n);
+    let n_inv: Felt = Felt::from(n as u64).inv().expect("n is a power of two");
+    let g_n_inv: Felt = coset_offset_pow_n.inv().expect("non-zero");
+
     // Barycentric evaluation (new path)
-    let result = get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size);
+    let result = get_trace_evaluations_from_lde(
+        &lde_trace,
+        &domain,
+        &z,
+        &frame_offsets,
+        step_size,
+        &coset_points,
+        &coset_offset_pow_n,
+        &n_inv,
+        &g_n_inv,
+    );
 
     assert_eq!(result.width, expected.width);
     assert_eq!(result.height, expected.height);

@@ -1004,12 +1004,18 @@ pub trait IsStarkProver<
         // === Trace polynomials: barycentric evaluation via LDE ===
         // Uses get_trace_evaluations_from_lde which performs barycentric interpolation
         // on the LDE trace data, avoiding the need for coefficient-form trace_polys.
+        // Reuses coset_points, coset_offset_pow_n, domain_size_inv, g_n_inv already
+        // computed above for composition poly evaluation — avoids redundant work.
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
             &round_1_result.lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
             air.step_size(),
+            &coset_points,
+            &coset_offset_pow_n,
+            &domain_size_inv,
+            &g_n_inv,
         );
 
         Round3 {
