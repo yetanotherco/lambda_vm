@@ -1964,6 +1964,191 @@ fn build_traces(
 }
 
 impl Traces {
+    /// Returns the total number of main-trace field elements across all tables.
+    ///
+    /// Counts only the main (base-field) trace columns — equivalent to SP1's
+    /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    ///
+    /// Preprocessed columns (committed in a separate PCS round during setup, not at
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (2), PAGE (2).
+    pub fn total_field_elements(&self) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
+        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * CPU_COLS) as u64;
+        }
+        total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        for t in lts {
+            total += (t.num_rows() * LT_COLS) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * SHIFT_COLS) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * MEMW_COLS) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * MEMW_A_COLS) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * LOAD_COLS) as u64;
+        }
+        total += (decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
+        for t in muls {
+            total += (t.num_rows() * MUL_COLS) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * DVRM_COLS) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * BRANCH_COLS) as u64;
+        }
+        total += (halt.num_rows() * HALT_COLS) as u64;
+        total += (commit.num_rows() * COMMIT_COLS) as u64;
+        total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
+        for t in pages {
+            total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * MEMW_R_COLS) as u64;
+        }
+        total
+    }
+
+    /// Returns the total number of auxiliary-trace field elements (extension field)
+    /// across all tables.
+    ///
+    /// The LogUp layout packs N bus interactions into ⌈N/2⌉ EF columns
+    /// (`num_committed_pairs + 1` accumulated column). Each EF column costs one
+    /// extension-field element per row.
+    pub fn total_auxiliary_field_elements(&self) -> u64 {
+        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
+        let n_lt = aux_cols(super::lt::bus_interactions().len());
+        let n_shift = aux_cols(super::shift::bus_interactions().len());
+        let n_memw = aux_cols(super::memw::bus_interactions().len());
+        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
+        let n_load = aux_cols(super::load::bus_interactions().len());
+        let n_decode = aux_cols(super::decode::bus_interactions().len());
+        let n_mul = aux_cols(super::mul::bus_interactions().len());
+        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
+        let n_branch = aux_cols(super::branch::bus_interactions().len());
+        let n_halt = aux_cols(super::halt::bus_interactions().len());
+        let n_commit = aux_cols(super::commit::bus_interactions().len());
+        let n_register = aux_cols(super::register::bus_interactions().len());
+        // page::bus_interactions count is constant regardless of page_base.
+        let n_page = aux_cols(super::page::bus_interactions(0).len());
+        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * n_cpu) as u64;
+        }
+        total += (bitwise.num_rows() * n_bitwise) as u64;
+        for t in lts {
+            total += (t.num_rows() * n_lt) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * n_shift) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * n_memw) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * n_memw_a) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * n_load) as u64;
+        }
+        total += (decode.num_rows() * n_decode) as u64;
+        for t in muls {
+            total += (t.num_rows() * n_mul) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * n_dvrm) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * n_branch) as u64;
+        }
+        total += (halt.num_rows() * n_halt) as u64;
+        total += (commit.num_rows() * n_commit) as u64;
+        total += (register.num_rows() * n_register) as u64;
+        for t in pages {
+            total += (t.num_rows() * n_page) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * n_memw_r) as u64;
+        }
+        total
+    }
+
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
         crate::TableCounts {
