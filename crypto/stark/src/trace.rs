@@ -4,15 +4,15 @@ use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::polynomial::{
-    barycentric_inv_denoms, interpolate_coset_eval_ext_with_g_n_inv,
-    interpolate_coset_eval_with_g_n_inv,
+    barycentric_inv_denoms, interpolate_coset_eval_ext_strided_with_g_n_inv,
+    interpolate_coset_eval_strided_with_g_n_inv,
 };
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -404,74 +404,49 @@ where
 
     // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
-    // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
-    #[cfg(feature = "parallel")]
-    let main_iter = (0..num_main_cols).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let main_iter = 0..num_main_cols;
-    let main_col_evals: Vec<Vec<FieldElement<F>>> = main_iter
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_main(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
-
-    #[cfg(feature = "parallel")]
-    let aux_iter = (0..num_aux_cols).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let aux_iter = 0..num_aux_cols;
-    let aux_col_evals: Vec<Vec<FieldElement<E>>> = aux_iter
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_aux(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
-
+    // Evaluate every column directly on the LDE with stride = blowup_factor, skipping
+    // the per-column `Vec` pre-extraction that used to clone ~(num_main + num_aux)*n
+    // field elements out of already column-major LDE storage.
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
     for eval_point in &evaluation_points {
-        // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
-
-        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
         let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
 
-        // Evaluate all main columns (parallel when feature enabled)
         #[cfg(feature = "parallel")]
-        let main_iter = main_col_evals.par_iter();
+        let main_iter = lde_trace.main_columns.par_iter();
         #[cfg(not(feature = "parallel"))]
-        let main_iter = main_col_evals.iter();
+        let main_iter = lde_trace.main_columns.iter();
         let main_evals: Vec<FieldElement<E>> = main_iter
-            .map(|col_evals| {
-                interpolate_coset_eval_with_g_n_inv(
+            .map(|lde_col| {
+                interpolate_coset_eval_strided_with_g_n_inv(
                     &z_pow_n,
                     &coset_offset_pow_n,
                     &n_inv,
                     &g_n_inv,
                     &coset_points,
-                    col_evals,
+                    lde_col,
+                    bf,
                     &inv_denoms,
                 )
             })
             .collect();
         table_data.extend(main_evals);
 
-        // Evaluate all aux columns
         #[cfg(feature = "parallel")]
-        let aux_iter = aux_col_evals.par_iter();
+        let aux_iter = lde_trace.aux_columns.par_iter();
         #[cfg(not(feature = "parallel"))]
-        let aux_iter = aux_col_evals.iter();
+        let aux_iter = lde_trace.aux_columns.iter();
         let aux_evals: Vec<FieldElement<E>> = aux_iter
-            .map(|col_evals| {
-                interpolate_coset_eval_ext_with_g_n_inv(
+            .map(|lde_col| {
+                interpolate_coset_eval_ext_strided_with_g_n_inv(
                     &z_pow_n,
                     &coset_offset_pow_n,
                     &n_inv,
                     &g_n_inv,
                     &coset_points,
-                    col_evals,
+                    lde_col,
+                    bf,
                     &inv_denoms,
                 )
             })

@@ -812,6 +812,75 @@ where
     &scalar * &(vanishing * &sum) // F × E → E
 }
 
+/// Strided variant of `interpolate_coset_eval_with_g_n_inv`.
+///
+/// Reads `full_evaluations[0], full_evaluations[stride], …, full_evaluations[(N-1)*stride]`
+/// instead of requiring the caller to pre-extract a contiguous `Vec` of length N.
+/// Avoids allocating N field elements per column when the source data already lives
+/// in a larger buffer (e.g. LDE evaluations striped by `blowup_factor`).
+pub fn interpolate_coset_eval_strided_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    full_evaluations: &[FieldElement<F>],
+    stride: usize,
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+    debug_assert!(full_evaluations.len() >= coset_points.len() * stride);
+
+    let n = coset_points.len();
+    let sum: FieldElement<E> = (0..n).fold(FieldElement::<E>::zero(), |acc, i| {
+        let point = &coset_points[i];
+        let eval = &full_evaluations[i * stride];
+        let inv_d = &inv_denoms[i];
+        acc + (point * eval) * inv_d
+    });
+
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
+    let scalar = n_inv * g_n_inv;
+    &scalar * &(vanishing * &sum)
+}
+
+/// Strided variant of `interpolate_coset_eval_ext_with_g_n_inv`. Same contract as
+/// `interpolate_coset_eval_strided_with_g_n_inv`, but for extension-field columns.
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext_strided_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    full_evaluations: &[FieldElement<E>],
+    stride: usize,
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+    debug_assert!(full_evaluations.len() >= coset_points.len() * stride);
+
+    let n = coset_points.len();
+    let sum: FieldElement<E> = (0..n).fold(FieldElement::<E>::zero(), |acc, i| {
+        let point = &coset_points[i];
+        let eval = &full_evaluations[i * stride];
+        let inv_d = &inv_denoms[i];
+        acc + (point * eval) * inv_d
+    });
+
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
+    let scalar = n_inv * g_n_inv;
+    &scalar * &(vanishing * &sum)
+}
+
 #[cfg(test)]
 impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Returns a polynomial that interpolates the points with x coordinates and y coordinates given by
