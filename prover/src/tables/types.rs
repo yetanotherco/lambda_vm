@@ -43,7 +43,8 @@ pub enum BusId {
     // =========================================================================
     // Range checks (BITWISE table provides)
     // =========================================================================
-    /// Range check: value is a valid byte [0, 256)
+    /// Range check: both values are valid bytes [0, 256).
+    /// Single-byte checks send the second value as 0.
     IsByte = 0,
     /// Range check: value is a valid halfword [0, 2^16)
     IsHalfword,
