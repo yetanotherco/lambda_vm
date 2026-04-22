@@ -22,3 +22,13 @@ When `ECALL` is executed, it is assumed that:
 - the return value is written to `A0`,
 where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
 #footnote([RISC-V - Register sets; en.wikipedia.org, #link("https://web.archive.org/web/20260209053447/https://en.wikipedia.org/wiki/RISC-V#Register_sets")[[src]]]).
+
+= ECALL number overview
+
+We provide a list of supported ECALL numbers.
+Negative numbers (represented as 2s complement 64-bit numbers), are used for our own custom accelerators/extensions.
+
+/ 64: `write` (@commit)
+/ 93: `exit` (@halt)
+/ -1: `SHA256` (@sha256)
+/ -2: `KECCAK` (@keccak)

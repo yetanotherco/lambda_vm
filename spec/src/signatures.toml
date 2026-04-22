@@ -211,3 +211,16 @@ tag = "ROTXOR"
 kind = "interaction"
 input = ["Word", "Byte", "Byte", "Byte", "Bit"]
 output = "Word"
+
+# Keccak communication between rounds
+[[signatures]]
+tag = "KECCAK"
+kind = "interaction"
+input = ["DWordWL", "BaseField", [[["Byte", 8], 5], 5]]
+
+# Keccak round constants
+[[signatures]]
+tag = "KECCAK_RC"
+kind = "interaction"
+input = ["BaseField"]
+output = ["Byte", 8]
