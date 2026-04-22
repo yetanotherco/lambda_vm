@@ -157,6 +157,9 @@ impl Memory {
     /// 4-byte LE length prefix followed by the raw data. The guest reads these
     /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
     pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
         if inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }

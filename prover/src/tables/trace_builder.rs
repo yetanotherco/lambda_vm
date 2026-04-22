@@ -99,6 +99,9 @@ impl MemoryState {
 
     /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
     fn add_private_input(&mut self, private_input: &[u8]) {
+        if private_input.is_empty() {
+            return;
+        }
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let start = PRIVATE_INPUT_START_INDEX;
         let len_bytes = (private_input.len() as u32).to_le_bytes();
