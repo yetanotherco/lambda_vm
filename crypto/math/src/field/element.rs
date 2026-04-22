@@ -51,7 +51,29 @@ impl<F: IsField> FieldElement<F> {
     /// Computes the multiplicative inverses of a slice of field elements
     /// The algorithm just performs one inversion and several multiplications and should be used
     /// when wanting to invert several elements together
-    pub fn inplace_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError> {
+    pub fn inplace_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError>
+    where
+        Self: Send + Sync,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            // Montgomery batch inverse has a serial prefix-product dependency, but
+            // chunks are independent — each chunk inverts its own elements without
+            // needing values from other chunks. Trade K-1 extra field inversions
+            // (negligible vs ~2N mults per chunk) for K-way parallelism.
+            const PARALLEL_BATCH_INV_THRESHOLD: usize = 1 << 16;
+            if numbers.len() >= PARALLEL_BATCH_INV_THRESHOLD {
+                use rayon::prelude::*;
+                let chunk_size = numbers.len().div_ceil(rayon::current_num_threads().max(1));
+                return numbers
+                    .par_chunks_mut(chunk_size)
+                    .try_for_each(Self::inplace_batch_inverse_sequential);
+            }
+        }
+        Self::inplace_batch_inverse_sequential(numbers)
+    }
+
+    fn inplace_batch_inverse_sequential(numbers: &mut [Self]) -> Result<(), FieldError> {
         if numbers.is_empty() {
             return Ok(());
         }
