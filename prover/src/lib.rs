@@ -138,10 +138,6 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
-    /// Private input bytes. The verifier needs these to reconstruct the
-    /// PAGE preprocessed commitments for the private-input memory region
-    /// (pages at `PRIVATE_INPUT_START_INDEX = 0xFF000000`).
-    pub private_input: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -483,26 +479,14 @@ pub(crate) fn compute_expected_commit_bus_balance(
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(
-        elf_bytes,
-        vec![],
-        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
-        &MaxRowsConfig::default(),
-    )
+    prove_with_inputs(elf_bytes, &[])
 }
 
-/// Prove an ELF binary execution with a private input.
-///
-/// The `private_input` bytes are pre-loaded at `PRIVATE_INPUT_START_INDEX`
-/// (`0xFF000000`) as an initial memory segment (4-byte LE length prefix +
-/// data). The guest reads them via normal RISC-V loads — see
-/// `syscalls::syscalls::get_private_input`. The bytes are also included in
-/// the returned `VmProof` so the verifier can reconstruct the matching PAGE
-/// preprocessed commitments.
-pub fn prove_with_input(elf_bytes: &[u8], private_input: Vec<u8>) -> Result<VmProof, Error> {
-    prove_with_options(
+/// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
+pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(
         elf_bytes,
-        private_input,
+        private_inputs,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
@@ -511,7 +495,17 @@ pub fn prove_with_input(elf_bytes: &[u8], private_input: Vec<u8>) -> Result<VmPr
 /// Prove an ELF binary execution with custom proof options and max rows config.
 pub fn prove_with_options(
     elf_bytes: &[u8],
-    private_input: Vec<u8>,
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(elf_bytes, &[], proof_options, max_rows)
+}
+
+/// Prove an ELF binary execution with custom proof options, max rows config,
+/// and explicit private inputs.
+pub fn prove_with_options_and_inputs(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
@@ -523,12 +517,8 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    // Clone private_input so we can (a) hand ownership to the executor,
-    // (b) pass a reference to the trace builder, and (c) include it in VmProof
-    // for the verifier to reconstruct PAGE init data.
-    let saved_private_input = private_input.clone();
-    let executor =
-        Executor::new(&program, private_input).map_err(|e| Error::Execution(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -542,8 +532,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces =
-        Traces::from_elf_and_logs(&program, &result.logs, max_rows, &saved_private_input)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -588,7 +577,6 @@ pub fn prove_with_options(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
-        private_input: saved_private_input,
     })
 }
 
@@ -602,6 +590,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
         vm_proof,
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &[],
     )
 }
 
@@ -614,17 +603,15 @@ pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
+    private_inputs: &[u8],
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
-        &vm_proof.runtime_page_ranges,
-        &vm_proof.private_input,
-    );
+    let page_configs =
+        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges, private_inputs);
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
@@ -666,6 +653,23 @@ pub fn verify_with_options(
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     ))
+}
+
+/// Verify a proof that was produced with private inputs.
+///
+/// The verifier needs the private inputs to reconstruct the correct page
+/// configs (private input bytes have non-zero init values in PAGE tables).
+pub fn verify_with_inputs(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<bool, Error> {
+    verify_with_options(
+        vm_proof,
+        elf_bytes,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        private_inputs,
+    )
 }
 
 /// Prove and verify in one call (convenience).

@@ -98,11 +98,6 @@ impl MemoryState {
     }
 
     /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
-    ///
-    /// Writes the 4-byte LE length prefix at `0xFF000000` and the input bytes at
-    /// `0xFF000004+`, all at timestamp=0. This mirrors the executor's
-    /// `Memory::store_private_inputs` layout so the guest can read input bytes
-    /// directly via RISC-V loads (memory-mapped input).
     fn add_private_input(&mut self, private_input: &[u8]) {
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let start = PRIVATE_INPUT_START_INDEX;
@@ -1341,20 +1336,17 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
     ops
 }
 
-/// Build a `page_base → init_data` map from the ELF segments and the private
-/// input region.
+/// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
-/// The private input is laid out at `PRIVATE_INPUT_START_INDEX` as a 4-byte LE
-/// length prefix followed by the raw bytes (matching
-/// `Memory::store_private_inputs` and `MemoryState::add_private_input`). Both
-/// the prover (trace generation) and verifier (page config reconstruction) call
-/// this so they agree on PAGE init values exactly.
+/// Each PAGE byte generates 2 IS_BYTE lookups:
+/// - C1: IS_BYTE[init] for initialization range check
+/// - C2: IS_BYTE[fini] for finalization range check
+///
+/// This must be called BEFORE bitwise multiplicities are updated.
 fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
-
-    // ELF segments
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
             let word_addr = segment.base_addr + (i as u64 * 4);
@@ -1370,15 +1362,9 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
             }
         }
     }
-
-    // Private input: length prefix at 0xFF000000, data at 0xFF000004+
     if !private_input.is_empty() {
         let len_bytes = (private_input.len() as u32).to_le_bytes();
-        let all_bytes: Vec<u8> = len_bytes
-            .iter()
-            .chain(private_input.iter())
-            .copied()
-            .collect();
+        let all_bytes: Vec<u8> = len_bytes.iter().chain(private_input.iter()).copied().collect();
         for (i, &b) in all_bytes.iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
             let page_base = page::page_base_for_address(addr, page_size);
@@ -1389,22 +1375,10 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
             page_data[offset] = b;
         }
     }
-
     init_page_data
 }
 
-/// Collects IS_BYTE lookups from PAGE data (init and fini values).
-///
-/// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init] for initialization range check
-/// - C2: IS_BYTE[fini] for finalization range check
-///
-/// This must be called BEFORE bitwise multiplicities are updated.
-fn collect_bitwise_from_page(
-    elf: &Elf,
-    memory_state: &MemoryState,
-    private_input: &[u8],
-) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState, private_input: &[u8]) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1432,7 +1406,7 @@ fn collect_bitwise_from_page(
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
 
-            // Get init value (from ELF/private-input or 0)
+            // Get init value (from ELF or 0)
             let init = init_data.map_or(0u8, |data| data[offset]);
 
             // Get fini value (from final_state or init if never accessed)
@@ -1569,7 +1543,8 @@ fn generate_page_tables(
 
     let page_size = page::DEFAULT_PAGE_SIZE;
 
-    let elf_page_data = build_init_page_data(elf, private_input);
+    // Collect init data from ELF segments + private input region
+    let init_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
@@ -1589,7 +1564,7 @@ fn generate_page_tables(
     let mut page_configs = Vec::new();
 
     for &page_base in &page_bases {
-        let config = if let Some(init_data) = elf_page_data.get(&page_base) {
+        let config = if let Some(init_data) = init_page_data.get(&page_base) {
             PageConfig::with_data(page_base, page_size, init_data.clone())
         } else {
             PageConfig::zero_init(page_base, page_size)
@@ -1811,9 +1786,9 @@ fn build_traces(
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
-    private_input: &[u8],
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
+    private_input: &[u8],
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -1994,28 +1969,37 @@ impl Traces {
         }
     }
 
-    /// Extract page configurations for the deterministic portion of memory:
-    /// ELF segments and the private-input region at `PRIVATE_INPUT_START_INDEX`.
+    /// Extract page configurations from ELF only (deterministic from binary).
+    ///
+    /// Returns PageConfigs for pages covered by ELF segments, with their
+    /// init data populated. Used by the verifier to reconstruct the ELF
+    /// portion of the PAGE table layout.
     pub fn page_configs_from_elf(elf: &Elf, private_input: &[u8]) -> Vec<PageConfig> {
+        use std::collections::BTreeSet;
+
         let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, private_input);
 
-        let mut bases: Vec<u64> = init_page_data.keys().copied().collect();
-        bases.sort();
-        bases
+        let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
+
+        page_bases
             .into_iter()
             .map(|base| {
-                let data = init_page_data[&base].clone();
-                PageConfig::with_data(base, page_size, data)
+                if let Some(init_data) = init_page_data.get(&base) {
+                    PageConfig::with_data(base, page_size, init_data.clone())
+                } else {
+                    PageConfig::zero_init(base, page_size)
+                }
             })
             .collect()
     }
 
-    /// Reconstruct page configs from ELF, private input, and runtime page ranges.
+    /// Reconstruct page configs from ELF and runtime page ranges.
     ///
     /// Used by the verifier to reconstruct the full PAGE table layout.
-    /// Combines deterministic ELF + private-input pages with prover-provided runtime
+    /// Combines deterministic ELF pages with prover-provided runtime
     /// page ranges (zero-initialized: stack, heap, etc.).
+    /// Each range is `(base, count)` — `count` contiguous 4KB pages from `base`.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
@@ -2128,9 +2112,9 @@ impl Traces {
             elf.entry_point,
             decode_trace,
             decode_pc_to_row,
-            private_input,
             register_state,
             max_rows,
+            private_input,
         )
     }
 
@@ -2177,9 +2161,9 @@ impl Traces {
             entry_point,
             decode_trace,
             decode_pc_to_row,
-            &[],
             register_state,
             max_rows,
+            &[],
         )
     }
 
