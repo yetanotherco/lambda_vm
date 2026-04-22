@@ -48,8 +48,8 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // Constants
 // =========================================================================
 
-/// Default page size in bytes (4KB).
-pub const DEFAULT_PAGE_SIZE: usize = 4096;
+/// Default page size in bytes (256KB).
+pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
 /// Stack top address (where SP starts). Re-exported from executor.
 pub use executor::vm::registers::STACK_TOP;
