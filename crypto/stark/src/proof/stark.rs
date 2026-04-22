@@ -13,8 +13,6 @@ use crate::{
 pub struct PolynomialOpenings<F: IsField> {
     /// Openings at the 4 positions of the arity-4 orbit: index, index^1, index^2, index^3.
     /// For trace trees: 4 independent Merkle proofs (one per row).
-    /// For the composition poly tree (pair-leaf): proof covers {0,1} and proof_2 covers {2,3}
-    /// (proof_sym duplicates proof; proof_3 duplicates proof_2 — both are unused by the verifier).
     pub proof: Proof<Commitment>,
     pub proof_sym: Proof<Commitment>,
     pub proof_2: Proof<Commitment>,
@@ -25,10 +23,26 @@ pub struct PolynomialOpenings<F: IsField> {
     pub evaluations_3: Vec<FieldElement<F>>,
 }
 
+/// Openings for the composition polynomial tree (pair-leaf: leaf j covers positions {2j, 2j+1}).
+/// Arity-4 opens 4 positions {4i, 4i+1, 4i+2, 4i+3} spanning 2 leaves, so only 2 Merkle proofs
+/// are needed — unlike the trace-tree openings where 4 distinct paths are required.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct CompositionPolyOpenings<F: IsField> {
+    /// Merkle proof for leaf containing positions {4i, 4i+1}.
+    pub proof: Proof<Commitment>,
+    /// Merkle proof for leaf containing positions {4i+2, 4i+3}.
+    pub proof_2: Proof<Commitment>,
+    pub evaluations: Vec<FieldElement<F>>,
+    pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_2: Vec<FieldElement<F>>,
+    pub evaluations_3: Vec<FieldElement<F>>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
-    pub composition_poly: PolynomialOpenings<E>,
+    pub composition_poly: CompositionPolyOpenings<E>,
     pub main_trace_polys: PolynomialOpenings<F>,
     /// For preprocessed tables: openings for precomputed columns.
     /// These are verified against the hardcoded precomputed commitment.

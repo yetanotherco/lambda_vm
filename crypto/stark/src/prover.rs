@@ -27,7 +27,7 @@ use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
-use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+use crate::proof::stark::{CompositionPolyOpenings, DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
@@ -1280,7 +1280,7 @@ pub trait IsStarkProver<
         composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
-    ) -> PolynomialOpenings<FieldExtension>
+    ) -> CompositionPolyOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
@@ -1307,11 +1307,9 @@ pub trait IsStarkProver<
                 .collect()
         };
 
-        PolynomialOpenings {
-            proof: proof_01.clone(),
-            proof_sym: proof_01,
-            proof_2: proof_23.clone(),
-            proof_3: proof_23,
+        CompositionPolyOpenings {
+            proof: proof_01,
+            proof_2: proof_23,
             evaluations: eval_at(index * 4),
             evaluations_sym: eval_at(index * 4 + 1),
             evaluations_2: eval_at(index * 4 + 2),
