@@ -1,5 +1,5 @@
 use crate::{
-    constraints::transition::TransitionConstraint,
+    constraints::transition::TransitionConstraintEvaluator,
     lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -28,7 +28,7 @@ impl From<BusId> for u64 {
 pub fn new_cpu_air_with_lookup(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
@@ -59,7 +59,7 @@ pub fn new_cpu_air_with_lookup(
 pub fn new_mul_air_with_lookup(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
@@ -84,7 +84,7 @@ pub fn new_mul_air_with_lookup(
 pub fn new_add_air_with_lookup(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
