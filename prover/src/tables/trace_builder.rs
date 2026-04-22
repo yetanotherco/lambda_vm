@@ -2192,7 +2192,6 @@ impl Traces {
     ///
     /// Frees RAM by memory-mapping the main trace data for every table.
     /// This is a no-op for tables that are already spilled or empty.
-    #[cfg(feature = "disk-spill")]
     pub fn spill_all_main_to_disk(&mut self) -> Result<(), Error> {
         let spill = |t: &mut TraceTable<GoldilocksField, GoldilocksExtension>| {
             t.main_table

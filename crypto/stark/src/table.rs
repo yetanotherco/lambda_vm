@@ -11,7 +11,6 @@ use rayon::prelude::*;
 /// The table data is written row-major to a temp file and mmapped back.
 /// Access goes through pointer arithmetic on the mmap, matching the
 /// original `data[row * width + col]` layout.
-#[cfg(feature = "disk-spill")]
 pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
     /// Number of columns per row.
@@ -22,7 +21,6 @@ pub(crate) struct TableMmapBacking {
     elem_size: usize,
 }
 
-#[cfg(feature = "disk-spill")]
 impl std::fmt::Debug for TableMmapBacking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableMmapBacking")
@@ -44,7 +42,6 @@ pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
-    #[cfg(feature = "disk-spill")]
     #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
@@ -55,7 +52,6 @@ pub struct Table<F: IsField> {
 /// would produce on `TableMmapBacking`.
 impl<F: IsField> Clone for Table<F> {
     fn clone(&self) -> Self {
-        #[cfg(feature = "disk-spill")]
         if self.mmap_backing.is_some() {
             let mut data = Vec::with_capacity(self.width * self.height);
             for row in 0..self.height {
@@ -74,7 +70,6 @@ impl<F: IsField> Clone for Table<F> {
             data: self.data.clone(),
             width: self.width,
             height: self.height,
-            #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         }
     }
@@ -110,7 +105,6 @@ impl<F: IsField> Table<F> {
                 data: Vec::new(),
                 width,
                 height: 0,
-                #[cfg(feature = "disk-spill")]
                 mmap_backing: None,
             };
         }
@@ -123,7 +117,6 @@ impl<F: IsField> Table<F> {
             data,
             width,
             height,
-            #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         }
     }
@@ -152,7 +145,6 @@ impl<F: IsField> Table<F> {
 
     /// Given a row index, returns a reference to that row as a slice of field elements.
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
-        #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             // Guard the unsafe pointer math below; matches the non-spill
             // path's checked indexing so release builds don't drop the check.
@@ -236,7 +228,6 @@ impl<F: IsField> Table<F> {
     /// Given row and column indexes, returns the stored field element in that position of the table.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
-        #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             // Guard the unsafe pointer math below; matches the non-spill
             // path's checked indexing so release builds don't drop the check.
@@ -264,14 +255,7 @@ impl<F: IsField> Table<F> {
 
     /// Returns true if this table's data has been spilled to disk via mmap.
     pub fn is_spilled(&self) -> bool {
-        #[cfg(feature = "disk-spill")]
-        {
-            self.mmap_backing.is_some()
-        }
-        #[cfg(not(feature = "disk-spill"))]
-        {
-            false
-        }
+        self.mmap_backing.is_some()
     }
 
     /// Spill the table's row-major data to a temp file and mmap it back.
@@ -279,7 +263,6 @@ impl<F: IsField> Table<F> {
     /// `get_row()`, `columns()`, and `extract_columns_into()`.
     ///
     /// No-op if the table is empty or already spilled.
-    #[cfg(feature = "disk-spill")]
     pub fn spill_to_disk(&mut self) -> std::io::Result<()> {
         const {
             assert!(
@@ -343,7 +326,7 @@ impl<F: IsField> Table<F> {
     /// Unix-only: `madvise(MADV_DONTNEED)` has no direct Windows equivalent,
     /// so this is a no-op on non-Unix targets (callers rely on natural
     /// page-cache reclaim there).
-    #[cfg(all(feature = "disk-spill", unix))]
+    #[cfg(unix)]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
             // SAFETY: pointer and length are from a valid mmap.
@@ -358,7 +341,7 @@ impl<F: IsField> Table<F> {
         }
     }
 
-    #[cfg(all(feature = "disk-spill", not(unix)))]
+    #[cfg(not(unix))]
     pub fn advise_drop_cache(&self) {}
 
     /// Given a step size, converts the given table into a `Frame`.
@@ -419,7 +402,7 @@ where
     }
 }
 
-#[cfg(all(test, feature = "disk-spill"))]
+#[cfg(test)]
 mod disk_spill_tests {
     use super::*;
     use math::field::goldilocks::GoldilocksField;

@@ -26,7 +26,7 @@ impl std::error::Error for Error {}
 ///
 /// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
 /// node access goes through this mmap instead.
-#[cfg(feature = "disk-spill")]
+#[cfg(feature = "std")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
     node_count: usize,
@@ -42,12 +42,12 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
-#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
+#[cfg_attr(not(feature = "std"), derive(Clone))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
-    #[cfg(feature = "disk-spill")]
+    #[cfg(feature = "std")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
 }
@@ -92,7 +92,7 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
-            #[cfg(feature = "disk-spill")]
+            #[cfg(feature = "std")]
             mmap_backing: None,
         })
     }
@@ -100,7 +100,7 @@ where
     /// Total number of nodes in the tree (inner + leaves).
     #[inline]
     fn node_count(&self) -> usize {
-        #[cfg(feature = "disk-spill")]
+        #[cfg(feature = "std")]
         if let Some(ref backing) = self.mmap_backing {
             return backing.node_count;
         }
@@ -112,7 +112,7 @@ where
     /// Returns `None` if `idx` is out of bounds.
     #[inline]
     fn node_get(&self, idx: usize) -> Option<&B::Node> {
-        #[cfg(feature = "disk-spill")]
+        #[cfg(feature = "std")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
                 // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
@@ -268,7 +268,7 @@ where
 
     /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
     /// Node access methods read from the mmap after this call.
-    #[cfg(feature = "disk-spill")]
+    #[cfg(feature = "std")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
         B::Node: Copy,
