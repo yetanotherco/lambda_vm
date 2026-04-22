@@ -1300,7 +1300,10 @@ pub trait IsStarkProver<
 
         let eval_at = |raw_idx: usize| -> Vec<FieldElement<FieldExtension>> {
             (0..num_parts)
-                .map(|p| lde_composition_poly_evaluations[p][reverse_index(raw_idx, part_len as u64)].clone())
+                .map(|p| {
+                    lde_composition_poly_evaluations[p][reverse_index(raw_idx, part_len as u64)]
+                        .clone()
+                })
                 .collect()
         };
 

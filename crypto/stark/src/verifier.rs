@@ -781,12 +781,14 @@ pub trait IsStarkVerifier<
         let num_layers = fri_layers_merkle_roots.len();
         let mut result = true;
 
+        #[allow(clippy::needless_range_loop)]
         for i in 0..num_layers {
             let siblings = &fri_decommitment.layers_evaluations_siblings[i];
             let auth_path = &fri_decommitment.layers_auth_paths[i];
             let merkle_root = &fri_layers_merkle_roots[i];
 
-            result &= Self::verify_fri_layer_openings_quad(merkle_root, auth_path, &v, siblings, index);
+            result &=
+                Self::verify_fri_layer_openings_quad(merkle_root, auth_path, &v, siblings, index);
 
             let is_last = i == num_layers - 1;
 
@@ -852,6 +854,7 @@ pub trait IsStarkVerifier<
     /// Returns 4-tuple of DEEP composition polynomial evaluations for all queries.
     /// Each query's 4-element orbit gives evaluations at positions
     /// {4*iota, 4*iota+1, 4*iota+2, 4*iota+3} in the LDE domain.
+    #[allow(clippy::type_complexity)]
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
@@ -875,21 +878,20 @@ pub trait IsStarkVerifier<
 
             // Helper to gather trace evaluations for one orbit position.
             // For preprocessed tables: precomputed columns come FIRST, then multiplicities.
-            let gather_trace_evals =
-                |main_evals: &[FieldElement<Field>],
-                 precomp_evals: Option<&[FieldElement<Field>]>,
-                 aux_evals: Option<&[FieldElement<FieldExtension>]>|
-                 -> Vec<FieldElement<FieldExtension>> {
-                    let mut evals: Vec<FieldElement<FieldExtension>> = Vec::new();
-                    if let Some(pe) = precomp_evals {
-                        evals.extend(pe.iter().cloned().map(|x| x.to_extension()));
-                    }
-                    evals.extend(main_evals.iter().cloned().map(|x| x.to_extension()));
-                    if let Some(ae) = aux_evals {
-                        evals.extend_from_slice(ae);
-                    }
-                    evals
-                };
+            let gather_trace_evals = |main_evals: &[FieldElement<Field>],
+                                      precomp_evals: Option<&[FieldElement<Field>]>,
+                                      aux_evals: Option<&[FieldElement<FieldExtension>]>|
+             -> Vec<FieldElement<FieldExtension>> {
+                let mut evals: Vec<FieldElement<FieldExtension>> = Vec::new();
+                if let Some(pe) = precomp_evals {
+                    evals.extend(pe.iter().cloned().map(|x| x.to_extension()));
+                }
+                evals.extend(main_evals.iter().cloned().map(|x| x.to_extension()));
+                if let Some(ae) = aux_evals {
+                    evals.extend_from_slice(ae);
+                }
+                evals
+            };
 
             let precomp_0 = opening
                 .precomputed_trace_polys
@@ -908,21 +910,28 @@ pub trait IsStarkVerifier<
                 .as_ref()
                 .map(|p| p.evaluations_3.as_slice());
 
-            let aux_0 = opening.aux_trace_polys.as_ref().map(|a| a.evaluations.as_slice());
+            let aux_0 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations.as_slice());
             let aux_1 = opening
                 .aux_trace_polys
                 .as_ref()
                 .map(|a| a.evaluations_sym.as_slice());
-            let aux_2 = opening.aux_trace_polys.as_ref().map(|a| a.evaluations_2.as_slice());
-            let aux_3 = opening.aux_trace_polys.as_ref().map(|a| a.evaluations_3.as_slice());
+            let aux_2 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_2.as_slice());
+            let aux_3 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_3.as_slice());
 
             let te0 = gather_trace_evals(&opening.main_trace_polys.evaluations, precomp_0, aux_0);
             let te1 =
                 gather_trace_evals(&opening.main_trace_polys.evaluations_sym, precomp_1, aux_1);
-            let te2 =
-                gather_trace_evals(&opening.main_trace_polys.evaluations_2, precomp_2, aux_2);
-            let te3 =
-                gather_trace_evals(&opening.main_trace_polys.evaluations_3, precomp_3, aux_3);
+            let te2 = gather_trace_evals(&opening.main_trace_polys.evaluations_2, precomp_2, aux_2);
+            let te3 = gather_trace_evals(&opening.main_trace_polys.evaluations_3, precomp_3, aux_3);
 
             let ep0 = Self::query_challenge_to_evaluation_point(*iota, domain);
             let ep1 = {
