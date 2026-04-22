@@ -104,12 +104,8 @@ impl MemoryState {
         }
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let start = PRIVATE_INPUT_START_INDEX;
-        let len_bytes = (private_input.len() as u32).to_le_bytes();
-        for (i, &b) in len_bytes.iter().enumerate() {
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             self.cells.insert(start + i as u64, (b, 0));
-        }
-        for (i, &b) in private_input.iter().enumerate() {
-            self.cells.insert(start + 4 + i as u64, (b, 0));
         }
     }
 
@@ -1346,6 +1342,18 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 /// - C2: IS_BYTE[fini] for finalization range check
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
+///
+/// Encode private input as `[len_u32_LE][data]` — the canonical wire format.
+/// Must match `executor::vm::memory::Memory::store_private_inputs`.
+fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
+    let len_bytes = (private_input.len() as u32).to_le_bytes();
+    len_bytes
+        .iter()
+        .chain(private_input.iter())
+        .copied()
+        .collect()
+}
+
 fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1366,13 +1374,7 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
         }
     }
     if !private_input.is_empty() {
-        let len_bytes = (private_input.len() as u32).to_le_bytes();
-        let all_bytes: Vec<u8> = len_bytes
-            .iter()
-            .chain(private_input.iter())
-            .copied()
-            .collect();
-        for (i, &b) in all_bytes.iter().enumerate() {
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
             let page_base = page::page_base_for_address(addr, page_size);
             let offset = page::offset_in_page(addr, page_size);

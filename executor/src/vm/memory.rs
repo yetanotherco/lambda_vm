@@ -46,6 +46,7 @@ pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Fixed high address where private input is mapped. Guest programs can read
 /// directly from this address (ZisK-style memory-mapped input).
 /// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
+/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]

@@ -138,6 +138,9 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
+    /// Whether the proof was generated with non-empty private inputs.
+    /// Callers must use `verify_with_inputs` instead of `verify` for such proofs.
+    pub uses_private_input: bool,
 }
 
 /// Error type for the prover crate.
@@ -155,6 +158,9 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Proof requires private inputs but `verify()` was called without them.
+    /// Use `verify_with_inputs()` instead.
+    MissingPrivateInput,
 }
 
 impl fmt::Display for Error {
@@ -168,6 +174,10 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::MissingPrivateInput => write!(
+                f,
+                "proof requires private inputs — use verify_with_inputs() instead of verify()"
+            ),
         }
     }
 }
@@ -618,6 +628,7 @@ pub fn prove_with_options_and_inputs(
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
+        uses_private_input: !private_inputs.is_empty(),
     })
 }
 
@@ -627,6 +638,9 @@ pub fn prove_with_options_and_inputs(
 /// `runtime_page_ranges` from the proof are hints — preprocessed commitments
 /// bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
+    if vm_proof.uses_private_input {
+        return Err(Error::MissingPrivateInput);
+    }
     verify_with_options(
         vm_proof,
         elf_bytes,
