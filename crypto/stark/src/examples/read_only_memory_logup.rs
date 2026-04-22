@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -45,7 +45,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for ContinuityConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for ContinuityConstraint<F, E>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -63,7 +63,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -139,7 +139,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for SingleValueConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for SingleValueConstraint<F, E>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -157,7 +157,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -240,7 +240,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for PermutationConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for PermutationConstraint<F, E>
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
@@ -257,7 +257,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -357,7 +357,7 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -389,7 +389,7 @@ where
 
     fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
-            Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
         > = vec![
             Box::new(ContinuityConstraint::new()),
             Box::new(SingleValueConstraint::new()),
@@ -504,7 +504,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
 

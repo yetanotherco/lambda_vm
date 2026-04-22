@@ -23,7 +23,6 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
@@ -792,21 +791,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
