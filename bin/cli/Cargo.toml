@@ -13,6 +13,7 @@ tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 [features]
+default = ["disk-spill"]
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
 disk-spill = ["prover/disk-spill"]
 instruments = ["prover/instruments", "stark/instruments"]
