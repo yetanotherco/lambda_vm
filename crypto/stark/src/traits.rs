@@ -151,20 +151,11 @@ pub trait AIR: Send + Sync {
     where
         Self: Sized;
 
-    /// Build the auxiliary trace columns.
-    ///
-    /// Returns `Some((bus_public_inputs, aux_columns))` where `aux_columns` is the
-    /// column-major auxiliary data (committed + accumulated columns). Callers can use
-    /// the returned columns directly for LDE + commit, avoiding a round-trip through
-    /// the row-major trace table.
     fn build_auxiliary_trace(
         &self,
         _main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-    ) -> Option<(
-        BusPublicInputs<Self::FieldExtension>,
-        Vec<Vec<FieldElement<Self::FieldExtension>>>,
-    )> {
+    ) -> Option<BusPublicInputs<Self::FieldExtension>> {
         None
     }
 

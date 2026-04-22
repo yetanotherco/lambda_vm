@@ -1663,8 +1663,6 @@ pub trait IsStarkProver<
         // Pass 1: Build aux traces in parallel.
         // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
         // but outer parallelism over 12 tables also helps on high-core-count machines.
-        // Returns both BusPublicInputs and column-major aux data to avoid re-extracting
-        // from the row-major trace table in Pass 2.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
@@ -1672,12 +1670,7 @@ pub trait IsStarkProver<
         let aux_iter = air_trace_pairs.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
         let aux_iter = air_trace_pairs.iter_mut();
-        let aux_build_results: Vec<
-            Option<(
-                BusPublicInputs<FieldExtension>,
-                Vec<Vec<FieldElement<FieldExtension>>>,
-            )>,
-        > = aux_iter
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
             .map(|(air, trace, _)| {
                 if air.has_aux_trace() {
                     air.build_auxiliary_trace(*trace, &lookup_challenges)
@@ -1687,33 +1680,11 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Split into bus_inputs + column-major aux data (wrapped in Mutex for
-        // safe parallel consumption in Pass 2 — no contention since each index
-        // is accessed by exactly one thread).
-        let mut bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> =
-            Vec::with_capacity(num_airs);
-        let aux_columns_vec: Vec<std::sync::Mutex<Option<Vec<Vec<FieldElement<FieldExtension>>>>>> =
-            aux_build_results
-                .into_iter()
-                .map(|result| match result {
-                    Some((bpi, cols)) => {
-                        bus_inputs_vec.push(Some(bpi));
-                        std::sync::Mutex::new(Some(cols))
-                    }
-                    None => {
-                        bus_inputs_vec.push(None);
-                        std::sync::Mutex::new(None)
-                    }
-                })
-                .collect();
-
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
 
-        // Pass 2: Parallel fork transcript → LDE → commit in chunks of K.
+        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork.
-        // Uses column-major aux data from Pass 1 directly, skipping the
-        // column→row→column round-trip through trace.extract_columns_aux.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
@@ -1753,13 +1724,7 @@ pub trait IsStarkProver<
 
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-                        // Use pre-built column-major data from Pass 1 instead of
-                        // extracting from the row-major trace table.
-                        let mut columns = aux_columns_vec[idx]
-                            .lock()
-                            .unwrap()
-                            .take()
-                            .unwrap_or_else(|| trace.extract_columns_aux(lde_size));
+                        let mut columns = trace.extract_columns_aux(lde_size);
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_columns_to_lde::<FieldExtension>(

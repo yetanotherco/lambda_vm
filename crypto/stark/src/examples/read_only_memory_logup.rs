@@ -413,10 +413,7 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<E>],
-    ) -> Option<(
-        crate::lookup::BusPublicInputs<Self::FieldExtension>,
-        Vec<Vec<FieldElement<Self::FieldExtension>>>,
-    )> {
+    ) -> Option<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
         // Main table
         let main_segment_cols = trace.columns_main();
         let a = &main_segment_cols[0];
