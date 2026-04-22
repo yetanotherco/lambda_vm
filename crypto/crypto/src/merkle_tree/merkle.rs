@@ -279,7 +279,6 @@ where
                 "B::Node must have alignment 1 for mmap safety"
             )
         }
-        use std::io::Write;
 
         if self.nodes.is_empty() {
             return Ok(());
@@ -291,28 +290,22 @@ where
 
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes as u64)?;
-        {
-            let mut writer = std::io::BufWriter::new(&file);
-            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
-            // the contiguous Vec to a byte slice is valid.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
-            };
-            writer.write_all(bytes)?;
-            writer.flush()?;
-        }
-        // Flush dirty pages to disk so the subsequent mmap reads the data
-        // that was written, not the zero-filled holes left by `set_len`.
-        // Under memory pressure, unsynced pages can be evicted from the
-        // page cache before readback, producing partially-zeroed reads.
-        file.sync_all()?;
 
-        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
-        // so no other process can open or modify it.
-        // The mapping keeps its own reference to the underlying object
-        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
-        // `file` local can drop at end of scope without invalidating it.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        // Write directly through a writable mmap, then downgrade to read-only.
+        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
+        // under memory pressure could produce partially-zeroed reads from the
+        // read-only mmap.
+        //
+        // SAFETY: tempfile() creates an anonymous file with no filesystem
+        // path, so no other process can open or modify it.
+        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+        // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+        // the contiguous Vec to a byte slice is valid.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes) };
+        mmap_mut.copy_from_slice(bytes);
+        mmap_mut.flush()?;
+        let mmap = mmap_mut.make_read_only()?;
 
         // Free the heap allocation
         self.nodes = Vec::new();

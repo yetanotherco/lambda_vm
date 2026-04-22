@@ -288,7 +288,6 @@ impl<F: IsField> Table<F> {
                 "FieldElement<F> size must be a multiple of its alignment for mmap interior reads to be aligned"
             )
         }
-        use std::io::Write;
 
         if self.data.is_empty() || self.mmap_backing.is_some() {
             return Ok(());
@@ -306,33 +305,23 @@ impl<F: IsField> Table<F> {
 
         let file = tempfile::tempfile()?;
         file.set_len(total_bytes)?;
-        {
-            let mut writer = std::io::BufWriter::new(&file);
-            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
-            // The Vec has the same byte layout as a contiguous array.
-            // `self.data.len() * elem_size` fits in usize because Vec allocations
-            // are bounded by isize::MAX bytes.
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    self.data.as_ptr() as *const u8,
-                    self.data.len() * elem_size,
-                )
-            };
-            writer.write_all(bytes)?;
-            writer.flush()?;
-        }
-        // Flush dirty pages to disk so the subsequent mmap reads the data
-        // that was written, not the zero-filled holes left by `set_len`.
-        // Under memory pressure, unsynced pages can be evicted from the
-        // page cache before readback, producing partially-zeroed reads.
-        file.sync_all()?;
 
-        // SAFETY: tempfile() creates an anonymous file with no filesystem path,
-        // so no other process can open or modify it.
-        // The mapping keeps its own reference to the underlying object
-        // (Unix: kernel VMA; Windows: duplicated handle in memmap2), so the
-        // `file` local can drop at end of scope without invalidating it.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        // Write directly through a writable mmap, then downgrade to read-only.
+        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
+        // under memory pressure could produce partially-zeroed reads from the
+        // read-only mmap (the previous implementation relied on that handoff).
+        //
+        // SAFETY: tempfile() creates an anonymous file with no filesystem
+        // path, so no other process can open or modify it.
+        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+        // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
+        // The Vec has the same byte layout as a contiguous array.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * elem_size)
+        };
+        mmap_mut.copy_from_slice(bytes);
+        mmap_mut.flush()?;
+        let mmap = mmap_mut.make_read_only()?;
 
         self.mmap_backing = Some(TableMmapBacking {
             mmap,
