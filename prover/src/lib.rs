@@ -138,9 +138,10 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
-    /// Whether the proof was generated with non-empty private inputs.
-    /// Callers must use `verify_with_inputs` instead of `verify` for such proofs.
-    pub uses_private_input: bool,
+    /// Number of PAGE tables that hold private input data.
+    /// These pages are NOT preprocessed — the verifier reconstructs them
+    /// as non-preprocessed tables starting at `PRIVATE_INPUT_START_INDEX`.
+    pub num_private_input_pages: usize,
 }
 
 /// Error type for the prover crate.
@@ -158,9 +159,6 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
-    /// Proof requires private inputs but `verify()` was called without them.
-    /// Use `verify_with_inputs()` instead.
-    MissingPrivateInput,
 }
 
 impl fmt::Display for Error {
@@ -174,10 +172,6 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
-            Error::MissingPrivateInput => write!(
-                f,
-                "proof requires private inputs — use verify_with_inputs() instead of verify()"
-            ),
         }
     }
 }
@@ -376,10 +370,19 @@ impl VmAirs {
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
-                create_page_air(proof_options, config.page_base).with_preprocessed(
-                    page::precomputed_commitment_cached(config, proof_options),
-                    page::NUM_PREPROCESSED_COLS,
-                )
+                if config.is_private_input {
+                    // Private-input pages: all columns are main trace (not preprocessed).
+                    // The verifier doesn't see the init values; correctness is enforced
+                    // by the memory bus constraints.
+                    create_page_air(proof_options, config.page_base)
+                } else {
+                    // ELF and zero-init pages: OFFSET + INIT are preprocessed.
+                    // The verifier independently recomputes the commitment from public data.
+                    create_page_air(proof_options, config.page_base).with_preprocessed(
+                        page::precomputed_commitment_cached(config, proof_options),
+                        page::NUM_PREPROCESSED_COLS,
+                    )
+                }
             })
             .collect();
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
@@ -623,12 +626,18 @@ pub fn prove_with_options_and_inputs(
         );
     }
 
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+
     Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
-        uses_private_input: !private_inputs.is_empty(),
+        num_private_input_pages,
     })
 }
 
@@ -638,14 +647,10 @@ pub fn prove_with_options_and_inputs(
 /// `runtime_page_ranges` from the proof are hints — preprocessed commitments
 /// bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
-    if vm_proof.uses_private_input {
-        return Err(Error::MissingPrivateInput);
-    }
     verify_with_options(
         vm_proof,
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
-        &[],
     )
 }
 
@@ -658,7 +663,6 @@ pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
-    private_inputs: &[u8],
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
@@ -668,7 +672,7 @@ pub fn verify_with_options(
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
         &vm_proof.runtime_page_ranges,
-        private_inputs,
+        vm_proof.num_private_input_pages,
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
@@ -711,23 +715,6 @@ pub fn verify_with_options(
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     ))
-}
-
-/// Verify a proof that was produced with private inputs.
-///
-/// The verifier needs the private inputs to reconstruct the correct page
-/// configs (private input bytes have non-zero init values in PAGE tables).
-pub fn verify_with_inputs(
-    vm_proof: &VmProof,
-    elf_bytes: &[u8],
-    private_inputs: &[u8],
-) -> Result<bool, Error> {
-    verify_with_options(
-        vm_proof,
-        elf_bytes,
-        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
-        private_inputs,
-    )
 }
 
 /// Prove and verify in one call (convenience).

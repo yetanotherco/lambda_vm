@@ -776,7 +776,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -806,7 +806,7 @@ fn test_verify_rejects_tampered_public_output() {
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, &[])
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
             .expect("Valid commit proof should verify"),
         "Baseline proof should verify before tampering"
     );
@@ -818,7 +818,7 @@ fn test_verify_rejects_tampered_public_output() {
         ..vm_proof
     };
 
-    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, &[])
+    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options)
         .expect("Verifier should not error on tampered public output");
     assert!(
         !verified,
@@ -1504,7 +1504,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs =
-        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1559,7 +1559,7 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1649,7 +1649,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs =
-        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, &[]);
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1709,7 +1709,7 @@ fn test_verify_rejects_zero_table_counts() {
         .expect("Prover should succeed on valid program");
 
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, &[])
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
             .expect("Verification should not error on valid proof"),
         "Valid proof should verify"
     );
@@ -1730,7 +1730,7 @@ fn test_verify_rejects_zero_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, &[]);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -1751,7 +1751,7 @@ fn test_verify_rejects_zero_cpu_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, &[]);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -1772,7 +1772,7 @@ fn test_verify_rejects_zero_memw_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, &[]);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -1847,7 +1847,7 @@ fn test_small_max_rows_splits_tables() {
         vm_proof.table_counts.cpu
     );
 
-    let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, &[])
+    let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
         .expect("Verifier should not error");
     assert!(verified, "Proof with small max_rows should verify");
 }
@@ -1900,7 +1900,7 @@ fn test_verify_rejects_inflated_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, &[]);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
     assert!(
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",
@@ -1979,7 +1979,7 @@ fn test_prove_private_input_xpage() {
     let proof =
         crate::prove_with_inputs(&elf_bytes, &input).expect("prove_with_inputs should succeed");
     assert!(
-        crate::verify_with_inputs(&proof, &elf_bytes, &input).expect("verify should not error"),
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
         "proof should verify"
     );
     assert_eq!(proof.public_output, input[4..12].to_vec());
@@ -1995,7 +1995,7 @@ fn test_prove_private_input_different_values() {
     ];
     let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
     assert!(
-        crate::verify_with_inputs(&proof, &elf_bytes, &input).expect("verify"),
+        crate::verify(&proof, &elf_bytes).expect("verify"),
         "proof should verify"
     );
     assert_eq!(proof.public_output, input[4..12].to_vec());
@@ -2014,7 +2014,7 @@ fn test_prove_commit_sum() {
     let input = &[3u8, 5u8];
     let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
     assert!(
-        crate::verify_with_inputs(&proof, &elf_bytes, input).expect("verify should not error"),
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
         "commit_sum should verify"
     );
     assert_eq!(proof.public_output, vec![8u8]);
@@ -2035,7 +2035,7 @@ fn test_prove_ethrex_empty_block() {
         std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin")).unwrap();
     let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
     assert!(
-        crate::verify_with_inputs(&proof, &elf_bytes, &input).expect("verify"),
+        crate::verify(&proof, &elf_bytes).expect("verify"),
         "ethrex empty block should verify"
     );
     assert_eq!(proof.public_output.len(), 160);

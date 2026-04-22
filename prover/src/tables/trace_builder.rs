@@ -1584,8 +1584,24 @@ fn generate_page_tables(
     let mut pages = Vec::new();
     let mut page_configs = Vec::new();
 
+    // Determine which page bases hold private input data.
+    let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let total_bytes = 4 + private_input.len(); // length prefix + data
+        (0..total_bytes)
+            .map(|i| {
+                page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size)
+            })
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
     for &page_base in &page_bases {
-        let config = if let Some(init_data) = init_page_data.get(&page_base) {
+        let config = if private_input_page_bases.contains(&page_base) {
+            let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
+            PageConfig::with_private_input(page_base, page_size, init_data)
+        } else if let Some(init_data) = init_page_data.get(&page_base) {
             PageConfig::with_data(page_base, page_size, init_data.clone())
         } else {
             PageConfig::zero_init(page_base, page_size)
@@ -2180,11 +2196,11 @@ impl Traces {
     /// Returns PageConfigs for pages covered by ELF segments, with their
     /// init data populated. Used by the verifier to reconstruct the ELF
     /// portion of the PAGE table layout.
-    pub fn page_configs_from_elf(elf: &Elf, private_input: &[u8]) -> Vec<PageConfig> {
+    pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
-        let init_page_data = build_init_page_data(elf, private_input);
+        let init_page_data = build_init_page_data(elf, &[]);
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
 
@@ -2200,19 +2216,22 @@ impl Traces {
             .collect()
     }
 
-    /// Reconstruct page configs from ELF and runtime page ranges.
+    /// Reconstruct page configs from ELF, runtime page ranges, and private-input page count.
     ///
     /// Used by the verifier to reconstruct the full PAGE table layout.
-    /// Combines deterministic ELF pages with prover-provided runtime
-    /// page ranges (zero-initialized: stack, heap, etc.).
-    /// Each range is `(base, count)` — `count` contiguous 4KB pages from `base`.
+    /// Combines:
+    /// - Deterministic ELF pages (preprocessed, init from binary)
+    /// - Runtime pages from prover hints (preprocessed, zero-init)
+    /// - Private-input pages (NOT preprocessed, verifier doesn't see init values)
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
-        private_input: &[u8],
+        num_private_input_pages: usize,
     ) -> Vec<PageConfig> {
-        let mut configs = Self::page_configs_from_elf(elf, private_input);
+        let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
+
+        // Add zero-init runtime pages (stack, heap)
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
             for i in 0..count {
@@ -2222,6 +2241,22 @@ impl Traces {
                 ));
             }
         }
+
+        // Add private-input pages (non-preprocessed, verifier doesn't know init values)
+        if num_private_input_pages > 0 {
+            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+            let first_page_base =
+                page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
+            for i in 0..num_private_input_pages {
+                configs.push(PageConfig {
+                    page_base: first_page_base + i as u64 * page_size as u64,
+                    page_size,
+                    init_values: None, // Verifier doesn't know these
+                    is_private_input: true,
+                });
+            }
+        }
+
         configs.sort_by_key(|c| c.page_base);
         configs
     }
