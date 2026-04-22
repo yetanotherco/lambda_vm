@@ -645,8 +645,8 @@ pub trait IsStarkProver<
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
         commitments: &[Round1Commitments<Field, FieldExtension>],
-        domains: &[Domain<Field>],
-        twiddle_caches: &[LdeTwiddles<Field>],
+        domains: &[Arc<Domain<Field>>],
+        twiddle_caches: &[Arc<LdeTwiddles<Field>>],
     ) where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
