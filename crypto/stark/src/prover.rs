@@ -361,10 +361,11 @@ pub trait IsStarkProver<
     /// Builds a Merkle tree commitment from column-major LDE evaluations with
     /// bit-reverse permutation, without cloning the full evaluation matrix.
     ///
-    /// For each row index `i`, we hash `col_0[br(i)] || col_1[br(i)] || ...`
-    /// where `br(i)` is the bit-reversal of `i`. This produces the same Merkle
-    /// tree as the old clone + bit-reverse + columns2rows + batch_commit flow,
-    /// but avoids allocating the cloned and transposed matrices entirely.
+    /// Hashes `col_0[k] || col_1[k] || ...` for k = 0..num_rows (sequential column
+    /// reads, cache-friendly), then permutes the hash vector in bit-reversed order
+    /// so leaves[i] = hash(col_0[br(i)] || col_1[br(i)] || ...). Same Merkle tree
+    /// as reading at br(row_idx) inside the hashing loop, but the scattered column
+    /// access is replaced by a single small bit-reverse pass over 32-byte digests.
     fn commit_columns_bit_reversed<E>(
         columns: &[Vec<FieldElement<E>>],
     ) -> Option<(BatchedMerkleTree<E>, Commitment)>
@@ -392,20 +393,19 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
-        // One allocation per row (was one per field element): write all columns
-        // into a single buffer, then hash once.
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
+        let mut hashed_leaves: Vec<Commitment> = iter
+            .map(|k| {
                 let total_bytes = num_cols * byte_len;
                 let mut buf = vec![0u8; total_bytes];
                 for col_idx in 0..num_cols {
-                    columns[col_idx][br_idx]
+                    columns[col_idx][k]
                         .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
                 }
                 BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
             })
             .collect();
+
+        in_place_bit_reverse_permute(&mut hashed_leaves);
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
