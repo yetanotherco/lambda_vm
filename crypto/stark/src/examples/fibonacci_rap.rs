@@ -204,7 +204,10 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<F>],
-    ) -> Option<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
+    ) -> Option<(
+        crate::lookup::BusPublicInputs<Self::FieldExtension>,
+        Vec<Vec<FieldElement<Self::FieldExtension>>>,
+    )> {
         let main_segment_cols = trace.columns_main();
         let not_perm = &main_segment_cols[0];
         let perm = &main_segment_cols[1];

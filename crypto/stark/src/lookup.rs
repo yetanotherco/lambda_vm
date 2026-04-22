@@ -1000,7 +1000,7 @@ where
         &self,
         trace: &mut TraceTable<F, E>,
         challenges: &[FieldElement<E>],
-    ) -> Option<BusPublicInputs<E>> {
+    ) -> Option<(BusPublicInputs<E>, Vec<Vec<FieldElement<E>>>)> {
         // Allocate aux table if not already present
         let (_, num_aux_columns) = self.trace_layout();
         if num_aux_columns > 0 && trace.num_aux_columns == 0 {
@@ -1091,20 +1091,30 @@ where
         let mut all_columns = committed_columns;
         all_columns.push(virtual_column);
         let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
-        let table_contribution =
+        let (table_contribution, acc_column) =
             build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
 
-        Some(BusPublicInputs {
-            table_contribution,
-            #[cfg(feature = "debug-checks")]
-            per_bus_sums,
-            #[cfg(feature = "debug-checks")]
-            per_bus_sender_sums,
-            #[cfg(feature = "debug-checks")]
-            per_bus_receiver_sums,
-            #[cfg(feature = "debug-checks")]
-            table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
-        })
+        // Collect column-major aux data: committed columns + accumulated column.
+        // The virtual column is NOT included (it's not committed to the trace).
+        // all_columns = [committed_0, ..., committed_{N-1}, virtual]
+        // We need: [committed_0, ..., committed_{N-1}, accumulated]
+        all_columns.pop(); // remove virtual column
+        all_columns.push(acc_column); // add accumulated column
+
+        Some((
+            BusPublicInputs {
+                table_contribution,
+                #[cfg(feature = "debug-checks")]
+                per_bus_sums,
+                #[cfg(feature = "debug-checks")]
+                per_bus_sender_sums,
+                #[cfg(feature = "debug-checks")]
+                per_bus_receiver_sums,
+                #[cfg(feature = "debug-checks")]
+                table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
+            },
+            all_columns,
+        ))
     }
 
     fn build_rap_challenges(
@@ -1679,13 +1689,13 @@ fn build_accumulated_column_from_terms<F, E>(
     acc_column_idx: usize,
     term_columns: &[Vec<FieldElement<E>>],
     trace: &mut TraceTable<F, E>,
-) -> FieldElement<E>
+) -> (FieldElement<E>, Vec<FieldElement<E>>)
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     if term_columns.is_empty() {
-        return FieldElement::zero();
+        return (FieldElement::zero(), Vec::new());
     }
     let trace_len = term_columns[0].len();
 
@@ -1701,7 +1711,8 @@ where
     let n = FieldElement::<E>::from(trace_len as u64);
     let offset_per_row = &table_contribution * n.inv().unwrap();
 
-    // Build circular accumulated column
+    // Build circular accumulated column and return it as a Vec
+    let mut acc_column = Vec::with_capacity(trace_len);
     let mut accumulated = FieldElement::<E>::zero();
     for row in 0..trace_len {
         let mut row_sum = FieldElement::<E>::zero();
@@ -1710,9 +1721,10 @@ where
         }
         accumulated = &accumulated + &row_sum - &offset_per_row;
         trace.set_aux(row, acc_column_idx, accumulated.clone());
+        acc_column.push(accumulated.clone());
     }
 
-    table_contribution
+    (table_contribution, acc_column)
 }
 
 /// Sum per-interaction contributions by bus_id for debug reporting.
