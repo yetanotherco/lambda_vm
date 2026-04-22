@@ -2327,6 +2327,10 @@ impl Traces {
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
+        use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
+        use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
+        use super::keccak_rnd::cols::NUM_COLUMNS as KECCAK_RND_COLS;
         use super::load::cols::NUM_COLUMNS as LOAD_COLS;
         use super::lt::cols::NUM_COLUMNS as LT_COLS;
         use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
@@ -2355,6 +2359,9 @@ impl Traces {
             branches,
             halt,
             commit,
+            keccak,
+            keccak_rnd,
+            keccak_rc,
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
@@ -2399,6 +2406,9 @@ impl Traces {
         for t in memw_registers {
             total += (t.num_rows() * MEMW_R_COLS) as u64;
         }
+        total += (keccak.num_rows() * KECCAK_COLS) as u64;
+        total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
+        total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         total
     }
 
@@ -2431,6 +2441,9 @@ impl Traces {
         // page::bus_interactions count is constant regardless of page_base.
         let n_page = aux_cols(super::page::bus_interactions(0).len());
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
+        let n_keccak = aux_cols(super::keccak::bus_interactions().len());
+        let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
+        let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -2448,6 +2461,9 @@ impl Traces {
             branches,
             halt,
             commit,
+            keccak,
+            keccak_rnd,
+            keccak_rc,
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
@@ -2492,6 +2508,9 @@ impl Traces {
         for t in memw_registers {
             total += (t.num_rows() * n_memw_r) as u64;
         }
+        total += (keccak.num_rows() * n_keccak) as u64;
+        total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
+        total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         total
     }
 

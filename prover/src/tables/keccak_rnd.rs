@@ -28,7 +28,7 @@
 //! constants derived from `KECCAK_RHO[x][y]`, not materialized as columns.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -901,7 +901,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
-    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
     (Vec::new(), constraint_idx_start)

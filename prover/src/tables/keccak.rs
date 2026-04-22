@@ -16,7 +16,7 @@
 //! | mu             |    1 | Multiplicity flag                              |
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -441,11 +441,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
-    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
-        Vec::with_capacity(50);
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::with_capacity(50);
     let mut idx = constraint_idx_start;
 
     // state_ptr[lane] = addr + 8*lane_idx
@@ -460,8 +461,8 @@ pub fn create_constraints(
             AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
             idx,
         );
-        constraints.push(Box::new(c0));
-        constraints.push(Box::new(c1));
+        constraints.push(c0.boxed());
+        constraints.push(c1.boxed());
         idx += 2;
     }
 
