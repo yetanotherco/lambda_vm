@@ -19,7 +19,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -387,24 +387,38 @@ pub trait IsStarkProver<
             "num_rows must be a power of two for reverse_index"
         );
 
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
+        let row_bytes = num_cols * byte_len;
 
-        // One allocation per row (was one per field element): write all columns
-        // into a single buffer, then hash once.
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let total_bytes = num_cols * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                for col_idx in 0..num_cols {
-                    columns[col_idx][br_idx]
-                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-                }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-            })
+        // Pre-serialize ALL rows into a flat byte matrix (one allocation for the
+        // entire table). Each row is a contiguous row_bytes slice, so subsequent
+        // hashing reads sequential memory — no per-row heap allocation and
+        // better cache locality during hashing.
+        let mut byte_matrix = vec![0u8; num_rows * row_bytes];
+
+        // Phase 1: Serialize field elements into the byte matrix (parallel over rows).
+        // Each row writes to its own disjoint row_bytes slice.
+        #[cfg(feature = "parallel")]
+        let row_iter = byte_matrix.par_chunks_exact_mut(row_bytes);
+        #[cfg(not(feature = "parallel"))]
+        let row_iter = byte_matrix.chunks_exact_mut(row_bytes);
+
+        row_iter.enumerate().for_each(|(row_idx, row_buf)| {
+            let br_idx = reverse_index(row_idx, num_rows as u64);
+            for col_idx in 0..num_cols {
+                columns[col_idx][br_idx]
+                    .write_bytes_be(&mut row_buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+            }
+        });
+
+        // Phase 2: Hash contiguous row slices (parallel over rows).
+        // Sequential memory access — each row_bytes slice is contiguous.
+        #[cfg(feature = "parallel")]
+        let hash_iter = byte_matrix.as_slice().par_chunks_exact(row_bytes);
+        #[cfg(not(feature = "parallel"))]
+        let hash_iter = byte_matrix.chunks_exact(row_bytes);
+
+        let hashed_leaves: Vec<Commitment> = hash_iter
+            .map(|row_buf| BatchedMerkleTreeBackend::<E>::hash_bytes(row_buf))
             .collect();
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
