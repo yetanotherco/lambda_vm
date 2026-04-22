@@ -1251,34 +1251,38 @@ pub trait IsStarkProver<
         }
 
         // Compressed traces: for each eval point k, build compressed_k[i] for all i.
-        // Accumulate column-by-column (sequential column access on column-major storage).
-        let mut compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
-            .map(|_| vec![FieldElement::zero(); domain_size])
+        // Parallelized over rows: each thread computes the full column sum for its rows.
+        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|k| {
+                // Collect gammas for this eval point
+                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
+                    .map(|j| &trace_terms_gammas[j][k])
+                    .collect();
+                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
+                    .map(|j| &trace_terms_gammas[num_main_cols + j][k])
+                    .collect();
+
+                #[cfg(feature = "parallel")]
+                let iter = (0..domain_size).into_par_iter();
+                #[cfg(not(feature = "parallel"))]
+                let iter = 0..domain_size;
+
+                iter.map(|i| {
+                    let row_idx = i * blowup_factor;
+                    let mut sum = FieldElement::<FieldExtension>::zero();
+                    // Main columns: F × E → E (3 base muls each)
+                    for (j, gamma) in main_gammas.iter().enumerate() {
+                        sum += lde_trace.get_main(row_idx, j) * *gamma;
+                    }
+                    // Aux columns: E × E → E (9 base muls each)
+                    for (j, gamma) in aux_gammas.iter().enumerate() {
+                        sum += lde_trace.get_aux(row_idx, j) * *gamma;
+                    }
+                    sum
+                })
+                .collect()
+            })
             .collect();
-
-        // Main columns: F × E multiplication (3 base muls per element)
-        for j in 0..num_main_cols {
-            let col = &lde_trace.main_columns[j];
-            for k in 0..num_eval_points {
-                let gamma_jk = &trace_terms_gammas[j][k];
-                let compressed_k = &mut compressed[k];
-                for i in 0..domain_size {
-                    compressed_k[i] += &col[i * blowup_factor] * gamma_jk;
-                }
-            }
-        }
-
-        // Aux columns: E × E multiplication (9 base muls per element)
-        for j in 0..num_aux_cols {
-            let col = &lde_trace.aux_columns[j];
-            for k in 0..num_eval_points {
-                let gamma_jk = &trace_terms_gammas[num_main_cols + j][k];
-                let compressed_k = &mut compressed[k];
-                for i in 0..domain_size {
-                    compressed_k[i] += gamma_jk * &col[i * blowup_factor];
-                }
-            }
-        }
 
         // === Phase 2: Hot loop — only K=2 ext ops per row for trace terms ===
         #[cfg(feature = "parallel")]
