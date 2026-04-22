@@ -42,8 +42,8 @@ use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
     create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_mul_air, create_page_air, create_register_air,
-    create_shift_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -74,6 +74,7 @@ pub struct TableCounts {
     pub dvrm: usize,
     pub shift: usize,
     pub branch: usize,
+    pub memw_register: usize,
 }
 
 impl TableCounts {
@@ -92,6 +93,7 @@ impl TableCounts {
             + self.dvrm
             + self.shift
             + self.branch
+            + self.memw_register
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -109,6 +111,7 @@ impl TableCounts {
             ("dvrm", self.dvrm),
             ("shift", self.shift),
             ("branch", self.branch),
+            ("memw_register", self.memw_register),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -199,6 +202,7 @@ pub(crate) struct VmAirs {
     pub keccak_rc: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
+    pub memw_registers: Vec<VmAir>,
 }
 
 impl VmAirs {
@@ -249,6 +253,13 @@ impl VmAirs {
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
             pairs.push((air, trace, &()));
         }
+        for (air, trace) in self
+            .memw_registers
+            .iter()
+            .zip(traces.memw_registers.iter_mut())
+        {
+            pairs.push((air, trace, &()));
+        }
 
         pairs
     }
@@ -294,6 +305,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.pages {
+            refs.push(air);
+        }
+        for air in &self.memw_registers {
             refs.push(air);
         }
 
@@ -374,6 +388,9 @@ impl VmAirs {
                 )
             })
             .collect();
+        let memw_registers: Vec<_> = (0..table_counts.memw_register)
+            .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
+            .collect();
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -397,6 +414,7 @@ impl VmAirs {
             keccak_rc,
             register,
             pages,
+            memw_registers,
         }
     }
 }
@@ -480,8 +498,14 @@ pub(crate) fn compute_expected_commit_bus_balance(
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(
+    prove_with_inputs(elf_bytes, &[])
+}
+
+/// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
+pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(
         elf_bytes,
+        private_inputs,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
@@ -493,6 +517,17 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    prove_with_options_and_inputs(elf_bytes, &[], proof_options, max_rows)
+}
+
+/// Prove an ELF binary execution with custom proof options, max rows config,
+/// and explicit private inputs.
+pub fn prove_with_options_and_inputs(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<VmProof, Error> {
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
 
@@ -501,7 +536,8 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
