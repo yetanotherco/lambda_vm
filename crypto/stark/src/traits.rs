@@ -10,7 +10,7 @@ use math::{
 };
 
 use crate::{
-    constraints::transition::TransitionConstraint,
+    constraints::transition::TransitionConstraintEvaluator,
     domain::Domain,
     lookup::{BusPublicInputs, PackingShifts},
 };
@@ -228,7 +228,7 @@ pub trait AIR: Send + Sync {
             vec![FieldElement::<Self::FieldExtension>::zero(); self.num_transition_constraints()];
         self.transition_constraints()
             .iter()
-            .for_each(|c| c.evaluate(evaluation_context, &mut evaluations));
+            .for_each(|c| c.evaluate_verifier(evaluation_context, &mut evaluations));
 
         evaluations
     }
@@ -247,7 +247,43 @@ pub trait AIR: Send + Sync {
         }
         self.transition_constraints()
             .iter()
-            .for_each(|c| c.evaluate(evaluation_context, evaluations));
+            .for_each(|c| c.evaluate_verifier(evaluation_context, evaluations));
+    }
+
+    /// Number of constraints that evaluate in the base field F.
+    ///
+    /// These constraints use the cheaper F×E accumulation path (3 base-field muls
+    /// per term) instead of E×E (9 muls). Domain constraints (ALU, memory, PC, etc.)
+    /// produce base-field values; only LogUp constraints need extension arithmetic.
+    ///
+    /// The first `num_base_transition_constraints()` entries in the constraint list
+    /// must be base-field constraints. Default is 0 (all E×E, no optimization).
+    fn num_base_transition_constraints(&self) -> usize {
+        0
+    }
+
+    /// Prover-optimized evaluation that writes base-field constraints to `base_evals`
+    /// and extension-field constraints to `ext_evals[num_base..]`.
+    ///
+    /// `base_evals` has length `num_base_transition_constraints()`.
+    /// `ext_evals` has length `num_transition_constraints()`; only indices
+    /// `[num_base..]` are written/read for extension constraints.
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in base_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        let num_base = base_evals.len();
+        for e in ext_evals[num_base..].iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate_prover(evaluation_context, base_evals, ext_evals));
     }
 
     /// Evaluate all transition constraints using the AirBuilder pattern.
@@ -377,7 +413,7 @@ pub trait AIR: Send + Sync {
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>>;
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
 
     fn transition_zerofier_evaluations(
         &self,

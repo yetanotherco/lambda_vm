@@ -1,7 +1,7 @@
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -24,7 +24,7 @@ impl<F: IsFFTField> FibConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -40,7 +40,7 @@ where
         2
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -79,7 +79,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +104,7 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraint<F, F>>> =
+        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>> =
             vec![Box::new(FibConstraint::new())];
 
         let context = AirContext {
@@ -124,7 +124,7 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
+    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, F>>> {
         &self.constraints
     }
 

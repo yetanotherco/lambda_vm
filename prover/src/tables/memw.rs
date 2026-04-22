@@ -30,11 +30,10 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::IsBitConstraint;
@@ -917,31 +916,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
@@ -953,40 +933,33 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 /// - IS_BIT<μ_read> (1)
 /// - IS_BIT<μ_write> (1)
 /// - IS_BIT for carry[0..6] (7)
-pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     let mut idx = 0;
 
     // IS_BIT<μ_sum>
-    constraints.push(Box::new(MemwConstraint::new(
-        MemwConstraintKind::MuSumIsBit,
-        idx,
-    )));
+    constraints.push(MemwConstraint::new(MemwConstraintKind::MuSumIsBit, idx).boxed());
     idx += 1;
 
     // w2 => μ_sum
-    constraints.push(Box::new(MemwConstraint::new(
-        MemwConstraintKind::W2ImpliesMuSum,
-        idx,
-    )));
+    constraints.push(MemwConstraint::new(MemwConstraintKind::W2ImpliesMuSum, idx).boxed());
     idx += 1;
 
     // IS_BIT<μ_read>
-    constraints.push(Box::new(IsBitConstraint::unconditional(cols::MU_READ, idx)));
+    constraints.push(IsBitConstraint::unconditional(cols::MU_READ, idx).boxed());
     idx += 1;
 
     // IS_BIT<μ_write>
-    constraints.push(Box::new(IsBitConstraint::unconditional(
-        cols::MU_WRITE,
-        idx,
-    )));
+    constraints.push(IsBitConstraint::unconditional(cols::MU_WRITE, idx).boxed());
     idx += 1;
 
     // IS_BIT for carry[0..6]
     for &col in &cols::CARRY {
-        constraints.push(Box::new(IsBitConstraint::unconditional(col, idx)));
+        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }
 
