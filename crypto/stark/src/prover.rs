@@ -18,8 +18,7 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -284,6 +283,90 @@ fn table_parallelism() -> usize {
     #[cfg(not(feature = "parallel"))]
     {
         1
+    }
+}
+
+/// Number of isolated thread pools for Rounds 2-4 in `multi_prove`.
+/// Default: num_cores / 8 (each pool gets ~8 threads for effective intra-table parallelism).
+/// Override with `SHARD_PARALLELISM` env var.
+fn shard_parallelism() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        std::env::var("SHARD_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                (cores / 8).max(1)
+            })
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
+
+/// Partition `num_airs` tables into `s` groups using greedy LPT scheduling.
+/// Returns Vec of Vec of original table indices.
+/// Cost estimate: rows * (main_cols + aux_cols + 1).
+#[cfg(feature = "parallel")]
+fn partition_tables_by_cost<F, E, PI>(
+    air_trace_pairs: &[AirTracePair<'_, F, E, PI>],
+    s: usize,
+) -> Vec<Vec<usize>>
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: Send + Sync + IsField,
+{
+    // Estimate cost per table
+    let mut indexed_costs: Vec<(usize, usize)> = air_trace_pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (air, trace, _))| {
+            let rows = trace.num_rows();
+            let cols = air.context().trace_columns + 1;
+            (i, rows * cols)
+        })
+        .collect();
+
+    // Sort by cost descending (largest first for LPT)
+    indexed_costs.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Greedy assignment: assign each table to the partition with least total cost
+    let mut partitions: Vec<Vec<usize>> = (0..s).map(|_| Vec::new()).collect();
+    let mut partition_costs: Vec<usize> = vec![0; s];
+
+    for (idx, cost) in indexed_costs {
+        let min_partition = partition_costs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| *c)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        partitions[min_partition].push(idx);
+        partition_costs[min_partition] += cost;
+    }
+
+    partitions
+}
+
+/// Raw pointer wrapper for disjoint mutable access across threads.
+/// SAFETY: Caller must guarantee non-overlapping indices.
+#[cfg(feature = "parallel")]
+struct SendPtr<T> {
+    ptr: *mut T,
+}
+#[cfg(feature = "parallel")]
+unsafe impl<T> Send for SendPtr<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T> Sync for SendPtr<T> {}
+
+#[cfg(feature = "parallel")]
+impl<T> SendPtr<T> {
+    unsafe fn get_mut(&self, idx: usize) -> &mut T {
+        unsafe { &mut *self.ptr.add(idx) }
     }
 }
 
@@ -1757,105 +1840,233 @@ pub trait IsStarkProver<
         Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
 
         // =====================================================================
-        // Rounds 2-4: Parallel per-table proving in chunks of K
+        // Rounds 2-4: Isolated-pool parallel proving
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Cached LDE columns
-        // from Phase A/C are consumed here (zero-copy move), eliminating the
-        // expensive reconstruct_round1 recomputation.
+        // Partition tables into S groups. Each group runs on an isolated Rayon
+        // ThreadPool with cores/S threads, eliminating cross-table contention.
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let mut table_timings: Vec<(
+        let table_timings: Vec<(
             String,
             usize,
             std::time::Duration,
             crate::instruments::TableSubOps,
-        )> = Vec::with_capacity(num_airs);
+        )>;
 
-        let mut proofs = Vec::with_capacity(num_airs);
-        let mut lde_drain = cached_ldes.into_iter();
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
-            let chunk_size = chunk_end - chunk_start;
+        let s = shard_parallelism().min(num_airs / 2).max(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let threads_per_pool = (cores / s).max(1);
 
-            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
-                lde_drain.by_ref().take(chunk_size).collect();
-            let chunk_commitments = &commitments[chunk_start..chunk_end];
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+        #[cfg(feature = "parallel")]
+        let partitions = partition_tables_by_cost(&air_trace_pairs, s);
 
-            #[cfg(feature = "parallel")]
-            let iter = chunk_ldes
-                .into_par_iter()
-                .zip(chunk_commitments.par_iter())
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = chunk_ldes
-                .into_iter()
-                .zip(chunk_commitments.iter())
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
+        info!(
+            "Rounds 2-4: {} tables across {} partitions ({} threads/pool)",
+            num_airs, s, threads_per_pool
+        );
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, ((lde, commitment), table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let _ = trace; // used by instruments
-                    let domain = &domains[idx];
+        // Pre-group cached LDEs by partition for ownership transfer.
+        // Each partition gets its own Vec of (table_index, Lde) pairs.
+        #[allow(unused_mut)] // mut needed for parallel path's .take()
+        let mut lde_options: Vec<Option<Lde<Field, FieldExtension>>> =
+            cached_ldes.into_iter().map(Some).collect();
 
-                    #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
+        #[cfg(feature = "parallel")]
+        let proofs = {
+            let transcripts_ptr = SendPtr {
+                ptr: table_transcripts.as_mut_ptr(),
+            };
 
-                    // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result = commitment.build_round1(
-                        lde,
-                        air.step_size(),
-                        domain.blowup_factor,
-                        air.has_aux_trace(),
-                    );
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &round_1_result,
-                        table_transcript,
-                        domain,
-                    )?;
-
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
+            // Pre-group LDEs per partition
+            let partition_ldes: Vec<Vec<(usize, Lde<Field, FieldExtension>)>> = partitions
+                .iter()
+                .map(|indices| {
+                    indices
+                        .iter()
+                        .map(|&idx| (idx, lde_options[idx].take().expect("LDE already taken")))
+                        .collect()
                 })
                 .collect();
 
-            for result in chunk_results {
+            let pools: Vec<rayon::ThreadPool> = (0..s)
+                .map(|_| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads_per_pool)
+                        .build()
+                        .expect("failed to create Rayon thread pool")
+                })
+                .collect();
+
+            #[cfg(feature = "instruments")]
+            type ProofResult<F, E, PI> = (
+                usize,
+                Result<StarkProof<F, E, PI>, ProvingError>,
+                Option<(String, usize, std::time::Duration, crate::instruments::TableSubOps)>,
+            );
+            #[cfg(not(feature = "instruments"))]
+            type ProofResult<F, E, PI> = (usize, Result<StarkProof<F, E, PI>, ProvingError>);
+
+            let partition_results: Vec<Vec<ProofResult<Field, FieldExtension, PI>>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = pools
+                        .iter()
+                        .zip(partition_ldes)
+                        .map(|(pool, partition_lde_pairs)| {
+                            let air_trace_pairs = &air_trace_pairs;
+                            let commitments = &commitments;
+                            let domains = &domains;
+                            let transcripts_ptr = &transcripts_ptr;
+
+                            scope.spawn(move || {
+                                pool.install(|| {
+                                    partition_lde_pairs
+                                        .into_iter()
+                                        .map(|(idx, lde)| {
+                                            let (air, _trace, pub_inputs) =
+                                                &air_trace_pairs[idx];
+                                            let domain = &domains[idx];
+
+                                            // SAFETY: each idx is unique across all partitions,
+                                            // so no two threads access the same transcript.
+                                            let transcript =
+                                                unsafe { transcripts_ptr.get_mut(idx) };
+
+                                            #[cfg(feature = "instruments")]
+                                            let table_start = Instant::now();
+
+                                            let round_1_result = commitments[idx].build_round1(
+                                                lde,
+                                                air.step_size(),
+                                                domain.blowup_factor,
+                                                air.has_aux_trace(),
+                                            );
+
+                                            if let Some(ref bpi) =
+                                                round_1_result.bus_public_inputs
+                                            {
+                                                transcript.append_field_element(
+                                                    &bpi.table_contribution,
+                                                );
+                                            }
+
+                                            let proof = Self::prove_rounds_2_to_4(
+                                                *air,
+                                                *pub_inputs,
+                                                &round_1_result,
+                                                transcript,
+                                                domain,
+                                            );
+
+                                            #[cfg(feature = "instruments")]
+                                            {
+                                                let sub_ops = crate::instruments::take_round_sub_ops()
+                                                    .unwrap_or_default();
+                                                let timing = (
+                                                    air.name().to_string(),
+                                                    _trace.num_rows(),
+                                                    table_start.elapsed(),
+                                                    sub_ops,
+                                                );
+                                                (idx, proof, Some(timing))
+                                            }
+                                            #[cfg(not(feature = "instruments"))]
+                                            {
+                                                (idx, proof)
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                            })
+                        })
+                        .collect();
+
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            // Flatten and sort by original table index
+            let mut indexed_proofs: Vec<ProofResult<Field, FieldExtension, PI>> =
+                partition_results.into_iter().flatten().collect();
+            indexed_proofs.sort_by_key(|r| r.0);
+
+            #[cfg(feature = "instruments")]
+            {
+                table_timings = indexed_proofs
+                    .iter_mut()
+                    .filter_map(|r| r.2.take())
+                    .collect();
+            }
+
+            indexed_proofs
+                .into_iter()
+                .map(|r| r.1)
+                .collect::<Vec<_>>()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let proofs = {
+            #[cfg(feature = "instruments")]
+            let mut timings_vec = Vec::with_capacity(num_airs);
+
+            let mut result_proofs = Vec::with_capacity(num_airs);
+            for (idx, lde) in lde_options.into_iter().enumerate() {
+                let lde = lde.expect("LDE should be present");
+                let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
+                let domain = &domains[idx];
+                let transcript = &mut table_transcripts[idx];
+
+                #[cfg(feature = "instruments")]
+                let table_start = Instant::now();
+
+                let round_1_result = commitments[idx].build_round1(
+                    lde,
+                    air.step_size(),
+                    domain.blowup_factor,
+                    air.has_aux_trace(),
+                );
+
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    transcript.append_field_element(&bpi.table_contribution);
+                }
+
+                let proof = Self::prove_rounds_2_to_4(
+                    *air,
+                    *pub_inputs,
+                    &round_1_result,
+                    transcript,
+                    domain,
+                );
+
                 #[cfg(feature = "instruments")]
                 {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
-                    table_timings.push(timing);
+                    let sub_ops =
+                        crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    timings_vec.push((
+                        air.name().to_string(),
+                        _trace.num_rows(),
+                        table_start.elapsed(),
+                        sub_ops,
+                    ));
                 }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
+
+                result_proofs.push(proof);
             }
-        }
+
+            #[cfg(feature = "instruments")]
+            {
+                table_timings = timings_vec;
+            }
+
+            result_proofs
+        };
+
+        // Propagate errors and collect successful proofs
+        let proofs: Vec<StarkProof<Field, FieldExtension, PI>> = proofs
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
         #[cfg(feature = "instruments")]
         {
