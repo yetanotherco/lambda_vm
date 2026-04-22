@@ -1905,7 +1905,12 @@ pub trait IsStarkProver<
             type ProofResult<F, E, PI> = (
                 usize,
                 Result<StarkProof<F, E, PI>, ProvingError>,
-                Option<(String, usize, std::time::Duration, crate::instruments::TableSubOps)>,
+                Option<(
+                    String,
+                    usize,
+                    std::time::Duration,
+                    crate::instruments::TableSubOps,
+                )>,
             );
             #[cfg(not(feature = "instruments"))]
             type ProofResult<F, E, PI> = (usize, Result<StarkProof<F, E, PI>, ProvingError>);
@@ -1926,8 +1931,7 @@ pub trait IsStarkProver<
                                     partition_lde_pairs
                                         .into_iter()
                                         .map(|(idx, lde)| {
-                                            let (air, _trace, pub_inputs) =
-                                                &air_trace_pairs[idx];
+                                            let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
                                             let domain = &domains[idx];
 
                                             // SAFETY: each idx is unique across all partitions,
@@ -1945,12 +1949,10 @@ pub trait IsStarkProver<
                                                 air.has_aux_trace(),
                                             );
 
-                                            if let Some(ref bpi) =
-                                                round_1_result.bus_public_inputs
+                                            if let Some(ref bpi) = round_1_result.bus_public_inputs
                                             {
-                                                transcript.append_field_element(
-                                                    &bpi.table_contribution,
-                                                );
+                                                transcript
+                                                    .append_field_element(&bpi.table_contribution);
                                             }
 
                                             let proof = Self::prove_rounds_2_to_4(
@@ -1963,8 +1965,9 @@ pub trait IsStarkProver<
 
                                             #[cfg(feature = "instruments")]
                                             {
-                                                let sub_ops = crate::instruments::take_round_sub_ops()
-                                                    .unwrap_or_default();
+                                                let sub_ops =
+                                                    crate::instruments::take_round_sub_ops()
+                                                        .unwrap_or_default();
                                                 let timing = (
                                                     air.name().to_string(),
                                                     _trace.num_rows(),
@@ -2000,10 +2003,7 @@ pub trait IsStarkProver<
                     .collect();
             }
 
-            indexed_proofs
-                .into_iter()
-                .map(|r| r.1)
-                .collect::<Vec<_>>()
+            indexed_proofs.into_iter().map(|r| r.1).collect::<Vec<_>>()
         };
 
         #[cfg(not(feature = "parallel"))]
@@ -2042,8 +2042,7 @@ pub trait IsStarkProver<
 
                 #[cfg(feature = "instruments")]
                 {
-                    let sub_ops =
-                        crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
                     timings_vec.push((
                         air.name().to_string(),
                         _trace.num_rows(),
@@ -2064,9 +2063,8 @@ pub trait IsStarkProver<
         };
 
         // Propagate errors and collect successful proofs
-        let proofs: Vec<StarkProof<Field, FieldExtension, PI>> = proofs
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let proofs: Vec<StarkProof<Field, FieldExtension, PI>> =
+            proofs.into_iter().collect::<Result<Vec<_>, _>>()?;
 
         #[cfg(feature = "instruments")]
         {
