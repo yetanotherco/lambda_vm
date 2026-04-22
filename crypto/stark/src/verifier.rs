@@ -82,6 +82,30 @@ pub trait IsStarkVerifier<
     PI,
 >
 {
+    fn reconstruct_fri_zetas(
+        number_layers: usize,
+        merkle_roots: &[Commitment],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let num_double_rounds = number_layers.saturating_sub(1) / 2;
+        let mut zetas = Vec::with_capacity(number_layers);
+        for (i, root) in merkle_roots.iter().enumerate() {
+            let z1 = transcript.sample_field_element();
+            zetas.push(z1);
+            if i < num_double_rounds {
+                let z2 = transcript.sample_field_element();
+                zetas.push(z2);
+            }
+            transcript.append_bytes(root);
+        }
+        zetas.push(transcript.sample_field_element());
+        zetas
+    }
+
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &VerifierDomain<Field>,
@@ -200,23 +224,8 @@ pub trait IsStarkVerifier<
         // FRI commit phase — arity-4: 2 zetas per double-fold layer, 1 for odd-extra layer.
         // number_layers = domain.root_order (log2 of the LDE domain size).
         let number_layers = domain.root_order as usize;
-        let num_double_rounds = number_layers.saturating_sub(1) / 2;
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = Vec::with_capacity(number_layers);
-        for (i, root) in merkle_roots.iter().enumerate() {
-            // >>>> Send challenges: 2 for double-fold layers, 1 for the odd-extra layer.
-            let z1 = transcript.sample_field_element();
-            zetas.push(z1);
-            if i < num_double_rounds {
-                let z2 = transcript.sample_field_element();
-                zetas.push(z2);
-            }
-            // <<<< Receive commitment: [pₖ]
-            transcript.append_bytes(root);
-        }
-
-        // >>>> Send final challenge 𝜁ₙ₋₁ (for the last single fold that produces fri_last_value)
-        zetas.push(transcript.sample_field_element());
+        let zetas =
+            Self::reconstruct_fri_zetas(number_layers, &proof.fri_layers_merkle_roots, transcript);
 
         // <<<< Receive value: pₙ
         transcript.append_field_element(&proof.fri_last_value);
@@ -409,18 +418,25 @@ pub trait IsStarkVerifier<
 
         // Arity-4: each query needs eval_inv at position 4*iota (eval_inv_a)
         // and at position 4*iota+2 (eval_inv_b) for the 2-step fold bootstrap.
+        // eval_inv_b is only used when num_double_rounds >= 1.
+        let num_double_rounds = (challenges.zetas.len() - 1) / 2;
         let mut eval_inv_a_vec: Vec<FieldElement<Field>> = challenges
             .iotas
             .iter()
             .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
             .collect();
-        let mut eval_inv_b_vec: Vec<FieldElement<Field>> = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point_2(*iota, domain))
-            .collect();
         FieldElement::inplace_batch_inverse(&mut eval_inv_a_vec).unwrap();
-        FieldElement::inplace_batch_inverse(&mut eval_inv_b_vec).unwrap();
+        let eval_inv_b_vec: Vec<FieldElement<Field>> = if num_double_rounds > 0 {
+            let mut v: Vec<FieldElement<Field>> = challenges
+                .iotas
+                .iter()
+                .map(|iota| Self::query_challenge_to_evaluation_point_2(*iota, domain))
+                .collect();
+            FieldElement::inplace_batch_inverse(&mut v).unwrap();
+            v
+        } else {
+            vec![FieldElement::zero(); challenges.iotas.len()]
+        };
 
         proof
             .query_list
@@ -1337,21 +1353,8 @@ pub trait IsStarkVerifier<
 
         // FRI commit phase — arity-4: 2 zetas per double-fold layer, 1 for odd-extra layer.
         let number_layers = domain.root_order as usize;
-        let num_double_rounds = number_layers.saturating_sub(1) / 2;
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = Vec::with_capacity(number_layers);
-        for (i, root) in merkle_roots.iter().enumerate() {
-            let z1 = transcript.sample_field_element();
-            zetas.push(z1);
-            if i < num_double_rounds {
-                let z2 = transcript.sample_field_element();
-                zetas.push(z2);
-            }
-            transcript.append_bytes(root);
-        }
-
-        // >>>> Send final challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
+        let zetas =
+            Self::reconstruct_fri_zetas(number_layers, &proof.fri_layers_merkle_roots, transcript);
 
         // <<<< Receive value: pₙ
         transcript.append_field_element(&proof.fri_last_value);

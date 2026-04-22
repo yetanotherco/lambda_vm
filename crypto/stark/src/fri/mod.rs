@@ -49,8 +49,12 @@ where
     let num_double_rounds = number_layers.saturating_sub(1) / 2;
 
     for _ in 0..num_double_rounds {
-        // Sample both fold challenges before committing (Fiat-Shamir: both betas
-        // depend only on transcript state before this round's commitment).
+        // Sample both fold challenges before committing.
+        // This is sound for arity-4 FRI: the prover commits *one* combined layer
+        // that covers both binary folds, so it fixes its evaluations before either
+        // challenge is revealed. It cannot choose zeta2 adaptively after seeing
+        // zeta1 because both are sampled from the same transcript state, before
+        // the commitment is appended.
         let zeta1 = transcript.sample_field_element();
         let zeta2 = transcript.sample_field_element();
 
@@ -117,7 +121,10 @@ where
     let zeta = transcript.sample_field_element();
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
+    let last_value = evals
+        .first()
+        .expect("FRI evals empty after folding")
+        .clone();
     transcript.append_field_element(&last_value);
 
     (last_value, fri_layer_list)
