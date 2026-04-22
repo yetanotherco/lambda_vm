@@ -506,43 +506,32 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
+        num_leaves: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         // Arity-4: 4 positions per query orbit.
-        let i0 = iota * 4;
-        let i1 = iota * 4 + 1;
-        let i2 = iota * 4 + 2;
-        let i3 = iota * 4 + 3;
+        let positions = [iota * 4, iota * 4 + 1, iota * 4 + 2, iota * 4 + 3];
         let mut result = true;
 
         // Verify main trace (multiplicities for preprocessed, full trace for normal)
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof,
-            &proof.lde_trace_main_merkle_root,
-            i0,
-            &deep_poly_openings.main_trace_polys.evaluations,
-        );
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof_sym,
-            &proof.lde_trace_main_merkle_root,
-            i1,
-            &deep_poly_openings.main_trace_polys.evaluations_sym,
-        );
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof_2,
-            &proof.lde_trace_main_merkle_root,
-            i2,
-            &deep_poly_openings.main_trace_polys.evaluations_2,
-        );
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof_3,
-            &proof.lde_trace_main_merkle_root,
-            i3,
-            &deep_poly_openings.main_trace_polys.evaluations_3,
-        );
+        let main_values = [
+            deep_poly_openings.main_trace_polys.evaluations.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_sym.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_2.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_3.clone(),
+        ];
+        result &= deep_poly_openings
+            .main_trace_polys
+            .batch_proof
+            .verify::<BatchedMerkleTreeBackend<Field>>(
+                &proof.lde_trace_main_merkle_root,
+                &positions,
+                &main_values,
+                num_leaves,
+            );
 
         // Verify precomputed trace (for preprocessed tables only)
         match (
@@ -554,30 +543,20 @@ pub trait IsStarkVerifier<
             (None, Some(_)) => result = false,
             (Some(_), None) => result = false,
             (Some(precomputed_root), Some(precomputed_opening)) => {
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof,
-                    precomputed_root,
-                    i0,
-                    &precomputed_opening.evaluations,
-                );
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof_sym,
-                    precomputed_root,
-                    i1,
-                    &precomputed_opening.evaluations_sym,
-                );
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof_2,
-                    precomputed_root,
-                    i2,
-                    &precomputed_opening.evaluations_2,
-                );
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof_3,
-                    precomputed_root,
-                    i3,
-                    &precomputed_opening.evaluations_3,
-                );
+                let precomputed_values = [
+                    precomputed_opening.evaluations.clone(),
+                    precomputed_opening.evaluations_sym.clone(),
+                    precomputed_opening.evaluations_2.clone(),
+                    precomputed_opening.evaluations_3.clone(),
+                ];
+                result &= precomputed_opening
+                    .batch_proof
+                    .verify::<BatchedMerkleTreeBackend<Field>>(
+                        precomputed_root,
+                        &positions,
+                        &precomputed_values,
+                        num_leaves,
+                    );
             }
             _ => {}
         }
@@ -590,30 +569,20 @@ pub trait IsStarkVerifier<
             (None, Some(_)) => result = false,
             (Some(_), None) => result = false,
             (Some(aux_root), Some(aux_trace_polys_opening)) => {
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof,
-                    &aux_root,
-                    i0,
-                    &aux_trace_polys_opening.evaluations,
-                );
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof_sym,
-                    &aux_root,
-                    i1,
-                    &aux_trace_polys_opening.evaluations_sym,
-                );
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof_2,
-                    &aux_root,
-                    i2,
-                    &aux_trace_polys_opening.evaluations_2,
-                );
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof_3,
-                    &aux_root,
-                    i3,
-                    &aux_trace_polys_opening.evaluations_3,
-                );
+                let aux_values = [
+                    aux_trace_polys_opening.evaluations.clone(),
+                    aux_trace_polys_opening.evaluations_sym.clone(),
+                    aux_trace_polys_opening.evaluations_2.clone(),
+                    aux_trace_polys_opening.evaluations_3.clone(),
+                ];
+                result &= aux_trace_polys_opening
+                    .batch_proof
+                    .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                        &aux_root,
+                        &positions,
+                        &aux_values,
+                        num_leaves,
+                    );
             }
             _ => {}
         }
@@ -665,6 +634,7 @@ pub trait IsStarkVerifier<
     fn step_4_verify_trace_and_composition_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
+        num_leaves: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -679,7 +649,8 @@ pub trait IsStarkVerifier<
                     iota_n,
                 );
 
-                result &= Self::verify_trace_openings(proof, deep_poly_opening, *iota_n);
+                result &=
+                    Self::verify_trace_openings(proof, deep_poly_opening, *iota_n, num_leaves);
                 result
             },
         )
@@ -1476,7 +1447,11 @@ pub trait IsStarkVerifier<
         let timer4 = Instant::now();
 
         #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
+        if !Self::step_4_verify_trace_and_composition_openings(
+            proof,
+            &challenges,
+            domain.lde_length,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
             return false;

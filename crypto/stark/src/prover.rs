@@ -1338,10 +1338,7 @@ pub trait IsStarkProver<
         let i2 = challenge * 4 + 2;
         let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(i0).unwrap(),
-            proof_sym: tree.get_proof_by_pos(i1).unwrap(),
-            proof_2: tree.get_proof_by_pos(i2).unwrap(),
-            proof_3: tree.get_proof_by_pos(i3).unwrap(),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_main_row(reverse_index(i0, domain_size as u64)),
             evaluations_sym: lde_trace.gather_main_row(reverse_index(i1, domain_size as u64)),
             evaluations_2: lde_trace.gather_main_row(reverse_index(i2, domain_size as u64)),
@@ -1369,10 +1366,7 @@ pub trait IsStarkProver<
         let i2 = challenge * 4 + 2;
         let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(i0).unwrap(),
-            proof_sym: tree.get_proof_by_pos(i1).unwrap(),
-            proof_2: tree.get_proof_by_pos(i2).unwrap(),
-            proof_3: tree.get_proof_by_pos(i3).unwrap(),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_main_row_range(
                 reverse_index(i0, domain_size as u64),
                 col_start,
@@ -1414,10 +1408,7 @@ pub trait IsStarkProver<
         let i2 = challenge * 4 + 2;
         let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(i0).unwrap(),
-            proof_sym: tree.get_proof_by_pos(i1).unwrap(),
-            proof_2: tree.get_proof_by_pos(i2).unwrap(),
-            proof_3: tree.get_proof_by_pos(i3).unwrap(),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_aux_row(reverse_index(i0, domain_size as u64)),
             evaluations_sym: lde_trace.gather_aux_row(reverse_index(i1, domain_size as u64)),
             evaluations_2: lde_trace.gather_aux_row(reverse_index(i2, domain_size as u64)),

@@ -1,4 +1,4 @@
-use crypto::merkle_tree::proof::Proof;
+use crypto::merkle_tree::proof::{BatchProof, Proof};
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
@@ -12,11 +12,9 @@ use crate::{
 #[serde(bound = "")]
 pub struct PolynomialOpenings<F: IsField> {
     /// Openings at the 4 positions of the arity-4 orbit: index, index^1, index^2, index^3.
-    /// For trace trees: 4 independent Merkle proofs (one per row).
-    pub proof: Proof<Commitment>,
-    pub proof_sym: Proof<Commitment>,
-    pub proof_2: Proof<Commitment>,
-    pub proof_3: Proof<Commitment>,
+    /// A single batch Merkle proof authenticates all 4 leaves, sharing the common
+    /// auth-path prefix — smaller than 4 independent proofs.
+    pub batch_proof: BatchProof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
     pub evaluations_2: Vec<FieldElement<F>>,
