@@ -365,6 +365,7 @@ where
 /// Accepts precomputed `coset_points`, `coset_offset_pow_n`, `n_inv`, and `g_n_inv`
 /// to avoid redundant computation when these are already available from the caller
 /// (e.g., round_3 in prover.rs computes identical values for composition poly eval).
+#[allow(clippy::too_many_arguments)]
 pub fn get_trace_evaluations_from_lde<F, E>(
     lde_trace: &LDETraceTable<F, E>,
     domain: &Domain<F>,

@@ -167,7 +167,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
     let n = domain.interpolation_domain_size;
     let bf = domain.blowup_factor;
     let coset_points: Vec<Felt> = (0..n)
-        .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+        .map(|i| domain.lde_roots_of_unity_coset[i * bf])
         .collect();
     let coset_offset_pow_n: Felt = domain.coset_offset.pow(n);
     let n_inv: Felt = Felt::from(n as u64).inv().expect("n is a power of two");

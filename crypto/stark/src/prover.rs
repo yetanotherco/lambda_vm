@@ -1178,8 +1178,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let domain_size = domain.interpolation_domain_size;
-        let blowup_factor = domain.blowup_factor;
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
