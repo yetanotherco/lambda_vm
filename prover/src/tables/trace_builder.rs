@@ -1589,9 +1589,7 @@ fn generate_page_tables(
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let total_bytes = 4 + private_input.len(); // length prefix + data
         (0..total_bytes)
-            .map(|i| {
-                page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size)
-            })
+            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size))
             .collect()
     } else {
         std::collections::BTreeSet::new()
@@ -2245,8 +2243,7 @@ impl Traces {
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
             use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base =
-                page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
+            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
             for i in 0..num_private_input_pages {
                 configs.push(PageConfig {
                     page_base: first_page_base + i as u64 * page_size as u64,
