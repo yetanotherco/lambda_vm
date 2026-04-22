@@ -346,6 +346,12 @@ fn cmd_prove(
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
 
+    #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
+    stark::instruments::set_heap_reader(|| {
+        tikv_jemalloc_ctl::epoch::advance().ok();
+        tikv_jemalloc_ctl::stats::allocated::read().ok()
+    });
+
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
