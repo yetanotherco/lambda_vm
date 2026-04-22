@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Benchmark: Lambda VM vs SP1 v6 — Fibonacci proving time comparison.
 #
 # Usage: ./bench_vs/run.sh [-n 1000 50000 100000 | --steps 1000000 2000000]

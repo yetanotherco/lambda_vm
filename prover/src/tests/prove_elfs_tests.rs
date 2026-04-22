@@ -15,7 +15,7 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
@@ -106,7 +106,7 @@ fn test_cpu_only_no_bus() {
     let proof_options = ProofOptions::default_test_options();
 
     // Create AIR with NO bus interactions
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![], // NO bus interactions
     };
@@ -1959,4 +1959,21 @@ fn test_addiw_neg_immediate() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_addiw_neg");
     let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(result, "addiw with negative immediate should verify");
+}
+
+/// Regression test: both main and aux field element counts must be nonzero for any real ELF.
+/// Guards against silent under-count if a table is added to `Traces` but not enumerated in
+/// `total_field_elements` or `total_auxiliary_field_elements`.
+#[test]
+fn test_count_elements_nonzero() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("addi_one");
+    let (main, aux) = crate::count_elements(&elf_bytes, &[]).expect("count_elements failed");
+    assert!(
+        main > 0,
+        "total_field_elements should be nonzero (got {main})"
+    );
+    assert!(
+        aux > 0,
+        "total_auxiliary_field_elements should be nonzero (got {aux})"
+    );
 }
