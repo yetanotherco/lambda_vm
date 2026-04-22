@@ -1628,6 +1628,23 @@ pub struct Traces {
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
+/// Intermediate state from Phase 2: all ops collected from CPU, ready for
+/// Phases 3-5 (LT extension, bitwise, trace generation).
+struct CollectedOps {
+    cpu_ops: Vec<CpuOperation>,
+    memw_ops: Vec<MemwOperation>,
+    memw_aligned_ops: Vec<MemwOperation>,
+    memw_register_ops: Vec<MemwOperation>,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    branch_ops: Vec<BranchOperation>,
+    mul_ops: Vec<(MulOperation, bool)>,
+    dvrm_ops: Vec<(DvrmOperation, bool)>,
+    commit_ops: Vec<CommitOperation>,
+}
+
 /// Chunk raw ops and generate one trace table per chunk.
 fn chunk_and_generate<T>(
     ops: &[T],
@@ -1641,7 +1658,474 @@ fn chunk_and_generate<T>(
     }
 }
 
+/// Phase 2: Collect and route all operations from CPU ops.
+///
+/// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
+/// (for HALT finalization), and returns fully-routed ops ready for Phase 3+.
+#[allow(clippy::too_many_arguments)]
+fn collect_all_ops(
+    cpu_ops: Vec<CpuOperation>,
+    mut memw_ops: Vec<MemwOperation>,
+    load_ops: Vec<LoadOperation>,
+    mut lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    commit_ops: Vec<CommitOperation>,
+    register_state: &mut RegisterState,
+) -> CollectedOps {
+    // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+    // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
+    let halt_memw_ops = collect_halt_ops(register_state);
+    memw_ops.extend(halt_memw_ops);
+
+    // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
+    // Order matters: register ops would also pass is_aligned_op, so check first.
+    let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
+        memw_ops.into_iter().partition(is_register_op);
+    let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
+        memw_ops.into_iter().partition(is_aligned_op);
+
+    // Collect BRANCH operations from CPU ops where branch_cond = true
+    let branch_ops: Vec<BranchOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.branch_cond)
+        .map(|op| {
+            BranchOperation::new(
+                op.decode.pc,
+                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                op.compute_arg1(), // register value must match CPU's arg1 for bus signature
+                op.decode.op_jalr,
+            )
+        })
+        .collect();
+
+    // Collect MUL operations from CPU ops where op_mul = true
+    let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.op_mul)
+        .map(|op| {
+            let lhs = op.compute_arg1();
+            let lhs_signed = op.decode.signed;
+            // rhs_signed = mp_selector per spec CPU-CA44:
+            // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
+            let rhs_signed = op.decode.mp_selector;
+            let rhs = op.compute_arg2();
+            let wants_hi = op.decode.muldiv_selector;
+            (
+                MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                wants_hi,
+            )
+        })
+        .collect();
+
+    // Collect DVRM operations from CPU ops where op_divrem = true
+    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.op_divrem)
+        .map(|op| {
+            let n = op.compute_arg1();
+            let d = op.compute_arg2();
+            let signed = op.decode.signed;
+            let wants_remainder = op.decode.muldiv_selector;
+            (DvrmOperation::new(n, d, signed), wants_remainder)
+        })
+        .collect();
+
+    // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
+    for (op, _wants_remainder) in &dvrm_ops {
+        lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+    }
+
+    // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
+    for (op, _wants_remainder) in &dvrm_ops {
+        let d = op.d;
+        let d_signed = op.signed;
+        let q = op.compute_quotient();
+        let q_signed = op.sign_q();
+        let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+        mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+        mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+    }
+
+    CollectedOps {
+        cpu_ops,
+        memw_ops,
+        memw_aligned_ops,
+        memw_register_ops,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        commit_ops,
+    }
+}
+
+/// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
+///
+/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
+/// and PAGE bitwise lookups; `None` produces empty page tables.
+#[allow(clippy::too_many_arguments)]
+fn build_traces(
+    ops: CollectedOps,
+    elf: Option<&Elf>,
+    memory_state: &MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
+    max_rows: &super::MaxRowsConfig,
+) -> Result<Traces, Error> {
+    let CollectedOps {
+        cpu_ops,
+        memw_ops,
+        memw_aligned_ops,
+        memw_register_ops,
+        load_ops,
+        mut lt_ops,
+        shift_ops,
+        mut bitwise_ops,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        commit_ops,
+    } = ops;
+
+    // =====================================================================
+    // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+    // =====================================================================
+    lt_ops.extend(collect_lt_from_memw(&memw_ops));
+    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+
+    // =====================================================================
+    // PHASE 4: All → Bitwise lookups
+    // =====================================================================
+    bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+    bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+    bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+    bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+    bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
+    // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+    if let Some(elf) = elf {
+        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state));
+    }
+
+    let public_output_bytes: Vec<u8> = commit_ops
+        .iter()
+        .filter(|op| !op.end)
+        .map(|op| op.value)
+        .collect();
+    // COMMIT table sends IsByte and IsHalfword lookups
+    bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+
+    // CPU padding rows send IS_BYTE with all-zero values.
+    // Add corresponding ops so the bitwise table multiplicities balance.
+    let num_padding_rows: usize = cpu_ops
+        .chunks(max_rows.cpu)
+        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+        .sum();
+    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
+    // =====================================================================
+    // PHASE 5: Generate final traces (parallelized)
+    // =====================================================================
+
+    // Extract halt timestamp from the last ECALL instruction
+    let halt_op = cpu_ops
+        .iter()
+        .rev()
+        .find(|op| op.decode.op_ecall)
+        .ok_or(Error::MissingHaltEcall)?;
+    let halt_timestamp = halt_op.timestamp;
+
+    let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+    let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+    let memw_aligneds = chunk_and_generate(
+        &memw_aligned_ops,
+        max_rows.memw_aligned,
+        memw_aligned::generate_memw_aligned_trace,
+    );
+    let memw_registers = chunk_and_generate(
+        &memw_register_ops,
+        max_rows.memw_register,
+        memw_register::generate_memw_register_trace,
+    );
+    let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+    let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+    let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+    let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+    let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+    let branches = chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+
+    let mut bitwise = bitwise::generate_bitwise_trace();
+    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+    // Update DECODE multiplicities
+    // Each CPU operation looks up the DECODE table once
+    // Padding rows also look up pc=1 (the CPU padding entry)
+    // When CPU is split, each chunk pads independently
+    let mut decode = decode_trace;
+    let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+    decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+    decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+
+    // Prepare register final state before scope (needs register_state ownership)
+    let register_final_state = register_state.to_final_state_map();
+
+    // Generate remaining traces in parallel (page, register, halt, commit).
+    // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+    let commit_trace = commit::generate_commit_trace(&commit_ops);
+    let (pages, page_configs, register_trace, halt_trace);
+    #[cfg(feature = "parallel")]
+    {
+        let ((pages_val, register_val), halt_val) = rayon::join(
+            || {
+                rayon::join(
+                    || match elf {
+                        Some(elf) => generate_page_tables(elf, memory_state),
+                        None => (Vec::new(), Vec::new()),
+                    },
+                    || register::generate_register_trace(&register_final_state, entry_point),
+                )
+            },
+            || halt::generate_halt_trace(halt_timestamp),
+        );
+        let (pages_v, page_configs_v) = pages_val;
+        pages = pages_v;
+        page_configs = page_configs_v;
+        register_trace = register_val;
+        halt_trace = halt_val;
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        match elf {
+            Some(elf) => {
+                let (p, c) = generate_page_tables(elf, memory_state);
+                pages = p;
+                page_configs = c;
+            }
+            None => {
+                pages = Vec::new();
+                page_configs = Vec::new();
+            }
+        }
+        register_trace = register::generate_register_trace(&register_final_state, entry_point);
+        halt_trace = halt::generate_halt_trace(halt_timestamp);
+    }
+
+    Ok(Traces {
+        cpus,
+        bitwise,
+        lts,
+        shifts,
+        memws,
+        memw_aligneds,
+        loads,
+        decode,
+        muls,
+        dvrms,
+        pages,
+        page_configs,
+        register: register_trace,
+        public_output_bytes,
+        branches,
+        halt: halt_trace,
+        commit: commit_trace,
+        memw_registers,
+    })
+}
+
 impl Traces {
+    /// Returns the total number of main-trace field elements across all tables.
+    ///
+    /// Counts only the main (base-field) trace columns — equivalent to SP1's
+    /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    ///
+    /// Preprocessed columns (committed in a separate PCS round during setup, not at
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (2), PAGE (2).
+    pub fn total_field_elements(&self) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
+        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * CPU_COLS) as u64;
+        }
+        total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        for t in lts {
+            total += (t.num_rows() * LT_COLS) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * SHIFT_COLS) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * MEMW_COLS) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * MEMW_A_COLS) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * LOAD_COLS) as u64;
+        }
+        total += (decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
+        for t in muls {
+            total += (t.num_rows() * MUL_COLS) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * DVRM_COLS) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * BRANCH_COLS) as u64;
+        }
+        total += (halt.num_rows() * HALT_COLS) as u64;
+        total += (commit.num_rows() * COMMIT_COLS) as u64;
+        total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
+        for t in pages {
+            total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * MEMW_R_COLS) as u64;
+        }
+        total
+    }
+
+    /// Returns the total number of auxiliary-trace field elements (extension field)
+    /// across all tables.
+    ///
+    /// The LogUp layout packs N bus interactions into ⌈N/2⌉ EF columns
+    /// (`num_committed_pairs + 1` accumulated column). Each EF column costs one
+    /// extension-field element per row.
+    pub fn total_auxiliary_field_elements(&self) -> u64 {
+        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
+        let n_lt = aux_cols(super::lt::bus_interactions().len());
+        let n_shift = aux_cols(super::shift::bus_interactions().len());
+        let n_memw = aux_cols(super::memw::bus_interactions().len());
+        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
+        let n_load = aux_cols(super::load::bus_interactions().len());
+        let n_decode = aux_cols(super::decode::bus_interactions().len());
+        let n_mul = aux_cols(super::mul::bus_interactions().len());
+        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
+        let n_branch = aux_cols(super::branch::bus_interactions().len());
+        let n_halt = aux_cols(super::halt::bus_interactions().len());
+        let n_commit = aux_cols(super::commit::bus_interactions().len());
+        let n_register = aux_cols(super::register::bus_interactions().len());
+        // page::bus_interactions count is constant regardless of page_base.
+        let n_page = aux_cols(super::page::bus_interactions(0).len());
+        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * n_cpu) as u64;
+        }
+        total += (bitwise.num_rows() * n_bitwise) as u64;
+        for t in lts {
+            total += (t.num_rows() * n_lt) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * n_shift) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * n_memw) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * n_memw_a) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * n_load) as u64;
+        }
+        total += (decode.num_rows() * n_decode) as u64;
+        for t in muls {
+            total += (t.num_rows() * n_mul) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * n_dvrm) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * n_branch) as u64;
+        }
+        total += (halt.num_rows() * n_halt) as u64;
+        total += (commit.num_rows() * n_commit) as u64;
+        total += (register.num_rows() * n_register) as u64;
+        for t in pages {
+            total += (t.num_rows() * n_page) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * n_memw_r) as u64;
+        }
+        total
+    }
+
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
         crate::TableCounts {
@@ -1780,250 +2264,44 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        // =====================================================================
-        // PHASE 0: ELF → DECODE + instructions
-        // =====================================================================
+        // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
-        // tables_from_elf iterates ELF segments sequentially, but the commitment
-        // is computed via HashMap iteration which may have different ordering.
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
 
-        // =====================================================================
-        // PHASE 1: Logs → CPU operations
-        // =====================================================================
+        // Phase 1: Logs → CPU operations
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
-        // =====================================================================
-        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
-        // =====================================================================
-        // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
-        // Initialize memory state from ELF so first accesses get correct old_value.
+        // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
-        // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
-        // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
-        let halt_memw_ops = collect_halt_ops(&mut register_state);
-        memw_ops.extend(halt_memw_ops);
-
-        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-        // Order matters: register ops would also pass is_aligned_op, so check first.
-        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_register_op);
-        let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_aligned_op);
-
-        // Collect BRANCH operations from CPU ops where branch_cond = true
-        let branch_ops: Vec<BranchOperation> = cpu_ops
-            .iter()
-            .filter(|op| op.branch_cond)
-            .map(|op| {
-                BranchOperation::new(
-                    op.decode.pc,
-                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
-                    op.decode.op_jalr,
-                )
-            })
-            .collect();
-
-        // Collect MUL operations from CPU ops where op_mul = true
-        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_mul)
-            .map(|op| {
-                let lhs = op.compute_arg1();
-                let lhs_signed = op.decode.signed;
-                // rhs_signed = mp_selector per spec CPU-CA44:
-                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
-                let rhs_signed = op.decode.mp_selector;
-                let rhs = op.compute_arg2();
-                let wants_hi = op.decode.muldiv_selector;
-                (
-                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                    wants_hi,
-                )
-            })
-            .collect();
-
-        // Collect DVRM operations from CPU ops where op_divrem = true
-        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_divrem)
-            .map(|op| {
-                let n = op.compute_arg1();
-                let d = op.compute_arg2();
-                let signed = op.decode.signed;
-                let wants_remainder = op.decode.muldiv_selector;
-                (DvrmOperation::new(n, d, signed), wants_remainder)
-            })
-            .collect();
-
-        // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
-        for (op, _wants_remainder) in &dvrm_ops {
-            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
-        }
-
-        // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
-        for (op, _wants_remainder) in &dvrm_ops {
-            let d = op.d;
-            let d_signed = op.signed;
-            let q = op.compute_quotient();
-            let q_signed = op.sign_q();
-            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
-            mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
-            mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
-        }
-
-        // =====================================================================
-        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
-        // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(&memw_ops));
-        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-
-        // =====================================================================
-        // PHASE 4: All → Bitwise lookups
-        // =====================================================================
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
-        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
-
-        let public_output_bytes: Vec<u8> = commit_ops
-            .iter()
-            .filter(|op| !op.end)
-            .map(|op| op.value)
-            .collect();
-        // COMMIT table sends IsByte and IsHalfword lookups
-        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-
-        // CPU padding rows send IS_BYTE with all-zero values.
-        // Add corresponding ops so the bitwise table multiplicities balance.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
-
-        // =====================================================================
-        // PHASE 5: Generate final traces (parallelized)
-        // =====================================================================
-
-        // Extract halt timestamp from the last ECALL instruction
-        let halt_op = cpu_ops
-            .iter()
-            .rev()
-            .find(|op| op.decode.op_ecall)
-            .ok_or(Error::MissingHaltEcall)?;
-        let halt_timestamp = halt_op.timestamp;
-
-        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let memw_aligneds = chunk_and_generate(
-            &memw_aligned_ops,
-            max_rows.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace,
+        let ops = collect_all_ops(
+            cpu_ops,
+            memw_ops,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            &mut register_state,
         );
-        let memw_registers = chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
-        );
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-        let branches =
-            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-        // Update DECODE multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        // When CPU is split, each chunk pads independently
-        let mut decode = decode_trace;
-        let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
-
-        // Prepare register final state before scope (needs register_state ownership)
-        let register_final_state = register_state.to_final_state_map();
-
-        // Generate remaining traces in parallel (page, register, halt, commit).
-        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-        let commit_trace = commit::generate_commit_trace(&commit_ops);
-        let (pages, page_configs, register_trace, halt_trace);
-        #[cfg(feature = "parallel")]
-        {
-            let ((pages_val, register_val), halt_val) = rayon::join(
-                || {
-                    rayon::join(
-                        || generate_page_tables(elf, &memory_state),
-                        || {
-                            register::generate_register_trace(
-                                &register_final_state,
-                                elf.entry_point,
-                            )
-                        },
-                    )
-                },
-                || halt::generate_halt_trace(halt_timestamp),
-            );
-            let (pages_v, page_configs_v) = pages_val;
-            pages = pages_v;
-            page_configs = page_configs_v;
-            register_trace = register_val;
-            halt_trace = halt_val;
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
-            pages = pages_v;
-            page_configs = page_configs_v;
-            register_trace =
-                register::generate_register_trace(&register_final_state, elf.entry_point);
-            halt_trace = halt::generate_halt_trace(halt_timestamp);
-        }
-
-        Ok(Traces {
-            cpus,
-            bitwise,
-            lts,
-            shifts,
-            memws,
-            memw_aligneds,
-            loads,
-            decode,
-            muls,
-            dvrms,
-            pages,
-            page_configs,
-            register: register_trace,
-            public_output_bytes,
-            branches,
-            halt: halt_trace,
-            commit: commit_trace,
-            memw_registers,
-        })
+        // Phases 3-5
+        build_traces(
+            ops,
+            Some(elf),
+            &memory_state,
+            elf.entry_point,
+            decode_trace,
+            decode_pc_to_row,
+            register_state,
+            max_rows,
+        )
     }
 
     /// Generates all traces from execution logs (legacy API).
@@ -2037,222 +2315,41 @@ impl Traces {
         instructions: U64HashMap<Instruction>,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        // =====================================================================
-        // PHASE 1: Logs → CPU operations
-        // =====================================================================
+        // Phase 1: Logs → CPU operations
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
-        // =====================================================================
-        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
-        // =====================================================================
-        // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
+        // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::new();
-        // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
+        let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
-        // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
-        // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
-        let halt_memw_ops = collect_halt_ops(&mut register_state);
-        memw_ops.extend(halt_memw_ops);
-
-        // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-        let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_register_op);
-        let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
-            memw_ops.into_iter().partition(is_aligned_op);
-
-        // Collect MUL operations from CPU ops where op_mul = true
-        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_mul)
-            .map(|op| {
-                let lhs = op.compute_arg1();
-                let lhs_signed = op.decode.signed;
-                // rhs_signed = mp_selector per spec CPU-CA44:
-                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
-                let rhs_signed = op.decode.mp_selector;
-                let rhs = op.compute_arg2();
-                let wants_hi = op.decode.muldiv_selector;
-                (
-                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                    wants_hi,
-                )
-            })
-            .collect();
-
-        // Collect DVRM operations from CPU ops where op_divrem = true
-        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_divrem)
-            .map(|op| {
-                let n = op.compute_arg1();
-                let d = op.compute_arg2();
-                let signed = op.decode.signed;
-                let wants_remainder = op.decode.muldiv_selector;
-                (DvrmOperation::new(n, d, signed), wants_remainder)
-            })
-            .collect();
-
-        // Collect BRANCH operations from CPU ops where branch_cond = true
-        let branch_ops: Vec<BranchOperation> = cpu_ops
-            .iter()
-            .filter(|op| op.branch_cond)
-            .map(|op| {
-                BranchOperation::new(
-                    op.decode.pc,
-                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
-                    op.decode.op_jalr,
-                )
-            })
-            .collect();
-
-        // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
-        for (op, _wants_remainder) in &dvrm_ops {
-            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
-        }
-
-        // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
-        for (op, _wants_remainder) in &dvrm_ops {
-            let d = op.d;
-            let d_signed = op.signed;
-            let q = op.compute_quotient();
-            let q_signed = op.sign_q();
-            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
-            mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
-            mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
-        }
-
-        // =====================================================================
-        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
-        // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(&memw_ops));
-        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-
-        // =====================================================================
-        // PHASE 4: All → Bitwise lookups
-        // =====================================================================
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
-        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-        // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-        bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-
-        let public_output_bytes: Vec<u8> = commit_ops
-            .iter()
-            .filter(|op| !op.end)
-            .map(|op| op.value)
-            .collect();
-        // COMMIT table sends IsHalfword lookups
-        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-
-        // CPU padding rows send IS_BYTE with all-zero values.
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
-
-        // =====================================================================
-        // PHASE 5: Generate final traces (parallelized)
-        // =====================================================================
-
-        // Extract halt timestamp from the last ECALL instruction
-        let halt_op = cpu_ops
-            .iter()
-            .rev()
-            .find(|op| op.decode.op_ecall)
-            .ok_or(Error::MissingHaltEcall)?;
-        let halt_timestamp = halt_op.timestamp;
-
-        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let memw_aligneds = chunk_and_generate(
-            &memw_aligned_ops,
-            max_rows.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace,
+        let ops = collect_all_ops(
+            cpu_ops,
+            memw_ops,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            &mut register_state,
         );
-        let memw_registers = chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
-        );
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-        let branches =
-            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
 
-        // Generate DECODE trace and update multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        // When CPU is split, each chunk pads independently
-        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
-        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
-        let register_final_state = register_state.to_final_state_map();
-
-        let commit_trace = commit::generate_commit_trace(&commit_ops);
-
-        // Generate remaining traces in parallel (register, halt).
-        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-        let (register_trace, halt_trace);
-        #[cfg(feature = "parallel")]
-        {
-            let (register_val, halt_val) = rayon::join(
-                || register::generate_register_trace(&register_final_state, entry_point),
-                || halt::generate_halt_trace(halt_timestamp),
-            );
-            register_trace = register_val;
-            halt_trace = halt_val;
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            register_trace = register::generate_register_trace(&register_final_state, entry_point);
-            halt_trace = halt::generate_halt_trace(halt_timestamp);
-        }
-
-        // Create empty PAGE tables for legacy API
-        // (caller should use from_elf_and_logs for proper PAGE table support)
-        let pages = Vec::new();
-        let page_configs = Vec::new();
-
-        Ok(Traces {
-            cpus,
-            bitwise,
-            lts,
-            shifts,
-            memws,
-            memw_aligneds,
-            loads,
-            decode,
-            muls,
-            dvrms,
-            pages,
-            page_configs,
-            register: register_trace,
-            public_output_bytes,
-            branches,
-            halt: halt_trace,
-            commit: commit_trace,
-            memw_registers,
-        })
+        // Phases 3-5 (elf=None → empty PAGE tables)
+        build_traces(
+            ops,
+            None,
+            &memory_state,
+            entry_point,
+            decode_trace,
+            decode_pc_to_row,
+            register_state,
+            max_rows,
+        )
     }
 
     /// Generates all traces with a trimmed bitwise table (TEST ONLY).

@@ -1,8 +1,6 @@
 use embedded_alloc::TlsfHeap as Heap;
 use riscv as _;
 
-use crate::syscalls::print_string;
-
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
@@ -49,6 +47,7 @@ pub unsafe extern "C" fn sys_getenv(
     _varname: *const u8,
     _varname_len: usize,
 ) -> usize {
-    print_string("sys_getenv is disabled");
+    // NOTE: no print_string here — the Print ecall (#1) has no receiver on the
+    // Ecall bus and would cause a verification failure.
     usize::MAX
 }
