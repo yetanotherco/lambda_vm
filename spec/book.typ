@@ -106,6 +106,7 @@
 
 // Invisibly include another chapter, so that its labels can be resolved
 #let xref-include(f) = {
+  show ref: none
   context {
     place(hide(box(width: auto, height: 0%, strip-all(include "/" + f))))
   }
@@ -170,13 +171,19 @@
         }
       })
       let cond() = _toplevel.final() == file
-      project.with(..args, title: context meta_sections.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
-        #show ref: it => context if _toplevel.final() == file {
-          xref(it)
-        }
+      show ref: it => context if _toplevel.final() == file {
+        xref(it)
+      }
+      let title = context {
+        // Strip raw, because shiroa already makes the title raw
+        show raw: it => it.text
+        meta_sections.find(x => x.at(0) == _toplevel.final()).at(1)
+      }
+      project.with(..args, title: title, description: plain-text(meta_sections.find(x => x.at(0) == file).at(1)), cond: cond)([
         #context _xref-included.final().pairs().map(((key, value)) => context if value and cond() {
           xref-include(key)
         }).join()
+        #metadata(json("interaction_count.json").sum(default: (:)))<interaction_count>
         #body
       ])
     }
