@@ -507,7 +507,12 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let traces = Traces::from_elf_and_logs(&program, &result.logs, &MaxRowsConfig::default(), private_inputs)?;
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &MaxRowsConfig::default(),
+        private_inputs,
+    )?;
     Ok((
         traces.total_field_elements(),
         traces.total_auxiliary_field_elements(),
