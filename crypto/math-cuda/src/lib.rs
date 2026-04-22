@@ -5,6 +5,7 @@
 //! parity test suite.
 
 pub mod barycentric;
+pub mod deep;
 pub mod device;
 pub mod lde;
 pub mod merkle;

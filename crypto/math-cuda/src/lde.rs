@@ -10,12 +10,34 @@
 //! On-device steps, picks a stream from the shared pool so rayon-parallel
 //! callers overlap on the GPU. Twiddles are cached in the backend.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use std::sync::Arc;
+
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
 use crate::merkle::{launch_keccak_base, launch_keccak_ext3};
 use crate::ntt::run_ntt_body;
+
+/// Handle to a base-field LDE kept live on device after R1 commit.
+/// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
+/// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
+#[derive(Clone)]
+pub struct GpuLdeBase {
+    pub buf: Arc<CudaSlice<u64>>,
+    pub m: usize,
+    pub lde_size: usize,
+}
+
+/// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
+/// slabs per column. Column `c` component `k` at u64 offset
+/// `(c*3 + k) * lde_size` within `buf`.
+#[derive(Clone)]
+pub struct GpuLdeExt3 {
+    pub buf: Arc<CudaSlice<u64>>,
+    pub m: usize,
+    pub lde_size: usize,
+}
 
 pub fn coset_lde_base(
     evals: &[u64],
@@ -663,9 +685,50 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<()> {
+    coset_lde_batch_base_into_with_merkle_tree_inner(
+        columns,
+        blowup_factor,
+        weights,
+        outputs,
+        merkle_nodes_out,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// Fused LDE + leaf-hash + Merkle tree build. If `keep_device_buf` is true,
+/// returns an `Arc<CudaSlice<u64>>` wrapping the LDE device buffer so callers
+/// (R2–R4 GPU paths) can reuse the LDE without a re-H2D.
+pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
+    columns: &[&[u64]],
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    merkle_nodes_out: &mut [u8],
+) -> Result<GpuLdeBase> {
+    let opt = coset_lde_batch_base_into_with_merkle_tree_inner(
+        columns,
+        blowup_factor,
+        weights,
+        outputs,
+        merkle_nodes_out,
+        true,
+    )?;
+    let handle = opt.expect("keep_device_buf=true must return Some");
+    Ok(handle)
+}
+
+fn coset_lde_batch_base_into_with_merkle_tree_inner(
+    columns: &[&[u64]],
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    merkle_nodes_out: &mut [u8],
+    keep_device_buf: bool,
+) -> Result<Option<GpuLdeBase>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
-        return Ok(());
+        return Ok(None);
     }
     let m = columns.len();
     assert_eq!(outputs.len(), m);
@@ -878,7 +941,17 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
         });
     drop(tree_staging);
     drop(staging);
-    Ok(())
+
+    if keep_device_buf {
+        Ok(Some(GpuLdeBase {
+            buf: Arc::new(buf),
+            m,
+            lde_size,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: run an LDE
@@ -1102,9 +1175,53 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<()> {
+    coset_lde_batch_ext3_into_with_merkle_tree_inner(
+        columns,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        merkle_nodes_out,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// Ext3 variant of [`coset_lde_batch_base_into_with_merkle_tree_keep`] —
+/// returns an `Arc<CudaSlice<u64>>` handle to the de-interleaved LDE device
+/// buffer.
+pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    merkle_nodes_out: &mut [u8],
+) -> Result<GpuLdeExt3> {
+    let opt = coset_lde_batch_ext3_into_with_merkle_tree_inner(
+        columns,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        merkle_nodes_out,
+        true,
+    )?;
+    Ok(opt.expect("keep_device_buf=true must return Some"))
+}
+
+fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    merkle_nodes_out: &mut [u8],
+    keep_device_buf: bool,
+) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
-        return Ok(());
+        return Ok(None);
     }
     let m = columns.len();
     assert_eq!(outputs.len(), m);
@@ -1121,7 +1238,7 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
     let total_nodes = 2 * lde_size - 1;
     assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
@@ -1335,7 +1452,17 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
         });
     drop(tree_staging);
     drop(staging);
-    Ok(())
+
+    if keep_device_buf {
+        Ok(Some(GpuLdeExt3 {
+            buf: Arc::new(buf),
+            m,
+            lde_size,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Batched ext3 polynomial → coset evaluation.

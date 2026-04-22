@@ -37,7 +37,9 @@ fn bench_prove(name: &str, trials: u32) {
         let leaf = stark::gpu_lde::gpu_leaf_hash_calls();
         let bary = stark::gpu_lde::gpu_bary_calls();
         let mtree = stark::gpu_lde::gpu_merkle_tree_calls();
+        let deep = stark::gpu_lde::gpu_deep_calls();
         println!("  GPU LDE calls across {trials} proves: {calls}");
+        println!("  GPU deep-composition calls: {deep}");
         println!("  GPU extend_two_halves calls: {eh}");
         println!("  GPU R4 deep-poly LDE calls: {r4}");
         println!("  GPU R2 parts LDE calls: {parts}");

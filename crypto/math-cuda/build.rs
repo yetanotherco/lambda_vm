@@ -56,4 +56,5 @@ fn main() {
     compile_ptx("ntt.cu", "ntt.ptx");
     compile_ptx("keccak.cu", "keccak.ptx");
     compile_ptx("barycentric.cu", "barycentric.ptx");
+    compile_ptx("deep.cu", "deep.ptx");
 }
