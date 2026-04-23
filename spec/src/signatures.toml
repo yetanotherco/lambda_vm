@@ -5,6 +5,12 @@ kind = "template"
 input = ["BaseField"]
 cond = "BaseField"
 
+# IS_BYTE<X, μ>
+[[signatures]]
+tag = "IS_BYTE"
+kind = "template"
+input = ["BaseField", "BaseField"]
+
 # cond => ADD<sum; lhs, rhs>
 [[signatures]]
 tag = "ADD"

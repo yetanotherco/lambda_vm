@@ -18,6 +18,7 @@
     )),
     ("TEMPLATES", (
       ("is_bit.typ", [`IS_BIT` template], <isbit>),
+      ("is_byte.typ", [`IS_BYTE` template], <isbyte>),
       ("sign.typ", [`SIGN` template], <sign>),
       ("add.typ", [`ADD`/`SUB` template], <add>),
       ("neg.typ", [`NEG` template], <neg>),
