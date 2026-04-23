@@ -7,6 +7,8 @@ pub use math::field::element::FieldElement;
 use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
@@ -94,29 +96,37 @@ where
 {
     if !fri_layers.is_empty() {
         let num_layers = fri_layers.len();
-        iotas
-            .iter()
-            .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
-                let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
-                let mut index = *iota_s;
-                for layer in fri_layers {
-                    // symmetric element
-                    let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                    let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
-                    layers_auth_paths_sym.push(auth_path_sym);
+        // Queries are independent: each walks down the (immutable) FRI layer
+        // stack reading evaluations and building auth paths. Parallelize across
+        // queries — this runs after FRI commit, where cross-table parallelism
+        // has wound down.
+        #[cfg(feature = "parallel")]
+        let iter = iotas.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = iotas.iter();
 
-                    index >>= 1;
-                }
+        iter.map(|iota_s| {
+            let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+            let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
-                FriDecommitment {
-                    layers_auth_paths: layers_auth_paths_sym,
-                    layers_evaluations_sym,
-                }
-            })
-            .collect()
+            let mut index = *iota_s;
+            for layer in fri_layers {
+                // symmetric element
+                let evaluation_sym = layer.evaluation[index ^ 1].clone();
+                let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
+                layers_evaluations_sym.push(evaluation_sym);
+                layers_auth_paths_sym.push(auth_path_sym);
+
+                index >>= 1;
+            }
+
+            FriDecommitment {
+                layers_auth_paths: layers_auth_paths_sym,
+                layers_evaluations_sym,
+            }
+        })
+        .collect()
     } else {
         // For 0 FRI layers (small traces), return empty decommitments for each query.
         // The verifier still needs one decommitment entry per query, even if the
