@@ -387,6 +387,15 @@ where
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
 
+    // Caller-supplied barycentric scalars must match the domain they describe.
+    // A mismatch would silently produce wrong evaluations (if too short) or panic
+    // with an opaque index-out-of-bounds in the LDE stride access below.
+    debug_assert_eq!(
+        coset_points.len(),
+        n,
+        "coset_points length must equal domain.interpolation_domain_size"
+    );
+
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
     let evaluation_points =
         compute_frame_evaluation_points(z, frame_offsets, &domain.trace_primitive_root, step_size);

@@ -1231,9 +1231,10 @@ pub trait IsStarkProver<
 
         // === Phase 1: Column compression (Plonky3-style) ===
         // Instead of iterating all ~95 columns per row in the hot loop, we precompute:
-        //   compressed_k[i] = Σ_j gamma[j][k] * trace_col_j[i * bf]
+        //   compressed_k[i] = Σ_j gamma[j][k] * lde_trace.get_main(i, j)   for i in 0..lde_size
         //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k]
-        // This moves the column sum outside the hot loop.
+        // This moves the column sum outside the hot loop. Since the new path evaluates
+        // DEEP directly at all 2N LDE points, no stride is needed — every row is used.
 
         // Precompute OOD compressed values (one per eval point)
         let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
