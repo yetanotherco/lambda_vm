@@ -442,30 +442,49 @@ where
 
     // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
-    // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
-    #[cfg(feature = "parallel")]
-    let main_iter = (0..num_main_cols).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let main_iter = 0..num_main_cols;
-    let main_col_evals: Vec<Vec<FieldElement<F>>> = main_iter
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_main(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
+    // Extract trace-size evaluations from LDE for each column (stride = blowup_factor).
+    // Skip the extraction when the GPU path will handle it — the kernels
+    // read the LDE directly from device handles via stride.
+    #[cfg(feature = "cuda")]
+    let gpu_main_available = lde_trace.gpu_main().is_some();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_main_available = false;
+    #[cfg(feature = "cuda")]
+    let gpu_aux_available = lde_trace.gpu_aux().is_some();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_aux_available = false;
 
-    #[cfg(feature = "parallel")]
-    let aux_iter = (0..num_aux_cols).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let aux_iter = 0..num_aux_cols;
-    let aux_col_evals: Vec<Vec<FieldElement<E>>> = aux_iter
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_aux(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
+    let main_col_evals: Vec<Vec<FieldElement<F>>> = if gpu_main_available {
+        Vec::new()
+    } else {
+        #[cfg(feature = "parallel")]
+        let main_iter = (0..num_main_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let main_iter = 0..num_main_cols;
+        main_iter
+            .map(|col| {
+                (0..n)
+                    .map(|i| lde_trace.get_main(i * bf, col).clone())
+                    .collect()
+            })
+            .collect()
+    };
+
+    let aux_col_evals: Vec<Vec<FieldElement<E>>> = if gpu_aux_available {
+        Vec::new()
+    } else {
+        #[cfg(feature = "parallel")]
+        let aux_iter = (0..num_aux_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = 0..num_aux_cols;
+        aux_iter
+            .map(|col| {
+                (0..n)
+                    .map(|i| lde_trace.get_aux(i * bf, col).clone())
+                    .collect()
+            })
+            .collect()
+    };
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
