@@ -163,6 +163,12 @@ tag = "IS_BYTE"
 kind = "interaction"
 input = ["Byte"]
 
+# ARE_BYTES[X, Y]
+[[signatures]]
+tag = "ARE_BYTES"
+kind = "interaction"
+input = ["Byte", "Byte"]
+
 # IS_HALF[X]
 [[signatures]]
 tag = "IS_HALF"
