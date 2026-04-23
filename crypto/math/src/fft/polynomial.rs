@@ -101,6 +101,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             return Ok(vec![FieldElement::zero(); len]);
         }
 
+        if !len.is_power_of_two() {
+            return Err(FFTError::InputError(len));
+        }
+
         let mut coeffs = poly.coefficients().to_vec();
         coeffs.resize(len, FieldElement::zero());
 
