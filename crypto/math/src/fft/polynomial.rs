@@ -107,12 +107,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         let mut coeffs = poly.coefficients().to_vec();
         coeffs.resize(len, FieldElement::zero());
-
-        let order = len.trailing_zeros() as u64;
-        let layer_twiddles =
-            LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
-        dispatch_fft(&mut coeffs, &layer_twiddles)?;
-        Ok(coeffs)
+        evaluate_fft_cpu_inner::<F, E>(coeffs, false)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -313,7 +308,10 @@ where
     Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
-pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
+fn evaluate_fft_cpu_inner<F, E>(
+    mut coeffs: Vec<FieldElement<E>>,
+    permute_after: bool,
+) -> Result<Vec<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField + Send + Sync,
@@ -326,10 +324,19 @@ where
     let layer_twiddles =
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
-    let mut result = coeffs.to_vec();
-    dispatch_fft(&mut result, &layer_twiddles)?;
-    in_place_bit_reverse_permute(&mut result);
-    Ok(result)
+    dispatch_fft(&mut coeffs, &layer_twiddles)?;
+    if permute_after {
+        in_place_bit_reverse_permute(&mut coeffs);
+    }
+    Ok(coeffs)
+}
+
+pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    evaluate_fft_cpu_inner::<F, E>(coeffs.to_vec(), true)
 }
 
 pub fn interpolate_fft_cpu<F, E>(
