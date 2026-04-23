@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
@@ -256,29 +258,43 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
-        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
-        let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
-            boundary_constraints
-                .constraints
-                .iter()
-                .map(|bc| {
-                    let point = match boundary_step_points.iter().find(|(s, _)| *s == bc.step) {
-                        Some((_, p)) => p.clone(),
-                        None => {
-                            let p = domain.trace_primitive_root.pow(bc.step as u64);
-                            boundary_step_points.push((bc.step, p.clone()));
-                            p
-                        }
-                    };
-                    let mut evals = domain
-                        .lde_roots_of_unity_coset
-                        .iter()
-                        .map(|v| v - &point)
-                        .collect::<Vec<FieldElement<Field>>>();
-                    FieldElement::inplace_batch_inverse(&mut evals).unwrap();
-                    evals
-                })
-                .collect::<Vec<Vec<FieldElement<Field>>>>();
+
+        // Deduplicate boundary zerofier inverses by step.
+        //
+        // Two boundary constraints at the same step share the same zerofier
+        // `v - g^step` on the LDE coset, so `inplace_batch_inverse` over the
+        // full LDE (≥2M elements at typical sizes) would run redundantly if we
+        // computed one vector per constraint.
+        //
+        // Build `unique_zerofier_invs`: one inverted zerofier vector per unique
+        // step. `constraint_zerofier_idx[c]` indexes into it so the downstream
+        // hot-loop keeps its per-constraint shape but reads from the shared
+        // storage.
+        //
+        // Typical savings (e.g. circular LogUp pins `acc[N-1]=0` on every table
+        // sharing step = N-1): the batch inversion runs ≤ 3 times per table
+        // instead of `num_boundary_constraints` times, and peak memory drops
+        // from `num_boundary_constraints × lde_size` to `unique_steps × lde_size`.
+        let mut step_to_idx: HashMap<usize, usize> = HashMap::new();
+        let mut unique_zerofier_invs: Vec<Vec<FieldElement<Field>>> = Vec::new();
+        let mut constraint_zerofier_idx: Vec<usize> =
+            Vec::with_capacity(boundary_constraints.constraints.len());
+        for bc in boundary_constraints.constraints.iter() {
+            let idx = *step_to_idx.entry(bc.step).or_insert_with(|| {
+                let point = domain.trace_primitive_root.pow(bc.step as u64);
+                let mut evals = domain
+                    .lde_roots_of_unity_coset
+                    .iter()
+                    .map(|v| v - &point)
+                    .collect::<Vec<FieldElement<Field>>>();
+                FieldElement::inplace_batch_inverse(&mut evals)
+                    .expect("boundary zerofier has no zero: g^step is unique in the trace coset");
+                let idx = unique_zerofier_invs.len();
+                unique_zerofier_invs.push(evals);
+                idx
+            });
+            constraint_zerofier_idx.push(idx);
+        }
 
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
@@ -312,16 +328,17 @@ where
                 b_constraints
                     .iter()
                     .zip(boundary_coefficients)
-                    .zip(boundary_zerofiers_inverse_evaluations.iter())
+                    .zip(constraint_zerofier_idx.iter())
                     .fold(
                         FieldElement::zero(),
-                        |acc, ((constraint, beta), zerofier_inv)| {
+                        |acc, ((constraint, beta), &zerofier_idx)| {
                             let bp = if constraint.is_aux {
                                 lde_trace.get_aux(domain_index, constraint.col) - &constraint.value
                             } else {
                                 lde_trace.get_main(domain_index, constraint.col) - &constraint.value
                             };
-                            acc + &zerofier_inv[domain_index] * beta * bp
+                            let zerofier_inv = &unique_zerofier_invs[zerofier_idx][domain_index];
+                            acc + zerofier_inv * beta * bp
                         },
                     )
             })
