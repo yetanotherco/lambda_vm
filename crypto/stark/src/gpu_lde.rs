@@ -1502,24 +1502,32 @@ where
             gammas_tr_out[idx + 2] = v[2];
         }
     }
-    let mut inv_h_flat = vec![0u64; domain_size * 3];
-    for (i, e) in inv_h.iter().enumerate() {
-        let v = e3_raw(e);
-        inv_h_flat[i * 3] = v[0];
-        inv_h_flat[i * 3 + 1] = v[1];
-        inv_h_flat[i * 3 + 2] = v[2];
+    // SAFETY: E == Ext3; each FieldElement<E> is `[u64; 3]`. Cast the
+    // contiguous Vec<FieldElement<E>> layer to a `&[u64]` and memcpy once,
+    // instead of a per-element u64 copy loop.
+    let inv_h_flat: Vec<u64> = unsafe {
+        core::slice::from_raw_parts(inv_h.as_ptr() as *const u64, inv_h.len() * 3)
     }
+    .to_vec();
     assert_eq!(inv_t.len(), num_eval_points);
-    let mut inv_t_flat = vec![0u64; num_eval_points * domain_size * 3];
-    for (k, layer) in inv_t.iter().enumerate() {
-        debug_assert_eq!(layer.len(), domain_size);
-        for (i, e) in layer.iter().enumerate() {
-            let v = e3_raw(e);
-            let idx = (k * domain_size + i) * 3;
-            inv_t_flat[idx] = v[0];
-            inv_t_flat[idx + 1] = v[1];
-            inv_t_flat[idx + 2] = v[2];
-        }
+    let mut inv_t_flat: Vec<u64> = Vec::with_capacity(num_eval_points * domain_size * 3);
+    unsafe { inv_t_flat.set_len(num_eval_points * domain_size * 3) };
+    {
+        let dst_ptr = inv_t_flat.as_mut_ptr() as usize;
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_eval_points).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_eval_points;
+        iter.for_each(|k| {
+            let layer = &inv_t[k];
+            let src = unsafe {
+                core::slice::from_raw_parts(layer.as_ptr() as *const u64, domain_size * 3)
+            };
+            unsafe {
+                let dst = (dst_ptr as *mut u64).add(k * domain_size * 3);
+                core::ptr::copy_nonoverlapping(src.as_ptr(), dst, domain_size * 3);
+            }
+        });
     }
 
     let raw_out = math_cuda::deep::deep_composition_ext3(
