@@ -246,6 +246,11 @@ where
         }
     }
 
+    /// Number of boundary constraints captured when this evaluator was built.
+    pub fn num_boundary_constraints(&self) -> usize {
+        self.boundary_constraints.constraints.len()
+    }
+
     pub(crate) fn evaluate(
         &self,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
