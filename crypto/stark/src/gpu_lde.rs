@@ -1267,6 +1267,155 @@ pub fn gpu_deep_calls() -> u64 {
     GPU_DEEP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static GPU_FRI_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn gpu_fri_calls() -> u64 {
+    GPU_FRI_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// GPU-resident FRI commit phase. Keeps evals, twiddles, and per-layer
+/// trees on device across all folds. Mirrors
+/// `commit_phase_from_evaluations` on CPU (transcript interleaving
+/// unchanged — each layer's zeta is sampled from the host transcript,
+/// each layer's root is D2H'd and appended there).
+///
+/// Returns `None` to fall back to CPU (small domain, type mismatch, etc.).
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_fri_commit_gpu<F, E>(
+    number_layers: usize,
+    evals: &[FieldElement<E>],
+    transcript: &mut impl crypto::fiat_shamir::is_transcript::IsStarkTranscript<E, F>,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> Option<(
+    FieldElement<E>,
+    Vec<crate::fri::fri_commitment::FriLayer<E, crate::config::FriLayerMerkleTreeBackend<E>>>,
+)>
+where
+    F: math::field::traits::IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: math::traits::AsBytes + Sync + Send,
+    FieldElement<E>: math::traits::AsBytes + Sync + Send,
+{
+    use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+    use math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
+
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if !domain_size.is_power_of_two() || domain_size < gpu_lde_threshold() {
+        return None;
+    }
+    if evals.len() != domain_size || number_layers < 1 {
+        return None;
+    }
+    if domain_size < (1 << 3) {
+        return None;
+    }
+
+    GPU_FRI_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Compute initial inv_twiddles on host — same recipe as
+    // `compute_coset_twiddles_inv`.
+    let half = domain_size / 2;
+    let order = domain_size.trailing_zeros() as u64;
+    let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset)
+        .expect("coset twiddles available");
+    in_place_bit_reverse_permute(&mut points);
+    FieldElement::inplace_batch_inverse(&mut points).expect("twiddle inverse");
+
+    // Raw u64 views: E == Ext3 (3 u64) for evals, F == Gl (1 u64) for twiddles.
+    let evals_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, domain_size * 3) };
+    let tw_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(points.as_ptr() as *const u64, half) };
+
+    let mut state = math_cuda::fri::FriCommitState::new(evals_raw, tw_raw, domain_size)
+        .expect("FRI state alloc");
+
+    let mut fri_layer_list =
+        Vec::<crate::fri::fri_commitment::FriLayer<E, crate::config::FriLayerMerkleTreeBackend<E>>>::with_capacity(number_layers);
+    let mut current_coset_offset = coset_offset.clone();
+    let mut current_domain_size = domain_size;
+
+    for _ in 1..number_layers {
+        let zeta: FieldElement<E> = transcript.sample_field_element();
+        current_coset_offset = current_coset_offset.square();
+        current_domain_size /= 2;
+
+        // SAFETY: E == Ext3 (layout [u64; 3]).
+        let zeta_raw: [u64; 3] = unsafe {
+            let p = &zeta as *const FieldElement<E> as *const u64;
+            [*p, *p.add(1), *p.add(2)]
+        };
+
+        let (root_bytes, layer_evals_raw, nodes_bytes) =
+            state.fold_and_commit_layer(zeta_raw).expect("FRI fold+commit");
+
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&root_bytes[..32]);
+
+        // Re-chunk tree nodes into Vec<[u8; 32]> for MerkleTree.
+        let num_leaves = current_domain_size / 2;
+        let tight_total_nodes = 2 * num_leaves - 1;
+        debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
+        let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
+        for i in 0..tight_total_nodes {
+            let mut n = [0u8; 32];
+            n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
+            nodes.push(n);
+        }
+        let merkle_tree =
+            crypto::merkle_tree::merkle::MerkleTree::<crate::config::FriLayerMerkleTreeBackend<E>>::from_precomputed_nodes(nodes)
+                .expect("FRI MerkleTree build");
+
+        // Rebuild the layer's ext3 evals from raw u64s.
+        debug_assert_eq!(layer_evals_raw.len(), 3 * current_domain_size);
+        let mut layer_evals: Vec<FieldElement<E>> = Vec::with_capacity(current_domain_size);
+        unsafe { layer_evals.set_len(current_domain_size) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                layer_evals_raw.as_ptr(),
+                layer_evals.as_mut_ptr() as *mut u64,
+                current_domain_size * 3,
+            );
+        }
+
+        fri_layer_list.push(crate::fri::fri_commitment::FriLayer::new(
+            &layer_evals,
+            merkle_tree,
+            current_coset_offset.clone().to_extension(),
+            current_domain_size,
+        ));
+
+        transcript.append_bytes(&root_arr);
+    }
+
+    // Final fold.
+    let zeta: FieldElement<E> = transcript.sample_field_element();
+    let zeta_raw: [u64; 3] = unsafe {
+        let p = &zeta as *const FieldElement<E> as *const u64;
+        [*p, *p.add(1), *p.add(2)]
+    };
+    let last_raw = state.fold_final(zeta_raw).expect("FRI final fold");
+
+    // SAFETY: E == Ext3; build FieldElement<E> from raw u64s.
+    let last_value: FieldElement<E> = unsafe {
+        let mut e: FieldElement<E> = core::mem::zeroed();
+        let ptr = &mut e as *mut FieldElement<E> as *mut u64;
+        *ptr = last_raw[0];
+        *ptr.add(1) = last_raw[1];
+        *ptr.add(2) = last_raw[2];
+        e
+    };
+
+    transcript.append_field_element(&last_value);
+
+    Some((last_value, fri_layer_list))
+}
+
 /// R3 OOD barycentric over the **main** (base-field) LDE read directly from
 /// the device handle with stride `row_stride = blowup_factor`. Applies the
 /// same trailing `scalar * vanishing * sum` ext3 scale on host that

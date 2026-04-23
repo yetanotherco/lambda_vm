@@ -33,6 +33,24 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    // GPU fast path: keeps evals, inv_twiddles, and per-layer Merkle trees
+    // device-resident across log₂(domain_size) layers. Only D2H'd per
+    // layer: the root (32 B → transcript) + the layer's evals and tree
+    // nodes (needed by query_phase later). Falls back to CPU when the
+    // `cuda` feature is off, types mismatch, or the domain is too small.
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E>(
+            number_layers,
+            &evals,
+            transcript,
+            coset_offset,
+            domain_size,
+        ) {
+            return result;
+        }
+    }
+
     // Inverse twiddle factors for evaluation-form folding
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
