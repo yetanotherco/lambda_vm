@@ -854,11 +854,15 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
+    ///
+    /// Takes a pre-built [`ConstraintEvaluator`] so callers (prove_rounds_2_to_4)
+    /// can consult `evaluator.num_boundary_constraints()` for coefficient sizing
+    /// without paying for the full `boundary_constraints(..)` build twice.
     fn round_2_compute_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        pub_inputs: &PI,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
+        evaluator: &ConstraintEvaluator<Field, FieldExtension, PI>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
     ) -> Result<Round2<FieldExtension>, ProvingError>
@@ -868,13 +872,6 @@ pub trait IsStarkProver<
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
         let trace_length = domain.interpolation_domain_size;
-        let evaluator = ConstraintEvaluator::new(
-            air,
-            pub_inputs,
-            &round_1_result.rap_challenges,
-            round_1_result.bus_public_inputs.as_ref(),
-            trace_length,
-        );
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let constraint_evaluations = evaluator.evaluate(
@@ -1936,15 +1933,20 @@ pub trait IsStarkProver<
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
         let trace_length = domain.interpolation_domain_size;
-        let num_boundary_constraints = air
-            .boundary_constraints(
-                pub_inputs,
-                &round_1_result.rap_challenges,
-                round_1_result.bus_public_inputs.as_ref(),
-                trace_length,
-            )
-            .constraints
-            .len();
+
+        // Build the constraint evaluator once. Its stored BoundaryConstraints
+        // is reused for (1) sizing the β-power coefficient vector and (2) the
+        // `evaluate(..)` call inside round_2. Previously we ran
+        // `air.boundary_constraints(..)` here just to read `.constraints.len()`
+        // and `ConstraintEvaluator::new` ran it again.
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            pub_inputs,
+            &round_1_result.rap_challenges,
+            round_1_result.bus_public_inputs.as_ref(),
+            trace_length,
+        );
+        let num_boundary_constraints = evaluator.num_boundary_constraints();
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
@@ -1959,9 +1961,9 @@ pub trait IsStarkProver<
 
         let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
-            pub_inputs,
             domain,
             round_1_result,
+            &evaluator,
             &transition_coefficients,
             &boundary_coefficients,
         )?;
