@@ -39,7 +39,7 @@ Given that `CPU` asserts that `EBREAK = 0` (see @cpu:c:ebreak_traps), using this
 Note moreover that the `pc` is set to $7$.
 This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _$4$_ (i.e., the max `pc`-increment) greater than _$1$_ (i.e., the `pc`-value used in the #link(<cpu-padding-decode-row>)[additional instruction] referred to by `CPU`-padding lines).
 
-= Decoding
+= Decoding<decode:decoding-overview>
 For the purposes of explaining decoding, we decompress #decode's `packed_decode` variable into its constituent variables.
 Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
 
@@ -63,12 +63,6 @@ For the purpose of brevity and readability, the table uses the following rules-o
   *The `c_type` flag is set independently of the below table*, as explained next.
 
 Further clarification is provided in the notes following the table.
-
-== C-type instructions
-The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size.
-This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by $2$ rather than $4$.
-To indicate an instruction is provided in compressed form, the `c_type` flag is introduced.
-*This flag should be set to $1$ whenever the decoded instruction is provided in compressed form and $0$ otherwise.*
 
 /// Add a reference to one or more notes following this table.
 #let ref_note(..refs) = {
@@ -151,6 +145,12 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
 )
 
 #decoding_table(decoding)
+
+== C-type instructions
+The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size.
+This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by $2$ rather than $4$.
+To indicate an instruction is provided in compressed form, the `c_type` flag is introduced.
+*This flag should be set to $1$ whenever the decoded instruction is provided in compressed form and $0$ otherwise.*
 
 // Construct a note that can be referenced through `lbl`
 #let referenceable_note(lbl, note) = {

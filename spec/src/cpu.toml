@@ -664,6 +664,7 @@ tag = "MEMW"
 input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
 output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register1"
+ref = "cpu:c:read_rv1"
 
 [[constraints.mem]]
 kind = "arith"

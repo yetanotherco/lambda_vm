@@ -62,12 +62,13 @@ The interactions with the memory, both for register loading and storing, as for 
 Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs.
 The `pc` register behaves very predictably with respect to its timestamps and when it is being read,
 so for performance reasons, we inline its memory interactions directly into the #cpu chip.
-The timestamps are ensured to be disjoint for disjoint memory locations.
+
+Potentially overlapping memory accesses are ensured to have disjoint timestamps.
 One consequence of that is that `next_pc` is written at `timestamp + 1`
-to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction.
-Constraints on `pc_double_read` corresponding to an `AUIPC` instruction are not necessary,
+to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction (see @cpu:c:read_rv1 and @decode:decoding-overview).
+Constraints regarding whether `pc_double_read` corresponds to an `AUIPC` instruction are not necessary,
 as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp,
-and the integrity of the memory argument therefor ensures the correctness of this bit.
+and the integrity of the memory argument therefore ensures the correctness of this bit.
 
 #render_constraint_table(chip, config, groups: "mem")
 
