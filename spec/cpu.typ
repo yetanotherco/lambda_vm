@@ -56,7 +56,7 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 
 #render_constraint_table(chip, config, groups: "alu")
 
-== Memory
+== Memory<cpu:memory>
 
 The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled.
 Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs.
