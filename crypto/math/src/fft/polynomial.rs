@@ -257,6 +257,65 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         Ok(())
     }
+
+    /// In-place non-coset LDE: the buffer already contains N evaluation points on the
+    /// N-point (non-offset) domain. Expands to `N * blowup_factor` evaluations on the
+    /// `N * blowup_factor`-point (non-offset) domain.
+    ///
+    /// Steps:
+    /// 1. bit-reverse buffer[..N]; iFFT in place
+    /// 2. Scale buffer[..N] by 1/N
+    /// 3. Zero-pad to `N * blowup_factor`
+    /// 4. Forward FFT on the full buffer; bit-reverse
+    ///
+    /// This is mathematically equivalent to `interpolate_fft_with_twiddles` followed by
+    /// resizing the resulting coefficient vector and calling
+    /// `evaluate_fft_with_twiddles`, but avoids 4–5 intermediate Vec clones of N elements.
+    ///
+    /// Used for the Round 4 DEEP composition polynomial extension: input evaluations
+    /// on a trace-size coset are treated as f(ω_N^i) for f(x) = h(g·x). After
+    /// expansion, the output equals f on the 2N-th roots of unity, which coincides
+    /// with h on the 2N-point g-coset — i.e. the LDE values needed by FRI.
+    pub fn fft_expand_in_place<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        blowup_factor: usize,
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = buffer.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        // Scale by 1/n — base field scalar, F × E → E mixed multiplication.
+        let n_inv = FieldElement::<F>::from(n as u64)
+            .inv()
+            .expect("n is a power of two, hence non-zero in the field");
+        for coeff in buffer[..n].iter_mut() {
+            *coeff = &n_inv * &*coeff;
+        }
+
+        buffer.resize(lde_size, FieldElement::zero());
+
+        dispatch_fft(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::cpu::bit_reversing::reverse_index;
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
@@ -1057,10 +1057,14 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset.
+        // The buffer is allocated at 2N capacity so `fft_expand_in_place` can grow
+        // in place without reallocating.
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+        let n = domain.interpolation_domain_size;
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        let mut lde_evals = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1070,20 +1074,37 @@ pub trait IsStarkProver<
             &gammas,
             &trace_term_coeffs,
         );
+        // Ensure the buffer has capacity for the LDE-sized output so the subsequent
+        // `resize(domain_size, zero)` inside `fft_expand_in_place` is realloc-free.
+        lde_evals.reserve_exact(domain_size - lde_evals.len());
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
-        // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
-        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via a fused
+        // in-place iFFT + zero-pad + FFT on a single buffer.
+        // `deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i)` where `f(x) = h(offset·x)`.
+        // Non-offset iFFT + non-offset FFT(2N) recovers `f(Ω^j) = h(offset·Ω^j)`,
+        // i.e. h on the 2N-point g-coset (the LDE domain).
+        //
+        // This replaces the old `interpolate_fft → coefficients.to_vec → evaluate_fft`
+        // chain, eliminating 4–5 full-N intermediate clones of extension-field data.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
-        in_place_bit_reverse_permute(&mut lde_evals);
+        let inv_twiddles = LayerTwiddles::<Field>::new_inverse(n.trailing_zeros() as u64)
+            .expect("valid inverse twiddles");
+        let fwd_twiddles = LayerTwiddles::<Field>::new(domain_size.trailing_zeros() as u64)
+            .expect("valid forward twiddles");
+        Polynomial::<FieldElement<FieldExtension>>::fft_expand_in_place::<Field>(
+            &mut lde_evals,
+            domain.blowup_factor,
+            &inv_twiddles,
+            &fwd_twiddles,
+        )
+        .expect("in-place FFT expansion");
+        // FRI commit expects bit-reversed evaluations. `fft_expand_in_place` returns
+        // natural-order evaluations (matching `coset_lde_full_expand`), so bit-reverse
+        // once here — same as the original code did after `evaluate_fft`.
+        math::fft::cpu::bit_reversing::in_place_bit_reverse_permute(&mut lde_evals);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
