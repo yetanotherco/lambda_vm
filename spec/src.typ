@@ -115,6 +115,38 @@
   }
 }
 
+/// Fowler-Noll-Vo (FNV) hash function, version 1a
+/// Src: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+/// 
+/// Note: this is a non-cryptographic hash function; it is optimized
+/// for speed at the expense of unpredictability.
+/// 
+/// This implementation operates on two 32-bit limbs, rather than a single 
+/// 64-bit limb, since Typst does not support u64s.
+#let FNV-1a(bytes) = {
+  // FNV_prime := 0x00000100000001B3
+  let prime = (0x000001B3, 0x00000100)
+
+  // hash := FNV_offset_basis = 0xCBF29CE484222325
+  let hash = (0x84222325, 0xCBF29CE4)
+  for b in bytes {
+    // hash := hash XOR byte_of_data
+    hash.at(0) = hash.at(0).bit-xor(b)
+
+    // hash := hash × FNV_prime
+    let lo = hash.at(0) * prime.at(0)
+    let hi = hash.at(0) * prime.at(1) + hash.at(1) * prime.at(0)
+    
+    // Carry result
+    let carry = lo.bit-rshift(32)
+    let lo = lo.bit-and(0xFFFFFFFF)
+    let hi = (hi + carry).bit-and(0xFFFFFFFF)
+    hash = (lo, hi)
+  }
+
+  hash.map(int.to-bytes).join()
+}
+
 /// Load a chip object from file
 ///
 /// - path(str): path to file containing chip data
