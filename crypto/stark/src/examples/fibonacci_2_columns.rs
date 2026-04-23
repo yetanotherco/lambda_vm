@@ -4,7 +4,7 @@ use super::simple_fibonacci::FibonacciPublicInputs;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -26,7 +26,7 @@ impl<F: IsFFTField> FibTransition1<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibTransition1<F>
+impl<F> TransitionConstraintEvaluator<F, F> for FibTransition1<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -42,7 +42,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -89,7 +89,7 @@ impl<F: IsFFTField> FibTransition2<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibTransition2<F>
+impl<F> TransitionConstraintEvaluator<F, F> for FibTransition2<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -105,7 +105,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -144,7 +144,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 /// The AIR for to a 2 column trace, where the columns form a Fibonacci sequence when
@@ -162,7 +162,9 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> = vec![
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![
             Box::new(FibTransition1::new()),
             Box::new(FibTransition2::new()),
         ];
@@ -193,7 +195,7 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
+    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, F>>> {
         &self.constraints
     }
 

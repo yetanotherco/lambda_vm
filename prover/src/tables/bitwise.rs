@@ -1,9 +1,9 @@
 //! BITWISE precomputed lookup table.
 //!
-//! This table provides 11 different lookup types used by other tables:
+//! This table provides 10 different lookup types used by other tables:
 //!
 //! ## Range Checks
-//! - `IS_BYTE[X]` - X is a valid byte [0, 256)
+//! - `IS_BYTE[X, Y]` - X and Y are valid bytes [0, 256)
 //! - `IS_HALF[X]` - X is a valid halfword [0, 2^16)
 //! - `IS_B20[X]` - X is a valid 20-bit value [0, 2^20)
 //!
@@ -84,7 +84,8 @@ pub mod cols {
     pub const MU_MSB16: usize = 15;
     /// Multiplicity for ZERO lookups
     pub const MU_ZERO: usize = 16;
-    /// Multiplicity for IS_BYTE lookups
+    /// Multiplicity for IS_BYTE lookups. Each lookup checks X and Y; pass Y=0
+    /// for a single-byte range check.
     pub const MU_IS_BYTE: usize = 17;
     /// Multiplicity for IS_HALF lookups
     pub const MU_IS_HALF: usize = 18;
@@ -92,7 +93,6 @@ pub mod cols {
     pub const MU_IS_B20: usize = 19;
     /// Multiplicity for HWSL lookups
     pub const MU_HWSL: usize = 20;
-
     /// Total number of columns
     pub const NUM_COLUMNS: usize = 21;
 }
@@ -417,7 +417,7 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (indices 11-21)
+            // Check all multiplicity columns (indices 11-20)
             (cols::MU_AND..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
         })
         .collect();
@@ -476,7 +476,8 @@ pub enum BitwiseOperationType {
 /// - AND/OR/XOR: `x OP y`
 /// - MSB8: MSB of `x`
 /// - MSB16: MSB of halfword `x + y * 256`
-/// - IS_BYTE/IS_HALF: Range check on `x + y * 256`
+/// - IS_BYTE: Range check both `x` and `y`; use `y = 0` for a single byte
+/// - IS_HALF: Range check on `x + y * 256`
 /// - HWSL: Shift `x + y * 256` by `z` bits, returning [SLL, SLLC] as a pair
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BitwiseOperation {
@@ -667,14 +668,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // IS_BYTE[X] - range check, no output
+        // IS_BYTE[X, Y] - range check two byte values, no output.
+        // Single-byte checks send the second argument as 0.
         BusInteraction::receiver(
             BusId::IsByte,
             Multiplicity::Column(cols::MU_IS_BYTE),
-            vec![BusValue::Packed {
-                start_column: cols::X,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+            ],
         ),
         // IS_HALF[X + 256*Y] - range check for halfword
         BusInteraction::receiver(
