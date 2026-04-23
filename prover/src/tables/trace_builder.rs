@@ -1240,7 +1240,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - IS_BYTE[next_pc_low[1]] - range check bits 8-15
+/// - IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
 /// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
@@ -1260,7 +1260,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
 
-        // IS_BYTE[next_pc_low[1]] - range check for byte value
+        // IS_BYTE[next_pc_low[1], 0] - range check for byte value
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             next_pc_low_1,
@@ -1302,20 +1302,34 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Generates IS_BYTE ops for CPU padding rows.
 ///
 /// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
-/// Since the CPU bus interactions use Multiplicity::One for byte checks,
+/// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 27 IsByte(0) = 27 ops.
+/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
+/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
     }
 
-    let mut ops = Vec::with_capacity(num_padding_rows * 27);
+    let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        for _ in 0..27 {
-            ops.push(BitwiseOperation::single_byte(
+        // IS_BYTE[RS1, RS2] pair (both zero in padding)
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::IsByte,
+            0,
+            0,
+        ));
+        // IS_BYTE[RD, 0] single (zero in padding)
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            0,
+        ));
+        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
+        for _ in 0..12 {
+            ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
+                0,
                 0,
             ));
         }
@@ -1325,9 +1339,8 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
-/// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init] for initialization range check
-/// - C2: IS_BYTE[fini] for finalization range check
+/// Each PAGE row generates 1 batched IS_BYTE lookup:
+/// - C1+C2: IS_BYTE[init, fini] — range-checks both bytes in one interaction
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
 fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
@@ -1383,15 +1396,10 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1: IS_BYTE[init]
-            bitwise_ops.push(BitwiseOperation::single_byte(
+            // C1+C2: IS_BYTE[init, fini] — batched range check for both bytes
+            bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
                 init,
-            ));
-
-            // C2: IS_BYTE[fini]
-            bitwise_ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
                 fini,
             ));
         }
@@ -1810,7 +1818,7 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+    // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
     if let Some(elf) = elf {
         bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state));
     }
