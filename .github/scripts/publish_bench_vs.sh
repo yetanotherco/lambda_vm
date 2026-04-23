@@ -2,6 +2,12 @@
 set -euo pipefail
 
 WEBHOOK_URL="$1"
+
+if [ -z "$WEBHOOK_URL" ]; then
+    echo "SLACK_WEBHOOK not configured, skipping notification."
+    exit 0
+fi
+
 METRICS_FILE="bench_vs_artifacts/metrics.txt"
 
 if [ ! -f "$METRICS_FILE" ]; then
