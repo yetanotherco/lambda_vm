@@ -57,4 +57,5 @@ fn main() {
     compile_ptx("keccak.cu", "keccak.ptx");
     compile_ptx("barycentric.cu", "barycentric.ptx");
     compile_ptx("deep.cu", "deep.ptx");
+    compile_ptx("fri.cu", "fri.ptx");
 }

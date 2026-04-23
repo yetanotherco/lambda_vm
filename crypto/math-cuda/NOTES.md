@@ -5,12 +5,12 @@ context loss between sessions. Update as you go.
 
 ## Current state (2026-04-21, 5 commits on branch `cuda/batched-ntt`)
 
-### End-to-end speedup (fused tree + R2-commit tree + GPU R4 deep + LDE-resident handles)
+### End-to-end speedup (fused tree + GPU R4 deep + LDE-resident handles + GPU R3 OOD)
 
 | Program | CPU rayon (46 cores) | CUDA (median over 5+ runs) | Delta |
 |---|---|---|---|
-| fib_iterative_1M | **18.269 s** | **12.66 s** | **1.44× (30.7% faster)** |
-| fib_iterative_4M |               | **29.75 s** |   |
+| fib_iterative_1M | **18.269 s** | **12.13 s** | **1.51× (33.6% faster)** |
+| fib_iterative_4M |               | **29.05 s** |   |
 
 Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 
@@ -24,6 +24,7 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
 | R2 commit_composition_poly | Row-pair ext3 Keccak leaves + pair-hash inner tree | `keccak_comp_poly_leaves_ext3` + `keccak_merkle_level` |
 | R4 DEEP-poly LDE | Standard ext3 LDE with uniform 1/N weights | `ntt_*_batched` via ext3 decomposition |
 | **R4 deep_composition_poly_evals** | Per trace-size row, sum ~200 ext3 FMAs over all LDE cols + scalars. Reads main+aux LDE **from device handles** (no re-H2D) | `deep_composition_ext3_row` |
+| **R3 OOD evaluation** | Per eval point, batched barycentric over all main (base) + aux (ext3) columns. Reads LDE directly from device handles with `row_stride = blowup_factor` (no slab extraction, no H2D) | `barycentric_{base,ext3}_batched_strided` |
 | R2 `extend_half_to_lde` | Dormant — only hit by tiny tables below threshold | Infrastructure in place |
 
 ### Where time still goes (aggregate across rayon threads, 1M-fib, warm)
