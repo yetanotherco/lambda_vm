@@ -163,12 +163,6 @@ kind = "interaction"
 input = ["B20"]
 output = "Bit"
 
-# IS_BYTE[X]
-[[signatures]]
-tag = "IS_BYTE"
-kind = "interaction"
-input = ["Byte"]
-
 # ARE_BYTES[X, Y]
 [[signatures]]
 tag = "ARE_BYTES"
