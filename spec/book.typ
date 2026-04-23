@@ -145,7 +145,7 @@
         } else {
           rf.supplement
         }
-        [#supplement#numbering(fig.numbering, ..counter.at(lbl))]
+        [#supplement #numbering(fig.numbering, ..counter.at(lbl))]
       }
       cross-link("/" + ch, reference: shiroa-label, link-content)
     }
@@ -183,6 +183,11 @@
           xref-include(key)
         }).join()
         #metadata(json("interaction_count.json").sum(default: (:)))<interaction_count>
+
+        #let chapter-index = meta_sections.position(x => x.at(0) == file) + 1
+        #set heading(numbering: (..args) => [#chapter-index.#numbering("1.1", ..args)])
+        #counter(heading).update(0)
+
         #body
       ])
     }
