@@ -1523,11 +1523,17 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor).
-        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
-        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20) and
+        // typically share the same proof_options, so one entry per unique trace
+        // length is the common case. `coset_offset` is included in the key so that
+        // if callers ever pass AIRs with heterogeneous proof_options, tables with
+        // different offsets do not silently alias onto the same Domain/LdeTwiddles
+        // — an aliased domain would produce wrong LDE evaluations and an invalid
+        // proof.
+        // Without dedup, each AIR creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
         type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
-        let mut domain_cache: std::collections::HashMap<(usize, usize), DomainEntry<Field>> =
+        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
             std::collections::HashMap::new();
 
         let mut domains = Vec::with_capacity(num_airs);
@@ -1536,7 +1542,8 @@ pub trait IsStarkProver<
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let blowup = air.options().blowup_factor as usize;
-            let key = (trace_length, blowup);
+            let coset_offset = air.options().coset_offset;
+            let key = (trace_length, blowup, coset_offset);
 
             let (domain, twiddles) = domain_cache
                 .entry(key)
