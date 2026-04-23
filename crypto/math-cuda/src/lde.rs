@@ -1485,8 +1485,50 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    evaluate_poly_coset_batch_ext3_into_inner(
+        coefs,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// Same as [`evaluate_poly_coset_batch_ext3_into`] but retains the de-
+/// interleaved LDE device buffer as a `GpuLdeExt3` handle. Lets R2 commit
+/// and R4 DEEP composition read the composition-parts LDE without
+/// re-H2D'ing.
+pub fn evaluate_poly_coset_batch_ext3_into_keep(
+    coefs: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<GpuLdeExt3> {
+    let opt = evaluate_poly_coset_batch_ext3_into_inner(
+        coefs,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        true,
+    )?;
+    Ok(opt.expect("keep_device_buf=true must return Some"))
+}
+
+fn evaluate_poly_coset_batch_ext3_into_inner(
+    coefs: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    keep_device_buf: bool,
+) -> Result<Option<GpuLdeExt3>> {
     if coefs.is_empty() {
-        return Ok(());
+        assert_eq!(outputs.len(), 0);
+        return Ok(None);
     }
     let m = coefs.len();
     assert_eq!(outputs.len(), m);
@@ -1501,7 +1543,7 @@ pub fn evaluate_poly_coset_batch_ext3_into(
         assert_eq!(o.len(), 3 * lde_size);
     }
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let log_lde = lde_size.trailing_zeros() as u64;
 
@@ -1518,7 +1560,7 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     coefs.par_iter().enumerate().for_each(|(c, col)| {
         let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 0) * n), n)
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
         };
         let slab_b = unsafe {
             std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
@@ -1527,7 +1569,7 @@ pub fn evaluate_poly_coset_batch_ext3_into(
             std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
         };
         for i in 0..n {
-            slab_a[i] = col[i * 3 + 0];
+            slab_a[i] = col[i * 3];
             slab_b[i] = col[i * 3 + 1];
             slab_c[i] = col[i * 3 + 2];
         }
@@ -1601,7 +1643,7 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let slab_a = unsafe {
             std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 0) * lde_size),
+                (pinned_const as *const u64).add((c * 3) * lde_size),
                 lde_size,
             )
         };
@@ -1618,13 +1660,22 @@ pub fn evaluate_poly_coset_batch_ext3_into(
             )
         };
         for i in 0..lde_size {
-            dst[i * 3 + 0] = slab_a[i];
+            dst[i * 3] = slab_a[i];
             dst[i * 3 + 1] = slab_b[i];
             dst[i * 3 + 2] = slab_c[i];
         }
     });
     drop(staging);
-    Ok(())
+    if keep_device_buf {
+        Ok(Some(GpuLdeExt3 {
+            buf: std::sync::Arc::new(buf),
+            m,
+            lde_size,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Fused variant of [`evaluate_poly_coset_batch_ext3_into`]: in addition to

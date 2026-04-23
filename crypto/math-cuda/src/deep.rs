@@ -39,6 +39,87 @@ pub fn deep_composition_ext3(
     blowup_factor: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    deep_composition_ext3_impl(
+        main_lde,
+        aux_lde,
+        None,
+        h_parts_deinterleaved,
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        inv_h,
+        inv_t,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        blowup_factor,
+        domain_size,
+    )
+}
+
+/// Same as [`deep_composition_ext3`] but reads the composition-parts LDE
+/// from a device handle (`GpuLdeExt3`) populated by the R2 fused path,
+/// skipping the `num_parts * 3 * lde_size * 8` byte H2D of
+/// `h_parts_deinterleaved`.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_composition_ext3_with_dev_parts(
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: &GpuLdeExt3,
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    inv_h: &[u64],
+    inv_t: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    blowup_factor: usize,
+    domain_size: usize,
+) -> Result<Vec<u64>> {
+    deep_composition_ext3_impl(
+        main_lde,
+        aux_lde,
+        Some(h_parts_dev),
+        &[],
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        inv_h,
+        inv_t,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        blowup_factor,
+        domain_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deep_composition_ext3_impl(
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: Option<&GpuLdeExt3>,
+    h_parts_host: &[u64],
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    inv_h: &[u64],
+    inv_t: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    blowup_factor: usize,
+    domain_size: usize,
+) -> Result<Vec<u64>> {
     assert_eq!(main_lde.m, num_main);
     if let Some(a) = aux_lde {
         assert_eq!(a.m, num_aux);
@@ -46,7 +127,12 @@ pub fn deep_composition_ext3(
     } else {
         assert_eq!(num_aux, 0);
     }
-    assert_eq!(h_parts_deinterleaved.len(), num_parts * 3 * main_lde.lde_size);
+    if let Some(h) = h_parts_dev {
+        assert_eq!(h.m, num_parts);
+        assert_eq!(h.lde_size, main_lde.lde_size);
+    } else {
+        assert_eq!(h_parts_host.len(), num_parts * 3 * main_lde.lde_size);
+    }
     assert_eq!(h_ood.len(), num_parts * 3);
     let num_total_cols = num_main + num_aux;
     assert_eq!(trace_ood.len(), num_total_cols * num_eval_points * 3);
@@ -58,8 +144,8 @@ pub fn deep_composition_ext3(
     let be = backend();
     let stream = be.next_stream();
 
-    // H2D the host-side arrays.
-    let h_lde_dev = stream.clone_htod(h_parts_deinterleaved)?;
+    // H2D only the scalar arrays — h_parts comes from a device handle
+    // when available.
     let h_ood_dev = stream.clone_htod(h_ood)?;
     let trace_ood_dev = stream.clone_htod(trace_ood)?;
     let gammas_h_dev = stream.clone_htod(gammas_h)?;
@@ -67,16 +153,25 @@ pub fn deep_composition_ext3(
     let inv_h_dev = stream.clone_htod(inv_h)?;
     let inv_t_dev = stream.clone_htod(inv_t)?;
 
+    // Keep the owned H2D of h_lde alive until kernel completes. Only
+    // populated in the host-parts path.
+    let h_lde_host_dev;
+
     let mut deep_out = stream.alloc_zeros::<u64>(domain_size * 3)?;
 
-    // Dummy zero-sized aux LDE buffer when num_aux == 0 — the kernel's aux
-    // loop skips iteration but the pointer still needs to be valid.
     let dummy_aux;
     let aux_slice = if let Some(a) = aux_lde {
         a.buf.as_ref()
     } else {
         dummy_aux = stream.alloc_zeros::<u64>(1)?;
         &dummy_aux
+    };
+
+    let h_lde_slice = if let Some(h) = h_parts_dev {
+        h.buf.as_ref()
+    } else {
+        h_lde_host_dev = stream.clone_htod(h_parts_host)?;
+        &h_lde_host_dev
     };
 
     let lde_stride = main_lde.lde_size as u64;
@@ -98,7 +193,7 @@ pub fn deep_composition_ext3(
             .launch_builder(&be.deep_composition_ext3_row)
             .arg(main_lde.buf.as_ref())
             .arg(aux_slice)
-            .arg(&h_lde_dev)
+            .arg(h_lde_slice)
             .arg(&lde_stride)
             .arg(&num_main_u)
             .arg(&num_aux_u)

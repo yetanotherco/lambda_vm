@@ -334,6 +334,11 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
+    /// Device-side composition-poly LDE handle, retained when the R2 GPU
+    /// fused path produced the LDE. Lets R2 commit + R4 DEEP composition
+    /// skip re-H2D'ing the composition parts.
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -976,6 +981,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[cfg(feature = "cuda")]
+        let mut gpu_comp_handle: Option<math_cuda::lde::GpuLdeExt3> = None;
         let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
@@ -993,10 +1000,10 @@ pub trait IsStarkProver<
                     .unwrap();
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
-            // GPU fast path: batch all parts' LDEs into a single call. Parts
-            // share offset/size so a one-shot ext3 evaluate-on-coset saves
-            // one kernel pipeline per part. Falls through to CPU when the
-            // `cuda` feature is off or the size is below the GPU threshold.
+            // GPU fast path: batch all parts' LDEs into a single call AND
+            // retain the device buffer so R2 commit + R4 DEEP composition
+            // can read it without re-H2D'ing. Falls through to CPU when
+            // `cuda` is off or the size is below the GPU threshold.
             #[cfg(feature = "cuda")]
             let gpu_result = {
                 let parts_slices: Vec<&[FieldElement<FieldExtension>]> =
@@ -1004,7 +1011,7 @@ pub trait IsStarkProver<
                         .iter()
                         .map(|p| p.coefficients.as_slice())
                         .collect();
-                crate::gpu_lde::try_evaluate_parts_on_lde_gpu::<Field, FieldExtension>(
+                crate::gpu_lde::try_evaluate_parts_on_lde_gpu_keep::<Field, FieldExtension>(
                     &parts_slices,
                     domain.blowup_factor,
                     domain.interpolation_domain_size,
@@ -1012,9 +1019,15 @@ pub trait IsStarkProver<
                 )
             };
             #[cfg(not(feature = "cuda"))]
-            let gpu_result: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+            let gpu_result: Option<(Vec<Vec<FieldElement<FieldExtension>>>, ())> = None;
 
-            if let Some(results) = gpu_result {
+            if let Some((results, handle)) = gpu_result {
+                #[cfg(feature = "cuda")]
+                {
+                    gpu_comp_handle = Some(handle);
+                }
+                #[cfg(not(feature = "cuda"))]
+                let _ = handle;
                 results
             } else {
                 composition_poly_parts
@@ -1063,6 +1076,8 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
+            #[cfg(feature = "cuda")]
+            gpu_composition_parts: gpu_comp_handle,
         })
     }
 
@@ -1379,8 +1394,9 @@ pub trait IsStarkProver<
             if let Some(v) = crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                 lde_trace,
                 &round_2_result.lde_composition_poly_evaluations,
+                round_2_result.gpu_composition_parts.as_ref(),
                 h_ood,
-&trace_ood_columns,
+                &trace_ood_columns,
                 composition_poly_gammas,
                 trace_terms_gammas,
                 inv_h,

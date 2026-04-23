@@ -354,8 +354,52 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
+    try_evaluate_parts_on_lde_gpu_impl(parts_coefs, blowup_factor, domain_size, offset, false)
+        .map(|(v, _)| v)
+}
+
+/// Same as [`try_evaluate_parts_on_lde_gpu`] but also retains the
+/// composition-parts LDE device buffer as a `GpuLdeExt3` handle. Used by
+/// `round_2_compute_composition_polynomial` to feed R2 commit and R4
+/// DEEP composition without re-H2D'ing.
+pub(crate) fn try_evaluate_parts_on_lde_gpu_keep<F, E>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: math::field::traits::IsFFTField + IsField,
+    E: IsField,
+    F: IsSubFieldOf<E>,
+{
+    let (v, h) = try_evaluate_parts_on_lde_gpu_impl(
+        parts_coefs,
+        blowup_factor,
+        domain_size,
+        offset,
+        true,
+    )?;
+    Some((v, h.expect("keep=true returns Some handle")))
+}
+
+fn try_evaluate_parts_on_lde_gpu_impl<F, E>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+    keep: bool,
+) -> Option<(
+    Vec<Vec<FieldElement<E>>>,
+    Option<math_cuda::lde::GpuLdeExt3>,
+)>
+where
+    F: math::field::traits::IsFFTField + IsField,
+    E: IsField,
+    F: IsSubFieldOf<E>,
+{
     if parts_coefs.is_empty() {
-        return Some(Vec::new());
+        return Some((Vec::new(), None));
     }
     if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
         return None;
@@ -383,12 +427,10 @@ where
         w = w * offset;
     }
 
-    // Pack each part into a 3*domain_size u64 buffer, zero-padded.
     let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
     for part in parts_coefs.iter() {
         let mut buf = vec![0u64; 3 * domain_size];
         let len = part.len().min(domain_size);
-        // Copy the real part coefficients; the rest stays zero (padding).
         let src_ptr = part.as_ptr() as *const u64;
         let src_len = len * 3;
         let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
@@ -400,7 +442,7 @@ where
     let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
         .map(|_| vec![FieldElement::<E>::zero(); lde_size])
         .collect();
-    {
+    let handle = {
         let mut out_slices: Vec<&mut [u64]> = outputs
             .iter_mut()
             .map(|o| {
@@ -408,16 +450,30 @@ where
                 unsafe { core::slice::from_raw_parts_mut(ptr, 3 * lde_size) }
             })
             .collect();
-        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
-            &input_slices,
-            domain_size,
-            blowup_factor,
-            &weights_u64,
-            &mut out_slices,
-        )
-        .expect("GPU parts LDE failed");
-    }
-    Some(outputs)
+        if keep {
+            Some(
+                math_cuda::lde::evaluate_poly_coset_batch_ext3_into_keep(
+                    &input_slices,
+                    domain_size,
+                    blowup_factor,
+                    &weights_u64,
+                    &mut out_slices,
+                )
+                .expect("GPU parts LDE (keep) failed"),
+            )
+        } else {
+            math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
+                &input_slices,
+                domain_size,
+                blowup_factor,
+                &weights_u64,
+                &mut out_slices,
+            )
+            .expect("GPU parts LDE failed");
+            None
+        }
+    };
+    Some((outputs, handle))
 }
 
 /// Fused variant of [`try_evaluate_parts_on_lde_gpu`]: in addition to the
@@ -1541,6 +1597,7 @@ where
 pub(crate) fn try_deep_composition_gpu<F, E>(
     lde_trace: &crate::trace::LDETraceTable<F, E>,
     h_lde_parts: &[Vec<FieldElement<E>>],
+    h_parts_gpu: Option<&math_cuda::lde::GpuLdeExt3>,
     h_ood: &[FieldElement<E>],
     trace_ood_cols: &[Vec<FieldElement<E>>], // num_total_cols × num_eval_points
     gammas_h: &[FieldElement<E>],
@@ -1579,9 +1636,13 @@ where
 
     GPU_DEEP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Pack: h_parts de-interleaved (num_parts × 3 × lde_size).
-    let mut h_flat = vec![0u64; num_parts * 3 * lde_size];
-    {
+    // If a device handle is present for h_parts, skip the host-side pack.
+    // Falls back to packing Vec<Vec<_>> → flat u64 and H2D'ing in the
+    // impl otherwise.
+    let h_flat_opt: Option<Vec<u64>> = if h_parts_gpu.is_some() {
+        None
+    } else {
+        let mut h_flat = vec![0u64; num_parts * 3 * lde_size];
         #[cfg(feature = "parallel")]
         let iter = h_lde_parts.par_iter().enumerate();
         #[cfg(not(feature = "parallel"))]
@@ -1602,7 +1663,8 @@ where
                 }
             }
         });
-    }
+        Some(h_flat)
+    };
 
     // Pack scalar arrays: h_ood, trace_ood, gammas_h, gammas_tr, inv_h, inv_t.
     let e3_raw = |e: &FieldElement<E>| -> [u64; 3] {
@@ -1679,24 +1741,45 @@ where
         });
     }
 
-    let raw_out = math_cuda::deep::deep_composition_ext3(
-        &main_handle,
-        aux_handle_opt.as_ref(),
-        &h_flat,
-        &h_ood_flat,
-        &trace_ood_flat,
-        &gammas_h_flat,
-        &gammas_tr_out,
-        &inv_h_flat,
-        &inv_t_flat,
-        num_parts,
-        num_main,
-        num_aux,
-        num_eval_points,
-        blowup_factor,
-        domain_size,
-    )
-    .expect("GPU deep composition failed");
+    let raw_out = if let Some(h_gpu) = h_parts_gpu {
+        math_cuda::deep::deep_composition_ext3_with_dev_parts(
+            &main_handle,
+            aux_handle_opt.as_ref(),
+            h_gpu,
+            &h_ood_flat,
+            &trace_ood_flat,
+            &gammas_h_flat,
+            &gammas_tr_out,
+            &inv_h_flat,
+            &inv_t_flat,
+            num_parts,
+            num_main,
+            num_aux,
+            num_eval_points,
+            blowup_factor,
+            domain_size,
+        )
+        .expect("GPU deep composition (dev parts) failed")
+    } else {
+        math_cuda::deep::deep_composition_ext3(
+            &main_handle,
+            aux_handle_opt.as_ref(),
+            h_flat_opt.as_ref().expect("host h_flat packed").as_slice(),
+            &h_ood_flat,
+            &trace_ood_flat,
+            &gammas_h_flat,
+            &gammas_tr_out,
+            &inv_h_flat,
+            &inv_t_flat,
+            num_parts,
+            num_main,
+            num_aux,
+            num_eval_points,
+            blowup_factor,
+            domain_size,
+        )
+        .expect("GPU deep composition failed")
+    };
 
     // Transmute raw u64s → FieldElement<E>. Requires E == Ext3 layout, which
     // the type_name check above verifies.
