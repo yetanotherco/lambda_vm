@@ -78,17 +78,36 @@ where
         let (new_level_iter, children_iter) =
             nodes[new_level_begin_index..level_end_index + 1].split_at_mut(new_level_length);
 
+        // Skip Rayon for small levels: the scheduling overhead exceeds
+        // computation for levels with fewer than 1024 nodes. This avoids
+        // hundreds of unnecessary task spawns from small FRI layer trees.
         #[cfg(feature = "parallel")]
-        let parent_and_children_zipped_iter = new_level_iter
-            .into_par_iter()
-            .zip(children_iter.par_chunks_exact(2));
+        {
+            if new_level_length >= 1024 {
+                new_level_iter
+                    .into_par_iter()
+                    .zip(children_iter.par_chunks_exact(2))
+                    .for_each(|(new_parent, children)| {
+                        *new_parent = B::hash_new_parent(&children[0], &children[1]);
+                    });
+            } else {
+                new_level_iter
+                    .iter_mut()
+                    .zip(children_iter.chunks_exact(2))
+                    .for_each(|(new_parent, children)| {
+                        *new_parent = B::hash_new_parent(&children[0], &children[1]);
+                    });
+            }
+        }
         #[cfg(not(feature = "parallel"))]
-        let parent_and_children_zipped_iter =
-            new_level_iter.iter_mut().zip(children_iter.chunks_exact(2));
-
-        parent_and_children_zipped_iter.for_each(|(new_parent, children)| {
-            *new_parent = B::hash_new_parent(&children[0], &children[1]);
-        });
+        {
+            new_level_iter
+                .iter_mut()
+                .zip(children_iter.chunks_exact(2))
+                .for_each(|(new_parent, children)| {
+                    *new_parent = B::hash_new_parent(&children[0], &children[1]);
+                });
+        }
 
         level_end_index = level_begin_index - 1;
         level_begin_index = new_level_begin_index;
