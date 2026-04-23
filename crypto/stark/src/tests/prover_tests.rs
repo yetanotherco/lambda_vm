@@ -404,3 +404,134 @@ fn test_multi_prove_dedups_shared_domain_params() {
         "verification should succeed when AIRs share all domain parameters"
     );
 }
+
+/// Differential test for the DEEP composition polynomial "direct 2N" evaluation.
+///
+/// After this PR, `compute_deep_composition_poly_evaluations` evaluates the DEEP
+/// polynomial directly at all 2N LDE points. The old path computed it at the N
+/// trace-coset points and then extended via iFFT(N)+FFT(2N).
+///
+/// Both paths should produce the same values because `deep(X)` is a polynomial
+/// of degree < N (the poles cancel by construction, since the numerators vanish
+/// at the denominators' zeros). By uniqueness of polynomial interpolation, a
+/// polynomial of degree < N is fully determined by its values on any N-point
+/// subset — so extending from N matches evaluating directly at 2N.
+///
+/// This test constructs a synthetic scenario (known trace polys, composition
+/// polys, OOD values, gammas), computes `deep(x)` at every LDE point two ways,
+/// and asserts the results match exactly.
+#[test]
+fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
+    let n = 16usize;
+    let blowup_factor = 2usize;
+    let two_n = n * blowup_factor;
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 0,
+    };
+
+    let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+    let domain = Domain::new(&air, n);
+
+    // Trace polynomials (degree < N): two columns with deterministic coefficients.
+    let num_trace_cols = 2usize;
+    let trace_polys: Vec<Polynomial<Felt>> = (0..num_trace_cols)
+        .map(|j| {
+            let coeffs: Vec<Felt> = (0..n)
+                .map(|i| Felt::from(((i + 1) * (j + 2) * 11 + 7) as u64))
+                .collect();
+            Polynomial::new(&coeffs)
+        })
+        .collect();
+
+    // Composition poly parts (each of degree < N): two parts.
+    let num_parts = 2usize;
+    let h_polys: Vec<Polynomial<Felt>> = (0..num_parts)
+        .map(|j| {
+            let coeffs: Vec<Felt> = (0..n)
+                .map(|i| Felt::from(((i + 3) * (j + 5) * 19 + 31) as u64))
+                .collect();
+            Polynomial::new(&coeffs)
+        })
+        .collect();
+
+    // OOD evaluation point and the derived poles.
+    let z = Felt::from(12345u64);
+    let z_power = z.pow(num_parts);
+
+    let num_eval_points = 2usize;
+    let z_shifted: Vec<Felt> = (0..num_eval_points)
+        .map(|k| domain.trace_primitive_root.pow(k) * &z)
+        .collect();
+
+    // OOD values: H_j(z^K) and t_j(z·w^k).
+    let h_ood: Vec<Felt> = h_polys.iter().map(|h| h.evaluate(&z_power)).collect();
+    let t_ood: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|t| z_shifted.iter().map(|z_k| t.evaluate(z_k)).collect())
+        .collect();
+
+    // Random-ish gammas.
+    let gamma_h: Vec<Felt> = (0..num_parts)
+        .map(|j| Felt::from((j as u64 + 1) * 100))
+        .collect();
+    let gamma_t: Vec<Vec<Felt>> = (0..num_trace_cols)
+        .map(|j| {
+            (0..num_eval_points)
+                .map(|k| Felt::from((((j + 1) * (k + 1)) as u64) * 200))
+                .collect()
+        })
+        .collect();
+
+    // Helper that computes deep(x) at a single point — same formula as the
+    // production code, written here without the per-row optimizations.
+    let compute_deep = |x: &Felt| -> Felt {
+        let mut result = Felt::zero();
+        // H terms
+        for j in 0..num_parts {
+            let numer = h_polys[j].evaluate(x) - &h_ood[j];
+            let denom_inv = (x - &z_power).inv().expect("z^K not on coset");
+            result += &gamma_h[j] * &numer * &denom_inv;
+        }
+        // Trace terms
+        for (j, trace_poly) in trace_polys.iter().enumerate().take(num_trace_cols) {
+            for k in 0..num_eval_points {
+                let numer = trace_poly.evaluate(x) - &t_ood[j][k];
+                let denom_inv = (x - &z_shifted[k]).inv().expect("z·w^k not on coset");
+                result += &gamma_t[j][k] * &numer * &denom_inv;
+            }
+        }
+        result
+    };
+
+    // Path A — direct evaluation at all 2N LDE points (the new path).
+    let direct_2n: Vec<Felt> = domain
+        .lde_roots_of_unity_coset
+        .iter()
+        .map(compute_deep)
+        .collect();
+
+    // Path B — evaluate at the N trace-coset points {g·ω^i} = lde_coset[i·bf],
+    // interpolate via iFFT, then extend via FFT to all 2N LDE points.
+    let trace_coset_evals: Vec<Felt> = (0..n)
+        .map(|i| compute_deep(&domain.lde_roots_of_unity_coset[i * blowup_factor]))
+        .collect();
+    let deep_poly = Polynomial::interpolate_offset_fft(&trace_coset_evals, &domain.coset_offset)
+        .expect("interpolation should succeed on trace-coset evaluations");
+    let extended_2n =
+        evaluate_polynomial_on_lde_domain(&deep_poly, blowup_factor, n, &domain.coset_offset)
+            .expect("LDE extension should succeed");
+
+    assert_eq!(direct_2n.len(), two_n);
+    assert_eq!(extended_2n.len(), two_n);
+    for i in 0..two_n {
+        assert_eq!(
+            direct_2n[i], extended_2n[i],
+            "deep evaluation mismatch at LDE index {i}: direct-2N path diverges from \
+             iFFT+FFT-extended path"
+        );
+    }
+}
