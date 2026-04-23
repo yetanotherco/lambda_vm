@@ -147,6 +147,114 @@
   hash.map(int.to-bytes).join()
 }
 
+/// Converts a byte array to a hexadecimal string
+#let bytes-to-hex(bytes) = {
+  /// Pads a string with 0s on the left to reach a certain length
+  let z-fill(string) = "0" * (2 - string.len()) + string
+
+  array(bytes)
+    .map(b => str(b, base: 16))
+    .map(z-fill)
+    .sum()
+}
+
+/// Tag constraints with an identifier
+#let _add_constraint_ids(chip) = {
+
+  /// A NON-CRYPTOGRAPHIC hash function.
+  let nchf(str) = FNV-1a(bytes(str))
+  
+  // number of characters in constraint ID
+  let CONSTRAINT_ID_CHAR_COUNT = 4;
+
+  /// Digests a variable based on its location and type.
+  let digest_variable(chip, group, idx, var) = {
+    /// Flatten the type of a variable into a string
+    let flatten_vartype(typ) = {
+      if type(typ) == array {
+        "(" + typ.map(flatten_vartype).join(",") + ")"
+      } else {
+        str(typ)
+      }
+    }
+    
+    let flattened_type = lower(flatten_vartype(var.type))    
+    let input = (chip, group, str(idx), flattened_type).join(",")
+    let digest = bytes-to-hex(nchf(input))
+    digest.slice(0, count: 8)
+  }
+
+  // Map variables to their ID
+  let variable_to_ID = chip
+    .variables
+    .pairs()
+    .map(((group, variables)) => {
+      variables
+        .enumerate()
+        .map(((idx, var)) => {
+          (var.name: digest_variable(chip.name, group, idx, var))
+        }).sum()
+    }).sum()
+
+  // replace variable with ID in LISP
+  let replace_variable_with_ID(lisp) = {
+    if type(lisp) == array {
+      "(" + lisp.map(replace_variable_with_ID).join(",") + ")"
+    } else {
+      variable_to_ID.at(str(lisp), default: str(lisp))
+    }
+  }
+
+  // Replace variable names with their ID 
+  let digestable_constraint(c) = { 
+    let CONSTRAINT_CAT_TO_SCOPE = (
+      "interaction": ("iter", "input", "output", "multiplicity"),
+      "template": ("iter", "input", "output", "cond"),
+      "arith": ("iter", "poly")
+    )
+
+    assert(c.kind in CONSTRAINT_CAT_TO_SCOPE)
+    let id_tagged = CONSTRAINT_CAT_TO_SCOPE
+      .at(c.kind)
+      .filter(cat => cat in c.keys())
+      .map(cat => (str(cat): replace_variable_with_ID(c.at(cat))))
+      .sum(default: (:))
+
+    repr(id_tagged)
+      .replace("\n", "")
+      .replace(" ", "")
+  }
+
+  // Map hash digest to ID
+  let digest_to_id(hash_bytes) = {
+    let CHARS = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
+    assert(CHARS.len() == 32, message: "invalid CHARS length")
+
+    let int = int.from-bytes(hash_bytes.slice(0, count: 8))
+    for i in range(CONSTRAINT_ID_CHAR_COUNT) {
+      let idx = int.bit-and(31)
+      int = int.bit-rshift(5)
+      (CHARS.at(idx), )
+    }.sum()
+  }
+
+  // Add an ID to each constraint
+  chip.constraints = chip.at("constraints", default: (:))
+    .pairs()
+    .map(((group, constraints)) => {
+      (
+        str(group):
+        constraints
+          .map(c => {
+            c.id = digest_to_id(nchf(digestable_constraint(c)))
+            c
+          })
+      )
+    }).sum(default: (:))
+
+  chip
+}
+
 /// Load a chip object from file
 ///
 /// - path(str): path to file containing chip data
@@ -154,5 +262,5 @@
 #let load_chip(path, config) = {
   let chip = toml(path)
   _check_chip(chip, config)
-  return chip
+  return _add_constraint_ids(chip)
 }
