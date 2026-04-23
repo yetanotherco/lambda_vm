@@ -20,8 +20,7 @@ use math::field::{
 };
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-    ParallelSliceMut,
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
 };
 
 // =============================================================================
@@ -1964,58 +1963,82 @@ where
     }
     let trace_len = term_columns[0].len();
 
-    // Precompute row_sums[row] = sum of all term_columns at that row.
-    // This avoids recomputing during the prefix sum and enables parallel reduction.
-    let row_sums: Vec<FieldElement<E>> = (0..trace_len)
-        .map(|row| {
-            let mut s = FieldElement::<E>::zero();
-            for col in term_columns {
-                s = s + &col[row];
-            }
-            s
-        })
-        .collect();
+    // Circular accumulated constraint:
+    //   acc[(i+1) mod N] - acc[i] - terms[(i+1) mod N] + L/N = 0
+    // Build: acc[0] = row_sum[0] - L/N, acc[i] = acc[i-1] + row_sum[i] - L/N.
+    // Result: acc[N-1] = L - N·(L/N) = 0.
+    //
+    // Two passes over `term_columns`:
+    //
+    //   Pass 1 (parallel per chunk): compute `chunk_totals[k] = Σ row_sum(row)`
+    //     for rows in chunk k. Only N/CHUNK scalars stored; no per-row data.
+    //     L = Σ chunk_totals.
+    //
+    //   Pass 2 (parallel per chunk): knowing L/N, build per-chunk local prefix
+    //     sums `Σ (row_sum(row) - L/N)`. Stored as `Vec<Vec<E>>` of total size N.
+    //
+    //   Final (sequential): scan chunk totals → per-chunk global offsets, then
+    //   write `chunk_offset + local_prefix[i]` straight into `trace.set_aux`.
+    //
+    // The previous design materialized an additional N-sized `row_sums` Vec
+    // plus an N-sized `acc_col` Vec before scattering. This version eliminates
+    // both: peak transient storage drops from ~3N to ~N extension-field
+    // elements per table. At N = 2^20 and cubic Goldilocks (24 B / element)
+    // that is ≈48 MiB saved per table, ~670 MiB across ~14 tables.
+    //
+    // Trade-off: one extra pass over `term_columns` (Pass 1 computes only
+    // totals), which is parallelizable and small relative to the subsequent
+    // LDE FFTs in the same proof.
 
-    // Compute L = sum of all row_sums (parallel when feature enabled)
+    // Inline row_sum — used in both passes; avoids materializing a row_sums Vec.
+    let row_sum = |row: usize| -> FieldElement<E> {
+        let mut s = FieldElement::<E>::zero();
+        for col in term_columns {
+            s = s + &col[row];
+        }
+        s
+    };
+
+    // `n.inv()` is guaranteed to succeed: `term_columns` is non-empty (early
+    // return above) and trace_len is a power-of-two AIR row count passed in
+    // by the caller, so n ∈ {1, 2, 4, …} is non-zero in any prime field.
+    let n_inv_expect = "trace_len is non-zero, so N is invertible";
+
     #[cfg(feature = "parallel")]
-    let table_contribution: FieldElement<E> = row_sums
-        .par_iter()
-        .cloned()
-        .reduce(FieldElement::zero, |a, b| a + b);
-    #[cfg(not(feature = "parallel"))]
-    let table_contribution: FieldElement<E> =
-        row_sums.iter().fold(FieldElement::zero(), |a, b| a + b);
-
-    // offset_per_row = L / N
-    let n = FieldElement::<E>::from(trace_len as u64);
-    let offset_per_row = &table_contribution * n.inv().unwrap();
-
-    // Build circular accumulated column using 3-phase parallel prefix sum.
-    //
-    // Phase 1: Compute chunk-local prefix sums in parallel.
-    //   Each chunk computes partial_sums[i] = Σ(row_sums[j] - offset) for j in chunk.
-    //   Also stores the chunk's total as `chunk_totals[chunk_idx]`.
-    //
-    // Phase 2: Sequential scan of chunk_totals to compute offsets for each chunk.
-    //
-    // Phase 3: Add chunk offset to each element in the accumulated vector.
-    //
-    // Finally write the accumulated column to trace (sequential, since set_aux takes &mut).
-    #[cfg(feature = "parallel")]
-    let accumulated_col = {
+    {
         let num_chunks = trace_len.div_ceil(LOGUP_CHUNK_SIZE);
 
-        // Phase 1: Compute chunk-local prefix sums
+        // Pass 1: per-chunk totals, no per-row storage.
+        let chunk_totals: Vec<FieldElement<E>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * LOGUP_CHUNK_SIZE;
+                let end = (start + LOGUP_CHUNK_SIZE).min(trace_len);
+                let mut sum = FieldElement::<E>::zero();
+                for row in start..end {
+                    sum += row_sum(row);
+                }
+                sum
+            })
+            .collect();
+
+        let table_contribution: FieldElement<E> = chunk_totals
+            .iter()
+            .fold(FieldElement::<E>::zero(), |a, b| &a + b);
+
+        let n = FieldElement::<E>::from(trace_len as u64);
+        let offset_per_row = &table_contribution * n.inv().expect(n_inv_expect);
+
+        // Pass 2: chunk-local prefix of (row_sum − offset).
         let chunk_data: Vec<(Vec<FieldElement<E>>, FieldElement<E>)> = (0..num_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * LOGUP_CHUNK_SIZE;
                 let end = (start + LOGUP_CHUNK_SIZE).min(trace_len);
-
                 let mut local_prefix = Vec::with_capacity(end - start);
                 let mut acc = FieldElement::<E>::zero();
-                for rs in &row_sums[start..end] {
-                    acc = &acc + rs - &offset_per_row;
+                for row in start..end {
+                    acc = &acc + &row_sum(row) - &offset_per_row;
                     local_prefix.push(acc.clone());
                 }
                 let chunk_total = acc;
@@ -2023,7 +2046,7 @@ where
             })
             .collect();
 
-        // Phase 2: Sequential scan of chunk totals to get per-chunk offsets
+        // Sequential scan of chunk totals → per-chunk global offset.
         let mut chunk_offsets = Vec::with_capacity(num_chunks);
         let mut running = FieldElement::<E>::zero();
         for (_, chunk_total) in &chunk_data {
@@ -2031,37 +2054,39 @@ where
             running = &running + chunk_total;
         }
 
-        // Phase 3: Build final accumulated vector (parallel across chunks)
-        let mut acc_col = vec![FieldElement::<E>::zero(); trace_len];
-        acc_col
-            .par_chunks_mut(LOGUP_CHUNK_SIZE)
-            .enumerate()
-            .for_each(|(chunk_idx, out_chunk)| {
-                let offset = &chunk_offsets[chunk_idx];
-                for (i, out) in out_chunk.iter_mut().enumerate() {
-                    *out = offset + &chunk_data[chunk_idx].0[i];
-                }
-            });
-        acc_col
-    };
-
-    #[cfg(not(feature = "parallel"))]
-    let accumulated_col = {
-        let mut col = Vec::with_capacity(trace_len);
-        let mut accumulated = FieldElement::<E>::zero();
-        for row_sum in &row_sums {
-            accumulated = &accumulated + row_sum - &offset_per_row;
-            col.push(accumulated.clone());
+        // Scatter directly to trace.aux — no N-sized intermediate `acc_col`.
+        // Sequential because `set_aux` takes `&mut TraceTable`; per-row work
+        // is one extension-field add, small vs. the LDE FFTs that follow.
+        for (chunk_idx, (local_prefix, _)) in chunk_data.iter().enumerate() {
+            let chunk_offset = &chunk_offsets[chunk_idx];
+            let start = chunk_idx * LOGUP_CHUNK_SIZE;
+            for (i, value) in local_prefix.iter().enumerate() {
+                trace.set_aux(start + i, acc_column_idx, chunk_offset + value);
+            }
         }
-        col
-    };
 
-    // Write accumulated column to trace
-    for (row, value) in accumulated_col.into_iter().enumerate() {
-        trace.set_aux(row, acc_column_idx, value);
+        table_contribution
     }
 
-    table_contribution
+    #[cfg(not(feature = "parallel"))]
+    {
+        // Two sequential passes mirror the parallel version without any
+        // intermediate Vec. Pass 1: L via fold. Pass 2: write acc into trace.
+        let mut table_contribution = FieldElement::<E>::zero();
+        for row in 0..trace_len {
+            table_contribution += row_sum(row);
+        }
+        let n = FieldElement::<E>::from(trace_len as u64);
+        let offset_per_row = &table_contribution * n.inv().expect(n_inv_expect);
+
+        let mut acc = FieldElement::<E>::zero();
+        for row in 0..trace_len {
+            acc = &acc + &row_sum(row) - &offset_per_row;
+            trace.set_aux(row, acc_column_idx, acc.clone());
+        }
+
+        table_contribution
+    }
 }
 
 /// Sum per-interaction contributions by bus_id for debug reporting.
