@@ -233,3 +233,40 @@ fn test_decompose_and_extend_d2_matches_original() {
         assert_eq!(new_result[1][i], original[1][i], "H₁ mismatch at index {i}");
     }
 }
+
+#[test]
+fn commit_columns_bit_reversed_matches_naive_reference() {
+    use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+    use math::fft::cpu::bit_reversing::reverse_index;
+    use math::traits::ByteConversion;
+
+    let num_rows = 8usize;
+    let num_cols = 3usize;
+    let columns: Vec<Vec<Felt>> = (0..num_cols)
+        .map(|c| {
+            (0..num_rows)
+                .map(|r| Felt::from((c * num_rows + r + 1) as u64))
+                .collect()
+        })
+        .collect();
+
+    let byte_len = <Felt as ByteConversion>::BYTE_LEN;
+    let reference_leaves: Vec<Commitment> = (0..num_rows)
+        .map(|i| {
+            let br_i = reverse_index(i, num_rows as u64);
+            let mut buf = vec![0u8; num_cols * byte_len];
+            for c in 0..num_cols {
+                columns[c][br_i].write_bytes_be(&mut buf[c * byte_len..(c + 1) * byte_len]);
+            }
+            BatchedMerkleTreeBackend::<GoldilocksField>::hash_bytes(&buf)
+        })
+        .collect();
+    let reference_tree =
+        BatchedMerkleTree::<GoldilocksField>::build_from_hashed_leaves(reference_leaves).unwrap();
+
+    let (_tree, root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed(&columns)
+            .unwrap();
+
+    assert_eq!(reference_tree.root, root);
+}
