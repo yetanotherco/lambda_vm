@@ -645,8 +645,8 @@ pub trait IsStarkProver<
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
         commitments: &[Round1Commitments<Field, FieldExtension>],
-        domains: &[Domain<Field>],
-        twiddle_caches: &[LdeTwiddles<Field>],
+        domains: &[Arc<Domain<Field>>],
+        twiddle_caches: &[Arc<LdeTwiddles<Field>>],
     ) where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1523,13 +1523,32 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        let mut domains = Vec::with_capacity(num_airs);
-        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
+        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        // The key is a 3-tuple to avoid correctness bugs where two AIRs share trace_len+blowup
+        // but differ in coset_offset, which would silently produce the wrong Domain.
+        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
+            std::collections::HashMap::new();
+
+        let mut domains: Vec<Arc<Domain<Field>>> = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
-            let domain = new_domain(*air, trace_length);
-            let twiddles = LdeTwiddles::new(&domain);
+            let blowup = air.options().blowup_factor as usize;
+            let coset_offset = air.options().coset_offset;
+            let key = (trace_length, blowup, coset_offset);
+
+            let (domain, twiddles) = domain_cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let d = new_domain(*air, trace_length);
+                    let t = LdeTwiddles::new(&d);
+                    (Arc::new(d), Arc::new(t))
+                })
+                .clone();
 
             domains.push(domain);
             twiddle_caches.push(twiddles);
