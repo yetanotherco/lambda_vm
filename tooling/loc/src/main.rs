@@ -9,6 +9,7 @@ mod report;
 
 const EXCLUDED: &[&str] = &[
     "tooling",
+    "bench_vs",
     "*target*",
     "*tests*",
     "*test_utils*",

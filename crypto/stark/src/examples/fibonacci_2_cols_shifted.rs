@@ -1,7 +1,7 @@
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -27,7 +27,7 @@ impl<F: IsFFTField> ShiftedFibTransition1<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for ShiftedFibTransition1<F>
+impl<F> TransitionConstraintEvaluator<F, F> for ShiftedFibTransition1<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -43,7 +43,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -88,7 +88,7 @@ impl<F: IsFFTField> ShiftedFibTransition2<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for ShiftedFibTransition2<F>
+impl<F> TransitionConstraintEvaluator<F, F> for ShiftedFibTransition2<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -104,7 +104,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -163,7 +163,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 /// The AIR for to a 2 column trace, where each column is a Fibonacci sequence and the
@@ -184,7 +184,7 @@ where
 
     fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
-            Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
         > = vec![
             Box::new(ShiftedFibTransition1::new()),
             Box::new(ShiftedFibTransition2::new()),
@@ -222,7 +222,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
 

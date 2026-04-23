@@ -1506,6 +1506,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
+        #[cfg(feature = "instruments")]
+        let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
 
         let num_airs = air_trace_pairs.len();
 
@@ -1553,6 +1555,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After pool alloc") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1615,6 +1621,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After main commits") {
+            heap_snaps.push(s);
+        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1661,6 +1671,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux build") {
+            heap_snaps.push(s);
+        }
 
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork.
@@ -1768,6 +1782,10 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux commit") {
+            heap_snaps.push(s);
+        }
 
         #[cfg(feature = "debug-checks")]
         Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
@@ -1885,6 +1903,7 @@ pub trait IsStarkProver<
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
+                heap_snapshots: heap_snaps,
             });
         }
 

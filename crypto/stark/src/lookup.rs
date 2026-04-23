@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -800,7 +800,10 @@ pub struct AirWithBuses<
     context: AirContext,
     step_size: usize,
     trace_layout: (usize, usize),
-    transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
+    /// Number of domain (base-field) constraints. These come before LogUp constraints
+    /// in the transition_constraints vec and use the cheaper F×E accumulation path.
+    num_base_constraints: usize,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -837,8 +840,12 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+        mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
     ) -> Self {
+        // Domain constraints are passed in first; LogUp constraints are appended below.
+        // The domain constraints use the F×E accumulation path (3 muls vs 9).
+        let num_base_constraints = transition_constraints.len();
+
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed
@@ -898,6 +905,7 @@ impl<
             step_size,
             trace_layout,
             transition_constraints,
+            num_base_constraints,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -998,9 +1006,13 @@ where
         &self.context
     }
 
+    fn num_base_transition_constraints(&self) -> usize {
+        self.num_base_constraints
+    }
+
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
 
@@ -2216,7 +2228,7 @@ impl LookupBatchedTermConstraint {
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for LookupBatchedTermConstraint
+impl<F, E> TransitionConstraintEvaluator<F, E> for LookupBatchedTermConstraint
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -2229,7 +2241,7 @@ where
         self.constraint_idx
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -2343,7 +2355,7 @@ impl LookupAccumulatedConstraint {
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for LookupAccumulatedConstraint
+impl<F, E> TransitionConstraintEvaluator<F, E> for LookupAccumulatedConstraint
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -2356,7 +2368,7 @@ where
         self.constraint_idx
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
