@@ -131,21 +131,29 @@ where
                                 .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                             z * &sum
                         } else {
-                            let mut sum = base_buf
-                                .iter()
-                                .enumerate()
-                                .zip(&transition_coefficients[..num_base])
-                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                });
-                            sum = transition_buf[num_base..]
-                                .iter()
-                                .enumerate()
-                                .zip(&transition_coefficients[num_base..])
-                                .fold(sum, |acc, ((j, eval), beta)| {
-                                    acc + zerofier_data.get(num_base + j, i) * eval * beta
-                                });
-                            sum
+                            // Iterate group-by-group, amortizing each zerofier
+                            // multiply across the constraints that share it.
+                            // Base vs extension routing per constraint is still
+                            // needed (F×E vs E×E arithmetic) but the zerofier
+                            // multiply is hoisted outside the inner loop.
+                            zerofier_data.group_to_constraints.iter().enumerate().fold(
+                                FieldElement::zero(),
+                                |acc, (group_idx, members)| {
+                                    let z = zerofier_data.get_group(group_idx, i);
+                                    let group_sum = members.iter().fold(
+                                        FieldElement::<FieldExtension>::zero(),
+                                        |s, &c_idx| {
+                                            let beta = &transition_coefficients[c_idx];
+                                            if c_idx < num_base {
+                                                s + &base_buf[c_idx] * beta
+                                            } else {
+                                                s + &transition_buf[c_idx] * beta
+                                            }
+                                        },
+                                    );
+                                    acc + z * group_sum
+                                },
+                            )
                         };
 
                         acc_transition + boundary
@@ -197,21 +205,24 @@ where
                             .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                         z * &sum
                     } else {
-                        let mut sum = base_buf
-                            .iter()
-                            .enumerate()
-                            .zip(&transition_coefficients[..num_base])
-                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                acc + zerofier_data.get(c_idx, i) * eval * beta
-                            });
-                        sum = transition_buf[num_base..]
-                            .iter()
-                            .enumerate()
-                            .zip(&transition_coefficients[num_base..])
-                            .fold(sum, |acc, ((j, eval), beta)| {
-                                acc + zerofier_data.get(num_base + j, i) * eval * beta
-                            });
-                        sum
+                        zerofier_data.group_to_constraints.iter().enumerate().fold(
+                            FieldElement::zero(),
+                            |acc, (group_idx, members)| {
+                                let z = zerofier_data.get_group(group_idx, i);
+                                let group_sum = members.iter().fold(
+                                    FieldElement::<FieldExtension>::zero(),
+                                    |s, &c_idx| {
+                                        let beta = &transition_coefficients[c_idx];
+                                        if c_idx < num_base {
+                                            s + &base_buf[c_idx] * beta
+                                        } else {
+                                            s + &transition_buf[c_idx] * beta
+                                        }
+                                    },
+                                );
+                                acc + z * group_sum
+                            },
+                        )
                     };
 
                     acc_transition + boundary

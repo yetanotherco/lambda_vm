@@ -25,11 +25,30 @@ use super::{
 /// Multiple constraints often share the same zerofier (same period, offset, and exemptions).
 /// Instead of cloning a `Vec<FieldElement<F>>` per constraint, this struct stores each unique
 /// zerofier vector once and maps each constraint index to its group.
+///
+/// `group_to_constraints` is the inverse of `constraint_to_group` and lets the
+/// transition evaluator iterate by group in the non-uniform hot loop, so each
+/// zerofier multiply is amortized across all constraints that share it:
+///
+/// ```ignore
+/// acc = Σ_g zerofier_g · Σ_{c ∈ g} (transition[c] · β[c])
+/// ```
+///
+/// For a proof with `C` constraints in `G` groups this costs `C + G` extension
+/// multiplies per LDE point instead of `2C` for the per-constraint form.
 pub struct ZerofierEvaluations<F: IsField> {
     /// Unique zerofier evaluation vectors (deduplicated).
     pub groups: Vec<Vec<FieldElement<F>>>,
     /// constraint_idx → group index.
     pub constraint_to_group: Vec<usize>,
+    /// group index → list of constraint_idx values in that group.
+    ///
+    /// Populated once alongside `constraint_to_group` so the transition hot
+    /// loop can iterate groups → members without re-scanning
+    /// `constraint_to_group`. For the common VM case (all constraints share
+    /// one group because none have exemptions), this is a single Vec containing
+    /// every constraint_idx — functionally equivalent to the uniform fast path.
+    pub group_to_constraints: Vec<Vec<usize>>,
 }
 
 impl<F: IsField> ZerofierEvaluations<F> {
@@ -48,6 +67,14 @@ impl<F: IsField> ZerofierEvaluations<F> {
     #[inline]
     pub fn get_uniform(&self, lde_idx: usize) -> &FieldElement<F> {
         let group = &self.groups[0];
+        &group[lde_idx % group.len()]
+    }
+
+    /// Zerofier evaluation for a specific group at a given LDE index.
+    /// Amortized across all constraints in the group.
+    #[inline]
+    pub fn get_group(&self, group_idx: usize, lde_idx: usize) -> &FieldElement<F> {
+        let group = &self.groups[group_idx];
         &group[lde_idx % group.len()]
     }
 }
@@ -397,6 +424,7 @@ pub trait AIR: Send + Sync {
         let mut constraint_to_group = vec![0usize; num_constraints];
         let mut zerofier_groups_map: HashMap<ZerofierGroupKey, usize> = HashMap::new();
         let mut groups: Vec<Vec<FieldElement<Self::Field>>> = Vec::new();
+        let mut group_to_constraints: Vec<Vec<usize>> = Vec::new();
 
         self.transition_constraints().iter().for_each(|c| {
             let key = ZerofierGroupKey {
@@ -409,14 +437,17 @@ pub trait AIR: Send + Sync {
             let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {
                 let idx = groups.len();
                 groups.push(c.zerofier_evaluations_on_extended_domain(domain));
+                group_to_constraints.push(Vec::new());
                 idx
             });
             constraint_to_group[c.constraint_idx()] = group_idx;
+            group_to_constraints[group_idx].push(c.constraint_idx());
         });
 
         ZerofierEvaluations {
             groups,
             constraint_to_group,
+            group_to_constraints,
         }
     }
 }
