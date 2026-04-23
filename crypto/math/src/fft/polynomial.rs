@@ -549,4 +549,34 @@ mod tests {
             assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
         }
     }
+
+    #[test]
+    fn evaluate_fft_bit_reversed_matches_evaluate_fft_then_permute() {
+        for order in 1..=8 {
+            let n = 1usize << order;
+            let coeffs: Vec<FE> = (0..n).map(|i| FE::from((i * 17 + 3) as u64)).collect();
+            let poly = Polynomial::new(&coeffs);
+
+            for blowup_factor in [1, 2, 4] {
+                let size = Some(n);
+                let mut expected =
+                    Polynomial::evaluate_fft::<F>(&poly, blowup_factor, size).unwrap();
+                in_place_bit_reverse_permute(&mut expected);
+
+                let got =
+                    Polynomial::evaluate_fft_bit_reversed::<F>(&poly, blowup_factor, size).unwrap();
+
+                assert_eq!(got, expected, "order={order}, blowup={blowup_factor}");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_fft_bit_reversed_rejects_non_power_of_two_blowup() {
+        let coeffs: Vec<FE> = (0..8).map(|i| FE::from(i as u64)).collect();
+        let poly = Polynomial::new(&coeffs);
+
+        let err = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 3, Some(8));
+        assert!(matches!(err, Err(FFTError::InputError(_))));
+    }
 }
