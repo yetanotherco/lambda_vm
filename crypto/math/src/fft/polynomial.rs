@@ -84,6 +84,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// skipping the final natural-order permutation. Use when the consumer expects
     /// bit-reversed input (e.g. FRI commit phase, which pairs consecutive values as
     /// {f(x), f(-x)}).
+    ///
+    /// Stricter validation than `evaluate_fft`: non-power-of-two `len` is rejected
+    /// even for empty polynomials. `evaluate_fft`'s guard lives inside
+    /// `evaluate_fft_cpu`, which its empty-polynomial fast path skips.
     pub fn evaluate_fft_bit_reversed<F: IsFFTField + IsSubFieldOf<E>>(
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
