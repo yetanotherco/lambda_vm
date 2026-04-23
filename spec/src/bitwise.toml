@@ -168,10 +168,9 @@ output = "ZERO"
 multiplicity = ["-", "μ_ZERO"]
 
 [[constraints.contributions]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = ["X"]
-multiplicity = ["-", "μ_IS_BYTE"]
+input = ["X", ["-", "μ_IS_BYTE"]]
 
 [[constraints.contributions]]
 kind = "interaction"

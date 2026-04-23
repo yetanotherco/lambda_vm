@@ -116,10 +116,9 @@ output = "next_pc_unmasked"
 cond = "JALR"
 
 [[constraints.all]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "next_pc_low", 1]]
-multiplicity = "μ"
+input = [["idx", "next_pc_low", 1], "μ"]
 
 [[constraints.all]]
 kind = "interaction"

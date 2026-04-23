@@ -211,18 +211,16 @@ multiplicity = "μ"
 # Cxz_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
 # Cxz_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
 [[constraints.theta]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = [["idx", ["idx", "Cxz_left", "x"], "z"]]
+input = [["idx", ["idx", "Cxz_left", "x"], "z"], "μ"]
 iters = [["x", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
 
 [[constraints.theta]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
+input = [["idx", ["idx", "Cxz_right", "x"], "z"], "μ"]
 iters = [["x", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
@@ -257,18 +255,16 @@ multiplicity = "μ"
 # rot_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
 # rot_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
 [[constraints.rho]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
-iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
+input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"], "μ"]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]] 
 
 [[constraints.rho]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
-input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
+input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"], "μ"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
 
 [[constraint_groups]]
 name = "chi"
