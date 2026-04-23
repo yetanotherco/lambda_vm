@@ -76,6 +76,44 @@ extern "C" __global__ void barycentric_base_batched(
     }
 }
 
+/// Same as `barycentric_base_batched` but reads rows at stride `row_stride`
+/// within each column — i.e. treats the column as an LDE of length
+/// `n * row_stride` and sums over the trace-size coset (every `row_stride`-th
+/// row). Lets R3 OOD run directly against the LDE device handle from R1
+/// without materialising a trace-size slab.
+extern "C" __global__ void barycentric_base_batched_strided(
+    const uint64_t *columns,
+    uint64_t col_stride,
+    uint64_t row_stride,
+    const uint64_t *coset_points,
+    const uint64_t *inv_denoms,
+    uint64_t n,
+    uint64_t *out_ext3_int
+) {
+    uint64_t col = blockIdx.x;
+    const uint64_t *col_data = columns + col * col_stride;
+
+    ext3::Fe3 acc = ext3::zero();
+    for (uint64_t i = threadIdx.x; i < n; i += BARY_BLOCK_DIM) {
+        uint64_t eval  = col_data[i * row_stride];
+        uint64_t point = coset_points[i];
+        uint64_t pe    = goldilocks::mul(point, eval);
+        ext3::Fe3 inv_d = ext3::make(
+            inv_denoms[i * 3 + 0],
+            inv_denoms[i * 3 + 1],
+            inv_denoms[i * 3 + 2]);
+        ext3::Fe3 term = ext3::mul_base(inv_d, pe);
+        acc = ext3::add(acc, term);
+    }
+
+    ext3::Fe3 sum = block_reduce_ext3(acc);
+    if (threadIdx.x == 0) {
+        out_ext3_int[col * 3 + 0] = sum.a;
+        out_ext3_int[col * 3 + 1] = sum.b;
+        out_ext3_int[col * 3 + 2] = sum.c;
+    }
+}
+
 /// Ext3-column variant: M ext3 columns stored as 3M base slabs. Column `c`
 /// lives at `columns[(c*3+k)*col_stride + i]` for component `k ∈ 0..3`.
 extern "C" __global__ void barycentric_ext3_batched(
@@ -98,6 +136,43 @@ extern "C" __global__ void barycentric_ext3_batched(
         // F × E → E  (point times eval, componentwise on the 3 base components)
         ext3::Fe3 pe = ext3::mul_base(eval, point);
         // E × E → E
+        ext3::Fe3 inv_d = ext3::make(
+            inv_denoms[i * 3 + 0],
+            inv_denoms[i * 3 + 1],
+            inv_denoms[i * 3 + 2]);
+        ext3::Fe3 term = ext3::mul(pe, inv_d);
+        acc = ext3::add(acc, term);
+    }
+
+    ext3::Fe3 sum = block_reduce_ext3(acc);
+    if (threadIdx.x == 0) {
+        out_ext3_int[col * 3 + 0] = sum.a;
+        out_ext3_int[col * 3 + 1] = sum.b;
+        out_ext3_int[col * 3 + 2] = sum.c;
+    }
+}
+
+/// Strided ext3 variant for R3 OOD of aux LDE.
+extern "C" __global__ void barycentric_ext3_batched_strided(
+    const uint64_t *columns,
+    uint64_t col_stride,
+    uint64_t row_stride,
+    const uint64_t *coset_points,
+    const uint64_t *inv_denoms,
+    uint64_t n,
+    uint64_t *out_ext3_int
+) {
+    uint64_t col = blockIdx.x;
+    const uint64_t *slab_a = columns + (col * 3 + 0) * col_stride;
+    const uint64_t *slab_b = columns + (col * 3 + 1) * col_stride;
+    const uint64_t *slab_c = columns + (col * 3 + 2) * col_stride;
+
+    ext3::Fe3 acc = ext3::zero();
+    for (uint64_t i = threadIdx.x; i < n; i += BARY_BLOCK_DIM) {
+        uint64_t lde_i = i * row_stride;
+        ext3::Fe3 eval = ext3::make(slab_a[lde_i], slab_b[lde_i], slab_c[lde_i]);
+        uint64_t point = coset_points[i];
+        ext3::Fe3 pe = ext3::mul_base(eval, point);
         ext3::Fe3 inv_d = ext3::make(
             inv_denoms[i * 3 + 0],
             inv_denoms[i * 3 + 1],

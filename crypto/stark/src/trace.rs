@@ -476,44 +476,83 @@ where
         // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
         let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
 
-        // Evaluate all main columns (parallel when feature enabled)
-        #[cfg(feature = "parallel")]
-        let main_iter = main_col_evals.par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let main_iter = main_col_evals.iter();
-        let main_evals: Vec<FieldElement<E>> = main_iter
-            .map(|col_evals| {
-                interpolate_coset_eval_with_g_n_inv(
-                    &z_pow_n,
-                    &coset_offset_pow_n,
-                    &n_inv,
-                    &g_n_inv,
-                    &coset_points,
-                    col_evals,
-                    &inv_denoms,
-                )
-            })
-            .collect();
+        // GPU fast path: batched strided barycentric over the main-trace
+        // LDE already on device. Avoids the per-column CPU vec allocation
+        // above when the R1 fused path ran.
+        #[cfg(feature = "cuda")]
+        let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
+            lde_trace,
+            bf,
+            &coset_points,
+            &coset_offset_pow_n,
+            &n_inv,
+            &g_n_inv,
+            &z_pow_n,
+            &inv_denoms,
+        );
+        #[cfg(not(feature = "cuda"))]
+        let main_gpu: Option<Vec<FieldElement<E>>> = None;
+
+        let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
+            v
+        } else {
+            // Evaluate all main columns (parallel when feature enabled)
+            #[cfg(feature = "parallel")]
+            let main_iter = main_col_evals.par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let main_iter = main_col_evals.iter();
+            main_iter
+                .map(|col_evals| {
+                    interpolate_coset_eval_with_g_n_inv(
+                        &z_pow_n,
+                        &coset_offset_pow_n,
+                        &n_inv,
+                        &g_n_inv,
+                        &coset_points,
+                        col_evals,
+                        &inv_denoms,
+                    )
+                })
+                .collect()
+        };
         table_data.extend(main_evals);
 
-        // Evaluate all aux columns
-        #[cfg(feature = "parallel")]
-        let aux_iter = aux_col_evals.par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = aux_col_evals.iter();
-        let aux_evals: Vec<FieldElement<E>> = aux_iter
-            .map(|col_evals| {
-                interpolate_coset_eval_ext_with_g_n_inv(
-                    &z_pow_n,
-                    &coset_offset_pow_n,
-                    &n_inv,
-                    &g_n_inv,
-                    &coset_points,
-                    col_evals,
-                    &inv_denoms,
-                )
-            })
-            .collect();
+        // GPU fast path for aux columns.
+        #[cfg(feature = "cuda")]
+        let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
+            lde_trace,
+            bf,
+            &coset_points,
+            &coset_offset_pow_n,
+            &n_inv,
+            &g_n_inv,
+            &z_pow_n,
+            &inv_denoms,
+        );
+        #[cfg(not(feature = "cuda"))]
+        let aux_gpu: Option<Vec<FieldElement<E>>> = None;
+
+        let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
+            v
+        } else {
+            #[cfg(feature = "parallel")]
+            let aux_iter = aux_col_evals.par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let aux_iter = aux_col_evals.iter();
+            aux_iter
+                .map(|col_evals| {
+                    interpolate_coset_eval_ext_with_g_n_inv(
+                        &z_pow_n,
+                        &coset_offset_pow_n,
+                        &n_inv,
+                        &g_n_inv,
+                        &coset_points,
+                        col_evals,
+                        &inv_denoms,
+                    )
+                })
+                .collect()
+        };
         table_data.extend(aux_evals);
     }
 

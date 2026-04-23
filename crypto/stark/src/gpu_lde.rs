@@ -1267,6 +1267,119 @@ pub fn gpu_deep_calls() -> u64 {
     GPU_DEEP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// R3 OOD barycentric over the **main** (base-field) LDE read directly from
+/// the device handle with stride `row_stride = blowup_factor`. Applies the
+/// same trailing `scalar * vanishing * sum` ext3 scale on host that
+/// `interpolate_coset_eval_with_g_n_inv` does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_base_on_handle<F, E>(
+    lde_trace: &crate::trace::LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let num_cols = main.m;
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = coset_points.len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if inv_denoms.len() != n || main.lde_size != n * row_stride {
+        return None;
+    }
+
+    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let points_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
+
+    let sums_raw = math_cuda::barycentric::barycentric_base_on_device(
+        main,
+        row_stride,
+        points_raw,
+        inv_denoms_raw,
+        n,
+    )
+    .expect("GPU barycentric_base_on_device failed");
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+/// Ext3 counterpart reading the aux LDE handle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_ext3_on_handle<F, E>(
+    lde_trace: &crate::trace::LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    if type_name::<F>() != type_name::<GoldilocksField>() {
+        return None;
+    }
+    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let aux = lde_trace.gpu_aux()?;
+    let num_cols = aux.m;
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = coset_points.len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if inv_denoms.len() != n || aux.lde_size != n * row_stride {
+        return None;
+    }
+
+    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let points_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_raw: &[u64] =
+        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
+
+    let sums_raw = math_cuda::barycentric::barycentric_ext3_on_device(
+        aux,
+        row_stride,
+        points_raw,
+        inv_denoms_raw,
+        n,
+    )
+    .expect("GPU barycentric_ext3_on_device failed");
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
 /// GPU path for `compute_deep_composition_poly_evaluations`. Returns the N
 /// trace-size coset evaluations of the deep-composition polynomial as a
 /// `Vec<FieldElement<E>>` (same type as the CPU path), or `None` when the

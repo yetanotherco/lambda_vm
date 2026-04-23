@@ -152,6 +152,8 @@ pub struct Backend {
     // barycentric.ptx
     pub barycentric_base_batched: CudaFunction,
     pub barycentric_ext3_batched: CudaFunction,
+    pub barycentric_base_batched_strided: CudaFunction,
+    pub barycentric_ext3_batched_strided: CudaFunction,
 
     // deep.ptx
     pub deep_composition_ext3_row: CudaFunction,
@@ -215,6 +217,8 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
+            barycentric_base_batched_strided: bary.load_function("barycentric_base_batched_strided")?,
+            barycentric_ext3_batched_strided: bary.load_function("barycentric_ext3_batched_strided")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
