@@ -57,6 +57,12 @@ fn bench_prove_fib_1m() {
 
 #[test]
 #[ignore = "bench; run with --ignored --nocapture"]
+fn bench_prove_fib_1m_long() {
+    bench_prove("fib_iterative_1M", 15);
+}
+
+#[test]
+#[ignore = "bench; run with --ignored --nocapture"]
 fn bench_prove_fib_2m() {
     bench_prove("fib_iterative_2M", 5);
 }

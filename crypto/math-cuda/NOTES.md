@@ -7,9 +7,9 @@ context loss between sessions. Update as you go.
 
 ### End-to-end speedup (fused tree + GPU R4 deep + LDE-resident handles + GPU R3 OOD)
 
-| Program | CPU rayon (46 cores) | CUDA (median over 5+ runs) | Delta |
+| Program | CPU rayon (46 cores) | CUDA (mean over 15 trials) | Delta |
 |---|---|---|---|
-| fib_iterative_1M | **18.269 s** | **12.0 s** | **1.52× (34.3% faster)** |
+| fib_iterative_1M | **18.269 s** | **11.64 s** | **1.57× (36.3% faster)** |
 | fib_iterative_4M |               | **28.3 s** |   |
 
 Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
