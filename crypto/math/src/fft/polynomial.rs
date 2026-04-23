@@ -97,12 +97,12 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         if len.trailing_zeros() as u64 > F::TWO_ADICITY {
             return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
         }
-        if poly.coefficients().is_empty() {
-            return Ok(vec![FieldElement::zero(); len]);
-        }
-
         if !len.is_power_of_two() {
             return Err(FFTError::InputError(len));
+        }
+
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
         }
 
         let mut coeffs = poly.coefficients().to_vec();
@@ -577,6 +577,10 @@ mod tests {
         let poly = Polynomial::new(&coeffs);
 
         let err = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 3, Some(8));
+        assert!(matches!(err, Err(FFTError::InputError(_))));
+
+        let empty = Polynomial::<FE>::new(&[]);
+        let err = Polynomial::evaluate_fft_bit_reversed::<F>(&empty, 3, None);
         assert!(matches!(err, Err(FFTError::InputError(_))));
     }
 }
