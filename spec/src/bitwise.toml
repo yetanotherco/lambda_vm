@@ -102,6 +102,11 @@ type = "BaseField"
 desc = ""
 
 [[variables.multiplicity]]
+name = "μ_ARE_BYTES"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
 name = "μ_IS_HALF"
 type = "BaseField"
 desc = ""
@@ -167,6 +172,12 @@ kind = "interaction"
 tag = "IS_BYTE"
 input = ["X"]
 multiplicity = ["-", "μ_IS_BYTE"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = ["X", "Y"]
+multiplicity = ["-", "μ_ARE_BYTES"]
 
 [[constraints.contributions]]
 kind = "interaction"
