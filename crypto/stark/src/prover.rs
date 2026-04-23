@@ -19,7 +19,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -1219,22 +1219,33 @@ pub trait IsStarkProver<
         let num_aux_cols = lde_trace.num_aux_cols();
 
         // Precompute all inverse denominators via batch inversion.
-        let num_denoms = domain_size * (1 + num_eval_points);
-        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
+        // Layout: [ (x_i - z_power)_{i<N},
+        //          (x_i - z_shifted[0])_{i<N}, ..., (x_i - z_shifted[M-1])_{i<N} ]
+        // Fill each of the (1 + num_eval_points) chunks in parallel: the
+        // denom value for group g, row i is `x_i - poles[g]`, independent.
+        let num_groups = 1 + num_eval_points;
+        let num_denoms = domain_size * num_groups;
+        let mut denoms: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::<FieldExtension>::zero(); num_denoms];
 
-        // H-term denominators: x_i - z^K
-        for i in 0..domain_size {
-            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
-            denoms.push(x_i - &z_power);
-        }
+        #[cfg(feature = "parallel")]
+        let chunks = denoms.par_chunks_mut(domain_size);
+        #[cfg(not(feature = "parallel"))]
+        let chunks = denoms.chunks_mut(domain_size);
 
-        // Trace-term denominators: x_i - z_shifted[k]
-        for z_k in z_shifted.iter().take(num_eval_points) {
-            for i in 0..domain_size {
+        chunks.enumerate().for_each(|(group, slot)| {
+            // group 0: pole = z_power (H terms)
+            // group 1..: pole = z_shifted[group-1] (trace terms)
+            let pole = if group == 0 {
+                &z_power
+            } else {
+                &z_shifted[group - 1]
+            };
+            for (i, dst) in slot.iter_mut().enumerate() {
                 let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
-                denoms.push(x_i - z_k);
+                *dst = x_i - pole;
             }
-        }
+        });
 
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
