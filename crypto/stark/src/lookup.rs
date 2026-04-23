@@ -2420,3 +2420,90 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use math::field::{
+        element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
+        goldilocks::GoldilocksField,
+    };
+
+    use super::*;
+
+    /// Builds a synthetic main-segment trace with `num_cols` columns and `trace_len` rows.
+    /// Column `i` is filled with `(row * num_cols + i + 1)` as a simple pattern.
+    fn make_trace_cols(
+        num_cols: usize,
+        trace_len: usize,
+    ) -> Vec<Vec<FieldElement<GoldilocksField>>> {
+        (0..num_cols)
+            .map(|col| {
+                (0..trace_len)
+                    .map(|row| {
+                        FieldElement::<GoldilocksField>::from((row * num_cols + col + 1) as u64)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn batched_term_column_chunked_matches_non_chunked() {
+        type F = GoldilocksField;
+        type E = Degree3GoldilocksExtensionField;
+
+        let trace_len: usize = 2048;
+        let num_cols: usize = 4;
+
+        // Build synthetic main trace columns
+        let main_cols = make_trace_cols(num_cols, trace_len);
+
+        // interaction_a: sender on bus 1, multiplicity from column 0, two BusValue columns (1, 2)
+        let interaction_a = BusInteraction::sender(
+            1u64,
+            Multiplicity::Column(0),
+            vec![BusValue::column(1), BusValue::column(2)],
+        );
+
+        // interaction_b: receiver on bus 1, multiplicity One, one BusValue column (3)
+        let interaction_b =
+            BusInteraction::receiver(1u64, Multiplicity::One, vec![BusValue::column(3)]);
+
+        // Construct challenges: [z, alpha] — two extension-field elements
+        let challenges: Vec<FieldElement<E>> = vec![
+            FieldElement::<E>::from(7u64),
+            FieldElement::<E>::from(13u64),
+        ];
+
+        let result_standard = compute_logup_batched_term_column::<F, E>(
+            &interaction_a,
+            &interaction_b,
+            &main_cols,
+            trace_len,
+            &challenges,
+            "test_table",
+        );
+
+        let result_chunked = compute_logup_batched_term_column_chunked::<F, E>(
+            &interaction_a,
+            &interaction_b,
+            &main_cols,
+            trace_len,
+            &challenges,
+        );
+
+        assert_eq!(
+            result_standard.len(),
+            result_chunked.len(),
+            "output lengths differ"
+        );
+        for (row, (a, b)) in result_standard
+            .iter()
+            .zip(result_chunked.iter())
+            .enumerate()
+        {
+            assert_eq!(a, b, "mismatch at row {row}: standard={a:?}, chunked={b:?}");
+        }
+    }
+}
