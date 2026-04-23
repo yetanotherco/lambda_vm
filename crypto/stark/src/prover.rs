@@ -981,11 +981,33 @@ pub trait IsStarkProver<
         let comp_z_pow_n = z_power.pow(domain_size);
         let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
 
+        // For the typical case of 2 composition poly parts, evaluate them in
+        // parallel — each barycentric evaluation is a fresh N-point extract +
+        // O(N) linear combination, independent of the other.
+        #[cfg(feature = "parallel")]
+        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
+            .lde_composition_poly_evaluations
+            .par_iter()
+            .map(|lde_evals| {
+                let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
+                    .map(|i| lde_evals[i * blowup_factor].clone())
+                    .collect();
+                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                    &comp_z_pow_n,
+                    &coset_offset_pow_n,
+                    &domain_size_inv,
+                    &g_n_inv,
+                    &coset_points,
+                    &evals,
+                    &comp_inv_denoms,
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
             .lde_composition_poly_evaluations
             .iter()
             .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
                 let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
                     .map(|i| lde_evals[i * blowup_factor].clone())
                     .collect();
