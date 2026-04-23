@@ -578,13 +578,24 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
 
-        let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
-                .ok_or(ProvingError::EmptyCommitment)?;
+        // The two Merkle builds read disjoint column slices; run them concurrently.
+        // Preprocessed tables carry heavy preprocessed trees (e.g. BITWISE: ~20 cols
+        // × 2^21 LDE leaves) alongside much smaller multiplicity trees, so the join
+        // overlaps the dominant Keccak hashing with the lighter multiplicity hashing.
+        #[cfg(feature = "parallel")]
+        let (precomputed_opt, mult_opt) = rayon::join(
+            || Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols]),
+            || Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..]),
+        );
+        #[cfg(not(feature = "parallel"))]
+        let (precomputed_opt, mult_opt) = (
+            Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols]),
+            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..]),
+        );
+        let (precomputed_tree, precomputed_root) =
+            precomputed_opt.ok_or(ProvingError::EmptyCommitment)?;
+        let (mult_tree, mult_root) = mult_opt.ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
