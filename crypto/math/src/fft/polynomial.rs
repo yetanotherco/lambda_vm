@@ -569,15 +569,21 @@ mod tests {
             let poly = Polynomial::new(&coeffs);
 
             for blowup_factor in [1, 2, 4] {
-                let size = Some(n);
-                let mut expected =
-                    Polynomial::evaluate_fft::<F>(&poly, blowup_factor, size).unwrap();
-                in_place_bit_reverse_permute(&mut expected);
+                for domain_mult in [1, 2] {
+                    let size = Some(n * domain_mult);
+                    let mut expected =
+                        Polynomial::evaluate_fft::<F>(&poly, blowup_factor, size).unwrap();
+                    in_place_bit_reverse_permute(&mut expected);
 
-                let got =
-                    Polynomial::evaluate_fft_bit_reversed::<F>(&poly, blowup_factor, size).unwrap();
+                    let got =
+                        Polynomial::evaluate_fft_bit_reversed::<F>(&poly, blowup_factor, size)
+                            .unwrap();
 
-                assert_eq!(got, expected, "order={order}, blowup={blowup_factor}");
+                    assert_eq!(
+                        got, expected,
+                        "order={order}, blowup={blowup_factor}, domain_mult={domain_mult}"
+                    );
+                }
             }
         }
     }
