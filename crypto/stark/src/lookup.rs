@@ -508,7 +508,7 @@ impl Packing {
 /// Used to build custom linear combinations of column values and constants.
 /// Supports both positive and negative coefficients (i64) for use in
 /// Multiplicity::Linear (e.g., μ - read2 - read4 - read8).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinearTerm {
     /// coefficient * column_value (coefficient can be negative)
     Column {
@@ -536,7 +536,7 @@ pub enum LinearTerm {
 /// Each `BusValue` produces exactly **1 bus element** for the fingerprint.
 /// The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
 /// where each `vᵢ` is a bus element from a `BusValue`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusValue {
     /// Columns combined with predefined packing (powers of 2).
     ///
@@ -1628,37 +1628,75 @@ where
     // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
 
-    for row in 0..trace_len {
-        let mut lc_a = &bus_id_a * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_a.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_a,
-                &shifts,
-            );
-            alpha_offset += consumed;
+    // Shared-tail fast path: when the two interactions reference the exact same
+    // token vector (structurally equal `values`), only the `bus_id * alpha_0` term
+    // differs. Compute the tail Σ token_i * alpha^(i+1) once per row, then derive
+    // both fingerprints with a single F×E mul + add per interaction.
+    //
+    // Today this triggers for the CPU table's AND_BYTE/OR_BYTE/XOR_BYTE triples,
+    // which all share token (ARG1[i], ARG2[i], RES[i]).
+    let shared_tokens = interaction_a.values == interaction_b.values;
+
+    if shared_tokens {
+        let bus_id_a_alpha0 = &bus_id_a * &alpha_powers[0];
+        let bus_id_b_alpha0 = &bus_id_b * &alpha_powers[0];
+        // Size the vector upfront so fp_a lands in [0, N) and fp_b in [N, 2N),
+        // matching the layout expected by the downstream batch inversion and
+        // term assembly below.
+        all_fingerprints.resize(2 * trace_len, FieldElement::<E>::zero());
+        for row in 0..trace_len {
+            let mut tail = FieldElement::<E>::zero();
+            let mut alpha_offset = 1;
+            for bv in &interaction_a.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut tail,
+                    &shifts,
+                );
+                alpha_offset += consumed;
+            }
+            // fp_k = z - (bus_id_k * alpha_0 + tail) = (z - tail) - bus_id_k * alpha_0.
+            // Compute `common = z - tail` once and reuse for both a and b.
+            let common = z - &tail;
+            all_fingerprints[row] = &common - &bus_id_a_alpha0;
+            all_fingerprints[trace_len + row] = &common - &bus_id_b_alpha0;
         }
-        all_fingerprints.push(z - &lc_a);
-    }
-    for row in 0..trace_len {
-        let mut lc_b = &bus_id_b * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_b.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_b,
-                &shifts,
-            );
-            alpha_offset += consumed;
+    } else {
+        for row in 0..trace_len {
+            let mut lc_a = &bus_id_a * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &interaction_a.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc_a,
+                    &shifts,
+                );
+                alpha_offset += consumed;
+            }
+            all_fingerprints.push(z - &lc_a);
         }
-        all_fingerprints.push(z - &lc_b);
+        for row in 0..trace_len {
+            let mut lc_b = &bus_id_b * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &interaction_b.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc_b,
+                    &shifts,
+                );
+                alpha_offset += consumed;
+            }
+            all_fingerprints.push(z - &lc_b);
+        }
     }
 
     // Single batch inversion for all 2*N fingerprints

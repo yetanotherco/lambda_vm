@@ -1019,74 +1019,47 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // Bitwise byte interactions (AND_BYTE / OR_BYTE / XOR_BYTE, ×8 per op)
     // -------------------------------------------------------------------------
+    // Interleave AND[i] and OR[i] so the aux-trace pair builder groups them
+    // together: both send the identical token (ARG1[i], ARG2[i], RES[i]),
+    // only bus_id and multiplicity differ. The `compute_logup_batched_term_column`
+    // shared-tail fast path in stark/src/lookup.rs computes the token tail
+    // once per row for this pair. XOR bytes follow as a contiguous block so
+    // they pair among themselves (different tokens per byte, no tail sharing).
+    let byte_token = |i: usize| {
+        vec![
+            BusValue::Packed {
+                start_column: cols::ARG1[i],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[i],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[i],
+                packing: Packing::Direct,
+            },
+        ]
+    };
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
             BusId::AndByte,
             Multiplicity::Column(cols::AND),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
+            byte_token(i),
         ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
         interactions.push(BusInteraction::sender(
             BusId::OrByte,
             Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
+            byte_token(i),
         ));
     }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
             BusId::XorByte,
             Multiplicity::Column(cols::XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
+            byte_token(i),
         ));
     }
 
