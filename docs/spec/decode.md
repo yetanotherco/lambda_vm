@@ -26,7 +26,7 @@ The  table must be padded to a length that is a power of two. Empty rows with th
 
 Note that this row sets the `EBREAK` flag. Given that `CPU` asserts that `EBREAK = 0` (see [cpu:c:ebreak_traps]), using this "padding-instruction" would immediately make the CPU table unprovable. Note moreover that the `pc` is set to `7`. This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _`4`_ (i.e., the max `pc`-increment) greater than _`1`_ (i.e., the `pc`-value used in the [additional instruction] referred to by `CPU`-padding lines).
 
-## Decoding
+## Decoding<decode:decoding-overview>
 
 For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
 
@@ -79,10 +79,6 @@ For the purpose of brevity and readability, the table uses the following rules-o
 
 Further clarification is provided in the notes following the table.
 
-### C-type instructions
-
-The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
-
 /// Add a reference to one or more notes following this table.
 
 super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
@@ -92,6 +88,10 @@ show figure: set block(breakable: true)
 figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), )) }
 
 // OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
+
+### C-type instructions
+
+The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
 
 // Construct a note that can be referenced through `lbl`
 

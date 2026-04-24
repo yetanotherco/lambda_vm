@@ -128,7 +128,7 @@ To ensure temporal integrity, every memory operation needs to be constrained for
 
 Because the LogUp argument handling token consumption and emission needs to be fully balanced --- every token emitted should be consumed, and vice versa --- we need to have a system to emit the initial tokens and consume the final tokens. This needs to ensure that every address has at most a single initializing emission, and at most one finalizing consumption. Having at most one initialization will, through the correctness of the lookup argument, immediately lead to having at most one correct finalization, and vice versa.
 
-The initialization will need to correspond to a fixed initial register state for the VM, as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover. The contribution of initialization with static data from the ELF executable and the initial register state to the sum can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven. This leaves only zero-initialization and prover input as prover-side concerns for initialization, alongside the finalization of the entire used memory.
+The initialization will need to correspond to a fixed initial register state for the VM, as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover. The contribution of initialization with static data from the ELF executable and the initial register state to the sum can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven. To enable the loading of the PC in [cpu]:memory, register initialization happens at timestamp 1. Register finalization is made possible for the verifier by having a known state from the HALT chip ([halt]). This leaves only zero-initialization and prover input as prover-side concerns for initialization, alongside the finalization of the entire used memory.
 
 For our chosen scheme (which we refer to as "paged initialization/finalization"), the available memory range is split into equally (power-of-two) sized "pages". Each address can then be represented as `address = page_base_address + page_offset`, with `page_base_address` being "page-aligned", and `page_offset` belonging to a limited range (the page size). As such, initialization or finalization of a page is represented by a table with columns `page`, `offset`, `value`, and ---for finalization--- `timestamp`. The `page` column is a preprocessed, constant value (which can be entirely virtualized/inlined into the constraints for this table), and the `offset` column is a preprocessed column containing its row index. Depending on the type of initialization, `value` can be a prover-committed column (input data), or a precomputed, constant column containing `0` (free memory space). This table then feeds into the LogUp system in the normal way, emitting the initial tokens for all addresses in a page, without consuming any tokens. Since the `offset` column is always the same, it can be reused across all paged initialization and finalization tables.
 
@@ -143,33 +143,6 @@ We present here a set of constraints on the `PAGE` table that
 + enforces the initial and final values of each address are bytes + adds the initial and final interaction to the LogUp argument
 
 For zero-initialized pages, `init` can be a constant `0`, and hence doesn't need a column, nor a range check.
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `offset` | `RowIndex` | The offset from the page base address. |
-| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
-| `fini` | `Byte` | The final value this address took |
-| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
-
-**Definition of `address`:**
-```
-address := page + offset * 1::DWordWL
-```
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `PAGE-C1` | `IS_BYTE[init]` | 1 |
-| `PAGE-C2` | `IS_BYTE[fini]` | 1 |
-| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
-| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |
 
 We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
 
@@ -211,9 +184,9 @@ let (lb, rb) = if sig.kind == "interaction" { (`[`, `]`) } else if sig.kind == "
 
 let cond = sig.at("cond", default: none) let cond_str = if cond != none { raw(cond) + ` => ` } else {``}
 
-let input_str = sig.input.map(elt => { if type(elt) == array { raw(elt.at(0)) + `[` + raw(str(elt.at(1))) + `]` } else { raw(elt) } }).join(`, `)
+let input_str = sig.input.map(type_to_code).join(`, `)
 
-let output = sig.at("output", default: none) let output_str = if output != none { if type(output) == array { raw(output.at(0)) + `[` + raw(str(output.at(1))) + `]` } else { raw(output) } + `; ` } else {``}
+let output = sig.at("output", default: none) let output_str = if output != none { type_to_code(output) + `; ` } else {``}
 
 return [] }
 
@@ -221,7 +194,7 @@ return [] }
 
 let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
 
-return vars.map(v => { let (label, factor) = if type(v) == array { (v.at(0), v.at(1)) } else { (v, 1) } config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor }) .sum() }
+return vars.map(v => { let factor = 1 while type(v) == array { factor *= v.at(1) v = v.at(0) } let lbl = v config.variables.types.filter(type => type.label == lbl).first().subtypes.len() * factor }) .sum() }
 
 The following lists signatures of the .len() interactions in this VM.
 
@@ -808,7 +781,7 @@ The  table must be padded to a length that is a power of two. Empty rows with th
 
 Note that this row sets the `EBREAK` flag. Given that `CPU` asserts that `EBREAK = 0` (see [cpu:c:ebreak_traps]), using this "padding-instruction" would immediately make the CPU table unprovable. Note moreover that the `pc` is set to `7`. This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _`4`_ (i.e., the max `pc`-increment) greater than _`1`_ (i.e., the `pc`-value used in the [additional instruction] referred to by `CPU`-padding lines).
 
-## Decoding
+## Decoding<decode:decoding-overview>
 
 For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
 
@@ -861,10 +834,6 @@ For the purpose of brevity and readability, the table uses the following rules-o
 
 Further clarification is provided in the notes following the table.
 
-### C-type instructions
-
-The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
-
 /// Add a reference to one or more notes following this table.
 
 super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
@@ -874,6 +843,10 @@ show figure: set block(breakable: true)
 figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), )) }
 
 // OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
+
+### C-type instructions
+
+The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
 
 // Construct a note that can be referenced through `lbl`
 
@@ -950,6 +923,8 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 
 | Name | Type | Description |
 |------|------|-------------|
+| `prev_pc_timestamp_borrow` | `Bit` | The borrow bit for computing the previous timestamp the PC was accessed |
+| `pc_double_read` | `Bit` | Whether the PC is being read as a general purpose register (`rs1`) this cycle |
 | `rv1` | `DWordWHH` | The value of register `rs1` |
 | `rv2` | `DWordWHH` | The value of register `rs2` |
 | `rv1_ext_bit` | `Bit` | The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr` |
@@ -1057,9 +1032,11 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 | `CPU-CA45` |  | `MUL[res::DWordWL; arg1::DWordHL, signed, arg2::DWordHL, mp_selector, muldiv_selector]` | MUL |
 | `CPU-CA46` |  | `DVRM[res::DWordWL; arg1::DWordHL, arg2::DWordHL, signed, muldiv_selector]` | DIVREM |
 
-### Memory
+### Memory<cpu:memory>
 
-The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled. Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs. The timestamps are ensured to be disjoint for disjoint memory locations. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction.
+The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled. Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs. The `pc` register behaves very predictably with respect to its timestamps and when it is being read, so for performance reasons, we inline its memory interactions directly into the  chip.
+
+Potentially overlapping memory accesses are ensured to have disjoint timestamps. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction (see [cpu:c:read_rv1] and [decode]:decoding-overview). Constraints regarding whether `pc_double_read` corresponds to an `AUIPC` instruction are not necessary, as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp, and the integrity of the memory argument therefore ensures the correctness of this bit.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
@@ -1072,7 +1049,14 @@ The interactions with the memory, both for register loading and storing, as for 
 | `CPU-CM51` |  | `MEMW[1, 2::DWordWL * rd, ['arr', ['idx', 'rvd', 0], ['idx', 'rvd', 1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
 | `CPU-CM52` |  | `LOAD[rvd; res::DWordWL, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
 | `CPU-CM53` |  | `MEMW[0, res::DWordWL, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM54` |  | `MEMW[['arr', ['idx', 'pc', 0], ['idx', 'pc', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 255)::DWordWL, ['arr', ['idx', 'next_pc', 0], ['idx', 'next_pc', 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
+| `CPU-CM54` |  | `IS_BIT<pc_double_read>` |  |
+| `CPU-CM55` |  | `IS_BIT<prev_pc_timestamp_borrow>` |  |
+| `CPU-CM56.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], ['arr', ['+', ['-', ['idx', 'timestamp', 0], ['*', 3, ['not', 'pc_double_read']]], ['*', ['^', 2, 32], 'prev_pc_timestamp_borrow']], ['-', ['idx', 'timestamp', 1], 'prev_pc_timestamp_borrow']], pc[i]]` | 1 - pad |
+| `CPU-CM57.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], timestamp + 1::DWordWL, next_pc[i]]` | -(1 - pad) |
+
+#### Potential optimizations
+
+- `double_pc_read` could be integrated into decoding, so that `AUIPC` could set `read_register1 = 0` and no extra MEMW access for `rv1` is needed at this point.
 
 ### System
 
@@ -1080,9 +1064,9 @@ The interactions with the wider system.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CS55` | `!EBREAK` |  |
+| `CPU-CS58` | `!EBREAK` |  |
 | | _polynomial:_ `1 - EBREAK = 0` | |
-| `CPU-CS56` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
+| `CPU-CS59` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
 
 ### Input and output to the ALU
 
@@ -1090,20 +1074,20 @@ We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values, includ
 
 | Tag | Description |
 |-----|-------------|
-| `CPU-CE57` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
-| `CPU-CE58` | `arg1[:4]` = `rv1[:2]` |
+| `CPU-CE60` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
+| `CPU-CE61` | `arg1[:4]` = `rv1[:2]` |
 | | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` |
-| `CPU-CE59` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
+| `CPU-CE62` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
 | | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_ext_bit * (2^32 - 1) = 0` |
-| `CPU-CE60` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
-| `CPU-CE61` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
+| `CPU-CE63` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
+| `CPU-CE64` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
 | | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` |
-| `CPU-CE62` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
+| `CPU-CE65` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
 | | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * rv2_ext_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` |
-| `CPU-CE63` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
-| `CPU-CE64` | `!LOAD` => `rvd[0]` = `res[:4]` |
+| `CPU-CE66` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
+| `CPU-CE67` | `!LOAD` => `rvd[0]` = `res[:4]` |
 | | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` |
-| `CPU-CE65` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
+| `CPU-CE68` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
 | | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_ext_bit * (2^32 - 1)) = 0` |
 
 ### Other constraints
@@ -1112,11 +1096,11 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CO66` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
-| `CPU-CO67` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
+| `CPU-CO69` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
+| `CPU-CO70` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO68` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
-| `CPU-CO69` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
+| `CPU-CO71` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO72` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding
 
@@ -2038,6 +2022,12 @@ ECALLs provide system-level functionalities to the guest program.
 When `ECALL` is executed, it is assumed that: - register `A7` contains the system call number
 
 - the arguments are located in registers `A0`-`A6`, and - the return value is written to `A0`, where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
+
+## ECALL number overview
+
+We provide a list of supported ECALL numbers. Negative numbers (represented as 2s complement 64-bit numbers), are used for our own custom accelerators/extensions.
+
+/ 64: `write` ([commit]) / 93: `exit` ([halt]) / -1: `SHA256` ([sha256]) / -2: `KECCAK` ([keccak])
 
 ---
 

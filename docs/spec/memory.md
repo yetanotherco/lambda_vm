@@ -42,7 +42,7 @@ To ensure temporal integrity, every memory operation needs to be constrained for
 
 Because the LogUp argument handling token consumption and emission needs to be fully balanced --- every token emitted should be consumed, and vice versa --- we need to have a system to emit the initial tokens and consume the final tokens. This needs to ensure that every address has at most a single initializing emission, and at most one finalizing consumption. Having at most one initialization will, through the correctness of the lookup argument, immediately lead to having at most one correct finalization, and vice versa.
 
-The initialization will need to correspond to a fixed initial register state for the VM, as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover. The contribution of initialization with static data from the ELF executable and the initial register state to the sum can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven. This leaves only zero-initialization and prover input as prover-side concerns for initialization, alongside the finalization of the entire used memory.
+The initialization will need to correspond to a fixed initial register state for the VM, as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover. The contribution of initialization with static data from the ELF executable and the initial register state to the sum can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven. To enable the loading of the PC in [cpu]:memory, register initialization happens at timestamp 1. Register finalization is made possible for the verifier by having a known state from the HALT chip ([halt]). This leaves only zero-initialization and prover input as prover-side concerns for initialization, alongside the finalization of the entire used memory.
 
 For our chosen scheme (which we refer to as "paged initialization/finalization"), the available memory range is split into equally (power-of-two) sized "pages". Each address can then be represented as `address = page_base_address + page_offset`, with `page_base_address` being "page-aligned", and `page_offset` belonging to a limited range (the page size). As such, initialization or finalization of a page is represented by a table with columns `page`, `offset`, `value`, and ---for finalization--- `timestamp`. The `page` column is a preprocessed, constant value (which can be entirely virtualized/inlined into the constraints for this table), and the `offset` column is a preprocessed column containing its row index. Depending on the type of initialization, `value` can be a prover-committed column (input data), or a precomputed, constant column containing `0` (free memory space). This table then feeds into the LogUp system in the normal way, emitting the initial tokens for all addresses in a page, without consuming any tokens. Since the `offset` column is always the same, it can be reused across all paged initialization and finalization tables.
 
@@ -57,33 +57,6 @@ We present here a set of constraints on the `PAGE` table that
 + enforces the initial and final values of each address are bytes + adds the initial and final interaction to the LogUp argument
 
 For zero-initialized pages, `init` can be a constant `0`, and hence doesn't need a column, nor a range check.
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `offset` | `RowIndex` | The offset from the page base address. |
-| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
-| `fini` | `Byte` | The final value this address took |
-| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
-
-**Definition of `address`:**
-```
-address := page + offset * 1::DWordWL
-```
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `PAGE-C1` | `IS_BYTE[init]` | 1 |
-| `PAGE-C2` | `IS_BYTE[fini]` | 1 |
-| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
-| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |
 
 We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
 

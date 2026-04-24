@@ -55,6 +55,8 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 
 | Name | Type | Description |
 |------|------|-------------|
+| `prev_pc_timestamp_borrow` | `Bit` | The borrow bit for computing the previous timestamp the PC was accessed |
+| `pc_double_read` | `Bit` | Whether the PC is being read as a general purpose register (`rs1`) this cycle |
 | `rv1` | `DWordWHH` | The value of register `rs1` |
 | `rv2` | `DWordWHH` | The value of register `rs2` |
 | `rv1_ext_bit` | `Bit` | The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr` |
@@ -162,9 +164,11 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 | `CPU-CA45` |  | `MUL[res::DWordWL; arg1::DWordHL, signed, arg2::DWordHL, mp_selector, muldiv_selector]` | MUL |
 | `CPU-CA46` |  | `DVRM[res::DWordWL; arg1::DWordHL, arg2::DWordHL, signed, muldiv_selector]` | DIVREM |
 
-### Memory
+### Memory<cpu:memory>
 
-The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled. Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs. The timestamps are ensured to be disjoint for disjoint memory locations. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction.
+The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled. Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs. The `pc` register behaves very predictably with respect to its timestamps and when it is being read, so for performance reasons, we inline its memory interactions directly into the  chip.
+
+Potentially overlapping memory accesses are ensured to have disjoint timestamps. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction (see [cpu:c:read_rv1] and [decode]:decoding-overview). Constraints regarding whether `pc_double_read` corresponds to an `AUIPC` instruction are not necessary, as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp, and the integrity of the memory argument therefore ensures the correctness of this bit.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
@@ -177,7 +181,14 @@ The interactions with the memory, both for register loading and storing, as for 
 | `CPU-CM51` |  | `MEMW[1, 2::DWordWL * rd, ['arr', ['idx', 'rvd', 0], ['idx', 'rvd', 1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
 | `CPU-CM52` |  | `LOAD[rvd; res::DWordWL, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
 | `CPU-CM53` |  | `MEMW[0, res::DWordWL, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM54` |  | `MEMW[['arr', ['idx', 'pc', 0], ['idx', 'pc', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 255)::DWordWL, ['arr', ['idx', 'next_pc', 0], ['idx', 'next_pc', 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
+| `CPU-CM54` |  | `IS_BIT<pc_double_read>` |  |
+| `CPU-CM55` |  | `IS_BIT<prev_pc_timestamp_borrow>` |  |
+| `CPU-CM56.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], ['arr', ['+', ['-', ['idx', 'timestamp', 0], ['*', 3, ['not', 'pc_double_read']]], ['*', ['^', 2, 32], 'prev_pc_timestamp_borrow']], ['-', ['idx', 'timestamp', 1], 'prev_pc_timestamp_borrow']], pc[i]]` | 1 - pad |
+| `CPU-CM57.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], timestamp + 1::DWordWL, next_pc[i]]` | -(1 - pad) |
+
+#### Potential optimizations
+
+- `double_pc_read` could be integrated into decoding, so that `AUIPC` could set `read_register1 = 0` and no extra MEMW access for `rv1` is needed at this point.
 
 ### System
 
@@ -185,9 +196,9 @@ The interactions with the wider system.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CS55` | `!EBREAK` |  |
+| `CPU-CS58` | `!EBREAK` |  |
 | | _polynomial:_ `1 - EBREAK = 0` | |
-| `CPU-CS56` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
+| `CPU-CS59` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
 
 ### Input and output to the ALU
 
@@ -195,20 +206,20 @@ We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values, includ
 
 | Tag | Description |
 |-----|-------------|
-| `CPU-CE57` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
-| `CPU-CE58` | `arg1[:4]` = `rv1[:2]` |
+| `CPU-CE60` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
+| `CPU-CE61` | `arg1[:4]` = `rv1[:2]` |
 | | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` |
-| `CPU-CE59` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
+| `CPU-CE62` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
 | | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_ext_bit * (2^32 - 1) = 0` |
-| `CPU-CE60` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
-| `CPU-CE61` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
+| `CPU-CE63` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
+| `CPU-CE64` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
 | | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` |
-| `CPU-CE62` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
+| `CPU-CE65` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
 | | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * rv2_ext_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` |
-| `CPU-CE63` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
-| `CPU-CE64` | `!LOAD` => `rvd[0]` = `res[:4]` |
+| `CPU-CE66` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
+| `CPU-CE67` | `!LOAD` => `rvd[0]` = `res[:4]` |
 | | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` |
-| `CPU-CE65` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
+| `CPU-CE68` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
 | | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_ext_bit * (2^32 - 1)) = 0` |
 
 ### Other constraints
@@ -217,11 +228,11 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CO66` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
-| `CPU-CO67` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
+| `CPU-CO69` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
+| `CPU-CO70` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO68` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
-| `CPU-CO69` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
+| `CPU-CO71` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO72` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding
 
