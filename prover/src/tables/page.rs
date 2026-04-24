@@ -47,8 +47,8 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // Constants
 // =========================================================================
 
-/// Default page size in bytes (4KB).
-pub const DEFAULT_PAGE_SIZE: usize = 4096;
+/// Default page size in bytes (256KB).
+pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
 /// Stack top address (where SP starts). Re-exported from executor.
 pub use executor::vm::registers::STACK_TOP;
@@ -111,6 +111,11 @@ pub struct PageConfig {
     /// Initial values for each byte in the page.
     /// If None, all bytes are zero-initialized.
     pub init_values: Option<Vec<u8>>,
+    /// Whether this page holds private input data.
+    /// Private-input pages are NOT preprocessed — the verifier does not see
+    /// the init values. Instead, all columns (including OFFSET and INIT)
+    /// are committed as main trace and constrained via the memory bus.
+    pub is_private_input: bool,
 }
 
 impl PageConfig {
@@ -120,10 +125,11 @@ impl PageConfig {
             page_base,
             page_size,
             init_values: None,
+            is_private_input: false,
         }
     }
 
-    /// Create a page with initial values from data.
+    /// Create a page with initial values from ELF data.
     pub fn with_data(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
         assert!(data.len() <= page_size, "Data exceeds page size");
         let mut init_values = data;
@@ -132,6 +138,21 @@ impl PageConfig {
             page_base,
             page_size,
             init_values: Some(init_values),
+            is_private_input: false,
+        }
+    }
+
+    /// Create a page with initial values from private input data.
+    /// These pages are NOT preprocessed — the verifier never sees the init values.
+    pub fn with_private_input(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
+        assert!(data.len() <= page_size, "Data exceeds page size");
+        let mut init_values = data;
+        init_values.resize(page_size, 0);
+        Self {
+            page_base,
+            page_size,
+            init_values: Some(init_values),
+            is_private_input: true,
         }
     }
 }
