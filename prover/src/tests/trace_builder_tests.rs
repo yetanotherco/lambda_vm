@@ -295,7 +295,8 @@ fn test_cpu_timestamps() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check timestamps are 4, 8, 12, 16 (starting from 4 to ensure old_timestamp < timestamp)
+    // Check timestamps are 4, 8, 12, 16 (starting from 4 so inline PC prev_ts = 1 on first row,
+    // matching REGISTER init at timestamp 1 per spec/memory.typ).
     for i in 0..4 {
         let row = traces.cpus[0].main_table.get_row(i);
         assert_eq!(row[cols::TIMESTAMP], FE::from((i * 4 + 4) as u64));
