@@ -26,7 +26,9 @@ use sysinfo::System;
 pub fn estimate_peak_bytes(main_elements: u64) -> u64 {
     const PEAK_BYTES_PER_MAIN_ELEMENT: u64 = 85;
     const PEAK_BYTES_FIXED_OVERHEAD: u64 = 3_000_000_000;
-    main_elements.saturating_mul(PEAK_BYTES_PER_MAIN_ELEMENT) + PEAK_BYTES_FIXED_OVERHEAD
+    main_elements
+        .saturating_mul(PEAK_BYTES_PER_MAIN_ELEMENT)
+        .saturating_add(PEAK_BYTES_FIXED_OVERHEAD)
 }
 
 /// Pick a storage mode given the estimate and the machine's available RAM.

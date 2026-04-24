@@ -562,13 +562,13 @@ pub fn prove_with_options_and_inputs(
     // isn't double-counting the trace's own footprint.
     let available = auto_storage::available_ram_bytes();
 
-    // When the caller has set a RAM cap, they're explicitly asking for
-    // memory-constrained proving — spill each trace chunk during build so the
-    // trace itself can't push us over the cap before the post-build decision.
-    let trace_build_mode = if proof_options.max_ram_bytes.is_some() {
-        StorageMode::Disk
-    } else {
-        StorageMode::Ram
+    // When a cap is set and it's tighter than available RAM, spill each trace
+    // chunk during build so the trace itself can't push us over the cap before
+    // the post-build decision. A cap larger than available RAM is effectively
+    // inactive and doesn't force Disk.
+    let trace_build_mode = match (proof_options.max_ram_bytes, available) {
+        (Some(cap), a) if a == 0 || cap < a => StorageMode::Disk,
+        _ => StorageMode::Ram,
     };
     let mut traces =
         Traces::from_elf_and_logs_with_mode(&program, &result.logs, max_rows, trace_build_mode)?;
