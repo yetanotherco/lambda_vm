@@ -668,6 +668,21 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
+    // Bound num_private_input_pages before allocating PageConfigs.
+    // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
+    {
+        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
+        use crate::tables::page::DEFAULT_PAGE_SIZE;
+        let max_pages =
+            (MAX_PRIVATE_INPUT_SIZE as usize + 4 + DEFAULT_PAGE_SIZE - 1) / DEFAULT_PAGE_SIZE + 1;
+        if vm_proof.num_private_input_pages > max_pages {
+            return Err(Error::InvalidTableCounts(format!(
+                "num_private_input_pages ({}) exceeds max ({max_pages})",
+                vm_proof.num_private_input_pages,
+            )));
+        }
+    }
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
