@@ -279,6 +279,18 @@ fn gpu_logup_threshold() -> usize {
 
 static GPU_LOGUP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serializes GPU dispatch across the rayon-parallel table loop in Pass 1.
+/// The prover runs `build_auxiliary_trace` concurrently for every table,
+/// and without this lock ~12 streams compete for the GPU: H2D of each
+/// table's 240 MB main_cols saturates PCIe, and kernel launches fight
+/// for SM time. Serializing with a mutex trades a bit of CPU idle for
+/// a clean GPU pipeline.
+///
+/// Only the GPU-bound portion is under the lock — flatten_main_cols
+/// (host copy) and the final triples → FieldElement reassembly both
+/// run outside, so rayon still gets to overlap CPU work across tables.
+static GPU_LOGUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn gpu_logup_calls() -> u64 {
     GPU_LOGUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -321,78 +333,35 @@ where
     let (num_committed_pairs, absorbed_count) =
         crate::lookup::split_interactions(interactions.len());
 
-    // Upload main_cols ONCE.
-    let main_cols_u64 = unsafe { flatten_main_cols(main_segment_cols) };
-    let device_main =
-        math_cuda::logup::upload_main_cols(&main_cols_u64, main_segment_cols.len(), trace_len)
-            .ok()?;
+    // ── CPU prep (no lock held — many tables can prep in parallel) ──
 
     let alpha = &challenges[crate::lookup::LOGUP_CHALLENGE_ALPHA];
     let z = &challenges[0];
     let z_triple = unsafe { ext3_to_triple(z) };
+    let main_cols_u64 = unsafe { flatten_main_cols(main_segment_cols) };
 
-    let mut committed = Vec::with_capacity(num_committed_pairs);
+    enum PreppedCall {
+        Pair(PairBytecode, Vec<u64>),
+        Single(SingleBytecode, Vec<u64>),
+    }
+    let mut prepped: Vec<PreppedCall> = Vec::with_capacity(num_committed_pairs + 1);
+
     for i in 0..num_committed_pairs {
         let a = &interactions[i * 2];
         let b = &interactions[i * 2 + 1];
         let bytecode = build_pair_bytecode(a, b);
-        let alpha_powers_fe =
-            crate::lookup::compute_alpha_powers(alpha, bytecode.max_bus_elements);
-        let mut alpha_powers_u64 = Vec::with_capacity(bytecode.max_bus_elements * 3);
-        for ap in &alpha_powers_fe {
-            let t = unsafe { ext3_to_triple(ap) };
-            alpha_powers_u64.extend_from_slice(&t);
-        }
-        let result = math_cuda::logup::logup_pair_term_column_on_device(
-            &device_main,
-            bytecode.bus_id_a,
-            bytecode.bus_id_b,
-            &bytecode.ops_a,
-            &bytecode.ops_b,
-            &bytecode.linear_terms,
-            &alpha_powers_u64,
-            &z_triple,
-            &bytecode.mult_a,
-            &bytecode.mult_b,
-            bytecode.negate_a,
-            bytecode.negate_b,
-        )
-        .ok()?;
-        GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        committed.push(triples_to_ext3_fieldelements::<E>(&result, trace_len));
+        let alpha_powers_u64 = alpha_powers_u64_vec(alpha, bytecode.max_bus_elements);
+        prepped.push(PreppedCall::Pair(bytecode, alpha_powers_u64));
     }
 
-    // Virtual column (for absorbed interactions).
-    let virtual_col = match absorbed_count {
-        0 => None,
+    match absorbed_count {
+        0 => {}
         2 => {
             let a = &interactions[interactions.len() - 2];
             let b = &interactions[interactions.len() - 1];
             let bytecode = build_pair_bytecode(a, b);
-            let alpha_powers_fe =
-                crate::lookup::compute_alpha_powers(alpha, bytecode.max_bus_elements);
-            let mut alpha_powers_u64 = Vec::with_capacity(bytecode.max_bus_elements * 3);
-            for ap in &alpha_powers_fe {
-                let t = unsafe { ext3_to_triple(ap) };
-                alpha_powers_u64.extend_from_slice(&t);
-            }
-            let result = math_cuda::logup::logup_pair_term_column_on_device(
-                &device_main,
-                bytecode.bus_id_a,
-                bytecode.bus_id_b,
-                &bytecode.ops_a,
-                &bytecode.ops_b,
-                &bytecode.linear_terms,
-                &alpha_powers_u64,
-                &z_triple,
-                &bytecode.mult_a,
-                &bytecode.mult_b,
-                bytecode.negate_a,
-                bytecode.negate_b,
-            )
-            .ok()?;
-            GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(triples_to_ext3_fieldelements::<E>(&result, trace_len))
+            let alpha_powers_u64 = alpha_powers_u64_vec(alpha, bytecode.max_bus_elements);
+            prepped.push(PreppedCall::Pair(bytecode, alpha_powers_u64));
         }
         1 => {
             let a = &interactions[interactions.len() - 1];
@@ -400,33 +369,116 @@ where
             let ops = encode_bus_values(&a.values, 1, &mut pool);
             let mult = encode_multiplicity(&a.multiplicity, &mut pool);
             let max_bus_elements = a.num_bus_elements();
-            let alpha_powers_fe = crate::lookup::compute_alpha_powers(alpha, max_bus_elements);
-            let mut alpha_powers_u64 = Vec::with_capacity(max_bus_elements * 3);
-            for ap in &alpha_powers_fe {
-                let t = unsafe { ext3_to_triple(ap) };
-                alpha_powers_u64.extend_from_slice(&t);
-            }
-            let result = math_cuda::logup::logup_single_term_column_on_device(
-                &device_main,
-                a.bus_id,
-                &ops,
-                &pool,
-                &alpha_powers_u64,
-                &z_triple,
-                &mult,
-                !a.is_sender,
-            )
-            .ok()?;
-            GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(triples_to_ext3_fieldelements::<E>(&result, trace_len))
+            let alpha_powers_u64 = alpha_powers_u64_vec(alpha, max_bus_elements);
+            let bytecode = SingleBytecode {
+                ops,
+                linear_terms: pool,
+                mult,
+                bus_id: a.bus_id,
+                negate: !a.is_sender,
+            };
+            prepped.push(PreppedCall::Single(bytecode, alpha_powers_u64));
         }
         _ => unreachable!("absorbed_count must be 0, 1, or 2"),
+    };
+
+    // ── GPU dispatch (lock held — tables run serially on device) ──
+    let raw_results: Vec<Vec<u64>> = {
+        let _guard = GPU_LOGUP_LOCK
+            .lock()
+            .expect("GPU LogUp lock poisoned");
+
+        let device_main = math_cuda::logup::upload_main_cols(
+            &main_cols_u64,
+            main_segment_cols.len(),
+            trace_len,
+        )
+        .ok()?;
+
+        let mut results: Vec<Vec<u64>> = Vec::with_capacity(prepped.len());
+        for call in &prepped {
+            match call {
+                PreppedCall::Pair(bc, alpha) => {
+                    let r = math_cuda::logup::logup_pair_term_column_on_device(
+                        &device_main,
+                        bc.bus_id_a,
+                        bc.bus_id_b,
+                        &bc.ops_a,
+                        &bc.ops_b,
+                        &bc.linear_terms,
+                        alpha,
+                        &z_triple,
+                        &bc.mult_a,
+                        &bc.mult_b,
+                        bc.negate_a,
+                        bc.negate_b,
+                    )
+                    .ok()?;
+                    GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    results.push(r);
+                }
+                PreppedCall::Single(bc, alpha) => {
+                    let r = math_cuda::logup::logup_single_term_column_on_device(
+                        &device_main,
+                        bc.bus_id,
+                        &bc.ops,
+                        &bc.linear_terms,
+                        alpha,
+                        &z_triple,
+                        &bc.mult,
+                        bc.negate,
+                    )
+                    .ok()?;
+                    GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    results.push(r);
+                }
+            }
+        }
+        results
+        // _guard drops here; device_main drops here (releases VRAM).
+    };
+
+    // ── CPU post (lock released — FieldElement<E> reassembly parallelizable) ──
+    let mut committed = Vec::with_capacity(num_committed_pairs);
+    for r in raw_results.iter().take(num_committed_pairs) {
+        committed.push(triples_to_ext3_fieldelements::<E>(r, trace_len));
+    }
+
+    let virtual_col = match absorbed_count {
+        0 => None,
+        1 | 2 => Some(triples_to_ext3_fieldelements::<E>(
+            &raw_results[num_committed_pairs],
+            trace_len,
+        )),
+        _ => unreachable!(),
     };
 
     Some(TableTermColumns {
         committed,
         virtual_col,
     })
+}
+
+/// Helper: single-interaction bytecode bundle used by the 1-absorbed branch.
+struct SingleBytecode {
+    ops: Vec<FingerprintOp>,
+    linear_terms: Vec<math_cuda::logup::LinearTerm>,
+    mult: MultiplicityDesc,
+    bus_id: u64,
+    negate: bool,
+}
+
+fn alpha_powers_u64_vec<E: IsField>(
+    alpha: &FieldElement<E>,
+    max_bus_elements: usize,
+) -> Vec<u64> {
+    let fe = crate::lookup::compute_alpha_powers(alpha, max_bus_elements);
+    let mut out = Vec::with_capacity(max_bus_elements * 3);
+    for ap in &fe {
+        let t = unsafe { ext3_to_triple(ap) };
+        out.extend_from_slice(&t);
+    }
+    out
 }
 
 pub struct TableTermColumns<E: IsField> {

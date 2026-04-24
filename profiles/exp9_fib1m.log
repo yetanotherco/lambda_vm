@@ -1,0 +1,765 @@
+warning: unused import: `rayon::prelude::*`
+   --> crypto/math-cuda/src/lde.rs:304:9
+    |
+304 |     use rayon::prelude::*;
+    |         ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `math-cuda` (lib) generated 1 warning (run `cargo fix --lib -p math-cuda` to apply 1 suggestion)
+   Compiling stark v0.1.0 (/workspace/lambda_vm/crypto/stark)
+warning: function `try_evaluate_parts_on_lde_gpu` is never used
+   --> crypto/stark/src/gpu_lde.rs:346:15
+    |
+346 | pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `stark` (lib) generated 1 warning
+   Compiling lambda-vm-prover v0.1.0 (/workspace/lambda_vm/prover)
+    Finished `release` profile [optimized] target(s) in 7.88s
+     Running tests/bench_gpu.rs (target/release/deps/bench_gpu-e859e640ef646130)
+
+running 1 test
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.06s    0.4%
+  Trace build                             2.41s   15.6%
+  AIR construction                        1.14s    7.4%
+  Pre-pass (domains/twiddles)             0.22s    1.4%
+  Round 1                                 7.37s   47.8%
+    Main trace commits                    3.54s          22.9%
+      expand_columns_to_lde               7.25s          47.0%
+      commit (Merkle)                     1.33s           8.6%
+    Aux trace build (parallel)            2.60s          16.8%
+    Aux trace commit                      1.24s           8.0%
+      expand_columns_to_lde               2.19s          14.2%
+      commit (Merkle)                     1.14s           7.4%
+  Rounds 2–4                              4.03s   26.1%
+      MEMW_R x3            3.1M           5.18s          33.6%
+      CPU x2               1.0M           2.89s          18.8%
+      BITWISE              1.0M           2.11s          13.7%
+      BRANCH               262K           0.97s           6.3%
+      LT                      8           0.75s           4.8%
+      DVRM                    4           0.75s           4.8%
+      REGISTER              128           0.75s           4.8%
+      MEMW                    4           0.74s           4.8%
+      DECODE                 16           0.74s           4.8%
+      MEMW_A                 64           0.71s           4.6%
+      SHIFT                   4           0.71s           4.6%
+      LOAD                    4           0.62s           4.0%
+      HALT                    1           0.62s           4.0%
+      MUL                     4           0.32s           2.1%
+      COMMIT                  4           0.32s           2.1%
+      (2 others)                          0.04s           0.3%
+      ── sub-operation totals (all tables) ──
+      R3  OOD evaluation                  4.77s          30.9%
+      R2  evaluate                        3.70s          24.0%
+      R2  decompose_and_extend_d2         3.08s          20.0%
+      R4  queries & openings              2.40s          15.5%
+      R2  commit_composition_poly         2.02s          13.1%
+      R4  deep_composition_poly_evals     1.18s           7.7%
+      R4  fri::commit_phase               0.59s           3.8%
+      R4  interpolate+evaluate_fft        0.37s           2.4%
+
+  Total FFT                              12.89s   83.5%
+  Total Merkle                            5.08s   32.9%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  15.43s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.06s    0.5%
+  Trace build                             2.40s   21.6%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.15s    1.4%
+  Round 1                                 4.23s   38.0%
+    Main trace commits                    1.15s          10.3%
+      expand_columns_to_lde               1.98s          17.8%
+      commit (Merkle)                     0.50s           4.5%
+    Aux trace build (parallel)            2.01s          18.1%
+    Aux trace commit                      1.07s           9.6%
+      expand_columns_to_lde               2.23s          20.0%
+      commit (Merkle)                     0.23s           2.1%
+  Rounds 2–4                              4.08s   36.6%
+      MEMW_R x3            3.1M           5.16s          46.3%
+      CPU x2               1.0M           2.74s          24.6%
+      BITWISE              1.0M           2.09s          18.7%
+      MEMW                    4           0.74s           6.7%
+      COMMIT                  4           0.74s           6.6%
+      DECODE                 16           0.74s           6.6%
+      REGISTER              128           0.71s           6.4%
+      MEMW_A                 64           0.71s           6.4%
+      SHIFT                   4           0.65s           5.8%
+      BRANCH               262K           0.65s           5.8%
+      HALT                    1           0.65s           5.8%
+      DVRM                    4           0.65s           5.8%
+      MUL                     4           0.65s           5.8%
+      LOAD                    4           0.35s           3.1%
+      LT                      8           0.35s           3.1%
+      (2 others)                          0.19s           1.7%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        5.42s          48.7%
+      R3  OOD evaluation                  3.20s          28.7%
+      R2  decompose_and_extend_d2         2.93s          26.3%
+      R4  queries & openings              2.46s          22.1%
+      R2  commit_composition_poly         1.35s          12.2%
+      R4  deep_composition_poly_evals     1.24s          11.2%
+      R4  fri::commit_phase               0.60s           5.4%
+      R4  interpolate+evaluate_fft        0.37s           3.3%
+
+  Total FFT                               7.51s   67.4%
+  Total Merkle                            2.69s   24.2%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  11.14s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.10s    0.9%
+  Trace build                             2.38s   21.5%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.18s    1.6%
+  Round 1                                 4.24s   38.3%
+    Main trace commits                    1.09s           9.8%
+      expand_columns_to_lde               1.95s          17.6%
+      commit (Merkle)                     0.76s           6.8%
+    Aux trace build (parallel)            1.96s          17.7%
+    Aux trace commit                      1.19s          10.7%
+      expand_columns_to_lde               2.16s          19.5%
+      commit (Merkle)                     0.36s           3.3%
+  Rounds 2–4                              3.99s   36.1%
+      MEMW_R x3            3.1M           5.22s          47.2%
+      CPU x2               1.0M           2.68s          24.2%
+      BITWISE              1.0M           2.07s          18.7%
+      REGISTER              128           1.12s          10.1%
+      MEMW                    4           1.12s          10.1%
+      DECODE                 16           1.12s          10.1%
+      BRANCH               262K           1.01s           9.1%
+      LT                      8           0.69s           6.2%
+      HALT                    1           0.69s           6.2%
+      DVRM                    4           0.69s           6.2%
+      COMMIT                  4           0.69s           6.2%
+      SHIFT                   4           0.69s           6.2%
+      MEMW_A                 64           0.69s           6.2%
+      MUL                     4           0.68s           6.2%
+      LOAD                    4           0.22s           2.0%
+      (2 others)                          0.04s           0.4%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        6.53s          59.0%
+      R4  queries & openings              5.26s          47.5%
+      R2  decompose_and_extend_d2         2.58s          23.3%
+      R3  OOD evaluation                  1.91s          17.3%
+      R4  deep_composition_poly_evals     1.34s          12.1%
+      R2  commit_composition_poly         0.76s           6.8%
+      R4  fri::commit_phase               0.48s           4.3%
+      R4  interpolate+evaluate_fft        0.39s           3.5%
+
+  Total FFT                               7.08s   64.0%
+  Total Merkle                            2.36s   21.3%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  11.07s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.06s    0.5%
+  Trace build                             2.39s   22.8%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.19s    1.8%
+  Round 1                                 3.94s   37.5%
+    Main trace commits                    1.00s           9.5%
+      expand_columns_to_lde               1.51s          14.4%
+      commit (Merkle)                     0.47s           4.5%
+    Aux trace build (parallel)            1.94s          18.5%
+    Aux trace commit                      1.00s           9.5%
+      expand_columns_to_lde               1.85s          17.6%
+      commit (Merkle)                     0.21s           2.0%
+  Rounds 2–4                              3.72s   35.4%
+      MEMW_R x3            3.1M           4.41s          42.1%
+      CPU x2               1.0M           2.79s          26.6%
+      BITWISE              1.0M           2.14s          20.4%
+      BRANCH               262K           0.98s           9.4%
+      MEMW_A                 64           0.72s           6.9%
+      REGISTER              128           0.72s           6.9%
+      LT                      8           0.71s           6.8%
+      COMMIT                  4           0.71s           6.8%
+      MEMW                    4           0.71s           6.8%
+      LOAD                    4           0.71s           6.8%
+      SHIFT                   4           0.22s           2.1%
+      (6 others)                          0.40s           3.8%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        3.60s          34.4%
+      R4  queries & openings              3.30s          31.5%
+      R2  decompose_and_extend_d2         2.27s          21.6%
+      R3  OOD evaluation                  1.86s          17.7%
+      R2  commit_composition_poly         1.40s          13.3%
+      R4  deep_composition_poly_evals     1.16s          11.1%
+      R4  fri::commit_phase               1.15s          10.9%
+      R4  interpolate+evaluate_fft        0.34s           3.3%
+
+  Total FFT                               5.98s   57.0%
+  Total Merkle                            3.22s   30.7%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.49s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.06s    0.6%
+  Trace build                             2.36s   22.5%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.2%
+  Round 1                                 3.69s   35.1%
+    Main trace commits                    1.01s           9.6%
+      expand_columns_to_lde               1.68s          16.0%
+      commit (Merkle)                     0.70s           6.7%
+    Aux trace build (parallel)            1.75s          16.7%
+    Aux trace commit                      0.93s           8.8%
+      expand_columns_to_lde               1.66s          15.8%
+      commit (Merkle)                     0.36s           3.4%
+  Rounds 2–4                              4.04s   38.5%
+      MEMW_R x3            3.1M           4.63s          44.1%
+      BITWISE              1.0M           2.34s          22.2%
+      CPU x2               1.0M           2.29s          21.8%
+      BRANCH               262K           0.95s           9.0%
+      DECODE                 16           0.67s           6.4%
+      LOAD                    4           0.67s           6.4%
+      LT                      8           0.60s           5.7%
+      DVRM                    4           0.60s           5.7%
+      SHIFT                   4           0.58s           5.5%
+      REGISTER              128           0.58s           5.5%
+      HALT                    1           0.58s           5.5%
+      MEMW                    4           0.26s           2.5%
+      PAGE:0x11000           4K           0.25s           2.3%
+      (4 others)                          0.51s           4.8%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        3.76s          35.8%
+      R3  OOD evaluation                  3.17s          30.2%
+      R4  queries & openings              2.90s          27.7%
+      R2  decompose_and_extend_d2         2.61s          24.9%
+      R4  deep_composition_poly_evals     1.21s          11.5%
+      R4  fri::commit_phase               0.71s           6.8%
+      R2  commit_composition_poly         0.62s           5.9%
+      R4  interpolate+evaluate_fft        0.38s           3.6%
+
+  Total FFT                               6.33s   60.3%
+  Total Merkle                            2.39s   22.8%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.50s
+
+test bench_prove_fib_1m_long has been running for over 60 seconds
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.35s   22.2%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.16s    1.5%
+  Round 1                                 3.89s   36.8%
+    Main trace commits                    1.08s          10.2%
+      expand_columns_to_lde               2.35s          22.2%
+      commit (Merkle)                     1.40s          13.3%
+    Aux trace build (parallel)            1.82s          17.3%
+    Aux trace commit                      0.99s           9.4%
+      expand_columns_to_lde               1.69s          16.0%
+      commit (Merkle)                     0.37s           3.5%
+  Rounds 2–4                              3.90s   37.0%
+      MEMW_R x3            3.1M           4.48s          42.4%
+      CPU x2               1.0M           2.95s          28.0%
+      BITWISE              1.0M           2.12s          20.0%
+      REGISTER              128           0.96s           9.1%
+      COMMIT                  4           0.96s           9.1%
+      DECODE                 16           0.96s           9.1%
+      BRANCH               262K           0.90s           8.5%
+      DVRM                    4           0.67s           6.4%
+      MEMW                    4           0.67s           6.4%
+      PAGE:0x10000           4K           0.23s           2.2%
+      (7 others)                          0.56s           5.3%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        6.13s          58.1%
+      R3  OOD evaluation                  2.59s          24.5%
+      R2  decompose_and_extend_d2         2.35s          22.3%
+      R4  queries & openings              1.28s          12.1%
+      R4  deep_composition_poly_evals     1.15s          10.9%
+      R4  fri::commit_phase               0.72s           6.9%
+      R2  commit_composition_poly         0.68s           6.5%
+      R4  interpolate+evaluate_fft        0.39s           3.7%
+
+  Total FFT                               6.78s   64.3%
+  Total Merkle                            3.18s   30.1%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.55s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.51s   23.3%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.2%
+  Round 1                                 3.92s   36.4%
+    Main trace commits                    1.05s           9.7%
+      expand_columns_to_lde               1.36s          12.6%
+      commit (Merkle)                     0.73s           6.7%
+    Aux trace build (parallel)            1.89s          17.5%
+    Aux trace commit                      0.98s           9.1%
+      expand_columns_to_lde               1.67s          15.5%
+      commit (Merkle)                     0.25s           2.3%
+  Rounds 2–4                              3.96s   36.8%
+      MEMW_R x3            3.1M           4.71s          43.7%
+      CPU x2               1.0M           2.51s          23.3%
+      BITWISE              1.0M           2.23s          20.7%
+      LT                      8           1.32s          12.2%
+      BRANCH               262K           0.97s           9.0%
+      LOAD                    4           0.68s           6.3%
+      MEMW                    4           0.37s           3.5%
+      MEMW_A                 64           0.37s           3.5%
+      DECODE                 16           0.37s           3.5%
+      HALT                    1           0.37s           3.5%
+      COMMIT                  4           0.37s           3.5%
+      (6 others)                          0.28s           2.6%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        4.48s          41.6%
+      R2  decompose_and_extend_d2         3.00s          27.9%
+      R4  queries & openings              2.44s          22.7%
+      R3  OOD evaluation                  1.67s          15.5%
+      R4  deep_composition_poly_evals     1.20s          11.2%
+      R2  commit_composition_poly         0.73s           6.8%
+      R4  fri::commit_phase               0.54s           5.0%
+      R4  interpolate+evaluate_fft        0.35s           3.3%
+
+  Total FFT                               6.39s   59.3%
+  Total Merkle                            2.26s   20.9%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.77s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.04s    0.4%
+  Trace build                             2.38s   22.5%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.15s    1.4%
+  Round 1                                 4.05s   38.4%
+    Main trace commits                    1.05s           9.9%
+      expand_columns_to_lde               1.77s          16.8%
+      commit (Merkle)                     0.79s           7.5%
+    Aux trace build (parallel)            1.95s          18.5%
+    Aux trace commit                      1.05s          10.0%
+      expand_columns_to_lde               1.82s          17.2%
+      commit (Merkle)                     0.25s           2.4%
+  Rounds 2–4                              3.71s   35.2%
+      MEMW_R x3            3.1M           4.70s          44.6%
+      CPU x2               1.0M           2.63s          24.9%
+      BITWISE              1.0M           1.97s          18.6%
+      REGISTER              128           1.34s          12.7%
+      BRANCH               262K           0.88s           8.3%
+      MEMW_A                 64           0.73s           6.9%
+      COMMIT                  4           0.70s           6.6%
+      LOAD                    4           0.70s           6.6%
+      LT                      8           0.70s           6.6%
+      DECODE                 16           0.22s           2.1%
+      (7 others)                          0.73s           6.9%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        5.68s          53.8%
+      R3  OOD evaluation                  3.19s          30.2%
+      R2  decompose_and_extend_d2         2.58s          24.5%
+      R4  deep_composition_poly_evals     1.18s          11.2%
+      R4  queries & openings              0.88s           8.3%
+      R2  commit_composition_poly         0.85s           8.1%
+      R4  fri::commit_phase               0.47s           4.5%
+      R4  interpolate+evaluate_fft        0.36s           3.4%
+
+  Total FFT                               6.53s   61.9%
+  Total Merkle                            2.37s   22.5%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.55s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.36s   22.5%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.12s    1.2%
+  Round 1                                 3.89s   37.2%
+    Main trace commits                    1.01s           9.7%
+      expand_columns_to_lde               1.47s          14.1%
+      commit (Merkle)                     0.48s           4.6%
+    Aux trace build (parallel)            1.89s          18.0%
+    Aux trace commit                      1.00s           9.5%
+      expand_columns_to_lde               1.66s          15.9%
+      commit (Merkle)                     0.14s           1.3%
+  Rounds 2–4                              3.86s   36.9%
+      MEMW_R x3            3.1M           5.04s          48.1%
+      CPU x2               1.0M           2.31s          22.1%
+      BITWISE              1.0M           1.99s          19.0%
+      BRANCH               262K           0.87s           8.3%
+      SHIFT                   4           0.62s           5.9%
+      DVRM                    4           0.62s           5.9%
+      LOAD                    4           0.61s           5.9%
+      REGISTER              128           0.61s           5.9%
+      MEMW                    4           0.61s           5.9%
+      COMMIT                  4           0.61s           5.9%
+      MUL                     4           0.61s           5.9%
+      PAGE:0x11000           4K           0.27s           2.6%
+      (5 others)                          0.34s           3.2%
+      ── sub-operation totals (all tables) ──
+      R4  queries & openings              3.47s          33.1%
+      R2  evaluate                        3.26s          31.1%
+      R3  OOD evaluation                  2.99s          28.5%
+      R2  decompose_and_extend_d2         2.11s          20.1%
+      R4  deep_composition_poly_evals     1.15s          11.0%
+      R4  fri::commit_phase               0.93s           8.9%
+      R2  commit_composition_poly         0.69s           6.6%
+      R4  interpolate+evaluate_fft        0.40s           3.8%
+
+  Total FFT                               5.64s   53.9%
+  Total Merkle                            2.25s   21.5%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.48s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.46s   22.0%
+  AIR construction                        0.02s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.2%
+  Round 1                                 4.24s   38.0%
+    Main trace commits                    1.10s           9.8%
+      expand_columns_to_lde               1.56s          14.0%
+      commit (Merkle)                     0.50s           4.5%
+    Aux trace build (parallel)            2.02s          18.1%
+    Aux trace commit                      1.12s          10.0%
+      expand_columns_to_lde               1.87s          16.8%
+      commit (Merkle)                     0.01s           0.1%
+  Rounds 2–4                              4.07s   36.5%
+      MEMW_R x3            3.1M           4.79s          43.0%
+      CPU x2               1.0M           2.41s          21.6%
+      BITWISE              1.0M           2.22s          19.9%
+      MEMW_A                 64           0.77s           6.9%
+      BRANCH               262K           0.76s           6.8%
+      HALT                    1           0.76s           6.8%
+      COMMIT                  4           0.76s           6.8%
+      REGISTER              128           0.54s           4.8%
+      LT                      8           0.40s           3.6%
+      SHIFT                   4           0.40s           3.6%
+      DVRM                    4           0.40s           3.6%
+      MUL                     4           0.40s           3.6%
+      MEMW                    4           0.23s           2.0%
+      (4 others)                          0.25s           2.2%
+      ── sub-operation totals (all tables) ──
+      R4  queries & openings              3.14s          28.1%
+      R2  evaluate                        2.93s          26.2%
+      R2  decompose_and_extend_d2         2.41s          21.6%
+      R3  OOD evaluation                  2.40s          21.5%
+      R2  commit_composition_poly         1.93s          17.3%
+      R4  deep_composition_poly_evals     1.27s          11.4%
+      R4  fri::commit_phase               0.52s           4.7%
+      R4  interpolate+evaluate_fft        0.35s           3.1%
+
+  Total FFT                               6.19s   55.5%
+  Total Merkle                            2.96s   26.5%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  11.16s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.39s   23.3%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.12s    1.2%
+  Round 1                                 3.92s   38.2%
+    Main trace commits                    1.06s          10.3%
+      expand_columns_to_lde               1.29s          12.6%
+      commit (Merkle)                     0.99s           9.6%
+    Aux trace build (parallel)            1.97s          19.2%
+    Aux trace commit                      0.90s           8.7%
+      expand_columns_to_lde               1.40s          13.7%
+      commit (Merkle)                     0.34s           3.3%
+  Rounds 2–4                              3.57s   34.8%
+      MEMW_R x3            3.1M           4.43s          43.2%
+      CPU x2               1.0M           2.75s          26.8%
+      BITWISE              1.0M           1.97s          19.2%
+      BRANCH               262K           1.00s           9.8%
+      MUL                     4           0.76s           7.4%
+      LT                      8           0.72s           7.1%
+      MEMW_A                 64           0.72s           7.0%
+      SHIFT                   4           0.72s           7.0%
+      DVRM                    4           0.72s           7.0%
+      MEMW                    4           0.72s           7.0%
+      DECODE                 16           0.72s           7.0%
+      HALT                    1           0.72s           7.0%
+      LOAD                    4           0.22s           2.2%
+      REGISTER              128           0.22s           2.2%
+      (3 others)                          0.22s           2.2%
+      ── sub-operation totals (all tables) ──
+      R4  queries & openings              4.80s          46.8%
+      R2  evaluate                        4.28s          41.7%
+      R3  OOD evaluation                  2.58s          25.1%
+      R2  decompose_and_extend_d2         2.20s          21.5%
+      R4  deep_composition_poly_evals     1.07s          10.4%
+      R2  commit_composition_poly         0.73s           7.1%
+      R4  fri::commit_phase               0.47s           4.6%
+      R4  interpolate+evaluate_fft        0.37s           3.6%
+
+  Total FFT                               5.26s   51.3%
+  Total Merkle                            2.53s   24.7%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.25s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.38s   21.9%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.2%
+  Round 1                                 3.96s   36.6%
+    Main trace commits                    1.05s           9.7%
+      expand_columns_to_lde               1.85s          17.1%
+      commit (Merkle)                     0.51s           4.7%
+    Aux trace build (parallel)            1.89s          17.4%
+    Aux trace commit                      1.02s           9.4%
+      expand_columns_to_lde               2.62s          24.2%
+      commit (Merkle)                     0.01s           0.1%
+  Rounds 2–4                              4.11s   38.0%
+      MEMW_R x3            3.1M           4.93s          45.6%
+      CPU x2               1.0M           2.28s          21.0%
+      BITWISE              1.0M           2.22s          20.5%
+      BRANCH               262K           0.91s           8.4%
+      DECODE                 16           0.68s           6.2%
+      LT                      8           0.67s           6.2%
+      COMMIT                  4           0.67s           6.2%
+      LOAD                    4           0.67s           6.2%
+      DVRM                    4           0.67s           6.2%
+      PAGE:0x11000           4K           0.25s           2.3%
+      (7 others)                          0.70s           6.4%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        3.43s          31.7%
+      R4  queries & openings              3.21s          29.6%
+      R2  decompose_and_extend_d2         2.28s          21.1%
+      R3  OOD evaluation                  1.88s          17.3%
+      R4  fri::commit_phase               1.48s          13.7%
+      R4  deep_composition_poly_evals     1.27s          11.7%
+      R2  commit_composition_poly         0.57s           5.3%
+      R4  interpolate+evaluate_fft        0.42s           3.8%
+
+  Total FFT                               7.17s   66.2%
+  Total Merkle                            2.57s   23.8%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.82s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.42s   22.7%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.2%
+  Round 1                                 3.81s   35.7%
+    Main trace commits                    1.07s          10.0%
+      expand_columns_to_lde               1.35s          12.7%
+      commit (Merkle)                     0.46s           4.3%
+    Aux trace build (parallel)            1.82s          17.0%
+    Aux trace commit                      0.92s           8.7%
+      expand_columns_to_lde               1.61s          15.1%
+      commit (Merkle)                     0.14s           1.3%
+  Rounds 2–4                              4.05s   38.0%
+      MEMW_R x3            3.1M           4.93s          46.2%
+      CPU x2               1.0M           2.53s          23.7%
+      BITWISE              1.0M           2.13s          19.9%
+      DECODE                 16           0.70s           6.6%
+      MEMW_A                 64           0.69s           6.5%
+      BRANCH               262K           0.68s           6.4%
+      COMMIT                  4           0.34s           3.2%
+      MEMW                    4           0.21s           2.0%
+      HALT                    1           0.21s           2.0%
+      MUL                     4           0.21s           2.0%
+      (7 others)                          0.87s           8.2%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        3.51s          32.9%
+      R2  decompose_and_extend_d2         2.74s          25.7%
+      R3  OOD evaluation                  2.09s          19.6%
+      R4  queries & openings              1.62s          15.2%
+      R2  commit_composition_poly         1.43s          13.4%
+      R4  deep_composition_poly_evals     1.16s          10.8%
+      R4  fri::commit_phase               0.50s           4.7%
+      R4  interpolate+evaluate_fft        0.35s           3.3%
+
+  Total FFT                               6.06s   56.8%
+  Total Merkle                            2.52s   23.7%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.66s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.41s   22.8%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.12s    1.2%
+  Round 1                                 3.87s   36.6%
+    Main trace commits                    1.09s          10.3%
+      expand_columns_to_lde               1.56s          14.8%
+      commit (Merkle)                     1.38s          13.1%
+    Aux trace build (parallel)            1.81s          17.1%
+    Aux trace commit                      0.98s           9.3%
+      expand_columns_to_lde               1.93s          18.3%
+      commit (Merkle)                     0.39s           3.6%
+  Rounds 2–4                              3.91s   37.0%
+      MEMW_R x3            3.1M           4.53s          42.9%
+      CPU x2               1.0M           2.32s          21.9%
+      BITWISE              1.0M           2.22s          21.0%
+      BRANCH               262K           0.89s           8.4%
+      COMMIT                  4           0.64s           6.0%
+      DVRM                    4           0.64s           6.0%
+      REGISTER              128           0.59s           5.6%
+      MEMW                    4           0.59s           5.6%
+      DECODE                 16           0.59s           5.6%
+      MUL                     4           0.59s           5.6%
+      LOAD                    4           0.38s           3.6%
+      SHIFT                   4           0.29s           2.7%
+      HALT                    1           0.29s           2.7%
+      (4 others)                          0.32s           3.0%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        3.06s          29.0%
+      R4  queries & openings              2.96s          28.0%
+      R3  OOD evaluation                  2.94s          27.8%
+      R2  decompose_and_extend_d2         2.48s          23.5%
+      R2  commit_composition_poly         1.28s          12.1%
+      R4  deep_composition_poly_evals     1.13s          10.7%
+      R4  fri::commit_phase               0.56s           5.3%
+      R4  interpolate+evaluate_fft        0.36s           3.4%
+
+  Total FFT                               6.33s   59.9%
+  Total Merkle                            3.61s   34.2%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.57s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.04s    0.3%
+  Trace build                             2.43s   23.3%
+  AIR construction                        0.01s    0.1%
+  Pre-pass (domains/twiddles)             0.13s    1.3%
+  Round 1                                 3.90s   37.5%
+    Main trace commits                    1.02s           9.8%
+      expand_columns_to_lde               1.47s          14.1%
+      commit (Merkle)                     0.71s           6.8%
+    Aux trace build (parallel)            1.95s          18.8%
+    Aux trace commit                      0.92s           8.9%
+      expand_columns_to_lde               1.54s          14.8%
+      commit (Merkle)                     0.40s           3.8%
+  Rounds 2–4                              3.68s   35.4%
+      MEMW_R x3            3.1M           4.42s          42.5%
+      CPU x2               1.0M           2.32s          22.3%
+      BITWISE              1.0M           2.13s          20.5%
+      BRANCH               262K           0.96s           9.2%
+      MEMW_A                 64           0.75s           7.2%
+      MEMW                    4           0.74s           7.1%
+      SHIFT                   4           0.74s           7.1%
+      REGISTER              128           0.68s           6.6%
+      LOAD                    4           0.68s           6.6%
+      DECODE                 16           0.68s           6.6%
+      DVRM                    4           0.68s           6.6%
+      MUL                     4           0.68s           6.6%
+      HALT                    1           0.68s           6.6%
+      (4 others)                          0.41s           4.0%
+      ── sub-operation totals (all tables) ──
+      R4  queries & openings              4.38s          42.1%
+      R2  evaluate                        3.49s          33.6%
+      R3  OOD evaluation                  3.10s          29.8%
+      R2  decompose_and_extend_d2         2.16s          20.8%
+      R2  commit_composition_poly         1.43s          13.8%
+      R4  deep_composition_poly_evals     1.01s           9.7%
+      R4  fri::commit_phase               0.55s           5.3%
+      R4  interpolate+evaluate_fft        0.31s           3.0%
+
+  Total FFT                               5.48s   52.7%
+  Total Merkle                            3.09s   29.7%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.40s
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.03s    0.3%
+  Trace build                             2.41s   23.4%
+  AIR construction                        0.02s    0.1%
+  Pre-pass (domains/twiddles)             0.12s    1.2%
+  Round 1                                 3.88s   37.6%
+    Main trace commits                    1.04s          10.1%
+      expand_columns_to_lde               1.28s          12.4%
+      commit (Merkle)                     0.47s           4.5%
+    Aux trace build (parallel)            1.81s          17.5%
+    Aux trace commit                      1.03s          10.0%
+      expand_columns_to_lde               1.89s          18.3%
+      commit (Merkle)                     0.01s           0.1%
+  Rounds 2–4                              3.69s   35.7%
+      MEMW_R x3            3.1M           5.20s          50.3%
+      CPU x2               1.0M           2.13s          20.6%
+      BITWISE              1.0M           1.79s          17.4%
+      REGISTER              128           0.71s           6.9%
+      LT                      8           0.71s           6.9%
+      DECODE                 16           0.70s           6.8%
+      MEMW                    4           0.70s           6.8%
+      MEMW_A                 64           0.70s           6.8%
+      DVRM                    4           0.70s           6.8%
+      MUL                     4           0.70s           6.8%
+      BRANCH               262K           0.67s           6.5%
+      LOAD                    4           0.60s           5.8%
+      COMMIT                  4           0.57s           5.5%
+      PAGE:0x10000           4K           0.29s           2.8%
+      (3 others)                          0.20s           1.9%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        4.77s          46.2%
+      R3  OOD evaluation                  4.44s          43.0%
+      R2  decompose_and_extend_d2         2.62s          25.4%
+      R4  deep_composition_poly_evals     1.22s          11.8%
+      R2  commit_composition_poly         1.04s          10.1%
+      R4  queries & openings              0.91s           8.8%
+      R4  fri::commit_phase               0.83s           8.0%
+      R4  interpolate+evaluate_fft        0.38s           3.7%
+
+  Total FFT                               6.17s   59.8%
+  Total Merkle                            2.35s   22.7%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  10.33s
+
+prove(fib_iterative_1M) [gpu]: 10.959s avg over 15 trials
+  GPU LDE calls across 15 proves: 7155
+  GPU deep-composition calls: 96
+  GPU extend_two_halves calls: 0
+  GPU R4 deep-poly LDE calls: 112
+  GPU R2 parts LDE calls: 112
+  GPU leaf-hash calls: 208
+  GPU barycentric OOD calls: 416
+  GPU Merkle inner-tree calls: 320
+test bench_prove_fib_1m_long ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 180.11s
+
