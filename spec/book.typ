@@ -171,9 +171,7 @@
         }
       })
       let cond() = _toplevel.final() == file
-      show ref: it => context if _toplevel.final() == file {
-        xref(it)
-      }
+      show ref: it => context if cond() { xref(it) }
       let title = context {
         // Strip raw, because shiroa already makes the title raw
         show raw: it => it.text
