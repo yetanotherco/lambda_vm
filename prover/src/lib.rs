@@ -10,6 +10,7 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+pub mod auto_storage;
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
@@ -557,19 +558,24 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Pick where trace buffers and Merkle tree nodes live for this proof.
-    // Replaced in step E with an automatic decision based on available RAM
-    // vs estimated peak usage.
-    let storage_mode = StorageMode::Ram;
-
-    // Generate all traces from ELF and execution logs.
-    // Page tables are derived from the prover's MemoryState (all accessed pages).
+    // Build in RAM; if the measured trace size implies proving would exceed
+    // available memory, switch to Disk mode before the LDE/Merkle expansion.
     let mut traces =
-        Traces::from_elf_and_logs_with_mode(&program, &result.logs, max_rows, storage_mode)?;
+        Traces::from_elf_and_logs_with_mode(&program, &result.logs, max_rows, StorageMode::Ram)?;
 
     drop(result);
 
+    let main_elements = traces.total_field_elements();
+    let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
+    let available = auto_storage::available_ram_bytes();
+    let storage_mode = auto_storage::select_storage_mode(estimated_peak, available, None);
+
     if storage_mode == StorageMode::Disk {
+        eprintln!(
+            "Auto disk-spill: estimated peak {} MB exceeds 80% of {} MB available",
+            estimated_peak / 1_000_000,
+            available / 1_000_000,
+        );
         traces
             .spill_all_main_to_disk()
             .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
