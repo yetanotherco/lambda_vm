@@ -2070,7 +2070,7 @@ fn test_verify_rejects_tampered_num_private_input_pages_zero() {
 
     let result = crate::verify(&tampered, &elf_bytes);
     assert!(
-        result.is_err() || result.unwrap() == false,
+        result.is_err() || !result.unwrap(),
         "Verifier must reject proof with num_private_input_pages zeroed out"
     );
 }
@@ -2095,7 +2095,7 @@ fn test_verify_rejects_inflated_num_private_input_pages() {
 
     let result = crate::verify(&tampered, &elf_bytes);
     assert!(
-        result.is_err() || result.unwrap() == false,
+        result.is_err() || !result.unwrap(),
         "Verifier must reject proof with inflated num_private_input_pages"
     );
 }
