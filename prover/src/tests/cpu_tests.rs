@@ -19,7 +19,7 @@ fn ops4(op: CpuOperation) -> Vec<CpuOperation> {
     (0..4)
         .map(|i| {
             let mut new_op = op.clone();
-            new_op.timestamp = (i as u64) * 4;
+            new_op.timestamp = (i as u64) * 4 + 4;
             new_op.decode.pc = op.decode.pc + (i as u64) * 4;
             new_op.next_pc = op.decode.pc + (i as u64) * 4 + 4;
             new_op
@@ -177,7 +177,7 @@ fn test_trace_generation_basic() {
 
     // Check first row values
     let row0 = trace.main_table.get_row(0);
-    assert_eq!(row0[cols::TIMESTAMP], FE::from(0u64));
+    assert_eq!(row0[cols::TIMESTAMP], FE::from(4u64));
     assert_eq!(row0[cols::PC_0], FE::from(0x1000u64));
     assert_eq!(row0[cols::PC_1], FE::zero());
     assert_eq!(row0[cols::RS1], FE::from(1u64));
@@ -322,7 +322,7 @@ fn test_bus_interactions_count() {
     // - 1 M5 (MEMW write rd register)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
-    // - 1 CM54 (MEMW PC register read-write)
+    // - 4 inline PC (2 reads + 2 writes to Memory bus for x255)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
@@ -332,13 +332,14 @@ fn test_bus_interactions_count() {
     // - 1 IS_BYTE for (RS1, RS2) paired
     // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 55
-    assert_eq!(interactions.len(), 55);
+    // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 58
+    assert_eq!(interactions.len(), 58);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 74);
+    assert_eq!(cols::NUM_COLUMNS, 76);
 }
 
 #[test]

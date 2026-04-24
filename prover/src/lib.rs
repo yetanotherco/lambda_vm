@@ -140,6 +140,10 @@ pub struct VmProof {
     pub table_counts: TableCounts,
     /// Committed public output bytes.
     pub public_output: Vec<u8>,
+    /// Number of PAGE tables that hold private input data.
+    /// These pages are NOT preprocessed — the verifier reconstructs them
+    /// as non-preprocessed tables starting at `PRIVATE_INPUT_START_INDEX`.
+    pub num_private_input_pages: usize,
 }
 
 /// Error type for the prover crate.
@@ -368,10 +372,19 @@ impl VmAirs {
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
-                create_page_air(proof_options, config.page_base).with_preprocessed(
-                    page::precomputed_commitment_cached(config, proof_options),
-                    page::NUM_PREPROCESSED_COLS,
-                )
+                if config.is_private_input {
+                    // Private-input pages: all columns are main trace (not preprocessed).
+                    // The verifier doesn't see the init values; correctness is enforced
+                    // by the memory bus constraints.
+                    create_page_air(proof_options, config.page_base)
+                } else {
+                    // ELF and zero-init pages: OFFSET + INIT are preprocessed.
+                    // The verifier independently recomputes the commitment from public data.
+                    create_page_air(proof_options, config.page_base).with_preprocessed(
+                        page::precomputed_commitment_cached(config, proof_options),
+                        page::NUM_PREPROCESSED_COLS,
+                    )
+                }
             })
             .collect();
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
@@ -509,7 +522,12 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let traces = Traces::from_elf_and_logs(&program, &result.logs, &MaxRowsConfig::default())?;
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &MaxRowsConfig::default(),
+        private_inputs,
+    )?;
     Ok((
         traces.total_field_elements(),
         traces.total_auxiliary_field_elements(),
@@ -567,7 +585,7 @@ pub fn prove_with_options_and_inputs(
     // Phases 0-4: op collection and derivation (cheap compared to phase 5's
     // trace-table allocation). After this we have the exact op counts needed
     // to compute `main_elements` without materializing the trace tables.
-    let prep = Traces::prepare_from_elf_and_logs(&program, &result.logs, max_rows)?;
+    let prep = Traces::prepare_from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     drop(result);
 
     let main_elements = prep.estimate_main_elements(max_rows);
@@ -643,11 +661,18 @@ pub fn prove_with_options_and_inputs(
         );
     }
 
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+
     Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
+        num_private_input_pages,
     })
 }
 
@@ -678,9 +703,26 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
+    // Bound num_private_input_pages before allocating PageConfigs.
+    // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
+    {
+        use crate::tables::page::DEFAULT_PAGE_SIZE;
+        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
+        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
+        if vm_proof.num_private_input_pages > max_pages {
+            return Err(Error::InvalidTableCounts(format!(
+                "num_private_input_pages ({}) exceeds max ({max_pages})",
+                vm_proof.num_private_input_pages,
+            )));
+        }
+    }
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+    );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
