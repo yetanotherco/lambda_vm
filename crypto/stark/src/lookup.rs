@@ -1084,6 +1084,7 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
+                _table_name,
             )
         };
         #[cfg(not(feature = "parallel"))]
@@ -1878,6 +1879,7 @@ fn compute_logup_term_column_chunked<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
@@ -1921,6 +1923,30 @@ where
                     alpha_offset += consumed;
                 }
                 fingerprints.push(z - &lc);
+
+                #[cfg(feature = "debug-checks")]
+                {
+                    let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
+                    base_elements.extend(
+                        interaction.values.iter().flat_map(|bv| {
+                            bv.combine_from(|col| main_segment_cols[col][row].clone())
+                        }),
+                    );
+                    let multiplicity = compute_multiplicity_for_row(
+                        &interaction.multiplicity,
+                        main_segment_cols,
+                        row,
+                    );
+                    crate::bus_debug::log_interaction(
+                        _table_name,
+                        row,
+                        interaction.bus_id,
+                        interaction.is_sender,
+                        &multiplicity.canonical(),
+                        &base_elements,
+                        fingerprints.last().unwrap(),
+                    );
+                }
             }
 
             // Phase 2: Batch-invert fingerprints
@@ -2491,6 +2517,58 @@ mod tests {
             &main_cols,
             trace_len,
             &challenges,
+        );
+
+        assert_eq!(
+            result_standard.len(),
+            result_chunked.len(),
+            "output lengths differ"
+        );
+        for (row, (a, b)) in result_standard
+            .iter()
+            .zip(result_chunked.iter())
+            .enumerate()
+        {
+            assert_eq!(a, b, "mismatch at row {row}: standard={a:?}, chunked={b:?}");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn term_column_chunked_matches_non_chunked() {
+        type F = GoldilocksField;
+        type E = Degree3GoldilocksExtensionField;
+
+        let trace_len: usize = 2048;
+        let num_cols: usize = 4;
+
+        let main_cols = make_trace_cols(num_cols, trace_len);
+
+        let interaction = BusInteraction::sender(
+            1u64,
+            Multiplicity::Column(0),
+            vec![BusValue::column(1), BusValue::column(2)],
+        );
+
+        let challenges: Vec<FieldElement<E>> = vec![
+            FieldElement::<E>::from(7u64),
+            FieldElement::<E>::from(13u64),
+        ];
+
+        let result_standard = compute_logup_term_column::<F, E>(
+            &interaction,
+            &main_cols,
+            trace_len,
+            &challenges,
+            "test_table",
+        );
+
+        let result_chunked = compute_logup_term_column_chunked::<F, E>(
+            &interaction,
+            &main_cols,
+            trace_len,
+            &challenges,
+            "test_table",
         );
 
         assert_eq!(
