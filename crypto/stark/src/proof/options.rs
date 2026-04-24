@@ -48,6 +48,7 @@ pub struct ProofOptions {
     pub fri_number_of_queries: usize,
     pub coset_offset: u64,
     pub grinding_factor: u8,
+    #[serde(default)]
     pub max_ram_bytes: Option<u64>,
 }
 

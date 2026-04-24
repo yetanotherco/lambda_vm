@@ -1,9 +1,3 @@
-// `StorageMode::Disk` is backed by `memmap2` / `tempfile` / `libc`, none of
-// which compile for `wasm32-*`. Fail loudly rather than via a confusing
-// transitive error deep inside a dependency.
-#[cfg(target_arch = "wasm32")]
-compile_error!("stark crate does not support wasm32 targets (memmap2 is required)");
-
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;
