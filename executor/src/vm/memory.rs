@@ -41,10 +41,13 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u64 = 1024;
 const PUBLIC_OUTPUT_START_INDEX: u64 = 0;
-// Ported from main: increased from 1024 to support larger inputs (ethrex)
-const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
-// Ported from main: fixed high address to avoid overlap with program memory
-const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+/// Maximum size of the private input memory region (in bytes).
+pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
+/// Fixed high address where private input is mapped. Guest programs can read
+/// directly from this address (ZisK-style memory-mapped input).
+/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
+/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
+pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]
 pub struct Memory(U64HashMap<[u8; 4]>);
@@ -151,20 +154,19 @@ impl Memory {
         Ok(self.load_bytes(PUBLIC_OUTPUT_START_INDEX + 4, size as u64))
     }
 
+    /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
+    /// 4-byte LE length prefix followed by the raw data. The guest reads these
+    /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
     pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
         if inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }
         self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
         self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
         Ok(())
-    }
-
-    pub fn load_private_inputs(&self) -> Result<Vec<u8>, MemoryError> {
-        let size = self.load_word(PRIVATE_INPUT_START_INDEX)?;
-        let mut inputs = size.to_le_bytes().to_vec();
-        inputs.extend_from_slice(&self.load_bytes(PRIVATE_INPUT_START_INDEX + 4, size as u64));
-        Ok(inputs)
     }
 
     pub fn load_bytes(&self, mut addr: u64, len: u64) -> Vec<u8> {
