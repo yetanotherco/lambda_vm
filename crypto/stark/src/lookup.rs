@@ -19,7 +19,9 @@ use math::field::{
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -1039,21 +1041,40 @@ where
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
         // Compute committed term columns (batched pairs only).
-        // With `parallel`: sequential over pairs, each using chunk-local parallelism
-        // (parallel across row-chunks, not across pairs) for better cache locality.
+        // With `parallel`: when `trace_len > LOGUP_CHUNK_SIZE` the chunk-internal
+        // parallelism inside each pair already saturates Rayon, so iterate pairs
+        // sequentially to keep cache locality. When `trace_len <= LOGUP_CHUNK_SIZE`
+        // each pair yields a single chunk, so parallelize across pairs to recover
+        // the throughput the per-pair dispatch used to provide for small-trace
+        // tables with many interactions.
         // Without `parallel`: sequential over pairs, sequential over rows.
         #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
-            .map(|i| {
-                compute_logup_batched_term_column_chunked(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                )
-            })
-            .collect();
+        let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE {
+            (0..num_committed_pairs)
+                .into_par_iter()
+                .map(|i| {
+                    compute_logup_batched_term_column_chunked(
+                        &self.auxiliary_trace_build_data.interactions[i * 2],
+                        &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                    )
+                })
+                .collect()
+        } else {
+            (0..num_committed_pairs)
+                .map(|i| {
+                    compute_logup_batched_term_column_chunked(
+                        &self.auxiliary_trace_build_data.interactions[i * 2],
+                        &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                    )
+                })
+                .collect()
+        };
         #[cfg(not(feature = "parallel"))]
         let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
             .map(|i| {
