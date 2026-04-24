@@ -1,0 +1,540 @@
+From fa9176f8bb057b018d6672743b4307b4454a0ac0 Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Thu, 23 Apr 2026 18:39:29 +0000
+Subject: [PATCH 25/28] perf(cuda): FRI commit phase fully device-resident
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`FriCommitState` in math-cuda owns two ping-pong ext3 eval buffers and
+the base-field inv_twiddles buffer; each `fold_and_commit_layer(zeta)`
+call launches fri_fold_ext3 → keccak_fri_leaves_ext3 →
+keccak_merkle_level × log(n), plus fri_update_twiddles for the next
+layer — all on the same stream, no cross-layer host round-trips.
+
+Wired into `commit_phase_from_evaluations` via `try_fri_commit_gpu`:
+the host loop still samples each layer's zeta from the transcript and
+appends the root, but the folded evals, twiddles, and per-layer trees
+never leave the device between iterations. Per-layer D2H is only the
+32 B root + the layer's evals + its tree nodes (needed by
+query_phase). Falls back to CPU when `cuda` off, type mismatch, or
+domain below threshold.
+
+The CPU `compute_coset_twiddles_inv` is still done on host (bit-reverse
+permute + batch_inverse on n/2 base-field entries) — cheap vs. the
+pattern of kernel launches we just avoided. Moving that to GPU too is
+a follow-up.
+
+Benchmark (median of 3×5):
+  fib_1M : 12.04 s → 11.77 s  (−2.3 %, 1.55× vs CPU 18.27 s)
+  fib_4M : 29.05 s → 28.34 s  (−2.4 %)
+
+Correctness: 121 stark cuda tests pass end-to-end (prove/verify
+round-trip is the ultimate parity gate).
+---
+ crypto/math-cuda/src/fri.rs | 289 ++++++++++++++++++++++++++++++++++++
+ crypto/math-cuda/src/lib.rs |   1 +
+ crypto/stark/src/fri/mod.rs |  18 +++
+ crypto/stark/src/gpu_lde.rs | 149 +++++++++++++++++++
+ 4 files changed, 457 insertions(+)
+ create mode 100644 crypto/math-cuda/src/fri.rs
+
+diff --git a/crypto/math-cuda/src/fri.rs b/crypto/math-cuda/src/fri.rs
+new file mode 100644
+index 00000000..a3fa7a2b
+--- /dev/null
++++ b/crypto/math-cuda/src/fri.rs
+@@ -0,0 +1,289 @@
++//! Fully-device-resident FRI commit phase orchestration.
++//!
++//! The host loop (in the stark crate) samples each layer's `zeta` from the
++//! transcript and feeds it in; this module keeps the folded evaluations,
++//! twiddles, and per-layer Merkle trees on device, only D2H'ing each
++//! layer's root (to append to the transcript), plus its full evals and
++//! tree nodes (to plug into `FriLayer` for the query phase).
++//!
++//! Mirrors `commit_phase_from_evaluations` at
++//! `crypto/stark/src/fri/mod.rs`.
++
++use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
++use std::sync::Arc;
++
++use crate::Result;
++use crate::device::backend;
++
++/// Device-side state across FRI commit iterations. Owns two ext3 eval
++/// buffers (flip-flopped as layer input / output) and the inv_twiddles
++/// buffer. Freed when dropped.
++pub struct FriCommitState {
++    pub stream: Arc<CudaStream>,
++    // Ping-pong evaluation buffers. Both sized `3 * n0` u64 at init; each
++    // successive fold uses half the space. Cheap to pre-allocate vs. per-
++    // layer alloc.
++    evals_a: CudaSlice<u64>,
++    evals_b: CudaSlice<u64>,
++    /// Base-field inv_twiddles; `n0 / 2` u64 at init, halved each layer.
++    inv_tw: CudaSlice<u64>,
++    /// Number of ext3 elements currently in the "input" buffer.
++    pub current_n: usize,
++    /// Which buffer holds the current layer's input. Toggles each fold.
++    a_is_input: bool,
++}
++
++impl FriCommitState {
++    /// H2D the starting evals (ext3 interleaved, 3 * n0 u64) and the
++    /// initial inv_twiddles (base field, n0/2 u64). `n0` must be a power of
++    /// two and ≥ 2.
++    pub fn new(
++        evals_host: &[u64],
++        inv_tw_host: &[u64],
++        n0: usize,
++    ) -> Result<Self> {
++        assert!(n0 >= 2 && n0.is_power_of_two());
++        assert_eq!(evals_host.len(), 3 * n0);
++        assert_eq!(inv_tw_host.len(), n0 / 2);
++
++        let be = backend();
++        let stream = be.next_stream();
++
++        // SAFETY: every byte of evals_a is overwritten by the H2D below.
++        // evals_b is written by the first fold before it is read.
++        let mut evals_a = unsafe { stream.alloc::<u64>(3 * n0) }?;
++        let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
++        stream.memcpy_htod(evals_host, &mut evals_a)?;
++        let inv_tw = stream.clone_htod(inv_tw_host)?;
++
++        Ok(Self {
++            stream,
++            evals_a,
++            evals_b,
++            inv_tw,
++            current_n: n0,
++            a_is_input: true,
++        })
++    }
++
++    /// Fold the current layer using `zeta`, run the row-pair Keccak leaves
++    /// + pair-hash Merkle tree kernels on the result, and D2H:
++    ///   - the new root (32 bytes)
++    ///   - the new layer's evals (3 * (current_n / 2) u64s)
++    ///   - the new layer's Merkle tree nodes (standard layout, byte-packed)
++    ///
++    /// Also updates `inv_twiddles` in place to shrink for the next layer.
++    pub fn fold_and_commit_layer(
++        &mut self,
++        zeta_raw: [u64; 3],
++    ) -> Result<(Vec<u8>, Vec<u64>, Vec<u8>)> {
++        let be = backend();
++        let n_in = self.current_n;
++        let n_out = n_in / 2;
++        assert!(n_out >= 1, "FRI fold_layer called with current_n = 1");
++
++        // Allocate the tree buffer. num_leaves = n_out / 2 (row-pair leaves).
++        let num_leaves = n_out / 2;
++        let tight_total_nodes = if num_leaves >= 1 {
++            2 * num_leaves - 1
++        } else {
++            // Degenerate case: n_out == 1, no further Merkle commit needed.
++            // Caller should use `fold_final` for the final layer, not here.
++            panic!("fold_and_commit_layer requires n_out >= 2 (num_leaves >= 1)");
++        };
++
++        // H2D zeta.
++        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
++
++        // Select input and output buffers.
++        // Borrow checker requires us to split_borrow; use raw pointers via
++        // slice_mut to pass both into the kernel.
++        // We pass `input` via `&CudaSlice<u64>` and `output` via
++        // `&mut CudaSlice<u64>`. Rust borrow rules require them to be
++        // distinct; `a_is_input` flips between the two owned slices.
++        let cfg = LaunchConfig {
++            grid_dim: (((n_out as u32) + 128 - 1) / 128, 1, 1),
++            block_dim: (128, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        let n_out_u64 = n_out as u64;
++
++        if self.a_is_input {
++            unsafe {
++                self.stream
++                    .launch_builder(&be.fri_fold_ext3)
++                    .arg(&self.evals_a)
++                    .arg(&n_out_u64)
++                    .arg(&self.inv_tw)
++                    .arg(&zeta_dev)
++                    .arg(&mut self.evals_b)
++                    .launch(cfg)?;
++            }
++        } else {
++            unsafe {
++                self.stream
++                    .launch_builder(&be.fri_fold_ext3)
++                    .arg(&self.evals_b)
++                    .arg(&n_out_u64)
++                    .arg(&self.inv_tw)
++                    .arg(&zeta_dev)
++                    .arg(&mut self.evals_a)
++                    .launch(cfg)?;
++            }
++        }
++
++        // Keccak leaves + pair-hash tree into fresh device buffer.
++        let mut nodes_dev = unsafe { self.stream.alloc::<u8>(tight_total_nodes * 32) }?;
++        let leaves_offset_bytes = (num_leaves - 1) * 32;
++        {
++            let mut leaves_view = nodes_dev
++                .slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
++            let num_leaves_u64 = num_leaves as u64;
++            let grid = ((num_leaves as u32) + 128 - 1) / 128;
++            let kcfg = LaunchConfig {
++                grid_dim: (grid, 1, 1),
++                block_dim: (128, 1, 1),
++                shared_mem_bytes: 0,
++            };
++            // Leaves read from the layer's OUTPUT eval buffer.
++            if self.a_is_input {
++                unsafe {
++                    self.stream
++                        .launch_builder(&be.keccak_fri_leaves_ext3)
++                        .arg(&self.evals_b)
++                        .arg(&num_leaves_u64)
++                        .arg(&mut leaves_view)
++                        .launch(kcfg)?;
++                }
++            } else {
++                unsafe {
++                    self.stream
++                        .launch_builder(&be.keccak_fri_leaves_ext3)
++                        .arg(&self.evals_a)
++                        .arg(&num_leaves_u64)
++                        .arg(&mut leaves_view)
++                        .launch(kcfg)?;
++                }
++            }
++        }
++        {
++            let mut level_begin: u64 = (num_leaves - 1) as u64;
++            while level_begin != 0 {
++                let new_begin = level_begin / 2;
++                let n_pairs = level_begin - new_begin;
++                let grid = ((n_pairs as u32) + 128 - 1) / 128;
++                let cfg = LaunchConfig {
++                    grid_dim: (grid, 1, 1),
++                    block_dim: (128, 1, 1),
++                    shared_mem_bytes: 0,
++                };
++                unsafe {
++                    self.stream
++                        .launch_builder(&be.keccak_merkle_level)
++                        .arg(&mut nodes_dev)
++                        .arg(&new_begin)
++                        .arg(&n_pairs)
++                        .launch(cfg)?;
++                }
++                level_begin = new_begin;
++            }
++        }
++
++        // Update inv_twiddles for the next layer: `new[j] = old[2j]²` for
++        // j in 0..n_out/2. (If n_out == 1, skip — no next fold.)
++        let tw_next = n_out / 2;
++        if tw_next > 0 {
++            let grid = ((tw_next as u32) + 128 - 1) / 128;
++            let cfg = LaunchConfig {
++                grid_dim: (grid, 1, 1),
++                block_dim: (128, 1, 1),
++                shared_mem_bytes: 0,
++            };
++            let tw_next_u64 = tw_next as u64;
++            unsafe {
++                self.stream
++                    .launch_builder(&be.fri_update_twiddles)
++                    .arg(&mut self.inv_tw)
++                    .arg(&tw_next_u64)
++                    .launch(cfg)?;
++            }
++        }
++
++        // Sync and D2H.
++        self.stream.synchronize()?;
++
++        // Layer evals: 3 * n_out u64 from the output buffer.
++        let layer_evals: Vec<u64> = if self.a_is_input {
++            let view = self.evals_b.slice(0..3 * n_out);
++            self.stream.clone_dtoh(&view)?
++        } else {
++            let view = self.evals_a.slice(0..3 * n_out);
++            self.stream.clone_dtoh(&view)?
++        };
++
++        // Tree nodes.
++        let nodes_bytes: Vec<u8> = self.stream.clone_dtoh(&nodes_dev)?;
++        debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
++
++        let mut root = vec![0u8; 32];
++        root.copy_from_slice(&nodes_bytes[0..32]);
++
++        self.a_is_input = !self.a_is_input;
++        self.current_n = n_out;
++
++        Ok((root, layer_evals, nodes_bytes))
++    }
++
++    /// Final fold — no Merkle commit. Returns the single ext3 output
++    /// element (the FRI last_value).
++    pub fn fold_final(&mut self, zeta_raw: [u64; 3]) -> Result<[u64; 3]> {
++        let be = backend();
++        let n_in = self.current_n;
++        let n_out = n_in / 2;
++        assert!(n_out >= 1);
++
++        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
++        let cfg = LaunchConfig {
++            grid_dim: (((n_out as u32) + 128 - 1) / 128, 1, 1),
++            block_dim: (128, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        let n_out_u64 = n_out as u64;
++
++        if self.a_is_input {
++            unsafe {
++                self.stream
++                    .launch_builder(&be.fri_fold_ext3)
++                    .arg(&self.evals_a)
++                    .arg(&n_out_u64)
++                    .arg(&self.inv_tw)
++                    .arg(&zeta_dev)
++                    .arg(&mut self.evals_b)
++                    .launch(cfg)?;
++            }
++        } else {
++            unsafe {
++                self.stream
++                    .launch_builder(&be.fri_fold_ext3)
++                    .arg(&self.evals_b)
++                    .arg(&n_out_u64)
++                    .arg(&self.inv_tw)
++                    .arg(&zeta_dev)
++                    .arg(&mut self.evals_a)
++                    .launch(cfg)?;
++            }
++        }
++
++        self.stream.synchronize()?;
++        let out_first: Vec<u64> = if self.a_is_input {
++            let view = self.evals_b.slice(0..3);
++            self.stream.clone_dtoh(&view)?
++        } else {
++            let view = self.evals_a.slice(0..3);
++            self.stream.clone_dtoh(&view)?
++        };
++        self.a_is_input = !self.a_is_input;
++        self.current_n = n_out;
++        Ok([out_first[0], out_first[1], out_first[2]])
++    }
++}
+diff --git a/crypto/math-cuda/src/lib.rs b/crypto/math-cuda/src/lib.rs
+index 07a81f18..71efb595 100644
+--- a/crypto/math-cuda/src/lib.rs
++++ b/crypto/math-cuda/src/lib.rs
+@@ -7,6 +7,7 @@
+ pub mod barycentric;
+ pub mod deep;
+ pub mod device;
++pub mod fri;
+ pub mod lde;
+ pub mod merkle;
+ pub mod ntt;
+diff --git a/crypto/stark/src/fri/mod.rs b/crypto/stark/src/fri/mod.rs
+index 87ab66a5..1fa7f5e2 100644
+--- a/crypto/stark/src/fri/mod.rs
++++ b/crypto/stark/src/fri/mod.rs
+@@ -33,6 +33,24 @@ where
+     FieldElement<F>: AsBytes + Sync + Send,
+     FieldElement<E>: AsBytes + Sync + Send,
+ {
++    // GPU fast path: keeps evals, inv_twiddles, and per-layer Merkle trees
++    // device-resident across log₂(domain_size) layers. Only D2H'd per
++    // layer: the root (32 B → transcript) + the layer's evals and tree
++    // nodes (needed by query_phase later). Falls back to CPU when the
++    // `cuda` feature is off, types mismatch, or the domain is too small.
++    #[cfg(feature = "cuda")]
++    {
++        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E>(
++            number_layers,
++            &evals,
++            transcript,
++            coset_offset,
++            domain_size,
++        ) {
++            return result;
++        }
++    }
++
+     // Inverse twiddle factors for evaluation-form folding
+     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+ 
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index 5bbab1ef..3fdaac64 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -1267,6 +1267,155 @@ pub fn gpu_deep_calls() -> u64 {
+     GPU_DEEP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
++static GPU_FRI_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub fn gpu_fri_calls() -> u64 {
++    GPU_FRI_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// GPU-resident FRI commit phase. Keeps evals, twiddles, and per-layer
++/// trees on device across all folds. Mirrors
++/// `commit_phase_from_evaluations` on CPU (transcript interleaving
++/// unchanged — each layer's zeta is sampled from the host transcript,
++/// each layer's root is D2H'd and appended there).
++///
++/// Returns `None` to fall back to CPU (small domain, type mismatch, etc.).
++#[allow(clippy::type_complexity)]
++pub(crate) fn try_fri_commit_gpu<F, E>(
++    number_layers: usize,
++    evals: &[FieldElement<E>],
++    transcript: &mut impl crypto::fiat_shamir::is_transcript::IsStarkTranscript<E, F>,
++    coset_offset: &FieldElement<F>,
++    domain_size: usize,
++) -> Option<(
++    FieldElement<E>,
++    Vec<crate::fri::fri_commitment::FriLayer<E, crate::config::FriLayerMerkleTreeBackend<E>>>,
++)>
++where
++    F: math::field::traits::IsFFTField + IsSubFieldOf<E>,
++    E: IsField,
++    FieldElement<F>: math::traits::AsBytes + Sync + Send,
++    FieldElement<E>: math::traits::AsBytes + Sync + Send,
++{
++    use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
++    use math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
++
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++    if !domain_size.is_power_of_two() || domain_size < gpu_lde_threshold() {
++        return None;
++    }
++    if evals.len() != domain_size || number_layers < 1 {
++        return None;
++    }
++    if domain_size < (1 << 3) {
++        return None;
++    }
++
++    GPU_FRI_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // Compute initial inv_twiddles on host — same recipe as
++    // `compute_coset_twiddles_inv`.
++    let half = domain_size / 2;
++    let order = domain_size.trailing_zeros() as u64;
++    let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset)
++        .expect("coset twiddles available");
++    in_place_bit_reverse_permute(&mut points);
++    FieldElement::inplace_batch_inverse(&mut points).expect("twiddle inverse");
++
++    // Raw u64 views: E == Ext3 (3 u64) for evals, F == Gl (1 u64) for twiddles.
++    let evals_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, domain_size * 3) };
++    let tw_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(points.as_ptr() as *const u64, half) };
++
++    let mut state = math_cuda::fri::FriCommitState::new(evals_raw, tw_raw, domain_size)
++        .expect("FRI state alloc");
++
++    let mut fri_layer_list =
++        Vec::<crate::fri::fri_commitment::FriLayer<E, crate::config::FriLayerMerkleTreeBackend<E>>>::with_capacity(number_layers);
++    let mut current_coset_offset = coset_offset.clone();
++    let mut current_domain_size = domain_size;
++
++    for _ in 1..number_layers {
++        let zeta: FieldElement<E> = transcript.sample_field_element();
++        current_coset_offset = current_coset_offset.square();
++        current_domain_size /= 2;
++
++        // SAFETY: E == Ext3 (layout [u64; 3]).
++        let zeta_raw: [u64; 3] = unsafe {
++            let p = &zeta as *const FieldElement<E> as *const u64;
++            [*p, *p.add(1), *p.add(2)]
++        };
++
++        let (root_bytes, layer_evals_raw, nodes_bytes) =
++            state.fold_and_commit_layer(zeta_raw).expect("FRI fold+commit");
++
++        let mut root_arr = [0u8; 32];
++        root_arr.copy_from_slice(&root_bytes[..32]);
++
++        // Re-chunk tree nodes into Vec<[u8; 32]> for MerkleTree.
++        let num_leaves = current_domain_size / 2;
++        let tight_total_nodes = 2 * num_leaves - 1;
++        debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
++        let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
++        for i in 0..tight_total_nodes {
++            let mut n = [0u8; 32];
++            n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
++            nodes.push(n);
++        }
++        let merkle_tree =
++            crypto::merkle_tree::merkle::MerkleTree::<crate::config::FriLayerMerkleTreeBackend<E>>::from_precomputed_nodes(nodes)
++                .expect("FRI MerkleTree build");
++
++        // Rebuild the layer's ext3 evals from raw u64s.
++        debug_assert_eq!(layer_evals_raw.len(), 3 * current_domain_size);
++        let mut layer_evals: Vec<FieldElement<E>> = Vec::with_capacity(current_domain_size);
++        unsafe { layer_evals.set_len(current_domain_size) };
++        unsafe {
++            core::ptr::copy_nonoverlapping(
++                layer_evals_raw.as_ptr(),
++                layer_evals.as_mut_ptr() as *mut u64,
++                current_domain_size * 3,
++            );
++        }
++
++        fri_layer_list.push(crate::fri::fri_commitment::FriLayer::new(
++            &layer_evals,
++            merkle_tree,
++            current_coset_offset.clone().to_extension(),
++            current_domain_size,
++        ));
++
++        transcript.append_bytes(&root_arr);
++    }
++
++    // Final fold.
++    let zeta: FieldElement<E> = transcript.sample_field_element();
++    let zeta_raw: [u64; 3] = unsafe {
++        let p = &zeta as *const FieldElement<E> as *const u64;
++        [*p, *p.add(1), *p.add(2)]
++    };
++    let last_raw = state.fold_final(zeta_raw).expect("FRI final fold");
++
++    // SAFETY: E == Ext3; build FieldElement<E> from raw u64s.
++    let last_value: FieldElement<E> = unsafe {
++        let mut e: FieldElement<E> = core::mem::zeroed();
++        let ptr = &mut e as *mut FieldElement<E> as *mut u64;
++        *ptr = last_raw[0];
++        *ptr.add(1) = last_raw[1];
++        *ptr.add(2) = last_raw[2];
++        e
++    };
++
++    transcript.append_field_element(&last_value);
++
++    Some((last_value, fri_layer_list))
++}
++
+ /// R3 OOD barycentric over the **main** (base-field) LDE read directly from
+ /// the device handle with stride `row_stride = blowup_factor`. Applies the
+ /// same trailing `scalar * vanishing * sum` ext3 scale on host that
+-- 
+2.43.0
+

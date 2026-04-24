@@ -1,0 +1,39 @@
+From f8233f08fc4c287224fd089e22e6eec921558973 Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Thu, 23 Apr 2026 18:50:14 +0000
+Subject: [PATCH 26/30] =?UTF-8?q?docs(math-cuda):=20NOTES=20=E2=80=94=20po?=
+ =?UTF-8?q?st-FRI-on-device=20state=20(1.52=C3=97,=20FRI=20table=20entry)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ crypto/math-cuda/NOTES.md | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/crypto/math-cuda/NOTES.md b/crypto/math-cuda/NOTES.md
+index d7f88928..3e1752f6 100644
+--- a/crypto/math-cuda/NOTES.md
++++ b/crypto/math-cuda/NOTES.md
+@@ -9,8 +9,8 @@ context loss between sessions. Update as you go.
+ 
+ | Program | CPU rayon (46 cores) | CUDA (median over 5+ runs) | Delta |
+ |---|---|---|---|
+-| fib_iterative_1M | **18.269 s** | **12.04 s** | **1.52× (34.1% faster)** |
+-| fib_iterative_4M |               | **29.05 s** |   |
++| fib_iterative_1M | **18.269 s** | **12.0 s** | **1.52× (34.3% faster)** |
++| fib_iterative_4M |               | **28.3 s** |   |
+ 
+ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
+ 
+@@ -25,6 +25,7 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
+ | R4 DEEP-poly LDE | Standard ext3 LDE with uniform 1/N weights | `ntt_*_batched` via ext3 decomposition |
+ | **R4 deep_composition_poly_evals** | Per trace-size row, sum ~200 ext3 FMAs over all LDE cols + scalars. Reads main+aux LDE **from device handles** (no re-H2D) | `deep_composition_ext3_row` |
+ | **R3 OOD evaluation** | Per eval point, batched barycentric over all main (base) + aux (ext3) columns. Reads LDE directly from device handles with `row_stride = blowup_factor` (no slab extraction, no H2D) | `barycentric_{base,ext3}_batched_strided` |
++| **R4 FRI commit phase** | Fold + pair-hash Merkle tree per layer, evals + twiddles device-resident across log₂(N) layers. Only the root (32 B) D2Hs per layer to feed the transcript; layer evals + tree D2H at the end for query phase | `fri_fold_ext3` + `fri_update_twiddles` + `keccak_fri_leaves_ext3` + `keccak_merkle_level` |
+ | R2 `extend_half_to_lde` | Dormant — only hit by tiny tables below threshold | Infrastructure in place |
+ 
+ ### Where time still goes (aggregate across rayon threads, 1M-fib, warm)
+-- 
+2.43.0
+

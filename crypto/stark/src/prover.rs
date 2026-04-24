@@ -1356,24 +1356,85 @@ pub trait IsStarkProver<
 
         // Precompute all inverse denominators via batch inversion.
         let num_denoms = domain_size * (1 + num_eval_points);
-        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
-        // H-term denominators: x_i - z^K
-        for i in 0..domain_size {
-            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
-            denoms.push(x_i - &z_power);
-        }
+        // GPU fast path: fused compute-denoms + parallel Montgomery
+        // batch-inverse, all on device. The CPU path below runs when the
+        // `cuda` feature is off or the size is below the threshold.
+        #[cfg(feature = "cuda")]
+        let gpu_denoms: Option<Vec<FieldElement<FieldExtension>>> = {
+            if core::any::type_name::<Field>() == core::any::type_name::<math::field::goldilocks::GoldilocksField>()
+                && core::any::type_name::<FieldExtension>() == core::any::type_name::<math::field::extensions_goldilocks::Degree3GoldilocksExtensionField>()
+                && domain_size >= 1 << 10
+            {
+                // Pack z_scalars: [z_power, z_shifted[0], ..., z_shifted[ne-1]].
+                let mut z_flat: Vec<u64> = Vec::with_capacity((1 + num_eval_points) * 3);
+                let z_pow_p = &z_power as *const FieldElement<FieldExtension> as *const u64;
+                unsafe {
+                    z_flat.push(*z_pow_p);
+                    z_flat.push(*z_pow_p.add(1));
+                    z_flat.push(*z_pow_p.add(2));
+                }
+                for z_k in z_shifted.iter().take(num_eval_points) {
+                    let p = z_k as *const FieldElement<FieldExtension> as *const u64;
+                    unsafe {
+                        z_flat.push(*p);
+                        z_flat.push(*p.add(1));
+                        z_flat.push(*p.add(2));
+                    }
+                }
+                let x_base: &[u64] = unsafe {
+                    core::slice::from_raw_parts(
+                        domain.lde_roots_of_unity_coset.as_ptr() as *const u64,
+                        domain.lde_roots_of_unity_coset.len(),
+                    )
+                };
+                let raw = math_cuda::inverse::compute_and_invert_denoms_ext3(
+                    x_base,
+                    blowup_factor,
+                    &z_flat,
+                    1 + num_eval_points,
+                    domain_size,
+                )
+                .expect("GPU compute+invert denoms failed");
+                debug_assert_eq!(raw.len(), num_denoms * 3);
+                // Transmute back to Vec<FieldElement<E>>. Requires E == Ext3.
+                let mut v: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
+                unsafe {
+                    v.set_len(num_denoms);
+                    core::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        v.as_mut_ptr() as *mut u64,
+                        num_denoms * 3,
+                    );
+                }
+                Some(v)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_denoms: Option<Vec<FieldElement<FieldExtension>>> = None;
 
-        // Trace-term denominators: x_i - z_shifted[k]
-        for z_k in z_shifted.iter().take(num_eval_points) {
+        let denoms: Vec<FieldElement<FieldExtension>> = if let Some(v) = gpu_denoms {
+            v
+        } else {
+            let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
+            // H-term denominators: x_i - z^K
             for i in 0..domain_size {
                 let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
-                denoms.push(x_i - z_k);
+                denoms.push(x_i - &z_power);
             }
-        }
-
-        FieldElement::inplace_batch_inverse(&mut denoms)
-            .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
+            // Trace-term denominators: x_i - z_shifted[k]
+            for z_k in z_shifted.iter().take(num_eval_points) {
+                for i in 0..domain_size {
+                    let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+                    denoms.push(x_i - z_k);
+                }
+            }
+            FieldElement::inplace_batch_inverse(&mut denoms)
+                .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
+            denoms
+        };
 
         let inv_h = &denoms[0..domain_size];
 

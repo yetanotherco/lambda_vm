@@ -1,0 +1,159 @@
+From 42cf55740b9700ee4473148d86282a8c3c2fe803 Mon Sep 17 00:00:00 2001
+From: Mauro Toscano <mauro.toscano@yetanothercompany.xyz>
+Date: Tue, 21 Apr 2026 16:42:27 +0000
+Subject: [PATCH 02/28] perf(cuda): rayon-parallel host pack + median-of-10
+ microbench
+
+The batched-LDE host pack was a single-threaded memcpy from caller Vecs
+into the pinned staging buffer. At prover scale (20 cols x 1M rows, 640
+MB) that ran in 27 ms on one core while the GPU sat idle. Parallelising
+with rayon par_iter saturates DRAM across cores and drops pack to ~8 ms.
+
+Microbench impact (RTX 5090, prover-scale 20 cols, log_n=20, blowup=4):
+ - Before: host pack 27 ms
+ - After:  host pack  8 ms
+
+Also switched bench_quick to median-of-10 trials for stable measurements
+(prior single-trial numbers were 10-50% noisy).
+---
+ crypto/math-cuda/kernels/ntt.cu       |  1 +
+ crypto/math-cuda/src/lde.rs           | 33 +++++++++++++--------
+ crypto/math-cuda/tests/bench_quick.rs | 41 ++++++++++++++++-----------
+ 3 files changed, 46 insertions(+), 29 deletions(-)
+
+diff --git a/crypto/math-cuda/kernels/ntt.cu b/crypto/math-cuda/kernels/ntt.cu
+index 4e7866fc..2a5c8c78 100644
+--- a/crypto/math-cuda/kernels/ntt.cu
++++ b/crypto/math-cuda/kernels/ntt.cu
+@@ -151,6 +151,7 @@ extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
+     x[row] = tile[threadIdx.x];
+ }
+ 
++
+ /// Batched pointwise multiply: first n elements of each column multiplied by
+ /// the SHARED weight vector `w` (size n). Used for coset scaling — every
+ /// column of a table sees the same `g^i / N` weights.
+diff --git a/crypto/math-cuda/src/lde.rs b/crypto/math-cuda/src/lde.rs
+index d0ac9a31..2ca243a6 100644
+--- a/crypto/math-cuda/src/lde.rs
++++ b/crypto/math-cuda/src/lde.rs
+@@ -145,11 +145,24 @@ pub fn coset_lde_batch_base(
+     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
+     if debug_phases { phase("staging lock + grow", &mut last); }
+ 
+-    // Pack columns into first m*n slots of the pinned buffer, then one big H2D.
+-    for (c, col) in columns.iter().enumerate() {
+-        pinned[c * n..c * n + n].copy_from_slice(col);
+-    }
+-    if debug_phases { phase("host pack (pinned)", &mut last); }
++    // Pack columns into first m*n slots of the pinned buffer. Parallel: pinned
++    // writes are DRAM-bandwidth bound, saturates at ~8 cores on modern
++    // hardware, so rayon shaves 20+ ms at prover scale.
++    use rayon::prelude::*;
++    let pinned_base_ptr = pinned.as_mut_ptr() as usize;
++    columns.par_iter().enumerate().for_each(|(c, col)| {
++        // SAFETY: each task writes to a disjoint `[c*n..c*n+n]` region of
++        // `pinned`, and the outer `staging` lock guarantees no other call is
++        // using the buffer concurrently.
++        let dst = unsafe {
++            std::slice::from_raw_parts_mut(
++                (pinned_base_ptr as *mut u64).add(c * n),
++                n,
++            )
++        };
++        dst.copy_from_slice(col);
++    });
++    if debug_phases { phase("host pack (pinned, rayon)", &mut last); }
+ 
+     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
+     // tail of each column is already the zero-pad the CPU path does.
+@@ -266,16 +279,12 @@ pub fn coset_lde_batch_base(
+     // Vec page-faults, which can dominate total time (~75 ms for 128 MB).
+     // Parallelise so the fault cost spreads across CPU cores.
+     use rayon::prelude::*;
+-    let pinned_ptr = pinned.as_ptr() as usize; // Send a usize to dodge aliasing rules.
++    let pinned_ptr = pinned.as_ptr() as usize;
+     let out: Vec<Vec<u64>> = (0..m)
+         .into_par_iter()
+         .map(|c| {
+             let mut v = Vec::<u64>::with_capacity(lde_size);
+-            // SAFETY: we overwrite the entire range immediately below.
+             unsafe { v.set_len(lde_size) };
+-            // SAFETY: pinned buffer is held locked by the caller (staging
+-            // guard); the slice doesn't escape and can't alias another
+-            // column's write since `v` is thread-local.
+             let src = unsafe {
+                 std::slice::from_raw_parts(
+                     (pinned_ptr as *const u64).add(c * lde_size),
+@@ -425,8 +434,8 @@ pub fn coset_lde_batch_base_into(
+     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+     stream.synchronize()?;
+ 
+-    // Parallel copy pinned → caller outputs. Caller's Vecs should already be
+-    // faulted/resized so no page-fault cost here.
++    // Parallel copy pinned → caller outputs. Caller's Vecs may still fault
++    // on first write; we spread that cost across rayon cores.
+     use rayon::prelude::*;
+     let pinned_ptr = pinned.as_ptr() as usize;
+     outputs
+diff --git a/crypto/math-cuda/tests/bench_quick.rs b/crypto/math-cuda/tests/bench_quick.rs
+index 104285da..561331b7 100644
+--- a/crypto/math-cuda/tests/bench_quick.rs
++++ b/crypto/math-cuda/tests/bench_quick.rs
+@@ -176,29 +176,36 @@ fn bench_lde_batched_prover_scale() {
+     }
+ 
+     let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
+-    let mut gpu_ns = u128::MAX;
+-    for _ in 0..5 {
++    let mut gpu_samples = Vec::with_capacity(10);
++    for _ in 0..10 {
+         let t0 = Instant::now();
+         let _ = math_cuda::lde::coset_lde_batch_base(&slices, blowup, &weights).unwrap();
+-        gpu_ns = gpu_ns.min(t0.elapsed().as_nanos());
++        gpu_samples.push(t0.elapsed().as_nanos());
+     }
+-
+-    let mut cpu_bufs: Vec<Vec<Fp>> = columns
+-        .iter()
+-        .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
+-        .collect();
+-    let t0 = Instant::now();
+-    cpu_bufs.par_iter_mut().for_each(|buf| {
+-        Polynomial::coset_lde_full_expand::<GoldilocksField>(
+-            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+-        )
+-        .unwrap();
+-    });
+-    let cpu_ns = t0.elapsed().as_nanos();
++    gpu_samples.sort();
++    let gpu_ns = gpu_samples[gpu_samples.len() / 2]; // median
++
++    let mut cpu_samples = Vec::with_capacity(10);
++    for _ in 0..10 {
++        let mut cpu_bufs: Vec<Vec<Fp>> = columns
++            .iter()
++            .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
++            .collect();
++        let t0 = Instant::now();
++        cpu_bufs.par_iter_mut().for_each(|buf| {
++            Polynomial::coset_lde_full_expand::<GoldilocksField>(
++                buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
++            )
++            .unwrap();
++        });
++        cpu_samples.push(t0.elapsed().as_nanos());
++    }
++    cpu_samples.sort();
++    let cpu_ns = cpu_samples[cpu_samples.len() / 2]; // median
+ 
+     let ratio = cpu_ns as f64 / gpu_ns as f64;
+     println!(
+-        "prover-scale batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x",
++        "prover-scale batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x (median of 10)",
+     );
+ }
+ 
+-- 
+2.43.0
+

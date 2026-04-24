@@ -492,7 +492,10 @@ where
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
-        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
+        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns.
+        // Stays on CPU: batch-invert cost at this scale (n × num_eval_points ≈ 3 × 2^18 per
+        // table) is already rayon-parallelised across 7 tables, and a GPU port regressed
+        // wall time in a 2×15-trial A/B due to stream contention from 21 concurrent launches.
         let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
 
         // GPU fast path: batched strided barycentric over the main-trace

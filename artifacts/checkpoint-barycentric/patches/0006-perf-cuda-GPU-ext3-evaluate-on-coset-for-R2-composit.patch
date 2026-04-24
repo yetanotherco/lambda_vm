@@ -1,0 +1,541 @@
+From 98f6063d11f9b14c85c4de40734bde0f2170f039 Mon Sep 17 00:00:00 2001
+From: Mauro Toscano <mauro.toscano@yetanothercompany.xyz>
+Date: Tue, 21 Apr 2026 18:37:59 +0000
+Subject: [PATCH 06/11] perf(cuda): GPU ext3 evaluate-on-coset for R2
+ composition parts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The `number_of_parts > 2` branch of round_2_compute_composition_polynomial
+does `interpolate_offset_fft(2N evals) -> break_in_parts -> K calls to
+evaluate_polynomial_on_lde_domain`. At 1M-fib scale each of those K
+evaluations is a 2^20 -> 2^22 ext3 FFT on the g-coset — the single
+biggest FFT chunk in the proof after the main-trace LDE.
+
+Added `math_cuda::lde::evaluate_poly_coset_batch_ext3_into` which skips
+the iFFT stage (input is coefficients, not evaluations) and applies just
+the `offset^k` coset scaling + padded forward NTT. Parity-tested
+against `Polynomial::evaluate_offset_fft`.
+
+Stark prover now batches all K parts into a single GPU call via
+`try_evaluate_parts_on_lde_gpu`; CPU interpolate_offset_fft still runs
+once per table (smaller, and reusing it unchanged avoids scaffolding).
+
+End-to-end on fib_iterative_1M (median of 5 trials):
+ - CPU (rayon, 46 cores):             17.641s
+ - CUDA after this change:            13.460s  (23.7% faster end-to-end)
+
+GPU R2 parts LDE fires 42 times (~8 big tables per proof * 5 trials).
+---
+ crypto/math-cuda/src/lde.rs                   | 162 ++++++++++++++++++
+ crypto/math-cuda/tests/evaluate_coset_ext3.rs | 143 ++++++++++++++++
+ crypto/stark/src/gpu_lde.rs                   |  90 ++++++++++
+ crypto/stark/src/prover.rs                    |  50 ++++--
+ prover/tests/bench_gpu.rs                     |   2 +
+ 5 files changed, 435 insertions(+), 12 deletions(-)
+ create mode 100644 crypto/math-cuda/tests/evaluate_coset_ext3.rs
+
+diff --git a/crypto/math-cuda/src/lde.rs b/crypto/math-cuda/src/lde.rs
+index 29901639..a50b7c35 100644
+--- a/crypto/math-cuda/src/lde.rs
++++ b/crypto/math-cuda/src/lde.rs
+@@ -455,6 +455,168 @@ pub fn coset_lde_batch_base_into(
+     Ok(())
+ }
+ 
++/// Batched ext3 polynomial → coset evaluation.
++///
++/// Input: M ext3 columns of `n` coefficients each (interleaved, 3n u64).
++/// Output: M ext3 columns of `n * blowup_factor` evaluations each at the
++/// offset-coset.
++///
++/// Skips the iFFT stage of [`coset_lde_batch_ext3_into`] (input is
++/// coefficients, not evaluations). Weights encode the coset shift:
++/// `weights[k] = offset^k` (NO 1/N because iFFT normalisation doesn't apply).
++///
++/// Used by the stark prover to GPU-accelerate
++/// `evaluate_polynomial_on_lde_domain` calls inside the
++/// `number_of_parts > 2` branch of the composition-polynomial LDE.
++pub fn evaluate_poly_coset_batch_ext3_into(
++    coefs: &[&[u64]],
++    n: usize,
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++) -> Result<()> {
++    if coefs.is_empty() {
++        return Ok(());
++    }
++    let m = coefs.len();
++    assert_eq!(outputs.len(), m);
++    assert!(n.is_power_of_two());
++    assert_eq!(weights.len(), n);
++    assert!(blowup_factor.is_power_of_two());
++    for c in coefs.iter() {
++        assert_eq!(c.len(), 3 * n);
++    }
++    let lde_size = n * blowup_factor;
++    for o in outputs.iter() {
++        assert_eq!(o.len(), 3 * lde_size);
++    }
++    if n == 0 {
++        return Ok(());
++    }
++    let log_lde = lde_size.trailing_zeros() as u64;
++
++    let mb = 3 * m;
++    let be = backend();
++    let stream = be.next_stream();
++    let staging_slot = be.pinned_staging();
++
++    let mut staging = staging_slot.lock().unwrap();
++    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
++    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
++
++    use rayon::prelude::*;
++    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
++    coefs.par_iter().enumerate().for_each(|(c, col)| {
++        let slab_a = unsafe {
++            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 0) * n), n)
++        };
++        let slab_b = unsafe {
++            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
++        };
++        let slab_c = unsafe {
++            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
++        };
++        for i in 0..n {
++            slab_a[i] = col[i * 3 + 0];
++            slab_b[i] = col[i * 3 + 1];
++            slab_c[i] = col[i * 3 + 2];
++        }
++    });
++
++    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
++    for s in 0..mb {
++        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
++        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
++    }
++
++    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
++    let weights_dev = stream.clone_htod(weights)?;
++
++    let n_u64 = n as u64;
++    let lde_u64 = lde_size as u64;
++    let col_stride_u64 = lde_size as u64;
++    let mb_u32 = mb as u32;
++
++    // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
++    {
++        let grid_x = (n as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, mb_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.pointwise_mul_batched)
++                .arg(&mut buf)
++                .arg(&weights_dev)
++                .arg(&n_u64)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++
++    // Bit-reverse full lde_size slab, then forward DIT NTT.
++    {
++        let grid_x = (lde_size as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, mb_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.bit_reverse_permute_batched)
++                .arg(&mut buf)
++                .arg(&lde_u64)
++                .arg(&log_lde)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++    run_batched_ntt_body(
++        stream.as_ref(),
++        &mut buf,
++        fwd_tw.as_ref(),
++        lde_u64,
++        log_lde,
++        col_stride_u64,
++        mb_u32,
++    )?;
++
++    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
++    stream.synchronize()?;
++
++    let pinned_const = pinned.as_ptr() as usize;
++    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
++        let slab_a = unsafe {
++            std::slice::from_raw_parts(
++                (pinned_const as *const u64).add((c * 3 + 0) * lde_size),
++                lde_size,
++            )
++        };
++        let slab_b = unsafe {
++            std::slice::from_raw_parts(
++                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
++                lde_size,
++            )
++        };
++        let slab_c = unsafe {
++            std::slice::from_raw_parts(
++                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
++                lde_size,
++            )
++        };
++        for i in 0..lde_size {
++            dst[i * 3 + 0] = slab_a[i];
++            dst[i * 3 + 1] = slab_b[i];
++            dst[i * 3 + 2] = slab_c[i];
++        }
++    });
++    drop(staging);
++    Ok(())
++}
++
+ /// Batched coset LDE for Goldilocks **cubic extension** columns.
+ ///
+ /// A degree-3 extension element is `(a, b, c)` in memory (three contiguous
+diff --git a/crypto/math-cuda/tests/evaluate_coset_ext3.rs b/crypto/math-cuda/tests/evaluate_coset_ext3.rs
+new file mode 100644
+index 00000000..a7919529
+--- /dev/null
++++ b/crypto/math-cuda/tests/evaluate_coset_ext3.rs
+@@ -0,0 +1,143 @@
++//! Parity test for `evaluate_poly_coset_batch_ext3_into`.
++//!
++//! Reference: `math::polynomial::Polynomial::evaluate_offset_fft` on an ext3
++//! polynomial, then canonicalise. The GPU path should produce the same
++//! evaluations on the offset-coset at `n * blowup` points.
++
++use math::field::element::FieldElement;
++use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField};
++use math::polynomial::Polynomial;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
++
++fn offset_weights(n: usize, offset: u64) -> Vec<u64> {
++    let mut w = Vec::with_capacity(n);
++    let mut cur = 1u64;
++    for _ in 0..n {
++        w.push(cur);
++        cur = GoldilocksField::mul(&cur, &offset);
++    }
++    w
++}
++
++fn rand_ext3(rng: &mut ChaCha8Rng) -> Fp3 {
++    Fp3::new([
++        Fp::from_raw(rng.r#gen::<u64>()),
++        Fp::from_raw(rng.r#gen::<u64>()),
++        Fp::from_raw(rng.r#gen::<u64>()),
++    ])
++}
++
++fn ext3_to_u64s(col: &[Fp3]) -> Vec<u64> {
++    let mut out = Vec::with_capacity(col.len() * 3);
++    for e in col {
++        out.push(*e.value()[0].value());
++        out.push(*e.value()[1].value());
++        out.push(*e.value()[2].value());
++    }
++    out
++}
++
++fn u64s_to_ext3(raw: &[u64]) -> Vec<Fp3> {
++    let mut out = Vec::with_capacity(raw.len() / 3);
++    for i in 0..raw.len() / 3 {
++        out.push(Fp3::new([
++            Fp::from_raw(raw[i * 3 + 0]),
++            Fp::from_raw(raw[i * 3 + 1]),
++            Fp::from_raw(raw[i * 3 + 2]),
++        ]));
++    }
++    out
++}
++
++fn canon_fp3(e: &Fp3) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(e.value()[0].value()),
++        GoldilocksField::canonical(e.value()[1].value()),
++        GoldilocksField::canonical(e.value()[2].value()),
++    ]
++}
++
++fn assert_evaluate_coset(log_n: u64, blowup: usize, m: usize, offset: u64, seed: u64) {
++    let n = 1usize << log_n;
++    let lde_size = n * blowup;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++
++    // M ext3 polynomials, each of degree < n.
++    let polys: Vec<Vec<Fp3>> = (0..m)
++        .map(|_| (0..n).map(|_| rand_ext3(&mut rng)).collect())
++        .collect();
++
++    let weights = offset_weights(n, offset);
++
++    // CPU reference: evaluate each polynomial at `offset`-coset of size lde_size.
++    let offset_fp = Fp::from_raw(offset);
++    let cpu: Vec<Vec<Fp3>> = polys
++        .iter()
++        .map(|coefs| {
++            let p = Polynomial::new(coefs);
++            Polynomial::evaluate_offset_fft::<GoldilocksField>(
++                &p,
++                blowup,
++                Some(n),
++                &offset_fp,
++            )
++            .unwrap()
++        })
++        .collect();
++
++    // GPU: flatten each poly to 3n u64s, pre-allocate 3*lde_size u64 outputs.
++    let flat_inputs: Vec<Vec<u64>> = polys.iter().map(|p| ext3_to_u64s(p)).collect();
++    let input_slices: Vec<&[u64]> = flat_inputs.iter().map(|v| v.as_slice()).collect();
++    let mut flat_outputs: Vec<Vec<u64>> = (0..m).map(|_| vec![0u64; 3 * lde_size]).collect();
++    {
++        let mut out_slices: Vec<&mut [u64]> =
++            flat_outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
++        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
++            &input_slices,
++            n,
++            blowup,
++            &weights,
++            &mut out_slices,
++        )
++        .unwrap();
++    }
++
++    for c in 0..m {
++        let gpu: Vec<Fp3> = u64s_to_ext3(&flat_outputs[c]);
++        assert_eq!(gpu.len(), cpu[c].len(), "length mismatch");
++        for i in 0..gpu.len() {
++            let g = canon_fp3(&gpu[i]);
++            let cc = canon_fp3(&cpu[c][i]);
++            assert_eq!(g, cc, "eval mismatch col={c} row={i} log_n={log_n} blowup={blowup}");
++        }
++    }
++}
++
++#[test]
++fn ext3_evaluate_coset_small() {
++    for &m in &[1usize, 4] {
++        for log_n in 4..=10 {
++            for &blowup in &[2usize, 4] {
++                assert_evaluate_coset(log_n, blowup, m, 7, 100 + log_n * 10 + m as u64);
++            }
++        }
++    }
++}
++
++#[test]
++fn ext3_evaluate_coset_medium() {
++    for log_n in 11..=14 {
++        assert_evaluate_coset(log_n, 4, 2, 7, 200 + log_n);
++    }
++}
++
++#[test]
++fn ext3_evaluate_coset_large_one_column() {
++    assert_evaluate_coset(16, 4, 1, 7, 0xCAFE);
++}
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index c7e89bd6..50c6d160 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -333,6 +333,96 @@ pub fn gpu_r4_lde_calls() -> u64 {
+     GPU_R4_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
++/// GPU path for the composition-polynomial LDE in the `number_of_parts > 2`
++/// branch of `round_2_compute_composition_polynomial` (prover.rs:920). The
++/// caller already has the polynomial parts; we batch their evaluations at
++/// the `domain_size × blowup_factor` coset in a single GPU call.
++///
++/// Each part is padded to `domain_size` coefficients. Weights = `offset^k`
++/// (coset shift, no 1/N normalisation — input is coefficients).
++pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
++    parts_coefs: &[&[FieldElement<E>]],
++    blowup_factor: usize,
++    domain_size: usize,
++    offset: &FieldElement<F>,
++) -> Option<Vec<Vec<FieldElement<E>>>>
++where
++    F: math::field::traits::IsFFTField + IsField,
++    E: IsField,
++    F: IsSubFieldOf<E>,
++{
++    if parts_coefs.is_empty() {
++        return Some(Vec::new());
++    }
++    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
++        return None;
++    }
++    let lde_size = domain_size * blowup_factor;
++    if lde_size < gpu_lde_threshold() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    let m = parts_coefs.len();
++
++    GPU_PARTS_LDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // Weights: `offset^k` for k in 0..domain_size. F == Goldilocks.
++    let mut weights_u64 = Vec::with_capacity(domain_size);
++    let mut w = FieldElement::<F>::one();
++    for _ in 0..domain_size {
++        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
++        weights_u64.push(v);
++        w = w * offset;
++    }
++
++    // Pack each part into a 3*domain_size u64 buffer, zero-padded.
++    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
++    for part in parts_coefs.iter() {
++        let mut buf = vec![0u64; 3 * domain_size];
++        let len = part.len().min(domain_size);
++        // Copy the real part coefficients; the rest stays zero (padding).
++        let src_ptr = part.as_ptr() as *const u64;
++        let src_len = len * 3;
++        let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
++        buf[..src_len].copy_from_slice(src);
++        part_bufs.push(buf);
++    }
++    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
++
++    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
++        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
++        .collect();
++    {
++        let mut out_slices: Vec<&mut [u64]> = outputs
++            .iter_mut()
++            .map(|o| {
++                let ptr = o.as_mut_ptr() as *mut u64;
++                unsafe { core::slice::from_raw_parts_mut(ptr, 3 * lde_size) }
++            })
++            .collect();
++        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
++            &input_slices,
++            domain_size,
++            blowup_factor,
++            &weights_u64,
++            &mut out_slices,
++        )
++        .expect("GPU parts LDE failed");
++    }
++    Some(outputs)
++}
++
++pub(crate) static GPU_PARTS_LDE_CALLS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++pub fn gpu_parts_lde_calls() -> u64 {
++    GPU_PARTS_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
+ /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
+ /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
+ fn try_expand_columns_batched_ext3<F, E>(
+diff --git a/crypto/stark/src/prover.rs b/crypto/stark/src/prover.rs
+index ea054fef..2ed926db 100644
+--- a/crypto/stark/src/prover.rs
++++ b/crypto/stark/src/prover.rs
+@@ -933,18 +933,44 @@ pub trait IsStarkProver<
+                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
+                     .unwrap();
+             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
+-            composition_poly_parts
+-                .iter()
+-                .map(|part| {
+-                    evaluate_polynomial_on_lde_domain(
+-                        part,
+-                        domain.blowup_factor,
+-                        domain.interpolation_domain_size,
+-                        &domain.coset_offset,
+-                    )
+-                    .unwrap()
+-                })
+-                .collect()
++
++            // GPU fast path: batch all parts' LDEs into a single call. Parts
++            // share offset/size so a one-shot ext3 evaluate-on-coset saves
++            // one kernel pipeline per part. Falls through to CPU when the
++            // `cuda` feature is off or the size is below the GPU threshold.
++            #[cfg(feature = "cuda")]
++            let gpu_result = {
++                let parts_slices: Vec<&[FieldElement<FieldExtension>]> =
++                    composition_poly_parts
++                        .iter()
++                        .map(|p| p.coefficients.as_slice())
++                        .collect();
++                crate::gpu_lde::try_evaluate_parts_on_lde_gpu::<Field, FieldExtension>(
++                    &parts_slices,
++                    domain.blowup_factor,
++                    domain.interpolation_domain_size,
++                    &domain.coset_offset,
++                )
++            };
++            #[cfg(not(feature = "cuda"))]
++            let gpu_result: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
++
++            if let Some(results) = gpu_result {
++                results
++            } else {
++                composition_poly_parts
++                    .iter()
++                    .map(|part| {
++                        evaluate_polynomial_on_lde_domain(
++                            part,
++                            domain.blowup_factor,
++                            domain.interpolation_domain_size,
++                            &domain.coset_offset,
++                        )
++                        .unwrap()
++                    })
++                    .collect()
++            }
+         };
+         #[cfg(feature = "instruments")]
+         let fft_dur = t_sub.elapsed();
+diff --git a/prover/tests/bench_gpu.rs b/prover/tests/bench_gpu.rs
+index 4153cf98..31903eca 100644
+--- a/prover/tests/bench_gpu.rs
++++ b/prover/tests/bench_gpu.rs
+@@ -33,9 +33,11 @@ fn bench_prove(name: &str, trials: u32) {
+         let calls = stark::gpu_lde::gpu_lde_calls();
+         let eh = stark::gpu_lde::gpu_extend_halves_calls();
+         let r4 = stark::gpu_lde::gpu_r4_lde_calls();
++        let parts = stark::gpu_lde::gpu_parts_lde_calls();
+         println!("  GPU LDE calls across {trials} proves: {calls}");
+         println!("  GPU extend_two_halves calls: {eh}");
+         println!("  GPU R4 deep-poly LDE calls: {r4}");
++        println!("  GPU R2 parts LDE calls: {parts}");
+     }
+ }
+ 
+-- 
+2.43.0
+

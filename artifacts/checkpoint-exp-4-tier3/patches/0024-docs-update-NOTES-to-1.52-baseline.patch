@@ -1,0 +1,29 @@
+From 659f2b2430344d01e64ea9979e0f4485e8cdb56a Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Thu, 23 Apr 2026 17:13:03 +0000
+Subject: [PATCH 24/30] =?UTF-8?q?docs:=20update=20NOTES=20to=201.52=C3=97?=
+ =?UTF-8?q?=20baseline?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ crypto/math-cuda/NOTES.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crypto/math-cuda/NOTES.md b/crypto/math-cuda/NOTES.md
+index e041a29e..d7f88928 100644
+--- a/crypto/math-cuda/NOTES.md
++++ b/crypto/math-cuda/NOTES.md
+@@ -9,7 +9,7 @@ context loss between sessions. Update as you go.
+ 
+ | Program | CPU rayon (46 cores) | CUDA (median over 5+ runs) | Delta |
+ |---|---|---|---|
+-| fib_iterative_1M | **18.269 s** | **12.13 s** | **1.51× (33.6% faster)** |
++| fib_iterative_1M | **18.269 s** | **12.04 s** | **1.52× (34.1% faster)** |
+ | fib_iterative_4M |               | **29.05 s** |   |
+ 
+ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
+-- 
+2.43.0
+

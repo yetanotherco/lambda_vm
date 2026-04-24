@@ -1,0 +1,181 @@
+From d94f5140b93007389ec344d8e86b91605eb22039 Mon Sep 17 00:00:00 2001
+From: Mauro Toscano <mauro.toscano@yetanothercompany.xyz>
+Date: Tue, 21 Apr 2026 18:18:03 +0000
+Subject: [PATCH 05/11] perf(cuda): GPU ext3 LDE for Round 4 DEEP-poly
+ extension
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Round 4 extends the DEEP composition polynomial from N trace-coset
+evaluations to `domain_size` LDE-coset evaluations via
+`interpolate_fft + evaluate_fft(poly, 1, Some(domain_size))` — that's
+the no-coset ext3 LDE pattern with uniform `1/N` weights, which our
+existing `coset_lde_batch_ext3_into` already implements.
+
+Added `try_r4_deep_poly_lde_gpu` that routes the ext3 LDE through the
+batched GPU path; prover falls back to CPU when the feature is off or
+size is below threshold. Caller keeps its trailing `bit_reverse_permute`
+so output order is unchanged.
+
+End-to-end on fib_iterative_1M (median of 5 trials):
+ - CPU (rayon, 46 cores): 16.907s
+ - CUDA after this change:  14.971s  (11.5% faster end-to-end)
+
+R4 deep-poly LDE fires ~8-9 times per proof at prover scale (one per
+big table).
+---
+ crypto/stark/src/gpu_lde.rs | 83 +++++++++++++++++++++++++++++++++++++
+ crypto/stark/src/prover.rs  | 26 ++++++++++--
+ prover/tests/bench_gpu.rs   |  2 +
+ 3 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index abefbafc..c7e89bd6 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -250,6 +250,89 @@ where
+     Some((lde_h0, lde_h1))
+ }
+ 
++/// GPU path for Round 4's DEEP-poly LDE extension.
++///
++/// The CPU pipeline at `prover.rs:1107` is
++/// ```ignore
++/// let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals)?;
++/// let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))?;
++/// in_place_bit_reverse_permute(&mut lde_evals);
++/// ```
++///
++/// That is an iFFT over `N = deep_evals.len()` ext3 elements followed by an
++/// FFT evaluation on `domain_size` points — the **standard** (non-coset) LDE
++/// on the extension field with weights `[1/N, ..., 1/N]`. We reuse
++/// `coset_lde_batch_ext3_into` with a uniform `1/N` weight vector; the
++/// single ext3 column is handled internally as 3 base-field slabs. The
++/// caller keeps its trailing `in_place_bit_reverse_permute`, so output
++/// order is unchanged.
++pub(crate) fn try_r4_deep_poly_lde_gpu<E>(
++    deep_evals: &[FieldElement<E>],
++    domain_size: usize,
++) -> Option<Vec<FieldElement<E>>>
++where
++    E: IsField,
++{
++    let n = deep_evals.len();
++    if n == 0 || !n.is_power_of_two() {
++        return None;
++    }
++    if domain_size < n || !domain_size.is_power_of_two() {
++        return None;
++    }
++    let blowup = domain_size / n;
++    if blowup < 2 {
++        return None;
++    }
++    if domain_size < gpu_lde_threshold() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++
++    GPU_R4_LDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // Uniform weights = 1/N (no coset shift, just iFFT normalisation).
++    let inv_n_u64 = {
++        let fe = FieldElement::<GoldilocksField>::from(n as u64)
++            .inv()
++            .expect("N non-zero");
++        *fe.value()
++    };
++    let weights = vec![inv_n_u64; n];
++
++    // Input: single ext3 column, 3n u64s.
++    let input_raw: Vec<u64> = {
++        let len = n * 3;
++        let ptr = deep_evals.as_ptr() as *const u64;
++        unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
++    };
++    let inputs: [&[u64]; 1] = [&input_raw];
++
++    let mut out_vec = vec![FieldElement::<E>::zero(); domain_size];
++    {
++        let out_ptr = out_vec.as_mut_ptr() as *mut u64;
++        let out_slice = unsafe { core::slice::from_raw_parts_mut(out_ptr, 3 * domain_size) };
++        let mut outputs: [&mut [u64]; 1] = [out_slice];
++        math_cuda::lde::coset_lde_batch_ext3_into(
++            &inputs,
++            n,
++            blowup,
++            &weights,
++            &mut outputs,
++        )
++        .expect("GPU R4 deep-poly LDE failed");
++    }
++    Some(out_vec)
++}
++
++pub(crate) static GPU_R4_LDE_CALLS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++pub fn gpu_r4_lde_calls() -> u64 {
++    GPU_R4_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
+ /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
+ /// `Degree3GoldilocksExtensionField` by type_name match at the caller.
+ fn try_expand_columns_batched_ext3<F, E>(
+diff --git a/crypto/stark/src/prover.rs b/crypto/stark/src/prover.rs
+index 56f48495..ea054fef 100644
+--- a/crypto/stark/src/prover.rs
++++ b/crypto/stark/src/prover.rs
+@@ -1104,10 +1104,28 @@ pub trait IsStarkProver<
+         let domain_size = domain.lde_roots_of_unity_coset.len();
+         #[cfg(feature = "instruments")]
+         let t_sub = Instant::now();
+-        let deep_poly =
+-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
+-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
+-            .expect("FFT should succeed");
++        // GPU fast path: the deep-poly extension is an N → domain_size ext3
++        // LDE with uniform weights `1/N` (no coset shift). Falls through if
++        // the `cuda` feature is off, the type isn't ext3, or the size is
++        // below the threshold.
++        #[cfg(feature = "cuda")]
++        let mut lde_evals = if let Some(evals) =
++            crate::gpu_lde::try_r4_deep_poly_lde_gpu(&deep_evals, domain_size)
++        {
++            evals
++        } else {
++            let deep_poly =
++                Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
++            Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
++                .expect("FFT should succeed")
++        };
++        #[cfg(not(feature = "cuda"))]
++        let mut lde_evals = {
++            let deep_poly =
++                Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
++            Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
++                .expect("FFT should succeed")
++        };
+         in_place_bit_reverse_permute(&mut lde_evals);
+         #[cfg(feature = "instruments")]
+         let r4_fft_dur = t_sub.elapsed();
+diff --git a/prover/tests/bench_gpu.rs b/prover/tests/bench_gpu.rs
+index f4762889..4153cf98 100644
+--- a/prover/tests/bench_gpu.rs
++++ b/prover/tests/bench_gpu.rs
+@@ -32,8 +32,10 @@ fn bench_prove(name: &str, trials: u32) {
+     {
+         let calls = stark::gpu_lde::gpu_lde_calls();
+         let eh = stark::gpu_lde::gpu_extend_halves_calls();
++        let r4 = stark::gpu_lde::gpu_r4_lde_calls();
+         println!("  GPU LDE calls across {trials} proves: {calls}");
+         println!("  GPU extend_two_halves calls: {eh}");
++        println!("  GPU R4 deep-poly LDE calls: {r4}");
+     }
+ }
+ 
+-- 
+2.43.0
+

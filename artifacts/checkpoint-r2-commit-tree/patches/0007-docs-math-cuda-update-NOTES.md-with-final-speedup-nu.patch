@@ -1,0 +1,117 @@
+From d3ca95b1d366dee41f62a56e8470ac5b1c76493b Mon Sep 17 00:00:00 2001
+From: Mauro Toscano <mauro.toscano@yetanothercompany.xyz>
+Date: Tue, 21 Apr 2026 19:33:01 +0000
+Subject: [PATCH 07/17] docs(math-cuda): update NOTES.md with final speedup
+ numbers
+
+End-to-end on RTX 5090 vs 46-core rayon CPU:
+ - fib_iterative_1M:  17.64s CPU -> 13.46s CUDA  (1.31x, 24% faster)
+ - fib_iterative_4M:  41.40s CPU -> 35.14s CUDA  (1.18x, 15% faster)
+
+All 28 math-cuda parity tests + 121 stark cuda tests pass.
+---
+ crypto/math-cuda/NOTES.md | 80 ++++++++++++++++++++++++++-------------
+ 1 file changed, 53 insertions(+), 27 deletions(-)
+
+diff --git a/crypto/math-cuda/NOTES.md b/crypto/math-cuda/NOTES.md
+index 7303e1cf..f336cefc 100644
+--- a/crypto/math-cuda/NOTES.md
++++ b/crypto/math-cuda/NOTES.md
+@@ -3,41 +3,67 @@
+ Running log of attempts, analysis, and what's left. Intended to survive
+ context loss between sessions. Update as you go.
+ 
+-## Current state (as of this commit)
++## Current state (2026-04-21, 5 commits on branch `cuda/batched-ntt`)
+ 
+-`math-cuda` has a batched Goldilocks coset-LDE:
++### End-to-end speedup
+ 
+-- Kernels: `bit_reverse_permute_batched`, `ntt_dit_level_batched`,
+-  `ntt_dit_8_levels_batched` (shmem fusion of the first 8 DIT levels),
++| Program | CPU rayon (46 cores) | CUDA | Delta |
++|---|---|---|---|
++| fib_iterative_1M (median of 5) | **17.641 s** | **13.460 s** | **1.31× (24% faster)** |
++| fib_iterative_4M (median of 3) | **41.401 s** | **35.139 s** | **1.18× (15% faster)** |
++
++Correctness: all 28 math-cuda parity tests + 121 stark cuda tests pass.
++
++### What's on the GPU now
++
++Four independent hook points in the stark prover, all behind the `cuda`
++feature flag. CPU path unchanged when the feature is off.
++
++| Hook | Call site | Fires per 1M-fib proof | Notes |
++|---|---|---|---|
++| Main trace LDE (base-field) | `expand_columns_to_lde`, `prover.rs:479` | ~40 cols × few tables | `coset_lde_batch_base_into` |
++| Aux trace LDE (ext3, via 3× base decomposition) | `expand_columns_to_lde`, same call site | ~20 cols × few tables | `coset_lde_batch_ext3_into` |
++| R2 composition parts LDE (ext3, `number_of_parts > 2` branch) | `round_2_compute_composition_polynomial`, `prover.rs:948` | ~8 (one per big table) | `evaluate_poly_coset_batch_ext3_into` |
++| R4 DEEP-poly extension (ext3) | `round_4_compute_and_commit_fri_layers`, `prover.rs:1107` | ~8 | `coset_lde_batch_ext3_into` with uniform `1/N` weights |
++| R2 `extend_half_to_lde` (ext3, 2-halves batch) | `decompose_and_extend_d2`, `prover.rs:832` | **0** — only tiny tables hit that branch in current VM | Infrastructure in place but size gate skips it |
++
++The ext3 path costs no extra CUDA: an NTT over an ext3 column is
++componentwise equivalent to three independent base-field NTTs sharing
++the same twiddles, because a DIT butterfly's multiplication is `base *
++ext3 = componentwise base*u64`. Stark de-interleaves the 3n u64 slab
++into 3 base slabs in the pinned staging buffer, runs the existing
++`*_batched` kernels over 3M logical columns, and re-interleaves on the
++way out.
++
++### Backend (`device.rs`)
++
++- CUDA context, pool of 32 streams (round-robin via AtomicUsize).
++- Single shared pinned host staging buffer (`cuMemHostAlloc` with
++  flags=0: portable, non-write-combined). Grown once per process to the
++  largest LDE seen; serialised by a Mutex per call so concurrent rayon
++  workers don't step on each other. Per-stream buffers blew up pinned
++  memory 32× and forced first-call re-alloc on every new table size.
++- Twiddle cache per `log_n` (both fwd and inv), populated on a separate
++  utility stream.
++- Event tracking disabled globally (`disable_event_tracking()`) — cudarc
++  normally creates two events per `CudaSlice` alloc, which serialised
++  concurrent callers on the driver context lock and added per-alloc cost.
++
++### Kernels (`kernels/ntt.cu`)
++
++- `bit_reverse_permute_batched`, `ntt_dit_level_batched`,
++  `ntt_dit_8_levels_batched` (shmem fusion of first 8 DIT levels),
+   `pointwise_mul_batched`, `scalar_mul_batched`.
+-- Backend (`device.rs`): CUDA context, pool of 32 streams, single shared
+-  pinned host staging buffer (non-WC, allocated lazily and grown, reused
+-  across calls), twiddle cache per `log_n`. Event tracking is
+-  disabled globally — it adds ~2 CUDA API calls per slice allocation
+-  and serialised concurrent callers on the driver's context lock.
+-- Public entry points:
+-  - `lde::coset_lde_batch_base(columns: &[&[u64]], blowup, weights) -> Vec<Vec<u64>>`
+-  - `lde::coset_lde_batch_base_into(columns, blowup, weights, outputs: &mut [&mut [u64]])`
+-  - `ntt::forward/inverse` for single-column base-field NTT.
+-- Parity-tested against CPU (`tests/ntt.rs`, `tests/lde.rs`, `tests/lde_batch.rs`)
+-  up to `log_n = 20`.
+-- Hooked into stark via `crypto/stark/src/gpu_lde.rs` and
+-  `expand_columns_to_lde` at `crypto/stark/src/prover.rs:479`. Feature
+-  flag: `cuda` on `stark` and `lambda-vm-prover`.
+-
+-## Microbench results (RTX 5090, 46-core host, blowup=4, warm)
++- Parity-tested against CPU up to `log_n = 20` in `tests/lde_batch*.rs`
++  and `tests/evaluate_coset_ext3.rs`.
++
++### Microbenches (RTX 5090, 46-core host, blowup=4, warm)
+ 
+ | Size | CPU rayon | GPU batched | Ratio |
+ |---|---|---|---|
+-| 64 cols, log_n=16 (LDE 2^18) | ~75–100 ms | ~15–20 ms | **5–12×** (high variance) |
++| 64 cols, log_n=16 (LDE 2^18) | ~75–100 ms | ~15–20 ms | **5–12×** |
+ | 20 cols, log_n=20 (LDE 2^22, prover-scale) | ~470 ms | ~220 ms | **~2.0–2.3×** |
+ 
+-End-to-end 1M-fib fibonacci proof: CPU ~17 s, CUDA ~16.5–17 s — **tied**.
+-The microbench win doesn't translate to end-to-end because LDE is only
+-~20% of proof wall time (Round 1 LDE) and the per-call timings inside
+-the prover incur initial warmup and mutex serialisation on the shared
+-pinned staging.
+-
+ ## Where the time goes at prover scale (single LDE call, log_n=20, 20 cols)
+ 
+ Phase timings (enable with `MATH_CUDA_PHASE_TIMING=1`):
+-- 
+2.43.0
+

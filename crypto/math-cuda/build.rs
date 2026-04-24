@@ -58,4 +58,5 @@ fn main() {
     compile_ptx("barycentric.cu", "barycentric.ptx");
     compile_ptx("deep.cu", "deep.ptx");
     compile_ptx("fri.cu", "fri.ptx");
+    compile_ptx("inverse.cu", "inverse.ptx");
 }

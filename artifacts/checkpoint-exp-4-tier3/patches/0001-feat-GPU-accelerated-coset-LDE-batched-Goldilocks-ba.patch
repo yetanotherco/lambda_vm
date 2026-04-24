@@ -1,0 +1,2948 @@
+From 50ea4a9019d73fe46d6c02bbe6577066427d6e43 Mon Sep 17 00:00:00 2001
+From: Mauro Toscano <mauro.toscano@yetanothercompany.xyz>
+Date: Tue, 21 Apr 2026 16:14:14 +0000
+Subject: [PATCH 01/30] feat: GPU-accelerated coset LDE (batched, Goldilocks
+ base field)
+
+New `math-cuda` crate carries a CUDA backend for the per-table coset LDE:
+ - Goldilocks field arithmetic on device (bit-identical to CPU).
+ - Radix-2 DIT NTT with shared-memory fusion of the first 8 levels.
+ - Batched variant: one kernel launch handles all M columns of a table.
+ - Single shared pinned host staging buffer, grows to max LDE seen.
+ - Outputs written directly into caller-provided slices.
+
+Wired in at stark::prover::expand_columns_to_lde behind a `cuda` feature
+flag; Goldilocks-base tables above the LDE-size threshold route to the
+GPU batched path, others fall through to the existing rayon CPU path.
+
+Bench (RTX 5090, 46-core CPU, blowup=4, warm):
+ - 64 cols, n=2^16 (LDE 2^18): CPU 95ms, GPU 18ms (~5x)
+ - 20 cols, n=2^20 (LDE 2^22): CPU 512ms, GPU 266ms (~2x)
+ - 1M fib end-to-end: CPU ~16.5s, CUDA ~15s (warm)
+
+Feature is opt-in (`stark/cuda`, `lambda-vm-prover/cuda`). CPU-only builds
+are byte-identical to before and pay zero overhead.
+---
+ Cargo.lock                              |  31 ++
+ Cargo.toml                              |   1 +
+ Makefile                                |  16 +-
+ README.md                               |  22 +
+ crypto/math-cuda/Cargo.toml             |  21 +
+ crypto/math-cuda/build.rs               |  56 +++
+ crypto/math-cuda/kernels/arith.cu       |  49 +++
+ crypto/math-cuda/kernels/goldilocks.cuh |  69 ++++
+ crypto/math-cuda/kernels/ntt.cu         | 284 +++++++++++++
+ crypto/math-cuda/src/device.rs          | 247 +++++++++++
+ crypto/math-cuda/src/lde.rs             | 524 ++++++++++++++++++++++++
+ crypto/math-cuda/src/lib.rs             |  93 +++++
+ crypto/math-cuda/src/ntt.rs             | 211 ++++++++++
+ crypto/math-cuda/tests/bench_quick.rs   | 349 ++++++++++++++++
+ crypto/math-cuda/tests/goldilocks.rs    | 127 ++++++
+ crypto/math-cuda/tests/lde.rs           | 112 +++++
+ crypto/math-cuda/tests/lde_batch.rs     |  96 +++++
+ crypto/math-cuda/tests/ntt.rs           | 136 ++++++
+ crypto/stark/Cargo.toml                 |   4 +
+ crypto/stark/src/gpu_lde.rs             | 136 ++++++
+ crypto/stark/src/lib.rs                 |   2 +
+ crypto/stark/src/prover.rs              |  13 +
+ prover/Cargo.toml                       |   2 +
+ prover/tests/bench_gpu.rs               |  54 +++
+ 24 files changed, 2654 insertions(+), 1 deletion(-)
+ create mode 100644 crypto/math-cuda/Cargo.toml
+ create mode 100644 crypto/math-cuda/build.rs
+ create mode 100644 crypto/math-cuda/kernels/arith.cu
+ create mode 100644 crypto/math-cuda/kernels/goldilocks.cuh
+ create mode 100644 crypto/math-cuda/kernels/ntt.cu
+ create mode 100644 crypto/math-cuda/src/device.rs
+ create mode 100644 crypto/math-cuda/src/lde.rs
+ create mode 100644 crypto/math-cuda/src/lib.rs
+ create mode 100644 crypto/math-cuda/src/ntt.rs
+ create mode 100644 crypto/math-cuda/tests/bench_quick.rs
+ create mode 100644 crypto/math-cuda/tests/goldilocks.rs
+ create mode 100644 crypto/math-cuda/tests/lde.rs
+ create mode 100644 crypto/math-cuda/tests/lde_batch.rs
+ create mode 100644 crypto/math-cuda/tests/ntt.rs
+ create mode 100644 crypto/stark/src/gpu_lde.rs
+ create mode 100644 prover/tests/bench_gpu.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f6eea84d..e9024df9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -803,6 +803,15 @@ dependencies = [
+  "typenum",
+ ]
+ 
++[[package]]
++name = "cudarc"
++version = "0.19.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
++dependencies = [
++ "libloading",
++]
++
+ [[package]]
+ name = "darling"
+ version = "0.21.3"
+@@ -1989,6 +1998,16 @@ version = "0.2.178"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
+ 
++[[package]]
++name = "libloading"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
++dependencies = [
++ "cfg-if",
++ "windows-link",
++]
++
+ [[package]]
+ name = "libm"
+ version = "0.2.15"
+@@ -2105,6 +2124,17 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "math-cuda"
++version = "0.1.0"
++dependencies = [
++ "cudarc",
++ "math",
++ "rand 0.8.5",
++ "rand_chacha 0.3.1",
++ "rayon",
++]
++
+ [[package]]
+ name = "memchr"
+ version = "2.7.6"
+@@ -3172,6 +3202,7 @@ dependencies = [
+  "itertools 0.11.0",
+  "log",
+  "math",
++ "math-cuda",
+  "rayon",
+  "serde",
+  "serde-wasm-bindgen",
+diff --git a/Cargo.toml b/Cargo.toml
+index 4d10b7c4..e43dc7f0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,7 @@ members = [
+   "crypto/stark",
+   "crypto/crypto",
+   "crypto/math",
++  "crypto/math-cuda",
+   "bin/cli",
+ ]
+ 
+diff --git a/Makefile b/Makefile
+index c02bffc4..7857c949 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
+ compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
+ test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
+-test-fast test-prover test-prover-all build check clippy fmt lint
++test-fast test-prover test-prover-all build check clippy fmt lint test-cuda check-cuda
+ 
+ UNAME := $(shell uname)
+ 
+@@ -193,3 +193,17 @@ lint:
+ 
+ flamegraph-prover:
+ 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
++
++# === CUDA ===
++# Run math-cuda tests (requires CUDA + a visible GPU).
++test-cuda:
++	cargo test -p math-cuda
++
++check-cuda:
++	cargo check -p math-cuda
++	cargo check -p stark --features cuda
++	cargo check -p lambda-vm-prover --features cuda
++
++# Fast test suite with GPU LDE enabled (drop-in replacement for `test-fast`).
++test-fast-cuda:
++	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel,stark/cuda
+diff --git a/README.md b/README.md
+index df751528..7137d7a0 100644
+--- a/README.md
++++ b/README.md
+@@ -177,6 +177,28 @@ cargo test --release -p lambda-vm-prover --features debug-checks -- --nocapture
+ 
+ The feature is defined in `crypto/stark/Cargo.toml` and forwarded through `prover/Cargo.toml`. It has zero overhead when disabled.
+ 
++## GPU acceleration (experimental)
++
++A CUDA backend for the per-column coset LDE (the `coset_lde_full_expand` hot path) lives in the `math-cuda` crate and is gated behind the `cuda` feature on `stark` / `lambda-vm-prover`. Requires CUDA 13.x with a visible NVIDIA GPU. Covers the Goldilocks base field only; extension-field columns and small LDEs transparently fall back to the CPU path.
++
++```sh
++# Unit tests for the GPU kernels (parity against CPU, sizes up to 2^20):
++make test-cuda
++
++# Full workspace check including the CUDA feature:
++make check-cuda
++
++# `test-fast` with GPU LDE enabled:
++make test-fast-cuda
++```
++
++Behaviour:
++- The GPU path fires only when `buffer.len() * blowup_factor >= 2^19` and the column is `FieldElement<GoldilocksField>`. Tune with `LAMBDA_VM_GPU_LDE_THRESHOLD=<n>` at runtime.
++- If the `cuda` feature is enabled and CUDA initialisation fails, the process panics with a clear message — there is no transparent fallback to CPU.
++- The CPU-only build (default) is bit-for-bit identical to before; the feature is zero overhead when disabled.
++
++Status: on a single RTX 5090 with ~46 CPU cores and the current kernel set, end-to-end prove time ties the rayon-parallel CPU path on 1M–4M-instruction proofs. Wins on single-column LDE are ~16× at 2^18 sizes but are swallowed by CPU parallelism and per-call kernel launch overhead. Next steps for a real speedup are kernel fusion across NTT levels, CUDA graphs to amortise launch, keeping LDE on device through Merkle, and moving Keccak/constraint evaluation to GPU.
++
+ ## Roadmap for the virtual machine
+ 
+ This project is under active development. Our primary objective is to have a first working version for the virtual machine. Priorities and features might change as we continue developing.
+diff --git a/crypto/math-cuda/Cargo.toml b/crypto/math-cuda/Cargo.toml
+new file mode 100644
+index 00000000..3d78c42a
+--- /dev/null
++++ b/crypto/math-cuda/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "math-cuda"
++description = "CUDA-accelerated FFT/NTT for Goldilocks (base field) used by the lambda-vm STARK prover"
++version = "0.1.0"
++edition = "2024"
++
++[dependencies]
++cudarc = { version = "0.19", default-features = false, features = [
++    "driver",
++    "nvrtc",
++    "std",
++    "cuda-13010",
++    "dynamic-loading",
++] }
++math = { path = "../math" }
++rayon = "1.7"
++
++[dev-dependencies]
++rand = { version = "0.8.5", features = ["std"] }
++rand_chacha = "0.3.1"
++rayon = "1.7"
+diff --git a/crypto/math-cuda/build.rs b/crypto/math-cuda/build.rs
+new file mode 100644
+index 00000000..0a023018
+--- /dev/null
++++ b/crypto/math-cuda/build.rs
+@@ -0,0 +1,56 @@
++use std::env;
++use std::path::PathBuf;
++use std::process::Command;
++
++fn cuda_home() -> PathBuf {
++    env::var_os("CUDA_HOME")
++        .or_else(|| env::var_os("CUDA_PATH"))
++        .map(PathBuf::from)
++        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda"))
++}
++
++fn nvcc_path() -> PathBuf {
++    cuda_home().join("bin").join("nvcc")
++}
++
++fn compile_ptx(src: &str, out_name: &str) {
++    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
++    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
++    let src_path = manifest_dir.join("kernels").join(src);
++    let out_path = out_dir.join(out_name);
++
++    println!("cargo:rerun-if-changed=kernels/{src}");
++    println!("cargo:rerun-if-env-changed=CUDA_HOME");
++    println!("cargo:rerun-if-env-changed=CUDA_PATH");
++    println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
++
++    // Emit PTX for a virtual architecture; the CUDA driver JIT-compiles it for the
++    // actual GPU at load time, so one PTX works across Ada/Hopper/Blackwell. Override
++    // with CUDARC_NVCC_ARCH to pin a specific compute capability.
++    let arch = env::var("CUDARC_NVCC_ARCH").unwrap_or_else(|_| "compute_89".to_string());
++
++    let status = Command::new(nvcc_path())
++        .args([
++            "--ptx",
++            "-O3",
++            "-std=c++17",
++            "-arch",
++            &arch,
++            "-o",
++        ])
++        .arg(&out_path)
++        .arg(&src_path)
++        .status()
++        .expect("failed to invoke nvcc — is CUDA installed and CUDA_HOME set?");
++
++    if !status.success() {
++        panic!("nvcc failed compiling {}", src_path.display());
++    }
++}
++
++fn main() {
++    // Header is not compiled; emit rerun-if-changed so edits trigger rebuilds.
++    println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
++    compile_ptx("arith.cu", "arith.ptx");
++    compile_ptx("ntt.cu", "ntt.ptx");
++}
+diff --git a/crypto/math-cuda/kernels/arith.cu b/crypto/math-cuda/kernels/arith.cu
+new file mode 100644
+index 00000000..a466c330
+--- /dev/null
++++ b/crypto/math-cuda/kernels/arith.cu
+@@ -0,0 +1,49 @@
++// Element-wise Goldilocks kernels used by the Phase-2 parity tests. These mirror
++// the CPU reference in `crypto/math/src/field/goldilocks.rs` so raw u64 outputs
++// are bit-identical to the CPU path.
++
++#include "goldilocks.cuh"
++
++using goldilocks::add;
++using goldilocks::sub;
++using goldilocks::mul;
++using goldilocks::neg;
++
++extern "C" __global__ void vector_add_u64(const uint64_t *a,
++                                          const uint64_t *b,
++                                          uint64_t *c,
++                                          uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) c[tid] = a[tid] + b[tid];  // plain wrapping u64 add — toolchain sanity only.
++}
++
++extern "C" __global__ void gl_add_kernel(const uint64_t *a,
++                                         const uint64_t *b,
++                                         uint64_t *c,
++                                         uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) c[tid] = add(a[tid], b[tid]);
++}
++
++extern "C" __global__ void gl_sub_kernel(const uint64_t *a,
++                                         const uint64_t *b,
++                                         uint64_t *c,
++                                         uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) c[tid] = sub(a[tid], b[tid]);
++}
++
++extern "C" __global__ void gl_mul_kernel(const uint64_t *a,
++                                         const uint64_t *b,
++                                         uint64_t *c,
++                                         uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) c[tid] = mul(a[tid], b[tid]);
++}
++
++extern "C" __global__ void gl_neg_kernel(const uint64_t *a,
++                                         uint64_t *c,
++                                         uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) c[tid] = neg(a[tid]);
++}
+diff --git a/crypto/math-cuda/kernels/goldilocks.cuh b/crypto/math-cuda/kernels/goldilocks.cuh
+new file mode 100644
+index 00000000..5e296a39
+--- /dev/null
++++ b/crypto/math-cuda/kernels/goldilocks.cuh
+@@ -0,0 +1,69 @@
++// Goldilocks field on device. Ports `crypto/math/src/field/goldilocks.rs` one-to-one:
++// - Representation: non-canonical u64 in [0, 2^64). Canonicalise only at boundaries.
++// - Prime: 2^64 - 2^32 + 1.
++// - Reduction: exploits 2^64 ≡ EPSILON (mod p) and 2^96 ≡ -1 (mod p).
++//
++// The arithmetic here must produce bit-identical u64 outputs to the CPU path so
++// LDE parity tests can assert raw equality.
++
++#pragma once
++#include <cstdint>
++
++namespace goldilocks {
++
++__device__ constexpr uint64_t PRIME   = 0xFFFFFFFF00000001ULL;
++__device__ constexpr uint64_t EPSILON = 0xFFFFFFFFULL;  // 2^32 - 1
++
++__device__ __forceinline__ uint64_t add_no_canonicalize(uint64_t x, uint64_t y) {
++    // Mirror of `add_no_canonicalize_trashing_input`: one add, one EPSILON bump on carry.
++    uint64_t sum = x + y;
++    return sum + (sum < x ? EPSILON : 0ULL);
++}
++
++__device__ __forceinline__ uint64_t add(uint64_t a, uint64_t b) {
++    uint64_t sum  = a + b;
++    uint64_t over1 = (sum < a) ? EPSILON : 0ULL;
++    uint64_t sum2 = sum + over1;
++    uint64_t over2 = (sum2 < sum) ? EPSILON : 0ULL;
++    return sum2 + over2;
++}
++
++__device__ __forceinline__ uint64_t sub(uint64_t a, uint64_t b) {
++    uint64_t diff  = a - b;
++    uint64_t under1 = (a < b) ? EPSILON : 0ULL;
++    uint64_t diff2 = diff - under1;
++    uint64_t under2 = (diff2 > diff) ? EPSILON : 0ULL;
++    return diff2 - under2;
++}
++
++__device__ __forceinline__ uint64_t reduce128(uint64_t lo, uint64_t hi) {
++    uint64_t x_hi_hi = hi >> 32;
++    uint64_t x_hi_lo = hi & EPSILON;
++
++    // 2^96 ≡ -1 (mod p): subtract x_hi_hi from lo, EPSILON-correct on borrow.
++    uint64_t t0 = lo - x_hi_hi;
++    if (lo < x_hi_hi) t0 -= EPSILON;
++
++    // 2^64 ≡ EPSILON (mod p): x_hi_lo * EPSILON = (x_hi_lo << 32) - x_hi_lo.
++    uint64_t t1 = (x_hi_lo << 32) - x_hi_lo;
++
++    return add_no_canonicalize(t0, t1);
++}
++
++__device__ __forceinline__ uint64_t mul(uint64_t a, uint64_t b) {
++    uint64_t lo = a * b;
++    uint64_t hi = __umul64hi(a, b);
++    return reduce128(lo, hi);
++}
++
++__device__ __forceinline__ uint64_t neg(uint64_t a) {
++    // `a` may be non-canonical. Canonicalise first, then p - a (or 0).
++    uint64_t canon = (a >= PRIME) ? (a - PRIME) : a;
++    return canon == 0 ? 0 : (PRIME - canon);
++}
++
++__device__ __forceinline__ uint64_t canonical(uint64_t a) {
++    return (a >= PRIME) ? (a - PRIME) : a;
++}
++
++}  // namespace goldilocks
+diff --git a/crypto/math-cuda/kernels/ntt.cu b/crypto/math-cuda/kernels/ntt.cu
+new file mode 100644
+index 00000000..4e7866fc
+--- /dev/null
++++ b/crypto/math-cuda/kernels/ntt.cu
+@@ -0,0 +1,284 @@
++// Radix-2 DIT NTT over Goldilocks. One kernel per butterfly level; the caller
++// runs `bit_reverse_permute` once before the first level.
++//
++// Input layout: bit-reversed-order coefficients (after `bit_reverse_permute`).
++// Output layout: natural-order evaluations — matches the CPU `evaluate_fft` contract.
++//
++// Twiddle table: `tw[i] = ω^i` for i in [0, n/2). Stride-indexed per level.
++
++#include "goldilocks.cuh"
++
++using goldilocks::add;
++using goldilocks::sub;
++using goldilocks::mul;
++
++/// Reverse the low `log_n` bits of each index and swap x[i] ↔ x[rev(i)].
++/// One thread per index; guarded by `tid < rev` to avoid double-swap.
++extern "C" __global__ void bit_reverse_permute(uint64_t *x,
++                                               uint64_t n,
++                                               uint64_t log_n) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++
++    // __brevll reverses all 64 bits; shift right so result lives in [0, n).
++    uint64_t rev = __brevll(tid) >> (64 - log_n);
++    if (tid < rev) {
++        uint64_t tmp = x[tid];
++        x[tid] = x[rev];
++        x[rev] = tmp;
++    }
++}
++
++/// Pointwise multiply: x[i] *= w[i]. Used for coset scaling (w = g^i weights).
++extern "C" __global__ void pointwise_mul(uint64_t *x,
++                                         const uint64_t *w,
++                                         uint64_t n) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) x[tid] = mul(x[tid], w[tid]);
++}
++
++/// Broadcast scalar multiply: x[i] *= c. Used for the 1/n factor at the end of iNTT.
++extern "C" __global__ void scalar_mul(uint64_t *x,
++                                      uint64_t c,
++                                      uint64_t n) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < n) x[tid] = mul(x[tid], c);
++}
++
++// ============================================================================
++// BATCHED KERNELS
++//
++// One launch processes M columns at once. The device buffer holds M columns
++// back-to-back; column `c` starts at `data + c * col_stride`. gridDim.y is
++// the column index, so each block handles one (column, butterfly-window) pair.
++//
++// The same twiddle table is shared across all columns of a batch (they all
++// NTT on the same domain). The coset weights are also shared.
++// ============================================================================
++
++extern "C" __global__ void bit_reverse_permute_batched(uint64_t *data,
++                                                       uint64_t n,
++                                                       uint64_t log_n,
++                                                       uint64_t col_stride) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
++
++    uint64_t rev = __brevll(tid) >> (64 - log_n);
++    if (tid < rev) {
++        uint64_t tmp = x[tid];
++        x[tid] = x[rev];
++        x[rev] = tmp;
++    }
++}
++
++extern "C" __global__ void ntt_dit_level_batched(uint64_t *data,
++                                                 const uint64_t *tw,
++                                                 uint64_t n,
++                                                 uint64_t log_n,
++                                                 uint64_t level,
++                                                 uint64_t col_stride) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    uint64_t n_half = n >> 1;
++    if (tid >= n_half) return;
++    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
++
++    uint64_t half       = 1ULL << level;
++    uint64_t block_size = half << 1;
++    uint64_t block_idx  = tid >> level;
++    uint64_t k          = tid & (half - 1);
++
++    uint64_t i0 = block_idx * block_size + k;
++    uint64_t i1 = i0 + half;
++
++    uint64_t tw_index = k << (log_n - level - 1);
++    uint64_t w = tw[tw_index];
++
++    uint64_t u = x[i0];
++    uint64_t v = mul(w, x[i1]);
++    x[i0] = add(u, v);
++    x[i1] = sub(u, v);
++}
++
++extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
++                                                    const uint64_t *tw,
++                                                    uint64_t n,
++                                                    uint64_t log_n,
++                                                    uint64_t base_step,
++                                                    uint64_t col_stride) {
++    __shared__ uint64_t tile[256];
++    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
++
++    uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n - base_step);
++
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++
++    uint64_t group_size = 1ULL << base_step;
++    uint64_t n_groups   = n >> base_step;
++    uint64_t low_bits   = tid / n_groups;
++    uint64_t high_bits  = tid & (n_groups - 1);
++    uint64_t row        = high_bits * group_size + low_bits;
++
++    tile[threadIdx.x] = x[row];
++    __syncthreads();
++
++    uint32_t remaining_high_bits = (uint32_t)(log_n - base_step - 1);
++    uint32_t high_mask = (1u << remaining_high_bits) - 1u;
++
++    for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
++        if (threadIdx.x < 128) {
++            uint32_t i      = threadIdx.x;
++            uint32_t half   = 1u << loc_step;
++            uint32_t grp    = i >> loc_step;
++            uint32_t grp_pos = i & (half - 1);
++            uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
++            uint32_t idx2 = idx1 + half;
++
++            uint32_t gs  = (uint32_t)base_step + loc_step;
++            uint32_t ggp = (blockIdx.x << 7) + i;
++            ggp = ((ggp & high_mask) << (uint32_t)base_step) + (ggp >> remaining_high_bits);
++            ggp = ggp & ((1u << gs) - 1u);
++            uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
++
++            uint64_t u = tile[idx1];
++            uint64_t v = mul(tile[idx2], factor);
++            tile[idx1] = add(u, v);
++            tile[idx2] = sub(u, v);
++        }
++        __syncthreads();
++    }
++
++    x[row] = tile[threadIdx.x];
++}
++
++/// Batched pointwise multiply: first n elements of each column multiplied by
++/// the SHARED weight vector `w` (size n). Used for coset scaling — every
++/// column of a table sees the same `g^i / N` weights.
++extern "C" __global__ void pointwise_mul_batched(uint64_t *data,
++                                                 const uint64_t *w,
++                                                 uint64_t n,
++                                                 uint64_t col_stride) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
++    x[tid] = mul(x[tid], w[tid]);
++}
++
++/// Batched broadcast scalar multiply — one scalar c applied to the first n
++/// elements of every column.
++extern "C" __global__ void scalar_mul_batched(uint64_t *data,
++                                              uint64_t c,
++                                              uint64_t n,
++                                              uint64_t col_stride) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
++    x[tid] = mul(x[tid], c);
++}
++
++/// One DIT butterfly level. Thread `tid` (of n/2 total) owns exactly one
++/// butterfly pair (i0, i1 = i0 + half). Twiddle picked from the shared full
++/// `tw` table at stride `n / block_size`. Kept for log_n < 8 where shmem
++/// fusion is overkill.
++extern "C" __global__ void ntt_dit_level(uint64_t *x,
++                                         const uint64_t *tw,
++                                         uint64_t n,
++                                         uint64_t log_n,
++                                         uint64_t level) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    uint64_t n_half = n >> 1;
++    if (tid >= n_half) return;
++
++    uint64_t half       = 1ULL << level;          // 2^ℓ
++    uint64_t block_size = half << 1;              // 2^{ℓ+1}
++    uint64_t block_idx  = tid >> level;           // floor(tid / half)
++    uint64_t k          = tid & (half - 1);       // tid mod half
++
++    uint64_t i0 = block_idx * block_size + k;
++    uint64_t i1 = i0 + half;
++
++    // Stride = n / block_size = n >> (level + 1).
++    uint64_t tw_index = k << (log_n - level - 1);
++    uint64_t w = tw[tw_index];
++
++    uint64_t u = x[i0];
++    uint64_t v = mul(w, x[i1]);
++    x[i0] = add(u, v);
++    x[i1] = sub(u, v);
++}
++
++/// Up to 8 DIT butterfly levels fused in one kernel using shared memory.
++///
++/// Ported from Zisk's `br_ntt_8_steps` (`pil2-stark/src/goldilocks/src/ntt_goldilocks.cu`),
++/// simplified to single-column. Each block of 256 threads processes 256
++/// elements in on-chip shared memory, running up to 8 butterfly levels
++/// without writing to global memory between them — cuts DRAM traffic by up
++/// to 8× vs the per-level kernel.
++///
++/// `base_step` selects which 8-level window this launch handles (0, 8, 16…).
++/// For levels 0–7 the implicit DIT element layout already places all pair
++/// mates inside the same 256-block; for higher base_step we remap the loaded
++/// row so pair mates land in consecutive shared-memory slots.
++///
++/// Expects bit-reversed input (the caller runs `bit_reverse_permute` once
++/// before the first kernel launch).
++///
++/// Assumes `n` is a multiple of 256, i.e. `log_n >= 8`.
++extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
++                                            const uint64_t *tw,
++                                            uint64_t n,
++                                            uint64_t log_n,
++                                            uint64_t base_step) {
++    __shared__ uint64_t tile[256];
++
++    uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n - base_step);
++
++    // tid is the *unpermuted* flat index the block/thread would own.
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++
++    // Row remap: for base_step > 0, gather elements that pair at levels
++    // `base_step..base_step+7` so they land consecutively in the block.
++    uint64_t group_size = 1ULL << base_step;
++    uint64_t n_groups   = n >> base_step;  // = n / group_size
++    uint64_t low_bits   = tid / n_groups;
++    uint64_t high_bits  = tid & (n_groups - 1);
++    uint64_t row        = high_bits * group_size + low_bits;
++
++    // Load one element per thread.
++    tile[threadIdx.x] = x[row];
++    __syncthreads();
++
++    // Each butterfly level uses half the threads (128 butterflies per block).
++    // The global butterfly index `ggp` is recovered from blockIdx + threadIdx
++    // and reshaped by the same row-remap to find the right twiddle.
++    uint32_t remaining_high_bits = (uint32_t)(log_n - base_step - 1);  // log2(n_groups / 2)
++    uint32_t high_mask = (1u << remaining_high_bits) - 1u;
++
++    for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
++        if (threadIdx.x < 128) {
++            uint32_t i      = threadIdx.x;
++            uint32_t half   = 1u << loc_step;
++            uint32_t grp    = i >> loc_step;
++            uint32_t grp_pos = i & (half - 1);
++            uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
++            uint32_t idx2 = idx1 + half;
++
++            // Global step and butterfly position for twiddle lookup.
++            uint32_t gs  = (uint32_t)base_step + loc_step;
++            uint32_t ggp = (blockIdx.x << 7) + i;  // blockIdx * 128 + i
++            // Un-remap ggp to find its position in the natural ordering.
++            ggp = ((ggp & high_mask) << (uint32_t)base_step) + (ggp >> remaining_high_bits);
++            ggp = ggp & ((1u << gs) - 1u);
++            uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
++
++            uint64_t u = tile[idx1];
++            uint64_t v = mul(tile[idx2], factor);
++            tile[idx1] = add(u, v);
++            tile[idx2] = sub(u, v);
++        }
++        __syncthreads();
++    }
++
++    // Store back to the remapped row.
++    x[row] = tile[threadIdx.x];
++}
+diff --git a/crypto/math-cuda/src/device.rs b/crypto/math-cuda/src/device.rs
+new file mode 100644
+index 00000000..45e08bf4
+--- /dev/null
++++ b/crypto/math-cuda/src/device.rs
+@@ -0,0 +1,247 @@
++//! CUDA device context, stream pool, kernel handles, and twiddle cache.
++//!
++//! One process-wide backend — lazy-initialised on first use. All kernels live
++//! on a single CUDA context; a pool of streams lets rayon-parallel callers
++//! overlap H2D / compute / D2H.
++
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++
++use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream};
++use cudarc::nvrtc::Ptx;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsFFTField;
++
++use crate::Result;
++use crate::ntt::{twiddles_forward, twiddles_inverse};
++
++/// Reusable pinned host staging buffer. One per stream; the stream's LDE call
++/// holds its buffer's lock across the D2H + memcpy-to-user-Vecs window.
++///
++/// Allocated with `cuMemHostAlloc(flags=0)` — portable, non-write-combined,
++/// so both DMA writes from device and CPU reads into user Vecs run at full
++/// speed. Grows power-of-two; never shrinks.
++pub struct PinnedStaging {
++    ptr: *mut u64,
++    capacity_elems: usize,
++}
++
++// SAFETY: the raw pointer aliases host memory allocated via cuMemHostAlloc.
++// We guard concurrent access with a Mutex; the pointer is valid for the
++// lifetime of this struct and is freed on drop.
++unsafe impl Send for PinnedStaging {}
++unsafe impl Sync for PinnedStaging {}
++
++impl PinnedStaging {
++    const fn empty() -> Self {
++        Self {
++            ptr: std::ptr::null_mut(),
++            capacity_elems: 0,
++        }
++    }
++
++    pub fn ensure_capacity(
++        &mut self,
++        min_elems: usize,
++        ctx: &CudaContext,
++    ) -> Result<()> {
++        if self.capacity_elems >= min_elems {
++            return Ok(());
++        }
++        // cuMemHostAlloc requires the context to be current on this thread.
++        ctx.bind_to_thread()?;
++        // Free old (if any) before allocating the new one.
++        if !self.ptr.is_null() {
++            unsafe {
++                let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut _);
++            }
++            self.ptr = std::ptr::null_mut();
++            self.capacity_elems = 0;
++        }
++        let new_cap = min_elems.next_power_of_two().max(1 << 20); // at least 8 MB
++        let bytes = new_cap * std::mem::size_of::<u64>();
++        let ptr = unsafe {
++            cudarc::driver::result::malloc_host(bytes, 0 /* flags: non-WC */)?
++        } as *mut u64;
++        self.ptr = ptr;
++        self.capacity_elems = new_cap;
++        Ok(())
++    }
++
++    /// View of the first `len` elements. Caller must hold this `PinnedStaging`
++    /// locked while using the slice; the slice aliases the internal pointer.
++    ///
++    /// # Safety
++    /// Caller must not outlive the `PinnedStaging` and must not race with
++    /// concurrent uses.
++    pub unsafe fn as_mut_slice(&mut self, len: usize) -> &mut [u64] {
++        assert!(len <= self.capacity_elems);
++        if len == 0 {
++            return &mut [];
++        }
++        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
++    }
++}
++
++impl Drop for PinnedStaging {
++    fn drop(&mut self) {
++        if !self.ptr.is_null() {
++            unsafe {
++                let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut _);
++            }
++        }
++    }
++}
++
++const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
++const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
++/// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
++/// callers overlap on the GPU without serializing on stream ownership. The
++/// default stream is deliberately excluded because it synchronises with all
++/// other streams, defeating the point of the pool.
++const STREAM_POOL_SIZE: usize = 32;
++
++pub struct Backend {
++    pub ctx: Arc<CudaContext>,
++    streams: Vec<Arc<CudaStream>>,
++    /// Single shared pinned staging buffer, grown to the biggest LDE size
++    /// seen. Concurrent batched LDE calls serialise on it; in exchange the
++    /// process keeps only ONE gigabyte-sized pinned allocation (per-stream
++    /// buffers 32×-inflated memory use and multiplied the one-time pinning
++    /// cost for every first use of a new table size).
++    pinned_staging: Mutex<PinnedStaging>,
++    util_stream: Arc<CudaStream>,
++    next: AtomicUsize,
++
++    // arith.ptx
++    pub vector_add_u64: CudaFunction,
++    pub gl_add: CudaFunction,
++    pub gl_sub: CudaFunction,
++    pub gl_mul: CudaFunction,
++    pub gl_neg: CudaFunction,
++
++    // ntt.ptx
++    pub bit_reverse_permute: CudaFunction,
++    pub ntt_dit_level: CudaFunction,
++    pub ntt_dit_8_levels: CudaFunction,
++    pub pointwise_mul: CudaFunction,
++    pub scalar_mul: CudaFunction,
++    pub bit_reverse_permute_batched: CudaFunction,
++    pub ntt_dit_level_batched: CudaFunction,
++    pub ntt_dit_8_levels_batched: CudaFunction,
++    pub pointwise_mul_batched: CudaFunction,
++    pub scalar_mul_batched: CudaFunction,
++
++    // Twiddle caches keyed by log_n.
++    fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
++    inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
++}
++
++impl Backend {
++    fn init() -> Result<Self> {
++        let ctx = CudaContext::new(0)?;
++        // cudarc's default per-slice CudaEvent tracking adds two driver calls
++        // per alloc and serialises under the context lock. We never share
++        // slices across streams (every call scopes its own buffers and syncs
++        // before returning), so the tracking is pure overhead. Disable it.
++        unsafe { ctx.disable_event_tracking() };
++
++        let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
++        let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
++
++        let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
++        for _ in 0..STREAM_POOL_SIZE {
++            streams.push(ctx.new_stream()?);
++        }
++        let pinned_staging = Mutex::new(PinnedStaging::empty());
++        // Separate "utility" stream for twiddle uploads and other bookkeeping;
++        // not part of the pool that callers rotate through.
++        let util_stream = ctx.new_stream()?;
++
++        // Goldilocks TWO_ADICITY is 32, so log_n ≤ 32 covers every LDE size
++        // the prover can produce. Overshoot by one for safety.
++        let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
++
++        Ok(Self {
++            vector_add_u64: arith.load_function("vector_add_u64")?,
++            gl_add: arith.load_function("gl_add_kernel")?,
++            gl_sub: arith.load_function("gl_sub_kernel")?,
++            gl_mul: arith.load_function("gl_mul_kernel")?,
++            gl_neg: arith.load_function("gl_neg_kernel")?,
++            bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
++            ntt_dit_level: ntt.load_function("ntt_dit_level")?,
++            ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
++            pointwise_mul: ntt.load_function("pointwise_mul")?,
++            scalar_mul: ntt.load_function("scalar_mul")?,
++            bit_reverse_permute_batched: ntt.load_function("bit_reverse_permute_batched")?,
++            ntt_dit_level_batched: ntt.load_function("ntt_dit_level_batched")?,
++            ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
++            pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
++            scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
++            fwd_twiddles: Mutex::new(vec![None; max_log]),
++            inv_twiddles: Mutex::new(vec![None; max_log]),
++            ctx,
++            streams,
++            pinned_staging,
++            util_stream,
++            next: AtomicUsize::new(0),
++        })
++    }
++
++    /// Round-robin over the stream pool. Concurrent callers get different
++    /// streams so their kernel launches overlap on the GPU.
++    pub fn next_stream(&self) -> Arc<CudaStream> {
++        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.streams.len();
++        self.streams[idx].clone()
++    }
++
++    /// Shared pinned staging buffer. Grows to the largest LDE the process
++    /// has seen so far. Concurrent callers serialise on the mutex.
++    pub fn pinned_staging(&self) -> &Mutex<PinnedStaging> {
++        &self.pinned_staging
++    }
++
++    pub fn fwd_twiddles_for(&self, log_n: u64) -> Result<Arc<CudaSlice<u64>>> {
++        self.cached_twiddles(log_n, true)
++    }
++
++    pub fn inv_twiddles_for(&self, log_n: u64) -> Result<Arc<CudaSlice<u64>>> {
++        self.cached_twiddles(log_n, false)
++    }
++
++    fn cached_twiddles(&self, log_n: u64, forward: bool) -> Result<Arc<CudaSlice<u64>>> {
++        let idx = log_n as usize;
++        let cache = if forward {
++            &self.fwd_twiddles
++        } else {
++            &self.inv_twiddles
++        };
++        {
++            let guard = cache.lock().unwrap();
++            if let Some(t) = &guard[idx] {
++                return Ok(t.clone());
++            }
++        }
++        // Compute on host, upload on the utility stream. Another thread may
++        // have populated the cache in the meantime; prefer that entry.
++        let host = if forward {
++            twiddles_forward(log_n)
++        } else {
++            twiddles_inverse(log_n)
++        };
++        let dev = Arc::new(self.util_stream.clone_htod(&host)?);
++        self.util_stream.synchronize()?;
++        let mut guard = cache.lock().unwrap();
++        if let Some(t) = &guard[idx] {
++            Ok(t.clone())
++        } else {
++            guard[idx] = Some(dev.clone());
++            Ok(dev)
++        }
++    }
++}
++
++pub fn backend() -> &'static Backend {
++    static BACKEND: OnceLock<Backend> = OnceLock::new();
++    BACKEND.get_or_init(|| Backend::init().expect("failed to initialise CUDA backend"))
++}
+diff --git a/crypto/math-cuda/src/lde.rs b/crypto/math-cuda/src/lde.rs
+new file mode 100644
+index 00000000..d0ac9a31
+--- /dev/null
++++ b/crypto/math-cuda/src/lde.rs
+@@ -0,0 +1,524 @@
++//! Full coset LDE on device. Mirrors `Polynomial::coset_lde_full_expand` in
++//! `crypto/math/src/fft/polynomial.rs` algebraically:
++//!
++//! Input  : N evaluations (natural order) of a poly on the standard subgroup,
++//!          plus coset weights (size N). The weights include the `1/N` iFFT
++//!          normalisation, matching the `LdeTwiddles::coset_weights` format at
++//!          `crypto/stark/src/prover.rs:248` — i.e. `weights[i] = g^i / N`.
++//! Output : N*blowup_factor evaluations (natural order) on the coset.
++//!
++//! On-device steps, picks a stream from the shared pool so rayon-parallel
++//! callers overlap on the GPU. Twiddles are cached in the backend.
++
++use cudarc::driver::{LaunchConfig, PushKernelArg};
++
++use crate::Result;
++use crate::device::backend;
++use crate::ntt::run_ntt_body;
++
++pub fn coset_lde_base(
++    evals: &[u64],
++    blowup_factor: usize,
++    weights: &[u64],
++) -> Result<Vec<u64>> {
++    let n = evals.len();
++    assert!(n.is_power_of_two(), "evals length must be a power of two");
++    assert_eq!(weights.len(), n, "weights length must match evals");
++    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let lde_size = n * blowup_factor;
++    let log_n = n.trailing_zeros() as u64;
++    let log_lde = lde_size.trailing_zeros() as u64;
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    // Device buffer of lde_size, zero-padded tail, first N filled by copy.
++    let mut buf = stream.alloc_zeros::<u64>(lde_size)?;
++    {
++        let mut head = buf.slice_mut(0..n);
++        stream.memcpy_htod(evals, &mut head)?;
++    }
++
++    let inv_tw = be.inv_twiddles_for(log_n)?;
++    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
++    let weights_dev = stream.clone_htod(weights)?;
++
++    let n_u64 = n as u64;
++    let lde_u64 = lde_size as u64;
++
++    // === 1. iNTT on first N: bit_reverse + 8-level-fused DIT body ===
++    unsafe {
++        stream
++            .launch_builder(&be.bit_reverse_permute)
++            .arg(&mut buf)
++            .arg(&n_u64)
++            .arg(&log_n)
++            .launch(LaunchConfig::for_num_elems(n as u32))?;
++    }
++    // Note: `run_ntt_body` expects a standalone CudaSlice; we pass `buf` and
++    // the kernel walks the first `n_u64` elements via its own indexing.
++    run_ntt_body(stream.as_ref(), &mut buf, inv_tw.as_ref(), n_u64, log_n)?;
++    // Note: the CPU iFFT does not include 1/N — it's folded into `weights`. The
++    // next pointwise multiply applies both the coset shift and the 1/N factor.
++
++    // === 2. Pointwise multiply first N by coset weights (includes 1/N) ===
++    unsafe {
++        stream
++            .launch_builder(&be.pointwise_mul)
++            .arg(&mut buf)
++            .arg(&weights_dev)
++            .arg(&n_u64)
++            .launch(LaunchConfig::for_num_elems(n as u32))?;
++    }
++
++    // === 3. Forward NTT on full buffer ===
++    unsafe {
++        stream
++            .launch_builder(&be.bit_reverse_permute)
++            .arg(&mut buf)
++            .arg(&lde_u64)
++            .arg(&log_lde)
++            .launch(LaunchConfig::for_num_elems(lde_size as u32))?;
++    }
++    run_ntt_body(stream.as_ref(), &mut buf, fwd_tw.as_ref(), lde_u64, log_lde)?;
++
++    let out = stream.clone_dtoh(&buf)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
++/// Batched coset LDE: processes `m` columns (all the same domain) in a single
++/// pipeline on one stream. One H2D per column, then per-level batched kernels
++/// that launch with `grid.y = m` so a single launch does the butterflies for
++/// every column at that level.
++///
++/// Returns one `Vec<u64>` per input column, each of length `n * blowup_factor`.
++pub fn coset_lde_batch_base(
++    columns: &[&[u64]],
++    blowup_factor: usize,
++    weights: &[u64],
++) -> Result<Vec<Vec<u64>>> {
++    if columns.is_empty() {
++        return Ok(Vec::new());
++    }
++    let m = columns.len();
++    let n = columns[0].len();
++    assert!(n.is_power_of_two(), "column length must be a power of two");
++    assert_eq!(weights.len(), n, "weights length must match column length");
++    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
++    for c in columns.iter() {
++        assert_eq!(c.len(), n, "all columns must be the same size");
++    }
++
++    if n == 0 {
++        return Ok(vec![Vec::new(); m]);
++    }
++    let lde_size = n * blowup_factor;
++    let log_n = n.trailing_zeros() as u64;
++    let log_lde = lde_size.trailing_zeros() as u64;
++
++    let be = backend();
++    let stream = be.next_stream();
++    let staging_slot = be.pinned_staging();
++
++    let debug_phases = std::env::var("MATH_CUDA_PHASE_TIMING").is_ok();
++    let t_start = if debug_phases { Some(std::time::Instant::now()) } else { None };
++    let phase = |label: &str, prev: &mut Option<std::time::Instant>| {
++        if let Some(p) = prev.as_ref() {
++            let now = std::time::Instant::now();
++            eprintln!("  [{:>6.2} ms] {}", (now - *p).as_secs_f64() * 1e3, label);
++            *prev = Some(now);
++        }
++    };
++    let mut last = t_start;
++
++    // Pinned staging. Lock and grow to max(m*n for upload, m*lde_size for
++    // download). Holding the guard across the whole call serialises concurrent
++    // batched calls that happened to hash to the same stream slot, but that's
++    // exactly what we want — one stream can only do one sequence at a time.
++    let mut staging = staging_slot.lock().unwrap();
++    staging.ensure_capacity(m * lde_size, &be.ctx)?;
++    // SAFETY: staging is locked, the slice alias ends before we unlock.
++    let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
++    if debug_phases { phase("staging lock + grow", &mut last); }
++
++    // Pack columns into first m*n slots of the pinned buffer, then one big H2D.
++    for (c, col) in columns.iter().enumerate() {
++        pinned[c * n..c * n + n].copy_from_slice(col);
++    }
++    if debug_phases { phase("host pack (pinned)", &mut last); }
++
++    // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
++    // tail of each column is already the zero-pad the CPU path does.
++    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
++    if debug_phases { stream.synchronize()?; phase("alloc_zeros", &mut last); }
++    // One memcpy per column from the pinned buffer into the strided slots.
++    // The pinned source hits PCIe line-rate.
++    for c in 0..m {
++        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
++        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
++    }
++    if debug_phases { stream.synchronize()?; phase("H2D cols (pinned)", &mut last); }
++
++    let inv_tw = be.inv_twiddles_for(log_n)?;
++    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
++    let weights_dev = stream.clone_htod(weights)?;
++    if debug_phases { stream.synchronize()?; phase("twiddles + weights", &mut last); }
++
++    let n_u64 = n as u64;
++    let lde_u64 = lde_size as u64;
++    let col_stride_u64 = lde_size as u64;
++    let m_u32 = m as u32;
++
++    // === 1. Bit-reverse first N of every column ===
++    {
++        let grid_x = (n as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.bit_reverse_permute_batched)
++                .arg(&mut buf)
++                .arg(&n_u64)
++                .arg(&log_n)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++
++    if debug_phases { stream.synchronize()?; phase("bit_reverse N", &mut last); }
++    // === 2. iNTT body over all columns ===
++    run_batched_ntt_body(
++        stream.as_ref(),
++        &mut buf,
++        inv_tw.as_ref(),
++        n_u64,
++        log_n,
++        col_stride_u64,
++        m_u32,
++    )?;
++    if debug_phases { stream.synchronize()?; phase("iNTT body", &mut last); }
++
++    // === 3. Pointwise multiply by coset weights (includes 1/N) ===
++    {
++        let grid_x = (n as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.pointwise_mul_batched)
++                .arg(&mut buf)
++                .arg(&weights_dev)
++                .arg(&n_u64)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++
++    // === 4. Bit-reverse full LDE of every column ===
++    {
++        let grid_x = (lde_size as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.bit_reverse_permute_batched)
++                .arg(&mut buf)
++                .arg(&lde_u64)
++                .arg(&log_lde)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++
++    if debug_phases { stream.synchronize()?; phase("pointwise + bit_reverse LDE", &mut last); }
++    // === 5. Forward NTT on full LDE of every column ===
++    run_batched_ntt_body(
++        stream.as_ref(),
++        &mut buf,
++        fwd_tw.as_ref(),
++        lde_u64,
++        log_lde,
++        col_stride_u64,
++        m_u32,
++    )?;
++    if debug_phases { stream.synchronize()?; phase("forward NTT body", &mut last); }
++
++    // Single big D2H into the reusable pinned staging buffer — pinned, one
++    // call to the driver, saturates PCIe.
++    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
++    stream.synchronize()?;
++    if debug_phases { phase("D2H (one shot into pinned)", &mut last); }
++
++    // Split pinned → per-column Vec<u64>s. The first write to each virgin
++    // Vec page-faults, which can dominate total time (~75 ms for 128 MB).
++    // Parallelise so the fault cost spreads across CPU cores.
++    use rayon::prelude::*;
++    let pinned_ptr = pinned.as_ptr() as usize; // Send a usize to dodge aliasing rules.
++    let out: Vec<Vec<u64>> = (0..m)
++        .into_par_iter()
++        .map(|c| {
++            let mut v = Vec::<u64>::with_capacity(lde_size);
++            // SAFETY: we overwrite the entire range immediately below.
++            unsafe { v.set_len(lde_size) };
++            // SAFETY: pinned buffer is held locked by the caller (staging
++            // guard); the slice doesn't escape and can't alias another
++            // column's write since `v` is thread-local.
++            let src = unsafe {
++                std::slice::from_raw_parts(
++                    (pinned_ptr as *const u64).add(c * lde_size),
++                    lde_size,
++                )
++            };
++            v.copy_from_slice(src);
++            v
++        })
++        .collect();
++    if debug_phases { phase("copy out (rayon pinned → Vecs)", &mut last); }
++    drop(staging);
++    Ok(out)
++}
++
++/// Like `coset_lde_batch_base` but writes directly into caller-provided
++/// output slices instead of allocating fresh `Vec<u64>`s. Each output slice
++/// must already have length `n * blowup_factor`. Saves ~50–100 ms of pageable
++/// allocator work + page faults at prover scale because the caller's Vecs
++/// have been sized once and are reused across calls.
++pub fn coset_lde_batch_base_into(
++    columns: &[&[u64]],
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++) -> Result<()> {
++    if columns.is_empty() {
++        return Ok(());
++    }
++    let m = columns.len();
++    assert_eq!(outputs.len(), m, "outputs must match columns count");
++    let n = columns[0].len();
++    assert!(n.is_power_of_two(), "column length must be a power of two");
++    assert_eq!(weights.len(), n, "weights length must match column length");
++    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
++    for c in columns.iter() {
++        assert_eq!(c.len(), n, "all columns must be the same size");
++    }
++    let lde_size = n * blowup_factor;
++    for o in outputs.iter() {
++        assert_eq!(o.len(), lde_size, "each output must be lde_size");
++    }
++    if n == 0 {
++        return Ok(());
++    }
++    let log_n = n.trailing_zeros() as u64;
++    let log_lde = lde_size.trailing_zeros() as u64;
++
++    let be = backend();
++    let stream = be.next_stream();
++    let staging_slot = be.pinned_staging();
++
++    let mut staging = staging_slot.lock().unwrap();
++    staging.ensure_capacity(m * lde_size, &be.ctx)?;
++    let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
++
++    for (c, col) in columns.iter().enumerate() {
++        pinned[c * n..c * n + n].copy_from_slice(col);
++    }
++
++    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
++    for c in 0..m {
++        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
++        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
++    }
++
++    let inv_tw = be.inv_twiddles_for(log_n)?;
++    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
++    let weights_dev = stream.clone_htod(weights)?;
++
++    let n_u64 = n as u64;
++    let lde_u64 = lde_size as u64;
++    let col_stride_u64 = lde_size as u64;
++    let m_u32 = m as u32;
++
++    // iNTT bit-reverse + body, pointwise mul, forward bit-reverse + body.
++    {
++        let grid_x = (n as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.bit_reverse_permute_batched)
++                .arg(&mut buf)
++                .arg(&n_u64)
++                .arg(&log_n)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++    run_batched_ntt_body(
++        stream.as_ref(),
++        &mut buf,
++        inv_tw.as_ref(),
++        n_u64,
++        log_n,
++        col_stride_u64,
++        m_u32,
++    )?;
++    {
++        let grid_x = (n as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.pointwise_mul_batched)
++                .arg(&mut buf)
++                .arg(&weights_dev)
++                .arg(&n_u64)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++    {
++        let grid_x = (lde_size as u32).div_ceil(256);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m_u32, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.bit_reverse_permute_batched)
++                .arg(&mut buf)
++                .arg(&lde_u64)
++                .arg(&log_lde)
++                .arg(&col_stride_u64)
++                .launch(cfg)?;
++        }
++    }
++    run_batched_ntt_body(
++        stream.as_ref(),
++        &mut buf,
++        fwd_tw.as_ref(),
++        lde_u64,
++        log_lde,
++        col_stride_u64,
++        m_u32,
++    )?;
++
++    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
++    stream.synchronize()?;
++
++    // Parallel copy pinned → caller outputs. Caller's Vecs should already be
++    // faulted/resized so no page-fault cost here.
++    use rayon::prelude::*;
++    let pinned_ptr = pinned.as_ptr() as usize;
++    outputs
++        .par_iter_mut()
++        .enumerate()
++        .for_each(|(c, dst)| {
++            let src = unsafe {
++                std::slice::from_raw_parts(
++                    (pinned_ptr as *const u64).add(c * lde_size),
++                    lde_size,
++                )
++            };
++            dst.copy_from_slice(src);
++        });
++    drop(staging);
++    Ok(())
++}
++
++/// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched
++/// columns in one device buffer. Same fusion strategy as `run_ntt_body`:
++/// first 8 levels shmem-fused (coalesced), subsequent levels one kernel each.
++fn run_batched_ntt_body(
++    stream: &cudarc::driver::CudaStream,
++    x_dev: &mut cudarc::driver::CudaSlice<u64>,
++    tw_dev: &cudarc::driver::CudaSlice<u64>,
++    n: u64,
++    log_n: u64,
++    col_stride: u64,
++    m: u32,
++) -> Result<()> {
++    let be = backend();
++    let fused = core::cmp::min(log_n, 8);
++    if fused >= 8 {
++        let grid_x = (n / 256) as u32;
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        let base_step = 0u64;
++        unsafe {
++            stream
++                .launch_builder(&be.ntt_dit_8_levels_batched)
++                .arg(&mut *x_dev)
++                .arg(tw_dev)
++                .arg(&n)
++                .arg(&log_n)
++                .arg(&base_step)
++                .arg(&col_stride)
++                .launch(cfg)?;
++        }
++    } else {
++        let grid_x = ((n / 2) as u32).div_ceil(256).max(1);
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, m, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        for level in 0..fused {
++            unsafe {
++                stream
++                    .launch_builder(&be.ntt_dit_level_batched)
++                    .arg(&mut *x_dev)
++                    .arg(tw_dev)
++                    .arg(&n)
++                    .arg(&log_n)
++                    .arg(&level)
++                    .arg(&col_stride)
++                    .launch(cfg)?;
++            }
++        }
++    }
++
++    let grid_x = ((n / 2) as u32).div_ceil(256).max(1);
++    let cfg = LaunchConfig {
++        grid_dim: (grid_x, m, 1),
++        block_dim: (256, 1, 1),
++        shared_mem_bytes: 0,
++    };
++    for level in fused..log_n {
++        unsafe {
++            stream
++                .launch_builder(&be.ntt_dit_level_batched)
++                .arg(&mut *x_dev)
++                .arg(tw_dev)
++                .arg(&n)
++                .arg(&log_n)
++                .arg(&level)
++                .arg(&col_stride)
++                .launch(cfg)?;
++        }
++    }
++    Ok(())
++}
++
+diff --git a/crypto/math-cuda/src/lib.rs b/crypto/math-cuda/src/lib.rs
+new file mode 100644
+index 00000000..1adfd8d7
+--- /dev/null
++++ b/crypto/math-cuda/src/lib.rs
+@@ -0,0 +1,93 @@
++//! GPU backend for the lambda-vm STARK prover.
++//!
++//! Primary entry point: [`lde::coset_lde_base`]. Everything else (`ntt`,
++//! element-wise arith) is either internal to the LDE pipeline or used by the
++//! parity test suite.
++
++pub mod device;
++pub mod lde;
++pub mod ntt;
++
++use cudarc::driver::{LaunchConfig, PushKernelArg};
++
++use crate::device::{Backend, backend};
++
++pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
++
++/// Toolchain sanity: plain wrapping u64 vector add. Not a field op.
++pub fn vector_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    launch_binary_u64(a, b, |be| &be.vector_add_u64)
++}
++
++/// Goldilocks field add on device, element-wise. Inputs may be non-canonical.
++pub fn gl_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    launch_binary_u64(a, b, |be| &be.gl_add)
++}
++
++pub fn gl_sub_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    launch_binary_u64(a, b, |be| &be.gl_sub)
++}
++
++pub fn gl_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    launch_binary_u64(a, b, |be| &be.gl_mul)
++}
++
++pub fn gl_neg_u64(a: &[u64]) -> Result<Vec<u64>> {
++    let n = a.len();
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let be = backend();
++    let stream = be.next_stream();
++
++    let a_dev = stream.clone_htod(a)?;
++    let mut c_dev = stream.alloc_zeros::<u64>(n)?;
++
++    let cfg = LaunchConfig::for_num_elems(n as u32);
++    let n_u64 = n as u64;
++    unsafe {
++        stream
++            .launch_builder(&be.gl_neg)
++            .arg(&a_dev)
++            .arg(&mut c_dev)
++            .arg(&n_u64)
++            .launch(cfg)?;
++    }
++
++    let out = stream.clone_dtoh(&c_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
++fn launch_binary_u64<F>(a: &[u64], b: &[u64], pick: F) -> Result<Vec<u64>>
++where
++    F: for<'a> Fn(&'a Backend) -> &'a cudarc::driver::CudaFunction,
++{
++    assert_eq!(a.len(), b.len(), "length mismatch");
++    let n = a.len();
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let be = backend();
++    let stream = be.next_stream();
++
++    let a_dev = stream.clone_htod(a)?;
++    let b_dev = stream.clone_htod(b)?;
++    let mut c_dev = stream.alloc_zeros::<u64>(n)?;
++
++    let cfg = LaunchConfig::for_num_elems(n as u32);
++    let n_u64 = n as u64;
++    unsafe {
++        stream
++            .launch_builder(pick(be))
++            .arg(&a_dev)
++            .arg(&b_dev)
++            .arg(&mut c_dev)
++            .arg(&n_u64)
++            .launch(cfg)?;
++    }
++
++    let out = stream.clone_dtoh(&c_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
+diff --git a/crypto/math-cuda/src/ntt.rs b/crypto/math-cuda/src/ntt.rs
+new file mode 100644
+index 00000000..0ebb015e
+--- /dev/null
++++ b/crypto/math-cuda/src/ntt.rs
+@@ -0,0 +1,211 @@
++//! Forward and inverse NTT over Goldilocks base field. Matches the algebraic
++//! contract of `math::polynomial::Polynomial::evaluate_fft` /
++//! `interpolate_fft`:
++//!   input  = n elements in natural order
++//!   output = n elements in natural order.
++//!
++//! Parity is checked by `tests/ntt.rs` against the CPU implementation.
++
++use cudarc::driver::{LaunchConfig, PushKernelArg};
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsFFTField, IsField};
++
++use crate::Result;
++use crate::device::backend;
++
++/// Host-side twiddle table: `[ω^0, ω^1, …, ω^{n/2-1}]` where ω is the
++/// primitive n-th root of unity. Exposed for `device::Backend::cached_twiddles`
++/// and for direct use in tests / benches.
++pub fn twiddles_forward(log_n: u64) -> Vec<u64> {
++    let omega = *GoldilocksField::get_primitive_root_of_unity(log_n)
++        .expect("primitive root")
++        .value();
++    powers_of(omega, 1usize << (log_n - 1))
++}
++
++/// Inverse twiddle table: `[ω^{-i}]` for i in [0, n/2).
++pub fn twiddles_inverse(log_n: u64) -> Vec<u64> {
++    let omega = GoldilocksField::get_primitive_root_of_unity(log_n).expect("primitive root");
++    let omega_inv = FieldElement::<GoldilocksField>::inv(&omega).expect("inverse");
++    powers_of(*omega_inv.value(), 1usize << (log_n - 1))
++}
++
++fn powers_of(base: u64, count: usize) -> Vec<u64> {
++    let mut out = Vec::with_capacity(count);
++    let mut w = 1u64;
++    for _ in 0..count {
++        out.push(w);
++        w = GoldilocksField::mul(&w, &base);
++    }
++    out
++}
++
++/// Forward NTT on a slice of `n = 2^log_n` Goldilocks coefficients. Takes
++/// natural-order input and returns natural-order evaluations.
++pub fn forward(coeffs: &[u64]) -> Result<Vec<u64>> {
++    ntt_inplace(coeffs, /*forward=*/ true)
++}
++
++/// Inverse NTT on a slice of `n = 2^log_n` Goldilocks evaluations. Takes
++/// natural-order evaluations and returns natural-order coefficients. Includes
++/// the 1/n scaling.
++pub fn inverse(evals: &[u64]) -> Result<Vec<u64>> {
++    ntt_inplace(evals, /*forward=*/ false)
++}
++
++fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
++    let n = input.len();
++    assert!(n.is_power_of_two(), "ntt length must be a power of two");
++    if n <= 1 {
++        return Ok(input.to_vec());
++    }
++    let log_n = n.trailing_zeros() as u64;
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    let mut x_dev = stream.clone_htod(input)?;
++    let tw_dev = if forward {
++        be.fwd_twiddles_for(log_n)?
++    } else {
++        be.inv_twiddles_for(log_n)?
++    };
++
++    let n_u64 = n as u64;
++
++    // 1. Bit-reverse: natural → bit-reversed.
++    unsafe {
++        stream
++            .launch_builder(&be.bit_reverse_permute)
++            .arg(&mut x_dev)
++            .arg(&n_u64)
++            .arg(&log_n)
++            .launch(LaunchConfig::for_num_elems(n as u32))?;
++    }
++
++    // 2. DIT butterfly levels. For log_n >= 8 we fuse 8 levels per kernel via
++    // the shmem kernel; for very small sizes (< 256 elements) we stick with
++    // the per-level kernel because the shmem block dimensions assume n ≥ 256.
++    run_ntt_body(
++        stream.as_ref(),
++        &mut x_dev,
++        tw_dev.as_ref(),
++        n_u64,
++        log_n,
++    )?;
++
++    // 3. For iNTT, multiply by 1/n.
++    if !forward {
++        let n_fe = FieldElement::<GoldilocksField>::from(n as u64);
++        let inv_n = *n_fe.inv().expect("n is non-zero").value();
++        unsafe {
++            stream
++                .launch_builder(&be.scalar_mul)
++                .arg(&mut x_dev)
++                .arg(&inv_n)
++                .arg(&n_u64)
++                .launch(LaunchConfig::for_num_elems(n as u32))?;
++        }
++    }
++
++    let out = stream.clone_dtoh(&x_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
++/// Run the butterfly body of a bit-reversed-input DIT NTT. Split out so the
++/// LDE orchestrator can reuse it on the same device buffer.
++pub(crate) fn run_ntt_body(
++    stream: &cudarc::driver::CudaStream,
++    x_dev: &mut cudarc::driver::CudaSlice<u64>,
++    tw_dev: &cudarc::driver::CudaSlice<u64>,
++    n: u64,
++    log_n: u64,
++) -> Result<()> {
++    let be = backend();
++    // Levels 0..min(log_n, 8): one shmem-fused launch. Loads are fully
++    // coalesced (base_step=0 → `row = tid`) and 8 butterfly rounds stay on
++    // chip. This is the big DRAM-bandwidth win.
++    let fused = core::cmp::min(log_n, 8);
++    if fused >= 8 {
++        let grid_x = (n / 256) as u32;
++        let cfg = LaunchConfig {
++            grid_dim: (grid_x, 1, 1),
++            block_dim: (256, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        let base_step = 0u64;
++        unsafe {
++            stream
++                .launch_builder(&be.ntt_dit_8_levels)
++                .arg(&mut *x_dev)
++                .arg(tw_dev)
++                .arg(&n)
++                .arg(&log_n)
++                .arg(&base_step)
++                .launch(cfg)?;
++        }
++    } else {
++        // Sub-256-element NTT. Use per-level.
++        let half_cfg = LaunchConfig::for_num_elems((n / 2) as u32);
++        for level in 0..fused {
++            unsafe {
++                stream
++                    .launch_builder(&be.ntt_dit_level)
++                    .arg(&mut *x_dev)
++                    .arg(tw_dev)
++                    .arg(&n)
++                    .arg(&log_n)
++                    .arg(&level)
++                    .launch(half_cfg)?;
++            }
++        }
++    }
++
++    // Levels 8..log_n: per-level kernels. Loads are fully coalesced in the
++    // per-level path; switching to fused-with-row-remap at base_step>0 tanks
++    // DRAM throughput enough to wipe out the launch savings.
++    let half_cfg = LaunchConfig::for_num_elems((n / 2) as u32);
++    for level in fused..log_n {
++        unsafe {
++            stream
++                .launch_builder(&be.ntt_dit_level)
++                .arg(&mut *x_dev)
++                .arg(tw_dev)
++                .arg(&n)
++                .arg(&log_n)
++                .arg(&level)
++                .launch(half_cfg)?;
++        }
++    }
++    Ok(())
++}
++
++/// Pointwise multiply: `x[i] *= w[i]`.
++pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
++    assert_eq!(x.len(), w.len());
++    let n = x.len();
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let be = backend();
++    let stream = be.next_stream();
++
++    let mut x_dev = stream.clone_htod(x)?;
++    let w_dev = stream.clone_htod(w)?;
++
++    let n_u64 = n as u64;
++    unsafe {
++        stream
++            .launch_builder(&be.pointwise_mul)
++            .arg(&mut x_dev)
++            .arg(&w_dev)
++            .arg(&n_u64)
++            .launch(LaunchConfig::for_num_elems(n as u32))?;
++    }
++
++    let out = stream.clone_dtoh(&x_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
+diff --git a/crypto/math-cuda/tests/bench_quick.rs b/crypto/math-cuda/tests/bench_quick.rs
+new file mode 100644
+index 00000000..104285da
+--- /dev/null
++++ b/crypto/math-cuda/tests/bench_quick.rs
+@@ -0,0 +1,349 @@
++//! Informal timing comparison for single-column and multi-column LDE.
++//! Ignored by default; run with `cargo test ... -- --ignored --nocapture`.
++
++use std::time::Instant;
++
++use math::fft::cpu::bowers_fft::LayerTwiddles;
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsField;
++use math::polynomial::Polynomial;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++use rayon::prelude::*;
++
++type Fp = FieldElement<GoldilocksField>;
++
++fn coset_weights(n: usize, g: u64) -> Vec<u64> {
++    let inv_n = *FieldElement::<GoldilocksField>::from(n as u64).inv().unwrap().value();
++    let mut w = Vec::with_capacity(n);
++    let mut cur = inv_n;
++    for _ in 0..n {
++        w.push(cur);
++        cur = GoldilocksField::mul(&cur, &g);
++    }
++    w
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_2_to_18_blowup_4() {
++    let log_n = 18;
++    let blowup = 4;
++    let n = 1usize << log_n;
++    let lde = n * blowup;
++    let mut rng = ChaCha8Rng::seed_from_u64(1);
++    let input: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
++    let weights = coset_weights(n, 7);
++
++    let _ = math_cuda::lde::coset_lde_base(&input, blowup, &weights).unwrap();
++
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
++    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(lde.trailing_zeros() as u64).unwrap();
++    let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
++
++    const TRIALS: u32 = 10;
++
++    let t0 = Instant::now();
++    for _ in 0..TRIALS {
++        let _ = math_cuda::lde::coset_lde_base(&input, blowup, &weights).unwrap();
++    }
++    let gpu_ns = t0.elapsed().as_nanos() / TRIALS as u128;
++
++    let t0 = Instant::now();
++    for _ in 0..TRIALS {
++        let mut buf: Vec<Fp> = input.iter().map(|&x| Fp::from_raw(x)).collect();
++        Polynomial::coset_lde_full_expand::<GoldilocksField>(
++            &mut buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
++        )
++        .unwrap();
++        std::hint::black_box(&buf);
++    }
++    let cpu_ns = t0.elapsed().as_nanos() / TRIALS as u128;
++
++    let ratio = cpu_ns as f64 / gpu_ns as f64;
++    println!(
++        "single-column LDE 2^{log_n} blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x",
++    );
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_2_to_16_blowup_4() {
++    let log_n = 16;
++    let blowup = 4;
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(2);
++    let input: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
++    let weights = coset_weights(n, 7);
++
++    let _ = math_cuda::lde::coset_lde_base(&input, blowup, &weights).unwrap();
++
++    const TRIALS: u32 = 20;
++
++    let t0 = Instant::now();
++    for _ in 0..TRIALS {
++        let _ = math_cuda::lde::coset_lde_base(&input, blowup, &weights).unwrap();
++    }
++    let gpu_ns = t0.elapsed().as_nanos() / TRIALS as u128;
++    println!("single-column LDE 2^{log_n} blowup={blowup}: gpu={gpu_ns}ns");
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_multi_column_parallel() {
++    // Simulates the prover's Phase A: many columns processed via rayon.
++    // log_n = 16 keeps memory footprint manageable while still stressing streams.
++    let log_n = 16u32;
++    let blowup = 4usize;
++    let n = 1usize << log_n;
++    let lde = n * blowup;
++    let num_cols = 64;
++
++    // Warm up.
++    let _ = math_cuda::lde::coset_lde_base(
++        &vec![0u64; n],
++        blowup,
++        &coset_weights(n, 7),
++    )
++    .unwrap();
++
++    // Build input data.
++    let mut rng = ChaCha8Rng::seed_from_u64(11);
++    let columns: Vec<Vec<u64>> = (0..num_cols)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++    let weights = coset_weights(n, 7);
++    let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
++    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(lde.trailing_zeros() as u64).unwrap();
++
++    // GPU: rayon parallel across columns, each column picks a stream.
++    let t0 = Instant::now();
++    let _gpu_results: Vec<Vec<u64>> = columns
++        .par_iter()
++        .map(|col| math_cuda::lde::coset_lde_base(col, blowup, &weights).unwrap())
++        .collect();
++    let gpu_ns = t0.elapsed().as_nanos();
++
++    // CPU: same rayon parallel pattern as the prover's `expand_columns_to_lde`.
++    let mut cpu_bufs: Vec<Vec<Fp>> = columns
++        .iter()
++        .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
++        .collect();
++    let t0 = Instant::now();
++    cpu_bufs.par_iter_mut().for_each(|buf| {
++        Polynomial::coset_lde_full_expand::<GoldilocksField>(
++            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
++        )
++        .unwrap();
++    });
++    let cpu_ns = t0.elapsed().as_nanos();
++
++    let ratio = cpu_ns as f64 / gpu_ns as f64;
++    println!(
++        "{num_cols}-column LDE 2^{log_n} blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x  (cores={})",
++        rayon::current_num_threads(),
++    );
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_batched_prover_scale() {
++    // Realistic large-table shape from the 1M-fib prover: ~1M rows, blowup 4,
++    // a few dozen columns. This is what actually runs in expand_columns_to_lde.
++    let log_n = 20u32; // 1M rows
++    let blowup = 4usize;
++    let n = 1usize << log_n;
++    let num_cols = 20;
++
++    let mut rng = ChaCha8Rng::seed_from_u64(31);
++    let columns: Vec<Vec<u64>> = (0..num_cols)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++    let weights = coset_weights(n, 7);
++    let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
++    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(
++        (n * blowup).trailing_zeros() as u64,
++    )
++    .unwrap();
++
++    let warm_slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
++    for _ in 0..8 {
++        let _ =
++            math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
++    }
++
++    let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
++    let mut gpu_ns = u128::MAX;
++    for _ in 0..5 {
++        let t0 = Instant::now();
++        let _ = math_cuda::lde::coset_lde_batch_base(&slices, blowup, &weights).unwrap();
++        gpu_ns = gpu_ns.min(t0.elapsed().as_nanos());
++    }
++
++    let mut cpu_bufs: Vec<Vec<Fp>> = columns
++        .iter()
++        .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
++        .collect();
++    let t0 = Instant::now();
++    cpu_bufs.par_iter_mut().for_each(|buf| {
++        Polynomial::coset_lde_full_expand::<GoldilocksField>(
++            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
++        )
++        .unwrap();
++    });
++    let cpu_ns = t0.elapsed().as_nanos();
++
++    let ratio = cpu_ns as f64 / gpu_ns as f64;
++    println!(
++        "prover-scale batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x",
++    );
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_batched_vs_rayon_cpu() {
++    let log_n = 16u32;
++    let blowup = 4usize;
++    let n = 1usize << log_n;
++    let num_cols = 64;
++
++    let mut rng = ChaCha8Rng::seed_from_u64(21);
++    let columns: Vec<Vec<u64>> = (0..num_cols)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++    let weights = coset_weights(n, 7);
++
++    // Warm up every stream slot so subsequent iterations don't pay the
++    // one-time pinned staging alloc cost.
++    let warm_slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
++    for _ in 0..64 {
++        let _ =
++            math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
++    }
++    let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
++    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(
++        (n * blowup).trailing_zeros() as u64,
++    )
++    .unwrap();
++
++    // GPU batched — first run may include lazy device init; do a few to stabilise.
++    let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
++    let mut gpu_ns = u128::MAX;
++    for _ in 0..5 {
++        let t0 = Instant::now();
++        let _ = math_cuda::lde::coset_lde_batch_base(&slices, blowup, &weights).unwrap();
++        gpu_ns = gpu_ns.min(t0.elapsed().as_nanos());
++    }
++
++    // CPU rayon (same pattern as prover).
++    let mut cpu_bufs: Vec<Vec<Fp>> = columns
++        .iter()
++        .map(|c| c.iter().map(|&x| Fp::from_raw(x)).collect())
++        .collect();
++    let t0 = Instant::now();
++    cpu_bufs.par_iter_mut().for_each(|buf| {
++        Polynomial::coset_lde_full_expand::<GoldilocksField>(
++            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
++        )
++        .unwrap();
++    });
++    let cpu_ns = t0.elapsed().as_nanos();
++
++    let ratio = cpu_ns as f64 / gpu_ns as f64;
++    println!(
++        "batched {num_cols} cols, log_n={log_n}, blowup={blowup}: cpu={cpu_ns}ns gpu={gpu_ns}ns ratio={ratio:.2}x  (cores={})",
++        rayon::current_num_threads(),
++    );
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_multi_column_serialized_gpu() {
++    use std::sync::Mutex;
++
++    let log_n = 16u32;
++    let blowup = 4usize;
++    let n = 1usize << log_n;
++    let num_cols = 64;
++
++    let _ = math_cuda::lde::coset_lde_base(
++        &vec![0u64; n],
++        blowup,
++        &coset_weights(n, 7),
++    )
++    .unwrap();
++
++    let mut rng = ChaCha8Rng::seed_from_u64(13);
++    let columns: Vec<Vec<u64>> = (0..num_cols)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++    let weights = coset_weights(n, 7);
++
++    // Single global Mutex so only one thread at a time calls GPU.
++    let gpu_lock = Mutex::new(());
++    let t0 = Instant::now();
++    let _: Vec<Vec<u64>> = columns
++        .par_iter()
++        .map(|col| {
++            let _guard = gpu_lock.lock().unwrap();
++            math_cuda::lde::coset_lde_base(col, blowup, &weights).unwrap()
++        })
++        .collect();
++    let gpu_ns = t0.elapsed().as_nanos();
++    println!("GPU mutex-serialised from rayon: {gpu_ns}ns for {num_cols} cols");
++}
++
++#[test]
++#[ignore = "informal perf probe; run with --ignored"]
++fn bench_lde_multi_column_gpu_limited_threads() {
++    // Same as multi_column_parallel but forces rayon to use only 8 threads
++    // (matching the GPU stream pool rough capacity). Tests whether oversubscribed
++    // rayon + many streams is the bottleneck.
++    let gpu_pool = rayon::ThreadPoolBuilder::new()
++        .num_threads(8)
++        .build()
++        .unwrap();
++
++    let log_n = 16u32;
++    let blowup = 4usize;
++    let n = 1usize << log_n;
++    let num_cols = 64;
++
++    let _ = math_cuda::lde::coset_lde_base(
++        &vec![0u64; n],
++        blowup,
++        &coset_weights(n, 7),
++    )
++    .unwrap();
++
++    let mut rng = ChaCha8Rng::seed_from_u64(12);
++    let columns: Vec<Vec<u64>> = (0..num_cols)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++    let weights = coset_weights(n, 7);
++
++    let t0 = Instant::now();
++    let _gpu_results: Vec<Vec<u64>> = gpu_pool.install(|| {
++        columns
++            .par_iter()
++            .map(|col| math_cuda::lde::coset_lde_base(col, blowup, &weights).unwrap())
++            .collect()
++    });
++    let gpu_ns = t0.elapsed().as_nanos();
++
++    let t0 = Instant::now();
++    let _serial_gpu_results: Vec<Vec<u64>> = columns
++        .iter()
++        .map(|col| math_cuda::lde::coset_lde_base(col, blowup, &weights).unwrap())
++        .collect();
++    let gpu_serial_ns = t0.elapsed().as_nanos();
++
++    println!(
++        "GPU-only 8-thread: gpu-parallel={gpu_ns}ns gpu-serial={gpu_serial_ns}ns speedup={:.2}x",
++        gpu_serial_ns as f64 / gpu_ns as f64,
++    );
++}
+diff --git a/crypto/math-cuda/tests/goldilocks.rs b/crypto/math-cuda/tests/goldilocks.rs
+new file mode 100644
+index 00000000..317ffb0f
+--- /dev/null
++++ b/crypto/math-cuda/tests/goldilocks.rs
+@@ -0,0 +1,127 @@
++//! GPU must produce bit-identical u64 outputs to `GoldilocksField` for every op.
++//! Non-canonical inputs are expected (CPU operates on the full [0, 2^64) range),
++//! so the test inputs include values above the prime.
++
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField};
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++const N: usize = 10_000;
++
++fn sample_inputs(seed: u64) -> Vec<u64> {
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    (0..N).map(|_| rng.r#gen::<u64>()).collect()
++}
++
++fn assert_raw_eq(op: &str, expected: &[u64], actual: &[u64]) {
++    assert_eq!(expected.len(), actual.len());
++    for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
++        if e != a {
++            panic!(
++                "{op} mismatch at {i}: cpu={e:#018x} (canon {:#018x}), gpu={a:#018x} (canon {:#018x})",
++                GoldilocksField::canonical(e),
++                GoldilocksField::canonical(a),
++            );
++        }
++    }
++}
++
++#[test]
++fn gpu_vector_add_u64_matches_wrapping() {
++    let a = sample_inputs(0xC0FFEE);
++    let b = sample_inputs(0xDEADBEEF);
++    let expected: Vec<u64> = a.iter().zip(&b).map(|(x, y)| x.wrapping_add(*y)).collect();
++    let actual = math_cuda::vector_add_u64(&a, &b).expect("GPU vector_add_u64");
++    assert_raw_eq("vector_add (wrapping)", &expected, &actual);
++}
++
++#[test]
++fn gpu_gl_add_matches_cpu() {
++    let a = sample_inputs(1);
++    let b = sample_inputs(2);
++    let expected: Vec<u64> = a
++        .iter()
++        .zip(&b)
++        .map(|(x, y)| GoldilocksField::add(x, y))
++        .collect();
++    let actual = math_cuda::gl_add_u64(&a, &b).expect("GPU gl_add");
++    assert_raw_eq("gl_add", &expected, &actual);
++}
++
++#[test]
++fn gpu_gl_sub_matches_cpu() {
++    let a = sample_inputs(3);
++    let b = sample_inputs(4);
++    let expected: Vec<u64> = a
++        .iter()
++        .zip(&b)
++        .map(|(x, y)| GoldilocksField::sub(x, y))
++        .collect();
++    let actual = math_cuda::gl_sub_u64(&a, &b).expect("GPU gl_sub");
++    assert_raw_eq("gl_sub", &expected, &actual);
++}
++
++#[test]
++fn gpu_gl_mul_matches_cpu() {
++    let a = sample_inputs(5);
++    let b = sample_inputs(6);
++    let expected: Vec<u64> = a
++        .iter()
++        .zip(&b)
++        .map(|(x, y)| GoldilocksField::mul(x, y))
++        .collect();
++    let actual = math_cuda::gl_mul_u64(&a, &b).expect("GPU gl_mul");
++    assert_raw_eq("gl_mul", &expected, &actual);
++}
++
++#[test]
++fn gpu_gl_neg_matches_cpu() {
++    let a = sample_inputs(7);
++    let expected: Vec<u64> = a.iter().map(|x| GoldilocksField::neg(x)).collect();
++    let actual = math_cuda::gl_neg_u64(&a).expect("GPU gl_neg");
++    assert_raw_eq("gl_neg", &expected, &actual);
++}
++
++/// Edge cases the random generator is unlikely to hit: 0, 1, p-1, p, p+1, 2p-1,
++/// u64::MAX, EPSILON boundary values. Covers double-overflow / double-underflow.
++#[test]
++fn gpu_goldilocks_edge_cases() {
++    const P: u64 = 0xFFFF_FFFF_0000_0001;
++    const EPS: u64 = 0xFFFF_FFFF;
++    let edge: [u64; 11] = [
++        0,
++        1,
++        P - 1,
++        P,
++        P + 1,
++        2u64.wrapping_mul(P).wrapping_sub(1),
++        u64::MAX,
++        u64::MAX - EPS,
++        u64::MAX - 1,
++        EPS,
++        EPS - 1,
++    ];
++    // All pairs via nested loops, materialised as flat a[], b[] of length edge^2.
++    let mut a = Vec::with_capacity(edge.len() * edge.len());
++    let mut b = Vec::with_capacity(edge.len() * edge.len());
++    for &x in &edge {
++        for &y in &edge {
++            a.push(x);
++            b.push(y);
++        }
++    }
++
++    let cases: &[(&str, fn(&[u64], &[u64]) -> math_cuda::Result<Vec<u64>>, fn(&u64, &u64) -> u64)] =
++        &[
++            ("gl_add", math_cuda::gl_add_u64, GoldilocksField::add),
++            ("gl_sub", math_cuda::gl_sub_u64, GoldilocksField::sub),
++            ("gl_mul", math_cuda::gl_mul_u64, GoldilocksField::mul),
++        ];
++
++    for (op, gpu_fn, cpu_fn) in cases {
++        let expected: Vec<u64> = a.iter().zip(&b).map(|(x, y)| cpu_fn(x, y)).collect();
++        let actual = gpu_fn(&a, &b).expect("GPU op");
++        assert_raw_eq(op, &expected, &actual);
++    }
++}
+diff --git a/crypto/math-cuda/tests/lde.rs b/crypto/math-cuda/tests/lde.rs
+new file mode 100644
+index 00000000..9648f833
+--- /dev/null
++++ b/crypto/math-cuda/tests/lde.rs
+@@ -0,0 +1,112 @@
++//! Phase-5 parity: GPU `coset_lde_base` must match the CPU
++//! `Polynomial::coset_lde_full_expand` for a sweep of realistic sizes and
++//! blowup factors.
++
++use math::fft::cpu::bowers_fft::LayerTwiddles;
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField};
++use math::polynomial::Polynomial;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++
++/// Build the coset weights `[1/N, g/N, g²/N, …, g^{n-1}/N]` — this is the
++/// layout `crypto/stark/src/prover.rs:248` uses, with `1/N` pre-folded into the
++/// first coefficient so the iFFT step does not need a separate scaling pass.
++fn coset_weights(n: usize, coset_offset: u64) -> Vec<u64> {
++    let inv_n_fe = FieldElement::<GoldilocksField>::from(n as u64)
++        .inv()
++        .expect("n is non-zero");
++    let mut w = Vec::with_capacity(n);
++    let mut cur = *inv_n_fe.value();
++    for _ in 0..n {
++        w.push(cur);
++        cur = GoldilocksField::mul(&cur, &coset_offset);
++    }
++    w
++}
++
++fn cpu_lde(evals: &[u64], blowup_factor: usize, coset_offset: u64) -> Vec<u64> {
++    let n = evals.len();
++    let log_n = n.trailing_zeros() as u64;
++    let log_lde = (n * blowup_factor).trailing_zeros() as u64;
++
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n).expect("inv tw");
++    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(log_lde).expect("fwd tw");
++    let weights_raw = coset_weights(n, coset_offset);
++    let weights: Vec<Fp> = weights_raw.iter().map(|&w| Fp::from_raw(w)).collect();
++
++    let mut buf: Vec<Fp> = evals.iter().map(|&x| Fp::from_raw(x)).collect();
++    Polynomial::coset_lde_full_expand::<GoldilocksField>(
++        &mut buf,
++        blowup_factor,
++        &weights,
++        &inv_tw,
++        &fwd_tw,
++    )
++    .expect("cpu lde");
++
++    buf.into_iter().map(|e| *e.value()).collect()
++}
++
++fn canon(xs: &[u64]) -> Vec<u64> {
++    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
++}
++
++fn assert_lde_match(log_n: u64, blowup_factor: usize, seed: u64) {
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    let evals: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
++
++    // Use a fixed, public coset offset. For lambda-vm the coset offset is the
++    // generator of Goldilocks' multiplicative subgroup; any non-trivial element
++    // works for an isolated correctness check.
++    let coset_offset: u64 = 7;
++    let weights = coset_weights(n, coset_offset);
++
++    let cpu = cpu_lde(&evals, blowup_factor, coset_offset);
++    let gpu = math_cuda::lde::coset_lde_base(&evals, blowup_factor, &weights).expect("gpu lde");
++
++    assert_eq!(cpu.len(), gpu.len(), "length mismatch (log_n={log_n}, blowup={blowup_factor})");
++    let cpu_c = canon(&cpu);
++    let gpu_c = canon(&gpu);
++    for (i, (e, a)) in cpu_c.iter().zip(&gpu_c).enumerate() {
++        if e != a {
++            panic!(
++                "lde mismatch log_n={log_n} blowup={blowup_factor} i={i}: cpu {e:#018x}, gpu {a:#018x}",
++            );
++        }
++    }
++}
++
++#[test]
++fn lde_small() {
++    for log_n in 4..=10 {
++        for &blow in &[2usize, 4, 8] {
++            assert_lde_match(log_n, blow, 1_000 + log_n + (blow as u64));
++        }
++    }
++}
++
++#[test]
++fn lde_medium() {
++    for log_n in 11..=14 {
++        for &blow in &[2usize, 4] {
++            assert_lde_match(log_n, blow, 2_000 + log_n + (blow as u64));
++        }
++    }
++}
++
++#[test]
++fn lde_large_2_to_18() {
++    // 2^18 × blowup 4 = 2^20 LDE — representative of Phase A trace columns.
++    assert_lde_match(18, 4, 0xCAFE);
++}
++
++#[test]
++fn lde_largest_2_to_20() {
++    // 2^20 LDE is the hot size; blowup 2 keeps total = 2^21 (within TWO_ADICITY).
++    assert_lde_match(20, 2, 0xF00D);
++}
+diff --git a/crypto/math-cuda/tests/lde_batch.rs b/crypto/math-cuda/tests/lde_batch.rs
+new file mode 100644
+index 00000000..67f97572
+--- /dev/null
++++ b/crypto/math-cuda/tests/lde_batch.rs
+@@ -0,0 +1,96 @@
++//! Batched coset LDE must agree with running the CPU single-column LDE on
++//! each column independently. Sweeps a few realistic (n, blowup, m) tuples.
++
++use math::fft::cpu::bowers_fft::LayerTwiddles;
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField};
++use math::polynomial::Polynomial;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++
++fn coset_weights(n: usize, g: u64) -> Vec<u64> {
++    let inv_n = *FieldElement::<GoldilocksField>::from(n as u64)
++        .inv()
++        .unwrap()
++        .value();
++    let mut w = Vec::with_capacity(n);
++    let mut cur = inv_n;
++    for _ in 0..n {
++        w.push(cur);
++        cur = GoldilocksField::mul(&cur, &g);
++    }
++    w
++}
++
++fn cpu_lde_one(col: &[u64], blowup: usize, weights_fp: &[Fp], inv_tw: &LayerTwiddles<GoldilocksField>, fwd_tw: &LayerTwiddles<GoldilocksField>) -> Vec<u64> {
++    let mut buf: Vec<Fp> = col.iter().map(|&x| Fp::from_raw(x)).collect();
++    Polynomial::coset_lde_full_expand::<GoldilocksField>(
++        &mut buf, blowup, weights_fp, inv_tw, fwd_tw,
++    )
++    .unwrap();
++    buf.into_iter().map(|e| *e.value()).collect()
++}
++
++fn canon(xs: &[u64]) -> Vec<u64> {
++    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
++}
++
++fn assert_batch(log_n: u64, blowup: usize, m: usize, seed: u64) {
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    let columns: Vec<Vec<u64>> = (0..m)
++        .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
++        .collect();
++
++    let coset_offset: u64 = 7;
++    let weights = coset_weights(n, coset_offset);
++    let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
++
++    let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n).unwrap();
++    let fwd_tw =
++        LayerTwiddles::<GoldilocksField>::new((n * blowup).trailing_zeros() as u64).unwrap();
++
++    let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
++    let gpu_all = math_cuda::lde::coset_lde_batch_base(&slices, blowup, &weights).unwrap();
++    assert_eq!(gpu_all.len(), m);
++
++    for (c, col) in columns.iter().enumerate() {
++        let cpu = cpu_lde_one(col, blowup, &weights_fp, &inv_tw, &fwd_tw);
++        assert_eq!(
++            canon(&gpu_all[c]),
++            canon(&cpu),
++            "batch mismatch at col {c}, log_n={log_n}, blowup={blowup}"
++        );
++    }
++}
++
++#[test]
++fn batch_small() {
++    for &m in &[1usize, 4, 16] {
++        for log_n in 4..=10 {
++            assert_batch(log_n, 4, m, 100 + log_n * 10 + m as u64);
++        }
++    }
++}
++
++#[test]
++fn batch_medium() {
++    for &m in &[2usize, 32] {
++        for log_n in 11..=14 {
++            assert_batch(log_n, 4, m, 200 + log_n * 10 + m as u64);
++        }
++    }
++}
++
++#[test]
++fn batch_large_one_column() {
++    assert_batch(18, 4, 1, 0xCAFE);
++}
++
++#[test]
++fn batch_large_32_columns() {
++    assert_batch(15, 4, 32, 0xBEEF);
++}
+diff --git a/crypto/math-cuda/tests/ntt.rs b/crypto/math-cuda/tests/ntt.rs
+new file mode 100644
+index 00000000..d7cf3680
+--- /dev/null
++++ b/crypto/math-cuda/tests/ntt.rs
+@@ -0,0 +1,136 @@
++//! Phase-3 parity: GPU forward NTT must agree with `Polynomial::evaluate_fft`
++//! as a field element, across a sweep of sizes from 2^4 to 2^20.
++//!
++//! Non-canonical u64s can differ between CPU and GPU while representing the
++//! same element; we canonicalise both sides before comparing.
++
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsPrimeField;
++use math::polynomial::Polynomial;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++
++fn cpu_fft(coeffs: &[u64]) -> Vec<u64> {
++    let elems: Vec<Fp> = coeffs.iter().map(|&x| Fp::from_raw(x)).collect();
++    let poly = Polynomial::new(&elems);
++    let evals = Polynomial::evaluate_fft::<GoldilocksField>(&poly, 1, None).expect("cpu fft");
++    evals.into_iter().map(|e| *e.value()).collect()
++}
++
++fn canonicalize(xs: &[u64]) -> Vec<u64> {
++    xs.iter()
++        .map(|x| GoldilocksField::canonical(x))
++        .collect()
++}
++
++fn assert_ntt_match(log_n: u64, seed: u64) {
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    let input: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
++
++    let cpu = cpu_fft(&input);
++    let gpu = math_cuda::ntt::forward(&input).expect("gpu ntt");
++
++    assert_eq!(cpu.len(), gpu.len(), "length mismatch at log_n = {log_n}");
++    let cpu_c = canonicalize(&cpu);
++    let gpu_c = canonicalize(&gpu);
++    for i in 0..n {
++        if cpu_c[i] != gpu_c[i] {
++            panic!(
++                "log_n={log_n} i={i}: cpu={:#018x} (canon {:#018x}), gpu={:#018x} (canon {:#018x})",
++                cpu[i], cpu_c[i], gpu[i], gpu_c[i],
++            );
++        }
++    }
++}
++
++#[test]
++fn ntt_sizes_small() {
++    for log_n in 4..=10 {
++        assert_ntt_match(log_n, 100 + log_n);
++    }
++}
++
++#[test]
++fn ntt_sizes_medium() {
++    for log_n in 11..=16 {
++        assert_ntt_match(log_n, 200 + log_n);
++    }
++}
++
++#[test]
++fn ntt_size_2_to_20() {
++    // The hot LDE size. One seed is enough; any mismatch screams loudly.
++    assert_ntt_match(20, 0xDEAD);
++}
++
++#[test]
++fn ntt_trivial_sizes() {
++    // Power-of-two below the interesting range — should still pass.
++    assert_ntt_match(1, 1);
++    assert_ntt_match(2, 2);
++    assert_ntt_match(3, 3);
++}
++
++fn assert_intt_match(log_n: u64, seed: u64) {
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    let evals: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
++
++    let elems: Vec<Fp> = evals.iter().map(|&x| Fp::from_raw(x)).collect();
++    let cpu_poly =
++        Polynomial::interpolate_fft::<GoldilocksField>(&elems).expect("cpu intt");
++    let cpu: Vec<u64> = cpu_poly.coefficients.into_iter().map(|e| *e.value()).collect();
++
++    let gpu = math_cuda::ntt::inverse(&evals).expect("gpu intt");
++
++    let cpu_c = canonicalize(&cpu);
++    let gpu_c = canonicalize(&gpu);
++    for i in 0..n {
++        if cpu_c[i] != gpu_c[i] {
++            panic!(
++                "iNTT log_n={log_n} i={i}: cpu canon {:#018x}, gpu canon {:#018x}",
++                cpu_c[i], gpu_c[i],
++            );
++        }
++    }
++}
++
++#[test]
++fn intt_sizes_small() {
++    for log_n in 4..=10 {
++        assert_intt_match(log_n, 700 + log_n);
++    }
++}
++
++#[test]
++fn intt_sizes_medium() {
++    for log_n in 11..=16 {
++        assert_intt_match(log_n, 800 + log_n);
++    }
++}
++
++#[test]
++fn intt_size_2_to_20() {
++    assert_intt_match(20, 0xBEEF);
++}
++
++#[test]
++fn ntt_round_trip() {
++    // inverse(forward(x)) == x up to canonical form.
++    let log_n = 14;
++    let n = 1usize << log_n;
++    let mut rng = ChaCha8Rng::seed_from_u64(42);
++    let x: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>() % 0xFFFF_FFFF_0000_0001).collect();
++
++    let evals = math_cuda::ntt::forward(&x).expect("forward");
++    let back = math_cuda::ntt::inverse(&evals).expect("inverse");
++
++    let x_c = canonicalize(&x);
++    let back_c = canonicalize(&back);
++    assert_eq!(x_c, back_c, "round trip failed");
++}
++
+diff --git a/crypto/stark/Cargo.toml b/crypto/stark/Cargo.toml
+index 53b20599..4d1f2cbc 100644
+--- a/crypto/stark/Cargo.toml
++++ b/crypto/stark/Cargo.toml
+@@ -22,6 +22,9 @@ itertools = "0.11.0"
+ # Parallelization crates
+ rayon = { version = "1.8.0", optional = true }
+ 
++# GPU backend for trace LDE — only linked when `cuda` is enabled.
++math-cuda = { path = "../math-cuda", optional = true }
++
+ # wasm
+ wasm-bindgen = { version = "0.2", optional = true }
+ serde-wasm-bindgen = { version = "0.5", optional = true }
+@@ -39,6 +42,7 @@ test_fiat_shamir = []
+ instruments = []                                                     # This enables timing prints in prover and verifier
+ debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
+ parallel = ["dep:rayon", "crypto/parallel"]
++cuda = ["dep:math-cuda"]
+ wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+ 
+ 
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+new file mode 100644
+index 00000000..63c2e949
+--- /dev/null
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -0,0 +1,136 @@
++//! GPU dispatch layer for the per-column coset LDE. Lives in the stark crate
++//! (not `math`) to avoid a dependency cycle between `math` and `math-cuda`.
++//!
++//! Handles only Goldilocks base-field columns above a size threshold; falls
++//! back to CPU for extension-field columns and small columns where kernel
++//! launch overhead dominates. Produces the same natural-order, non-canonical
++//! LDE evaluations as the CPU path.
++
++use core::any::type_name;
++
++use math::field::element::FieldElement;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsField;
++
++/// Break-even LDE size. Below this, the CPU `coset_lde_full_expand` completes
++/// in a few hundred microseconds and the GPU's ~37 kernel launches plus
++/// H2D/D2H round-trip is a net loss. The check is on **lde size**, not trace
++/// length, because that's what determines the FFT workload.
++///
++/// 2^19 is a conservative default calibrated against a 46-core machine where
++/// rayon-parallel CPU LDE is already fast. Override via env var for tuning
++/// on smaller machines; see `/workspace/lambda_vm/crypto/math-cuda/tests/bench_quick.rs`.
++const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
++
++fn gpu_lde_threshold() -> usize {
++    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::var("LAMBDA_VM_GPU_LDE_THRESHOLD")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
++    })
++}
++
++/// Atomically counted by `try_expand_column` every time it actually routes a
++/// column to the GPU. Used by benchmarks to confirm the GPU path fired.
++static GPU_LDE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++pub fn gpu_lde_calls() -> u64 {
++    GPU_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub fn reset_gpu_lde_calls() {
++    GPU_LDE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
++}
++
++/// Try to GPU-batch all columns in one pass.
++///
++/// Only engaged for Goldilocks-base tables whose LDE size is above the
++/// threshold. The prover's `expand_columns_to_lde` hands us every column of
++/// one table at once; those columns all share twiddles and coset weights so
++/// they can be processed in a single batched pipeline on one stream.
++///
++/// Returns `true` if the batch was handled on GPU (and `columns` now contains
++/// the LDE evaluations). Returns `false` to let the caller run the per-column
++/// CPU fallback.
++#[inline]
++pub(crate) fn try_expand_columns_batched<F, E>(
++    columns: &mut [Vec<FieldElement<E>>],
++    blowup_factor: usize,
++    weights: &[FieldElement<F>],
++) -> bool
++where
++    F: IsField,
++    E: IsField,
++{
++    if columns.is_empty() {
++        return true; // nothing to do — same as CPU path
++    }
++    let n = columns[0].len();
++    let lde_size = n.saturating_mul(blowup_factor);
++    if lde_size < gpu_lde_threshold() {
++        return false;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return false;
++    }
++    if type_name::<E>() != type_name::<GoldilocksField>() {
++        return false;
++    }
++    // All columns within one call must be the same size (invariant of the
++    // caller), but double-check before unsafe extraction.
++    if columns.iter().any(|c| c.len() != n) {
++        return false;
++    }
++
++    // Extract raw u64 slices. SAFETY: type_name above confirms
++    // `E == GoldilocksField`, so `FieldElement<E>` wraps u64 one-to-one.
++    let raw_columns: Vec<Vec<u64>> = columns
++        .iter()
++        .map(|col| {
++            col.iter()
++                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
++                .collect()
++        })
++        .collect();
++    let weights_u64: Vec<u64> = weights
++        .iter()
++        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
++        .collect();
++
++    // Pre-size caller Vecs to lde_size so the GPU path can write directly
++    // into the same backing allocation the caller already holds. This skips
++    // the intermediate `Vec<Vec<u64>>` allocation (which would page-fault
++    // per column) and is the main reason `coset_lde_batch_base_into` exists.
++    for col in columns.iter_mut() {
++        // SAFETY: set_len is valid here because capacity is already >=
++        // lde_size (the caller sized columns via `extract_columns_main(lde_size)`)
++        // and we're about to overwrite every slot via the GPU copy below.
++        debug_assert!(col.capacity() >= lde_size);
++        unsafe { col.set_len(lde_size) };
++    }
++
++    // Borrow each caller Vec as a raw `&mut [u64]` slice; safe because each
++    // FieldElement<E> aliases a single u64 when E == GoldilocksField.
++    let mut raw_outputs: Vec<&mut [u64]> = columns
++        .iter_mut()
++        .map(|col| {
++            let ptr = col.as_mut_ptr() as *mut u64;
++            let len = col.len();
++            // SAFETY: see above — single-u64 layout, caller still owns.
++            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
++        })
++        .collect();
++
++    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
++    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
++    math_cuda::lde::coset_lde_batch_base_into(
++        &slices,
++        blowup_factor,
++        &weights_u64,
++        &mut raw_outputs,
++    )
++    .expect("GPU batched coset LDE failed");
++    true
++}
+diff --git a/crypto/stark/src/lib.rs b/crypto/stark/src/lib.rs
+index 09ca16ed..24c149af 100644
+--- a/crypto/stark/src/lib.rs
++++ b/crypto/stark/src/lib.rs
+@@ -8,6 +8,8 @@ pub mod domain;
+ pub mod examples;
+ pub mod frame;
+ pub mod fri;
++#[cfg(feature = "cuda")]
++pub mod gpu_lde;
+ pub mod grinding;
+ #[cfg(feature = "instruments")]
+ pub mod instruments;
+diff --git a/crypto/stark/src/prover.rs b/crypto/stark/src/prover.rs
+index 8e59807c..286d84f6 100644
+--- a/crypto/stark/src/prover.rs
++++ b/crypto/stark/src/prover.rs
+@@ -489,6 +489,19 @@ pub trait IsStarkProver<
+             return;
+         }
+ 
++        // GPU batched fast path: all columns at once in one pipeline on one
++        // stream. Falls through to per-column rayon when the table is too
++        // small, the element type isn't Goldilocks, or the `cuda` feature is
++        // off.
++        #[cfg(feature = "cuda")]
++        if crate::gpu_lde::try_expand_columns_batched::<Field, E>(
++            columns,
++            domain.blowup_factor,
++            &twiddles.coset_weights,
++        ) {
++            return;
++        }
++
+         #[cfg(feature = "parallel")]
+         let iter = columns.par_iter_mut();
+         #[cfg(not(feature = "parallel"))]
+diff --git a/prover/Cargo.toml b/prover/Cargo.toml
+index dac71100..8bbad714 100644
+--- a/prover/Cargo.toml
++++ b/prover/Cargo.toml
+@@ -6,6 +6,7 @@ edition = "2024"
+ [features]
+ default = ["parallel"]
+ parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
++cuda = ["stark/cuda"]
+ debug-checks = ["stark/debug-checks"]
+ instruments = ["stark/instruments"]
+ 
+@@ -20,6 +21,7 @@ rayon = { version = "1.8.0", optional = true }
+ [dev-dependencies]
+ env_logger = "*"
+ criterion = { version = "0.5", default-features = false }
++stark = { path = "../crypto/stark" }
+ 
+ [[bench]]
+ name = "vm_prover_benchmark"
+diff --git a/prover/tests/bench_gpu.rs b/prover/tests/bench_gpu.rs
+new file mode 100644
+index 00000000..69808e0b
+--- /dev/null
++++ b/prover/tests/bench_gpu.rs
+@@ -0,0 +1,54 @@
++//! End-to-end timing probe: prove `fib_iterative_1M` (≈1M instructions) once
++//! and print wall-clock time. Intended to be run twice — once with the `cuda`
++//! feature, once without — so the caller can compare. Ignored by default.
++//!
++//! Usage:
++//!   cargo test -p lambda-vm-prover --release --test bench_gpu -- --ignored --nocapture
++//!   cargo test -p lambda-vm-prover --release --features cuda --test bench_gpu -- --ignored --nocapture
++
++use std::time::Instant;
++
++use lambda_vm_prover::test_utils::asm_elf_bytes;
++
++fn bench_prove(name: &str, trials: u32) {
++    let elf = asm_elf_bytes(name);
++    // Warm up — first prove pays lazy one-time costs (PTX load on the GPU side,
++    // buffer pool warm-up on the CPU side).
++    let _ = lambda_vm_prover::prove(&elf).expect("warm-up prove");
++
++    #[cfg(feature = "cuda")]
++    stark::gpu_lde::reset_gpu_lde_calls();
++
++    let t0 = Instant::now();
++    for _ in 0..trials {
++        let _ = lambda_vm_prover::prove(&elf).expect("prove");
++    }
++    let elapsed = t0.elapsed().as_secs_f64() / trials as f64;
++
++    let gpu = if cfg!(feature = "cuda") { "gpu" } else { "cpu" };
++    println!("prove({name}) [{gpu}]: {elapsed:.3}s avg over {trials} trials");
++
++    #[cfg(feature = "cuda")]
++    {
++        let calls = stark::gpu_lde::gpu_lde_calls();
++        println!("  GPU LDE calls across {trials} proves: {calls}");
++    }
++}
++
++#[test]
++#[ignore = "bench; run with --ignored --nocapture"]
++fn bench_prove_fib_1m() {
++    bench_prove("fib_iterative_1M", 5);
++}
++
++#[test]
++#[ignore = "bench; run with --ignored --nocapture"]
++fn bench_prove_fib_2m() {
++    bench_prove("fib_iterative_2M", 5);
++}
++
++#[test]
++#[ignore = "bench; run with --ignored --nocapture"]
++fn bench_prove_fib_4m() {
++    bench_prove("fib_iterative_4M", 3);
++}
+-- 
+2.43.0
+

@@ -1,0 +1,1256 @@
+From 763d3776a0f5659412be8c3578e0749dc8ed9152 Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Tue, 21 Apr 2026 21:29:14 +0000
+Subject: [PATCH 11/27] feat(cuda): barycentric OOD kernels + ext3 arithmetic
+ building blocks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds GPU infrastructure for barycentric point-evaluation of ext3 columns
+at a single evaluation point — the primitive behind R3 OOD and R4 DEEP
+composition. Parity-tested against the CPU reference but kept unwired
+in the prover: benchmarking showed R3 OOD is already rayon-parallelised
+in negligible wall time on a 46-core host while the GPU is busy with
+LDE/Merkle on other streams, so routing R3 to the GPU regresses the
+end-to-end proof (fib_1M 13.09s → 14.20s, fib_4M 33.67s → 36.03s).
+The kernels remain as a building block for single-table or very-large-
+trace workloads where the GPU has idle windows during R3.
+
+New:
+- kernels/ext3.cuh: full ext3 arithmetic (add/sub/neg/mul_base/mul).
+  Uses a dot3 helper that fuses 3 u128 products into a single reduce128
+  to cut ext3 multiplication cost.
+- kernels/barycentric.cu: batched kernels over M columns, one CUDA block
+  per column, shared-memory tree reduction, 256 threads per block. Two
+  variants: base-field and ext3 columns (de-interleaved 3-slab layout).
+  Returns the unscaled sum; the caller applies the ext3 scalar on host.
+- src/barycentric.rs: Rust launchers for both kernels.
+- tests/ext3.rs, tests/barycentric.rs: parity against CPU Degree3 ops.
+
+Plumbing:
+- build.rs compiles the new PTX.
+- device.rs registers the four new kernel handles.
+- gpu_lde.rs adds wrappers + counter (dead-coded until re-wired).
+- bin/cli exposes a `cuda` feature so the CLI picks up the GPU build.
+- bench_gpu prints the bary-call counter alongside the other GPU counters.
+---
+ Cargo.lock                              |   1 +
+ bin/cli/Cargo.toml                      |   1 +
+ crypto/math-cuda/NOTES.md               |  23 ++
+ crypto/math-cuda/build.rs               |   4 +-
+ crypto/math-cuda/kernels/arith.cu       |  34 +++
+ crypto/math-cuda/kernels/barycentric.cu | 115 ++++++++++
+ crypto/math-cuda/kernels/ext3.cuh       | 121 ++++++++++
+ crypto/math-cuda/src/barycentric.rs     | 114 ++++++++++
+ crypto/math-cuda/src/device.rs          |  12 +
+ crypto/math-cuda/src/lib.rs             |  60 +++++
+ crypto/math-cuda/tests/barycentric.rs   | 145 ++++++++++++
+ crypto/math-cuda/tests/ext3.rs          |  87 ++++++++
+ crypto/stark/src/gpu_lde.rs             | 283 ++++++++++++++++++++++++
+ prover/tests/bench_gpu.rs               |   2 +
+ 14 files changed, 1001 insertions(+), 1 deletion(-)
+ create mode 100644 crypto/math-cuda/kernels/barycentric.cu
+ create mode 100644 crypto/math-cuda/kernels/ext3.cuh
+ create mode 100644 crypto/math-cuda/src/barycentric.rs
+ create mode 100644 crypto/math-cuda/tests/barycentric.rs
+ create mode 100644 crypto/math-cuda/tests/ext3.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index e9024df9..7b6ed3c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2133,6 +2133,7 @@ dependencies = [
+  "rand 0.8.5",
+  "rand_chacha 0.3.1",
+  "rayon",
++ "sha3",
+ ]
+ 
+ [[package]]
+diff --git a/bin/cli/Cargo.toml b/bin/cli/Cargo.toml
+index 4bfcb795..b9fa430d 100644
+--- a/bin/cli/Cargo.toml
++++ b/bin/cli/Cargo.toml
+@@ -15,3 +15,4 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+ [features]
+ jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
+ instruments = ["prover/instruments"]
++cuda = ["prover/cuda"]
+diff --git a/crypto/math-cuda/NOTES.md b/crypto/math-cuda/NOTES.md
+index ef8da80c..e7034591 100644
+--- a/crypto/math-cuda/NOTES.md
++++ b/crypto/math-cuda/NOTES.md
+@@ -41,9 +41,21 @@ Correctness: all 30 math-cuda parity tests + 121 stark cuda tests pass.
+ 1. **Ext3 arithmetic on GPU**. Full `ext3 × ext3` multiplication (currently
+    we only use `base × ext3` in the NTT butterflies). Required for OOD and
+    deep-composition barycentric kernels. ~100 lines of CUDA plus parity tests.
++   **✅ LANDED** — `kernels/ext3.cuh` has add/sub/neg/mul_base/mul with the
++   `dot3` helper; parity tested in `tests/ext3.rs`.
+ 2. **Barycentric at a point** kernel. O(N) reduction per column, M columns
+    in parallel. Addresses OOD (5.94 s) + deep-composition (2.32 s). ~8 s of
+    aggregate work ≈ ~0.5–1 s wall savings with rayon.
++   **✅ LANDED (unwired)** — `kernels/barycentric.cu` +
++   `src/barycentric.rs` + parity test `tests/barycentric.rs` all work. The
++   R3-OOD wiring in `get_trace_evaluations_from_lde` was **reverted** after
++   benchmarking: in the current prover the CPU is idle during R3 (the GPU
++   is busy on LDE/Merkle streams), so routing R3 OOD to the GPU only adds
++   queue contention without freeing wall time — fib_iterative_1M went
++   13.09 s → 14.20 s, and fib_iterative_4M went 33.67 s → 36.03 s, both
++   regressions. The kernels stay here as a building block for future
++   workloads where the GPU has idle windows during R3 (single-table or
++   very-large-trace proofs).
+ 3. **R2 constraint evaluation on GPU**. Per-AIR pointwise kernels over the
+    LDE domain. Biggest engineering lift (each AIR has its own constraint
+    logic). Could save 5 s aggregate ≈ 0.3–0.5 s wall.
+@@ -55,6 +67,17 @@ None of these are trivial; individually each is hours to a day. Collectively
+ they'd probably push the 1M-fib proof under 10 s (matching Zisk/Airbender-
+ class wins).
+ 
++### Lesson from the R3-OOD attempt
++
++Aggregate CPU time (as reported by the `instruments` feature) overstates
++the real wall-time cost of a phase whenever rayon already parallelises
++it. R3 OOD's 5.94 s "aggregate" number was misleading: on a 46-core box
++with ~7 tables running in parallel, rayon reduces that to ≈0.15 s wall,
++which is *less than* one H2D round-trip of the 500 MB of column data the
++GPU kernel would need. The GPU-resident LDE refactor (item 4 above) is
++the unlock here — without it, the CPU barycentric is already close to a
++lower bound for this workload.
++
+ ### What's on the GPU now
+ 
+ Four independent hook points in the stark prover, all behind the `cuda`
+diff --git a/crypto/math-cuda/build.rs b/crypto/math-cuda/build.rs
+index 31d05ee4..e7269469 100644
+--- a/crypto/math-cuda/build.rs
++++ b/crypto/math-cuda/build.rs
+@@ -49,9 +49,11 @@ fn compile_ptx(src: &str, out_name: &str) {
+ }
+ 
+ fn main() {
+-    // Header is not compiled; emit rerun-if-changed so edits trigger rebuilds.
++    // Headers are not compiled; emit rerun-if-changed so edits trigger rebuilds.
+     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
++    println!("cargo:rerun-if-changed=kernels/ext3.cuh");
+     compile_ptx("arith.cu", "arith.ptx");
+     compile_ptx("ntt.cu", "ntt.ptx");
+     compile_ptx("keccak.cu", "keccak.ptx");
++    compile_ptx("barycentric.cu", "barycentric.ptx");
+ }
+diff --git a/crypto/math-cuda/kernels/arith.cu b/crypto/math-cuda/kernels/arith.cu
+index a466c330..4bee9b8b 100644
+--- a/crypto/math-cuda/kernels/arith.cu
++++ b/crypto/math-cuda/kernels/arith.cu
+@@ -3,6 +3,7 @@
+ // are bit-identical to the CPU path.
+ 
+ #include "goldilocks.cuh"
++#include "ext3.cuh"
+ 
+ using goldilocks::add;
+ using goldilocks::sub;
+@@ -47,3 +48,36 @@ extern "C" __global__ void gl_neg_kernel(const uint64_t *a,
+     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+     if (tid < n) c[tid] = neg(a[tid]);
+ }
++
++// ---------------------------------------------------------------------------
++// Ext3 (Goldilocks cubic extension) test kernels.
++// Input/output arrays are interleaved [a_0, b_0, c_0, a_1, b_1, c_1, ...].
++// ---------------------------------------------------------------------------
++
++extern "C" __global__ void ext3_mul_kernel(const uint64_t *a_int,
++                                           const uint64_t *b_int,
++                                           uint64_t *c_int,
++                                           uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++    ext3::Fe3 a = ext3::make(a_int[tid*3 + 0], a_int[tid*3 + 1], a_int[tid*3 + 2]);
++    ext3::Fe3 b = ext3::make(b_int[tid*3 + 0], b_int[tid*3 + 1], b_int[tid*3 + 2]);
++    ext3::Fe3 r = ext3::mul(a, b);
++    c_int[tid*3 + 0] = r.a;
++    c_int[tid*3 + 1] = r.b;
++    c_int[tid*3 + 2] = r.c;
++}
++
++extern "C" __global__ void ext3_add_kernel(const uint64_t *a_int,
++                                           const uint64_t *b_int,
++                                           uint64_t *c_int,
++                                           uint64_t n) {
++    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= n) return;
++    ext3::Fe3 a = ext3::make(a_int[tid*3 + 0], a_int[tid*3 + 1], a_int[tid*3 + 2]);
++    ext3::Fe3 b = ext3::make(b_int[tid*3 + 0], b_int[tid*3 + 1], b_int[tid*3 + 2]);
++    ext3::Fe3 r = ext3::add(a, b);
++    c_int[tid*3 + 0] = r.a;
++    c_int[tid*3 + 1] = r.b;
++    c_int[tid*3 + 2] = r.c;
++}
+diff --git a/crypto/math-cuda/kernels/barycentric.cu b/crypto/math-cuda/kernels/barycentric.cu
+new file mode 100644
+index 00000000..f5917185
+--- /dev/null
++++ b/crypto/math-cuda/kernels/barycentric.cu
+@@ -0,0 +1,115 @@
++// Barycentric evaluation of a polynomial (given as evaluations on a coset) at
++// a single out-of-domain point. Matches the CPU
++// `math::polynomial::interpolate_coset_eval_*_with_g_n_inv` pair.
++//
++// Per column, the barycentric sum is
++//     S = Σ_i  point_i * eval_i * inv_denom_i
++// where `point_i` is a base-field coset point, `eval_i` is the polynomial's
++// value at that point (base for main-trace columns, ext3 for aux / composition
++// columns), and `inv_denom_i = 1 / (z - point_i)` is an ext3 scalar (same for
++// every column sharing the evaluation point `z`).
++//
++// These kernels compute only S. The caller multiplies by the ext3 scalar
++// `vanishing * n_inv * g_n_inv` once per column on the host — cheap, and
++// keeping it out of the kernel means we don't need to carry yet another
++// ext3 constant argument.
++//
++// Launch: grid = (num_cols, 1, 1), block = (BARY_BLOCK_DIM, 1, 1).
++
++#include "goldilocks.cuh"
++#include "ext3.cuh"
++
++// 256 threads/block — one ext3 accumulator per thread in shmem ⇒ 6 KiB.
++#define BARY_BLOCK_DIM 256
++
++__device__ __forceinline__ ext3::Fe3 block_reduce_ext3(ext3::Fe3 my) {
++    __shared__ uint64_t shm_a[BARY_BLOCK_DIM];
++    __shared__ uint64_t shm_b[BARY_BLOCK_DIM];
++    __shared__ uint64_t shm_c[BARY_BLOCK_DIM];
++    uint32_t tid = threadIdx.x;
++    shm_a[tid] = my.a;
++    shm_b[tid] = my.b;
++    shm_c[tid] = my.c;
++    __syncthreads();
++    for (uint32_t s = BARY_BLOCK_DIM / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            shm_a[tid] = goldilocks::add(shm_a[tid], shm_a[tid + s]);
++            shm_b[tid] = goldilocks::add(shm_b[tid], shm_b[tid + s]);
++            shm_c[tid] = goldilocks::add(shm_c[tid], shm_c[tid + s]);
++        }
++        __syncthreads();
++    }
++    return ext3::make(shm_a[0], shm_b[0], shm_c[0]);
++}
++
++/// Base-column variant: M base-field columns, each `col_stride` u64 apart.
++/// `inv_denoms` is a flat 3N u64 buffer (ext3, interleaved `[a0,b0,c0,...]`).
++extern "C" __global__ void barycentric_base_batched(
++    const uint64_t *columns,
++    uint64_t col_stride,
++    const uint64_t *coset_points,
++    const uint64_t *inv_denoms,
++    uint64_t n,
++    uint64_t *out_ext3_int   // 3M u64, interleaved per column
++) {
++    uint64_t col = blockIdx.x;
++    const uint64_t *col_data = columns + col * col_stride;
++
++    ext3::Fe3 acc = ext3::zero();
++    for (uint64_t i = threadIdx.x; i < n; i += BARY_BLOCK_DIM) {
++        uint64_t eval  = col_data[i];
++        uint64_t point = coset_points[i];
++        uint64_t pe    = goldilocks::mul(point, eval);   // F × F → F
++        ext3::Fe3 inv_d = ext3::make(
++            inv_denoms[i * 3 + 0],
++            inv_denoms[i * 3 + 1],
++            inv_denoms[i * 3 + 2]);
++        ext3::Fe3 term = ext3::mul_base(inv_d, pe);      // E × F → E
++        acc = ext3::add(acc, term);
++    }
++
++    ext3::Fe3 sum = block_reduce_ext3(acc);
++    if (threadIdx.x == 0) {
++        out_ext3_int[col * 3 + 0] = sum.a;
++        out_ext3_int[col * 3 + 1] = sum.b;
++        out_ext3_int[col * 3 + 2] = sum.c;
++    }
++}
++
++/// Ext3-column variant: M ext3 columns stored as 3M base slabs. Column `c`
++/// lives at `columns[(c*3+k)*col_stride + i]` for component `k ∈ 0..3`.
++extern "C" __global__ void barycentric_ext3_batched(
++    const uint64_t *columns,
++    uint64_t col_stride,
++    const uint64_t *coset_points,
++    const uint64_t *inv_denoms,
++    uint64_t n,
++    uint64_t *out_ext3_int
++) {
++    uint64_t col = blockIdx.x;
++    const uint64_t *slab_a = columns + (col * 3 + 0) * col_stride;
++    const uint64_t *slab_b = columns + (col * 3 + 1) * col_stride;
++    const uint64_t *slab_c = columns + (col * 3 + 2) * col_stride;
++
++    ext3::Fe3 acc = ext3::zero();
++    for (uint64_t i = threadIdx.x; i < n; i += BARY_BLOCK_DIM) {
++        ext3::Fe3 eval = ext3::make(slab_a[i], slab_b[i], slab_c[i]);
++        uint64_t point = coset_points[i];
++        // F × E → E  (point times eval, componentwise on the 3 base components)
++        ext3::Fe3 pe = ext3::mul_base(eval, point);
++        // E × E → E
++        ext3::Fe3 inv_d = ext3::make(
++            inv_denoms[i * 3 + 0],
++            inv_denoms[i * 3 + 1],
++            inv_denoms[i * 3 + 2]);
++        ext3::Fe3 term = ext3::mul(pe, inv_d);
++        acc = ext3::add(acc, term);
++    }
++
++    ext3::Fe3 sum = block_reduce_ext3(acc);
++    if (threadIdx.x == 0) {
++        out_ext3_int[col * 3 + 0] = sum.a;
++        out_ext3_int[col * 3 + 1] = sum.b;
++        out_ext3_int[col * 3 + 2] = sum.c;
++    }
++}
+diff --git a/crypto/math-cuda/kernels/ext3.cuh b/crypto/math-cuda/kernels/ext3.cuh
+new file mode 100644
+index 00000000..2f404071
+--- /dev/null
++++ b/crypto/math-cuda/kernels/ext3.cuh
+@@ -0,0 +1,121 @@
++// Goldilocks cubic extension on device: Fp3 = Fp[w] / (w^3 - 2)
++// where Fp is Goldilocks (2^64 - 2^32 + 1).
++//
++// Layout matches the CPU `Degree3GoldilocksExtensionField` (see
++// `crypto/math/src/field/extensions_goldilocks.rs`): an element is a
++// 3-tuple `(a, b, c)` representing `a + b*w + c*w^2`.
++//
++// The reducible `w^3 = 2` means cross-term products get a factor of 2:
++//   (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2)
++//     = (a0*b0 + 2*(a1*b2 + a2*b1))
++//     + (a0*b1 + a1*b0 + 2*a2*b2) * w
++//     + (a0*b2 + a1*b1 + a2*b0) * w^2
++//
++// We use the same dot-product-of-three folding as the CPU (which saves
++// reductions by summing u128 products before `reduce128`). CUDA has
++// `__umul64hi` so we implement `dot_product_3` inline.
++
++#pragma once
++#include "goldilocks.cuh"
++
++namespace ext3 {
++
++struct Fe3 {
++    uint64_t a, b, c;
++};
++
++__device__ __forceinline__ Fe3 make(uint64_t a, uint64_t b, uint64_t c) {
++    Fe3 r = {a, b, c};
++    return r;
++}
++
++__device__ __forceinline__ Fe3 zero() { return make(0, 0, 0); }
++__device__ __forceinline__ Fe3 one()  { return make(1, 0, 0); }
++
++__device__ __forceinline__ Fe3 add(const Fe3 &x, const Fe3 &y) {
++    return make(goldilocks::add(x.a, y.a),
++                goldilocks::add(x.b, y.b),
++                goldilocks::add(x.c, y.c));
++}
++
++__device__ __forceinline__ Fe3 sub(const Fe3 &x, const Fe3 &y) {
++    return make(goldilocks::sub(x.a, y.a),
++                goldilocks::sub(x.b, y.b),
++                goldilocks::sub(x.c, y.c));
++}
++
++__device__ __forceinline__ Fe3 neg(const Fe3 &x) {
++    return make(goldilocks::neg(x.a),
++                goldilocks::neg(x.b),
++                goldilocks::neg(x.c));
++}
++
++/// Mixed: base * ext3 → ext3 (componentwise).
++__device__ __forceinline__ Fe3 mul_base(const Fe3 &x, uint64_t s) {
++    return make(goldilocks::mul(x.a, s),
++                goldilocks::mul(x.b, s),
++                goldilocks::mul(x.c, s));
++}
++
++/// Dot-product of three (a0*b0 + a1*b1 + a2*b2) mod p, with one reduce128
++/// on the sum of three u128 products. Matches CPU `dot_product_3`.
++__device__ __forceinline__ uint64_t dot3(uint64_t a0, uint64_t b0,
++                                         uint64_t a1, uint64_t b1,
++                                         uint64_t a2, uint64_t b2) {
++    // Split the sum of three u128 products into hi/lo u128 halves, then
++    // reduce once. We track overflow-count (at most 2) and add EPSILON^2
++    // per overflow, matching the CPU path.
++    // prod_i = a_i * b_i (u128)
++    uint64_t lo0 = a0 * b0, hi0 = __umul64hi(a0, b0);
++    uint64_t lo1 = a1 * b1, hi1 = __umul64hi(a1, b1);
++    uint64_t lo2 = a2 * b2, hi2 = __umul64hi(a2, b2);
++
++    // sum01 = prod0 + prod1 (in u128 lanes)
++    uint64_t s01_lo = lo0 + lo1;
++    uint64_t carry01 = (s01_lo < lo0) ? 1ULL : 0ULL;
++    uint64_t s01_hi = hi0 + hi1 + carry01;
++    uint32_t over1 = (s01_hi < hi0 + carry01) ? 1u : 0u; // low-pass overflow
++
++    // sum012 = sum01 + prod2
++    uint64_t s012_lo = s01_lo + lo2;
++    uint64_t carry012 = (s012_lo < s01_lo) ? 1ULL : 0ULL;
++    uint64_t s012_hi = s01_hi + hi2 + carry012;
++    uint32_t over2 = (s012_hi < hi2 + carry012) ? 1u : 0u;
++
++    uint64_t reduced = goldilocks::reduce128(s012_lo, s012_hi);
++
++    uint32_t overflow_count = over1 + over2;
++    if (overflow_count > 0) {
++        // 2^128 mod p = EPSILON^2 (= (2^32 - 1)^2).
++        uint64_t eps = goldilocks::EPSILON;
++        uint64_t eps_sq = eps * eps;
++        reduced = goldilocks::add_no_canonicalize(reduced, eps_sq);
++        if (overflow_count > 1) {
++            reduced = goldilocks::add_no_canonicalize(reduced, eps_sq);
++        }
++    }
++    return reduced;
++}
++
++/// Full ext3 × ext3 multiplication (matches CPU
++/// `Degree3GoldilocksExtensionField::mul`).
++__device__ __forceinline__ Fe3 mul(const Fe3 &x, const Fe3 &y) {
++    // c0 = x.a*y.a + x.b*(2*y.c) + x.c*(2*y.b)
++    // c1 = x.a*y.b + x.b*y.a     + x.c*(2*y.c)
++    // c2 = x.a*y.c + x.b*y.b     + x.c*y.a
++    uint64_t b1_2 = goldilocks::add(y.b, y.b);
++    uint64_t b2_2 = goldilocks::add(y.c, y.c);
++
++    uint64_t c0 = dot3(x.a, y.a, x.b, b2_2, x.c, b1_2);
++    uint64_t c1 = dot3(x.a, y.b, x.b, y.a, x.c, b2_2);
++    uint64_t c2 = dot3(x.a, y.c, x.b, y.b, x.c, y.a);
++    return make(c0, c1, c2);
++}
++
++__device__ __forceinline__ Fe3 canonical(const Fe3 &x) {
++    return make(goldilocks::canonical(x.a),
++                goldilocks::canonical(x.b),
++                goldilocks::canonical(x.c));
++}
++
++}  // namespace ext3
+diff --git a/crypto/math-cuda/src/barycentric.rs b/crypto/math-cuda/src/barycentric.rs
+new file mode 100644
+index 00000000..f59efede
+--- /dev/null
++++ b/crypto/math-cuda/src/barycentric.rs
+@@ -0,0 +1,114 @@
++//! Barycentric evaluation on device — matches
++//! `math::polynomial::interpolate_coset_eval_*_with_g_n_inv`.
++//!
++//! The kernels compute only the unscaled barycentric sum
++//!     S = Σ_i point_i * eval_i * inv_denom_i
++//! per column. The caller multiplies each `S` by the ext3 scalar
++//! `(z^N - g^N) * 1/N * 1/g^N` to get the final OOD value; that scaling is
++//! one ext3 mul per column and stays on host.
++
++use cudarc::driver::{LaunchConfig, PushKernelArg};
++
++use crate::Result;
++use crate::device::backend;
++
++const BLOCK_DIM: u32 = 256;
++
++/// Barycentric sums over M base-field columns, each of length `n`, laid out
++/// with stride `col_stride` (so column `c` is at `columns[c*col_stride ..
++/// c*col_stride + n]`). `inv_denoms` is 3N u64 (ext3 interleaved).
++/// Returns 3M u64 (ext3 interleaved), one per column.
++pub fn barycentric_base(
++    columns: &[u64],
++    col_stride: usize,
++    coset_points: &[u64],
++    inv_denoms_ext3: &[u64],
++    n: usize,
++    num_cols: usize,
++) -> Result<Vec<u64>> {
++    assert_eq!(coset_points.len(), n);
++    assert_eq!(inv_denoms_ext3.len(), 3 * n);
++    assert!(columns.len() >= num_cols * col_stride);
++    if num_cols == 0 || n == 0 {
++        return Ok(vec![0; 3 * num_cols]);
++    }
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    let cols_dev = stream.clone_htod(&columns[..num_cols * col_stride])?;
++    let points_dev = stream.clone_htod(coset_points)?;
++    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
++    let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
++
++    let col_stride_u64 = col_stride as u64;
++    let n_u64 = n as u64;
++    let cfg = LaunchConfig {
++        grid_dim: (num_cols as u32, 1, 1),
++        block_dim: (BLOCK_DIM, 1, 1),
++        shared_mem_bytes: 0,
++    };
++    unsafe {
++        stream
++            .launch_builder(&be.barycentric_base_batched)
++            .arg(&cols_dev)
++            .arg(&col_stride_u64)
++            .arg(&points_dev)
++            .arg(&inv_dev)
++            .arg(&n_u64)
++            .arg(&mut out_dev)
++            .launch(cfg)?;
++    }
++    let out = stream.clone_dtoh(&out_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
++/// Same as [`barycentric_base`] but `columns` holds M ext3 columns in the
++/// de-interleaved layout: slab `c*3 + k` at offset `(c*3+k)*col_stride`.
++/// `columns.len() >= num_cols * 3 * col_stride`.
++pub fn barycentric_ext3(
++    columns: &[u64],
++    col_stride: usize,
++    coset_points: &[u64],
++    inv_denoms_ext3: &[u64],
++    n: usize,
++    num_cols: usize,
++) -> Result<Vec<u64>> {
++    assert_eq!(coset_points.len(), n);
++    assert_eq!(inv_denoms_ext3.len(), 3 * n);
++    assert!(columns.len() >= num_cols * 3 * col_stride);
++    if num_cols == 0 || n == 0 {
++        return Ok(vec![0; 3 * num_cols]);
++    }
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    let cols_dev = stream.clone_htod(&columns[..num_cols * 3 * col_stride])?;
++    let points_dev = stream.clone_htod(coset_points)?;
++    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
++    let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
++
++    let col_stride_u64 = col_stride as u64;
++    let n_u64 = n as u64;
++    let cfg = LaunchConfig {
++        grid_dim: (num_cols as u32, 1, 1),
++        block_dim: (BLOCK_DIM, 1, 1),
++        shared_mem_bytes: 0,
++    };
++    unsafe {
++        stream
++            .launch_builder(&be.barycentric_ext3_batched)
++            .arg(&cols_dev)
++            .arg(&col_stride_u64)
++            .arg(&points_dev)
++            .arg(&inv_dev)
++            .arg(&n_u64)
++            .arg(&mut out_dev)
++            .launch(cfg)?;
++    }
++    let out = stream.clone_dtoh(&out_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
+diff --git a/crypto/math-cuda/src/device.rs b/crypto/math-cuda/src/device.rs
+index 9b1c37b3..5c9f7d08 100644
+--- a/crypto/math-cuda/src/device.rs
++++ b/crypto/math-cuda/src/device.rs
+@@ -96,6 +96,7 @@ impl Drop for PinnedStaging {
+ const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
+ const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
+ const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
++const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
+ /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
+ /// callers overlap on the GPU without serializing on stream ownership. The
+ /// default stream is deliberately excluded because it synchronises with all
+@@ -125,6 +126,8 @@ pub struct Backend {
+     pub gl_sub: CudaFunction,
+     pub gl_mul: CudaFunction,
+     pub gl_neg: CudaFunction,
++    pub ext3_mul: CudaFunction,
++    pub ext3_add: CudaFunction,
+ 
+     // ntt.ptx
+     pub bit_reverse_permute: CudaFunction,
+@@ -142,6 +145,10 @@ pub struct Backend {
+     pub keccak256_leaves_base_batched: CudaFunction,
+     pub keccak256_leaves_ext3_batched: CudaFunction,
+ 
++    // barycentric.ptx
++    pub barycentric_base_batched: CudaFunction,
++    pub barycentric_ext3_batched: CudaFunction,
++
+     // Twiddle caches keyed by log_n.
+     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
+     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
+@@ -159,6 +166,7 @@ impl Backend {
+         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
+         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
+         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
++        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
+ 
+         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
+         for _ in 0..STREAM_POOL_SIZE {
+@@ -180,6 +188,8 @@ impl Backend {
+             gl_sub: arith.load_function("gl_sub_kernel")?,
+             gl_mul: arith.load_function("gl_mul_kernel")?,
+             gl_neg: arith.load_function("gl_neg_kernel")?,
++            ext3_mul: arith.load_function("ext3_mul_kernel")?,
++            ext3_add: arith.load_function("ext3_add_kernel")?,
+             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
+             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
+             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
+@@ -192,6 +202,8 @@ impl Backend {
+             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
+             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
++            barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
++            barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
+             fwd_twiddles: Mutex::new(vec![None; max_log]),
+             inv_twiddles: Mutex::new(vec![None; max_log]),
+             ctx,
+diff --git a/crypto/math-cuda/src/lib.rs b/crypto/math-cuda/src/lib.rs
+index b2aafb67..d74b495e 100644
+--- a/crypto/math-cuda/src/lib.rs
++++ b/crypto/math-cuda/src/lib.rs
+@@ -4,6 +4,7 @@
+ //! element-wise arith) is either internal to the LDE pipeline or used by the
+ //! parity test suite.
+ 
++pub mod barycentric;
+ pub mod device;
+ pub mod lde;
+ pub mod merkle;
+@@ -60,6 +61,65 @@ pub fn gl_neg_u64(a: &[u64]) -> Result<Vec<u64>> {
+     Ok(out)
+ }
+ 
++/// Element-wise ext3 multiply. `a` and `b` are 3n u64s (interleaved
++/// [a0,a1,a2,b0,b1,b2,...]). Test helper for the `ext3.cuh` header.
++pub fn ext3_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    assert_eq!(a.len(), b.len());
++    assert_eq!(a.len() % 3, 0);
++    let n = a.len() / 3;
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let be = backend();
++    let stream = be.next_stream();
++    let a_dev = stream.clone_htod(a)?;
++    let b_dev = stream.clone_htod(b)?;
++    let mut c_dev = stream.alloc_zeros::<u64>(3 * n)?;
++    let cfg = LaunchConfig::for_num_elems(n as u32);
++    let n_u64 = n as u64;
++    unsafe {
++        stream
++            .launch_builder(&be.ext3_mul)
++            .arg(&a_dev)
++            .arg(&b_dev)
++            .arg(&mut c_dev)
++            .arg(&n_u64)
++            .launch(cfg)?;
++    }
++    let out = stream.clone_dtoh(&c_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
++/// Element-wise ext3 add.
++pub fn ext3_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
++    assert_eq!(a.len(), b.len());
++    assert_eq!(a.len() % 3, 0);
++    let n = a.len() / 3;
++    if n == 0 {
++        return Ok(Vec::new());
++    }
++    let be = backend();
++    let stream = be.next_stream();
++    let a_dev = stream.clone_htod(a)?;
++    let b_dev = stream.clone_htod(b)?;
++    let mut c_dev = stream.alloc_zeros::<u64>(3 * n)?;
++    let cfg = LaunchConfig::for_num_elems(n as u32);
++    let n_u64 = n as u64;
++    unsafe {
++        stream
++            .launch_builder(&be.ext3_add)
++            .arg(&a_dev)
++            .arg(&b_dev)
++            .arg(&mut c_dev)
++            .arg(&n_u64)
++            .launch(cfg)?;
++    }
++    let out = stream.clone_dtoh(&c_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
+ fn launch_binary_u64<F>(a: &[u64], b: &[u64], pick: F) -> Result<Vec<u64>>
+ where
+     F: for<'a> Fn(&'a Backend) -> &'a cudarc::driver::CudaFunction,
+diff --git a/crypto/math-cuda/tests/barycentric.rs b/crypto/math-cuda/tests/barycentric.rs
+new file mode 100644
+index 00000000..dcb47327
+--- /dev/null
++++ b/crypto/math-cuda/tests/barycentric.rs
+@@ -0,0 +1,145 @@
++//! Parity: GPU barycentric sum vs CPU. We don't call the upstream
++//! `interpolate_coset_eval_*_with_g_n_inv` directly because the GPU kernel
++//! returns only the unscaled sum — the caller applies the ext3 scale. We
++//! replicate the same unscaled sum on CPU for comparison.
++
++use math::field::element::FieldElement;
++use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsPrimeField;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
++
++fn canon_triplet(e: &Fp3) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(e.value()[0].value()),
++        GoldilocksField::canonical(e.value()[1].value()),
++        GoldilocksField::canonical(e.value()[2].value()),
++    ]
++}
++
++fn canon_triplet_raw(t: &[u64]) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(&t[0]),
++        GoldilocksField::canonical(&t[1]),
++        GoldilocksField::canonical(&t[2]),
++    ]
++}
++
++fn random_fp(rng: &mut ChaCha8Rng) -> Fp {
++    Fp::from_raw(rng.r#gen::<u64>())
++}
++fn random_fp3(rng: &mut ChaCha8Rng) -> Fp3 {
++    Fp3::new([random_fp(rng), random_fp(rng), random_fp(rng)])
++}
++
++#[test]
++fn barycentric_base_sum_matches_cpu() {
++    for &(log_n, num_cols) in &[(4u32, 1usize), (8, 5), (10, 17), (12, 3)] {
++        let n = 1 << log_n;
++        let mut rng = ChaCha8Rng::seed_from_u64(100 + log_n as u64 * 7 + num_cols as u64);
++
++        let coset_points: Vec<Fp> = (0..n).map(|_| random_fp(&mut rng)).collect();
++        let inv_denoms: Vec<Fp3> = (0..n).map(|_| random_fp3(&mut rng)).collect();
++
++        // Lay out columns base: column c contiguous slab of n u64s.
++        let cols_fp: Vec<Vec<Fp>> = (0..num_cols)
++            .map(|_| (0..n).map(|_| random_fp(&mut rng)).collect())
++            .collect();
++        let mut columns_flat = vec![0u64; num_cols * n];
++        for (c, col) in cols_fp.iter().enumerate() {
++            for (r, e) in col.iter().enumerate() {
++                columns_flat[c * n + r] = *e.value();
++            }
++        }
++        let points_raw: Vec<u64> = coset_points.iter().map(|e| *e.value()).collect();
++        let inv_denoms_raw: Vec<u64> = inv_denoms
++            .iter()
++            .flat_map(|e| [*e.value()[0].value(), *e.value()[1].value(), *e.value()[2].value()])
++            .collect();
++
++        let gpu = math_cuda::barycentric::barycentric_base(
++            &columns_flat,
++            n,
++            &points_raw,
++            &inv_denoms_raw,
++            n,
++            num_cols,
++        )
++        .unwrap();
++
++        for (c, col) in cols_fp.iter().enumerate() {
++            // CPU reference sum. Force ext3 by embedding the base product.
++            let mut sum = Fp3::zero();
++            for i in 0..n {
++                let pe_base: Fp = &coset_points[i] * &col[i]; // F × F = F
++                // Base × ext3 = ext3 (base is on the left — IsSubFieldOf direction).
++                let pe_ext3: Fp3 = &pe_base * &inv_denoms[i]; // F × E = E
++                sum = &sum + &pe_ext3;
++            }
++            let gpu_sum = canon_triplet_raw(&gpu[c * 3..(c + 1) * 3]);
++            let cpu_sum = canon_triplet(&sum);
++            assert_eq!(
++                gpu_sum, cpu_sum,
++                "base col {c} log_n={log_n} num_cols={num_cols}"
++            );
++        }
++    }
++}
++
++#[test]
++fn barycentric_ext3_sum_matches_cpu() {
++    for &(log_n, num_cols) in &[(4u32, 1usize), (8, 3), (10, 7)] {
++        let n = 1 << log_n;
++        let mut rng = ChaCha8Rng::seed_from_u64(200 + log_n as u64 * 11 + num_cols as u64);
++
++        let coset_points: Vec<Fp> = (0..n).map(|_| random_fp(&mut rng)).collect();
++        let inv_denoms: Vec<Fp3> = (0..n).map(|_| random_fp3(&mut rng)).collect();
++        let cols_fp3: Vec<Vec<Fp3>> = (0..num_cols)
++            .map(|_| (0..n).map(|_| random_fp3(&mut rng)).collect())
++            .collect();
++
++        // De-interleaved layout: 3 base slabs per ext3 column.
++        let mut columns_flat = vec![0u64; num_cols * 3 * n];
++        for (c, col) in cols_fp3.iter().enumerate() {
++            for (r, e) in col.iter().enumerate() {
++                columns_flat[(c * 3 + 0) * n + r] = *e.value()[0].value();
++                columns_flat[(c * 3 + 1) * n + r] = *e.value()[1].value();
++                columns_flat[(c * 3 + 2) * n + r] = *e.value()[2].value();
++            }
++        }
++        let points_raw: Vec<u64> = coset_points.iter().map(|e| *e.value()).collect();
++        let inv_denoms_raw: Vec<u64> = inv_denoms
++            .iter()
++            .flat_map(|e| [*e.value()[0].value(), *e.value()[1].value(), *e.value()[2].value()])
++            .collect();
++
++        let gpu = math_cuda::barycentric::barycentric_ext3(
++            &columns_flat,
++            n,
++            &points_raw,
++            &inv_denoms_raw,
++            n,
++            num_cols,
++        )
++        .unwrap();
++
++        for (c, col) in cols_fp3.iter().enumerate() {
++            let mut sum = Fp3::zero();
++            for i in 0..n {
++                let pe: Fp3 = &coset_points[i] * &col[i]; // F × E = E
++                let term: Fp3 = &pe * &inv_denoms[i]; // E × E = E
++                sum = &sum + &term;
++            }
++            let gpu_sum = canon_triplet_raw(&gpu[c * 3..(c + 1) * 3]);
++            let cpu_sum = canon_triplet(&sum);
++            assert_eq!(
++                gpu_sum, cpu_sum,
++                "ext3 col {c} log_n={log_n} num_cols={num_cols}"
++            );
++        }
++    }
++}
+diff --git a/crypto/math-cuda/tests/ext3.rs b/crypto/math-cuda/tests/ext3.rs
+new file mode 100644
+index 00000000..c9aabbc2
+--- /dev/null
++++ b/crypto/math-cuda/tests/ext3.rs
+@@ -0,0 +1,87 @@
++//! Parity: GPU ext3 arithmetic must agree (canonically) with CPU
++//! `Degree3GoldilocksExtensionField` on random ext3 inputs.
++
++use math::field::element::FieldElement;
++use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField};
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
++
++const N: usize = 10_000;
++
++fn random_fp3s(seed: u64, count: usize) -> Vec<Fp3> {
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    (0..count)
++        .map(|_| {
++            Fp3::new([
++                Fp::from_raw(rng.r#gen::<u64>()),
++                Fp::from_raw(rng.r#gen::<u64>()),
++                Fp::from_raw(rng.r#gen::<u64>()),
++            ])
++        })
++        .collect()
++}
++
++fn to_u64s(col: &[Fp3]) -> Vec<u64> {
++    let mut v = Vec::with_capacity(col.len() * 3);
++    for e in col {
++        v.push(*e.value()[0].value());
++        v.push(*e.value()[1].value());
++        v.push(*e.value()[2].value());
++    }
++    v
++}
++
++fn canon_triplet(e: &Fp3) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(e.value()[0].value()),
++        GoldilocksField::canonical(e.value()[1].value()),
++        GoldilocksField::canonical(e.value()[2].value()),
++    ]
++}
++
++fn canon_triplet_raw(t: &[u64]) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(&t[0]),
++        GoldilocksField::canonical(&t[1]),
++        GoldilocksField::canonical(&t[2]),
++    ]
++}
++
++#[test]
++fn ext3_mul_matches_cpu() {
++    let a = random_fp3s(11, N);
++    let b = random_fp3s(22, N);
++    let a_raw = to_u64s(&a);
++    let b_raw = to_u64s(&b);
++    let gpu = math_cuda::ext3_mul_u64(&a_raw, &b_raw).unwrap();
++    assert_eq!(gpu.len(), 3 * N);
++    for i in 0..N {
++        use math::field::traits::IsField;
++        let cpu = Degree3GoldilocksExtensionField::mul(a[i].value(), b[i].value());
++        let cpu_fp3 = Fp3::new(cpu);
++        let g = canon_triplet_raw(&gpu[i * 3..(i + 1) * 3]);
++        let c = canon_triplet(&cpu_fp3);
++        assert_eq!(g, c, "ext3 mul mismatch at {i}");
++    }
++}
++
++#[test]
++fn ext3_add_matches_cpu() {
++    let a = random_fp3s(33, N);
++    let b = random_fp3s(44, N);
++    let a_raw = to_u64s(&a);
++    let b_raw = to_u64s(&b);
++    let gpu = math_cuda::ext3_add_u64(&a_raw, &b_raw).unwrap();
++    for i in 0..N {
++        let cpu = Degree3GoldilocksExtensionField::add(a[i].value(), b[i].value());
++        let cpu_fp3 = Fp3::new(cpu);
++        let g = canon_triplet_raw(&gpu[i * 3..(i + 1) * 3]);
++        let c = canon_triplet(&cpu_fp3);
++        assert_eq!(g, c, "ext3 add mismatch at {i}");
++    }
++}
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index b21ad382..c2fd914e 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -8,6 +8,9 @@
+ 
+ use core::any::type_name;
+ 
++#[cfg(feature = "parallel")]
++use rayon::prelude::*;
++
+ use math::field::element::FieldElement;
+ use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+ use math::field::goldilocks::GoldilocksField;
+@@ -670,3 +673,283 @@ where
+     .expect("GPU batched ext3 coset LDE failed");
+     true
+ }
++
++// ============================================================================
++// GPU barycentric OOD evaluation
++// ============================================================================
++//
++// Infrastructure for future use: these wrappers drive
++// `math_cuda::barycentric::barycentric_{base,ext3}` and apply the trailing ext3
++// scalar on host. See the CPU reference in
++// `crypto/math/src/polynomial/mod.rs::interpolate_coset_eval_*_with_g_n_inv`.
++//
++// NOT currently wired into the prover — a benchmark on fib_iterative_{1M, 4M}
++// showed the CPU path (rayon over ~50 columns) already finishes in <1 ms wall
++// because the GPU is busy with LDE and Merkle on parallel streams, so moving
++// R3 OOD to the GPU just serialises work without freeing CPU wall time.
++// Kept here and covered by parity tests in `crypto/math-cuda/tests/barycentric.rs`
++// because it remains a net win for single-table or very-large-trace workloads.
++//
++// The GPU kernel returns the unscaled sum
++//     S = Σ_i point_i · eval_i · inv_denom_i
++// per column; the final barycentric value is
++//     f(z) = scalar · (z^N − g^N) · S
++// with `scalar = n_inv · g_n_inv` kept in the base field.
++
++static GPU_BARY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub fn gpu_bary_calls() -> u64 {
++    GPU_BARY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// Below this (trace-size) barycentric length we stay on CPU — the rayon path
++/// already completes in well under a millisecond and PCIe round-trip would
++/// dominate.
++#[allow(dead_code)]
++const DEFAULT_GPU_BARY_THRESHOLD: usize = 1 << 14;
++
++#[allow(dead_code)]
++fn gpu_bary_threshold() -> usize {
++    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::var("LAMBDA_VM_GPU_BARY_THRESHOLD")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(DEFAULT_GPU_BARY_THRESHOLD)
++    })
++}
++
++/// One ext3 scalar `(n_inv · g_n_inv) · (z^N − g^N)`; caller reads as `[u64;3]`.
++#[allow(dead_code)]
++fn ood_ext3_scalar<F, E>(
++    coset_offset_pow_n: &FieldElement<F>,
++    n_inv: &FieldElement<F>,
++    g_n_inv: &FieldElement<F>,
++    z_pow_n: &FieldElement<E>,
++) -> [u64; 3]
++where
++    F: IsField + IsSubFieldOf<E>,
++    E: IsField,
++{
++    // (z^N − g^N) in E — done via sub_subfield (E − F → E).
++    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
++    let base_scalar = n_inv * g_n_inv; // F × F → F
++    let scalar_ext3: FieldElement<E> = &base_scalar * &vanishing; // F × E → E
++    // SAFETY: E == Degree3Goldilocks; backing is `[FieldElement<Gl>; 3]`
++    // which is memory-equivalent to `[u64; 3]`.
++    let ptr = &scalar_ext3 as *const FieldElement<E> as *const u64;
++    unsafe { [*ptr, *ptr.add(1), *ptr.add(2)] }
++}
++
++/// Multiply each raw GPU ext3 sum by the host-computed ext3 scalar.
++/// `sums_raw` is `3 * num_cols` u64s (interleaved).
++#[allow(dead_code)]
++fn apply_ext3_scalar<E>(
++    sums_raw: &[u64],
++    scalar: [u64; 3],
++    num_cols: usize,
++) -> Vec<FieldElement<E>>
++where
++    E: IsField,
++{
++    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++    use math::field::goldilocks::GoldilocksField;
++    type Gl = GoldilocksField;
++    type Ext3 = Degree3GoldilocksExtensionField;
++
++    debug_assert_eq!(sums_raw.len(), 3 * num_cols);
++    debug_assert_eq!(type_name::<E>(), type_name::<Ext3>());
++
++    let scalar_e: FieldElement<Ext3> = FieldElement::<Ext3>::new([
++        FieldElement::<Gl>::from_raw(scalar[0]),
++        FieldElement::<Gl>::from_raw(scalar[1]),
++        FieldElement::<Gl>::from_raw(scalar[2]),
++    ]);
++
++    let mut out: Vec<FieldElement<E>> = Vec::with_capacity(num_cols);
++    for c in 0..num_cols {
++        let s: FieldElement<Ext3> = FieldElement::<Ext3>::new([
++            FieldElement::<Gl>::from_raw(sums_raw[c * 3]),
++            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 1]),
++            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 2]),
++        ]);
++        let final_ext3 = &s * &scalar_e;
++        // SAFETY: E == Ext3 at runtime; same layout.
++        let final_e: FieldElement<E> = unsafe {
++            core::mem::transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&final_ext3)
++        };
++        out.push(final_e);
++    }
++    out
++}
++
++/// Batched barycentric OOD evaluation over M base-field columns at a single
++/// ext3 evaluation point. Returns `Some(vec_of_M_ext3)` on GPU dispatch, or
++/// `None` if the caller should fall back to CPU.
++#[allow(dead_code)]
++pub(crate) fn try_barycentric_base_ood_gpu<F, E>(
++    columns: &[Vec<FieldElement<F>>],
++    coset_points: &[FieldElement<F>],
++    coset_offset_pow_n: &FieldElement<F>,
++    n_inv: &FieldElement<F>,
++    g_n_inv: &FieldElement<F>,
++    z_pow_n: &FieldElement<E>,
++    inv_denoms: &[FieldElement<E>],
++) -> Option<Vec<FieldElement<E>>>
++where
++    F: IsField + IsSubFieldOf<E>,
++    E: IsField,
++{
++    let num_cols = columns.len();
++    if num_cols == 0 {
++        return Some(Vec::new());
++    }
++    let n = columns[0].len();
++    if !n.is_power_of_two() || n < gpu_bary_threshold() {
++        return None;
++    }
++    if coset_points.len() != n || inv_denoms.len() != n {
++        return None;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++    // All columns must share the same length `n`.
++    for c in columns.iter() {
++        if c.len() != n {
++            return None;
++        }
++    }
++
++    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // Pack columns contiguously: column c at offset c*n. Skip the zero-fill
++    // prologue — we overwrite every byte below. `set_len` before write is
++    // safe because `u64` has no drop glue.
++    let total = num_cols * n;
++    let mut columns_flat: Vec<u64> = Vec::with_capacity(total);
++    unsafe { columns_flat.set_len(total) };
++    {
++        // Parallel pack: each column's slab is independent.
++        let flat_ptr = columns_flat.as_mut_ptr() as usize;
++        #[cfg(feature = "parallel")]
++        let iter = (0..num_cols).into_par_iter();
++        #[cfg(not(feature = "parallel"))]
++        let iter = 0..num_cols;
++        iter.for_each(|c| {
++            // SAFETY: disjoint slabs; no two `c`s overlap. F == Goldilocks.
++            unsafe {
++                let dst = (flat_ptr as *mut u64).add(c * n);
++                let src = columns[c].as_ptr() as *const u64;
++                core::ptr::copy_nonoverlapping(src, dst, n);
++            }
++        });
++    }
++    let points_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
++    let inv_denoms_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
++
++    let sums_raw = math_cuda::barycentric::barycentric_base(
++        &columns_flat,
++        n,
++        points_raw,
++        inv_denoms_raw,
++        n,
++        num_cols,
++    )
++    .expect("GPU barycentric_base failed");
++
++    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
++    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
++}
++
++/// Batched barycentric OOD evaluation over M ext3 columns at a single ext3
++/// evaluation point. Same contract as [`try_barycentric_base_ood_gpu`].
++#[allow(dead_code)]
++pub(crate) fn try_barycentric_ext3_ood_gpu<F, E>(
++    columns: &[Vec<FieldElement<E>>],
++    coset_points: &[FieldElement<F>],
++    coset_offset_pow_n: &FieldElement<F>,
++    n_inv: &FieldElement<F>,
++    g_n_inv: &FieldElement<F>,
++    z_pow_n: &FieldElement<E>,
++    inv_denoms: &[FieldElement<E>],
++) -> Option<Vec<FieldElement<E>>>
++where
++    F: IsField + IsSubFieldOf<E>,
++    E: IsField,
++{
++    let num_cols = columns.len();
++    if num_cols == 0 {
++        return Some(Vec::new());
++    }
++    let n = columns[0].len();
++    if !n.is_power_of_two() || n < gpu_bary_threshold() {
++        return None;
++    }
++    if coset_points.len() != n || inv_denoms.len() != n {
++        return None;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++    for c in columns.iter() {
++        if c.len() != n {
++            return None;
++        }
++    }
++
++    GPU_BARY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // De-interleaved layout: slab (c*3 + k) at offset (c*3+k)*n. Skip
++    // zero-fill (we overwrite every byte). Parallelise the de-interleave.
++    let total = num_cols * 3 * n;
++    let mut columns_flat: Vec<u64> = Vec::with_capacity(total);
++    unsafe { columns_flat.set_len(total) };
++    {
++        let flat_ptr = columns_flat.as_mut_ptr() as usize;
++        #[cfg(feature = "parallel")]
++        let iter = (0..num_cols).into_par_iter();
++        #[cfg(not(feature = "parallel"))]
++        let iter = 0..num_cols;
++        iter.for_each(|c| {
++            // SAFETY: E == Ext3 whose BaseType is [FieldElement<Gl>;3] =
++            // contiguous [u64;3] at runtime; disjoint per-c slabs.
++            unsafe {
++                let src = columns[c].as_ptr() as *const u64;
++                let base = flat_ptr as *mut u64;
++                let slab0 = base.add((c * 3) * n);
++                let slab1 = base.add((c * 3 + 1) * n);
++                let slab2 = base.add((c * 3 + 2) * n);
++                for r in 0..n {
++                    *slab0.add(r) = *src.add(r * 3);
++                    *slab1.add(r) = *src.add(r * 3 + 1);
++                    *slab2.add(r) = *src.add(r * 3 + 2);
++                }
++            }
++        });
++    }
++    let points_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(coset_points.as_ptr() as *const u64, n) };
++    let inv_denoms_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(inv_denoms.as_ptr() as *const u64, 3 * n) };
++
++    let sums_raw = math_cuda::barycentric::barycentric_ext3(
++        &columns_flat,
++        n,
++        points_raw,
++        inv_denoms_raw,
++        n,
++        num_cols,
++    )
++    .expect("GPU barycentric_ext3 failed");
++
++    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
++    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
++}
+diff --git a/prover/tests/bench_gpu.rs b/prover/tests/bench_gpu.rs
+index de3d910d..2b306710 100644
+--- a/prover/tests/bench_gpu.rs
++++ b/prover/tests/bench_gpu.rs
+@@ -35,11 +35,13 @@ fn bench_prove(name: &str, trials: u32) {
+         let r4 = stark::gpu_lde::gpu_r4_lde_calls();
+         let parts = stark::gpu_lde::gpu_parts_lde_calls();
+         let leaf = stark::gpu_lde::gpu_leaf_hash_calls();
++        let bary = stark::gpu_lde::gpu_bary_calls();
+         println!("  GPU LDE calls across {trials} proves: {calls}");
+         println!("  GPU extend_two_halves calls: {eh}");
+         println!("  GPU R4 deep-poly LDE calls: {r4}");
+         println!("  GPU R2 parts LDE calls: {parts}");
+         println!("  GPU leaf-hash calls: {leaf}");
++        println!("  GPU barycentric OOD calls: {bary}");
+     }
+ }
+ 
+-- 
+2.43.0
+

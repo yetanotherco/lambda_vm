@@ -1,0 +1,400 @@
+From 542fa16d9c3fb8e813f9ed465389ad29eca9a94d Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Tue, 21 Apr 2026 23:41:58 +0000
+Subject: [PATCH 16/19] feat(cuda): FRI layer Merkle tree kernel + parity
+ (infra, unwired)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`keccak_fri_leaves_ext3` hashes 2 consecutive ext3 evals (48 BE bytes) per
+leaf — matches `FriLayerMerkleTreeBackend::hash_data`. Reuses
+`keccak_merkle_level` for the inner tree. Parity-tested on log_num_leaves
+in {1..6, 10, 12, 14, 18}.
+
+Wired into `commit_phase_from_evaluations` then reverted after A/B: the
+per-layer H2D of the folded-evals slab (each layer is a fresh pageable
+Vec from `fold_evaluations_in_place`) eats the tree-build savings, so
+net is noise-to-slightly-negative on fib_1M and fib_4M. The real win
+needs the FRI state to stay on device across layers (fold + leaves +
+tree all GPU-side) — deferred to the "LDE GPU-resident across rounds"
+item. The kernel stays here as a building block for that fusion.
+---
+ crypto/math-cuda/kernels/keccak.cu       |  36 ++++++++
+ crypto/math-cuda/src/device.rs           |   2 +
+ crypto/math-cuda/src/merkle.rs           |  72 +++++++++++++++
+ crypto/math-cuda/tests/fri_layer_tree.rs | 111 +++++++++++++++++++++++
+ crypto/stark/src/gpu_lde.rs              |  68 ++++++++++++++
+ 5 files changed, 289 insertions(+)
+ create mode 100644 crypto/math-cuda/tests/fri_layer_tree.rs
+
+diff --git a/crypto/math-cuda/kernels/keccak.cu b/crypto/math-cuda/kernels/keccak.cu
+index 80c3a6aa..68ddce3b 100644
+--- a/crypto/math-cuda/kernels/keccak.cu
++++ b/crypto/math-cuda/kernels/keccak.cu
+@@ -270,6 +270,42 @@ extern "C" __global__ void keccak_comp_poly_leaves_ext3(
+     finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
+ }
+ 
++// ---------------------------------------------------------------------------
++// FRI layer leaf hashing.
++//
++// Each leaf hashes 2 consecutive ext3 values: Keccak256 over
++//   evals[2j].to_bytes_be() ++ evals[2j+1].to_bytes_be()
++// = 48 BE bytes = 6 u64 BE lanes. No bit reversal; no column slab layout —
++// the input is a single interleaved ext3 eval vector `[a0,a1,a2,b0,b1,b2,...]`.
++// ---------------------------------------------------------------------------
++extern "C" __global__ void keccak_fri_leaves_ext3(
++    const uint64_t *evals_interleaved,  // 3 * num_evals u64s (ext3 interleaved)
++    uint64_t num_leaves,                 // = num_evals / 2
++    uint8_t *leaves_out) {
++    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= num_leaves) return;
++
++    uint64_t st[25];
++    #pragma unroll
++    for (int i = 0; i < 25; ++i) st[i] = 0;
++    uint32_t rate_pos = 0;
++
++    const uint64_t *left = evals_interleaved + 2 * tid * 3;  // 3 u64s
++    const uint64_t *right = left + 3;
++    #pragma unroll
++    for (int i = 0; i < 3; ++i) {
++        uint64_t canon = goldilocks::canonical(left[i]);
++        absorb_lane(st, rate_pos, bswap64(canon));
++    }
++    #pragma unroll
++    for (int i = 0; i < 3; ++i) {
++        uint64_t canon = goldilocks::canonical(right[i]);
++        absorb_lane(st, rate_pos, bswap64(canon));
++    }
++
++    finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
++}
++
+ // ---------------------------------------------------------------------------
+ // Merkle inner-tree pair hash: one level of the inner Merkle tree.
+ //
+diff --git a/crypto/math-cuda/src/device.rs b/crypto/math-cuda/src/device.rs
+index 37588120..206e912e 100644
+--- a/crypto/math-cuda/src/device.rs
++++ b/crypto/math-cuda/src/device.rs
+@@ -145,6 +145,7 @@ pub struct Backend {
+     pub keccak256_leaves_base_batched: CudaFunction,
+     pub keccak256_leaves_ext3_batched: CudaFunction,
+     pub keccak_comp_poly_leaves_ext3: CudaFunction,
++    pub keccak_fri_leaves_ext3: CudaFunction,
+     pub keccak_merkle_level: CudaFunction,
+ 
+     // barycentric.ptx
+@@ -205,6 +206,7 @@ impl Backend {
+             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
+             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
++            keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
+             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
+             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
+diff --git a/crypto/math-cuda/src/merkle.rs b/crypto/math-cuda/src/merkle.rs
+index e7b6ddb1..18c2e14d 100644
+--- a/crypto/math-cuda/src/merkle.rs
++++ b/crypto/math-cuda/src/merkle.rs
+@@ -316,6 +316,78 @@ pub fn build_comp_poly_tree_from_evals_ext3(
+     Ok(out)
+ }
+ 
++/// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval
++/// vector. Each leaf hashes two consecutive ext3 values; `num_leaves =
++/// evals.len() / 6` (since each ext3 is 3 u64s).
++///
++/// Returns the `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
++pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
++    assert!(evals.len() % 6 == 0, "evals must hold whole pair-leaves");
++    let num_evals = evals.len() / 3;
++    let num_leaves = num_evals / 2;
++    assert!(num_leaves.is_power_of_two() && num_leaves >= 1);
++    let tight_total_nodes = 2 * num_leaves - 1;
++    if tight_total_nodes == 0 {
++        return Ok(Vec::new());
++    }
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    let evals_dev = stream.clone_htod(evals)?;
++    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
++
++    // Leaf kernel: num_leaves threads, one leaf each.
++    let leaves_offset_bytes = (num_leaves - 1) * 32;
++    {
++        let mut leaves_view =
++            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
++        let num_leaves_u64 = num_leaves as u64;
++        let grid = ((num_leaves as u32) + 128 - 1) / 128;
++        let cfg = LaunchConfig {
++            grid_dim: (grid, 1, 1),
++            block_dim: (128, 1, 1),
++            shared_mem_bytes: 0,
++        };
++        unsafe {
++            stream
++                .launch_builder(&be.keccak_fri_leaves_ext3)
++                .arg(&evals_dev)
++                .arg(&num_leaves_u64)
++                .arg(&mut leaves_view)
++                .launch(cfg)?;
++        }
++    }
++
++    // Inner tree levels — identical to the R2 version.
++    {
++        let mut level_begin: u64 = (num_leaves - 1) as u64;
++        while level_begin != 0 {
++            let new_begin = level_begin / 2;
++            let n_pairs = level_begin - new_begin;
++            let grid = ((n_pairs as u32) + 128 - 1) / 128;
++            let cfg = LaunchConfig {
++                grid_dim: (grid, 1, 1),
++                block_dim: (128, 1, 1),
++                shared_mem_bytes: 0,
++            };
++            unsafe {
++                stream
++                    .launch_builder(&be.keccak_merkle_level)
++                    .arg(&mut nodes_dev)
++                    .arg(&new_begin)
++                    .arg(&n_pairs)
++                    .launch(cfg)?;
++            }
++            level_begin = new_begin;
++        }
++    }
++
++    let out = stream.clone_dtoh(&nodes_dev)?;
++    stream.synchronize()?;
++    Ok(out)
++}
++
+ pub(crate) fn launch_keccak_ext3(
+     stream: &CudaStream,
+     cols_dev: &CudaSlice<u64>,
+diff --git a/crypto/math-cuda/tests/fri_layer_tree.rs b/crypto/math-cuda/tests/fri_layer_tree.rs
+new file mode 100644
+index 00000000..c637ccc0
+--- /dev/null
++++ b/crypto/math-cuda/tests/fri_layer_tree.rs
+@@ -0,0 +1,111 @@
++//! Parity: GPU `build_fri_layer_tree_from_evals_ext3` vs CPU
++//! `FriLayerMerkleTree::build` (PairKeccak256 backend over ext3 pairs).
++
++use math::field::element::FieldElement;
++use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::IsField;
++use math::traits::ByteConversion;
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++use sha3::{Digest, Keccak256};
++
++type Fp = FieldElement<GoldilocksField>;
++type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
++
++fn rand_ext3(rng: &mut ChaCha8Rng) -> Fp3 {
++    Fp3::new([
++        Fp::from_raw(rng.r#gen::<u64>()),
++        Fp::from_raw(rng.r#gen::<u64>()),
++        Fp::from_raw(rng.r#gen::<u64>()),
++    ])
++}
++
++fn ext3_to_u64s(col: &[Fp3]) -> Vec<u64> {
++    let mut out = Vec::with_capacity(col.len() * 3);
++    for e in col {
++        out.push(*e.value()[0].value());
++        out.push(*e.value()[1].value());
++        out.push(*e.value()[2].value());
++    }
++    out
++}
++
++fn cpu_hash_pair_bytes(a: &Fp3, b: &Fp3) -> [u8; 32] {
++    let mut buf = [0u8; 48];
++    a.write_bytes_be(&mut buf[0..24]);
++    b.write_bytes_be(&mut buf[24..48]);
++    let mut h = Keccak256::new();
++    h.update(&buf);
++    let mut out = [0u8; 32];
++    out.copy_from_slice(&h.finalize());
++    out
++}
++
++fn cpu_hash_pair_nodes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
++    let mut h = Keccak256::new();
++    h.update(left);
++    h.update(right);
++    let mut out = [0u8; 32];
++    out.copy_from_slice(&h.finalize());
++    out
++}
++
++fn cpu_fri_layer_nodes(evals: &[Fp3]) -> Vec<[u8; 32]> {
++    let num_leaves = evals.len() / 2;
++    assert!(num_leaves.is_power_of_two() && num_leaves >= 1);
++    let total = 2 * num_leaves - 1;
++    let mut nodes: Vec<[u8; 32]> = vec![[0u8; 32]; total];
++    for j in 0..num_leaves {
++        nodes[num_leaves - 1 + j] = cpu_hash_pair_bytes(&evals[2 * j], &evals[2 * j + 1]);
++    }
++    let mut level_begin = num_leaves - 1;
++    while level_begin != 0 {
++        let new_begin = level_begin / 2;
++        let n_pairs = level_begin - new_begin;
++        for k in 0..n_pairs {
++            let l = nodes[level_begin + 2 * k];
++            let r = nodes[level_begin + 2 * k + 1];
++            nodes[new_begin + k] = cpu_hash_pair_nodes(&l, &r);
++        }
++        level_begin = new_begin;
++    }
++    nodes
++}
++
++fn run_parity(log_num_leaves: u32, seed: u64) {
++    let num_leaves = 1usize << log_num_leaves;
++    let num_evals = num_leaves * 2;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++    let evals: Vec<Fp3> = (0..num_evals).map(|_| rand_ext3(&mut rng)).collect();
++    let evals_u64 = ext3_to_u64s(&evals);
++
++    let cpu_nodes = cpu_fri_layer_nodes(&evals);
++    let gpu_bytes = math_cuda::merkle::build_fri_layer_tree_from_evals_ext3(&evals_u64).unwrap();
++
++    assert_eq!(cpu_nodes.len() * 32, gpu_bytes.len());
++    for i in 0..cpu_nodes.len() {
++        let g = &gpu_bytes[i * 32..(i + 1) * 32];
++        let c = &cpu_nodes[i];
++        assert_eq!(g, c, "node {i} mismatch at log_num_leaves={log_num_leaves}");
++    }
++}
++
++#[test]
++fn fri_layer_tree_small() {
++    for log in 1u32..=6 {
++        run_parity(log, 100 + log as u64);
++    }
++}
++
++#[test]
++fn fri_layer_tree_medium() {
++    for log in [10u32, 12, 14] {
++        run_parity(log, 500 + log as u64);
++    }
++}
++
++#[test]
++fn fri_layer_tree_large() {
++    run_parity(18, 9999);
++}
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index 7bbe090a..940cf4dc 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -424,6 +424,7 @@ where
+ /// LDE parts, builds the R2 composition-polynomial Merkle tree on device
+ /// (row-pair Keccak leaves + pair-hash inner tree). Returns both the parts
+ /// (still needed downstream for R4 openings) and the finished tree.
++#[allow(dead_code)]
+ pub(crate) fn try_evaluate_parts_on_lde_and_commit_gpu<F, E, B>(
+     parts_coefs: &[&[FieldElement<E>]],
+     blowup_factor: usize,
+@@ -521,6 +522,56 @@ where
+     Some((outputs, tree))
+ }
+ 
++/// Build a FRI-layer Merkle tree from already-folded evaluations using the
++/// GPU pair-leaf kernel + pair-hash inner tree.
++///
++/// Not currently wired — benchmarking showed the win per layer (GPU tree
++/// vs rayon tree) is eaten by the H2D of each layer's eval slab since the
++/// evals are in pageable CPU Vec form at call time. A fused on-device FRI
++/// (fold + leaves + tree all staying on device across layers) would flip
++/// this but is deferred to the "LDE on GPU across rounds" item.
++#[allow(dead_code)]
++pub(crate) fn try_build_fri_layer_tree_gpu<E, B>(
++    evals: &[FieldElement<E>],
++) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
++where
++    E: IsField,
++    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
++{
++    let num_evals = evals.len();
++    if num_evals < 2 || !num_evals.is_power_of_two() {
++        return None;
++    }
++    let num_leaves = num_evals / 2;
++    // Higher threshold than the generic LDE path because each FRI layer
++    // H2Ds a fresh eval slab; tiny layers can't amortise that.
++    if num_leaves < gpu_fri_tree_threshold() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++
++    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // SAFETY: E == Ext3 whose BaseType is [FieldElement<Gl>; 3] =
++    // contiguous [u64; 3] at runtime.
++    let evals_raw: &[u64] =
++        unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, num_evals * 3) };
++    let nodes_bytes = math_cuda::merkle::build_fri_layer_tree_from_evals_ext3(evals_raw)
++        .expect("GPU FRI layer tree build failed");
++
++    let tight_total_nodes = 2 * num_leaves - 1;
++    debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
++    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(tight_total_nodes);
++    for i in 0..tight_total_nodes {
++        let mut n = [0u8; 32];
++        n.copy_from_slice(&nodes_bytes[i * 32..(i + 1) * 32]);
++        nodes.push(n);
++    }
++    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
++}
++
+ /// Build the R2 composition-polynomial Merkle tree from already-computed
+ /// LDE parts using the GPU row-pair leaf kernel + pair-hash inner tree.
+ /// Takes H2D for every call — only worth doing when the tree is large enough
+@@ -855,6 +906,7 @@ where
+ /// Decomposes each ext3 column into three base slabs, runs the LDE + Keccak
+ /// ext3 kernel in one on-device pipeline, re-interleaves LDE output back to
+ /// ext3 layout, and returns hashed leaves.
++#[allow(dead_code)]
+ pub(crate) fn try_expand_and_leaf_hash_batched_ext3<F, E>(
+     columns: &mut [Vec<FieldElement<E>>],
+     blowup_factor: usize,
+@@ -1048,6 +1100,22 @@ pub fn gpu_merkle_tree_calls() -> u64 {
+     GPU_MERKLE_TREE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
++/// FRI layers shrink by 2× each round; the last few layers are tiny. Below
++/// this leaf count, keep the tree build on CPU.
++#[allow(dead_code)]
++const DEFAULT_GPU_FRI_TREE_THRESHOLD: usize = 1 << 19;
++
++#[allow(dead_code)]
++fn gpu_fri_tree_threshold() -> usize {
++    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::var("LAMBDA_VM_GPU_FRI_TREE_THRESHOLD")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(DEFAULT_GPU_FRI_TREE_THRESHOLD)
++    })
++}
++
+ /// Build a Merkle tree from already-hashed leaves using the GPU pair-hash
+ /// kernel. Returns the filled `MerkleTree` in the same layout as the CPU
+ /// `build_from_hashed_leaves` would produce — plug straight in anywhere the
+-- 
+2.43.0
+

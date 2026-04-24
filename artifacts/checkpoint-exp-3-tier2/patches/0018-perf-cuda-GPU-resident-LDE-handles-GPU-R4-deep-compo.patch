@@ -1,0 +1,1740 @@
+From e15e558a420f68c396c351336478ce48ba23ca40 Mon Sep 17 00:00:00 2001
+From: Lambda Dev <dev@lambda.xyz>
+Date: Wed, 22 Apr 2026 21:26:18 +0000
+Subject: [PATCH 18/28] perf(cuda): GPU-resident LDE handles + GPU R4
+ deep-composition
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Item 4 (architectural unlock) + item 3 together. The R1 fused pipeline
+now optionally keeps the LDE device buffer alive and exposes it on
+`LDETraceTable` via new `GpuLdeBase` / `GpuLdeExt3` handles. Downstream
+GPU rounds can read the main/aux LDE directly from device without
+paying a re-H2D of ~500 MB per call.
+
+Concretely this ships item 3 (R4 deep_composition_poly_evaluations on
+GPU). New kernel `deep_composition_ext3_row` in `kernels/deep.cu`: one
+thread per trace-size row, sums ~(num_parts + num_total_cols ×
+num_eval_points) ext3 FMA contributions, reading main LDE (base) and
+aux LDE (ext3 de-interleaved) from the device handles plus
+composition-parts LDE + scalar arrays H2D'd fresh each call.
+
+Parity test `tests/deep.rs` covers small/medium/no-aux shapes against
+a direct CPU port of the prover's row-wise loop.
+
+Plumbing:
+  - `coset_lde_batch_{base,ext3}_into_with_merkle_tree_keep` —
+    variants that return `Arc<CudaSlice<u64>>` instead of dropping it.
+  - `try_expand_leaf_and_tree_batched{,_ext3}_keep` — thin stark-side
+    wrappers that propagate the handle.
+  - `MainTraceCommitResult` struct replaces the 6-tuple return of
+    `commit_main_trace` / `commit_preprocessed_trace`; adds a 7th
+    `gpu_main: Option<GpuLdeBase>` field.
+  - `Lde` struct gets matching `gpu_main` / `gpu_aux` fields.
+  - `LDETraceTable` gains cfg-gated `gpu_main` / `gpu_aux` fields and
+    set/get accessors.
+
+Benchmark (cargo test bench_gpu, median of 3 runs × 5 trials):
+  fib_1M: 13.02 s → 12.27 s  (−5.8 %, 1.49× vs CPU 18.27 s)
+  fib_4M: 32.09 s → 29.75 s  (−7.3 %)
+
+Correctness: 121 stark cuda tests + 43 math-cuda parity tests pass.
+---
+ crypto/math-cuda/build.rs        |   1 +
+ crypto/math-cuda/kernels/deep.cu | 117 ++++++++++
+ crypto/math-cuda/src/deep.rs     | 122 +++++++++++
+ crypto/math-cuda/src/device.rs   |   6 +
+ crypto/math-cuda/src/lde.rs      | 139 +++++++++++-
+ crypto/math-cuda/src/lib.rs      |   1 +
+ crypto/math-cuda/tests/deep.rs   | 286 +++++++++++++++++++++++++
+ crypto/stark/src/gpu_lde.rs      | 356 +++++++++++++++++++++++++++++++
+ crypto/stark/src/prover.rs       | 258 +++++++++++++++-------
+ crypto/stark/src/trace.rs        |  38 ++++
+ prover/tests/bench_gpu.rs        |   2 +
+ 11 files changed, 1247 insertions(+), 79 deletions(-)
+ create mode 100644 crypto/math-cuda/kernels/deep.cu
+ create mode 100644 crypto/math-cuda/src/deep.rs
+ create mode 100644 crypto/math-cuda/tests/deep.rs
+
+diff --git a/crypto/math-cuda/build.rs b/crypto/math-cuda/build.rs
+index e7269469..8d3d7a06 100644
+--- a/crypto/math-cuda/build.rs
++++ b/crypto/math-cuda/build.rs
+@@ -56,4 +56,5 @@ fn main() {
+     compile_ptx("ntt.cu", "ntt.ptx");
+     compile_ptx("keccak.cu", "keccak.ptx");
+     compile_ptx("barycentric.cu", "barycentric.ptx");
++    compile_ptx("deep.cu", "deep.ptx");
+ }
+diff --git a/crypto/math-cuda/kernels/deep.cu b/crypto/math-cuda/kernels/deep.cu
+new file mode 100644
+index 00000000..b723d17b
+--- /dev/null
++++ b/crypto/math-cuda/kernels/deep.cu
+@@ -0,0 +1,117 @@
++// R4 deep composition polynomial evaluations.
++//
++// For each trace-size row i in 0..domain_size, accumulate:
++//   result_i = Σ_j  γ_j · (H_j(x_i) − H_j(z^K)) · inv_h[i]           (H terms)
++//            + Σ_j Σ_k γ'_{j,k} · (t_j(x_i) − t_j(z·w^k)) · inv_t[k,i]  (trace)
++//
++// where x_i = LDE coset point at stride `blowup_factor` (so the kernel
++// reads LDE column data at `i * blowup_factor`). `j` ranges over
++// num_parts for H-terms and num_total_cols (= num_main + num_aux) for
++// trace terms. `k` ranges over num_eval_points.
++//
++// Buffer layouts (ALL on device):
++//   main_lde    base, row-major per column: main_lde[c * lde_stride + r]
++//   aux_lde     ext3 de-interleaved: aux_lde[(c*3 + k) * lde_stride + r]
++//   h_lde       ext3 de-interleaved: h_lde[(p*3 + k) * lde_stride + r]
++//   h_ood       num_parts * 3  (ext3 interleaved)
++//   trace_ood   num_total_cols * num_eval_points * 3 (ext3 interleaved,
++//               indexed as (col_idx * num_eval_points + k) * 3 + comp)
++//   gammas_h    num_parts * 3
++//   gammas_tr   num_total_cols * num_eval_points * 3
++//   inv_h       domain_size * 3
++//   inv_t       num_eval_points * domain_size * 3
++//   deep_out    domain_size * 3 (ext3 interleaved; caller reinterprets)
++
++#include "goldilocks.cuh"
++#include "ext3.cuh"
++
++extern "C" __global__ void deep_composition_ext3_row(
++    const uint64_t *main_lde,
++    const uint64_t *aux_lde,
++    const uint64_t *h_lde,
++    uint64_t lde_stride,
++    uint64_t num_main,
++    uint64_t num_aux,
++    uint64_t num_parts,
++    uint64_t num_eval_points,
++    uint64_t blowup_factor,
++    uint64_t domain_size,
++    const uint64_t *h_ood,
++    const uint64_t *trace_ood,
++    const uint64_t *gammas_h,
++    const uint64_t *gammas_tr,
++    const uint64_t *inv_h,
++    const uint64_t *inv_t,
++    uint64_t *deep_out) {
++    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= domain_size) return;
++    uint64_t row = i * blowup_factor;
++
++    ext3::Fe3 result = ext3::zero();
++    ext3::Fe3 inv_h_i = {inv_h[i * 3], inv_h[i * 3 + 1], inv_h[i * 3 + 2]};
++
++    // H-terms
++    for (uint64_t j = 0; j < num_parts; ++j) {
++        ext3::Fe3 h_val = {
++            h_lde[(j * 3 + 0) * lde_stride + row],
++            h_lde[(j * 3 + 1) * lde_stride + row],
++            h_lde[(j * 3 + 2) * lde_stride + row],
++        };
++        ext3::Fe3 h_ood_j = {h_ood[j * 3], h_ood[j * 3 + 1], h_ood[j * 3 + 2]};
++        ext3::Fe3 num = ext3::sub(h_val, h_ood_j);
++        ext3::Fe3 gamma = {gammas_h[j * 3], gammas_h[j * 3 + 1], gammas_h[j * 3 + 2]};
++        ext3::Fe3 tmp = ext3::mul(gamma, num);
++        tmp = ext3::mul(tmp, inv_h_i);
++        result = ext3::add(result, tmp);
++    }
++
++    uint64_t num_total_cols = num_main + num_aux;
++
++    // Main trace terms (base column - ext3 OOD)
++    for (uint64_t j = 0; j < num_main; ++j) {
++        uint64_t t_val = main_lde[j * lde_stride + row];
++        for (uint64_t k = 0; k < num_eval_points; ++k) {
++            uint64_t idx = (j * num_eval_points + k) * 3;
++            ext3::Fe3 t_ood = {trace_ood[idx], trace_ood[idx + 1], trace_ood[idx + 2]};
++            ext3::Fe3 num = {
++                goldilocks::sub(t_val, t_ood.a),
++                goldilocks::neg(t_ood.b),
++                goldilocks::neg(t_ood.c),
++            };
++            ext3::Fe3 gamma = {gammas_tr[idx], gammas_tr[idx + 1], gammas_tr[idx + 2]};
++            uint64_t inv_t_idx = (k * domain_size + i) * 3;
++            ext3::Fe3 inv_t_ki = {inv_t[inv_t_idx], inv_t[inv_t_idx + 1], inv_t[inv_t_idx + 2]};
++            ext3::Fe3 tmp = ext3::mul(gamma, num);
++            tmp = ext3::mul(tmp, inv_t_ki);
++            result = ext3::add(result, tmp);
++        }
++    }
++
++    // Aux trace terms (ext3 column - ext3 OOD)
++    for (uint64_t j = 0; j < num_aux; ++j) {
++        ext3::Fe3 t_val = {
++            aux_lde[(j * 3 + 0) * lde_stride + row],
++            aux_lde[(j * 3 + 1) * lde_stride + row],
++            aux_lde[(j * 3 + 2) * lde_stride + row],
++        };
++        uint64_t trace_j = num_main + j;
++        for (uint64_t k = 0; k < num_eval_points; ++k) {
++            uint64_t idx = (trace_j * num_eval_points + k) * 3;
++            ext3::Fe3 t_ood = {trace_ood[idx], trace_ood[idx + 1], trace_ood[idx + 2]};
++            ext3::Fe3 num = ext3::sub(t_val, t_ood);
++            ext3::Fe3 gamma = {gammas_tr[idx], gammas_tr[idx + 1], gammas_tr[idx + 2]};
++            uint64_t inv_t_idx = (k * domain_size + i) * 3;
++            ext3::Fe3 inv_t_ki = {inv_t[inv_t_idx], inv_t[inv_t_idx + 1], inv_t[inv_t_idx + 2]};
++            ext3::Fe3 tmp = ext3::mul(gamma, num);
++            tmp = ext3::mul(tmp, inv_t_ki);
++            result = ext3::add(result, tmp);
++        }
++    }
++
++    uint64_t out_idx = i * 3;
++    deep_out[out_idx + 0] = result.a;
++    deep_out[out_idx + 1] = result.b;
++    deep_out[out_idx + 2] = result.c;
++    // Suppress unused param warning when num_total_cols not referenced.
++    (void)num_total_cols;
++}
+diff --git a/crypto/math-cuda/src/deep.rs b/crypto/math-cuda/src/deep.rs
+new file mode 100644
+index 00000000..9514c52a
+--- /dev/null
++++ b/crypto/math-cuda/src/deep.rs
+@@ -0,0 +1,122 @@
++//! R4 deep-composition polynomial evaluations on GPU.
++//!
++//! Mirrors `Self::compute_deep_composition_poly_evaluations` in
++//! `crypto/stark/src/prover.rs`. Accepts the main/aux LDEs as device
++//! handles (populated by the R1 fused path in `LDETraceTable`) and
++//! takes every other tensor (composition parts LDE, OOD evals,
++//! gammas, inv-denoms) from host. Returns a `Vec<u64>` of
++//! `domain_size * 3` u64s, ext3 interleaved (ready to `transmute` to
++//! `FieldElement<Ext3>` when the caller promises layout compatibility).
++
++use cudarc::driver::{LaunchConfig, PushKernelArg};
++
++use crate::Result;
++use crate::device::backend;
++use crate::lde::{GpuLdeBase, GpuLdeExt3};
++
++/// Compute deep-composition evaluations on device.
++///
++/// `num_eval_points = trace_terms_gammas_interleaved.len() / ((num_main +
++/// num_aux) * 3)`. The caller is responsible for packing each Vec<ext3>
++/// into interleaved u64 slices (`[a0, a1, a2, b0, b1, b2, ...]`).
++#[allow(clippy::too_many_arguments)]
++pub fn deep_composition_ext3(
++    main_lde: &GpuLdeBase,
++    aux_lde: Option<&GpuLdeExt3>,
++    // Host-side inputs (H2D'd internally)
++    h_parts_deinterleaved: &[u64], // num_parts * 3 * lde_stride u64
++    h_ood: &[u64],                  // num_parts * 3
++    trace_ood: &[u64],              // num_total_cols * num_eval_points * 3
++    gammas_h: &[u64],               // num_parts * 3
++    gammas_tr: &[u64],              // num_total_cols * num_eval_points * 3
++    inv_h: &[u64],                  // domain_size * 3
++    inv_t: &[u64],                  // num_eval_points * domain_size * 3
++    // Shape params
++    num_parts: usize,
++    num_main: usize,
++    num_aux: usize,
++    num_eval_points: usize,
++    blowup_factor: usize,
++    domain_size: usize,
++) -> Result<Vec<u64>> {
++    assert_eq!(main_lde.m, num_main);
++    if let Some(a) = aux_lde {
++        assert_eq!(a.m, num_aux);
++        assert_eq!(a.lde_size, main_lde.lde_size);
++    } else {
++        assert_eq!(num_aux, 0);
++    }
++    assert_eq!(h_parts_deinterleaved.len(), num_parts * 3 * main_lde.lde_size);
++    assert_eq!(h_ood.len(), num_parts * 3);
++    let num_total_cols = num_main + num_aux;
++    assert_eq!(trace_ood.len(), num_total_cols * num_eval_points * 3);
++    assert_eq!(gammas_h.len(), num_parts * 3);
++    assert_eq!(gammas_tr.len(), num_total_cols * num_eval_points * 3);
++    assert_eq!(inv_h.len(), domain_size * 3);
++    assert_eq!(inv_t.len(), num_eval_points * domain_size * 3);
++
++    let be = backend();
++    let stream = be.next_stream();
++
++    // H2D the host-side arrays.
++    let h_lde_dev = stream.clone_htod(h_parts_deinterleaved)?;
++    let h_ood_dev = stream.clone_htod(h_ood)?;
++    let trace_ood_dev = stream.clone_htod(trace_ood)?;
++    let gammas_h_dev = stream.clone_htod(gammas_h)?;
++    let gammas_tr_dev = stream.clone_htod(gammas_tr)?;
++    let inv_h_dev = stream.clone_htod(inv_h)?;
++    let inv_t_dev = stream.clone_htod(inv_t)?;
++
++    let mut deep_out = stream.alloc_zeros::<u64>(domain_size * 3)?;
++
++    // Dummy zero-sized aux LDE buffer when num_aux == 0 — the kernel's aux
++    // loop skips iteration but the pointer still needs to be valid.
++    let dummy_aux;
++    let aux_slice = if let Some(a) = aux_lde {
++        a.buf.as_ref()
++    } else {
++        dummy_aux = stream.alloc_zeros::<u64>(1)?;
++        &dummy_aux
++    };
++
++    let lde_stride = main_lde.lde_size as u64;
++    let num_main_u = num_main as u64;
++    let num_aux_u = num_aux as u64;
++    let num_parts_u = num_parts as u64;
++    let num_eval_points_u = num_eval_points as u64;
++    let blowup_u = blowup_factor as u64;
++    let domain_size_u = domain_size as u64;
++
++    let grid = ((domain_size as u32) + 128 - 1) / 128;
++    let cfg = LaunchConfig {
++        grid_dim: (grid, 1, 1),
++        block_dim: (128, 1, 1),
++        shared_mem_bytes: 0,
++    };
++    unsafe {
++        stream
++            .launch_builder(&be.deep_composition_ext3_row)
++            .arg(main_lde.buf.as_ref())
++            .arg(aux_slice)
++            .arg(&h_lde_dev)
++            .arg(&lde_stride)
++            .arg(&num_main_u)
++            .arg(&num_aux_u)
++            .arg(&num_parts_u)
++            .arg(&num_eval_points_u)
++            .arg(&blowup_u)
++            .arg(&domain_size_u)
++            .arg(&h_ood_dev)
++            .arg(&trace_ood_dev)
++            .arg(&gammas_h_dev)
++            .arg(&gammas_tr_dev)
++            .arg(&inv_h_dev)
++            .arg(&inv_t_dev)
++            .arg(&mut deep_out)
++            .launch(cfg)?;
++    }
++
++    let out = stream.clone_dtoh(&deep_out)?;
++    stream.synchronize()?;
++    Ok(out)
++}
+diff --git a/crypto/math-cuda/src/device.rs b/crypto/math-cuda/src/device.rs
+index 206e912e..ec59a163 100644
+--- a/crypto/math-cuda/src/device.rs
++++ b/crypto/math-cuda/src/device.rs
+@@ -97,6 +97,7 @@ const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
+ const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
+ const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
+ const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
++const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
+ /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
+ /// callers overlap on the GPU without serializing on stream ownership. The
+ /// default stream is deliberately excluded because it synchronises with all
+@@ -152,6 +153,9 @@ pub struct Backend {
+     pub barycentric_base_batched: CudaFunction,
+     pub barycentric_ext3_batched: CudaFunction,
+ 
++    // deep.ptx
++    pub deep_composition_ext3_row: CudaFunction,
++
+     // Twiddle caches keyed by log_n.
+     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
+     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
+@@ -170,6 +174,7 @@ impl Backend {
+         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
+         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
+         let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
++        let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
+ 
+         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
+         for _ in 0..STREAM_POOL_SIZE {
+@@ -210,6 +215,7 @@ impl Backend {
+             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
+             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
++            deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
+             fwd_twiddles: Mutex::new(vec![None; max_log]),
+             inv_twiddles: Mutex::new(vec![None; max_log]),
+             ctx,
+diff --git a/crypto/math-cuda/src/lde.rs b/crypto/math-cuda/src/lde.rs
+index b9ccebfb..a891b593 100644
+--- a/crypto/math-cuda/src/lde.rs
++++ b/crypto/math-cuda/src/lde.rs
+@@ -10,13 +10,35 @@
+ //! On-device steps, picks a stream from the shared pool so rayon-parallel
+ //! callers overlap on the GPU. Twiddles are cached in the backend.
+ 
+-use cudarc::driver::{LaunchConfig, PushKernelArg};
++use std::sync::Arc;
++
++use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+ 
+ use crate::Result;
+ use crate::device::backend;
+ use crate::merkle::{launch_keccak_base, launch_keccak_ext3};
+ use crate::ntt::run_ntt_body;
+ 
++/// Handle to a base-field LDE kept live on device after R1 commit.
++/// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
++/// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
++#[derive(Clone)]
++pub struct GpuLdeBase {
++    pub buf: Arc<CudaSlice<u64>>,
++    pub m: usize,
++    pub lde_size: usize,
++}
++
++/// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
++/// slabs per column. Column `c` component `k` at u64 offset
++/// `(c*3 + k) * lde_size` within `buf`.
++#[derive(Clone)]
++pub struct GpuLdeExt3 {
++    pub buf: Arc<CudaSlice<u64>>,
++    pub m: usize,
++    pub lde_size: usize,
++}
++
+ pub fn coset_lde_base(
+     evals: &[u64],
+     blowup_factor: usize,
+@@ -663,9 +685,50 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
+     outputs: &mut [&mut [u64]],
+     merkle_nodes_out: &mut [u8],
+ ) -> Result<()> {
++    coset_lde_batch_base_into_with_merkle_tree_inner(
++        columns,
++        blowup_factor,
++        weights,
++        outputs,
++        merkle_nodes_out,
++        false,
++    )
++    .map(|_| ())
++}
++
++/// Fused LDE + leaf-hash + Merkle tree build. If `keep_device_buf` is true,
++/// returns an `Arc<CudaSlice<u64>>` wrapping the LDE device buffer so callers
++/// (R2–R4 GPU paths) can reuse the LDE without a re-H2D.
++pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
++    columns: &[&[u64]],
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++    merkle_nodes_out: &mut [u8],
++) -> Result<GpuLdeBase> {
++    let opt = coset_lde_batch_base_into_with_merkle_tree_inner(
++        columns,
++        blowup_factor,
++        weights,
++        outputs,
++        merkle_nodes_out,
++        true,
++    )?;
++    let handle = opt.expect("keep_device_buf=true must return Some");
++    Ok(handle)
++}
++
++fn coset_lde_batch_base_into_with_merkle_tree_inner(
++    columns: &[&[u64]],
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++    merkle_nodes_out: &mut [u8],
++    keep_device_buf: bool,
++) -> Result<Option<GpuLdeBase>> {
+     if columns.is_empty() {
+         assert_eq!(outputs.len(), 0);
+-        return Ok(());
++        return Ok(None);
+     }
+     let m = columns.len();
+     assert_eq!(outputs.len(), m);
+@@ -878,7 +941,17 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
+         });
+     drop(tree_staging);
+     drop(staging);
+-    Ok(())
++
++    if keep_device_buf {
++        Ok(Some(GpuLdeBase {
++            buf: Arc::new(buf),
++            m,
++            lde_size,
++        }))
++    } else {
++        drop(buf);
++        Ok(None)
++    }
+ }
+ 
+ /// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: run an LDE
+@@ -1102,9 +1175,53 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
+     outputs: &mut [&mut [u64]],
+     merkle_nodes_out: &mut [u8],
+ ) -> Result<()> {
++    coset_lde_batch_ext3_into_with_merkle_tree_inner(
++        columns,
++        n,
++        blowup_factor,
++        weights,
++        outputs,
++        merkle_nodes_out,
++        false,
++    )
++    .map(|_| ())
++}
++
++/// Ext3 variant of [`coset_lde_batch_base_into_with_merkle_tree_keep`] —
++/// returns an `Arc<CudaSlice<u64>>` handle to the de-interleaved LDE device
++/// buffer.
++pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
++    columns: &[&[u64]],
++    n: usize,
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++    merkle_nodes_out: &mut [u8],
++) -> Result<GpuLdeExt3> {
++    let opt = coset_lde_batch_ext3_into_with_merkle_tree_inner(
++        columns,
++        n,
++        blowup_factor,
++        weights,
++        outputs,
++        merkle_nodes_out,
++        true,
++    )?;
++    Ok(opt.expect("keep_device_buf=true must return Some"))
++}
++
++fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
++    columns: &[&[u64]],
++    n: usize,
++    blowup_factor: usize,
++    weights: &[u64],
++    outputs: &mut [&mut [u64]],
++    merkle_nodes_out: &mut [u8],
++    keep_device_buf: bool,
++) -> Result<Option<GpuLdeExt3>> {
+     if columns.is_empty() {
+         assert_eq!(outputs.len(), 0);
+-        return Ok(());
++        return Ok(None);
+     }
+     let m = columns.len();
+     assert_eq!(outputs.len(), m);
+@@ -1121,7 +1238,7 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
+     let total_nodes = 2 * lde_size - 1;
+     assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
+     if n == 0 {
+-        return Ok(());
++        return Ok(None);
+     }
+     let log_n = n.trailing_zeros() as u64;
+     let log_lde = lde_size.trailing_zeros() as u64;
+@@ -1335,7 +1452,17 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
+         });
+     drop(tree_staging);
+     drop(staging);
+-    Ok(())
++
++    if keep_device_buf {
++        Ok(Some(GpuLdeExt3 {
++            buf: Arc::new(buf),
++            m,
++            lde_size,
++        }))
++    } else {
++        drop(buf);
++        Ok(None)
++    }
+ }
+ 
+ /// Batched ext3 polynomial → coset evaluation.
+diff --git a/crypto/math-cuda/src/lib.rs b/crypto/math-cuda/src/lib.rs
+index d74b495e..07a81f18 100644
+--- a/crypto/math-cuda/src/lib.rs
++++ b/crypto/math-cuda/src/lib.rs
+@@ -5,6 +5,7 @@
+ //! parity test suite.
+ 
+ pub mod barycentric;
++pub mod deep;
+ pub mod device;
+ pub mod lde;
+ pub mod merkle;
+diff --git a/crypto/math-cuda/tests/deep.rs b/crypto/math-cuda/tests/deep.rs
+new file mode 100644
+index 00000000..4a03ddc5
+--- /dev/null
++++ b/crypto/math-cuda/tests/deep.rs
+@@ -0,0 +1,286 @@
++//! Parity: GPU deep_composition_ext3 vs a direct CPU port of the same
++//! row-wise summation. Uses random inputs — not the full stark LDE path.
++
++use math::field::element::FieldElement;
++use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
++use math::field::goldilocks::GoldilocksField;
++use math::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
++use rand::{Rng, SeedableRng};
++use rand_chacha::ChaCha8Rng;
++
++type Fp = FieldElement<GoldilocksField>;
++type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
++
++fn rand_fp(rng: &mut ChaCha8Rng) -> Fp {
++    Fp::from_raw(rng.r#gen::<u64>())
++}
++fn rand_fp3(rng: &mut ChaCha8Rng) -> Fp3 {
++    Fp3::new([rand_fp(rng), rand_fp(rng), rand_fp(rng)])
++}
++
++fn ext3_to_raw(e: &Fp3) -> [u64; 3] {
++    [*e.value()[0].value(), *e.value()[1].value(), *e.value()[2].value()]
++}
++
++fn canon3(e: &Fp3) -> [u64; 3] {
++    [
++        GoldilocksField::canonical(e.value()[0].value()),
++        GoldilocksField::canonical(e.value()[1].value()),
++        GoldilocksField::canonical(e.value()[2].value()),
++    ]
++}
++
++/// CPU reference: exact port of `compute_deep_composition_poly_evaluations`.
++#[allow(clippy::too_many_arguments)]
++fn cpu_deep(
++    main_lde: &[Vec<Fp>],                  // num_main cols × lde_size
++    aux_lde: &[Vec<Fp3>],                  // num_aux cols × lde_size
++    h_lde: &[Vec<Fp3>],                    // num_parts × lde_size
++    h_ood: &[Fp3],                         // num_parts
++    trace_ood: &[Vec<Fp3>],                // num_total_cols × num_eval_points
++    gammas_h: &[Fp3],                      // num_parts
++    gammas_tr: &[Vec<Fp3>],                // num_total_cols × num_eval_points
++    inv_h: &[Fp3],                         // domain_size
++    inv_t: &[Vec<Fp3>],                    // num_eval_points × domain_size
++    blowup_factor: usize,
++    domain_size: usize,
++) -> Vec<Fp3> {
++    let num_parts = h_lde.len();
++    let num_main = main_lde.len();
++    let num_aux = aux_lde.len();
++    let num_eval_points = if trace_ood.is_empty() {
++        0
++    } else {
++        trace_ood[0].len()
++    };
++
++    (0..domain_size)
++        .map(|i| {
++            let row = i * blowup_factor;
++            let mut result = Fp3::zero();
++            // H-terms
++            for j in 0..num_parts {
++                let num = &h_lde[j][row] - &h_ood[j];
++                result += &gammas_h[j] * &num * &inv_h[i];
++            }
++            // Main
++            for j in 0..num_main {
++                for k in 0..num_eval_points {
++                    let t_val = &main_lde[j][row];
++                    let t_ood = &trace_ood[j][k];
++                    let num = t_val - t_ood; // base − ext3 = ext3
++                    result += &gammas_tr[j][k] * &num * &inv_t[k][i];
++                }
++            }
++            // Aux
++            for j in 0..num_aux {
++                let trace_j = num_main + j;
++                for k in 0..num_eval_points {
++                    let t_val = &aux_lde[j][row];
++                    let t_ood = &trace_ood[trace_j][k];
++                    let num = t_val - t_ood;
++                    result += &gammas_tr[trace_j][k] * &num * &inv_t[k][i];
++                }
++            }
++            result
++        })
++        .collect()
++}
++
++fn run_parity(
++    log_domain_size: u32,
++    blowup_factor: usize,
++    num_main: usize,
++    num_aux: usize,
++    num_parts: usize,
++    num_eval_points: usize,
++    seed: u64,
++) {
++    let domain_size = 1usize << log_domain_size;
++    let lde_size = domain_size * blowup_factor;
++    let mut rng = ChaCha8Rng::seed_from_u64(seed);
++
++    let main_lde: Vec<Vec<Fp>> = (0..num_main)
++        .map(|_| (0..lde_size).map(|_| rand_fp(&mut rng)).collect())
++        .collect();
++    let aux_lde: Vec<Vec<Fp3>> = (0..num_aux)
++        .map(|_| (0..lde_size).map(|_| rand_fp3(&mut rng)).collect())
++        .collect();
++    let h_lde: Vec<Vec<Fp3>> = (0..num_parts)
++        .map(|_| (0..lde_size).map(|_| rand_fp3(&mut rng)).collect())
++        .collect();
++    let h_ood: Vec<Fp3> = (0..num_parts).map(|_| rand_fp3(&mut rng)).collect();
++    let num_total_cols = num_main + num_aux;
++    let trace_ood: Vec<Vec<Fp3>> = (0..num_total_cols)
++        .map(|_| (0..num_eval_points).map(|_| rand_fp3(&mut rng)).collect())
++        .collect();
++    let gammas_h: Vec<Fp3> = (0..num_parts).map(|_| rand_fp3(&mut rng)).collect();
++    let gammas_tr: Vec<Vec<Fp3>> = (0..num_total_cols)
++        .map(|_| (0..num_eval_points).map(|_| rand_fp3(&mut rng)).collect())
++        .collect();
++    let inv_h: Vec<Fp3> = (0..domain_size).map(|_| rand_fp3(&mut rng)).collect();
++    let inv_t: Vec<Vec<Fp3>> = (0..num_eval_points)
++        .map(|_| (0..domain_size).map(|_| rand_fp3(&mut rng)).collect())
++        .collect();
++
++    // CPU reference.
++    let cpu_out = cpu_deep(
++        &main_lde, &aux_lde, &h_lde, &h_ood, &trace_ood, &gammas_h, &gammas_tr, &inv_h, &inv_t,
++        blowup_factor, domain_size,
++    );
++
++    // GPU: upload main & aux LDEs into device buffers and wrap in handles.
++    use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
++    let be = math_cuda::device::backend();
++    let stream = be.next_stream();
++
++    // main_lde → col-major u64: m × lde_size
++    let mut main_flat = vec![0u64; num_main * lde_size];
++    for (c, col) in main_lde.iter().enumerate() {
++        for (r, v) in col.iter().enumerate() {
++            main_flat[c * lde_size + r] = *v.value();
++        }
++    }
++    let main_dev = stream.clone_htod(&main_flat).unwrap();
++
++    // aux_lde → de-interleaved: (m*3) × lde_size
++    let mut aux_flat = vec![0u64; num_aux * 3 * lde_size];
++    for (c, col) in aux_lde.iter().enumerate() {
++        for (r, v) in col.iter().enumerate() {
++            let [a, b, c0] = ext3_to_raw(v);
++            aux_flat[(c * 3) * lde_size + r] = a;
++            aux_flat[(c * 3 + 1) * lde_size + r] = b;
++            aux_flat[(c * 3 + 2) * lde_size + r] = c0;
++        }
++    }
++    let aux_dev = stream.clone_htod(&aux_flat).unwrap();
++    stream.synchronize().unwrap();
++
++    let main_handle = GpuLdeBase {
++        buf: std::sync::Arc::new(main_dev),
++        m: num_main,
++        lde_size,
++    };
++    let aux_handle = if num_aux > 0 {
++        Some(GpuLdeExt3 {
++            buf: std::sync::Arc::new(aux_dev),
++            m: num_aux,
++            lde_size,
++        })
++    } else {
++        drop(aux_dev);
++        None
++    };
++
++    // h_parts → de-interleaved: num_parts*3 × lde_size
++    let mut h_flat = vec![0u64; num_parts * 3 * lde_size];
++    for (p, col) in h_lde.iter().enumerate() {
++        for (r, v) in col.iter().enumerate() {
++            let [a, b, c0] = ext3_to_raw(v);
++            h_flat[(p * 3) * lde_size + r] = a;
++            h_flat[(p * 3 + 1) * lde_size + r] = b;
++            h_flat[(p * 3 + 2) * lde_size + r] = c0;
++        }
++    }
++
++    let mut h_ood_flat = vec![0u64; num_parts * 3];
++    for (j, e) in h_ood.iter().enumerate() {
++        let [a, b, c] = ext3_to_raw(e);
++        h_ood_flat[j * 3] = a;
++        h_ood_flat[j * 3 + 1] = b;
++        h_ood_flat[j * 3 + 2] = c;
++    }
++    let mut trace_ood_flat = vec![0u64; num_total_cols * num_eval_points * 3];
++    for (j, col) in trace_ood.iter().enumerate() {
++        for (k, e) in col.iter().enumerate() {
++            let idx = (j * num_eval_points + k) * 3;
++            let [a, b, c] = ext3_to_raw(e);
++            trace_ood_flat[idx] = a;
++            trace_ood_flat[idx + 1] = b;
++            trace_ood_flat[idx + 2] = c;
++        }
++    }
++    let mut gammas_h_flat = vec![0u64; num_parts * 3];
++    for (j, e) in gammas_h.iter().enumerate() {
++        let [a, b, c] = ext3_to_raw(e);
++        gammas_h_flat[j * 3] = a;
++        gammas_h_flat[j * 3 + 1] = b;
++        gammas_h_flat[j * 3 + 2] = c;
++    }
++    let mut gammas_tr_flat = vec![0u64; num_total_cols * num_eval_points * 3];
++    for (j, col) in gammas_tr.iter().enumerate() {
++        for (k, e) in col.iter().enumerate() {
++            let idx = (j * num_eval_points + k) * 3;
++            let [a, b, c] = ext3_to_raw(e);
++            gammas_tr_flat[idx] = a;
++            gammas_tr_flat[idx + 1] = b;
++            gammas_tr_flat[idx + 2] = c;
++        }
++    }
++    let mut inv_h_flat = vec![0u64; domain_size * 3];
++    for (i, e) in inv_h.iter().enumerate() {
++        let [a, b, c] = ext3_to_raw(e);
++        inv_h_flat[i * 3] = a;
++        inv_h_flat[i * 3 + 1] = b;
++        inv_h_flat[i * 3 + 2] = c;
++    }
++    let mut inv_t_flat = vec![0u64; num_eval_points * domain_size * 3];
++    for (k, layer) in inv_t.iter().enumerate() {
++        for (i, e) in layer.iter().enumerate() {
++            let idx = (k * domain_size + i) * 3;
++            let [a, b, c] = ext3_to_raw(e);
++            inv_t_flat[idx] = a;
++            inv_t_flat[idx + 1] = b;
++            inv_t_flat[idx + 2] = c;
++        }
++    }
++
++    let gpu_raw = math_cuda::deep::deep_composition_ext3(
++        &main_handle,
++        aux_handle.as_ref(),
++        &h_flat,
++        &h_ood_flat,
++        &trace_ood_flat,
++        &gammas_h_flat,
++        &gammas_tr_flat,
++        &inv_h_flat,
++        &inv_t_flat,
++        num_parts,
++        num_main,
++        num_aux,
++        num_eval_points,
++        blowup_factor,
++        domain_size,
++    )
++    .unwrap();
++
++    for i in 0..domain_size {
++        let gpu = [gpu_raw[i * 3], gpu_raw[i * 3 + 1], gpu_raw[i * 3 + 2]];
++        let gpu_canon = [
++            GoldilocksField::canonical(&gpu[0]),
++            GoldilocksField::canonical(&gpu[1]),
++            GoldilocksField::canonical(&gpu[2]),
++        ];
++        let cpu_canon = canon3(&cpu_out[i]);
++        assert_eq!(
++            gpu_canon, cpu_canon,
++            "row {i} mismatch at log_ds={log_domain_size} main={num_main} aux={num_aux} parts={num_parts}"
++        );
++    }
++}
++
++#[test]
++fn deep_parity_small() {
++    run_parity(4, 2, 3, 2, 2, 1, 100);
++    run_parity(6, 4, 5, 3, 2, 2, 200);
++}
++
++#[test]
++fn deep_parity_medium() {
++    run_parity(10, 2, 10, 5, 4, 3, 1000);
++}
++
++#[test]
++fn deep_parity_no_aux() {
++    run_parity(8, 2, 5, 0, 2, 2, 5000);
++}
+diff --git a/crypto/stark/src/gpu_lde.rs b/crypto/stark/src/gpu_lde.rs
+index 940cf4dc..bab2f040 100644
+--- a/crypto/stark/src/gpu_lde.rs
++++ b/crypto/stark/src/gpu_lde.rs
+@@ -731,6 +731,7 @@ pub fn gpu_leaf_hash_calls() -> u64 {
+ /// the pinned→pageable→pinned leaf dance of the separate-step pipeline.
+ /// Returns the filled `MerkleTree<B>` alongside populating `columns` with
+ /// the LDE-expanded evaluations.
++#[allow(dead_code)]
+ pub(crate) fn try_expand_leaf_and_tree_batched<F, E, B>(
+     columns: &mut [Vec<FieldElement<E>>],
+     blowup_factor: usize,
+@@ -816,10 +817,101 @@ where
+     crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
+ }
+ 
++/// Same as [`try_expand_leaf_and_tree_batched`] but ALSO retains the LDE
++/// device buffer so R2–R4 GPU paths can reuse the LDE without a re-H2D.
++/// Returns `(tree, gpu_handle)` on success, `None` if the GPU path doesn't
++/// apply (same gates as the non-`_keep` variant).
++pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
++    columns: &mut [Vec<FieldElement<E>>],
++    blowup_factor: usize,
++    weights: &[FieldElement<F>],
++) -> Option<(
++    crypto::merkle_tree::merkle::MerkleTree<B>,
++    math_cuda::lde::GpuLdeBase,
++)>
++where
++    F: IsField,
++    E: IsField,
++    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
++{
++    if columns.is_empty() {
++        return None;
++    }
++    let n = columns[0].len();
++    let lde_size = n.saturating_mul(blowup_factor);
++    if lde_size < gpu_lde_threshold() {
++        return None;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if columns.iter().any(|c| c.len() != n) {
++        return None;
++    }
++    if lde_size < 2 {
++        return None;
++    }
++
++    let raw_columns: Vec<Vec<u64>> = columns
++        .iter()
++        .map(|col| {
++            col.iter()
++                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
++                .collect()
++        })
++        .collect();
++    let weights_u64: Vec<u64> = weights
++        .iter()
++        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
++        .collect();
++
++    for col in columns.iter_mut() {
++        debug_assert!(col.capacity() >= lde_size);
++        unsafe { col.set_len(lde_size) };
++    }
++    let mut raw_outputs: Vec<&mut [u64]> = columns
++        .iter_mut()
++        .map(|col| {
++            let ptr = col.as_mut_ptr() as *mut u64;
++            let len = col.len();
++            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
++        })
++        .collect();
++
++    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
++
++    let total_nodes = 2 * lde_size - 1;
++    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
++    unsafe { nodes.set_len(total_nodes) };
++    let nodes_bytes: &mut [u8] = unsafe {
++        core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32)
++    };
++
++    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
++    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    let handle = math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
++        &slices,
++        blowup_factor,
++        &weights_u64,
++        &mut raw_outputs,
++        nodes_bytes,
++    )
++    .expect("GPU LDE+leaf-hash+tree+keep failed");
++
++    let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
++    Some((tree, handle))
++}
++
+ /// Ext3 variant of [`try_expand_leaf_and_tree_batched`]. Same fused flow
+ /// (LDE → leaf-hash → tree build) but over ext3 columns via the three-slab
+ /// decomposition; `B::Node = [u8; 32]` by construction for
+ /// `BatchKeccak256Backend<Ext3>`.
++#[allow(dead_code)]
+ pub(crate) fn try_expand_leaf_and_tree_batched_ext3<F, E, B>(
+     columns: &mut [Vec<FieldElement<E>>],
+     blowup_factor: usize,
+@@ -902,6 +994,93 @@ where
+     crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
+ }
+ 
++/// Same as [`try_expand_leaf_and_tree_batched_ext3`] but also returns the
++/// ext3 LDE device buffer (de-interleaved 3-slab layout) so downstream GPU
++/// rounds can reuse it.
++pub(crate) fn try_expand_leaf_and_tree_batched_ext3_keep<F, E, B>(
++    columns: &mut [Vec<FieldElement<E>>],
++    blowup_factor: usize,
++    weights: &[FieldElement<F>],
++) -> Option<(
++    crypto::merkle_tree::merkle::MerkleTree<B>,
++    math_cuda::lde::GpuLdeExt3,
++)>
++where
++    F: IsField,
++    E: IsField,
++    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
++{
++    if columns.is_empty() {
++        return None;
++    }
++    let n = columns[0].len();
++    let lde_size = n.saturating_mul(blowup_factor);
++    if lde_size < gpu_lde_threshold() {
++        return None;
++    }
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++    if lde_size < 2 {
++        return None;
++    }
++
++    let raw_columns: Vec<Vec<u64>> = columns
++        .iter()
++        .map(|col| {
++            let len = col.len() * 3;
++            let ptr = col.as_ptr() as *const u64;
++            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
++        })
++        .collect();
++    let weights_u64: Vec<u64> = weights
++        .iter()
++        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
++        .collect();
++
++    for col in columns.iter_mut() {
++        debug_assert!(col.capacity() >= lde_size);
++        unsafe { col.set_len(lde_size) };
++    }
++    let mut raw_outputs: Vec<&mut [u64]> = columns
++        .iter_mut()
++        .map(|col| {
++            let ptr = col.as_mut_ptr() as *mut u64;
++            let len = col.len() * 3;
++            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
++        })
++        .collect();
++
++    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
++
++    let total_nodes = 2 * lde_size - 1;
++    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
++    unsafe { nodes.set_len(total_nodes) };
++    let nodes_bytes: &mut [u8] = unsafe {
++        core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32)
++    };
++
++    GPU_LDE_CALLS.fetch_add((columns.len() * 3) as u64, std::sync::atomic::Ordering::Relaxed);
++    GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    let handle = math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
++        &slices,
++        n,
++        blowup_factor,
++        &weights_u64,
++        &mut raw_outputs,
++        nodes_bytes,
++    )
++    .expect("GPU ext3 LDE+leaf-hash+tree+keep failed");
++
++    let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
++    Some((tree, handle))
++}
++
+ /// Ext3 variant of [`try_expand_and_leaf_hash_batched`] for the aux trace.
+ /// Decomposes each ext3 column into three base slabs, runs the LDE + Keccak
+ /// ext3 kernel in one on-device pipeline, re-interleaves LDE output back to
+@@ -1083,6 +1262,183 @@ pub fn gpu_bary_calls() -> u64 {
+     GPU_BARY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
++static GPU_DEEP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub fn gpu_deep_calls() -> u64 {
++    GPU_DEEP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// GPU path for `compute_deep_composition_poly_evaluations`. Returns the N
++/// trace-size coset evaluations of the deep-composition polynomial as a
++/// `Vec<FieldElement<E>>` (same type as the CPU path), or `None` when the
++/// GPU is skipped (small tables, handle absent, type mismatch).
++///
++/// Reads the main/aux LDE from the device handles stored on the
++/// `LDETraceTable` by R1, avoiding a re-H2D of the largest tensor in R4.
++/// Composition-parts LDE + scalar arrays are still H2D'd fresh each call.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn try_deep_composition_gpu<F, E>(
++    lde_trace: &crate::trace::LDETraceTable<F, E>,
++    h_lde_parts: &[Vec<FieldElement<E>>],
++    h_ood: &[FieldElement<E>],
++    trace_ood_cols: &[Vec<FieldElement<E>>], // num_total_cols × num_eval_points
++    gammas_h: &[FieldElement<E>],
++    gammas_tr_flat: &[Vec<FieldElement<E>>], // num_total_cols × num_eval_points
++    inv_h: &[FieldElement<E>],
++    inv_t: &[Vec<FieldElement<E>>], // num_eval_points × domain_size
++    num_eval_points: usize,
++    blowup_factor: usize,
++    domain_size: usize,
++) -> Option<Vec<FieldElement<E>>>
++where
++    F: IsField + IsSubFieldOf<E>,
++    E: IsField,
++{
++    if type_name::<F>() != type_name::<GoldilocksField>() {
++        return None;
++    }
++    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
++        return None;
++    }
++
++    let main_handle = lde_trace.gpu_main()?.clone();
++    let aux_handle_opt = lde_trace.gpu_aux().cloned();
++    let num_main = main_handle.m;
++    let lde_size = main_handle.lde_size;
++    if lde_size < gpu_lde_threshold() {
++        return None;
++    }
++    let num_aux = aux_handle_opt.as_ref().map(|a| a.m).unwrap_or(0);
++    let num_parts = h_lde_parts.len();
++    let num_total_cols = num_main + num_aux;
++
++    if h_lde_parts.iter().any(|p| p.len() != lde_size) {
++        return None;
++    }
++
++    GPU_DEEP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
++    // Pack: h_parts de-interleaved (num_parts × 3 × lde_size).
++    let mut h_flat = vec![0u64; num_parts * 3 * lde_size];
++    {
++        #[cfg(feature = "parallel")]
++        let iter = h_lde_parts.par_iter().enumerate();
++        #[cfg(not(feature = "parallel"))]
++        let iter = h_lde_parts.iter().enumerate();
++        let ptr = h_flat.as_mut_ptr() as usize;
++        iter.for_each(|(p, col)| {
++            // SAFETY: E == Ext3; FieldElement<E> is [u64; 3] at runtime.
++            let src = unsafe { core::slice::from_raw_parts(col.as_ptr() as *const u64, lde_size * 3) };
++            unsafe {
++                let base = ptr as *mut u64;
++                let slab0 = base.add((p * 3) * lde_size);
++                let slab1 = base.add((p * 3 + 1) * lde_size);
++                let slab2 = base.add((p * 3 + 2) * lde_size);
++                for r in 0..lde_size {
++                    *slab0.add(r) = src[r * 3];
++                    *slab1.add(r) = src[r * 3 + 1];
++                    *slab2.add(r) = src[r * 3 + 2];
++                }
++            }
++        });
++    }
++
++    // Pack scalar arrays: h_ood, trace_ood, gammas_h, gammas_tr, inv_h, inv_t.
++    let e3_raw = |e: &FieldElement<E>| -> [u64; 3] {
++        // SAFETY: E == Ext3; memory layout [u64; 3].
++        unsafe {
++            let p = e as *const FieldElement<E> as *const u64;
++            [*p, *p.add(1), *p.add(2)]
++        }
++    };
++
++    let mut h_ood_flat = vec![0u64; num_parts * 3];
++    for (j, e) in h_ood.iter().enumerate() {
++        let v = e3_raw(e);
++        h_ood_flat[j * 3] = v[0];
++        h_ood_flat[j * 3 + 1] = v[1];
++        h_ood_flat[j * 3 + 2] = v[2];
++    }
++    assert_eq!(trace_ood_cols.len(), num_total_cols);
++    let mut trace_ood_flat = vec![0u64; num_total_cols * num_eval_points * 3];
++    for (j, col) in trace_ood_cols.iter().enumerate() {
++        debug_assert_eq!(col.len(), num_eval_points);
++        for (k, e) in col.iter().enumerate() {
++            let v = e3_raw(e);
++            let idx = (j * num_eval_points + k) * 3;
++            trace_ood_flat[idx] = v[0];
++            trace_ood_flat[idx + 1] = v[1];
++            trace_ood_flat[idx + 2] = v[2];
++        }
++    }
++    let mut gammas_h_flat = vec![0u64; num_parts * 3];
++    for (j, e) in gammas_h.iter().enumerate() {
++        let v = e3_raw(e);
++        gammas_h_flat[j * 3] = v[0];
++        gammas_h_flat[j * 3 + 1] = v[1];
++        gammas_h_flat[j * 3 + 2] = v[2];
++    }
++    assert_eq!(gammas_tr_flat.len(), num_total_cols);
++    let mut gammas_tr_out = vec![0u64; num_total_cols * num_eval_points * 3];
++    for (j, col) in gammas_tr_flat.iter().enumerate() {
++        debug_assert_eq!(col.len(), num_eval_points);
++        for (k, e) in col.iter().enumerate() {
++            let v = e3_raw(e);
++            let idx = (j * num_eval_points + k) * 3;
++            gammas_tr_out[idx] = v[0];
++            gammas_tr_out[idx + 1] = v[1];
++            gammas_tr_out[idx + 2] = v[2];
++        }
++    }
++    let mut inv_h_flat = vec![0u64; domain_size * 3];
++    for (i, e) in inv_h.iter().enumerate() {
++        let v = e3_raw(e);
++        inv_h_flat[i * 3] = v[0];
++        inv_h_flat[i * 3 + 1] = v[1];
++        inv_h_flat[i * 3 + 2] = v[2];
++    }
++    assert_eq!(inv_t.len(), num_eval_points);
++    let mut inv_t_flat = vec![0u64; num_eval_points * domain_size * 3];
++    for (k, layer) in inv_t.iter().enumerate() {
++        debug_assert_eq!(layer.len(), domain_size);
++        for (i, e) in layer.iter().enumerate() {
++            let v = e3_raw(e);
++            let idx = (k * domain_size + i) * 3;
++            inv_t_flat[idx] = v[0];
++            inv_t_flat[idx + 1] = v[1];
++            inv_t_flat[idx + 2] = v[2];
++        }
++    }
++
++    let raw_out = math_cuda::deep::deep_composition_ext3(
++        &main_handle,
++        aux_handle_opt.as_ref(),
++        &h_flat,
++        &h_ood_flat,
++        &trace_ood_flat,
++        &gammas_h_flat,
++        &gammas_tr_out,
++        &inv_h_flat,
++        &inv_t_flat,
++        num_parts,
++        num_main,
++        num_aux,
++        num_eval_points,
++        blowup_factor,
++        domain_size,
++    )
++    .expect("GPU deep composition failed");
++
++    // Transmute raw u64s → FieldElement<E>. Requires E == Ext3 layout, which
++    // the type_name check above verifies.
++    let mut out: Vec<FieldElement<E>> = Vec::with_capacity(domain_size);
++    unsafe { out.set_len(domain_size) };
++    let dst_ptr = out.as_mut_ptr() as *mut u64;
++    unsafe {
++        core::ptr::copy_nonoverlapping(raw_out.as_ptr(), dst_ptr, domain_size * 3);
++    }
++    Some(out)
++}
++
+ // ============================================================================
+ // GPU Merkle inner-tree construction
+ // ============================================================================
+diff --git a/crypto/stark/src/prover.rs b/crypto/stark/src/prover.rs
+index 6ac44620..048b3c8a 100644
+--- a/crypto/stark/src/prover.rs
++++ b/crypto/stark/src/prover.rs
+@@ -165,6 +165,30 @@ where
+ struct Lde<Field: IsFFTField, FieldExtension: IsField> {
+     main: Vec<Vec<FieldElement<Field>>>,
+     aux: Vec<Vec<FieldElement<FieldExtension>>>,
++    /// Device-side main LDE buffer, populated only when the R1 GPU fused
++    /// pipeline ran for this table. Kept so R2/R3/R4 GPU paths can read
++    /// the LDE without re-H2D.
++    #[cfg(feature = "cuda")]
++    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
++    #[cfg(feature = "cuda")]
++    gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
++}
++
++/// Result of `commit_main_trace` / `commit_preprocessed_trace`. Wraps the
++/// commitment Merkle data plus the owned LDE columns, and — when the R1
++/// fused GPU pipeline ran — the retained device LDE handle.
++pub struct MainTraceCommitResult<Field: IsFFTField>
++where
++    FieldElement<Field>: AsBytes,
++{
++    tree: BatchedMerkleTree<Field>,
++    root: Commitment,
++    precomputed_tree: Option<BatchedMerkleTree<Field>>,
++    precomputed_root: Option<Commitment>,
++    num_precomputed_cols: usize,
++    columns: Vec<Vec<FieldElement<Field>>>,
++    #[cfg(feature = "cuda")]
++    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+ }
+ 
+ impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
+@@ -182,7 +206,18 @@ where
+         blowup_factor: usize,
+         has_aux_trace: bool,
+     ) -> Round1<Field, FieldExtension> {
+-        let lde_trace = LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
++        #[allow(unused_mut)]
++        let mut lde_trace =
++            LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
++        #[cfg(feature = "cuda")]
++        {
++            if let Some(h) = lde.gpu_main {
++                lde_trace.set_gpu_main(h);
++            }
++            if let Some(h) = lde.gpu_aux {
++                lde_trace.set_gpu_aux(h);
++            }
++        }
+ 
+         let main = Round1CommitmentData::<Field> {
+             lde_trace_merkle_tree: Arc::clone(&self.main_merkle_tree),
+@@ -519,23 +554,15 @@ pub trait IsStarkProver<
+     }
+ 
+     /// Compute main LDE, commit, and return the Merkle tree/root along with the
+-    /// owned LDE columns (consumed later in Phase D).
++    /// owned LDE columns (consumed later in Phase D). When the fused GPU
++    /// pipeline runs, the device LDE buffer is also kept alive and returned so
++    /// downstream rounds can read it without a re-H2D.
+     #[allow(clippy::type_complexity)]
+     fn commit_main_trace(
+         trace: &TraceTable<Field, FieldExtension>,
+         domain: &Domain<Field>,
+         twiddles: &LdeTwiddles<Field>,
+-    ) -> Result<
+-        (
+-            BatchedMerkleTree<Field>,
+-            Commitment,
+-            Option<BatchedMerkleTree<Field>>,
+-            Option<Commitment>,
+-            usize,
+-            Vec<Vec<FieldElement<Field>>>,
+-        ),
+-        ProvingError,
+-    >
++    ) -> Result<MainTraceCommitResult<Field>, ProvingError>
+     where
+         FieldElement<Field>: AsBytes,
+         FieldElement<FieldExtension>: AsBytes,
+@@ -543,21 +570,16 @@ pub trait IsStarkProver<
+         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+         let mut columns = trace.extract_columns_main(lde_size);
+ 
+-        // GPU combined path: expand LDE + Merkle leaf hashing + Merkle tree
+-        // build, all in one on-device pipeline. Only D2Hs the LDE
+-        // evaluations and the final `2*lde_size - 1` tree nodes; the leaf
+-        // hashes themselves never leave the device, so we skip one full
+-        // lde_size × 32 B pinned→pageable→pinned round-trip vs. the
+-        // separate-step pipeline.
+         #[cfg(feature = "cuda")]
+         {
+             #[cfg(feature = "instruments")]
+             let t_sub = Instant::now();
+-            if let Some(tree) = crate::gpu_lde::try_expand_leaf_and_tree_batched::<
+-                Field,
+-                Field,
+-                BatchedMerkleTreeBackend<Field>,
+-            >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
++            if let Some((tree, handle)) =
++                crate::gpu_lde::try_expand_leaf_and_tree_batched_keep::<
++                    Field,
++                    Field,
++                    BatchedMerkleTreeBackend<Field>,
++                >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
+             {
+                 #[cfg(feature = "instruments")]
+                 let main_lde_dur = t_sub.elapsed();
+@@ -566,7 +588,15 @@ pub trait IsStarkProver<
+                 let root = tree.root;
+                 #[cfg(feature = "instruments")]
+                 crate::instruments::accum_r1_main(main_lde_dur, zero);
+-                return Ok((tree, root, None, None, 0, columns));
++                return Ok(MainTraceCommitResult {
++                    tree,
++                    root,
++                    precomputed_tree: None,
++                    precomputed_root: None,
++                    num_precomputed_cols: 0,
++                    columns,
++                    gpu_main: Some(handle),
++                });
+             }
+         }
+ 
+@@ -583,7 +613,16 @@ pub trait IsStarkProver<
+         #[cfg(feature = "instruments")]
+         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+ 
+-        Ok((tree, root, None, None, 0, columns))
++        Ok(MainTraceCommitResult {
++            tree,
++            root,
++            precomputed_tree: None,
++            precomputed_root: None,
++            num_precomputed_cols: 0,
++            columns,
++            #[cfg(feature = "cuda")]
++            gpu_main: None,
++        })
+     }
+ 
+     /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
+@@ -594,17 +633,7 @@ pub trait IsStarkProver<
+         precomputed_commitment: Commitment,
+         num_precomputed_cols: usize,
+         twiddles: &LdeTwiddles<Field>,
+-    ) -> Result<
+-        (
+-            BatchedMerkleTree<Field>,
+-            Commitment,
+-            Option<BatchedMerkleTree<Field>>,
+-            Option<Commitment>,
+-            usize,
+-            Vec<Vec<FieldElement<Field>>>,
+-        ),
+-        ProvingError,
+-    >
++    ) -> Result<MainTraceCommitResult<Field>, ProvingError>
+     where
+         FieldElement<Field>: AsBytes,
+         FieldElement<FieldExtension>: AsBytes,
+@@ -634,14 +663,16 @@ pub trait IsStarkProver<
+             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+         );
+ 
+-        Ok((
+-            mult_tree,
+-            mult_root,
+-            Some(precomputed_tree),
+-            Some(precomputed_root),
++        Ok(MainTraceCommitResult {
++            tree: mult_tree,
++            root: mult_root,
++            precomputed_tree: Some(precomputed_tree),
++            precomputed_root: Some(precomputed_root),
+             num_precomputed_cols,
+             columns,
+-        ))
++            #[cfg(feature = "cuda")]
++            gpu_main: None,
++        })
+     }
+ 
+     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
+@@ -1335,6 +1366,33 @@ pub trait IsStarkProver<
+         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
+         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+ 
++        // GPU fast path: reads main/aux LDE from the device handles set by
++        // the R1 fused pipeline. Only fires when both handles are present
++        // and the LDE is above the threshold.
++        #[cfg(feature = "cuda")]
++        {
++            // Per-k inv_t slices as Vec<Vec<_>>.
++            let inv_t: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
++                .map(|k| denoms[(1 + k) * domain_size..(2 + k) * domain_size].to_vec())
++                .collect();
++            // trace_terms_gammas is already indexed [col][k]; pass as-is.
++            if let Some(v) = crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
++                lde_trace,
++                &round_2_result.lde_composition_poly_evaluations,
++                h_ood,
++&trace_ood_columns,
++                composition_poly_gammas,
++                trace_terms_gammas,
++                inv_h,
++                &inv_t,
++                num_eval_points,
++                blowup_factor,
++                domain_size,
++            ) {
++                return v;
++            }
++        }
++
+         // Compute deep(x_i) for each trace-size coset point
+         #[cfg(feature = "parallel")]
+         let iter = (0..domain_size).into_par_iter();
+@@ -1658,6 +1716,9 @@ pub trait IsStarkProver<
+ 
+         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
+         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
++        #[cfg(feature = "cuda")]
++        let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
++            Vec::with_capacity(num_airs);
+ 
+         for chunk_start in (0..num_airs).step_by(k) {
+             let chunk_end = (chunk_start + k).min(num_airs);
+@@ -1690,19 +1751,21 @@ pub trait IsStarkProver<
+ 
+             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+             for result in chunk_results {
+-                let (tree, root, pre_tree, pre_root, n_pre, cached_main) = result?;
+-                if let Some(ref pre_r) = pre_root {
++                let r = result?;
++                if let Some(ref pre_r) = r.precomputed_root {
+                     transcript.append_bytes(pre_r);
+                 }
+-                transcript.append_bytes(&root);
++                transcript.append_bytes(&r.root);
+                 main_commits.push(MainCommitData {
+-                    main_tree: Arc::new(tree),
+-                    main_root: root,
+-                    precomputed_tree: pre_tree.map(Arc::new),
+-                    precomputed_root: pre_root,
+-                    num_precomputed_cols: n_pre,
++                    main_tree: Arc::new(r.tree),
++                    main_root: r.root,
++                    precomputed_tree: r.precomputed_tree.map(Arc::new),
++                    precomputed_root: r.precomputed_root,
++                    num_precomputed_cols: r.num_precomputed_cols,
+                 });
+-                main_ldes.push(cached_main);
++                main_ldes.push(r.columns);
++                #[cfg(feature = "cuda")]
++                main_gpu_handles.push(r.gpu_main);
+             }
+         }
+ 
+@@ -1771,13 +1834,24 @@ pub trait IsStarkProver<
+             })
+             .collect();
+ 
+-        // Parallel aux commit in chunks of K
+-        #[allow(clippy::type_complexity)]
+-        let mut aux_results: Vec<(
+-            Option<Arc<BatchedMerkleTree<FieldExtension>>>,
++        // Parallel aux commit in chunks of K. Fourth field is an optional
++        // GPU ext3 LDE handle retained when the R1 fused pipeline fires.
++        #[cfg(feature = "cuda")]
++        type AuxResult<FE> = (
++            Option<Arc<BatchedMerkleTree<FE>>>,
+             Option<Commitment>,
+-            Vec<Vec<FieldElement<FieldExtension>>>,
+-        )> = Vec::with_capacity(num_airs);
++            Vec<Vec<FieldElement<FE>>>,
++            Option<math_cuda::lde::GpuLdeExt3>,
++        );
++        #[cfg(not(feature = "cuda"))]
++        type AuxResult<FE> = (
++            Option<Arc<BatchedMerkleTree<FE>>>,
++            Option<Commitment>,
++            Vec<Vec<FieldElement<FE>>>,
++            (),
++        );
++        #[allow(clippy::type_complexity)]
++        let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
+ 
+         for chunk_start in (0..num_airs).step_by(k) {
+             let chunk_end = (chunk_start + k).min(num_airs);
+@@ -1800,14 +1874,14 @@ pub trait IsStarkProver<
+ 
+                         // GPU combined path: ext3 LDE + Keccak-256 leaf
+                         // hashing + Merkle tree build in one on-device
+-                        // pipeline. Falls through to CPU when `cuda` is off
+-                        // or the table is too small.
++                        // pipeline. The fused `_keep` variant also returns
++                        // the device LDE handle for downstream GPU rounds.
+                         #[cfg(feature = "cuda")]
+                         {
+                             #[cfg(feature = "instruments")]
+                             let t_sub = Instant::now();
+-                            if let Some(tree) =
+-                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3::<
++                            if let Some((tree, handle)) =
++                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3_keep::<
+                                     Field,
+                                     FieldExtension,
+                                     BatchedMerkleTreeBackend<FieldExtension>,
+@@ -1824,7 +1898,12 @@ pub trait IsStarkProver<
+                                 let root = tree.root;
+                                 #[cfg(feature = "instruments")]
+                                 crate::instruments::accum_r1_aux(aux_lde_dur, zero);
+-                                return Ok((Some(Arc::new(tree)), Some(root), columns));
++                                return Ok((
++                                    Some(Arc::new(tree)),
++                                    Some(root),
++                                    columns,
++                                    Some(handle),
++                                ));
+                             }
+                         }
+ 
+@@ -1844,20 +1923,28 @@ pub trait IsStarkProver<
+                         #[cfg(feature = "instruments")]
+                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+ 
+-                        Ok((Some(Arc::new(tree)), Some(root), columns))
++                        #[cfg(feature = "cuda")]
++                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
++                        #[cfg(not(feature = "cuda"))]
++                        let aux_gpu: () = ();
++                        Ok((Some(Arc::new(tree)), Some(root), columns, aux_gpu))
+                     } else {
+-                        Ok((None, None, Vec::new()))
++                        #[cfg(feature = "cuda")]
++                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
++                        #[cfg(not(feature = "cuda"))]
++                        let aux_gpu: () = ();
++                        Ok((None, None, Vec::new(), aux_gpu))
+                     }
+                 })
+                 .collect();
+ 
+             // Sequential: append aux roots to forked transcripts
+             for (j, result) in chunk_aux.into_iter().enumerate() {
+-                let (aux_tree, aux_root, cached_aux) = result?;
++                let (aux_tree, aux_root, cached_aux, aux_gpu) = result?;
+                 if let Some(ref root) = aux_root {
+                     table_transcripts[chunk_start + j].append_bytes(root);
+                 }
+-                aux_results.push((aux_tree, aux_root, cached_aux));
++                aux_results.push((aux_tree, aux_root, cached_aux, aux_gpu));
+             }
+         }
+ 
+@@ -1866,12 +1953,25 @@ pub trait IsStarkProver<
+         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
+             Vec::with_capacity(num_airs);
+         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+-        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
+-            main_commits
+-                .into_iter()
+-                .zip(main_ldes)
+-                .zip(aux_results)
+-                .zip(bus_inputs_vec)
++        // Zip in the optional GPU handles so the Lde constructor always
++        // has a value for its gpu_main/gpu_aux. Under `cfg(not(cuda))` the
++        // handles are `()` (see AuxResult type alias) — we just discard them.
++        #[cfg(feature = "cuda")]
++        let main_gpu_iter: Box<dyn Iterator<Item = Option<math_cuda::lde::GpuLdeBase>>> =
++            Box::new(main_gpu_handles.into_iter());
++        #[cfg(not(feature = "cuda"))]
++        let main_gpu_iter: Box<dyn Iterator<Item = ()>> =
++            Box::new(std::iter::repeat_with(|| ()).take(num_airs));
++
++        for (
++            (((main_commit, main_lde), main_gpu_h), (aux_tree, aux_root, cached_aux, aux_gpu_h)),
++            bus_public_inputs,
++        ) in main_commits
++            .into_iter()
++            .zip(main_ldes)
++            .zip(main_gpu_iter)
++            .zip(aux_results)
++            .zip(bus_inputs_vec)
+         {
+             commitments.push(Round1Commitments {
+                 main_merkle_tree: main_commit.main_tree,
+@@ -1884,10 +1984,22 @@ pub trait IsStarkProver<
+                 rap_challenges: lookup_challenges.clone(),
+                 bus_public_inputs,
+             });
++            #[cfg(feature = "cuda")]
+             cached_ldes.push(Lde {
+                 main: main_lde,
+                 aux: cached_aux,
++                gpu_main: main_gpu_h,
++                gpu_aux: aux_gpu_h,
+             });
++            #[cfg(not(feature = "cuda"))]
++            {
++                let _ = main_gpu_h;
++                let _ = aux_gpu_h;
++                cached_ldes.push(Lde {
++                    main: main_lde,
++                    aux: cached_aux,
++                });
++            }
+         }
+ 
+         #[cfg(feature = "instruments")]
+diff --git a/crypto/stark/src/trace.rs b/crypto/stark/src/trace.rs
+index d172c80f..3767647d 100644
+--- a/crypto/stark/src/trace.rs
++++ b/crypto/stark/src/trace.rs
+@@ -196,6 +196,16 @@ where
+     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
+     pub(crate) lde_step_size: usize,
+     pub(crate) blowup_factor: usize,
++    /// If the main trace was LDE'd on the GPU via the fused pipeline,
++    /// the device buffer is retained here so downstream GPU rounds can
++    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't
++    /// run (small tables, cuda feature off, fallback path).
++    #[cfg(feature = "cuda")]
++    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
++    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
++    /// layout on device).
++    #[cfg(feature = "cuda")]
++    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+ }
+ 
+ impl<F, E> LDETraceTable<F, E>
+@@ -218,9 +228,37 @@ where
+             aux_columns,
+             lde_step_size,
+             blowup_factor,
++            #[cfg(feature = "cuda")]
++            gpu_main: None,
++            #[cfg(feature = "cuda")]
++            gpu_aux: None,
+         }
+     }
+ 
++    /// Attach an already-populated device LDE handle for the main columns.
++    /// Only set when the GPU fused pipeline produced the LDE — callers that
++    /// ran the CPU path should leave this alone.
++    #[cfg(feature = "cuda")]
++    pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
++        self.gpu_main = Some(h);
++    }
++
++    /// Attach an already-populated device LDE handle for the aux columns.
++    #[cfg(feature = "cuda")]
++    pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
++        self.gpu_aux = Some(h);
++    }
++
++    #[cfg(feature = "cuda")]
++    pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
++        self.gpu_main.as_ref()
++    }
++
++    #[cfg(feature = "cuda")]
++    pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
++        self.gpu_aux.as_ref()
++    }
++
+     /// Consume self and return the owned column vectors.
+     #[allow(clippy::type_complexity)]
+     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
+diff --git a/prover/tests/bench_gpu.rs b/prover/tests/bench_gpu.rs
+index d3ccb1c1..87e08c86 100644
+--- a/prover/tests/bench_gpu.rs
++++ b/prover/tests/bench_gpu.rs
+@@ -37,7 +37,9 @@ fn bench_prove(name: &str, trials: u32) {
+         let leaf = stark::gpu_lde::gpu_leaf_hash_calls();
+         let bary = stark::gpu_lde::gpu_bary_calls();
+         let mtree = stark::gpu_lde::gpu_merkle_tree_calls();
++        let deep = stark::gpu_lde::gpu_deep_calls();
+         println!("  GPU LDE calls across {trials} proves: {calls}");
++        println!("  GPU deep-composition calls: {deep}");
+         println!("  GPU extend_two_halves calls: {eh}");
+         println!("  GPU R4 deep-poly LDE calls: {r4}");
+         println!("  GPU R2 parts LDE calls: {parts}");
+-- 
+2.43.0
+
