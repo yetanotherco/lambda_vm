@@ -558,9 +558,10 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Sample available RAM before any trace state is allocated so the
-    // threshold comparison isn't double-counting what the prover itself
-    // already holds.
+    // Sample available RAM before we start allocating trace tables. The
+    // executor result and op vectors built by `prepare_from_elf_and_logs`
+    // below are small relative to the trace tables themselves; the 1.3×
+    // safety factor in `estimate_peak_bytes` absorbs their contribution.
     let available = auto_storage::available_ram_bytes();
 
     // Phases 0-4: op collection and derivation (cheap compared to phase 5's
@@ -574,6 +575,12 @@ pub fn prove_with_options_and_inputs(
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
+    if available == 0 && proof_options.max_ram_bytes.is_none() {
+        log::warn!(
+            "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
+             Set ProofOptions::max_ram_bytes to force Disk in memory-constrained environments."
+        );
+    }
     if storage_mode == StorageMode::Disk {
         log::info!(
             "Auto disk-spill: estimated peak {} MB exceeds 80% of {} MB available",

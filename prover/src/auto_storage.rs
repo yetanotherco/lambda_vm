@@ -16,6 +16,11 @@
 //! fib), rounding the coefficients to `peak ≈ 85 * main + 3 GB`. The estimate
 //! therefore errs conservative for MUL/DVRM-heavy programs — it will pick Disk
 //! slightly earlier than strictly necessary, which is the safe direction.
+//!
+//! Note: the formula models trace/LDE/Merkle allocations. The intermediate
+//! op vectors (`CpuOperation`, `MemwOperation`, …) that the trace builder
+//! allocates before trace tables are not an explicit term; their contribution
+//! is absorbed by the 1.3× margin.
 
 use stark::storage_mode::StorageMode;
 use sysinfo::System;
