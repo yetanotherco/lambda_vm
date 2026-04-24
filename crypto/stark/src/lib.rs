@@ -14,6 +14,7 @@ pub mod instruments;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
+pub mod storage_mode;
 pub mod table;
 pub mod trace;
 pub mod traits;

@@ -31,6 +31,7 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
+use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
@@ -1653,25 +1654,14 @@ struct CollectedOps {
     commit_ops: Vec<CommitOperation>,
 }
 
-/// Chunk raw ops and generate one trace table per chunk.
-#[cfg(not(feature = "disk-spill"))]
+/// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
+/// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
+/// is built so peak heap usage stays bounded.
 fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
-) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
-    if ops.is_empty() {
-        vec![generate(&[])]
-    } else {
-        ops.chunks(max_rows).map(generate).collect()
-    }
-}
-
-#[cfg(feature = "disk-spill")]
-fn chunk_generate_and_spill<T>(
-    ops: &[T],
-    max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
         vec![&[][..]]
@@ -1681,9 +1671,11 @@ fn chunk_generate_and_spill<T>(
     let mut tables = Vec::with_capacity(op_chunks.len());
     for chunk in op_chunks {
         let mut t = generate(chunk);
-        t.main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        if storage_mode == StorageMode::Disk {
+            t.main_table
+                .spill_to_disk()
+                .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        }
         tables.push(t);
     }
     Ok(tables)
@@ -1808,6 +1800,7 @@ fn build_traces(
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
+    storage_mode: StorageMode,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -1874,39 +1867,61 @@ fn build_traces(
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
-    // Dispatch macro: disk-spill variant spills main_table to mmap as tables are generated,
-    // freeing the heap buffers before the next chunk is built.
-    macro_rules! gen_traces {
-        ($ops:expr, $max:expr, $gen:expr) => {{
-            #[cfg(feature = "disk-spill")]
-            {
-                chunk_generate_and_spill($ops, $max, $gen)?
-            }
-            #[cfg(not(feature = "disk-spill"))]
-            {
-                chunk_and_generate($ops, $max, $gen)
-            }
-        }};
-    }
-
-    let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-    let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-    let memw_aligneds = gen_traces!(
+    let cpus = chunk_and_generate(
+        &cpu_ops,
+        max_rows.cpu,
+        cpu::generate_cpu_trace,
+        storage_mode,
+    )?;
+    let memws = chunk_and_generate(
+        &memw_ops,
+        max_rows.memw,
+        memw::generate_memw_trace,
+        storage_mode,
+    )?;
+    let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
         max_rows.memw_aligned,
-        memw_aligned::generate_memw_aligned_trace
-    );
-    let memw_registers = gen_traces!(
+        memw_aligned::generate_memw_aligned_trace,
+        storage_mode,
+    )?;
+    let memw_registers = chunk_and_generate(
         &memw_register_ops,
         max_rows.memw_register,
-        memw_register::generate_memw_register_trace
-    );
-    let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
-    let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-    let shifts = gen_traces!(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-    let muls = gen_traces!(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-    let dvrms = gen_traces!(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-    let branches = gen_traces!(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        memw_register::generate_memw_register_trace,
+        storage_mode,
+    )?;
+    let loads = chunk_and_generate(
+        &load_ops,
+        max_rows.load,
+        load::generate_load_trace,
+        storage_mode,
+    )?;
+    let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace, storage_mode)?;
+    let shifts = chunk_and_generate(
+        &shift_ops,
+        max_rows.shift,
+        shift::generate_shift_trace,
+        storage_mode,
+    )?;
+    let muls = chunk_and_generate(
+        &mul_ops,
+        max_rows.mul,
+        mul::generate_mul_trace,
+        storage_mode,
+    )?;
+    let dvrms = chunk_and_generate(
+        &dvrm_ops,
+        max_rows.dvrm,
+        dvrm::generate_dvrm_trace,
+        storage_mode,
+    )?;
+    let branches = chunk_and_generate(
+        &branch_ops,
+        max_rows.branch,
+        branch::generate_branch_trace,
+        storage_mode,
+    )?;
 
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -2357,6 +2372,17 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_with_mode(elf, logs, max_rows, StorageMode::Ram)
+    }
+
+    /// Same as `from_elf_and_logs` but lets callers pick whether intermediate
+    /// trace buffers are kept in RAM or spilled chunk-by-chunk to mmap files.
+    pub fn from_elf_and_logs_with_mode(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
@@ -2394,6 +2420,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            storage_mode,
         )
     }
 
@@ -2442,6 +2469,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            StorageMode::Ram,
         )
     }
 

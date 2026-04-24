@@ -378,10 +378,6 @@ fn cmd_prove(
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
 
-    if cfg!(feature = "disk-spill") {
-        eprintln!("Disk-spill: enabled");
-    }
-
     #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
     stark::instruments::set_heap_reader(|| {
         tikv_jemalloc_ctl::epoch::advance().ok();

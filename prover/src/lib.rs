@@ -28,6 +28,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
+use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -556,16 +557,27 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
+    // Pick where trace buffers and Merkle tree nodes live for this proof.
+    // Step E replaces this with an automatic decision based on available RAM
+    // vs estimated peak usage.
+    let storage_mode = if cfg!(feature = "disk-spill") {
+        StorageMode::Disk
+    } else {
+        StorageMode::Ram
+    };
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+    let mut traces =
+        Traces::from_elf_and_logs_with_mode(&program, &result.logs, max_rows, storage_mode)?;
 
     drop(result);
 
-    #[cfg(feature = "disk-spill")]
-    traces
-        .spill_all_main_to_disk()
-        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    if storage_mode == StorageMode::Disk {
+        traces
+            .spill_all_main_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    }
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -593,9 +605,10 @@ pub fn prove_with_options_and_inputs(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
+    let proof = Prover::multi_prove_with_mode(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
+        storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
