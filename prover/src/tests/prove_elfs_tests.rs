@@ -2153,10 +2153,7 @@ fn test_verify_rejects_private_input_with_tampered_public_output() {
 #[test]
 fn test_proof_does_not_contain_private_input_field() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
-    let input: Vec<u8> = vec![
-        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE,
-        0xF0,
-    ];
+    let input: Vec<u8> = (0xA0u8..0xB0).collect();
     let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     // The VmProof struct should only contain num_private_input_pages (a count),
