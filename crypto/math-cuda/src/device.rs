@@ -100,6 +100,7 @@ const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx")
 const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
+const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -174,6 +175,12 @@ pub struct Backend {
     pub apply_reverse_scan_offsets_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
 
+    // logup.ptx
+    pub logup_pair_fingerprint: CudaFunction,
+    pub logup_pair_term_assembly: CudaFunction,
+    pub logup_single_fingerprint: CudaFunction,
+    pub logup_single_term_assembly: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -195,6 +202,7 @@ impl Backend {
         let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
+        let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -251,6 +259,10 @@ impl Backend {
             apply_reverse_scan_offsets_ext3: inverse
                 .load_function("apply_reverse_scan_offsets_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            logup_pair_fingerprint: logup.load_function("logup_pair_fingerprint")?,
+            logup_pair_term_assembly: logup.load_function("logup_pair_term_assembly")?,
+            logup_single_fingerprint: logup.load_function("logup_single_fingerprint")?,
+            logup_single_term_assembly: logup.load_function("logup_single_term_assembly")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

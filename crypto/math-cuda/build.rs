@@ -59,4 +59,5 @@ fn main() {
     compile_ptx("deep.cu", "deep.ptx");
     compile_ptx("fri.cu", "fri.ptx");
     compile_ptx("inverse.cu", "inverse.ptx");
+    compile_ptx("logup.cu", "logup.ptx");
 }

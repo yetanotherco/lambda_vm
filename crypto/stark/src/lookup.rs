@@ -105,7 +105,7 @@ pub const LOGUP_NUM_CHALLENGES: usize = 2;
 /// Returns `(num_committed_pairs, absorbed_count)` where:
 /// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
 /// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
-fn split_interactions(num_interactions: usize) -> (usize, usize) {
+pub(crate) fn split_interactions(num_interactions: usize) -> (usize, usize) {
     if num_interactions <= 2 {
         (0, num_interactions)
     } else if num_interactions % 2 == 1 {
@@ -1021,54 +1021,79 @@ where
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
-        // Compute committed term columns in parallel (batched pairs only)
-        #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
-            .into_par_iter()
-            .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                )
-            })
-            .collect();
-        #[cfg(not(feature = "parallel"))]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
-            .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                )
-            })
-            .collect();
+        let compute_cpu = || {
+            // Compute committed term columns in parallel (batched pairs only)
+            #[cfg(feature = "parallel")]
+            let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+                .into_par_iter()
+                .map(|i| {
+                    compute_logup_batched_term_column(
+                        &self.auxiliary_trace_build_data.interactions[i * 2],
+                        &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        table_name,
+                    )
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+                .map(|i| {
+                    compute_logup_batched_term_column(
+                        &self.auxiliary_trace_build_data.interactions[i * 2],
+                        &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        table_name,
+                    )
+                })
+                .collect();
 
-        // Compute virtual column for absorbed interactions (NOT written to trace)
-        let virtual_column = if absorbed_count == 2 {
-            compute_logup_batched_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
-        } else {
-            compute_logup_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
+            // Compute virtual column for absorbed interactions (NOT written to trace)
+            let virtual_column = if absorbed_count == 2 {
+                compute_logup_batched_term_column(
+                    &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
+                    &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
+                    &main_segment_cols,
+                    trace_len,
+                    challenges,
+                    table_name,
+                )
+            } else {
+                compute_logup_term_column(
+                    &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
+                    &main_segment_cols,
+                    trace_len,
+                    challenges,
+                    table_name,
+                )
+            };
+            (committed_columns, virtual_column)
         };
+
+        // CUDA fast path: upload main_cols once and run every pair against
+        // the shared device buffer. Skipped when F/E don't match or the
+        // trace is below the GPU threshold, in which case we fall through
+        // to the rayon-parallel CPU path.
+        #[cfg(feature = "cuda")]
+        let (committed_columns, virtual_column) =
+            match crate::logup_gpu::try_compute_table_term_columns(
+                &self.auxiliary_trace_build_data.interactions,
+                &main_segment_cols,
+                trace_len,
+                challenges,
+            ) {
+                Some(gpu) => (
+                    gpu.committed,
+                    gpu.virtual_col
+                        .expect("GPU path always produces a virtual column"),
+                ),
+                None => compute_cpu(),
+            };
+        #[cfg(not(feature = "cuda"))]
+        let (committed_columns, virtual_column) = compute_cpu();
 
         // Write only committed columns to trace
         for (col_idx, col_data) in committed_columns.iter().enumerate() {
@@ -1537,6 +1562,19 @@ where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(out) = crate::logup_gpu::try_compute_pair_term_column(
+            interaction_a,
+            interaction_b,
+            main_segment_cols,
+            trace_len,
+            challenges,
+        ) {
+            return out;
+        }
+    }
+
     let z = &challenges[0];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 

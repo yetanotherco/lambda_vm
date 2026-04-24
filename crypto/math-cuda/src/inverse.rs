@@ -372,6 +372,12 @@ fn gl_inv(a: u64) -> u64 {
     gl_pow(a, GOLDILOCKS_P as u64 - 2)
 }
 
+/// Public re-export of the host ext3 inverse — used by `logup.rs` for the
+/// single-element total inverse in its inlined batch-inverse flow.
+pub fn invert_ext3_host_pub(x: [u64; 3]) -> [u64; 3] {
+    invert_ext3_host(x)
+}
+
 /// Invert one ext3 element on the host. Used once per batch inverse to
 /// invert the total product; the main batch inverse work stays on GPU.
 fn invert_ext3_host(x: [u64; 3]) -> [u64; 3] {
