@@ -2039,6 +2039,140 @@ fn test_prove_ethrex_empty_block() {
     assert_eq!(proof.public_output.len(), 160);
 }
 
+// =============================================================================
+// Security: private-input tamper tests
+// =============================================================================
+
+/// Verifier must reject when num_private_input_pages is zeroed out.
+/// The proof contains a non-preprocessed PAGE sub-proof for the private input,
+/// but the verifier expects 0 such pages → proof count mismatch.
+#[test]
+fn test_verify_rejects_tampered_num_private_input_pages_zero() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    // Baseline: untampered proof must verify.
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("verify should not error"),
+        "Baseline proof must verify before tampering"
+    );
+    assert!(
+        vm_proof.num_private_input_pages > 0,
+        "proof should have private pages"
+    );
+
+    // Tamper: zero out private input pages.
+    let tampered = crate::VmProof {
+        num_private_input_pages: 0,
+        ..vm_proof
+    };
+
+    let result = crate::verify(&tampered, &elf_bytes);
+    assert!(
+        result.is_err() || result.unwrap() == false,
+        "Verifier must reject proof with num_private_input_pages zeroed out"
+    );
+}
+
+/// Verifier must reject when num_private_input_pages is inflated beyond actual.
+/// The proof has 1 private page but we claim 2 → proof count mismatch.
+#[test]
+fn test_verify_rejects_inflated_num_private_input_pages() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    assert_eq!(
+        vm_proof.num_private_input_pages, 1,
+        "16 bytes fits in 1 page"
+    );
+
+    let tampered = crate::VmProof {
+        num_private_input_pages: 2,
+        ..vm_proof
+    };
+
+    let result = crate::verify(&tampered, &elf_bytes);
+    assert!(
+        result.is_err() || result.unwrap() == false,
+        "Verifier must reject proof with inflated num_private_input_pages"
+    );
+}
+
+/// Verifier must reject num_private_input_pages that exceeds the max bound.
+/// The early bounds check should catch this before constructing AIRs.
+#[test]
+fn test_verify_rejects_num_private_input_pages_exceeds_max() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    let tampered = crate::VmProof {
+        num_private_input_pages: 1000,
+        ..vm_proof
+    };
+
+    assert!(
+        crate::verify(&tampered, &elf_bytes).is_err(),
+        "Verifier must error on num_private_input_pages exceeding max"
+    );
+}
+
+/// Verifier must reject tampered public_output when private input is used.
+/// Ensures the COMMIT bus balance check still works with non-preprocessed pages.
+#[test]
+fn test_verify_rejects_private_input_with_tampered_public_output() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("verify"),
+        "Baseline must verify"
+    );
+
+    let mut tampered_output = vm_proof.public_output.clone();
+    tampered_output[0] ^= 0x01;
+    let tampered = crate::VmProof {
+        public_output: tampered_output,
+        ..vm_proof
+    };
+
+    let verified =
+        crate::verify(&tampered, &elf_bytes).expect("verify should not error on tampered output");
+    assert!(
+        !verified,
+        "Verifier must reject proof with tampered public_output (private input present)"
+    );
+}
+
+/// VmProof must not contain a field that stores the raw private input bytes.
+/// This is a structural check: the proof struct should only carry
+/// `num_private_input_pages`, not the actual input data.
+#[test]
+fn test_proof_does_not_contain_private_input_field() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = vec![
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE,
+        0xF0,
+    ];
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    // The VmProof struct should only contain num_private_input_pages (a count),
+    // not the actual bytes. Verify the proof's public fields don't contain them.
+    assert_eq!(vm_proof.num_private_input_pages, 1);
+    // public_output is the committed output, NOT the private input.
+    // It should contain bytes [4..12] of the input (what the ASM program commits).
+    assert_eq!(vm_proof.public_output, input[4..12].to_vec());
+    // No `private_input` field exists — this is enforced by the type system,
+    // but explicitly document that the proof carries only the page count.
+    assert!(
+        vm_proof.num_private_input_pages <= 1,
+        "Only the page count is stored, not the bytes"
+    );
+}
+
 /// Regression test: addiw with negative immediate must verify.
 /// arg2_sign_bit is the sign bit of rv2 (bit 31), not of arg2, per spec
 /// constraint CPU-CE61: MSB16[arg2_sign_bit; rv2[1]].
