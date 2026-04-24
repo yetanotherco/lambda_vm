@@ -674,7 +674,7 @@ pub fn verify_with_options(
         use crate::tables::page::DEFAULT_PAGE_SIZE;
         use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
         let max_pages =
-            (MAX_PRIVATE_INPUT_SIZE as usize + 4 + DEFAULT_PAGE_SIZE - 1) / DEFAULT_PAGE_SIZE + 1;
+            (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
         if vm_proof.num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
                 "num_private_input_pages ({}) exceeds max ({max_pages})",
