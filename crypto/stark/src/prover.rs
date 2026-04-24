@@ -48,6 +48,34 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a PI,
 );
 
+#[cfg(test)]
+pub(crate) mod domain_cache_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.with(|c| c.set((0, 0)));
+    }
+
+    pub(crate) fn get() -> (usize, usize) {
+        COUNTS.with(Cell::get)
+    }
+
+    pub(crate) fn record(was_hit: bool) {
+        COUNTS.with(|c| {
+            let (hits, misses) = c.get();
+            c.set(if was_hit {
+                (hits + 1, misses)
+            } else {
+                (hits, misses + 1)
+            });
+        });
+    }
+}
+
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -645,8 +673,8 @@ pub trait IsStarkProver<
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
         commitments: &[Round1Commitments<Field, FieldExtension>],
-        domains: &[Domain<Field>],
-        twiddle_caches: &[LdeTwiddles<Field>],
+        domains: &[Arc<Domain<Field>>],
+        twiddle_caches: &[Arc<LdeTwiddles<Field>>],
     ) where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1547,17 +1575,44 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
+        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
+            std::collections::HashMap::new();
+
         let mut domains = Vec::with_capacity(num_airs);
-        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
-            let domain = new_domain(*air, trace_length);
-            let twiddles = LdeTwiddles::new(&domain);
+            let blowup = air.options().blowup_factor as usize;
+            let coset_offset = air.options().coset_offset;
+            let key = (trace_length, blowup, coset_offset);
+
+            #[cfg(test)]
+            let was_hit = domain_cache.contains_key(&key);
+
+            let (domain, twiddles) = domain_cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let d = new_domain(*air, trace_length);
+                    let t = LdeTwiddles::new(&d);
+                    (Arc::new(d), Arc::new(t))
+                })
+                .clone();
+
+            #[cfg(test)]
+            domain_cache_stats::record(was_hit);
 
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
+        // Free the HashMap (which holds extra strong Arc references) before the
+        // long proving rounds begin. `domains` and `twiddle_caches` already hold
+        // the only surviving Arcs we care about.
+        drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
 
