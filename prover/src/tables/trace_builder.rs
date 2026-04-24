@@ -2213,6 +2213,12 @@ impl Traces {
         for t in &mut self.memws {
             spill(t)?;
         }
+        for t in &mut self.memw_aligneds {
+            spill(t)?;
+        }
+        for t in &mut self.memw_registers {
+            spill(t)?;
+        }
         for t in &mut self.loads {
             spill(t)?;
         }
