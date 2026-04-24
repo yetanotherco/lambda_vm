@@ -152,14 +152,16 @@ struct RegisterState {
 
 impl RegisterState {
     fn new(entry_point: u64) -> Self {
-        let mut regs = [(0u64, 0u64); 32];
+        // Per spec/memory.typ: "register initialization happens at timestamp 1"
+        // to enable loading of the PC via the CPU memory argument.
+        let mut regs = [(0u64, 1u64); 32];
         // SP (x2) starts at STACK_TOP
-        regs[2] = (page::STACK_TOP, 0);
+        regs[2] = (page::STACK_TOP, 1);
         Self {
             regs,
-            index_register: (0, 0),
-            // PC register (x255) starts at entry_point, timestamp 0
-            pc_register: (entry_point, 0),
+            index_register: (0, 1),
+            // PC register (x255) starts at entry_point, timestamp 1
+            pc_register: (entry_point, 1),
         }
     }
 
@@ -302,7 +304,10 @@ fn collect_cpu_ops(
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
-    // for the first access to any register/memory location (where old_timestamp=0).
+    // for the first access to any register/memory location. The +4 stride reserves
+    // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
+    // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
+    // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
@@ -603,20 +608,9 @@ fn collect_register_ops_from_cpu(
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
-    // CM54: PC register read-write at timestamp+1
-    // Every non-padding CPU row sends a MEMW for x255 (address 510).
-    // old = pc (current), value = next_pc (new).
-    {
-        let pc_value = pack_register_value(op.decode.pc);
-        let next_pc_value = pack_register_value(op.next_pc);
-        let (_old_val, old_ts) = register_state.read_pc();
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
-            .with_old(pc_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write_pc(op.next_pc, op.timestamp + 1);
-    }
+    // PC register state update (needed for M1 reads when rs1=255, i.e. AUIPC/JAL).
+    // The actual PC read/write is now inline in the CPU via memory bus interactions.
+    register_state.write_pc(op.next_pc, op.timestamp + 1);
 
     memw_ops
 }
