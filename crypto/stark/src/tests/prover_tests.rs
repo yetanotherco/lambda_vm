@@ -7,7 +7,7 @@ use crate::{
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     },
     proof::options::ProofOptions,
-    prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
+    prover::{IsStarkProver, Prover, domain_cache_stats, evaluate_polynomial_on_lde_domain},
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
@@ -306,5 +306,81 @@ fn test_multi_prove_mixed_coset_offsets() {
             &FieldElement::zero(),
         ),
         "verification should succeed when AIRs share (trace_length, blowup) but differ in coset_offset"
+    );
+}
+
+/// Test that the domain cache deduplicates when multiple AIRs share all three key fields
+/// `(trace_length, blowup, coset_offset)`. Asserts exactly one `Domain`/`LdeTwiddles`
+/// construction for N identical AIRs and that the resulting proof still verifies.
+#[test_log::test]
+fn test_multi_prove_dedups_shared_domain_params() {
+    domain_cache_stats::reset();
+
+    let proof_options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_3 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air_1 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let air_2 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let air_3 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+        &mut _,
+        &_,
+    )> = vec![
+        (&air_1, &mut trace_1, &pub_inputs),
+        (&air_2, &mut trace_2, &pub_inputs),
+        (&air_3, &mut trace_3, &pub_inputs),
+    ];
+
+    let multi_proof = Prover::multi_prove(
+        air_trace_pairs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("proving should succeed");
+
+    let (hits, misses) = domain_cache_stats::get();
+    assert_eq!(
+        misses, 1,
+        "only one Domain/LdeTwiddles must be constructed for 3 AIRs sharing domain params"
+    );
+    assert_eq!(
+        hits, 2,
+        "remaining 2 AIRs must hit the cache instead of reconstructing"
+    );
+
+    let airs: Vec<
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+    > = vec![&air_1, &air_2, &air_3];
+
+    assert!(
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "verification should succeed when AIRs share all domain parameters"
     );
 }
