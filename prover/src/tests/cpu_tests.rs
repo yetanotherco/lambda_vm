@@ -310,9 +310,7 @@ fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
     // Expected interactions:
-    // - 8 AND_BYTE
-    // - 8 OR_BYTE
-    // - 8 XOR_BYTE
+    // - 8 BITWISE (unified AND/OR/XOR, one per byte, op_id = AND + 2*OR + 4*XOR)
     // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
     // - 1 MSB8 (res_sign_bit)
     // - 1 ZERO (is_equal for BEQ)
@@ -332,9 +330,8 @@ fn test_bus_interactions_count() {
     // - 1 IS_BYTE for (RS1, RS2) paired
     // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
-    // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 58
-    assert_eq!(interactions.len(), 58);
+    // Total: 8 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 42
+    assert_eq!(interactions.len(), 42);
 }
 
 #[test]

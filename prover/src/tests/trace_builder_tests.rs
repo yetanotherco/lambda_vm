@@ -268,10 +268,10 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check AND multiplicity was updated for (0x12, 0x34, 0)
-    let row_idx = bitwise::row_index(0x12, 0x34, 0);
+    // AND ops route to the unified MU_BITWISE at row (x, y, 1).
+    let row_idx = bitwise::row_index(0x12, 0x34, 1);
     let row = traces.bitwise.main_table.get_row(row_idx);
-    assert_eq!(row[bitwise::cols::MU_AND], FE::one());
+    assert_eq!(row[bitwise::cols::MU_BITWISE], FE::one());
 }
 
 #[test]

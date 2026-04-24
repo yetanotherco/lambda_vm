@@ -59,7 +59,7 @@ fn new_sender_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
-            BusId::AndByte,
+            BusId::Bitwise,
             Multiplicity::Column(sender_cols::AND),
             vec![
                 BusValue::Packed {
@@ -94,7 +94,7 @@ fn new_receiver_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            BusId::AndByte,
+            BusId::Bitwise,
             Multiplicity::Column(receiver_cols::MU_AND),
             vec![
                 BusValue::Packed {

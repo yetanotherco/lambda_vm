@@ -41,9 +41,22 @@ fn test_generate_bitwise_trace() {
     assert_eq!(row_data[cols::X], FE::from(5u64));
     assert_eq!(row_data[cols::Y], FE::from(3u64));
     assert_eq!(row_data[cols::Z], FE::from(0u64));
-    assert_eq!(row_data[cols::AND], FE::from(1u64)); // 5 & 3 = 1
-    assert_eq!(row_data[cols::OR], FE::from(7u64)); // 5 | 3 = 7
-    assert_eq!(row_data[cols::XOR], FE::from(6u64)); // 5 ^ 3 = 6
+    // z = 0 is outside the op_id set {1, 2, 4}: RESULT stays at 0.
+    assert_eq!(row_data[cols::RESULT], FE::from(0u64));
+
+    // AND/OR/XOR results live at z = 1 / 2 / 4 respectively.
+    assert_eq!(
+        trace.main_table.get_row(row_index(5, 3, 1))[cols::RESULT],
+        FE::from(1u64) // 5 & 3
+    );
+    assert_eq!(
+        trace.main_table.get_row(row_index(5, 3, 2))[cols::RESULT],
+        FE::from(7u64) // 5 | 3
+    );
+    assert_eq!(
+        trace.main_table.get_row(row_index(5, 3, 4))[cols::RESULT],
+        FE::from(6u64) // 5 ^ 3
+    );
 
     // Check MSB8 for x=128 (MSB set)
     let row = row_index(128, 0, 0);
@@ -94,8 +107,9 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 10 interactions (one per lookup type; HWSLC merged into HWSL)
-    assert_eq!(interactions.len(), 10);
+    // 8 interactions: one unified Bitwise (AND/OR/XOR share Z-as-op_id),
+    // plus MSB8, MSB16, ZERO, IS_BYTE, IS_HALF, IS_B20, HWSL.
+    assert_eq!(interactions.len(), 8);
 }
 
 #[test]
@@ -108,9 +122,8 @@ fn test_first_row() {
     assert_eq!(row_data[cols::X], FE::from(0u64));
     assert_eq!(row_data[cols::Y], FE::from(0u64));
     assert_eq!(row_data[cols::Z], FE::from(0u64));
-    assert_eq!(row_data[cols::AND], FE::from(0u64)); // 0 & 0 = 0
-    assert_eq!(row_data[cols::OR], FE::from(0u64)); // 0 | 0 = 0
-    assert_eq!(row_data[cols::XOR], FE::from(0u64)); // 0 ^ 0 = 0
+    // z = 0 → RESULT = 0 by convention (outside op_id set {1, 2, 4}).
+    assert_eq!(row_data[cols::RESULT], FE::from(0u64));
     assert_eq!(row_data[cols::MSB8], FE::from(0u64)); // MSB of 0 = 0
     assert_eq!(row_data[cols::MSB16], FE::from(0u64)); // MSB of 0 = 0
     assert_eq!(row_data[cols::ZERO], FE::from(1u64)); // 0 and 0 are both zero
@@ -128,9 +141,8 @@ fn test_last_row() {
     assert_eq!(row_data[cols::X], FE::from(255u64));
     assert_eq!(row_data[cols::Y], FE::from(255u64));
     assert_eq!(row_data[cols::Z], FE::from(15u64));
-    assert_eq!(row_data[cols::AND], FE::from(255u64)); // 255 & 255 = 255
-    assert_eq!(row_data[cols::OR], FE::from(255u64)); // 255 | 255 = 255
-    assert_eq!(row_data[cols::XOR], FE::from(0u64)); // 255 ^ 255 = 0
+    // z = 15 is outside the op_id set {1, 2, 4}: RESULT = 0.
+    assert_eq!(row_data[cols::RESULT], FE::from(0u64));
     assert_eq!(row_data[cols::MSB8], FE::from(1u64)); // MSB of 255 = 1
     // halfword = 255 + 256*255 = 65535 = 0xFFFF, MSB is bit 15 = 1
     assert_eq!(row_data[cols::MSB16], FE::from(1u64));
@@ -190,22 +202,25 @@ fn test_shift_boundaries() {
 fn test_all_bitwise_operations() {
     let trace = generate_bitwise_trace();
 
-    // Test with x=0xAA, y=0x55 (alternating bits)
-    let row = row_index(0xAA, 0x55, 0);
-    let row_data = trace.main_table.get_row(row);
-
-    assert_eq!(row_data[cols::AND], FE::from(0u64)); // 0xAA & 0x55 = 0
-    assert_eq!(row_data[cols::OR], FE::from(0xFFu64)); // 0xAA | 0x55 = 0xFF
-    assert_eq!(row_data[cols::XOR], FE::from(0xFFu64)); // 0xAA ^ 0x55 = 0xFF
+    // Test with x=0xAA, y=0x55 (alternating bits); bitwise results live at z = 1, 2, 4.
+    let row_data = trace.main_table.get_row(row_index(0xAA, 0x55, 1));
+    assert_eq!(row_data[cols::RESULT], FE::from(0u64)); // 0xAA & 0x55 = 0
+    let row_data = trace.main_table.get_row(row_index(0xAA, 0x55, 2));
+    assert_eq!(row_data[cols::RESULT], FE::from(0xFFu64)); // 0xAA | 0x55 = 0xFF
+    let row_data = trace.main_table.get_row(row_index(0xAA, 0x55, 4));
+    assert_eq!(row_data[cols::RESULT], FE::from(0xFFu64)); // 0xAA ^ 0x55 = 0xFF
+    // MSB8 is not op-indexed by z; check on a z = 0 row.
+    let row_data = trace.main_table.get_row(row_index(0xAA, 0x55, 0));
     assert_eq!(row_data[cols::MSB8], FE::from(1u64)); // MSB of 0xAA = 1
 
     // Test with x=0x55, y=0xAA
-    let row = row_index(0x55, 0xAA, 0);
-    let row_data = trace.main_table.get_row(row);
-
-    assert_eq!(row_data[cols::AND], FE::from(0u64)); // 0x55 & 0xAA = 0
-    assert_eq!(row_data[cols::OR], FE::from(0xFFu64)); // 0x55 | 0xAA = 0xFF
-    assert_eq!(row_data[cols::XOR], FE::from(0xFFu64)); // 0x55 ^ 0xAA = 0xFF
+    let row_data = trace.main_table.get_row(row_index(0x55, 0xAA, 1));
+    assert_eq!(row_data[cols::RESULT], FE::from(0u64)); // 0x55 & 0xAA = 0
+    let row_data = trace.main_table.get_row(row_index(0x55, 0xAA, 2));
+    assert_eq!(row_data[cols::RESULT], FE::from(0xFFu64)); // 0x55 | 0xAA = 0xFF
+    let row_data = trace.main_table.get_row(row_index(0x55, 0xAA, 4));
+    assert_eq!(row_data[cols::RESULT], FE::from(0xFFu64)); // 0x55 ^ 0xAA = 0xFF
+    let row_data = trace.main_table.get_row(row_index(0x55, 0xAA, 0));
     assert_eq!(row_data[cols::MSB8], FE::from(0u64)); // MSB of 0x55 = 0
 }
 
@@ -249,7 +264,7 @@ fn test_generate_bitwise_row_matches_trace() {
         let const_row = generate_bitwise_row(idx);
         let trace_row = trace.main_table.get_row(idx);
 
-        // Verify all 11 precomputed columns match
+        // Verify all 9 precomputed columns match: [X, Y, Z, RESULT, MSB8, MSB16, ZERO, SLL, SLLC]
         assert_eq!(const_row.len(), NUM_PRECOMPUTED_COLS);
 
         assert_eq!(
@@ -269,41 +284,31 @@ fn test_generate_bitwise_row_matches_trace() {
         );
         assert_eq!(
             const_row[3],
-            trace_row[cols::AND].canonical_u64(),
-            "AND mismatch at index {idx}"
+            trace_row[cols::RESULT].canonical_u64(),
+            "RESULT mismatch at index {idx}"
         );
         assert_eq!(
             const_row[4],
-            trace_row[cols::OR].canonical_u64(),
-            "OR mismatch at index {idx}"
-        );
-        assert_eq!(
-            const_row[5],
-            trace_row[cols::XOR].canonical_u64(),
-            "XOR mismatch at index {idx}"
-        );
-        assert_eq!(
-            const_row[6],
             trace_row[cols::MSB8].canonical_u64(),
             "MSB8 mismatch at index {idx}"
         );
         assert_eq!(
-            const_row[7],
+            const_row[5],
             trace_row[cols::MSB16].canonical_u64(),
             "MSB16 mismatch at index {idx}"
         );
         assert_eq!(
-            const_row[8],
+            const_row[6],
             trace_row[cols::ZERO].canonical_u64(),
             "ZERO mismatch at index {idx}"
         );
         assert_eq!(
-            const_row[9],
+            const_row[7],
             trace_row[cols::SLL].canonical_u64(),
             "SLL mismatch at index {idx}"
         );
         assert_eq!(
-            const_row[10],
+            const_row[8],
             trace_row[cols::SLLC].canonical_u64(),
             "SLLC mismatch at index {idx}"
         );
@@ -421,7 +426,7 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::AndByte,
+                BusId::Bitwise,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
                     BusValue::Packed {
@@ -472,7 +477,7 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::AndByte,
+                BusId::Bitwise,
                 Multiplicity::Column(receiver_cols::MU_AND),
                 vec![
                     BusValue::Packed {

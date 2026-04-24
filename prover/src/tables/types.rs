@@ -54,12 +54,12 @@ pub enum BusId {
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
-    /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
-    AndByte,
-    /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
-    OrByte,
-    /// Bitwise XOR of two bytes: XOR_BYTE[X, Y] -> X ^ Y
-    XorByte,
+    /// Unified bitwise byte lookup: BITWISE[op_id, X, Y] -> op_id(X, Y)
+    ///
+    /// Token: (op_id, X, Y, RESULT) with op_id = AND + 2*OR + 4*XOR
+    /// (disjoint-bit encoding). IS_BIT on the three flag columns combined
+    /// with the memory-argument integrity enforces at-most-one.
+    Bitwise,
     /// Most significant bit of a byte: MSB8[X] -> (X >> 7) & 1
     Msb8,
     /// Most significant bit of a halfword: MSB16[X] -> (X >> 15) & 1
@@ -119,9 +119,7 @@ impl BusId {
             BusId::IsByte => "IsByte",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
-            BusId::AndByte => "AndByte",
-            BusId::OrByte => "OrByte",
-            BusId::XorByte => "XorByte",
+            BusId::Bitwise => "Bitwise",
             BusId::Msb8 => "Msb8",
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
@@ -150,25 +148,23 @@ impl TryFrom<u64> for BusId {
             0 => Ok(BusId::IsByte),
             1 => Ok(BusId::IsHalfword),
             2 => Ok(BusId::IsB20),
-            3 => Ok(BusId::AndByte),
-            4 => Ok(BusId::OrByte),
-            5 => Ok(BusId::XorByte),
-            6 => Ok(BusId::Msb8),
-            7 => Ok(BusId::Msb16),
-            8 => Ok(BusId::Zero),
-            9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Lt),
-            11 => Ok(BusId::Mul),
-            12 => Ok(BusId::Dvrm),
-            13 => Ok(BusId::Shift),
-            14 => Ok(BusId::Memw),
-            15 => Ok(BusId::Load),
-            16 => Ok(BusId::Memory),
-            17 => Ok(BusId::Branch),
-            18 => Ok(BusId::Decode),
-            19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
-            21 => Ok(BusId::Commit),
+            3 => Ok(BusId::Bitwise),
+            4 => Ok(BusId::Msb8),
+            5 => Ok(BusId::Msb16),
+            6 => Ok(BusId::Zero),
+            7 => Ok(BusId::Hwsl),
+            8 => Ok(BusId::Lt),
+            9 => Ok(BusId::Mul),
+            10 => Ok(BusId::Dvrm),
+            11 => Ok(BusId::Shift),
+            12 => Ok(BusId::Memw),
+            13 => Ok(BusId::Load),
+            14 => Ok(BusId::Memory),
+            15 => Ok(BusId::Branch),
+            16 => Ok(BusId::Decode),
+            17 => Ok(BusId::Ecall),
+            18 => Ok(BusId::CommitNextByte),
+            19 => Ok(BusId::Commit),
             other => Err(other),
         }
     }

@@ -247,12 +247,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]
+        // BITWISE[op_id=1, unmasked_low_byte, 254] -> next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
+        // Unified bitwise bus; constant op_id = 1 selects the AND row (z=1).
         BusInteraction::sender(
-            BusId::AndByte,
+            BusId::Bitwise,
             Multiplicity::Column(cols::MU),
             vec![
+                BusValue::constant(1),
                 BusValue::Packed {
                     start_column: cols::UNMASKED_LOW_BYTE,
                     packing: Packing::Direct,

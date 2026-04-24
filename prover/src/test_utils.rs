@@ -373,24 +373,25 @@ pub fn collect_bitwise_ops_from_load(
 pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
     use std::collections::HashMap;
 
-    // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
+    // Multiplicities indexed as [MU_BITWISE, MU_MSB8, MU_MSB16, MU_ZERO,
+    //                           MU_IS_BYTE, MU_IS_HALF, MU_IS_B20, MU_HWSL]
+    // AND/OR/XOR ops route to z = 1 / 2 / 4 (disjoint-bit op_id) and share MU_BITWISE.
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 8]> = HashMap::new();
 
     for op in ops {
-        let key = (op.x, op.y, op.z);
-        let mu_idx = match op.lookup_type {
-            BitwiseOperationType::AndByte => 0,
-            BitwiseOperationType::OrByte => 1,
-            BitwiseOperationType::XorByte => 2,
-            BitwiseOperationType::Msb8 => 3,
-            BitwiseOperationType::Msb16 => 4,
-            BitwiseOperationType::Zero => 5,
-            BitwiseOperationType::IsByte => 6,
-            BitwiseOperationType::IsHalf => 7,
-            BitwiseOperationType::IsB20 => 8,
-            BitwiseOperationType::Hwsl => 9,
+        let (key, mu_idx) = match op.lookup_type {
+            BitwiseOperationType::AndByte => ((op.x, op.y, 1u8), 0),
+            BitwiseOperationType::OrByte => ((op.x, op.y, 2u8), 0),
+            BitwiseOperationType::XorByte => ((op.x, op.y, 4u8), 0),
+            BitwiseOperationType::Msb8 => ((op.x, op.y, op.z), 1),
+            BitwiseOperationType::Msb16 => ((op.x, op.y, op.z), 2),
+            BitwiseOperationType::Zero => ((op.x, op.y, op.z), 3),
+            BitwiseOperationType::IsByte => ((op.x, op.y, op.z), 4),
+            BitwiseOperationType::IsHalf => ((op.x, op.y, op.z), 5),
+            BitwiseOperationType::IsB20 => ((op.x, op.y, op.z), 6),
+            BitwiseOperationType::Hwsl => ((op.x, op.y, op.z), 7),
         };
-        row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
+        row_data.entry(key).or_insert([0; 8])[mu_idx] += 1;
     }
 
     // Need at least 4 rows for FRI, pad to power of 2
@@ -401,53 +402,55 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
     for (row_idx, (x, y, z)) in unique_rows.iter().enumerate() {
         let base = row_idx * bitwise_cols::NUM_COLUMNS;
-        let x = *x as u32;
-        let y = *y as u32;
-        let z = *z as u32;
+        let x_u = *x as u32;
+        let y_u = *y as u32;
+        let z_u = *z as u32;
 
         // Input columns
-        data[base + bitwise_cols::X] = FE::from(x as u64);
-        data[base + bitwise_cols::Y] = FE::from(y as u64);
-        data[base + bitwise_cols::Z] = FE::from(z as u64);
+        data[base + bitwise_cols::X] = FE::from(x_u as u64);
+        data[base + bitwise_cols::Y] = FE::from(y_u as u64);
+        data[base + bitwise_cols::Z] = FE::from(z_u as u64);
 
-        // Bitwise operation results
-        data[base + bitwise_cols::AND] = FE::from((x & y) as u64);
-        data[base + bitwise_cols::OR] = FE::from((x | y) as u64);
-        data[base + bitwise_cols::XOR] = FE::from((x ^ y) as u64);
+        // Unified bitwise result driven by Z (sender's op_id).
+        let result = match z_u {
+            1 => x_u & y_u,
+            2 => x_u | y_u,
+            4 => x_u ^ y_u,
+            _ => 0,
+        };
+        data[base + bitwise_cols::RESULT] = FE::from(result as u64);
 
         // MSB extractions
-        let msb8 = (x >> 7) & 1;
-        let halfword = x + y * 256;
+        let msb8 = (x_u >> 7) & 1;
+        let halfword = x_u + y_u * 256;
         let msb16 = (halfword >> 15) & 1;
         data[base + bitwise_cols::MSB8] = FE::from(msb8 as u64);
         data[base + bitwise_cols::MSB16] = FE::from(msb16 as u64);
 
         // Zero check
-        let is_zero = if x == 0 && y == 0 { 1u64 } else { 0u64 };
+        let is_zero = if x_u == 0 && y_u == 0 { 1u64 } else { 0u64 };
         data[base + bitwise_cols::ZERO] = FE::from(is_zero);
 
         // Shift operations
-        let sll = if z == 0 {
+        let sll = if z_u == 0 {
             halfword
         } else {
-            (halfword << z) & 0xFFFF
+            (halfword << z_u) & 0xFFFF
         };
-        let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
+        let sllc = if z_u == 0 { 0 } else { halfword >> (16 - z_u) };
         data[base + bitwise_cols::SLL] = FE::from(sll as u64);
         data[base + bitwise_cols::SLLC] = FE::from(sllc as u64);
 
         // Multiplicity columns
-        let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
+        let mus = &row_data[&(*x, *y, *z)];
+        data[base + bitwise_cols::MU_BITWISE] = FE::from(mus[0]);
+        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[1]);
+        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[2]);
+        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[3]);
+        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[4]);
+        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[5]);
+        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[7]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)

@@ -1038,61 +1038,36 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // BITWISE interactions (×8 for each byte)
     // -------------------------------------------------------------------------
+    // Unified bitwise lookup. Token: (op_id, X, Y, RESULT) with
+    //   op_id = AND + 2*OR + 4*XOR        (disjoint-bit encoding)
+    //   RESULT = RES[i]                   (matches x&y / x|y / x^y)
+    //   multiplicity = AND + OR + XOR     (at most one, enforced by IS_BIT)
+    // Receiver on BITWISE table uses Z as the op_id discriminator: the
+    // sender's op_id ∈ {1, 2, 4} lands on rows z = 1 (AND), 2 (OR), 4 (XOR).
+    // Invalid op_ids (3, 5, 6, 7) from multi-flag settings never match a
+    // preprocessed row with non-zero MU_BITWISE, so the memory argument
+    // enforces at-most-one without a dedicated algebraic constraint.
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
-            BusId::AndByte,
-            Multiplicity::Column(cols::AND),
+            BusId::Bitwise,
+            Multiplicity::Sum3(cols::AND, cols::OR, cols::XOR),
             vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::OrByte,
-            Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::XOR),
-            vec![
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::AND,
+                    },
+                    LinearTerm::Column {
+                        coefficient: 2,
+                        column: cols::OR,
+                    },
+                    LinearTerm::Column {
+                        coefficient: 4,
+                        column: cols::XOR,
+                    },
+                ]),
                 BusValue::Packed {
                     start_column: cols::ARG1[i],
                     packing: Packing::Direct,
