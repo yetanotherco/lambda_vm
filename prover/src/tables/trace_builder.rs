@@ -1654,15 +1654,23 @@ struct CollectedOps {
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
-fn chunk_and_generate<T>(
+fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Sync + Send,
 ) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
     if ops.is_empty() {
         vec![generate(&[])]
     } else {
-        ops.chunks(max_rows).map(generate).collect()
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            ops.par_chunks(max_rows).map(&generate).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            ops.chunks(max_rows).map(generate).collect()
+        }
     }
 }
 
