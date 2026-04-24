@@ -232,7 +232,9 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 73;
 
-    /// prev_pc_timestamp_borrow: Borrow bit for 64-bit subtraction timestamp - 3
+    /// prev_pc_timestamp_borrow: Borrow bit for the 32-bit subtraction timestamp_lo - 3
+    /// in the inline PC prev_ts formula. Fires only when timestamp_lo < 3 and
+    /// pc_double_read = 0 (i.e. after timestamp wraps past 2^32 into values 0..2).
     pub const PREV_PC_TIMESTAMP_BORROW: usize = 74;
 
     /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
@@ -901,7 +903,7 @@ pub fn generate_cpu_trace_from_logs(
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
-            (i as u64) * 4 + 3,
+            (i as u64) * 4 + 4,
             instruction,
         ));
     }
@@ -930,7 +932,7 @@ pub fn collect_bitwise_ops_from_logs(
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
-            (i as u64) * 4 + 3,
+            (i as u64) * 4 + 4,
             instruction,
         ));
     }

@@ -140,14 +140,16 @@ struct RegisterState {
 
 impl RegisterState {
     fn new(entry_point: u64) -> Self {
-        let mut regs = [(0u64, 0u64); 32];
+        // Per spec/memory.typ: "register initialization happens at timestamp 1"
+        // to enable loading of the PC via the CPU memory argument.
+        let mut regs = [(0u64, 1u64); 32];
         // SP (x2) starts at STACK_TOP
-        regs[2] = (page::STACK_TOP, 0);
+        regs[2] = (page::STACK_TOP, 1);
         Self {
             regs,
-            index_register: (0, 0),
-            // PC register (x255) starts at entry_point, timestamp 0
-            pc_register: (entry_point, 0),
+            index_register: (0, 1),
+            // PC register (x255) starts at entry_point, timestamp 1
+            pc_register: (entry_point, 1),
         }
     }
 
@@ -289,12 +291,13 @@ fn collect_cpu_ops(
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
-    // Timestamps start at 3 (not 0) to ensure old_timestamp < timestamp holds
-    // for the first access to any register/memory location (where old_timestamp=0).
-    // Exactly 3 so that inline PC's prev_ts = timestamp - 3 = 0 on the first row,
-    // matching the REGISTER table's initial PC token at timestamp 0.
+    // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
+    // for the first access to any register/memory location. The +4 stride reserves
+    // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
+    // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
+    // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 3;
+        let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()

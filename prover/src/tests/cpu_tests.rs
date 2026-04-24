@@ -19,7 +19,7 @@ fn ops4(op: CpuOperation) -> Vec<CpuOperation> {
     (0..4)
         .map(|i| {
             let mut new_op = op.clone();
-            new_op.timestamp = (i as u64) * 4 + 3;
+            new_op.timestamp = (i as u64) * 4 + 4;
             new_op.decode.pc = op.decode.pc + (i as u64) * 4;
             new_op.next_pc = op.decode.pc + (i as u64) * 4 + 4;
             new_op
@@ -177,7 +177,7 @@ fn test_trace_generation_basic() {
 
     // Check first row values
     let row0 = trace.main_table.get_row(0);
-    assert_eq!(row0[cols::TIMESTAMP], FE::from(3u64));
+    assert_eq!(row0[cols::TIMESTAMP], FE::from(4u64));
     assert_eq!(row0[cols::PC_0], FE::from(0x1000u64));
     assert_eq!(row0[cols::PC_1], FE::zero());
     assert_eq!(row0[cols::RS1], FE::from(1u64));

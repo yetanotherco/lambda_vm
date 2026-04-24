@@ -1017,98 +1017,15 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 // =========================================================================
 // Inline PC Constraints
 // =========================================================================
-
-/// Constraint: pc_double_read * (rs1 - 255) = 0
-/// When pc_double_read is set, rs1 must be 255 (AUIPC/JAL reading PC).
-///
-/// The reverse direction (rs1=255 ∧ read_register1=1 → pc_double_read=1) is enforced
-/// by the LogUp memory bus: setting pc_double_read=0 on an AUIPC/JAL row would produce
-/// prev_ts = timestamp - 3 instead of timestamp, creating a token mismatch that the
-/// bus balance catches with overwhelming probability (1 - 1/p).
-pub struct PcDoubleReadRs1Constraint {
-    idx: usize,
-}
-
-impl PcDoubleReadRs1Constraint {
-    pub fn new(idx: usize) -> Self {
-        Self { idx }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let pc_double_read = step
-            .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-            .clone();
-        let rs1 = step.get_main_evaluation_element(0, cols::RS1).clone();
-        let val_255 = FieldElement::<F>::from(255u64);
-        pc_double_read * (rs1 - val_255)
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadRs1Constraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Constraint: pc_double_read * prev_pc_timestamp_borrow = 0
-/// When pc_double_read is set, borrow must be 0 (no subtraction needed).
-pub struct PcDoubleReadBorrowConstraint {
-    idx: usize,
-}
-
-impl PcDoubleReadBorrowConstraint {
-    pub fn new(idx: usize) -> Self {
-        Self { idx }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let pc_double_read = step
-            .get_main_evaluation_element(0, cols::PC_DOUBLE_READ)
-            .clone();
-        let borrow = step
-            .get_main_evaluation_element(0, cols::PREV_PC_TIMESTAMP_BORROW)
-            .clone();
-        pc_double_read * borrow
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleReadBorrowConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
+//
+// Per spec/cpu.typ: "Constraints on `pc_double_read` corresponding to an `AUIPC`
+// instruction are not necessary, as regardless of its value, the old timestamp is
+// guaranteed smaller than the new timestamp, and the integrity of the memory
+// argument therefore ensures the correctness of this bit."
+//
+// The IS_BIT constraints on PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
+// sufficient; no extra algebraic constraints linking them to rs1/read_register1
+// or to each other are required.
 
 // =========================================================================
 // Constraint Summary
@@ -1135,9 +1052,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for PcDoubleRead
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 70 constraints (34 IS_BIT + 8 ADD + 28 other)
+/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
+/// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
+/// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
+/// are required.)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1236,12 +1156,6 @@ pub fn create_all_cpu_constraints() -> (
     other.push(next_pc_0.boxed());
     other.push(next_pc_1.boxed());
     next_idx += 2;
-
-    // Inline PC constraints
-    other.push(PcDoubleReadRs1Constraint::new(next_idx).boxed());
-    next_idx += 1;
-    other.push(PcDoubleReadBorrowConstraint::new(next_idx).boxed());
-    next_idx += 1;
 
     (is_bit, add_constraints, other, next_idx)
 }
