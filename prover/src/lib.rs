@@ -566,6 +566,13 @@ pub fn prove_with_options_and_inputs(
     // chunk during build so the trace itself can't push us over the cap before
     // the post-build decision. A cap larger than available RAM is effectively
     // inactive and doesn't force Disk.
+    //
+    // Limitation: with default options (no cap) or when `cap >= available`,
+    // trace build runs in Ram. A program whose *trace alone* exceeds available
+    // memory can OOM here before the post-build `select_storage_mode` gets a
+    // chance to decide. The post-build path below still spills before the
+    // LDE/Merkle expansion, so it handles the common case where the trace fits
+    // but the full proof peak doesn't.
     let trace_build_mode = match (proof_options.max_ram_bytes, available) {
         (Some(cap), a) if a == 0 || cap < a => StorageMode::Disk,
         _ => StorageMode::Ram,

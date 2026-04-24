@@ -13,7 +13,9 @@
 //!
 //! We bake in a 1.3× safety factor so this can be trusted on programs with a
 //! different trace-shape (e.g. matrix multiplication: heavier on MUL/DVRM than
-//! fib), rounding the coefficients to `peak ≈ 85 * main + 3 GB`.
+//! fib), rounding the coefficients to `peak ≈ 85 * main + 3 GB`. The estimate
+//! therefore errs conservative for MUL/DVRM-heavy programs — it will pick Disk
+//! slightly earlier than strictly necessary, which is the safe direction.
 
 use stark::storage_mode::StorageMode;
 use sysinfo::System;
