@@ -164,11 +164,11 @@ jobs:
 
       - name: Run stark disk-spill tests
         run: |
-          cargo test --release -p stark --features disk-spill disk_spill
+          cargo test --release -p stark disk_spill
 
       - name: Run prover disk-spill tests
         run: |
-          cargo test --release -p lambda-vm-prover --features disk-spill disk_spill -- --test-threads=1
+          cargo test --release -p lambda-vm-prover disk_spill -- --test-threads=1
 
   build-prover-tests:
     name: Build prover tests
