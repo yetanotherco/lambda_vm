@@ -1787,23 +1787,22 @@ where
         }
 
         // Sparse (or half-sparse) path: gather fingerprints only for active rows.
-        let compute_fp =
-            |interaction: &BusInteraction, bus_id_f: &FieldElement<F>, row: usize| {
-                let mut lc = bus_id_f * &alpha_powers[0];
-                let mut alpha_offset = 1;
-                for bv in &interaction.values {
-                    let consumed = bv.accumulate_fingerprint(
-                        main_segment_cols,
-                        row,
-                        &alpha_powers,
-                        alpha_offset,
-                        &mut lc,
-                        &shifts,
-                    );
-                    alpha_offset += consumed;
-                }
-                z - &lc
-            };
+        let compute_fp = |interaction: &BusInteraction, bus_id_f: &FieldElement<F>, row: usize| {
+            let mut lc = bus_id_f * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &interaction.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc,
+                    &shifts,
+                );
+                alpha_offset += consumed;
+            }
+            z - &lc
+        };
 
         let indices_a: Vec<usize> = match &active_a {
             Some(v) => v.clone(),
