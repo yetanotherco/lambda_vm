@@ -58,3 +58,68 @@ pub fn available_ram_bytes() -> u64 {
     sys.refresh_memory();
     sys.available_memory()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn estimate_has_fixed_overhead_at_zero() {
+        assert_eq!(estimate_peak_bytes(0), 3 * GB);
+    }
+
+    #[test]
+    fn estimate_scales_linearly_with_main_elements() {
+        let one_million = estimate_peak_bytes(1_000_000);
+        let two_million = estimate_peak_bytes(2_000_000);
+        assert_eq!(one_million - 3 * GB, 85_000_000);
+        assert_eq!(two_million - 3 * GB, 170_000_000);
+    }
+
+    #[test]
+    fn estimate_matches_measured_8m_fib_within_safety_margin() {
+        // fib_iterative_8M measured: main_elements=882,404,346, peak=60.26 GB.
+        // Estimator uses 1.3x safety factor so it should sit above the measurement.
+        let estimated = estimate_peak_bytes(882_404_346);
+        assert!(estimated >= 60 * GB);
+        assert!(estimated < 100 * GB);
+    }
+
+    #[test]
+    fn select_ram_when_estimate_below_threshold() {
+        // 10 GB estimated, 32 GB available → threshold 25.6 GB → Ram.
+        let mode = select_storage_mode(10 * GB, 32 * GB, None);
+        assert_eq!(mode, StorageMode::Ram);
+    }
+
+    #[test]
+    fn select_disk_when_estimate_exceeds_threshold() {
+        // 30 GB estimated, 32 GB available → threshold 25.6 GB → Disk.
+        let mode = select_storage_mode(30 * GB, 32 * GB, None);
+        assert_eq!(mode, StorageMode::Disk);
+    }
+
+    #[test]
+    fn cap_forces_disk_when_smaller_than_available() {
+        // 10 GB estimated, 64 GB available (would be Ram), but cap=4 GB
+        // → threshold = 4 × 0.8 = 3.2 GB → Disk.
+        let mode = select_storage_mode(10 * GB, 64 * GB, Some(4 * GB));
+        assert_eq!(mode, StorageMode::Disk);
+    }
+
+    #[test]
+    fn cap_ignored_when_larger_than_available() {
+        // available=8 GB dominates a cap of 64 GB.
+        // threshold = 8 × 0.8 = 6.4 GB, estimate 10 GB → Disk.
+        let mode = select_storage_mode(10 * GB, 8 * GB, Some(64 * GB));
+        assert_eq!(mode, StorageMode::Disk);
+    }
+
+    #[test]
+    fn tiny_cap_always_forces_disk() {
+        let mode = select_storage_mode(estimate_peak_bytes(0), 64 * GB, Some(1_000_000));
+        assert_eq!(mode, StorageMode::Disk);
+    }
+}
