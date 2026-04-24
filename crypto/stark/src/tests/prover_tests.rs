@@ -1,10 +1,16 @@
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
 use crate::{
     domain::Domain,
-    examples::{quadratic_air::QuadraticAIR, simple_fibonacci},
+    examples::{
+        quadratic_air::QuadraticAIR,
+        simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
+    },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
+    verifier::{IsStarkVerifier, Verifier},
 };
 use math::{
     field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField},
@@ -232,4 +238,73 @@ fn test_decompose_and_extend_d2_matches_original() {
         assert_eq!(new_result[0][i], original[0][i], "H₀ mismatch at index {i}");
         assert_eq!(new_result[1][i], original[1][i], "H₁ mismatch at index {i}");
     }
+}
+
+/// Test that the domain cache 3-tuple key `(trace_length, blowup, coset_offset)` correctly
+/// distinguishes AIRs that share the same `(trace_length, blowup)` but differ in
+/// `coset_offset`. Both AIRs must get their own `Domain` and the resulting proofs must
+/// verify successfully.
+#[test_log::test]
+fn test_multi_prove_mixed_coset_offsets() {
+    let proof_options_3 = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+    let proof_options_7 = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 7,
+        grinding_factor: 1,
+    };
+
+    // Both AIRs have the same trace length and blowup, but different coset offsets.
+    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air_1 = FibonacciAIR::<GoldilocksField>::new(&proof_options_3);
+    let air_2 = FibonacciAIR::<GoldilocksField>::new(&proof_options_7);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+        &mut _,
+        &_,
+    )> = vec![
+        (&air_1, &mut trace_1, &pub_inputs),
+        (&air_2, &mut trace_2, &pub_inputs),
+    ];
+
+    let multi_proof = Prover::multi_prove(
+        air_trace_pairs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("proving should succeed");
+
+    let airs: Vec<
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+    > = vec![&air_1, &air_2];
+
+    assert!(
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "verification should succeed when AIRs share (trace_length, blowup) but differ in coset_offset"
+    );
 }
