@@ -568,7 +568,8 @@ pub fn prove_with_options_and_inputs(
     let main_elements = traces.total_field_elements();
     let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
     let available = auto_storage::available_ram_bytes();
-    let storage_mode = auto_storage::select_storage_mode(estimated_peak, available, None);
+    let storage_mode =
+        auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
     if storage_mode == StorageMode::Disk {
         eprintln!(
