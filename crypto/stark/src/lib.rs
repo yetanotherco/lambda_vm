@@ -1,11 +1,10 @@
 // `StorageMode::Disk` is implemented via `memmap2`, which doesn't compile on
-// wasm32. The `wasm` feature is therefore non-functional in the current
-// architecture; fail loudly at build time rather than via a confusing
-// transitive memmap2 error.
-#[cfg(feature = "wasm")]
+// wasm32. Fail loudly at the top of the crate rather than via a confusing
+// transitive memmap2 error deeper in the dep graph.
+#[cfg(target_arch = "wasm32")]
 compile_error!(
-    "the `wasm` feature is non-functional: StorageMode::Disk requires memmap2, \
-     which does not compile on wasm32 targets"
+    "wasm32 targets are not supported: StorageMode::Disk requires memmap2, \
+     which does not compile on wasm32"
 );
 
 #[cfg(feature = "debug-checks")]
