@@ -572,7 +572,7 @@ pub fn prove_with_options_and_inputs(
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
     if storage_mode == StorageMode::Disk {
-        eprintln!(
+        log::info!(
             "Auto disk-spill: estimated peak {} MB exceeds 80% of {} MB available",
             estimated_peak / 1_000_000,
             available / 1_000_000,

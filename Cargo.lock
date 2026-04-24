@@ -1945,6 +1945,7 @@ dependencies = [
  "crypto",
  "env_logger",
  "executor",
+ "log",
  "math",
  "rayon",
  "serde",

@@ -35,13 +35,19 @@ pub fn estimate_peak_bytes(main_elements: u64) -> u64 {
 /// other processes, and allocator fragmentation. `cap` is an optional user-
 /// imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
+///
+/// `available == 0` means the OS didn't report a value (some containers /
+/// minimal Linux kernels). When that happens with no user cap, fall back to
+/// `Ram` rather than forcing Disk on every proof.
 pub fn select_storage_mode(estimated: u64, available: u64, cap: Option<u64>) -> StorageMode {
     const SAFETY_FRACTION_NUM: u64 = 4;
     const SAFETY_FRACTION_DEN: u64 = 5;
 
-    let budget = match cap {
-        Some(c) => c.min(available),
-        None => available,
+    let budget = match (cap, available) {
+        (Some(c), 0) => c,
+        (Some(c), a) => c.min(a),
+        (None, 0) => return StorageMode::Ram,
+        (None, a) => a,
     };
     let threshold = budget.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;
 
@@ -120,6 +126,22 @@ mod tests {
     #[test]
     fn tiny_cap_always_forces_disk() {
         let mode = select_storage_mode(estimate_peak_bytes(0), 64 * GB, Some(1_000_000));
+        assert_eq!(mode, StorageMode::Disk);
+    }
+
+    #[test]
+    fn zero_available_with_no_cap_falls_back_to_ram() {
+        // OS can't report available memory. Without a cap we can't make an
+        // informed decision, so stay in Ram rather than forcing Disk on every
+        // proof.
+        let mode = select_storage_mode(estimate_peak_bytes(0), 0, None);
+        assert_eq!(mode, StorageMode::Ram);
+    }
+
+    #[test]
+    fn zero_available_with_cap_uses_cap_as_budget() {
+        // OS can't report; cap is the whole budget.
+        let mode = select_storage_mode(10 * GB, 0, Some(4 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
 }
