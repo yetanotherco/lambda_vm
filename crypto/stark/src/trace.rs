@@ -1,6 +1,3 @@
-#[cfg(all(feature = "disk-spill", feature = "wasm"))]
-compile_error!("disk-spill and wasm features are mutually exclusive");
-
 use crate::domain::Domain;
 use crate::table::Table;
 use itertools::Itertools;

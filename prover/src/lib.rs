@@ -558,13 +558,9 @@ pub fn prove_with_options_and_inputs(
     let phase_start = std::time::Instant::now();
 
     // Pick where trace buffers and Merkle tree nodes live for this proof.
-    // Step E replaces this with an automatic decision based on available RAM
+    // Replaced in step E with an automatic decision based on available RAM
     // vs estimated peak usage.
-    let storage_mode = if cfg!(feature = "disk-spill") {
-        StorageMode::Disk
-    } else {
-        StorageMode::Ram
-    };
+    let storage_mode = StorageMode::Ram;
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
