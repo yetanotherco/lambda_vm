@@ -91,6 +91,9 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     // Computed flags
     cols::IS_EQUAL,
     cols::BRANCH_COND,
+    // Inline PC columns
+    cols::PREV_PC_TIMESTAMP_BORROW,
+    cols::PC_DOUBLE_READ,
 ];
 
 /// Creates all IS_BIT constraints for CPU flag columns.
@@ -1012,6 +1015,19 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 }
 
 // =========================================================================
+// Inline PC Constraints
+// =========================================================================
+//
+// Per spec/cpu.typ: "Constraints on `pc_double_read` corresponding to an `AUIPC`
+// instruction are not necessary, as regardless of its value, the old timestamp is
+// guaranteed smaller than the new timestamp, and the integrity of the memory
+// argument therefore ensures the correctness of this bit."
+//
+// The IS_BIT constraints on PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
+// sufficient; no extra algebraic constraints linking them to rs1/read_register1
+// or to each other are required.
+
+// =========================================================================
 // Constraint Summary
 // =========================================================================
 
@@ -1036,9 +1052,12 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 66 constraints (32 IS_BIT + 8 ADD + 26 other)
+/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
+/// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
+/// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
+/// are required.)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    32 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///
