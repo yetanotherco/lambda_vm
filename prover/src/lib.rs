@@ -558,31 +558,18 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Sample available RAM before trace build so the threshold comparison
-    // isn't double-counting the trace's own footprint.
+    // Sample available RAM before any trace state is allocated so the
+    // threshold comparison isn't double-counting what the prover itself
+    // already holds.
     let available = auto_storage::available_ram_bytes();
 
-    // When a cap is set and it's tighter than available RAM, spill each trace
-    // chunk during build so the trace itself can't push us over the cap before
-    // the post-build decision. A cap larger than available RAM is effectively
-    // inactive and doesn't force Disk.
-    //
-    // Limitation: with default options (no cap) or when `cap >= available`,
-    // trace build runs in Ram. A program whose *trace alone* exceeds available
-    // memory can OOM here before the post-build `select_storage_mode` gets a
-    // chance to decide. The post-build path below still spills before the
-    // LDE/Merkle expansion, so it handles the common case where the trace fits
-    // but the full proof peak doesn't.
-    let trace_build_mode = match (proof_options.max_ram_bytes, available) {
-        (Some(cap), a) if a == 0 || cap < a => StorageMode::Disk,
-        _ => StorageMode::Ram,
-    };
-    let mut traces =
-        Traces::from_elf_and_logs_with_mode(&program, &result.logs, max_rows, trace_build_mode)?;
-
+    // Phases 0-4: op collection and derivation (cheap compared to phase 5's
+    // trace-table allocation). After this we have the exact op counts needed
+    // to compute `main_elements` without materializing the trace tables.
+    let prep = Traces::prepare_from_elf_and_logs(&program, &result.logs, max_rows)?;
     drop(result);
 
-    let main_elements = traces.total_field_elements();
+    let main_elements = prep.estimate_main_elements(max_rows);
     let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
@@ -593,10 +580,12 @@ pub fn prove_with_options_and_inputs(
             estimated_peak / 1_000_000,
             available / 1_000_000,
         );
-        traces
-            .spill_all_main_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
     }
+
+    // Phase 5: allocate trace tables with the chosen mode. `Disk` spills each
+    // chunk as it's built, so the trace itself never fully materializes in
+    // RAM if the estimate said we'd overflow.
+    let mut traces = prep.into_traces(Some(&program), max_rows, storage_mode)?;
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();

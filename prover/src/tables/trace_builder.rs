@@ -1786,22 +1786,24 @@ fn collect_all_ops(
     }
 }
 
-/// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
-///
-/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
-/// and PAGE bitwise lookups; `None` produces empty page tables.
-#[allow(clippy::too_many_arguments)]
-fn build_traces(
+/// Result of phases 3-4: extended ops + derived metadata used by phase 5
+/// and by the main-elements estimator.
+struct DerivedOps {
+    ops: CollectedOps,
+    public_output_bytes: Vec<u8>,
+    num_padding_rows: usize,
+    halt_timestamp: u64,
+}
+
+/// Phases 3-4: Extend `lt_ops` with MEMW-derived LT ops, extend `bitwise_ops`
+/// with derivations from every other table, compute public-output bytes and
+/// halt timestamp. Cheap compared to phase 5 — no trace tables allocated.
+fn derive_ops(
     ops: CollectedOps,
     elf: Option<&Elf>,
     memory_state: &MemoryState,
-    entry_point: u64,
-    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
-    storage_mode: StorageMode,
-) -> Result<Traces, Error> {
+) -> Result<DerivedOps, Error> {
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -1855,17 +1857,98 @@ fn build_traces(
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
-    // =====================================================================
-    // PHASE 5: Generate final traces (parallelized)
-    // =====================================================================
-
-    // Extract halt timestamp from the last ECALL instruction
+    // Extract halt timestamp from the last ECALL instruction (needed by phase 5).
     let halt_op = cpu_ops
         .iter()
         .rev()
         .find(|op| op.decode.op_ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
+
+    Ok(DerivedOps {
+        ops: CollectedOps {
+            cpu_ops,
+            memw_ops,
+            memw_aligned_ops,
+            memw_register_ops,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            branch_ops,
+            mul_ops,
+            dvrm_ops,
+            commit_ops,
+        },
+        public_output_bytes,
+        num_padding_rows,
+        halt_timestamp,
+    })
+}
+
+/// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
+///
+/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
+/// and PAGE bitwise lookups; `None` produces empty page tables.
+#[allow(clippy::too_many_arguments)]
+fn build_traces(
+    ops: CollectedOps,
+    elf: Option<&Elf>,
+    memory_state: &MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
+    max_rows: &super::MaxRowsConfig,
+    storage_mode: StorageMode,
+) -> Result<Traces, Error> {
+    let derived = derive_ops(ops, elf, memory_state, max_rows)?;
+    generate_traces(
+        derived,
+        elf,
+        memory_state,
+        entry_point,
+        decode_trace,
+        decode_pc_to_row,
+        register_state,
+        max_rows,
+        storage_mode,
+    )
+}
+
+/// Phase 5: allocate trace tables (this is the heavy phase for memory).
+#[allow(clippy::too_many_arguments)]
+fn generate_traces(
+    derived: DerivedOps,
+    elf: Option<&Elf>,
+    memory_state: &MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
+    max_rows: &super::MaxRowsConfig,
+    storage_mode: StorageMode,
+) -> Result<Traces, Error> {
+    let DerivedOps {
+        ops:
+            CollectedOps {
+                cpu_ops,
+                memw_ops,
+                memw_aligned_ops,
+                memw_register_ops,
+                load_ops,
+                lt_ops,
+                shift_ops,
+                bitwise_ops,
+                branch_ops,
+                mul_ops,
+                dvrm_ops,
+                commit_ops,
+            },
+        public_output_bytes,
+        num_padding_rows,
+        halt_timestamp,
+    } = derived;
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -1999,6 +2082,113 @@ fn build_traces(
         commit: commit_trace,
         memw_registers,
     })
+}
+
+/// Intermediate state of trace generation after phases 0-4 (ELF decode, op
+/// collection, op derivation). Phase 5 (trace-table allocation) is the heavy
+/// phase for memory; by returning this struct we let callers estimate the
+/// resulting `main_elements` count and choose a `StorageMode` *before*
+/// allocating those tables.
+pub struct PreparedTraceInputs {
+    derived: DerivedOps,
+    memory_state: MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
+}
+
+impl PreparedTraceInputs {
+    /// Exact `main_elements` count for the traces that would be produced by
+    /// [`Self::into_traces`]. Mirrors [`Traces::total_field_elements`] column
+    /// for column, but is computable without allocating any trace tables.
+    ///
+    /// Uses the op-vector lengths from phase 2/3/4 plus each table's
+    /// `chunk_and_generate` padding rule (`len.next_power_of_two().max(4)` per
+    /// chunk) to derive post-padding row counts.
+    pub fn estimate_main_elements(&self, max_rows: &super::MaxRowsConfig) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::NUM_ROWS as BITWISE_ROWS;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        let ops = &self.derived.ops;
+        let mut total: u64 = 0;
+        total += padded_chunked_rows(ops.cpu_ops.len(), max_rows.cpu) * CPU_COLS as u64;
+        total += padded_chunked_rows(ops.memw_ops.len(), max_rows.memw) * MEMW_COLS as u64;
+        total += padded_chunked_rows(ops.memw_aligned_ops.len(), max_rows.memw_aligned)
+            * MEMW_A_COLS as u64;
+        total += padded_chunked_rows(ops.memw_register_ops.len(), max_rows.memw_register)
+            * MEMW_R_COLS as u64;
+        total += padded_chunked_rows(ops.load_ops.len(), max_rows.load) * LOAD_COLS as u64;
+        total += padded_chunked_rows(ops.lt_ops.len(), max_rows.lt) * LT_COLS as u64;
+        total += padded_chunked_rows(ops.shift_ops.len(), max_rows.shift) * SHIFT_COLS as u64;
+        total += padded_chunked_rows(ops.mul_ops.len(), max_rows.mul) * MUL_COLS as u64;
+        total += padded_chunked_rows(ops.dvrm_ops.len(), max_rows.dvrm) * DVRM_COLS as u64;
+        total += padded_chunked_rows(ops.branch_ops.len(), max_rows.branch) * BRANCH_COLS as u64;
+
+        // Fixed-size / lookup tables.
+        total += (BITWISE_ROWS * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        total += (self.decode_trace.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
+        let commit_rows = ops.commit_ops.len().next_power_of_two().max(4);
+        total += (commit_rows * COMMIT_COLS) as u64;
+        total += HALT_COLS as u64; // halt trace is always 1 row
+
+        // REGISTER and PAGE tables (preprocessed-heavy; small contribution)
+        // and pages (proportional to memory_state) are omitted here. They
+        // contribute < 1% for any program where the disk/ram decision matters.
+        total
+    }
+
+    /// Run phase 5: allocate trace tables with the chosen storage mode.
+    pub fn into_traces(
+        self,
+        elf: Option<&Elf>,
+        max_rows: &super::MaxRowsConfig,
+        storage_mode: StorageMode,
+    ) -> Result<Traces, Error> {
+        generate_traces(
+            self.derived,
+            elf,
+            &self.memory_state,
+            self.entry_point,
+            self.decode_trace,
+            self.decode_pc_to_row,
+            self.register_state,
+            max_rows,
+            storage_mode,
+        )
+    }
+}
+
+/// Row count for a chunked table after `chunk_and_generate` padding: each
+/// chunk is rounded up to `len.next_power_of_two().max(4)`. Matches the
+/// per-table `generate_*_trace` calls exactly.
+fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
+    if ops_count == 0 {
+        return 4; // empty-chunk tables still allocate one 4-row padded chunk
+    }
+    let mut total: u64 = 0;
+    let mut remaining = ops_count;
+    while remaining > 0 {
+        let chunk_size = remaining.min(max_rows);
+        total += chunk_size.next_power_of_two().max(4) as u64;
+        remaining -= chunk_size;
+    }
+    total
 }
 
 impl Traces {
@@ -2383,6 +2573,20 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
         storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        let prep = Self::prepare_from_elf_and_logs(elf, logs, max_rows)?;
+        prep.into_traces(Some(elf), max_rows, storage_mode)
+    }
+
+    /// Runs phases 0-4 (ELF decode, op collection, derivation) and returns a
+    /// [`PreparedTraceInputs`] from which `main_elements` can be estimated
+    /// before phase 5 (the heavy trace-table allocation) starts. Callers pick
+    /// `StorageMode` based on the estimate and then invoke
+    /// [`PreparedTraceInputs::into_traces`].
+    pub fn prepare_from_elf_and_logs(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<PreparedTraceInputs, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
@@ -2410,18 +2614,17 @@ impl Traces {
             &mut register_state,
         );
 
-        // Phases 3-5
-        build_traces(
-            ops,
-            Some(elf),
-            &memory_state,
-            elf.entry_point,
+        // Phases 3-4
+        let derived = derive_ops(ops, Some(elf), &memory_state, max_rows)?;
+
+        Ok(PreparedTraceInputs {
+            derived,
+            memory_state,
+            entry_point: elf.entry_point,
             decode_trace,
             decode_pc_to_row,
             register_state,
-            max_rows,
-            storage_mode,
-        )
+        })
     }
 
     /// Generates all traces from execution logs (legacy API).

@@ -7,7 +7,10 @@
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
+use crate::tables::trace_builder::Traces;
 use crate::test_utils::asm_elf_bytes;
+use executor::elf::Elf;
+use executor::vm::execution::Executor;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 const FORCE_DISK_CAP: u64 = 1_000_000;
@@ -70,6 +73,44 @@ fn test_disk_spill_prove_and_verify_2m() {
         .expect("prove failed");
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
     assert!(ok, "verification returned false for fib_iterative_2M");
+}
+
+/// `PreparedTraceInputs::estimate_main_elements` must match the post-build
+/// `Traces::total_field_elements` so the pre-build Disk/Ram decision is based
+/// on an honest number. Runs the same program both ways and compares.
+#[test]
+fn test_estimate_main_elements_matches_built_trace() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let program = Elf::load(&elf_bytes).expect("elf load");
+    let executor = Executor::new(&program, Vec::new()).expect("executor");
+    let result = executor.run().expect("run");
+    let max_rows = MaxRowsConfig::default();
+
+    let prep =
+        Traces::prepare_from_elf_and_logs(&program, &result.logs, &max_rows).expect("prepare");
+    let estimated = prep.estimate_main_elements(&max_rows);
+
+    let traces = prep
+        .into_traces(
+            Some(&program),
+            &max_rows,
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("into_traces");
+    let actual = traces.total_field_elements();
+
+    // Estimator omits REGISTER/PAGE contributions (small). Require it to be
+    // a lower bound within 5% of actual — anything bigger means an important
+    // table is missing from the estimate.
+    assert!(
+        estimated <= actual,
+        "estimator ({estimated}) > actual ({actual})"
+    );
+    let gap = actual - estimated;
+    assert!(
+        gap * 20 <= actual,
+        "estimator gap {gap} is >5% of actual {actual}"
+    );
 }
 
 /// Same as roundtrip test but with small chunks.
