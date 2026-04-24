@@ -306,11 +306,11 @@
 
   /// Render the contraint's tag.
   let tag(constraint, group) = {
-    let with_index(x) = ((x,) + iters_of(constraint).map(it => it.at(0))).join(".")
+    let with_index(x) = ((raw(x),) + iters_of(constraint).map(it => raw(it.at(0)))).join(".")
     let prefix = if "prefix" in group { group.prefix }
-    let lbl = [#chip.name\-C#prefix]
-    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
-    cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => [#lbl#i], supplement: [], [])]
+    let tag(x) = [#raw(chip.name + "-" + prefix + "" + constraint.id + "/")#with_index(x)]
+    show figure: (it) => align(left, context tag(it.counter.display()))
+    cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => tag(str(i)), supplement: [], [])]
   }
 
   /// Generates a representation of `constraint`
