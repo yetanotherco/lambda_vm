@@ -99,18 +99,17 @@ fn test_estimate_main_elements_matches_built_trace() {
         .expect("into_traces");
     let actual = traces.total_field_elements();
 
-    // Estimator omits REGISTER/PAGE contributions. On small programs fixed
-    // tables dominate and the relative gap widens; for anything big enough
-    // to warrant the disk/ram decision the gap collapses below 1%. Cap at
-    // 10% here so we catch a chunked-table omission if one ever sneaks in.
+    // Estimator includes chunked tables, BITWISE, DECODE, HALT, COMMIT, and
+    // PAGE. Only REGISTER is omitted (fixed 32 rows × 2 cols — negligible).
+    // Require it to be a lower bound within 2% of actual.
     assert!(
         estimated <= actual,
         "estimator ({estimated}) > actual ({actual})"
     );
     let gap = actual - estimated;
     assert!(
-        gap * 10 <= actual,
-        "estimator gap {gap} is >10% of actual {actual}"
+        gap * 50 <= actual,
+        "estimator gap {gap} is >2% of actual {actual}"
     );
 }
 

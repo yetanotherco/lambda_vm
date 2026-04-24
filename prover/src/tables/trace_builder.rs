@@ -98,6 +98,15 @@ impl MemoryState {
         Self { cells }
     }
 
+    /// Count unique memory pages touched during execution. Used by the
+    /// main-elements estimator to account for PAGE-table rows without
+    /// allocating the trace tables. O(N) in `cells.len()`.
+    fn unique_page_count(&self, page_size: u64) -> usize {
+        let mask = !(page_size - 1);
+        let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
+        pages.len()
+    }
+
     /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
     fn add_private_input(&mut self, private_input: &[u8]) {
         if private_input.is_empty() {
@@ -2160,6 +2169,8 @@ impl PreparedTraceInputs {
         use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
         use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
         use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
 
         let ops = &self.derived.ops;
@@ -2184,9 +2195,13 @@ impl PreparedTraceInputs {
         total += (commit_rows * COMMIT_COLS) as u64;
         total += HALT_COLS as u64; // halt trace is always 1 row
 
-        // REGISTER and PAGE tables (preprocessed-heavy; small contribution)
-        // and pages (proportional to memory_state) are omitted here. They
-        // contribute < 1% for any program where the disk/ram decision matters.
+        // PAGE tables: one per unique memory page, each `DEFAULT_PAGE_SIZE`
+        // rows. Dominates for memory-heavy programs.
+        let page_size = super::page::DEFAULT_PAGE_SIZE as u64;
+        let page_count = self.memory_state.unique_page_count(page_size) as u64;
+        total += page_count * page_size * (PAGE_COLS - PAGE_PREPROCESSED) as u64;
+
+        // REGISTER table: 32 rows, 2 non-preprocessed cols — constant, omitted.
         total
     }
 

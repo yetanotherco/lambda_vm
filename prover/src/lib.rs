@@ -576,17 +576,16 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Sample available RAM before we start allocating trace tables. The
-    // executor result and op vectors built by `prepare_from_elf_and_logs`
-    // below are small relative to the trace tables themselves; the 1.3×
-    // safety factor in `estimate_peak_bytes` absorbs their contribution.
-    let available = auto_storage::available_ram_bytes();
-
     // Phases 0-4: op collection and derivation (cheap compared to phase 5's
     // trace-table allocation). After this we have the exact op counts needed
     // to compute `main_elements` without materializing the trace tables.
     let prep = Traces::prepare_from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     drop(result);
+
+    // Sample available RAM after the executor result is freed and `prep`'s
+    // op vectors are resident, so the figure reflects what's left for
+    // trace-table allocation.
+    let available = auto_storage::available_ram_bytes();
 
     let main_elements = prep.estimate_main_elements(max_rows);
     let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
