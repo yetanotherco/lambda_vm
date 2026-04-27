@@ -38,25 +38,33 @@ pub fn estimate_peak_bytes(main_elements: u64) -> u64 {
         .saturating_add(PEAK_BYTES_FIXED_OVERHEAD)
 }
 
+/// Effective RAM budget against which the estimate is compared.
+///
+/// Returns `None` when the OS reports zero available memory and the user
+/// hasn't set a cap; in that case the caller should default to `Ram` rather
+/// than force Disk on every proof. Otherwise the budget is the user's cap (if
+/// set), clamped down by what the OS reports available.
+pub fn effective_budget(available: u64, cap: Option<u64>) -> Option<u64> {
+    match (cap, available) {
+        (Some(c), 0) => Some(c),
+        (Some(c), a) => Some(c.min(a)),
+        (None, 0) => None,
+        (None, a) => Some(a),
+    }
+}
+
 /// Pick a storage mode given the estimate and the machine's available RAM.
 ///
-/// Uses 80% of available RAM as the cutoff so there's headroom for the OS,
-/// other processes, and allocator fragmentation. `cap` is an optional user-
-/// imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
+/// Uses 80% of the effective budget as the cutoff so there's headroom for the
+/// OS, other processes, and allocator fragmentation. `cap` is an optional
+/// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
-///
-/// `available == 0` means the OS didn't report a value (some containers /
-/// minimal Linux kernels). When that happens with no user cap, fall back to
-/// `Ram` rather than forcing Disk on every proof.
 pub fn select_storage_mode(estimated: u64, available: u64, cap: Option<u64>) -> StorageMode {
     const SAFETY_FRACTION_NUM: u64 = 4;
     const SAFETY_FRACTION_DEN: u64 = 5;
 
-    let budget = match (cap, available) {
-        (Some(c), 0) => c,
-        (Some(c), a) => c.min(a),
-        (None, 0) => return StorageMode::Ram,
-        (None, a) => a,
+    let Some(budget) = effective_budget(available, cap) else {
+        return StorageMode::Ram;
     };
     let threshold = budget.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;
 
