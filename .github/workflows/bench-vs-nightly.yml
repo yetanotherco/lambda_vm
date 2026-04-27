@@ -61,4 +61,4 @@ jobs:
         if: always()
         env:
           SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
-        run: sh .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"
+        run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"

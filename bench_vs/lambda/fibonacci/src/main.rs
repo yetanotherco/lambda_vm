@@ -4,7 +4,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
-const SYSCALL_GET_PRIVATE_INPUTS: u64 = 4;
+const PRIVATE_INPUT_START: usize = 0xFF000000;
 const SYSCALL_COMMIT: u64 = 64;
 const SYSCALL_HALT: u64 = 93;
 
@@ -14,18 +14,18 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 fn read_n() -> u64 {
-    let mut input = [0u8; 12];
-
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") input.as_mut_ptr(),
-            in("a7") SYSCALL_GET_PRIVATE_INPUTS,
-        );
-    }
-
+    // Layout matches `syscalls::get_private_input`: 4-byte LE length prefix at
+    // PRIVATE_INPUT_START, payload at +4. We only need the first 8 bytes (u64).
     let mut n_bytes = [0u8; 8];
-    n_bytes.copy_from_slice(&input[4..12]);
+
+    debug_assert!(
+        unsafe { core::ptr::read_volatile(PRIVATE_INPUT_START as *const u32) } >= 8,
+        "private input too short to contain a u64"
+    );
+
+    let input_data = (PRIVATE_INPUT_START + 4) as *const u8;
+    n_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(input_data, 8) });
+
     u64::from_le_bytes(n_bytes)
 }
 
