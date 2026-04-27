@@ -631,6 +631,7 @@ jobs:
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
           GROWTH_SLOPE_PCT: ${{ steps.compare.outputs.growth_slope_pct }}
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
           script: |
             const peak = process.env.PR_PEAK;
@@ -670,8 +671,10 @@ jobs:
 
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
+            const tableParallelism = process.env.TABLE_PARALLELISM;
+            const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
             let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
-            body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
+            body += `<sub>Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
