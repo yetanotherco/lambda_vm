@@ -215,10 +215,7 @@ fn create_custom_receiver_trace(rows: &[(u8, u8, u8, u8, u32)]) -> TraceTable<F,
     TraceTable::new_main(data, receiver_cols::NUM_COLUMNS, 1)
 }
 
-fn run_proof(
-    mut sender_trace: TraceTable<F, E>,
-    mut receiver_trace: TraceTable<F, E>,
-) -> bool {
+fn run_proof(mut sender_trace: TraceTable<F, E>, mut receiver_trace: TraceTable<F, E>) -> bool {
     let proof_options = ProofOptions::default_test_options();
     let sender_air = new_sender_air(&proof_options);
     let receiver_air = new_receiver_air(&proof_options);
