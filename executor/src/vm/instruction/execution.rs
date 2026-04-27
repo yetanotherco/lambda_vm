@@ -10,7 +10,6 @@ const REGULAR_PC_UPDATE: u64 = 4;
 pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    GetPrivateInputs = 4,
     Commit = 64,
     Halt = 93,
     KeccakPermute = 94, // Actual syscall number is KECCAK_SYSCALL_NUMBER (u64::MAX - 1)
@@ -27,7 +26,6 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
-            4 => Ok(SyscallNumbers::GetPrivateInputs),
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
@@ -332,14 +330,6 @@ impl Instruction {
                         memory.commit_public_output(buf_addr, count)?;
                         src2_val = buf_addr;
                         dst_val = count;
-                    }
-                    SyscallNumbers::GetPrivateInputs => {
-                        // get private inputs
-                        let pointer = registers.read(10)?;
-                        let private_inputs = memory.load_private_inputs()?;
-                        for (i, byte) in private_inputs.iter().enumerate() {
-                            memory.store_byte(pointer + i as u64, *byte);
-                        }
                     }
                     SyscallNumbers::KeccakPermute => {
                         // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10

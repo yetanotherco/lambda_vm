@@ -21,6 +21,19 @@ fn run_program(elf_path: &str) {
     );
 }
 
+/// Test that the memory-mapped private input region is readable by guest programs.
+/// The ASM program reads from 0xFF000000 and commits 8 bytes of data.
+#[test]
+fn test_private_input_memory_mapped() {
+    let elf_data = std::fs::read("./program_artifacts/asm/test_private_input_xpage.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let input: Vec<u8> = (0u8..16).collect();
+    let executor = Executor::new(&program, input.clone()).unwrap();
+    let result = executor.run().unwrap();
+    // Committed bytes are at 0xFF000008 = data bytes [4..12]
+    assert_eq!(result.return_values.memory_values, input[4..12].to_vec());
+}
+
 #[test]
 fn test_basic_program() {
     run_program("./program_artifacts/asm/basic_program.elf");

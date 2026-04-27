@@ -6,7 +6,7 @@
 //!
 //! ## Token Model
 //!
-//! - **REG-C1**: Receives initial token `(1, address, ts=0, init)` - balances MEMW's send on first access
+//! - **REG-C1**: Receives initial token `(1, address, ts=1, init)` - balances MEMW's send on first access
 //! - **REG-C2**: Sends final token `(1, address, timestamp, fini)` - balances MEMW's receive on last access
 //!
 //! ## Columns
@@ -16,7 +16,7 @@
 //! | offset | RowIndex | Byte offset within register space |
 //! | init | Word | Initial value (0 for all registers at start) |
 //! | fini | Word | Final value after execution |
-//! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
+//! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
 
 use std::collections::HashMap;
 
@@ -67,7 +67,7 @@ pub mod cols {
     /// fini: Final byte value after execution
     pub const FINI: usize = 2;
 
-    /// timestamp[0]: Final timestamp low word (0 if never accessed)
+    /// timestamp[0]: Final timestamp low word (1 if never accessed, matching REG-C1 init)
     pub const TIMESTAMP_LO: usize = 3;
 
     /// timestamp[1]: Final timestamp high word
@@ -84,7 +84,7 @@ pub mod cols {
 /// Final state for a single register Word address.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinalRegisterWordState {
-    /// Final timestamp (0 if never accessed)
+    /// Final timestamp (1 if never accessed, matching REG-C1 init)
     pub timestamp: u64,
     /// Final Word value (32-bit)
     pub value: u32,
@@ -161,12 +161,12 @@ pub fn generate_register_trace(
         let init_value = init_value_for_address(word_addr, entry_point);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
-        // Final state: if accessed use final, otherwise use initial
+        // Final state: if accessed use final, otherwise use initial (timestamp 1)
         let (timestamp, fini_value) = if let Some(state) = final_state.get(&word_addr) {
             (state.timestamp, state.value)
         } else {
-            // Never accessed: timestamp=0, fini=init
-            (0, init_value)
+            // Never accessed: timestamp=1 (matches REG-C1 init), fini=init
+            (1, init_value)
         };
 
         data[base + cols::FINI] = FE::from(fini_value as u64);
@@ -174,8 +174,13 @@ pub fn generate_register_trace(
         data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
     }
 
-    // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES)
-    // Zero-initialized: offset=0, init=fini=0, ts=0 — self-cancelling on bus.
+    // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES): set TIMESTAMP_LO=1 so
+    // REG-C1's constant ts=1 emission matches REG-C2's ts=TIMESTAMP_LO consumption,
+    // keeping padding rows self-cancelling on the bus.
+    for row in NUM_REGISTER_ADDRESSES..num_rows {
+        let base = row * cols::NUM_COLUMNS;
+        data[base + cols::TIMESTAMP_LO] = FE::from(1u64);
+    }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
@@ -247,7 +252,7 @@ pub fn preprocessed_commitment(options: &ProofOptions, entry_point: u64) -> Comm
 ///
 /// ## Bus Interactions
 ///
-/// - REG-C1: memory[1, address, 0, init] - receiver, multiplicity -1
+/// - REG-C1: memory[1, address, 1, init] - receiver, multiplicity -1
 /// - REG-C2: memory[1, address, timestamp, fini] - sender, multiplicity 1
 ///
 /// Note: is_register=1 (constant) to distinguish from memory (is_register=0).
@@ -261,8 +266,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(0);
 
     vec![
-        // REG-C1: memory[1, address, 0, init] - receive initial token
-        // Balances MEMW's first send on this address
+        // REG-C1: memory[1, address, 1, init] - receive initial token
+        // Balances MEMW's first send on this address.
+        // Per spec/memory.typ: "register initialization happens at timestamp 1"
+        // so that the CPU's inline PC read on the first row consumes the init token.
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -273,8 +280,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 address_lo.clone(),
                 // address_hi = 0
                 address_hi.clone(),
-                // timestamp_lo = 0 (initial)
-                BusValue::constant(0),
+                // timestamp_lo = 1 (initial)
+                BusValue::constant(1),
                 // timestamp_hi = 0
                 BusValue::constant(0),
                 // value = init
@@ -365,11 +372,12 @@ mod tests {
         assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
         assert!(trace.num_rows().is_power_of_two());
 
-        // Check first row (address 0, never accessed)
+        // Check first row (address 0, never accessed): timestamp defaults to 1
+        // per spec/memory.typ so that REG-C1/REG-C2 cancel on the bus.
         assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::zero());
         assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
         assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
-        assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::zero());
+        assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::from(1u64));
 
         // Check x254 row (row 64 = addr 508)
         assert_eq!(*trace.main_table.get(64, cols::OFFSET), FE::from(508u64));
