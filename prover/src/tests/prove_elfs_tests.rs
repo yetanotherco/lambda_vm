@@ -23,7 +23,7 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::trace_builder::Traces;
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
 use executor::elf::Elf;
 
@@ -1006,7 +1006,7 @@ fn test_debug_memory_bus_tokens() {
 
     let z: i128 = 1000;
     let alpha: i128 = 2;
-    let bus_id: i128 = 16; // BusId::Memory
+    let bus_id: i128 = u64::from(BusId::Memory) as i128;
 
     // Compute fingerprint for a token
     let fingerprint =

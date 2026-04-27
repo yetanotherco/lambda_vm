@@ -1043,12 +1043,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Unified bitwise lookup. Token: (op_id, X, Y, RESULT) with
     //   op_id = AND + 2*OR + 4*XOR        (disjoint-bit encoding)
     //   RESULT = RES[i]                   (matches x&y / x|y / x^y)
-    //   multiplicity = AND + OR + XOR     (at most one, enforced by IS_BIT)
+    //   multiplicity = AND + OR + XOR     (at most one in honest traces)
     // Receiver on BITWISE table uses Z as the op_id discriminator: the
     // sender's op_id ∈ {1, 2, 4} lands on rows z = 1 (AND), 2 (OR), 4 (XOR).
-    // Invalid op_ids (3, 5, 6, 7) from multi-flag settings never match a
-    // preprocessed row with non-zero MU_BITWISE, so the memory argument
-    // enforces at-most-one without a dedicated algebraic constraint.
+    //
+    // Why op_id ∈ {1, 2, 4} (and never the multi-flag values 3, 5, 6, 7):
+    //   1. IS_BIT constraints (constraints/cpu.rs, BIT_FLAG_COLUMNS) force
+    //      AND, OR, XOR ∈ {0, 1} unconditionally.
+    //   2. The DECODE bus lookup ties the CPU's reconstructed packed_decode
+    //      (bits OP_AND/OP_OR/OP_XOR per types::packed_decode) to the
+    //      precomputed program table. DecodeEntry::set_arith_op
+    //      (types.rs) is exhaustive over ArithOp and sets exactly one of
+    //      {op_and, op_or, op_xor} per instruction, so the precomputed
+    //      packed_decode is one-hot over those bits.
+    // (1) + (2) ⇒ at most one of AND/OR/XOR is 1, so op_id ∈ {0, 1, 2, 4}.
+    // op_id = 0 has multiplicity Sum3 = 0, so only {1, 2, 4} reach the bus.
+    // The memory argument by itself does NOT enforce at-most-one: MU_BITWISE
+    // is a witness column and BITWISE has precomputed rows at z = 3, 5..15
+    // with RESULT = 0; without IS_BIT + DECODE a malicious prover could
+    // place MU_BITWISE > 0 there and balance the bus with RES[i] = 0.
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
             BusId::Bitwise,

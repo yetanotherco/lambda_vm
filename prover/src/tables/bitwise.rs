@@ -56,8 +56,9 @@ pub mod cols {
     /// For shift ops (SLL/SLLC/HWSL) Z is the shift amount 0..15.
     /// For AND/OR/XOR lookups, Z doubles as the op selector sent by the
     /// Bitwise sender: Z = 1 → AND, Z = 2 → OR, Z = 4 → XOR.
-    /// Z values 3, 5-15 have `RESULT = 0` and zero `MU_BITWISE` — no valid
-    /// sender ever emits a token targeting those rows on `BusId::Bitwise`.
+    /// Z values 3, 5-15 have `RESULT = 0`. In honest traces no sender emits
+    /// a token with op_id outside {1, 2, 4} (see the soundness comment on
+    /// the BusId::Bitwise receiver below for the IS_BIT + DECODE chain).
     pub const Z: usize = 2;
 
     /// Unified result column for `BusId::Bitwise` lookups.
@@ -66,7 +67,7 @@ pub mod cols {
     /// - Z = 1: RESULT = X & Y     (AND)
     /// - Z = 2: RESULT = X | Y     (OR)
     /// - Z = 4: RESULT = X ^ Y     (XOR)
-    /// - otherwise: RESULT = 0     (irrelevant; MU_BITWISE = 0 on those rows)
+    /// - otherwise: RESULT = 0     (no honest sender targets these rows)
     pub const RESULT: usize = 3;
     /// MSB of byte X: (X >> 7) & 1
     pub const MSB8: usize = 4;
@@ -570,11 +571,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // Single receiver for AND/OR/XOR byte lookups. The sender side
         // (CPU, branch.rs, shift.rs) emits `op_id = AND + 2*OR + 4*XOR`
         // as the first token element, matching this row's Z. Z=1 → AND,
-        // Z=2 → OR, Z=4 → XOR. IS_BIT on each op flag + disjoint-bit
-        // encoding ⇒ valid `op_id ∈ {0, 1, 2, 4}`; invalid combinations
-        // (3, 5, 6, 7) never match a row with non-zero MU_BITWISE, so
-        // the memory argument enforces at-most-one without a dedicated
-        // algebraic constraint.
+        // Z=2 → OR, Z=4 → XOR.
+        //
+        // Soundness chain (why op_id is forced into {1, 2, 4} for the CPU
+        // sender; branch.rs and shift.rs use the literal constant 1):
+        //   1. IS_BIT (in CPU constraints) forces AND, OR, XOR ∈ {0, 1}.
+        //   2. DECODE lookup ties the CPU's packed_decode (which embeds
+        //      bits OP_AND/OP_OR/OP_XOR) to the precomputed program table,
+        //      where DecodeEntry::set_arith_op sets exactly one of the
+        //      three flags per instruction.
+        // The memory argument alone is NOT load-bearing: MU_BITWISE is a
+        // witness column and rows with z ∈ {0, 3, 5..15} have RESULT = 0,
+        // so without (1)+(2) a prover could absorb a multi-flag token by
+        // emitting RES[i] = 0 and pumping MU_BITWISE on z = 3.
         BusInteraction::receiver(
             BusId::Bitwise,
             Multiplicity::Column(cols::MU_BITWISE),
