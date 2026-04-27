@@ -4,7 +4,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
-const SYSCALL_GET_PRIVATE_INPUTS: u64 = 4;
+const PRIVATE_INPUT_START: usize = 0xFF000000;
 const SYSCALL_COMMIT: u64 = 64;
 const SYSCALL_HALT: u64 = 93;
 
@@ -14,18 +14,13 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 fn read_n() -> u64 {
-    let mut input = [0u8; 12];
+    let mut n_bytes = [0u8; 8];
+    let input_data = (PRIVATE_INPUT_START + 4) as *const u8;
 
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") input.as_mut_ptr(),
-            in("a7") SYSCALL_GET_PRIVATE_INPUTS,
-        );
+    for (i, byte) in n_bytes.iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile(input_data.add(i)) };
     }
 
-    let mut n_bytes = [0u8; 8];
-    n_bytes.copy_from_slice(&input[4..12]);
     u64::from_le_bytes(n_bytes)
 }
 
