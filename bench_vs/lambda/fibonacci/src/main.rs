@@ -24,9 +24,7 @@ fn read_n() -> u64 {
     );
 
     let input_data = (PRIVATE_INPUT_START + 4) as *const u8;
-    for (i, byte) in n_bytes.iter_mut().enumerate() {
-        *byte = unsafe { core::ptr::read_volatile(input_data.add(i)) };
-    }
+    n_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(input_data, 8) });
 
     u64::from_le_bytes(n_bytes)
 }
