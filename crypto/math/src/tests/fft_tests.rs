@@ -48,6 +48,7 @@ mod fft_helpers_test {
 mod fft_polynomial_tests {
     use crate::field::traits::IsField;
 
+    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
     use crate::fft::cpu::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
@@ -225,6 +226,18 @@ mod fft_polynomial_tests {
                 let (poly, new_poly) = gen_fft_interpolate_and_evaluate(poly);
 
                 prop_assert_eq!(poly, new_poly);
+            }
+
+            // Property-based test that ensures evaluate_fft_bit_reversed returns the same
+            // values as evaluate_fft followed by an in-place bit-reverse permutation.
+            #[test]
+            fn test_fft_bit_reversed_matches_evaluate_fft_then_permute(poly in poly(8)
+                                                           .prop_filter("Avoid polynomials of size not power of two",
+                                                                        |poly| poly.coeff_len().is_power_of_two())) {
+                let mut expected = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();
+                in_place_bit_reverse_permute(&mut expected);
+                let got = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 1, None).unwrap();
+                prop_assert_eq!(got, expected);
             }
 
             #[test]
