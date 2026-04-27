@@ -281,12 +281,10 @@ pub fn generate_keccak_rnd_trace(
             }
 
             // Rotate C left by 1 bit using HWSL decomposition.
-            // HWSL shifts each halfword independently. The carry from halfword k
-            // propagates to halfword (k+1)%4, which is a 2-byte offset:
+            // HWSL shifts each halfword (u16) independently and emits the carry
+            // as a u16 at bytes [2k, 2k+1] of Cxz_right, so the carry propagates
+            // by 2 bytes (not 1):
             //   rotated_Cxz[z] = Cxz_left[z] + Cxz_right[(z-2) mod 8]
-            // Spec keccak_round.toml says (z-1) mod 8 — that is a spec bug:
-            // HWSL's SLLC is a u16 at bytes [2k, 2k+1] of Cxz_right, so the
-            // carry propagates by 2 bytes, not 1. See docs/keccak-spec-deviations.md.
             let mut cxz_left_bytes = [[0u8; 8]; 5];
             let mut cxz_right_bytes = [[0u8; 8]; 5];
             let mut rotated_c = [[0u8; 8]; 5];
@@ -653,8 +651,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // --- Theta: Dxz XOR_BYTE (40) ---
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
     // rotated_C[x'][b] = Cxz_left[x'][b] + Cxz_right[x'][(b-2)%8] (virtual).
-    // Spec has (b-1)%8 — see docs/keccak-spec-deviations.md for why HWSL carry
-    // needs a 2-byte offset, not 1.
+    // The 2-byte offset comes from HWSL emitting the carry as a u16 spanning
+    // bytes [2k, 2k+1] of Cxz_right.
     for x in 0..5 {
         for b in 0..8 {
             interactions.push(BusInteraction::sender(

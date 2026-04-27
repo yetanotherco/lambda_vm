@@ -83,7 +83,6 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::MUL,
     cols::DIVREM,
     cols::ECALL,
-    cols::ECALL_KECCAK,
     cols::EBREAK,
     // Sign bits
     cols::RV1_EXT_BIT,
@@ -102,60 +101,6 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// Returns the constraints and the next available constraint index.
 pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConstraint>, usize) {
     super::templates::new_is_bit_constraints(BIT_FLAG_COLUMNS, constraint_idx_start)
-}
-
-// =========================================================================
-// ECALL_KECCAK Implication Constraint
-// =========================================================================
-
-/// Constraint: ECALL_KECCAK * (1 - ECALL) = 0
-///
-/// Ensures ECALL_KECCAK can only be 1 when ECALL is 1.
-pub struct EcallKeccakImpliesEcallConstraint {
-    constraint_idx: usize,
-}
-
-impl EcallKeccakImpliesEcallConstraint {
-    pub fn new(constraint_idx: usize) -> Self {
-        Self { constraint_idx }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let ecall_keccak = step
-            .get_main_evaluation_element(0, cols::ECALL_KECCAK)
-            .clone();
-        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
-        let one = FieldElement::<F>::one();
-        ecall_keccak * (one - ecall)
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
-    for EcallKeccakImpliesEcallConstraint
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
 }
 
 // =========================================================================
@@ -1088,7 +1033,7 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 
 /// Total number of CPU constraints.
 ///
-/// - IS_BIT: 32 (all bit flags, including read_register1/2)
+/// - IS_BIT: 34 (all bit flags, including read_register1/2 and inline-PC columns)
 /// - ADD carry: 2 (for ADD + LOAD)
 /// - STORE ADD carry: 2 (for STORE: res = arg1 + imm)
 /// - SUB carry: 2 (for SUB + BEQ)
@@ -1107,12 +1052,12 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 70 constraints (35 IS_BIT + 8 ADD + 27 other)
+/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
 /// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
 /// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
 /// are required.)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    35 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1155,10 +1100,6 @@ pub fn create_all_cpu_constraints() -> (
 
     // EBREAK
     other.push(EbreakConstraint::new(next_idx).boxed());
-    next_idx += 1;
-
-    // ECALL_KECCAK implies ECALL
-    other.push(EcallKeccakImpliesEcallConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // rv1 zero-forcing (CM48): (1 - read_register1) * rv1[i] = 0 for i ∈ [0, 2]

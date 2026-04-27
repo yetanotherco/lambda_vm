@@ -232,24 +232,16 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 73;
 
-    /// ECALL_KECCAK: 1 when the ECALL is a KeccakPermute syscall, 0 otherwise
-    pub const ECALL_KECCAK: usize = 74;
-
-    /// Keccak state address (DWordWL: lo32 and hi32).
-    /// Non-zero only for KeccakPermute ECALLs.
-    pub const KECCAK_STATE_ADDR_0: usize = 75;
-    pub const KECCAK_STATE_ADDR_1: usize = 76;
-
     /// prev_pc_timestamp_borrow: Borrow bit for the 32-bit subtraction timestamp_lo - 3
     /// in the inline PC prev_ts formula. Fires only when timestamp_lo < 3 and
     /// pc_double_read = 0 (i.e. after timestamp wraps past 2^32 into values 0..2).
-    pub const PREV_PC_TIMESTAMP_BORROW: usize = 77;
+    pub const PREV_PC_TIMESTAMP_BORROW: usize = 74;
 
     /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
-    pub const PC_DOUBLE_READ: usize = 78;
+    pub const PC_DOUBLE_READ: usize = 75;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 79;
+    pub const NUM_COLUMNS: usize = 76;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -821,9 +813,6 @@ pub fn generate_cpu_trace(
         data[base + cols::MUL] = FE::from(d.op_mul as u64);
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
-        data[base + cols::ECALL_KECCAK] = FE::from(op.ecall_keccak as u64);
-        data[base + cols::KECCAK_STATE_ADDR_0] = FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
-        data[base + cols::KECCAK_STATE_ADDR_1] = FE::from(op.keccak_state_addr >> 32);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns

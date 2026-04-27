@@ -171,16 +171,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(160);
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
-    // Format: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] (DWordWL convention).
-    //
-    // Spec keccak.toml:51 has `["arr", 2^32-1, 2^32-2]` which flattens to
-    // [hi, lo] — inconsistent with HALT/COMMIT which use `["cast", N, "DWordWL"]`
-    // → [lo, hi]. The CPU ECALL sender (cpu.rs) is shared across all three
-    // receivers and uses [lo, hi], so applying the spec's keccak ordering
-    // literally desbalances the LogUp bus.
-    //
-    // Upstream spec needs to change keccak.toml:51 to `["cast", -2, "DWordWL"]`.
-    // See docs/keccak-spec-deviations.md #7.
+    // Payload: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] in DWordWL [lo, hi]
+    // ordering, matching the CPU ECALL sender shared with HALT/COMMIT.
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::Column(cols::MU),
