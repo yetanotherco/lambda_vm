@@ -994,11 +994,12 @@ class Chip:
             isinstance(self.name, str), f"name is not a string: {self.name!r}"
         )
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
-        self.code = data.get("name", "")
-        reporter.asserts(
-            isinstance(self.code, str), f"code is not a string: {self.code!r}"
-        )
-        reporter.asserts(self.code.isidentifier(), f"Invalid identifier: {self.name!r}")
+        self.code = data.get("code", "")
+        if self.code:
+            reporter.asserts(
+                isinstance(self.code, str), f"code is not a string: {self.code!r}"
+            )
+            reporter.asserts(self.code.isidentifier(), f"Invalid identifier: {self.code!r}")
         self.variables = [
             (Variable if cat != "virtual" else VirtualVariable)(config, cat, var)
             for cat, vars in data["variables"].items()
