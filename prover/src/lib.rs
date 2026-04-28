@@ -584,7 +584,11 @@ pub fn prove_with_options_and_inputs(
     )?;
 
     let available = auto_storage::available_ram_bytes();
-    let estimated_peak = auto_storage::peak_bytes(&lengths, proof_options.blowup_factor);
+    let estimated_peak = auto_storage::peak_bytes(
+        &lengths,
+        proof_options.blowup_factor,
+        stark::prover::table_parallelism(),
+    );
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 

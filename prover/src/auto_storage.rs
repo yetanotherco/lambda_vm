@@ -1,20 +1,36 @@
 //! Automatic `StorageMode` selection from an analytical peak-RAM estimate.
 //!
-//! [`peak_bytes`] sums every allocation `multi_prove_with_mode` keeps alive
-//! during phase 5 + commitment + composition + FRI, derived from the STARK
-//! structure (no regression fit, no averaged coefficients). Per-table:
+//! [`peak_bytes`] models the live working set of `multi_prove_with_mode` as the
+//! sum of three things:
+//!
+//! 1. **Persistent across phase D** — every cached LDE and its main/aux Merkle
+//!    tree, summed over all tables. These are built in phase A/C and stay
+//!    alive until the chunk that owns them runs in phase D.
+//! 2. **Concurrent transient** — composition LDE + composition Merkle + FRI
+//!    evals + FRI Merkle + the round-2 `constraint_evaluations` Vec, summed
+//!    over the *worst-case chunk*. `multi_prove_with_mode` runs `k =
+//!    table_parallelism()` tables of round 2-4 in parallel; only those k have
+//!    transient state alive at once.
+//! 3. **Domain + LdeTwiddles caches** — one entry per unique
+//!    `(trace_length, blowup, coset_offset)`, deduplicated by
+//!    `multi_prove_with_mode` (see prover.rs around the
+//!    `domain_cache` HashMap).
+//!
+//! Per-table contributions, given padded row count `N`, blowup `B`, full main
+//! columns `C_m` (including precomputed/multiplicity columns kept in the LDE),
+//! aux columns `C_a`, and `T` main Merkle trees (1 for the unified path, 2 for
+//! the preprocessed path that builds precomputed_tree + mult_tree):
 //!
 //! ```text
-//! main trace        : rows × main_cols × 8                 (Goldilocks = 8 B)
-//! main LDE          : rows × main_cols × 8 × blowup
-//! main Merkle       : (2 × rows × blowup) × 32             (Keccak256 node = 32 B)
-//! aux trace         : rows × aux_cols × 24                 (cubic ext = 24 B)
-//! aux LDE           : rows × aux_cols × 24 × blowup
-//! aux Merkle        : (2 × rows × blowup) × 32
-//! composition LDE   : rows × blowup × 24                   (one ext-field column)
-//! composition Merkle: (2 × rows × blowup) × 32
-//! FRI evals         : ~rows × blowup × 24 × 2              (geometric over layers)
-//! FRI Merkle        : ~(2 × rows × blowup) × 32 × 2        (geometric over layers)
+//! main LDE          : N × C_m × 8 × (1+B)              (Goldilocks = 8 B)
+//! main Merkle       : T × 2 × N × B × 32               (Keccak256 node = 32 B)
+//! aux trace + LDE   : N × C_a × 24 × (1+B)             (cubic ext = 24 B)
+//! aux Merkle        : 2 × N × B × 32
+//! constraint evals  : N × B × 24                       (round 2 transient)
+//! composition LDE   : 2 × N × B × 24                   (d=2 → two parts)
+//! composition Merkle: N × B × 32                       (PairKeccak: N/2 leaves)
+//! FRI evals         : N × B × 24                       (geometric ≈ 1)
+//! FRI Merkle        : N × B × 32                       (geometric ≈ 1)
 //! ```
 //!
 //! `aux_cols = ⌈bus_interactions.len() / 2⌉` — the LogUp committed-pair count
@@ -35,16 +51,12 @@
 //! [`count_table_lengths`]: crate::tables::trace_builder::count_table_lengths
 
 use crate::tables::bitwise::{
-    NUM_PRECOMPUTED_COLS as BITWISE_PRE, NUM_ROWS as BITWISE_ROWS,
-    bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
+    NUM_ROWS as BITWISE_ROWS, bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
 };
 use crate::tables::branch::{bus_interactions as branch_buses, cols::NUM_COLUMNS as BRANCH_COLS};
 use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS as COMMIT_COLS};
 use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
-use crate::tables::decode::{
-    NUM_PRECOMPUTED_COLS as DECODE_PRE, bus_interactions as decode_buses,
-    cols::NUM_COLUMNS as DECODE_COLS,
-};
+use crate::tables::decode::{bus_interactions as decode_buses, cols::NUM_COLUMNS as DECODE_COLS};
 use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
 use crate::tables::halt::{bus_interactions as halt_buses, cols::NUM_COLUMNS as HALT_COLS};
 use crate::tables::load::{bus_interactions as load_buses, cols::NUM_COLUMNS as LOAD_COLS};
@@ -58,12 +70,10 @@ use crate::tables::memw_register::{
 };
 use crate::tables::mul::{bus_interactions as mul_buses, cols::NUM_COLUMNS as MUL_COLS};
 use crate::tables::page::{
-    DEFAULT_PAGE_SIZE as PAGE_SIZE, NUM_PREPROCESSED_COLS as PAGE_PRE,
-    bus_interactions as page_buses, cols::NUM_COLUMNS as PAGE_COLS,
+    DEFAULT_PAGE_SIZE as PAGE_SIZE, bus_interactions as page_buses, cols::NUM_COLUMNS as PAGE_COLS,
 };
 use crate::tables::register::{
-    NUM_PREPROCESSED_COLS as REGISTER_PRE, NUM_REGISTER_ADDRESSES,
-    bus_interactions as register_buses, cols::NUM_COLUMNS as REGISTER_COLS,
+    NUM_REGISTER_ADDRESSES, bus_interactions as register_buses, cols::NUM_COLUMNS as REGISTER_COLS,
 };
 use crate::tables::shift::{bus_interactions as shift_buses, cols::NUM_COLUMNS as SHIFT_COLS};
 use crate::tables::trace_builder::TableLengths;
@@ -77,133 +87,198 @@ const LOG_STRUCT_BYTES: u64 = 40;
 const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
-/// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
-/// `blowup_factor` is the LDE blowup from `ProofOptions::blowup_factor`.
-pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8) -> u64 {
-    let b = blowup_factor as u64;
+/// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
+type TableSpec = (u64, u64, u64, u64);
 
-    // Bytes a single table contributes given its padded-row count, its
-    // non-preprocessed main columns, and its aux columns. Sums every
-    // allocation listed in the module doc that scales with that table.
-    let table_bytes = |rows: u64, main_cols: u64, aux_cols: u64| -> u64 {
-        // Trace + LDE: full LDE includes the trace itself, so factor = (1 + B).
-        let main_lde = rows * main_cols * GOLDILOCKS_BYTES * (1 + b);
-        let aux_lde = rows * aux_cols * CUBIC_EXT_BYTES * (1 + b);
-        // Merkle: 2N nodes (binary tree over N = rows × blowup leaves) × 32 B.
-        let main_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
-        let aux_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
-        // Composition: one ext-field column on the LDE domain + its Merkle.
-        let composition_lde = rows * b * CUBIC_EXT_BYTES;
-        let composition_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
-        // FRI evals across all layers (in-place fold halves each layer, but
-        // each FriLayer struct keeps its own clone of pre-fold evals; geometric
-        // series 1 + 1/2 + 1/4 + … = 2).
-        let fri_evals = 2 * rows * b * CUBIC_EXT_BYTES;
-        // FRI Merkle uses PairKeccak256 (one leaf per pair of evals), so first
-        // layer has rows × blowup / 2 leaves → ~rows × blowup nodes × 32 B.
-        // Geometric sum × 2 across layers.
-        let fri_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
+/// Bytes alive for the duration of phase D (LDE columns + main/aux Merkle).
+fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
+    let (rows, main_cols, aux_cols, main_trees) = spec;
+    let main_lde = rows * main_cols * GOLDILOCKS_BYTES * (1 + blowup);
+    let aux_lde = rows * aux_cols * CUBIC_EXT_BYTES * (1 + blowup);
+    let main_merkle = main_trees * 2 * rows * blowup * KECCAK_NODE_BYTES;
+    let aux_merkle = 2 * rows * blowup * KECCAK_NODE_BYTES;
+    main_lde + aux_lde + main_merkle + aux_merkle
+}
 
-        main_lde
-            + aux_lde
-            + main_merkle
-            + aux_merkle
-            + composition_lde
-            + composition_merkle
-            + fri_evals
-            + fri_merkle
-    };
+/// Bytes alive only while one chunk of `k` tables is in rounds 2-4. Sums:
+/// `constraint_evaluations` (transient mid-round 2), the two LDE-size
+/// composition parts (d=2 path, every current AIR), the composition Merkle,
+/// and the geometric-sum FRI evals + FRI Merkle.
+fn transient_per_table(spec: TableSpec, blowup: u64) -> u64 {
+    let (rows, _, _, _) = spec;
+    let lde_size = rows * blowup;
+    let constraint_evals = lde_size * CUBIC_EXT_BYTES;
+    let composition_lde = 2 * lde_size * CUBIC_EXT_BYTES;
+    let composition_merkle = lde_size * KECCAK_NODE_BYTES;
+    let fri_evals = lde_size * CUBIC_EXT_BYTES;
+    let fri_merkle = lde_size * KECCAK_NODE_BYTES;
+    constraint_evals + composition_lde + composition_merkle + fri_evals + fri_merkle
+}
 
-    let aux = |bus_count: usize| -> u64 { bus_count.div_ceil(2) as u64 };
+/// Bytes for one (trace_length, blowup, coset_offset) entry in the prover's
+/// Domain/LdeTwiddles cache. Domain holds `trace_roots_of_unity` (N elts) and
+/// `lde_roots_of_unity_coset` (N×B). LdeTwiddles holds `inv` (~N), `fwd`
+/// (~N×B), and `coset_weights` (N). All in base field (Goldilocks, 8 B).
+fn domain_cache_bytes(rows: u64, blowup: u64) -> u64 {
+    rows * (3 + 2 * blowup) * GOLDILOCKS_BYTES
+}
 
+fn aux_cols(bus_count: usize) -> u64 {
+    bus_count.div_ceil(2) as u64
+}
+
+/// Build the full per-table table list for a given `TableLengths`. Order
+/// matches the order tables are added to `air_trace_pairs` in `prove`.
+fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
     let halt_rows = 1u64;
     let page_rows = PAGE_SIZE as u64;
 
-    let mut total = 0u64;
-    total += table_bytes(
-        lengths.cpu_padded_rows,
-        CPU_COLS as u64,
-        aux(cpu_buses().len()),
-    );
-    total += table_bytes(
-        lengths.memw_padded_rows,
-        MEMW_COLS as u64,
-        aux(memw_buses().len()),
-    );
-    total += table_bytes(
-        lengths.memw_aligned_padded_rows,
-        MEMW_A_COLS as u64,
-        aux(memw_a_buses().len()),
-    );
-    total += table_bytes(
-        lengths.memw_register_padded_rows,
-        MEMW_R_COLS as u64,
-        aux(memw_r_buses().len()),
-    );
-    total += table_bytes(
-        lengths.load_padded_rows,
-        LOAD_COLS as u64,
-        aux(load_buses().len()),
-    );
-    total += table_bytes(
-        lengths.lt_padded_rows,
-        LT_COLS as u64,
-        aux(lt_buses().len()),
-    );
-    total += table_bytes(
-        lengths.shift_padded_rows,
-        SHIFT_COLS as u64,
-        aux(shift_buses().len()),
-    );
-    total += table_bytes(
-        lengths.mul_padded_rows,
-        MUL_COLS as u64,
-        aux(mul_buses().len()),
-    );
-    total += table_bytes(
-        lengths.dvrm_padded_rows,
-        DVRM_COLS as u64,
-        aux(dvrm_buses().len()),
-    );
-    total += table_bytes(
-        lengths.branch_padded_rows,
-        BRANCH_COLS as u64,
-        aux(branch_buses().len()),
-    );
-    total += table_bytes(
-        lengths.commit_padded_rows,
-        COMMIT_COLS as u64,
-        aux(commit_buses().len()),
-    );
-    total += table_bytes(
-        bitwise_rows,
-        (BITWISE_COLS - BITWISE_PRE) as u64,
-        aux(bitwise_buses().len()),
-    );
-    total += table_bytes(
-        lengths.decode_rows,
-        (DECODE_COLS - DECODE_PRE) as u64,
-        aux(decode_buses().len()),
-    );
-    total += table_bytes(halt_rows, HALT_COLS as u64, aux(halt_buses().len()));
-    total += table_bytes(
-        register_rows,
-        (REGISTER_COLS - REGISTER_PRE) as u64,
-        aux(register_buses().len()),
-    );
-    // Each unique 256 KB page gets its own PAGE table of `PAGE_SIZE` rows.
-    let page_main = (PAGE_COLS - PAGE_PRE) as u64;
-    let page_aux = aux(page_buses(0).len());
-    total += lengths.unique_page_count * table_bytes(page_rows, page_main, page_aux);
+    let mut specs = vec![
+        (
+            lengths.cpu_padded_rows,
+            CPU_COLS as u64,
+            aux_cols(cpu_buses().len()),
+            1,
+        ),
+        (
+            lengths.memw_padded_rows,
+            MEMW_COLS as u64,
+            aux_cols(memw_buses().len()),
+            1,
+        ),
+        (
+            lengths.memw_aligned_padded_rows,
+            MEMW_A_COLS as u64,
+            aux_cols(memw_a_buses().len()),
+            1,
+        ),
+        (
+            lengths.memw_register_padded_rows,
+            MEMW_R_COLS as u64,
+            aux_cols(memw_r_buses().len()),
+            1,
+        ),
+        (
+            lengths.load_padded_rows,
+            LOAD_COLS as u64,
+            aux_cols(load_buses().len()),
+            1,
+        ),
+        (
+            lengths.lt_padded_rows,
+            LT_COLS as u64,
+            aux_cols(lt_buses().len()),
+            1,
+        ),
+        (
+            lengths.shift_padded_rows,
+            SHIFT_COLS as u64,
+            aux_cols(shift_buses().len()),
+            1,
+        ),
+        (
+            lengths.mul_padded_rows,
+            MUL_COLS as u64,
+            aux_cols(mul_buses().len()),
+            1,
+        ),
+        (
+            lengths.dvrm_padded_rows,
+            DVRM_COLS as u64,
+            aux_cols(dvrm_buses().len()),
+            1,
+        ),
+        (
+            lengths.branch_padded_rows,
+            BRANCH_COLS as u64,
+            aux_cols(branch_buses().len()),
+            1,
+        ),
+        (
+            lengths.commit_padded_rows,
+            COMMIT_COLS as u64,
+            aux_cols(commit_buses().len()),
+            1,
+        ),
+        // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit
+        // path: it extracts ALL columns into the LDE and builds two Merkle trees
+        // (precomputed_tree + mult_tree), so main_cols = full NUM_COLUMNS and
+        // main_trees = 2.
+        (
+            bitwise_rows,
+            BITWISE_COLS as u64,
+            aux_cols(bitwise_buses().len()),
+            2,
+        ),
+        (
+            lengths.decode_rows,
+            DECODE_COLS as u64,
+            aux_cols(decode_buses().len()),
+            2,
+        ),
+        (halt_rows, HALT_COLS as u64, aux_cols(halt_buses().len()), 1),
+        (
+            register_rows,
+            REGISTER_COLS as u64,
+            aux_cols(register_buses().len()),
+            2,
+        ),
+    ];
+    // Each unique 256 KB page → its own PAGE table at PAGE_SIZE rows.
+    for _ in 0..lengths.unique_page_count {
+        specs.push((
+            page_rows,
+            PAGE_COLS as u64,
+            aux_cols(page_buses(0).len()),
+            2,
+        ));
+    }
+    specs
+}
 
-    // State kept alive across the prove call.
-    total += lengths.unique_byte_count * MEMORY_CELL_BYTES;
-    total += lengths.cycle_count * LOG_STRUCT_BYTES;
-    total += lengths.decode_rows * INSTRUCTION_MAP_BYTES_PER_ROW;
+/// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
+///
+/// `blowup_factor` is `ProofOptions::blowup_factor`. `table_parallelism` is the
+/// `k` used by `multi_prove_with_mode` to chunk rounds 2-4; pass
+/// `stark::prover::table_parallelism()` so the worst-case-chunk transient term
+/// matches the runtime.
+pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
+    let blowup = blowup_factor as u64;
+    let k = table_parallelism.max(1);
+    let specs = table_specs(lengths);
 
-    total
+    // Persistent: every table's LDE + main/aux Merkle is alive across phase D.
+    let persistent_total: u64 = specs.iter().map(|s| persistent_per_table(*s, blowup)).sum();
+
+    // Transient: only k tables run round 2-4 in parallel. Conservative bound is
+    // the top-k tables by transient bytes (worst possible chunk assignment).
+    let mut transient_per: Vec<u64> = specs
+        .iter()
+        .map(|s| transient_per_table(*s, blowup))
+        .collect();
+    transient_per.sort_unstable_by(|a, b| b.cmp(a));
+    let transient_total: u64 = transient_per.iter().take(k).sum();
+
+    // Domain + LdeTwiddles cache: one entry per unique padded-row count
+    // (blowup_factor and coset_offset are constant across tables in this
+    // codebase, so the unique key collapses to `rows`).
+    let mut unique_rows: Vec<u64> = specs.iter().map(|s| s.0).collect();
+    unique_rows.sort_unstable();
+    unique_rows.dedup();
+    let domain_total: u64 = unique_rows
+        .iter()
+        .map(|&r| domain_cache_bytes(r, blowup))
+        .sum();
+
+    // State alive across the prove call (memory cells, log Vec, instruction
+    // map). Independent of trace shape.
+    let state_total = lengths.unique_byte_count * MEMORY_CELL_BYTES
+        + lengths.cycle_count * LOG_STRUCT_BYTES
+        + lengths.decode_rows * INSTRUCTION_MAP_BYTES_PER_ROW;
+
+    persistent_total + transient_total + domain_total + state_total
 }
 
 /// Effective RAM budget against which the estimate is compared.
@@ -227,11 +302,10 @@ pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64>
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
 ///
-/// `available` is a one-shot sample. If a concurrent process allocates
-/// between this call and phase 5, this function may pick `Ram` and the
-/// prover OOMs. The 80% headroom and the estimator's 1.3× margin cover
-/// background jitter; under contention, pass `ProofOptions::max_ram_bytes`
-/// for a hard cap.
+/// `available` is a one-shot sample. If a concurrent process allocates between
+/// this call and phase 5, this function may pick `Ram` and the prover OOMs.
+/// The 80% headroom covers background jitter; under contention, pass
+/// `ProofOptions::max_ram_bytes` for a hard cap.
 pub fn select_storage_mode(
     estimated: u64,
     available: Option<u64>,
@@ -269,46 +343,71 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1_000_000_000;
+    /// Larger than the table count, so every table lands in the top-k and the
+    /// per-table delta in `peak_bytes_per_table_increment_is_exact` is purely
+    /// additive.
+    const ALL_TABLES: usize = 1_000;
 
     fn empty_lengths() -> TableLengths {
         TableLengths::default()
     }
 
     /// Adding rows to a single chunked table must increase `peak_bytes` by
-    /// exactly `delta_rows × table_bytes(1, main_cols, aux_cols)` from the
-    /// formula in the module doc. Verifies the per-table breakdown is exact
-    /// rather than an averaged approximation.
+    /// exactly the per-row contribution from the formula in the module doc.
+    /// Verifies the per-table breakdown is exact rather than averaged.
     #[test]
     fn peak_bytes_per_table_increment_is_exact() {
         let blowup = 2u8;
         let b = blowup as u64;
 
-        let baseline = peak_bytes(&empty_lengths(), blowup);
+        let baseline = peak_bytes(&empty_lengths(), blowup, ALL_TABLES);
 
         let mut lengths = empty_lengths();
         lengths.cpu_padded_rows = 4;
-        let bumped = peak_bytes(&lengths, blowup);
+        let bumped = peak_bytes(&lengths, blowup, ALL_TABLES);
+
         let cpu_main = CPU_COLS as u64;
         let cpu_aux = cpu_buses().len().div_ceil(2) as u64;
-        let per_row = cpu_main * GOLDILOCKS_BYTES * (1 + b)
+        let per_row_persistent = cpu_main * GOLDILOCKS_BYTES * (1 + b)
             + cpu_aux * CUBIC_EXT_BYTES * (1 + b)
-            + 2 * 2 * b * KECCAK_NODE_BYTES // main + aux Merkle (Batched: 2N nodes per N leaves = N rows × B)
-            + b * CUBIC_EXT_BYTES            // composition LDE
-            + 2 * b * KECCAK_NODE_BYTES      // composition Merkle
-            + 2 * b * CUBIC_EXT_BYTES        // FRI evals (geometric × 2)
-            + 2 * b * KECCAK_NODE_BYTES; // FRI Merkle (Pair backend, geometric × 2)
-        assert_eq!(bumped - baseline, 4 * per_row);
+            + 2 * b * KECCAK_NODE_BYTES   // main Merkle (1 tree)
+            + 2 * b * KECCAK_NODE_BYTES; // aux Merkle
+        let per_row_transient = b * CUBIC_EXT_BYTES   // constraint_evaluations
+            + 2 * b * CUBIC_EXT_BYTES                  // composition LDE (2 parts, d=2)
+            + b * KECCAK_NODE_BYTES                    // composition Merkle (PairKeccak)
+            + b * CUBIC_EXT_BYTES                      // FRI evals (geometric ≈ 1)
+            + b * KECCAK_NODE_BYTES; // FRI Merkle (geometric ≈ 1)
+        let per_row_domain = (3 + 2 * b) * GOLDILOCKS_BYTES;
+
+        // CPU adds 4 rows of persistent + transient (top-k by ALL_TABLES) +
+        // its 4-row Domain entry (a fresh unique key not previously present).
+        assert_eq!(
+            bumped - baseline,
+            4 * (per_row_persistent + per_row_transient + per_row_domain)
+        );
     }
 
     /// Higher blowup_factor should produce a strictly larger estimate.
     #[test]
     fn peak_bytes_scales_with_blowup() {
         let lengths = empty_lengths();
-        let two = peak_bytes(&lengths, 2);
-        let four = peak_bytes(&lengths, 4);
-        let eight = peak_bytes(&lengths, 8);
+        let two = peak_bytes(&lengths, 2, ALL_TABLES);
+        let four = peak_bytes(&lengths, 4, ALL_TABLES);
+        let eight = peak_bytes(&lengths, 8, ALL_TABLES);
         assert!(two < four);
         assert!(four < eight);
+    }
+
+    /// Lower table_parallelism caps the transient sum to fewer tables, so the
+    /// estimate must be monotone in `k`.
+    #[test]
+    fn peak_bytes_monotone_in_table_parallelism() {
+        let lengths = empty_lengths();
+        let k1 = peak_bytes(&lengths, 2, 1);
+        let k4 = peak_bytes(&lengths, 2, 4);
+        let k_all = peak_bytes(&lengths, 2, ALL_TABLES);
+        assert!(k1 < k4);
+        assert!(k4 <= k_all);
     }
 
     #[test]
@@ -344,7 +443,7 @@ mod tests {
     #[test]
     fn tiny_cap_always_forces_disk() {
         let mode = select_storage_mode(
-            peak_bytes(&empty_lengths(), 2),
+            peak_bytes(&empty_lengths(), 2, ALL_TABLES),
             Some(64 * GB),
             Some(1_000_000),
         );
@@ -356,7 +455,7 @@ mod tests {
         // OS can't report available memory. Without a cap we can't make an
         // informed decision, so stay in Ram rather than forcing Disk on every
         // proof.
-        let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2), None, None);
+        let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None, None);
         assert_eq!(mode, StorageMode::Ram);
     }
 
