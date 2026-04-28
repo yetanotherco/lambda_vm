@@ -977,6 +977,7 @@ def build_constraint(config, data: dict) -> Constraint:
 class Chip:
     config: Config
     name: str
+    code: str
     variables: list[Variable]
     assumptions: list[Assumption]
     constraints: list[Constraint]
@@ -993,6 +994,11 @@ class Chip:
             isinstance(self.name, str), f"name is not a string: {self.name!r}"
         )
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
+        self.code = data.get("name", "")
+        reporter.asserts(
+            isinstance(self.code, str), f"code is not a string: {self.code!r}"
+        )
+        reporter.asserts(self.code.isidentifier(), f"Invalid identifier: {self.name!r}")
         self.variables = [
             (Variable if cat != "virtual" else VirtualVariable)(config, cat, var)
             for cat, vars in data["variables"].items()
