@@ -389,7 +389,7 @@
 
   show figure: set block(breakable: true)
   figure(table(
-    columns: (auto, auto, auto, 1fr, auto),
+    columns: (auto, auto, if do_display_range {auto} else {0pt}, 1fr, if do_display_multiplicity {auto} else {0pt}),
     inset: 6pt,
     align: (top + left, top + left, top + left, top + left, top + center),
     stroke: none,
