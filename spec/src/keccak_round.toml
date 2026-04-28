@@ -254,6 +254,7 @@ input = [["idx", ["cast", ["idx", ["idx", "theta", "x"], "y"], "DWordHL"], "z"],
 output = ["arr", ["idx", ["cast", ["idx", ["idx", "rot_left", "x"], "y"], "DWordHL"], "z"], ["idx", ["cast", ["idx", ["idx", "rot_right", "x"], "y"], "DWordHL"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
+ref = "keccak:c:rho_rotation"
 
 # Note: these IS_BYTE checks are necessary.
 # Without them, it is possible to prove 0 <<< S evaluates to -1 by setting
@@ -265,6 +266,7 @@ tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
+ref = "keccak:c:range_rot_left"
 
 [[constraints.rho]]
 kind = "interaction"
@@ -272,6 +274,7 @@ tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
+ref = "keccak:c:range_rot_right"
 
 [[constraint_groups]]
 name = "chi"
