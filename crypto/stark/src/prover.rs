@@ -300,7 +300,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
-fn table_parallelism() -> usize {
+pub fn table_parallelism() -> usize {
     #[cfg(feature = "parallel")]
     {
         std::env::var("TABLE_PARALLELISM")
