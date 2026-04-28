@@ -179,7 +179,7 @@
     }
     
     let flattened_type = lower(flatten_vartype(var.type))    
-    let input = (chip, group, str(idx), flattened_type).join(",")
+    let input = (chip, group, str(idx), flattened_type).join("\x00")
     let digest = bytes-to-hex(nchf(input))
     digest.slice(0, count: 8)
   }
