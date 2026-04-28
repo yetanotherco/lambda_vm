@@ -1,4 +1,5 @@
 name = "KECCAK"
+code = "KCK"
 
 [[variables.input]]
 name = "timestamp"

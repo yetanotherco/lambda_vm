@@ -306,8 +306,9 @@
 
   /// Render the contraint's tag.
   let tag(constraint, group) = {
-    let counter-kind = chip.name + "constraint"
-    let tag = chip.name + "-" + constraint.id
+    let code = chip.at("code", default: chip.name)
+    let counter-kind = code + "constraint"
+    let tag = code + "-" + constraint.id
     
     let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
 
