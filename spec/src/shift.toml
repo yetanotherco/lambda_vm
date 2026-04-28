@@ -147,7 +147,7 @@ iter = ["i", 0, 3]
 ref = "shift:a:range_in"
 
 [[assumptions]]
-desc = "`IS_BYTE[shift]`"
+desc = "`IS_BYTE<shift>`"
 ref = "shift:a:range_shift"
 
 [[assumptions]]
