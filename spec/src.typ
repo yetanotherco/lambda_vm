@@ -208,8 +208,8 @@
   // Replace variable names with their ID 
   let digestable_constraint(c) = { 
     let CONSTRAINT_CAT_TO_SCOPE = (
-      "interaction": ("iter", "input", "output", "multiplicity"),
-      "template": ("iter", "input", "output", "cond"),
+      "interaction": ("tag", "iter", "input", "output", "multiplicity"),
+      "template": ("tag", "iter", "input", "output", "cond"),
       "arith": ("iter", "poly")
     )
 
