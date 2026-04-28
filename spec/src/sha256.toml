@@ -232,11 +232,11 @@ input = ["timestamp", "last_round_out", 64]
 multiplicity = ["-", "μ"]
 
 [[constraints.compress]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "out", "i"]]
-multiplicity = "μ"
 iter = ["i", 0, 31]
+cond = "μ"
 
 [[constraints.compress]]
 kind = "template"

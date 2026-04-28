@@ -523,43 +523,37 @@ input = ["EBREAK"]
 ref = "cpu:c:range_EBREAK"
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["rs1"]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["rs2"]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["rd"]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "arg1", "i"]]
 iter = ["i", 0, 7]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "arg2", "i"]]
 iter = ["i", 0, 7]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "res", "i"]]
 iter = ["i", 0, 7]
-multiplicity = 1
 
 
 [[constraint_groups]]

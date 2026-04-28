@@ -5,6 +5,13 @@ kind = "template"
 input = ["BaseField"]
 cond = "BaseField"
 
+# IS_BYTE<X, μ>
+[[signatures]]
+tag = "IS_BYTE"
+kind = "template"
+input = ["BaseField"]
+cond = "BaseField"
+
 # cond => ADD<sum; lhs, rhs>
 [[signatures]]
 tag = "ADD"
@@ -157,11 +164,11 @@ kind = "interaction"
 input = ["B20"]
 output = "Bit"
 
-# IS_BYTE[X]
+# ARE_BYTES[X, Y]
 [[signatures]]
-tag = "IS_BYTE"
+tag = "ARE_BYTES"
 kind = "interaction"
-input = ["Byte"]
+input = ["Byte", "Byte"]
 
 # IS_HALF[X]
 [[signatures]]
