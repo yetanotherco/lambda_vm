@@ -25,6 +25,8 @@ pub mod lt_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod peak_bytes_calibration_tests;
+#[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
