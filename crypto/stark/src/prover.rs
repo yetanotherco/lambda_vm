@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::cpu::bit_reversing::reverse_index;
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
@@ -1109,9 +1109,12 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         let deep_poly =
             Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
-        in_place_bit_reverse_permute(&mut lde_evals);
+        // FRI commit_phase consumes bit-reversed evaluations natively. Request them
+        // directly from evaluate_fft_bit_reversed to avoid a pair of redundant permutes
+        // (evaluate_fft's internal natural-order permute + an external re-bit-reverse).
+        let lde_evals =
+            Polynomial::evaluate_fft_bit_reversed::<Field>(&deep_poly, 1, Some(domain_size))
+                .expect("FFT should succeed");
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
