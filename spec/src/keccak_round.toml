@@ -28,8 +28,8 @@ desc = "the left-rotated component of `rotated_Cxz`"
 
 [[variables.auxiliary]]
 name = "Cxz_right"
-type = [["Byte", 8], 5]
-desc = "the right-rotated component of `rotated_Cxz`"
+type = [["Bit", 4], 5]
+desc = "the right-rotated component of `rotated_Cxz` (which is a single bit)"
 
 [[variables.auxiliary]]
 name = "Dxz"
@@ -75,7 +75,7 @@ desc = "state update following from step $iota$."
 name = "rotated_Cxz"
 type = [["Byte", 8], 5]
 desc = "$#`Cxz[x,`3#`,z]` <<< 1$"
-def = {iters=[["x", 0, 4], ["z", 0, 7]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], ["mod", ["-", "z", 2], 8]]]}
+def = {iters=[["x", 0, 4], ["z", 0, 7]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["*", ["-", 1, ["mod", "z", 2]], ["idx", ["idx", "Cxz_right", "x"], ["mod", ["-", ["/", "z", 2], 1], 4]]]]}
 
 [[variables.virtual]]
 name = "out"
@@ -202,7 +202,10 @@ ref = "keccak:c:theta_cxz"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", ["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordHL"], "z"], 1]
-output = ["arr", ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"], ["idx", ["cast", ["idx", "Cxz_right", "x"], "DWordHL"], "z"]]
+output = ["arr", 
+    ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"], 
+    ["cast", ["idx", ["idx", "Cxz_right", "x"], "z"], "Half"]
+]
 iters = [["x", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
 
@@ -218,11 +221,11 @@ iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
 
 [[constraints.theta]]
-kind = "interaction"
-tag = "IS_BYTE"
+kind = "template"
+tag = "IS_BIT"
 input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
-iters = [["x", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
+iters = [["x", 0, 4], ["z", 0, 3]]
+cond = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
