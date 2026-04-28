@@ -75,7 +75,16 @@ desc = "state update following from step $iota$."
 name = "rotated_Cxz"
 type = [["Byte", 8], 5]
 desc = "$#`Cxz[x,`3#`,z]` <<< 1$"
-def = {iters=[["x", 0, 4], ["z", 0, 7]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["*", ["-", 1, ["mod", "z", 2]], ["idx", ["idx", "Cxz_right", "x"], ["mod", ["-", ["/", "z", 2], 1], 4]]]]}
+def = {polys=[
+    {iters=[["x", 0, 4], ["z", 0]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 3]]},
+    {iters=[["x", 0, 4], ["z", 1]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 2]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 0]]},
+    {iters=[["x", 0, 4], ["z", 3]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 4]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 1]]},
+    {iters=[["x", 0, 4], ["z", 5]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 6]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 2]]},
+    {iters=[["x", 0, 4], ["z", 7]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+]}
 
 [[variables.virtual]]
 name = "out"
