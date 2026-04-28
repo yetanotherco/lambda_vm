@@ -42,12 +42,12 @@ name = "all"
 [[constraints.all]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["init", 1]
+input = ["init"]
 
 [[constraints.all]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["fini", 1]
+input = ["fini"]
 
 [[constraints.all]]
 kind = "interaction"

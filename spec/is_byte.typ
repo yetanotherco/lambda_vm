@@ -8,9 +8,9 @@
 #show: book-page(chip.name)
 #let is_byte = raw(chip.name)
 
-#is_byte is a constraint template that is used to assert that a variable lies in the range $[0, 255]$ with given multiplicity.
+#is_byte is a constraint template that is used to assert that a variable lies in the range $[0, 255]$ under the condition that `cond` is non-zero. Note: when `cond` is omitted, it defaults to $1$.
 
-When a chip leverages this template twice or more, implementors are encouraged to merge pairs of #is_byte interactions with identical multiplicities into `ARE_BYTES` interactions; the #is_byte template is included for convenience of notation, and to complete the specification of chips that use an odd number of #is_byte range checks.
+When a chip leverages this template twice or more, implementors are encouraged to merge pairs of #is_byte interactions with identical conditions into `ARE_BYTES` interactions; the #is_byte template is included for convenience of notation, and to complete the specification of chips that use an odd number of #is_byte range checks.
 
 = Variables
 #let nr_interactions = compute_nr_interactions(chip)

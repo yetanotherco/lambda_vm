@@ -234,8 +234,9 @@ multiplicity = ["-", "μ"]
 [[constraints.compress]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "out", "i"], "μ"]
+input = [["idx", "out", "i"]]
 iter = ["i", 0, 31]
+cond = "μ"
 
 [[constraints.compress]]
 kind = "template"

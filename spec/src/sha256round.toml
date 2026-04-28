@@ -256,7 +256,8 @@ iter = ["i", 0, 1]
 [[constraints.addition]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["carry_a", "μ"]
+input = ["carry_a"]
+cond = "μ"
 
 [[constraints.addition]]
 kind = "interaction"
@@ -268,7 +269,8 @@ iter = ["i", 0, 1]
 [[constraints.addition]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["carry_e", "μ"]
+input = ["carry_e"]
+cond = "μ"
 
 [[constraint_groups]]
 name = "output"

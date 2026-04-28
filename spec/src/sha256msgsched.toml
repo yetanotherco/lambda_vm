@@ -81,7 +81,8 @@ name = "lookback"
 [[constraints.lookback]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["-", "index", 16], "μ"]
+input = [["-", "index", 16]]
+cond = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"
@@ -131,7 +132,8 @@ multiplicity = "μ"
 [[constraints.calc]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["carry", "μ"]
+input = ["carry"]
+cond = "μ"
 
 [[constraints.calc]]
 kind = "interaction"

@@ -118,7 +118,8 @@ cond = "JALR"
 [[constraints.all]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "next_pc_low", 1], "μ"]
+input = [["idx", "next_pc_low", 1]]
+cond = "μ"
 
 [[constraints.all]]
 kind = "interaction"

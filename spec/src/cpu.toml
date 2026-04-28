@@ -513,34 +513,34 @@ ref = "cpu:c:range_EBREAK"
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["rs1", 1]
+input = ["rs1"]
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["rs2", 1]
+input = ["rs2"]
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["rd", 1]
+input = ["rd"]
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "arg1", "i"], 1]
+input = [["idx", "arg1", "i"]]
 iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "arg2", "i"], 1]
+input = [["idx", "arg2", "i"]]
 iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "res", "i"], 1]
+input = [["idx", "res", "i"]]
 iter = ["i", 0, 7]
 
 

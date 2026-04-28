@@ -9,7 +9,8 @@ cond = "BaseField"
 [[signatures]]
 tag = "IS_BYTE"
 kind = "template"
-input = ["BaseField", "BaseField"]
+input = ["BaseField"]
+cond = "BaseField"
 
 # cond => ADD<sum; lhs, rhs>
 [[signatures]]
