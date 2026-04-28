@@ -306,11 +306,20 @@
 
   /// Render the contraint's tag.
   let tag(constraint, group) = {
-    let with_index(x) = ((raw(x),) + iters_of(constraint).map(it => raw(it.at(0)))).join(".")
-    let prefix = if "prefix" in group { group.prefix }
-    let tag(x) = [#raw(chip.name + "-" + prefix + "" + constraint.id + "/")#with_index(x)]
-    show figure: (it) => align(left, context tag(it.counter.display()))
-    cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => tag(str(i)), supplement: [], [])]
+    let counter-kind = chip.name + "constraint"
+    let tag = chip.name + "-" + constraint.id
+    
+    let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
+
+    let z-fill(s) = "0" * (2 - s.len()) + s
+    let ref-tag(i) = raw(tag) + sub("/" + z-fill(str(i)))
+    return (
+      context super[#emph(z-fill(str(counter(figure.where(kind: counter-kind)).get().at(0) + 1)))],
+      [
+        #show figure: (it) => align(left, raw(tag + indices))
+        #cref(constraint)[#figure(kind: counter-kind, numbering: (i) => ref-tag(i), supplement: [], [])]
+      ],
+    )
   }
 
   /// Generates a representation of `constraint`
@@ -351,13 +360,23 @@
     }
 
     (..for poly in polys {
-      (table.cell(align: right, colspan: 2, [_polynomial_]), $#expr_to_math(poly) = 0$, [])
+      (
+        [], 
+        table.cell(align: right, colspan: 2, [_polynomial_]), 
+        table.cell(align: left, colspan: 1, $#expr_to_math(poly) = 0$), 
+        []
+      )
     },)
   }
 
   // Rendering the additional "desc" field for arith constraints
   let render_extra_description(constraint) = {
-    (table.cell(align: right, colspan: 2, [_description_]), eval(constraint.desc, mode: "markup"), [])
+    (
+      [],
+      table.cell(align: right, colspan: 2, [_description_]), 
+      table.cell(align: left, colspan: 1, eval(constraint.desc, mode: "markup")), 
+      []
+    )
   }
 
   // Whether there is at least one constraint with a range
@@ -370,11 +389,12 @@
 
   show figure: set block(breakable: true)
   figure(table(
-    columns: (auto, auto, 1fr, auto),
+    columns: (auto, auto, auto, 1fr, auto),
     inset: 6pt,
-    align: (top + left, top + left, top + left, top + center),
+    align: (top + left, top + left, top + left, top + left, top + center),
     stroke: none,
     table.header(
+[],
       [*Tag*], 
       if do_display_range {[*Range*]} else {[]}, 
       [*Description*], 
@@ -384,7 +404,7 @@
     ..for (group, group_constraints) in selected_constraints.pairs() {
       for constraint in group_constraints {
         (
-          [#tag(constraint, lookup_group(group))],
+          ..tag(constraint, lookup_group(group)),
           [#iters(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
