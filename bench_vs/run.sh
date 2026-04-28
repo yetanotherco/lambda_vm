@@ -37,6 +37,7 @@ SERIES=()
 SERIES_MODE=""
 RUN_LAMBDA=true
 RUN_SP1=true
+SERIAL=false
 
 # --- Parse args -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -93,8 +94,12 @@ while [[ $# -gt 0 ]]; do
             NO_COLOR=true
             shift
             ;;
+        --serial)
+            SERIAL=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-cycles N] [--no-color]"
+            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-cycles N] [--serial] [--no-color]"
             echo ""
             echo "  -n N1 N2 ...      Fibonacci iteration counts (space-separated)"
             echo "                    Default iteration series: ${DEFAULT_ITERATION_SERIES[*]}"
@@ -105,6 +110,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --report-dir DIR   Write TSV, metrics, markdown summary, and raw outputs"
             echo "  --target-cycles N  Projection target in cycles (default: $TARGET_CYCLES)"
             echo "  --target-steps N   Deprecated alias for --target-cycles"
+            echo "  --serial          Run both provers single-threaded (RAYON_NUM_THREADS=1, TABLE_PARALLELISM=1);"
+            echo "                    if --report-dir is unset, defaults to bench_vs_artifacts_serial"
             echo "  --no-color        Disable ANSI colors"
             exit 0
             ;;
@@ -138,6 +145,14 @@ if $NO_COLOR; then
     YELLOW=''
     BOLD=''
     NC=''
+fi
+
+if $SERIAL; then
+    export RAYON_NUM_THREADS=1
+    export TABLE_PARALLELISM=1
+    if [ -z "$REPORT_DIR" ]; then
+        REPORT_DIR="bench_vs_artifacts_serial"
+    fi
 fi
 
 mkdir -p "$TMP_DIR"
@@ -277,6 +292,9 @@ echo -e "${BOLD}=== Fibonacci Benchmark: Lambda VM vs SP1 v6 ===${NC}"
 echo -e "Series mode: ${YELLOW}${SERIES_MODE}${NC}"
 echo -e "Requested series: ${YELLOW}${SERIES[*]}${NC}"
 echo -e "Projection target: ${YELLOW}${TARGET_CYCLES}${NC} cycles"
+if $SERIAL; then
+    echo -e "Parallelism: ${YELLOW}serial${NC} (RAYON_NUM_THREADS=1, TABLE_PARALLELISM=1)"
+fi
 echo ""
 
 # --- Pre-build --------------------------------------------------------------
@@ -625,6 +643,13 @@ if [ -n "$REPORT_DIR" ]; then
         echo "projection_axis=$PROJECTION_AXIS"
         echo "timing_window=setup_plus_end_to_end_prove_no_verify"
         echo "target_cycles=$TARGET_CYCLES"
+        if $SERIAL; then
+            echo "parallelism=serial"
+            echo "rayon_num_threads=1"
+            echo "table_parallelism=1"
+        else
+            echo "parallelism=default"
+        fi
         echo "lambda_times=$(join_slash "${RESULT_LAMBDA[@]}")"
         echo "lambda_axis_values=$(join_slash "${RESULT_LAMBDA_AXIS[@]}")"
         echo "lambda_cycles=$(join_slash "${RESULT_LAMBDA_CYCLES[@]}")"
@@ -655,6 +680,10 @@ if [ -n "$REPORT_DIR" ]; then
         echo
         echo "Projection axis: \`$PROJECTION_AXIS\` (measured dynamic instruction count per prover)."
         echo
+        if $SERIAL; then
+            echo "Parallelism: \`serial\` (\`RAYON_NUM_THREADS=1\`, \`TABLE_PARALLELISM=1\`)."
+            echo
+        fi
         echo "| Target steps | Iterations | Lambda VM (s) | Lambda cycles | SP1 v6 (s) | SP1 cycles | Ratio |"
         echo "|-------------:|-----------:|--------------:|--------------:|-----------:|-----------:|------:|"
         for i in "${!RESULT_ITERATIONS[@]}"; do
