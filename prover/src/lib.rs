@@ -588,6 +588,8 @@ pub fn prove_with_options_and_inputs(
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
+    eprintln!("predicted_peak_bytes: {estimated_peak}");
+
     if available.is_none() && proof_options.max_ram_bytes.is_none() {
         log::warn!(
             "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
