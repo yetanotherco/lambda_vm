@@ -420,6 +420,7 @@
         if has_polynomial_constraints(constraint) {
           render_polynomial_constraints(constraint)
         }
+        (table.hline(stroke: stroke(thickness: .25pt)),)
       }
     }
   ))
