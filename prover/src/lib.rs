@@ -522,16 +522,13 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let traces = Traces::from_elf_and_logs(
+    let lengths = crate::tables::trace_builder::count_table_lengths(
         &program,
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
     )?;
-    Ok((
-        traces.total_field_elements(),
-        traces.total_auxiliary_field_elements(),
-    ))
+    Ok((lengths.total_main_elements(), lengths.total_aux_elements()))
 }
 
 /// Prove an ELF binary execution with custom proof options and max rows config.
@@ -576,19 +573,18 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Phases 0-4: op collection and derivation (cheap compared to phase 5's
-    // trace-table allocation). After this we have the exact op counts needed
-    // to compute `main_elements` without materializing the trace tables.
-    let prep = Traces::prepare_from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
-    drop(result);
+    // Stream over logs once to compute exact per-table row counts without
+    // allocating any op vectors. Use the resulting `TableLengths` to estimate
+    // peak heap analytically and pick a storage mode.
+    let lengths = crate::tables::trace_builder::count_table_lengths(
+        &program,
+        &result.logs,
+        max_rows,
+        private_inputs,
+    )?;
 
-    // Sample available RAM after the executor result is freed and `prep`'s
-    // op vectors are resident, so the figure reflects what's left for
-    // trace-table allocation.
     let available = auto_storage::available_ram_bytes();
-
-    let main_elements = prep.estimate_main_elements();
-    let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
+    let estimated_peak = auto_storage::peak_bytes(&lengths, proof_options.blowup_factor);
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
@@ -608,10 +604,16 @@ pub fn prove_with_options_and_inputs(
         );
     }
 
-    // Phase 5: allocate trace tables with the chosen mode. `Disk` spills each
-    // chunk as it's built, so the trace itself never fully materializes in
-    // RAM if the estimate said we'd overflow.
-    let mut traces = prep.into_traces(Some(&program), storage_mode)?;
+    // Phase 5: build the full traces with the chosen mode. `Disk` spills each
+    // chunk as it's built, so the trace never fully materializes in RAM.
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        max_rows,
+        private_inputs,
+        storage_mode,
+    )?;
+    drop(result);
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();

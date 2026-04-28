@@ -2928,9 +2928,10 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
+        storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         let prep = Self::prepare_from_elf_and_logs(elf, logs, max_rows, private_input)?;
-        prep.into_traces(Some(elf), StorageMode::Ram)
+        prep.into_traces(Some(elf), storage_mode)
     }
 
     /// Runs phases 0-4 (ELF decode, op collection, derivation) and returns a
