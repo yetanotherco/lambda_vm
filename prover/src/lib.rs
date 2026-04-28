@@ -587,12 +587,12 @@ pub fn prove_with_options_and_inputs(
     // trace-table allocation.
     let available = auto_storage::available_ram_bytes();
 
-    let main_elements = prep.estimate_main_elements(max_rows);
+    let main_elements = prep.estimate_main_elements();
     let estimated_peak = auto_storage::estimate_peak_bytes(main_elements);
     let storage_mode =
         auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
 
-    if available == 0 && proof_options.max_ram_bytes.is_none() {
+    if available.is_none() && proof_options.max_ram_bytes.is_none() {
         log::warn!(
             "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
              Set ProofOptions::max_ram_bytes to force Disk in memory-constrained environments."
@@ -611,7 +611,7 @@ pub fn prove_with_options_and_inputs(
     // Phase 5: allocate trace tables with the chosen mode. `Disk` spills each
     // chunk as it's built, so the trace itself never fully materializes in
     // RAM if the estimate said we'd overflow.
-    let mut traces = prep.into_traces(Some(&program), max_rows, storage_mode)?;
+    let mut traces = prep.into_traces(Some(&program), storage_mode)?;
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();

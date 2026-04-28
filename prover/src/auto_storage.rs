@@ -40,16 +40,15 @@ pub fn estimate_peak_bytes(main_elements: u64) -> u64 {
 
 /// Effective RAM budget against which the estimate is compared.
 ///
-/// Returns `None` when the OS reports zero available memory and the user
+/// Returns `None` when the OS can't report available memory and the user
 /// hasn't set a cap; in that case the caller should default to `Ram` rather
 /// than force Disk on every proof. Otherwise the budget is the user's cap (if
 /// set), clamped down by what the OS reports available.
-pub fn effective_budget(available: u64, cap: Option<u64>) -> Option<u64> {
+pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     match (cap, available) {
-        (Some(c), 0) => Some(c),
-        (Some(c), a) => Some(c.min(a)),
-        (None, 0) => None,
-        (None, a) => Some(a),
+        (Some(c), Some(a)) => Some(c.min(a)),
+        (Some(c), None) => Some(c),
+        (None, a) => a,
     }
 }
 
@@ -59,7 +58,11 @@ pub fn effective_budget(available: u64, cap: Option<u64>) -> Option<u64> {
 /// OS, other processes, and allocator fragmentation. `cap` is an optional
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
-pub fn select_storage_mode(estimated: u64, available: u64, cap: Option<u64>) -> StorageMode {
+pub fn select_storage_mode(
+    estimated: u64,
+    available: Option<u64>,
+    cap: Option<u64>,
+) -> StorageMode {
     const SAFETY_FRACTION_NUM: u64 = 4;
     const SAFETY_FRACTION_DEN: u64 = 5;
 
@@ -75,11 +78,16 @@ pub fn select_storage_mode(estimated: u64, available: u64, cap: Option<u64>) -> 
     }
 }
 
-/// Query the OS for currently available RAM (not total) in bytes.
-pub fn available_ram_bytes() -> u64 {
+/// Query the OS for currently available RAM (not total) in bytes. Returns
+/// `None` when the OS can't report a figure (e.g. inside containers without
+/// `/proc/meminfo`).
+pub fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.available_memory()
+    match sys.available_memory() {
+        0 => None,
+        n => Some(n),
+    }
 }
 
 #[cfg(test)]
@@ -113,14 +121,14 @@ mod tests {
     #[test]
     fn select_ram_when_estimate_below_threshold() {
         // 10 GB estimated, 32 GB available → threshold 25.6 GB → Ram.
-        let mode = select_storage_mode(10 * GB, 32 * GB, None);
+        let mode = select_storage_mode(10 * GB, Some(32 * GB), None);
         assert_eq!(mode, StorageMode::Ram);
     }
 
     #[test]
     fn select_disk_when_estimate_exceeds_threshold() {
         // 30 GB estimated, 32 GB available → threshold 25.6 GB → Disk.
-        let mode = select_storage_mode(30 * GB, 32 * GB, None);
+        let mode = select_storage_mode(30 * GB, Some(32 * GB), None);
         assert_eq!(mode, StorageMode::Disk);
     }
 
@@ -128,7 +136,7 @@ mod tests {
     fn cap_forces_disk_when_smaller_than_available() {
         // 10 GB estimated, 64 GB available (would be Ram), but cap=4 GB
         // → threshold = 4 × 0.8 = 3.2 GB → Disk.
-        let mode = select_storage_mode(10 * GB, 64 * GB, Some(4 * GB));
+        let mode = select_storage_mode(10 * GB, Some(64 * GB), Some(4 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
 
@@ -136,29 +144,29 @@ mod tests {
     fn cap_ignored_when_larger_than_available() {
         // available=8 GB dominates a cap of 64 GB.
         // threshold = 8 × 0.8 = 6.4 GB, estimate 10 GB → Disk.
-        let mode = select_storage_mode(10 * GB, 8 * GB, Some(64 * GB));
+        let mode = select_storage_mode(10 * GB, Some(8 * GB), Some(64 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
 
     #[test]
     fn tiny_cap_always_forces_disk() {
-        let mode = select_storage_mode(estimate_peak_bytes(0), 64 * GB, Some(1_000_000));
+        let mode = select_storage_mode(estimate_peak_bytes(0), Some(64 * GB), Some(1_000_000));
         assert_eq!(mode, StorageMode::Disk);
     }
 
     #[test]
-    fn zero_available_with_no_cap_falls_back_to_ram() {
+    fn unknown_available_with_no_cap_falls_back_to_ram() {
         // OS can't report available memory. Without a cap we can't make an
         // informed decision, so stay in Ram rather than forcing Disk on every
         // proof.
-        let mode = select_storage_mode(estimate_peak_bytes(0), 0, None);
+        let mode = select_storage_mode(estimate_peak_bytes(0), None, None);
         assert_eq!(mode, StorageMode::Ram);
     }
 
     #[test]
-    fn zero_available_with_cap_uses_cap_as_budget() {
+    fn unknown_available_with_cap_uses_cap_as_budget() {
         // OS can't report; cap is the whole budget.
-        let mode = select_storage_mode(10 * GB, 0, Some(4 * GB));
+        let mode = select_storage_mode(10 * GB, None, Some(4 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
 }

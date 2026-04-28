@@ -101,10 +101,10 @@ impl MemoryState {
     /// Count unique memory pages touched during execution. Used by the
     /// main-elements estimator to account for PAGE-table rows without
     /// allocating the trace tables. O(N) in `cells.len()`.
-    fn unique_page_count(&self, page_size: u64) -> usize {
+    fn unique_page_count(&self, page_size: u64) -> u64 {
         let mask = !(page_size - 1);
         let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
-        pages.len()
+        pages.len() as u64
     }
 
     /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
@@ -2142,6 +2142,7 @@ pub struct PreparedTraceInputs {
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     private_input: Vec<u8>,
+    max_rows: super::MaxRowsConfig,
 }
 
 impl PreparedTraceInputs {
@@ -2152,7 +2153,8 @@ impl PreparedTraceInputs {
     /// Uses the op-vector lengths from phase 2/3/4 plus each table's
     /// `chunk_and_generate` padding rule (`len.next_power_of_two().max(4)` per
     /// chunk) to derive post-padding row counts.
-    pub fn estimate_main_elements(&self, max_rows: &super::MaxRowsConfig) -> u64 {
+    pub fn estimate_main_elements(&self) -> u64 {
+        let max_rows = &self.max_rows;
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::NUM_ROWS as BITWISE_ROWS;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
@@ -2198,7 +2200,7 @@ impl PreparedTraceInputs {
         // PAGE tables: one per unique memory page, each `DEFAULT_PAGE_SIZE`
         // rows. Dominates for memory-heavy programs.
         let page_size = super::page::DEFAULT_PAGE_SIZE as u64;
-        let page_count = self.memory_state.unique_page_count(page_size) as u64;
+        let page_count = self.memory_state.unique_page_count(page_size);
         total += page_count * page_size * (PAGE_COLS - PAGE_PREPROCESSED) as u64;
 
         // REGISTER table: 32 rows, 2 non-preprocessed cols — constant, omitted.
@@ -2209,7 +2211,6 @@ impl PreparedTraceInputs {
     pub fn into_traces(
         self,
         elf: Option<&Elf>,
-        max_rows: &super::MaxRowsConfig,
         storage_mode: StorageMode,
     ) -> Result<Traces, Error> {
         generate_traces(
@@ -2220,7 +2221,7 @@ impl PreparedTraceInputs {
             self.decode_trace,
             self.decode_pc_to_row,
             self.register_state,
-            max_rows,
+            &self.max_rows,
             storage_mode,
             &self.private_input,
         )
@@ -2624,20 +2625,8 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
     ) -> Result<Self, Error> {
-        Self::from_elf_and_logs_with_mode(elf, logs, max_rows, private_input, StorageMode::Ram)
-    }
-
-    /// Same as `from_elf_and_logs` but lets callers pick whether intermediate
-    /// trace buffers are kept in RAM or spilled chunk-by-chunk to mmap files.
-    pub fn from_elf_and_logs_with_mode(
-        elf: &Elf,
-        logs: &[Log],
-        max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
-        storage_mode: StorageMode,
-    ) -> Result<Self, Error> {
         let prep = Self::prepare_from_elf_and_logs(elf, logs, max_rows, private_input)?;
-        prep.into_traces(Some(elf), max_rows, storage_mode)
+        prep.into_traces(Some(elf), StorageMode::Ram)
     }
 
     /// Runs phases 0-4 (ELF decode, op collection, derivation) and returns a
@@ -2690,6 +2679,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             private_input: private_input.to_vec(),
+            max_rows: max_rows.clone(),
         })
     }
 

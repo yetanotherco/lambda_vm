@@ -88,14 +88,10 @@ fn test_estimate_main_elements_matches_built_trace() {
 
     let prep =
         Traces::prepare_from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("prepare");
-    let estimated = prep.estimate_main_elements(&max_rows);
+    let estimated = prep.estimate_main_elements();
 
     let traces = prep
-        .into_traces(
-            Some(&program),
-            &max_rows,
-            stark::storage_mode::StorageMode::Ram,
-        )
+        .into_traces(Some(&program), stark::storage_mode::StorageMode::Ram)
         .expect("into_traces");
     let actual = traces.total_field_elements();
 
