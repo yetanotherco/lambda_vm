@@ -2245,6 +2245,310 @@ fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     total
 }
 
+/// Per-table row counts (post-chunking + post-padding) plus DECODE row count
+/// and unique-page count. Computed by [`count_table_lengths`] without allocating
+/// any operation vectors or trace tables.
+#[derive(Debug, Default, Clone)]
+pub struct TableLengths {
+    pub cpu_padded_rows: u64,
+    pub memw_padded_rows: u64,
+    pub memw_aligned_padded_rows: u64,
+    pub memw_register_padded_rows: u64,
+    pub load_padded_rows: u64,
+    pub lt_padded_rows: u64,
+    pub shift_padded_rows: u64,
+    pub mul_padded_rows: u64,
+    pub dvrm_padded_rows: u64,
+    pub branch_padded_rows: u64,
+    pub commit_padded_rows: u64,
+    pub decode_rows: u64,
+    pub unique_page_count: u64,
+}
+
+impl TableLengths {
+    /// Total main-trace (base-field) elements. Mirrors
+    /// [`Traces::total_field_elements`] column-for-column. Preprocessed columns
+    /// are excluded.
+    pub fn total_main_elements(&self) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::NUM_ROWS as BITWISE_ROWS;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::DEFAULT_PAGE_SIZE as PAGE_SIZE;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        self.cpu_padded_rows * CPU_COLS as u64
+            + self.memw_padded_rows * MEMW_COLS as u64
+            + self.memw_aligned_padded_rows * MEMW_A_COLS as u64
+            + self.memw_register_padded_rows * MEMW_R_COLS as u64
+            + self.load_padded_rows * LOAD_COLS as u64
+            + self.lt_padded_rows * LT_COLS as u64
+            + self.shift_padded_rows * SHIFT_COLS as u64
+            + self.mul_padded_rows * MUL_COLS as u64
+            + self.dvrm_padded_rows * DVRM_COLS as u64
+            + self.branch_padded_rows * BRANCH_COLS as u64
+            + self.commit_padded_rows * COMMIT_COLS as u64
+            + (BITWISE_ROWS * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64
+            + self.decode_rows * (DECODE_COLS - DECODE_PRECOMPUTED) as u64
+            + HALT_COLS as u64
+            + self.unique_page_count * PAGE_SIZE as u64 * (PAGE_COLS - PAGE_PREPROCESSED) as u64
+        // REGISTER table: 32 rows × 2 non-preprocessed cols — constant, omitted
+        // for parity with `Traces::total_field_elements`'s previous behavior.
+    }
+
+    /// Total auxiliary-trace (extension-field) elements. Mirrors
+    /// [`Traces::total_auxiliary_field_elements`] column-for-column.
+    pub fn total_aux_elements(&self) -> u64 {
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let n_cpu = aux_cols(super::cpu::bus_interactions().len()) as u64;
+        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len()) as u64;
+        let n_lt = aux_cols(super::lt::bus_interactions().len()) as u64;
+        let n_shift = aux_cols(super::shift::bus_interactions().len()) as u64;
+        let n_memw = aux_cols(super::memw::bus_interactions().len()) as u64;
+        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len()) as u64;
+        let n_load = aux_cols(super::load::bus_interactions().len()) as u64;
+        let n_decode = aux_cols(super::decode::bus_interactions().len()) as u64;
+        let n_mul = aux_cols(super::mul::bus_interactions().len()) as u64;
+        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len()) as u64;
+        let n_branch = aux_cols(super::branch::bus_interactions().len()) as u64;
+        let n_halt = aux_cols(super::halt::bus_interactions().len()) as u64;
+        let n_commit = aux_cols(super::commit::bus_interactions().len()) as u64;
+        let n_register = aux_cols(super::register::bus_interactions().len()) as u64;
+        let n_page = aux_cols(super::page::bus_interactions(0).len()) as u64;
+        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len()) as u64;
+
+        let bitwise_rows = super::bitwise::NUM_ROWS as u64;
+        // REGISTER table: always 32 rows.
+        let register_rows = 32u64;
+        let halt_rows = 1u64;
+
+        self.cpu_padded_rows * n_cpu
+            + self.memw_padded_rows * n_memw
+            + self.memw_aligned_padded_rows * n_memw_a
+            + self.memw_register_padded_rows * n_memw_r
+            + self.load_padded_rows * n_load
+            + self.lt_padded_rows * n_lt
+            + self.shift_padded_rows * n_shift
+            + self.mul_padded_rows * n_mul
+            + self.dvrm_padded_rows * n_dvrm
+            + self.branch_padded_rows * n_branch
+            + self.commit_padded_rows * n_commit
+            + bitwise_rows * n_bitwise
+            + self.decode_rows * n_decode
+            + halt_rows * n_halt
+            + register_rows * n_register
+            + self.unique_page_count * super::page::DEFAULT_PAGE_SIZE as u64 * n_page
+    }
+}
+
+/// Stream `logs` once and compute exact per-table row counts the trace builder
+/// would produce, without allocating the `Vec<*Operation>` intermediates.
+///
+/// Mirrors `prepare_from_elf_and_logs` + `collect_ops_from_cpu` +
+/// `collect_all_ops` + `derive_ops`, but every per-cycle struct lives on the
+/// stack and is dropped immediately after the partition predicate runs. Heap
+/// usage during this pass is `O(unique_pages + 32)` (memory + register state),
+/// not `O(N)`.
+///
+/// The two places that must stay in sync when the trace shape changes: this
+/// function and the `generate_traces` caller.
+pub fn count_table_lengths(
+    elf: &Elf,
+    logs: &[Log],
+    max_rows: &super::MaxRowsConfig,
+    private_input: &[u8],
+) -> Result<TableLengths, Error> {
+    // Phase 0: ELF → instructions + DECODE row count.
+    let instructions = decode::instructions_from_elf(elf)
+        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+    let (decode_trace, _decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+    let decode_rows = decode_trace.num_rows() as u64;
+
+    // Memory + register state for partition predicates that need timestamps.
+    let mut memory_state = MemoryState::from_elf(elf);
+    memory_state.add_private_input(private_input);
+    let mut register_state = RegisterState::new(elf.entry_point);
+
+    // Raw counts (pre-chunking + pre-padding).
+    let mut cpu_count = 0usize;
+    // memw_by_width[i] for i in 0..4 maps width 1/2/4/8 → wide-MEMW counts.
+    // Used by the LT-from-MEMW derivation: each wide-MEMW op contributes
+    // 1, 2, 4, or 8 LT ops based on its width.
+    let mut memw_by_width: [usize; 4] = [0; 4];
+    let mut memw_aligned_count = 0usize;
+    let mut memw_register_count = 0usize;
+    let mut load_count = 0usize;
+    let mut lt_count = 0usize;
+    let mut shift_count = 0usize;
+    let mut mul_count = 0usize;
+    let mut dvrm_count = 0usize;
+    let mut branch_count = 0usize;
+    let mut commit_count = 0usize;
+    let mut current_commit_index = 0u32;
+
+    let partition_memw = |op: &MemwOperation,
+                          by_width: &mut [usize; 4],
+                          aligned: &mut usize,
+                          register: &mut usize| {
+        if is_register_op(op) {
+            *register += 1;
+        } else if is_aligned_op(op) {
+            *aligned += 1;
+        } else {
+            let idx = match op.width {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                _ => return,
+            };
+            by_width[idx] += 1;
+        }
+    };
+
+    for (i, log) in logs.iter().enumerate() {
+        let timestamp = (i as u64) * 4 + 4;
+        let instruction = instructions
+            .get(&log.current_pc)
+            .copied()
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        let cpu_op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
+        cpu_count += 1;
+
+        // Memory ops from load/store
+        if cpu_op.decode.op_load {
+            let (memw_op, _load_op, _bitwise) =
+                collect_load_op_from_cpu(&cpu_op, &mut memory_state);
+            partition_memw(
+                &memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+            load_count += 1;
+        } else if cpu_op.decode.op_store {
+            let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
+            partition_memw(
+                &memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+        }
+
+        // Register accesses (M1 read rs1, M3 read rs2, M5 write rd).
+        let reg_memw_ops = collect_register_ops_from_cpu(&cpu_op, &mut register_state);
+        for memw_op in &reg_memw_ops {
+            partition_memw(
+                memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+        }
+
+        // ECALL Commit
+        if cpu_op.ecall_commit {
+            let commit_ops = expand_commit_operations_for_ecall(
+                &cpu_op,
+                &memory_state,
+                current_commit_index as u64,
+            );
+            commit_count += commit_ops.len();
+            let reg_commit_ops =
+                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
+            for memw_op in &reg_commit_ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            let count = u32::try_from(cpu_op.commit_count).expect("commit_count exceeds u32 range");
+            current_commit_index = current_commit_index
+                .checked_add(count)
+                .expect("commit index exceeds u32 range");
+        }
+
+        // CPU-side per-instruction-kind counters
+        if cpu_op.decode.op_slt || cpu_op.decode.op_blt {
+            lt_count += 1;
+        }
+        if cpu_op.decode.op_shift {
+            shift_count += 1;
+        }
+        if cpu_op.decode.op_mul {
+            mul_count += 1;
+        }
+        if cpu_op.decode.op_divrem {
+            dvrm_count += 1;
+        }
+        if cpu_op.branch_cond {
+            branch_count += 1;
+        }
+    }
+
+    // HALT finalization: 32 register MEMW ops at ts=u64::MAX. Their timestamp
+    // delta vs old_timestamp is enormous, so they fail `is_register_op`'s
+    // `<= 0x10000` check and fall through to wide MEMW.
+    let halt_memw_ops = collect_halt_ops(&mut register_state);
+    for memw_op in &halt_memw_ops {
+        partition_memw(
+            memw_op,
+            &mut memw_by_width,
+            &mut memw_aligned_count,
+            &mut memw_register_count,
+        );
+    }
+
+    // LT-from-MEMW: per wide-MEMW op, 1/2/4/8 LT ops by width.
+    // LT-from-MEMW_A: 1 LT op per memw_aligned op.
+    let memw_count = memw_by_width.iter().sum::<usize>();
+    let lt_from_memw =
+        memw_by_width[0] + 2 * memw_by_width[1] + 4 * memw_by_width[2] + 8 * memw_by_width[3];
+    lt_count += lt_from_memw + memw_aligned_count;
+
+    // DVRM-derived: 2 mul ops (lo + hi) and 1 lt op (|r| < |d|) per dvrm.
+    mul_count += 2 * dvrm_count;
+    lt_count += dvrm_count;
+
+    let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
+
+    Ok(TableLengths {
+        cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
+        memw_padded_rows: padded_chunked_rows(memw_count, max_rows.memw),
+        memw_aligned_padded_rows: padded_chunked_rows(memw_aligned_count, max_rows.memw_aligned),
+        memw_register_padded_rows: padded_chunked_rows(memw_register_count, max_rows.memw_register),
+        load_padded_rows: padded_chunked_rows(load_count, max_rows.load),
+        lt_padded_rows: padded_chunked_rows(lt_count, max_rows.lt),
+        shift_padded_rows: padded_chunked_rows(shift_count, max_rows.shift),
+        mul_padded_rows: padded_chunked_rows(mul_count, max_rows.mul),
+        dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
+        branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
+        commit_padded_rows: commit_count.next_power_of_two().max(4) as u64,
+        decode_rows,
+        unique_page_count,
+    })
+}
+
 impl Traces {
     /// Returns the total number of main-trace field elements across all tables.
     ///

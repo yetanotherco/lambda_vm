@@ -109,6 +109,53 @@ fn test_estimate_main_elements_matches_built_trace() {
     );
 }
 
+/// `count_table_lengths` must match `prepare_from_elf_and_logs` +
+/// `estimate_main_elements`: the streaming pass reproduces the prep step's
+/// per-table counts without allocating op vectors. This test guards the
+/// equivalence; if the trace builder's partition or derivation logic changes,
+/// `count_table_lengths` must be updated to match.
+fn assert_count_matches_prep(program_name: &str) {
+    let elf_bytes = asm_elf_bytes(program_name);
+    let program = Elf::load(&elf_bytes).expect("elf load");
+    let executor = Executor::new(&program, Vec::new()).expect("executor");
+    let result = executor.run().expect("run");
+    let max_rows = MaxRowsConfig::default();
+
+    let prep =
+        Traces::prepare_from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("prepare");
+    let main_via_prep = prep.estimate_main_elements();
+
+    let lengths =
+        crate::tables::trace_builder::count_table_lengths(&program, &result.logs, &max_rows, &[])
+            .expect("count_table_lengths");
+    let main_via_count = lengths.total_main_elements();
+
+    assert_eq!(
+        main_via_prep, main_via_count,
+        "streaming counter pass and prep diverged on {program_name}"
+    );
+}
+
+#[test]
+fn test_count_table_lengths_matches_prep_sub() {
+    assert_count_matches_prep("sub");
+}
+
+#[test]
+fn test_count_table_lengths_matches_prep_mul() {
+    assert_count_matches_prep("mul");
+}
+
+#[test]
+fn test_count_table_lengths_matches_prep_divu() {
+    assert_count_matches_prep("divu");
+}
+
+#[test]
+fn test_count_table_lengths_matches_prep_fib_iterative_160k() {
+    assert_count_matches_prep("fib_iterative_160k");
+}
+
 /// Same as roundtrip test but with small chunks.
 #[test]
 fn test_disk_spill_serialization_roundtrip_chunked() {

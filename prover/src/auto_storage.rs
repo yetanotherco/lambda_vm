@@ -58,6 +58,12 @@ pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64>
 /// OS, other processes, and allocator fragmentation. `cap` is an optional
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
+///
+/// `available` is a one-shot sample. If a concurrent process allocates
+/// between this call and phase 5, this function may pick `Ram` and the
+/// prover OOMs. The 80% headroom and the estimator's 1.3× margin cover
+/// background jitter; under contention, pass `ProofOptions::max_ram_bytes`
+/// for a hard cap.
 pub fn select_storage_mode(
     estimated: u64,
     available: Option<u64>,
