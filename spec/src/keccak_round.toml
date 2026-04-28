@@ -91,7 +91,7 @@ def = {polys=[
 [[variables.virtual]]
 name = "rho"
 type = [[["Byte", 8], 5], 5]
-desc = "$(rho compose theta)(#`start`)$; the state state after applying $rho$"
+desc = "$(rho compose theta)(#`start`)$; the state after applying $rho$"
 def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
     "+", 
     ["*", 
