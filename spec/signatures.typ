@@ -43,7 +43,7 @@
     let lbl = v
     config.variables.types.filter(type => type.label == lbl).first().subtypes.len() * factor
   })
-  .sum()
+  .sum(default: 0)
 }
 
 #let interactions = signatures.signatures.filter(s => s.kind == "interaction")

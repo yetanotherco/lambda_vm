@@ -193,8 +193,8 @@
         .enumerate()
         .map(((idx, var)) => {
           (var.name: digest_variable(chip.name, group, idx, var))
-        }).sum()
-    }).sum()
+        }).sum(default: (:))
+    }).sum(default: (:))
 
   // replace variable with ID in LISP
   let replace_variable_with_ID(lisp) = {
@@ -230,6 +230,7 @@
     let CHARS = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
     assert(CHARS.len() == 32, message: "invalid CHARS length")
 
+    assert(hash_bytes.len() >= 8, message: "too few bytes to digest: " + repr(hash_bytes))
     let int = int.from-bytes(hash_bytes.slice(0, count: 8))
     for i in range(CONSTRAINT_ID_CHAR_COUNT) {
       let idx = int.bit-and(31)

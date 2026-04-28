@@ -24,7 +24,7 @@
     
     config.variables.types.filter(type => type.label == var_type).first().subtypes.len() * factor
   })
-  .sum()
+  .sum(default: 0)
 }
 
 // Given a constraint, compute the number of interactions it induces
