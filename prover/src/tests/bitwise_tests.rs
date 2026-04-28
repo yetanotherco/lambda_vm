@@ -400,22 +400,29 @@ mod soundness_tests {
     type F = GoldilocksField;
     type E = GoldilocksExtension;
 
-    // Column indices for sender (CPU-like) table
+    // Column indices for sender (CPU-like) table.
+    // Token sent on BusId::Bitwise: (OP_ID, X, Y, AND_RESULT). OP_ID is fixed
+    // to 1 here (AND lane) — same shape branch.rs and shift.rs use against the
+    // unified bus, just with a witnessed AND_RESULT.
     mod sender_cols {
-        pub const X: usize = 0;
-        pub const Y: usize = 1;
-        pub const AND_RESULT: usize = 2;
-        pub const FLAG: usize = 3; // 1 = perform AND lookup
-        pub const NUM_COLUMNS: usize = 4;
+        pub const OP_ID: usize = 0;
+        pub const X: usize = 1;
+        pub const Y: usize = 2;
+        pub const AND_RESULT: usize = 3;
+        pub const FLAG: usize = 4; // 1 = perform AND lookup
+        pub const NUM_COLUMNS: usize = 5;
     }
 
-    // Column indices for receiver (BITWISE-like) table
+    // Column indices for receiver (BITWISE-like) table.
+    // Receives (Z, X, Y, AND). Z = 1 marks the AND lane (matches the real
+    // BITWISE table's discriminator).
     mod receiver_cols {
-        pub const X: usize = 0;
-        pub const Y: usize = 1;
-        pub const AND: usize = 2;
-        pub const MU_AND: usize = 3;
-        pub const NUM_COLUMNS: usize = 4;
+        pub const Z: usize = 0;
+        pub const X: usize = 1;
+        pub const Y: usize = 2;
+        pub const AND: usize = 3;
+        pub const MU_AND: usize = 4;
+        pub const NUM_COLUMNS: usize = 5;
     }
 
     fn create_sender_air(
@@ -429,6 +436,10 @@ mod soundness_tests {
                 BusId::Bitwise,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
+                    BusValue::Packed {
+                        start_column: sender_cols::OP_ID,
+                        packing: Packing::Direct,
+                    },
                     BusValue::Packed {
                         start_column: sender_cols::X,
                         packing: Packing::Direct,
@@ -464,8 +475,8 @@ mod soundness_tests {
         proof_options: &ProofOptions,
         commitment: stark::config::Commitment,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        // 3 precomputed columns: X, Y, AND (column 3 = MU_AND is multiplicity)
-        create_receiver_air_impl(proof_options, Some((commitment, 3)))
+        // 4 precomputed columns: Z, X, Y, AND (column 4 = MU_AND is multiplicity)
+        create_receiver_air_impl(proof_options, Some((commitment, 4)))
     }
 
     fn create_receiver_air_impl(
@@ -480,6 +491,10 @@ mod soundness_tests {
                 BusId::Bitwise,
                 Multiplicity::Column(receiver_cols::MU_AND),
                 vec![
+                    BusValue::Packed {
+                        start_column: receiver_cols::Z,
+                        packing: Packing::Direct,
+                    },
                     BusValue::Packed {
                         start_column: receiver_cols::X,
                         packing: Packing::Direct,
@@ -526,8 +541,8 @@ mod soundness_tests {
         // Create a dummy AIR just to get the domain parameters
         let dummy_air = create_receiver_air(proof_options);
 
-        // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
+        // Use the prover's commitment computation (4 precomputed cols: Z, X, Y, AND)
+        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 4)
             .expect("Failed to compute commitment")
     }
 
@@ -535,7 +550,8 @@ mod soundness_tests {
         let num_rows = 4; // minimum power of 2
         let mut data = vec![FE::zero(); num_rows * sender_cols::NUM_COLUMNS];
 
-        // Row 0: perform AND lookup
+        // Row 0: perform AND lookup (op_id = 1)
+        data[sender_cols::OP_ID] = FE::one();
         data[sender_cols::X] = FE::from(x as u64);
         data[sender_cols::Y] = FE::from(y as u64);
         data[sender_cols::AND_RESULT] = FE::from(claimed_result as u64);
@@ -548,7 +564,8 @@ mod soundness_tests {
         let num_rows = 4;
         let mut data = vec![FE::zero(); num_rows * receiver_cols::NUM_COLUMNS];
 
-        // Row 0: MALICIOUS - wrong AND value!
+        // Row 0: MALICIOUS - wrong AND value at the AND lane (Z = 1).
+        data[receiver_cols::Z] = FE::one();
         data[receiver_cols::X] = FE::from(x as u64);
         data[receiver_cols::Y] = FE::from(y as u64);
         data[receiver_cols::AND] = FE::from(fake_and as u64); // WRONG!
@@ -561,8 +578,9 @@ mod soundness_tests {
         let num_rows = 4;
         let mut data = vec![FE::zero(); num_rows * receiver_cols::NUM_COLUMNS];
 
-        // Row 0: CORRECT AND value
+        // Row 0: CORRECT AND value at the AND lane (Z = 1).
         let correct_and = x & y;
+        data[receiver_cols::Z] = FE::one();
         data[receiver_cols::X] = FE::from(x as u64);
         data[receiver_cols::Y] = FE::from(y as u64);
         data[receiver_cols::AND] = FE::from(correct_and as u64);
