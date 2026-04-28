@@ -234,7 +234,6 @@ kind = "template"
 tag = "IS_BIT"
 input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
 iters = [["x", 0, 4], ["z", 0, 3]]
-cond = "μ"
 
 [[constraints.theta]]
 kind = "interaction"
