@@ -37,8 +37,6 @@ This chip adds the following interactions to the lookup:
 
 = Notes/Optimizations
 The following ideas may prove to be optimizations for the #bitwise chip:
-+ Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. 
-  When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`.
 + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`.
   Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`).
   This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check.
