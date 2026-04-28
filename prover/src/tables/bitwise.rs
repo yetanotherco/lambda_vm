@@ -436,7 +436,7 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (indices 11-20)
+            // Check all multiplicity columns (MU_BITWISE..=MU_HWSL = 9..=16)
             (cols::MU_BITWISE..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
         })
         .collect();
