@@ -111,6 +111,54 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "alloc", feature = "parallel"))]
+    #[test]
+    fn test_inplace_batch_inverse_parallel_path() {
+        // Slice size must exceed the parallel threshold (1 << 16) so the
+        // parallel branch is actually exercised. Test under several thread
+        // counts to catch chunking bugs.
+        use rayon::ThreadPoolBuilder;
+
+        let n = (1 << 16) + 17;
+        let input: Vec<Gfe> = (1..=n as u64).map(Gfe::from).collect();
+
+        for num_threads in [1, 2, 4, 8] {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .unwrap();
+
+            pool.install(|| {
+                let mut inverses = input.clone();
+                FieldElement::inplace_batch_inverse(&mut inverses).unwrap();
+                for (i, x) in inverses.into_iter().enumerate() {
+                    assert_eq!(
+                        x * input[i],
+                        Gfe::one(),
+                        "x * inv(x) != 1 with {} threads at index {}",
+                        num_threads,
+                        i
+                    );
+                }
+            });
+        }
+    }
+
+    #[cfg(all(feature = "alloc", feature = "parallel"))]
+    #[test]
+    fn test_inplace_batch_inverse_parallel_zero_returns_err_without_mutation() {
+        // A zero in the slice must produce InvZeroError and leave the input
+        // unchanged (all-or-nothing semantics, matching the sequential path).
+        let n = (1 << 16) + 1;
+        let mut input: Vec<Gfe> = (1..=n as u64).map(Gfe::from).collect();
+        input[n / 2] = Gfe::zero();
+        let snapshot = input.clone();
+
+        let result = FieldElement::inplace_batch_inverse(&mut input);
+        assert!(result.is_err());
+        assert_eq!(input, snapshot, "input was partially mutated on Err");
+    }
+
     // Tests for BigUint conversion using Goldilocks field.
     #[test]
     fn test_reduced_biguint_conversion_goldilocks() {
