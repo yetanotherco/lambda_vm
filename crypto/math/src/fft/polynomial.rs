@@ -94,9 +94,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     {
         let domain_size = domain_size.unwrap_or(0);
         let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
-        if !len.is_power_of_two() {
-            return Err(FFTError::InputError(len));
-        }
         if len.trailing_zeros() as u64 > F::TWO_ADICITY {
             return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
         }
@@ -107,11 +104,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         let mut coeffs = poly.coefficients().to_vec();
         coeffs.resize(len, FieldElement::zero());
 
-        let order = len.trailing_zeros() as u64;
-        let layer_twiddles =
-            LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
-        dispatch_fft(&mut coeffs, &layer_twiddles)?;
-        Ok(coeffs)
+        evaluate_fft_cpu_raw::<F, E>(&coeffs, false)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -317,6 +310,17 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField + Send + Sync,
 {
+    evaluate_fft_cpu_raw::<F, E>(coeffs, true)
+}
+
+fn evaluate_fft_cpu_raw<F, E>(
+    coeffs: &[FieldElement<E>],
+    permute_to_natural: bool,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
     let n = coeffs.len();
     if !n.is_power_of_two() {
         return Err(FFTError::InputError(n));
@@ -327,7 +331,9 @@ where
 
     let mut result = coeffs.to_vec();
     dispatch_fft(&mut result, &layer_twiddles)?;
-    in_place_bit_reverse_permute(&mut result);
+    if permute_to_natural {
+        in_place_bit_reverse_permute(&mut result);
+    }
     Ok(result)
 }
 
