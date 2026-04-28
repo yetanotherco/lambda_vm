@@ -94,6 +94,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     {
         let domain_size = domain_size.unwrap_or(0);
         let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if !len.is_power_of_two() {
+            return Err(FFTError::InputError(len));
+        }
         if len.trailing_zeros() as u64 > F::TWO_ADICITY {
             return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
         }
