@@ -1,0 +1,21 @@
+name = "IS_BYTE"
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = ""
+
+[[variables.input]]
+name = "X"
+type = "BaseField"
+desc = "Value for which to assert that it lies in the range $[0, 255]$."
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [0, "X"]
+multiplicity = "cond"
+ref = "isbyte:c:isbyte"

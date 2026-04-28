@@ -254,10 +254,10 @@ multiplicity = "μ"
 iter = ["i", 0, 1]
 
 [[constraints.addition]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["carry_a"]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.addition]]
 kind = "interaction"
@@ -267,10 +267,10 @@ multiplicity = "μ"
 iter = ["i", 0, 1]
 
 [[constraints.addition]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["carry_e"]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraint_groups]]
 name = "output"

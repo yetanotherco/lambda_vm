@@ -223,11 +223,11 @@ multiplicity = "μ"
 # Cxz_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
 # Cxz_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
 [[constraints.theta]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", "Cxz_left", "x"], "z"]]
 iters = [["x", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.theta]]
 kind = "template"
@@ -269,19 +269,19 @@ ref = "keccak:c:rho_rotation"
 # rot_left  = [-1,  256, -1,  256, -1,  256, -1,  256] and
 # rot_right = [ 1, -256,  1, -256,  1, -256,  1, -256]
 [[constraints.rho]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
+cond = "μ"
 ref = "keccak:c:range_rot_left"
 
 [[constraints.rho]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-multiplicity = "μ"
+cond = "μ"
 ref = "keccak:c:range_rot_right"
 
 [[constraint_groups]]
