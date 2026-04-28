@@ -314,7 +314,7 @@
     
     let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
 
-    let z-fill(s) = "0" * (2 - s.len()) + s
+    let z-fill(s) = "0" * calc.max(2 - s.len(), 0) + s
     let ref-tag(i) = raw(tag) + sub("/" + z-fill(str(i)))
     return (
       context super[#emph(z-fill(str(counter(figure.where(kind: counter-kind)).get().at(0) + 1)))],

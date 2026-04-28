@@ -150,7 +150,7 @@
 /// Converts a byte array to a hexadecimal string
 #let bytes-to-hex(bytes) = {
   /// Pads a string with 0s on the left to reach a certain length
-  let z-fill(string) = "0" * (2 - string.len()) + string
+  let z-fill(str) = "0" * calc.max(2 - str.len(), 0) + str
 
   array(bytes)
     .map(b => str(b, base: 16))
