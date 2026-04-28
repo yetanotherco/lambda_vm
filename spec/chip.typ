@@ -256,7 +256,7 @@
 
 // Render the iterators of `obj`.
 #let iters(obj) = {
-  iters_of(obj).map(iter => [#raw(iter.at(0)) #sym.in `[`#expr_to_code(iter.at(1)), #expr_to_code(iter.at(2))`]`]).join("\n")
+  iters_of(obj).map(iter => [#raw(iter.at(0))#sym.in`[`#expr_to_code(iter.at(1)),#expr_to_code(iter.at(2))`]`]).join("\n")
 }
 
 #let args_interaction_like(input, output) = {
@@ -394,7 +394,7 @@
     align: (top + left, top + left, top + left, top + left, top + center),
     stroke: none,
     table.header(
-[],
+      [],
       [*Tag*], 
       if do_display_range {[*Range*]} else {[]}, 
       [*Description*], 
