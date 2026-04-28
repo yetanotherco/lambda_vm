@@ -390,7 +390,12 @@
   show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, if do_display_range {auto} else {0pt}, 1fr, if do_display_multiplicity {auto} else {0pt}),
-    inset: 6pt,
+    inset: (x,_) => (
+      left: if x == 0 or x == 1 {0pt} else {6pt}, 
+      right: if x == 4 {0pt} else {6pt}, 
+      top: 6pt, 
+      bottom: 6pt
+    ),
     align: (top + left, top + left, top + left, top + left, top + center),
     stroke: none,
     table.header(
@@ -398,7 +403,7 @@
       [*Tag*], 
       if do_display_range {[*Range*]} else {[]}, 
       [*Description*], 
-      if do_display_multiplicity {[*Multiplicity*]} else {[]},
+      if do_display_multiplicity {[*Multip.*]} else {[]},
     ),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for (group, group_constraints) in selected_constraints.pairs() {
