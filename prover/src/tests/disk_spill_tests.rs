@@ -75,85 +75,61 @@ fn test_disk_spill_prove_and_verify_2m() {
     assert!(ok, "verification returned false for fib_iterative_2M");
 }
 
-/// `PreparedTraceInputs::estimate_main_elements` must match the post-build
-/// `Traces::total_field_elements` so the pre-build Disk/Ram decision is based
-/// on an honest number. Runs the same program both ways and compares.
-#[test]
-fn test_estimate_main_elements_matches_built_trace() {
-    let elf_bytes = asm_elf_bytes("sub");
-    let program = Elf::load(&elf_bytes).expect("elf load");
-    let executor = Executor::new(&program, Vec::new()).expect("executor");
-    let result = executor.run().expect("run");
-    let max_rows = MaxRowsConfig::default();
-
-    let prep =
-        Traces::prepare_from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("prepare");
-    let estimated = prep.estimate_main_elements();
-
-    let traces = prep
-        .into_traces(Some(&program), stark::storage_mode::StorageMode::Ram)
-        .expect("into_traces");
-    let actual = traces.total_field_elements();
-
-    // Estimator includes chunked tables, BITWISE, DECODE, HALT, COMMIT, and
-    // PAGE. Only REGISTER is omitted (fixed 32 rows × 2 cols — negligible).
-    // Require it to be a lower bound within 2% of actual.
-    assert!(
-        estimated <= actual,
-        "estimator ({estimated}) > actual ({actual})"
-    );
-    let gap = actual - estimated;
-    assert!(
-        gap * 50 <= actual,
-        "estimator gap {gap} is >2% of actual {actual}"
-    );
-}
-
-/// `count_table_lengths` must match `prepare_from_elf_and_logs` +
-/// `estimate_main_elements`: the streaming pass reproduces the prep step's
-/// per-table counts without allocating op vectors. This test guards the
-/// equivalence; if the trace builder's partition or derivation logic changes,
-/// `count_table_lengths` must be updated to match.
-fn assert_count_matches_prep(program_name: &str) {
+/// `count_table_lengths().total_main_elements()` must be a safe upper bound
+/// on the post-build `Traces::total_field_elements`, so the pre-build
+/// Disk/Ram decision never under-predicts peak (i.e. never picks Ram on a
+/// proof that would actually OOM).
+///
+/// Equality does not hold: LT/MUL/DVRM/BRANCH `generate_*_trace` functions
+/// deduplicate identical operations into one row plus a multiplicity. The
+/// streaming counter pass tracks raw op counts, which are `>=` the unique
+/// counts the trace builder uses.
+fn assert_count_is_upper_bound_on_built_trace(program_name: &str) {
     let elf_bytes = asm_elf_bytes(program_name);
     let program = Elf::load(&elf_bytes).expect("elf load");
     let executor = Executor::new(&program, Vec::new()).expect("executor");
     let result = executor.run().expect("run");
     let max_rows = MaxRowsConfig::default();
 
-    let prep =
-        Traces::prepare_from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("prepare");
-    let main_via_prep = prep.estimate_main_elements();
-
     let lengths =
         crate::tables::trace_builder::count_table_lengths(&program, &result.logs, &max_rows, &[])
             .expect("count_table_lengths");
     let main_via_count = lengths.total_main_elements();
 
-    assert_eq!(
-        main_via_prep, main_via_count,
-        "streaming counter pass and prep diverged on {program_name}"
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        &[],
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("from_elf_and_logs");
+    let main_via_traces = traces.total_field_elements();
+
+    assert!(
+        main_via_count >= main_via_traces,
+        "count ({main_via_count}) underestimated built trace ({main_via_traces}) on {program_name}"
     );
 }
 
 #[test]
-fn test_count_table_lengths_matches_prep_sub() {
-    assert_count_matches_prep("sub");
+fn test_count_is_upper_bound_sub() {
+    assert_count_is_upper_bound_on_built_trace("sub");
 }
 
 #[test]
-fn test_count_table_lengths_matches_prep_mul() {
-    assert_count_matches_prep("mul");
+fn test_count_is_upper_bound_mul() {
+    assert_count_is_upper_bound_on_built_trace("mul");
 }
 
 #[test]
-fn test_count_table_lengths_matches_prep_divu() {
-    assert_count_matches_prep("divu");
+fn test_count_is_upper_bound_divu() {
+    assert_count_is_upper_bound_on_built_trace("divu");
 }
 
 #[test]
-fn test_count_table_lengths_matches_prep_fib_iterative_160k() {
-    assert_count_matches_prep("fib_iterative_160k");
+fn test_count_is_upper_bound_fib_iterative_160k() {
+    assert_count_is_upper_bound_on_built_trace("fib_iterative_160k");
 }
 
 /// Same as roundtrip test but with small chunks.

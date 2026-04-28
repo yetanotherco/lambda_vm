@@ -2129,105 +2129,6 @@ fn generate_traces(
     })
 }
 
-/// Intermediate state of trace generation after phases 0-4 (ELF decode, op
-/// collection, op derivation). Phase 5 (trace-table allocation) is the heavy
-/// phase for memory; by returning this struct we let callers estimate the
-/// resulting `main_elements` count and choose a `StorageMode` *before*
-/// allocating those tables.
-pub struct PreparedTraceInputs {
-    derived: DerivedOps,
-    memory_state: MemoryState,
-    entry_point: u64,
-    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
-    private_input: Vec<u8>,
-    max_rows: super::MaxRowsConfig,
-}
-
-impl PreparedTraceInputs {
-    /// Exact `main_elements` count for the traces that would be produced by
-    /// [`Self::into_traces`]. Mirrors [`Traces::total_field_elements`] column
-    /// for column, but is computable without allocating any trace tables.
-    ///
-    /// Uses the op-vector lengths from phase 2/3/4 plus each table's
-    /// `chunk_and_generate` padding rule (`len.next_power_of_two().max(4)` per
-    /// chunk) to derive post-padding row counts.
-    pub fn estimate_main_elements(&self) -> u64 {
-        let max_rows = &self.max_rows;
-        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
-        use super::bitwise::NUM_ROWS as BITWISE_ROWS;
-        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
-        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
-        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
-        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
-        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
-        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
-        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
-        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
-        use super::lt::cols::NUM_COLUMNS as LT_COLS;
-        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
-        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
-        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
-        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
-        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
-        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
-        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
-
-        let ops = &self.derived.ops;
-        let mut total: u64 = 0;
-        total += padded_chunked_rows(ops.cpu_ops.len(), max_rows.cpu) * CPU_COLS as u64;
-        total += padded_chunked_rows(ops.memw_ops.len(), max_rows.memw) * MEMW_COLS as u64;
-        total += padded_chunked_rows(ops.memw_aligned_ops.len(), max_rows.memw_aligned)
-            * MEMW_A_COLS as u64;
-        total += padded_chunked_rows(ops.memw_register_ops.len(), max_rows.memw_register)
-            * MEMW_R_COLS as u64;
-        total += padded_chunked_rows(ops.load_ops.len(), max_rows.load) * LOAD_COLS as u64;
-        total += padded_chunked_rows(ops.lt_ops.len(), max_rows.lt) * LT_COLS as u64;
-        total += padded_chunked_rows(ops.shift_ops.len(), max_rows.shift) * SHIFT_COLS as u64;
-        total += padded_chunked_rows(ops.mul_ops.len(), max_rows.mul) * MUL_COLS as u64;
-        total += padded_chunked_rows(ops.dvrm_ops.len(), max_rows.dvrm) * DVRM_COLS as u64;
-        total += padded_chunked_rows(ops.branch_ops.len(), max_rows.branch) * BRANCH_COLS as u64;
-
-        // Fixed-size / lookup tables.
-        total += (BITWISE_ROWS * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
-        total += (self.decode_trace.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
-        let commit_rows = ops.commit_ops.len().next_power_of_two().max(4);
-        total += (commit_rows * COMMIT_COLS) as u64;
-        total += HALT_COLS as u64; // halt trace is always 1 row
-
-        // PAGE tables: one per unique memory page, each `DEFAULT_PAGE_SIZE`
-        // rows. Dominates for memory-heavy programs.
-        let page_size = super::page::DEFAULT_PAGE_SIZE as u64;
-        let page_count = self.memory_state.unique_page_count(page_size);
-        total += page_count * page_size * (PAGE_COLS - PAGE_PREPROCESSED) as u64;
-
-        // REGISTER table: 32 rows, 2 non-preprocessed cols — constant, omitted.
-        total
-    }
-
-    /// Run phase 5: allocate trace tables with the chosen storage mode.
-    pub fn into_traces(
-        self,
-        elf: Option<&Elf>,
-        storage_mode: StorageMode,
-    ) -> Result<Traces, Error> {
-        generate_traces(
-            self.derived,
-            elf,
-            &self.memory_state,
-            self.entry_point,
-            self.decode_trace,
-            self.decode_pc_to_row,
-            self.register_state,
-            &self.max_rows,
-            storage_mode,
-            &self.private_input,
-        )
-    }
-}
-
 /// Row count for a chunked table after `chunk_and_generate` padding: each
 /// chunk is rounded up to `len.next_power_of_two().max(4)`. Matches the
 /// per-table `generate_*_trace` calls exactly.
@@ -2266,9 +2167,16 @@ pub struct TableLengths {
 }
 
 impl TableLengths {
-    /// Total main-trace (base-field) elements. Mirrors
-    /// [`Traces::total_field_elements`] column-for-column. Preprocessed columns
-    /// are excluded.
+    /// Upper bound on main-trace (base-field) elements. Mirrors
+    /// [`Traces::total_field_elements`] column-for-column.
+    ///
+    /// This is *not* exact for tables whose `generate_*_trace` deduplicates
+    /// identical operations into a single row with a multiplicity (LT, MUL,
+    /// DVRM, BRANCH). For those, the streaming counter pass tracks the raw op
+    /// count, which is `>=` the post-dedup unique count. The result is an
+    /// upper bound — safe for the [`peak_bytes`] decision (errs toward Disk).
+    ///
+    /// [`peak_bytes`]: crate::auto_storage::peak_bytes
     pub fn total_main_elements(&self) -> u64 {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::NUM_ROWS as BITWISE_ROWS;
@@ -2289,7 +2197,11 @@ impl TableLengths {
         use super::page::DEFAULT_PAGE_SIZE as PAGE_SIZE;
         use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
         use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
+        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        let register_rows = super::register::NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
 
         self.cpu_padded_rows * CPU_COLS as u64
             + self.memw_padded_rows * MEMW_COLS as u64
@@ -2305,13 +2217,14 @@ impl TableLengths {
             + (BITWISE_ROWS * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64
             + self.decode_rows * (DECODE_COLS - DECODE_PRECOMPUTED) as u64
             + HALT_COLS as u64
+            + register_rows * (REGISTER_COLS - REGISTER_PREPROCESSED) as u64
             + self.unique_page_count * PAGE_SIZE as u64 * (PAGE_COLS - PAGE_PREPROCESSED) as u64
-        // REGISTER table: 32 rows × 2 non-preprocessed cols — constant, omitted
-        // for parity with `Traces::total_field_elements`'s previous behavior.
     }
 
-    /// Total auxiliary-trace (extension-field) elements. Mirrors
-    /// [`Traces::total_auxiliary_field_elements`] column-for-column.
+    /// Upper bound on auxiliary-trace (extension-field) elements. Mirrors
+    /// [`Traces::total_auxiliary_field_elements`] column-for-column. Inherits
+    /// the upper-bound looseness of [`Self::total_main_elements`] for
+    /// deduplicated tables.
     pub fn total_aux_elements(&self) -> u64 {
         fn aux_cols(n: usize) -> usize {
             n.div_ceil(2)
@@ -2335,8 +2248,7 @@ impl TableLengths {
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len()) as u64;
 
         let bitwise_rows = super::bitwise::NUM_ROWS as u64;
-        // REGISTER table: always 32 rows.
-        let register_rows = 32u64;
+        let register_rows = super::register::NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
         let halt_rows = 1u64;
 
         self.cpu_padded_rows * n_cpu
@@ -2358,17 +2270,22 @@ impl TableLengths {
     }
 }
 
-/// Stream `logs` once and compute exact per-table row counts the trace builder
-/// would produce, without allocating the `Vec<*Operation>` intermediates.
+/// Stream `logs` once and compute upper-bound per-table row counts the trace
+/// builder would produce, without allocating the `Vec<*Operation>`
+/// intermediates.
 ///
-/// Mirrors `prepare_from_elf_and_logs` + `collect_ops_from_cpu` +
-/// `collect_all_ops` + `derive_ops`, but every per-cycle struct lives on the
-/// stack and is dropped immediately after the partition predicate runs. Heap
-/// usage during this pass is `O(unique_pages + 32)` (memory + register state),
-/// not `O(N)`.
+/// Mirrors the same partition + derivation logic as `Traces::from_elf_and_logs`
+/// (phases 0–4: ELF decode, op collection, MEMW partitioning, LT/MUL/DVRM
+/// derivation), but every per-cycle struct lives on the stack and is dropped
+/// immediately after the partition predicate runs. Heap usage during this
+/// pass is `O(unique_pages + 32)` (memory + register state), not `O(N)`.
+///
+/// Returns an upper bound (not exact) for tables whose `generate_*_trace`
+/// deduplicates identical operations: LT, MUL, DVRM, BRANCH. See
+/// [`TableLengths::total_main_elements`].
 ///
 /// The two places that must stay in sync when the trace shape changes: this
-/// function and the `generate_traces` caller.
+/// function and `Traces::from_elf_and_logs`.
 pub fn count_table_lengths(
     elf: &Elf,
     logs: &[Log],
@@ -2930,21 +2847,6 @@ impl Traces {
         private_input: &[u8],
         storage_mode: StorageMode,
     ) -> Result<Self, Error> {
-        let prep = Self::prepare_from_elf_and_logs(elf, logs, max_rows, private_input)?;
-        prep.into_traces(Some(elf), storage_mode)
-    }
-
-    /// Runs phases 0-4 (ELF decode, op collection, derivation) and returns a
-    /// [`PreparedTraceInputs`] from which `main_elements` can be estimated
-    /// before phase 5 (the heavy trace-table allocation) starts. Callers pick
-    /// `StorageMode` based on the estimate and then invoke
-    /// [`PreparedTraceInputs::into_traces`].
-    pub fn prepare_from_elf_and_logs(
-        elf: &Elf,
-        logs: &[Log],
-        max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
-    ) -> Result<PreparedTraceInputs, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
@@ -2976,16 +2878,19 @@ impl Traces {
         // Phases 3-4
         let derived = derive_ops(ops, Some(elf), &memory_state, max_rows, private_input)?;
 
-        Ok(PreparedTraceInputs {
+        // Phase 5
+        generate_traces(
             derived,
-            memory_state,
-            entry_point: elf.entry_point,
+            Some(elf),
+            &memory_state,
+            elf.entry_point,
             decode_trace,
             decode_pc_to_row,
             register_state,
-            private_input: private_input.to_vec(),
-            max_rows: max_rows.clone(),
-        })
+            max_rows,
+            storage_mode,
+            private_input,
+        )
     }
 
     /// Generates all traces from execution logs (legacy API).
