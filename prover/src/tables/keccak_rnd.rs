@@ -3,32 +3,33 @@
 //! One row per round (24 rows per keccak call). All bitwise operations are
 //! delegated to BITWISE lookup tables (XOR_BYTE, AND_BYTE, HWSL, IS_BYTE).
 //!
-//! ## Column layout (~1,775 columns)
+//! ## Column layout (1,480 columns)
 //!
-//! | Group          | Size | Description                                   |
-//! |----------------|------|-----------------------------------------------|
-//! | timestamp      |    2 | DWordWL                                       |
-//! | round          |    1 | Round index (0..23)                           |
-//! | start          |  200 | Input state bytes [5][5][8]                   |
-//! | Cxz            |  160 | Column parity chain [5][4][8]                 |
-//! | Cxz_left       |   40 | Left component of rotated C [5][8]            |
-//! | Cxz_right      |   40 | Right component of rotated C [5][8]           |
-//! | Dxz            |   40 | D values [5][8]                               |
-//! | theta          |  200 | State after θ [5][5][8]                       |
-//! | rot_left       |  200 | Left half of ρ rotation [5][5][8]             |
-//! | rot_right      |  200 | Right half of ρ rotation [5][5][8]            |
-//! | pi             |  200 | State after π∘ρ (materialized) [5][5][8]      |
-//! | chi_ands       |  200 | AND results for χ [5][5][8]                   |
-//! | chi            |  200 | State after χ [5][5][8]                       |
-//! | rc             |    8 | Round constant bytes                          |
-//! | iota           |    8 | χ[0][0] ⊕ rc                                  |
-//! | mu             |    1 | Multiplicity (1 for real, 0 for padding)      |
+//! | Group          | Size | Description                                       |
+//! |----------------|------|---------------------------------------------------|
+//! | timestamp      |    2 | DWordWL                                           |
+//! | round          |    1 | Round index (0..23)                               |
+//! | start          |  200 | Input state bytes [5][5][8]                       |
+//! | Cxz            |  160 | Column parity chain [5][4][8]                     |
+//! | Cxz_left       |   40 | Left component of rotated C [5][8]                |
+//! | Cxz_right      |   20 | Carry bits of HWSL(C[x],1) [5][4]                 |
+//! | Dxz            |   40 | D values [5][8]                                   |
+//! | theta          |  200 | State after θ [5][5][8]                           |
+//! | rot_left       |  200 | Left half of ρ rotation [5][5][8]                 |
+//! | rot_right      |  200 | Right half of ρ rotation [5][5][8]                |
+//! | chi_ands       |  200 | AND results for χ [5][5][8]                       |
+//! | chi            |  200 | State after χ [5][5][8]                           |
+//! | rc             |    8 | Round constant bytes                              |
+//! | iota           |    8 | χ[0][0] ⊕ rc                                      |
+//! | mu             |    1 | Multiplicity (1 for real, 0 for padding)          |
 //!
 //! Note: spec [[variables.constant]] `rnc` and `rbc` are inlined as compile-time
 //! constants derived from `KECCAK_RHO[x][y]`, not materialized as columns.
+//! `Cxz_right` is typed `[Bit, 4]` per spec d75944ee — HWSL with shift=1
+//! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-use stark::constraints::transition::TransitionConstraintEvaluator;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -52,41 +53,42 @@ pub mod cols {
     // Cxz_left[5][8] = 40 bytes — left shift component of rotated C
     pub const CXZ_LEFT: usize = CXZ + 160; // 363
 
-    // Cxz_right[5][8] = 40 bytes — right shift component of rotated C
+    // Cxz_right[5][4] = 20 bits — carry bit of HWSL(C[x] halfword[hw], 1).
+    // For shift=1, HWSL emits a single-bit carry; one column per halfword.
     pub const CXZ_RIGHT: usize = CXZ_LEFT + 40; // 403
 
     // Dxz[5][8] = 40 bytes
-    pub const DXZ: usize = CXZ_RIGHT + 40; // 443
+    pub const DXZ: usize = CXZ_RIGHT + 20; // 423
 
     // theta[5][5][8] = 200 bytes — state after θ
-    pub const THETA: usize = DXZ + 40; // 483
+    pub const THETA: usize = DXZ + 40; // 463
 
     // rot_left[5][5][8] = 200 bytes
-    pub const ROT_LEFT: usize = THETA + 200; // 683
+    pub const ROT_LEFT: usize = THETA + 200; // 663
 
     // rot_right[5][5][8] = 200 bytes
-    pub const ROT_RIGHT: usize = ROT_LEFT + 200; // 883
+    pub const ROT_RIGHT: usize = ROT_LEFT + 200; // 863
 
     // chi_ands[5][5][8] = 200 bytes
     // (pi is a spec [[variables.virtual]] — inlined as rot_left + rot_right at
     // compile-resolved offsets, not materialized as columns.)
-    pub const CHI_ANDS: usize = ROT_RIGHT + 200; // 1083
+    pub const CHI_ANDS: usize = ROT_RIGHT + 200; // 1063
 
     // chi[5][5][8] = 200 bytes — state after χ
-    pub const CHI: usize = CHI_ANDS + 200; // 1283
+    pub const CHI: usize = CHI_ANDS + 200; // 1263
 
     // rc[8] — round constant bytes
-    pub const RC: usize = CHI + 200; // 1483
+    pub const RC: usize = CHI + 200; // 1463
 
     // iota[8] — χ[0][0] ⊕ rc
-    pub const IOTA: usize = RC + 8; // 1491
+    pub const IOTA: usize = RC + 8; // 1471
 
     // mu — multiplicity flag.
     // rnc and rbc (spec [[variables.constant]]) are inlined as compile-time
     // constants from KECCAK_RHO, not allocated as columns.
-    pub const MU: usize = IOTA + 8; // 1499
+    pub const MU: usize = IOTA + 8; // 1479
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 1500
+    pub const NUM_COLUMNS: usize = MU + 1; // 1480
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -110,10 +112,23 @@ pub mod cols {
         CXZ_LEFT + x * 8 + byte
     }
 
-    /// Index into Cxz_right[x][byte]
+    /// Index into Cxz_right[x][hw] — single-bit carry for halfword `hw` of x.
     #[inline]
-    pub const fn cxz_right(x: usize, byte: usize) -> usize {
-        CXZ_RIGHT + x * 8 + byte
+    pub const fn cxz_right_bit(x: usize, hw: usize) -> usize {
+        CXZ_RIGHT + x * 4 + hw
+    }
+
+    /// For byte `b` of the rotated_Cxz output, return Some(hw) if a Cxz_right
+    /// bit contributes (even b), else None (odd b → only Cxz_left contributes).
+    /// Spec d75944ee/9143370f: rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) *
+    /// Cxz_right[(z/2 - 1) mod 4].
+    #[inline]
+    pub const fn cxz_right_bit_for_byte(b: usize) -> Option<usize> {
+        if b.is_multiple_of(2) {
+            Some((b / 2 + 3) % 4)
+        } else {
+            None
+        }
     }
 
     /// Index into Dxz[x][byte]
@@ -281,12 +296,12 @@ pub fn generate_keccak_rnd_trace(
             }
 
             // Rotate C left by 1 bit using HWSL decomposition.
-            // HWSL shifts each halfword (u16) independently and emits the carry
-            // as a u16 at bytes [2k, 2k+1] of Cxz_right, so the carry propagates
-            // by 2 bytes (not 1):
-            //   rotated_Cxz[z] = Cxz_left[z] + Cxz_right[(z-2) mod 8]
+            // HWSL shifts each halfword (u16) independently. For shift=1, the
+            // carry is a single bit (top bit of the halfword); we store it in
+            // one column per halfword (Cxz_right[x][hw], spec d75944ee).
+            //   rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) * Cxz_right[(z/2 - 1) mod 4]
             let mut cxz_left_bytes = [[0u8; 8]; 5];
-            let mut cxz_right_bytes = [[0u8; 8]; 5];
+            let mut cxz_right_bits = [[0u8; 4]; 5];
             let mut rotated_c = [[0u8; 8]; 5];
             for x in 0..5 {
                 for hw in 0..4 {
@@ -296,21 +311,22 @@ pub fn generate_keccak_rnd_trace(
                     let (shifted, carry) = hwsl(halfword, 1);
                     cxz_left_bytes[x][hw * 2] = (shifted & 0xFF) as u8;
                     cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
-                    cxz_right_bytes[x][hw * 2] = (carry & 0xFF) as u8;
-                    cxz_right_bytes[x][hw * 2 + 1] = (carry >> 8) as u8;
+                    // For shift=1, carry ∈ {0, 1}.
+                    cxz_right_bits[x][hw] = carry as u8;
                     data[base + cols::cxz_left(x, hw * 2)] =
                         FE::from(cxz_left_bytes[x][hw * 2] as u64);
                     data[base + cols::cxz_left(x, hw * 2 + 1)] =
                         FE::from(cxz_left_bytes[x][hw * 2 + 1] as u64);
-                    data[base + cols::cxz_right(x, hw * 2)] =
-                        FE::from(cxz_right_bytes[x][hw * 2] as u64);
-                    data[base + cols::cxz_right(x, hw * 2 + 1)] =
-                        FE::from(cxz_right_bytes[x][hw * 2 + 1] as u64);
+                    data[base + cols::cxz_right_bit(x, hw)] =
+                        FE::from(cxz_right_bits[x][hw] as u64);
                 }
-                // Reconstruct: left[z] + right[(z-2) mod 8]
+                // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
                 for b in 0..8 {
-                    rotated_c[x][b] =
-                        cxz_left_bytes[x][b].wrapping_add(cxz_right_bytes[x][(b + 6) % 8]);
+                    let right_contribution = match cols::cxz_right_bit_for_byte(b) {
+                        Some(hw) => cxz_right_bits[x][hw],
+                        None => 0,
+                    };
+                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(right_contribution);
                 }
             }
 
@@ -427,7 +443,7 @@ pub fn generate_keccak_rnd_trace(
 
 #[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1420);
+    let mut interactions = Vec::with_capacity(1380);
 
     // --- IO group (3) ---
 
@@ -580,6 +596,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // --- Theta: HWSL for rotated C (20) ---
     // HWSL(C[x] halfword[hw], 1) → (Cxz_left, Cxz_right)
+    // Cxz_right is a single carry bit zero-extended to a halfword (spec d75944ee).
     for x in 0..5 {
         for hw in 0..4 {
             interactions.push(BusInteraction::sender(
@@ -610,23 +627,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             column: cols::cxz_left(x, hw * 2 + 1),
                         },
                     ]),
-                    // Output: carry
-                    BusValue::linear(vec![
-                        LinearTerm::Column {
-                            coefficient: 1,
-                            column: cols::cxz_right(x, hw * 2),
-                        },
-                        LinearTerm::Column {
-                            coefficient: 256,
-                            column: cols::cxz_right(x, hw * 2 + 1),
-                        },
-                    ]),
+                    // Output: carry (single bit cast to Half — high byte = 0).
+                    BusValue::Packed {
+                        start_column: cols::cxz_right_bit(x, hw),
+                        packing: Packing::Direct,
+                    },
                 ],
             ));
         }
     }
 
-    // --- Theta: IS_BYTE range checks on Cxz_left + Cxz_right (80) ---
+    // --- Theta: IS_BYTE range checks on Cxz_left (40) ---
+    // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
     for x in 0..5 {
         for b in 0..8 {
             interactions.push(BusInteraction::sender(
@@ -637,24 +649,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 }],
             ));
-            interactions.push(BusInteraction::sender(
-                BusId::IsByte,
-                Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
-                    start_column: cols::cxz_right(x, b),
-                    packing: Packing::Direct,
-                }],
-            ));
         }
     }
 
     // --- Theta: Dxz XOR_BYTE (40) ---
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
-    // rotated_C[x'][b] = Cxz_left[x'][b] + Cxz_right[x'][(b-2)%8] (virtual).
-    // The 2-byte offset comes from HWSL emitting the carry as a u16 spanning
-    // bytes [2k, 2k+1] of Cxz_right.
+    // rotated_C[x'][b] = Cxz_left[x'][b] + (1 - b%2) * Cxz_right[x'][(b/2 - 1)%4]
+    // (spec d75944ee/9143370f). For odd b only Cxz_left contributes.
     for x in 0..5 {
         for b in 0..8 {
+            let mut rotated_c_terms = vec![LinearTerm::Column {
+                coefficient: 1,
+                column: cols::cxz_left((x + 1) % 5, b),
+            }];
+            if let Some(hw) = cols::cxz_right_bit_for_byte(b) {
+                rotated_c_terms.push(LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::cxz_right_bit((x + 1) % 5, hw),
+                });
+            }
             interactions.push(BusInteraction::sender(
                 BusId::XorByte,
                 Multiplicity::Column(cols::MU),
@@ -663,16 +676,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                         start_column: cols::cxz((x + 4) % 5, 3, b),
                         packing: Packing::Direct,
                     },
-                    BusValue::linear(vec![
-                        LinearTerm::Column {
-                            coefficient: 1,
-                            column: cols::cxz_left((x + 1) % 5, b),
-                        },
-                        LinearTerm::Column {
-                            coefficient: 1,
-                            column: cols::cxz_right((x + 1) % 5, (b + 6) % 8),
-                        },
-                    ]),
+                    BusValue::linear(rotated_c_terms),
                     BusValue::Packed {
                         start_column: cols::dxz(x, b),
                         packing: Packing::Direct,
@@ -889,7 +893,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Constraints
 // =========================================================================
 
-/// KECCAK_RND has no main-trace polynomial constraints.
+/// KECCAK_RND polynomial constraints: 20 IS_BIT(μ; Cxz_right) constraints.
+///
+/// Per spec d75944ee, `Cxz_right` is typed `[Bit, 4], 5` and range-checked via
+/// IS_BIT polynomial constraints (kind="template", cond="μ"), not lookups:
+///   μ * Cxz_right[x][hw] * (1 - Cxz_right[x][hw]) = 0
 ///
 /// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
 /// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
@@ -902,7 +910,20 @@ pub fn create_constraints(
     Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    (Vec::new(), constraint_idx_start)
+    use crate::constraints::templates::IsBitConstraint;
+
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::with_capacity(20);
+    let mut idx = constraint_idx_start;
+    for x in 0..5 {
+        for hw in 0..4 {
+            constraints
+                .push(IsBitConstraint::new(cols::MU, cols::cxz_right_bit(x, hw), idx).boxed());
+            idx += 1;
+        }
+    }
+    (constraints, idx)
 }
 
 #[cfg(test)]

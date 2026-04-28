@@ -1694,14 +1694,15 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // theta: HWSL for rotated C (20) + IS_BYTE (80)
+            // theta: HWSL for rotated C (20) + IS_BYTE on Cxz_left (40).
+            // Cxz_right is range-checked via IS_BIT polynomial constraints
+            // on the keccak_rnd chip, not via lookups (spec d75944ee).
             let mut rotated_c = [[0u8; 8]; 5];
             for x in 0..5 {
                 let c = cxz[x][3];
                 for hw in 0..4 {
                     let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
                     let shifted = halfword << 1; // u16 wraps
-                    let carry = if halfword >> 15 == 1 { 1u16 } else { 0 };
                     ops.push(BitwiseOperation::new(
                         BitwiseOperationType::Hwsl,
                         (halfword & 0xFF) as u8,
@@ -1717,30 +1718,24 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                         BitwiseOperationType::IsByte,
                         ((shifted >> 8) & 0xFF) as u8,
                     ));
-                    // IS_BYTE for cxz_right bytes
-                    ops.push(BitwiseOperation::single_byte(
-                        BitwiseOperationType::IsByte,
-                        (carry & 0xFF) as u8,
-                    ));
-                    ops.push(BitwiseOperation::single_byte(
-                        BitwiseOperationType::IsByte,
-                        ((carry >> 8) & 0xFF) as u8,
-                    ));
                 }
-                // Reconstruct rotated_c
+                // Reconstruct rotated_c using the bit-typed Cxz_right.
                 let mut left_bytes = [0u8; 8];
-                let mut right_bytes = [0u8; 8];
+                let mut right_bits = [0u8; 4];
                 for hw in 0..4 {
                     let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
                     let shifted = halfword << 1;
-                    let carry = if halfword >> 15 == 1 { 1u16 } else { 0 };
                     left_bytes[hw * 2] = (shifted & 0xFF) as u8;
                     left_bytes[hw * 2 + 1] = ((shifted >> 8) & 0xFF) as u8;
-                    right_bytes[hw * 2] = (carry & 0xFF) as u8;
-                    right_bytes[hw * 2 + 1] = ((carry >> 8) & 0xFF) as u8;
+                    right_bits[hw] = (halfword >> 15) as u8;
                 }
-                for b in 0..8 {
-                    rotated_c[x][b] = left_bytes[b].wrapping_add(right_bytes[(b + 6) % 8]);
+                for b in 0usize..8 {
+                    let right_contribution = if b.is_multiple_of(2) {
+                        right_bits[(b / 2 + 3) % 4]
+                    } else {
+                        0
+                    };
+                    rotated_c[x][b] = left_bytes[b].wrapping_add(right_contribution);
                 }
             }
 
@@ -2892,10 +2887,11 @@ mod keccak_tests {
 
         assert_eq!(xor, 24 * 608, "XorByte count");
         assert_eq!(and, 24 * 200, "AndByte count");
-        assert_eq!(is_byte, 24 * 480, "IsByte count");
+        // Cxz_right Byte→Bit (spec d75944ee): drops 40 IS_BYTE per round.
+        assert_eq!(is_byte, 24 * 440, "IsByte count");
         assert_eq!(hwsl, 24 * 120, "Hwsl count");
         assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 100 + 24 * 1408, "Total bitwise ops");
+        assert_eq!(ops.len(), 100 + 24 * 1368, "Total bitwise ops");
     }
 
     #[test]
@@ -3000,8 +2996,9 @@ mod keccak_tests {
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
-            1411,
-            "KECCAK_RND: 3 IO + 500 theta + 500 rho + 400 chi + 8 iota"
+            1371,
+            "KECCAK_RND: 3 IO + 460 theta + 500 rho + 400 chi + 8 iota \
+             (Cxz_right Byte→Bit drops 40 IS_BYTE per spec d75944ee)"
         );
         assert_eq!(
             keccak_rc::bus_interactions().len(),
@@ -3015,8 +3012,8 @@ mod keccak_tests {
         assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
-            1500,
-            "KECCAK_RND columns (rnc/rbc inlined as constants; pi virtual)"
+            1480,
+            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
         );
         assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
     }
@@ -3029,8 +3026,8 @@ mod keccak_tests {
         let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
         assert_eq!(
             rnd_constraints.len(),
-            0,
-            "KECCAK_RND: no polynomial constraints (pi virtual, rnc/rbc inlined)"
+            20,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
         );
     }
 }
