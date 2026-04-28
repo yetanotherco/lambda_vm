@@ -1,46 +1,209 @@
 //! Automatic `StorageMode` selection from an analytical peak-RAM estimate.
 //!
-//! Peak prover memory is the sum of two table-shaped terms (main + aux
-//! field elements times bytes-per-element through trace/LDE/Merkle) plus a
-//! mostly-fixed overhead for state kept alive across phase 5 (memory cells,
-//! log buffer, instruction map). Per-element coefficients are derived from
-//! the STARK structure, not fitted:
+//! [`peak_bytes`] sums every allocation `multi_prove_with_mode` keeps alive
+//! during phase 5 + commitment + composition + FRI, derived from the STARK
+//! structure (no regression fit, no averaged coefficients). Per-table:
 //!
 //! ```text
-//! per main element  = 8                   (Goldilocks base field byte count)
-//!                   + 8 * blowup_factor   (LDE expansion)
-//!                   + ~2                  (Merkle node share, averaged across cols)
-//! per aux element   = 24                  (cubic extension byte count)
-//!                   + 24 * blowup_factor  (LDE expansion)
-//!                   + ~3                  (Merkle node share)
-//! fixed overhead    = 2 GB                (memory_state cells, log Vec, HashMap slack)
+//! main trace        : rows × main_cols × 8                 (Goldilocks = 8 B)
+//! main LDE          : rows × main_cols × 8 × blowup
+//! main Merkle       : (2 × rows × blowup) × 32             (Keccak256 node = 32 B)
+//! aux trace         : rows × aux_cols × 24                 (cubic ext = 24 B)
+//! aux LDE           : rows × aux_cols × 24 × blowup
+//! aux Merkle        : (2 × rows × blowup) × 32
+//! composition LDE   : rows × blowup × 24                   (one ext-field column)
+//! composition Merkle: (2 × rows × blowup) × 32
+//! FRI evals         : ~rows × blowup × 24 × 2              (geometric over layers)
+//! FRI Merkle        : ~(2 × rows × blowup) × 32 × 2        (geometric over layers)
 //! ```
 //!
-//! Element counts come from [`TableLengths`] via [`count_table_lengths`]: a
-//! single streaming pass over execution logs that mirrors the trace builder's
-//! partition/derivation logic without allocating the `Vec<*Operation>`
-//! intermediates. The estimate is therefore *exact* up to the per-element
-//! coefficient, not a regression fit.
+//! `aux_cols = ⌈bus_interactions.len() / 2⌉` — the LogUp committed-pair count
+//! used by `Traces::total_auxiliary_field_elements`.
+//!
+//! Plus state kept alive across the prove call:
+//!
+//! ```text
+//! MemoryState.cells : unique_byte_count × 32   (HashMap<u64, (u8,u64)> ≈ 32 B/entry)
+//! Log Vec           : cycle_count × 40         (Log struct = 5 × u64)
+//! Instructions map  : decode_rows × 32
+//! ```
+//!
+//! Per-table row counts and the state-driving counters all come from
+//! [`TableLengths`] via [`count_table_lengths`], itself derived from the
+//! execution logs without allocating any operation vectors.
+//!
+//! [`count_table_lengths`]: crate::tables::trace_builder::count_table_lengths
 
+use crate::tables::bitwise::{
+    NUM_PRECOMPUTED_COLS as BITWISE_PRE, NUM_ROWS as BITWISE_ROWS,
+    bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
+};
+use crate::tables::branch::{bus_interactions as branch_buses, cols::NUM_COLUMNS as BRANCH_COLS};
+use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS as COMMIT_COLS};
+use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
+use crate::tables::decode::{
+    NUM_PRECOMPUTED_COLS as DECODE_PRE, bus_interactions as decode_buses,
+    cols::NUM_COLUMNS as DECODE_COLS,
+};
+use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
+use crate::tables::halt::{bus_interactions as halt_buses, cols::NUM_COLUMNS as HALT_COLS};
+use crate::tables::load::{bus_interactions as load_buses, cols::NUM_COLUMNS as LOAD_COLS};
+use crate::tables::lt::{bus_interactions as lt_buses, cols::NUM_COLUMNS as LT_COLS};
+use crate::tables::memw::{bus_interactions as memw_buses, cols::NUM_COLUMNS as MEMW_COLS};
+use crate::tables::memw_aligned::{
+    bus_interactions as memw_a_buses, cols::NUM_COLUMNS as MEMW_A_COLS,
+};
+use crate::tables::memw_register::{
+    bus_interactions as memw_r_buses, cols::NUM_COLUMNS as MEMW_R_COLS,
+};
+use crate::tables::mul::{bus_interactions as mul_buses, cols::NUM_COLUMNS as MUL_COLS};
+use crate::tables::page::{
+    DEFAULT_PAGE_SIZE as PAGE_SIZE, NUM_PREPROCESSED_COLS as PAGE_PRE,
+    bus_interactions as page_buses, cols::NUM_COLUMNS as PAGE_COLS,
+};
+use crate::tables::register::{
+    NUM_PREPROCESSED_COLS as REGISTER_PRE, NUM_REGISTER_ADDRESSES,
+    bus_interactions as register_buses, cols::NUM_COLUMNS as REGISTER_COLS,
+};
+use crate::tables::shift::{bus_interactions as shift_buses, cols::NUM_COLUMNS as SHIFT_COLS};
 use crate::tables::trace_builder::TableLengths;
 use stark::storage_mode::StorageMode;
 use sysinfo::System;
 
+const GOLDILOCKS_BYTES: u64 = 8;
+const CUBIC_EXT_BYTES: u64 = 24;
+const KECCAK_NODE_BYTES: u64 = 32;
+const LOG_STRUCT_BYTES: u64 = 40;
+const MEMORY_CELL_BYTES: u64 = 32;
+const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
+
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
 /// `blowup_factor` is the LDE blowup from `ProofOptions::blowup_factor`.
 pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8) -> u64 {
-    // Per element: trace + LDE + Merkle node share.
-    let blowup = blowup_factor as u64;
-    let bytes_per_main = 8 + 8 * blowup + 2;
-    let bytes_per_aux = 24 + 24 * blowup + 3;
-    // Memory cells, log Vec, instruction map, and HashMap allocator slack.
-    const FIXED_OVERHEAD: u64 = 2_000_000_000;
+    let b = blowup_factor as u64;
 
-    lengths
-        .total_main_elements()
-        .saturating_mul(bytes_per_main)
-        .saturating_add(lengths.total_aux_elements().saturating_mul(bytes_per_aux))
-        .saturating_add(FIXED_OVERHEAD)
+    // Bytes a single table contributes given its padded-row count, its
+    // non-preprocessed main columns, and its aux columns. Sums every
+    // allocation listed in the module doc that scales with that table.
+    let table_bytes = |rows: u64, main_cols: u64, aux_cols: u64| -> u64 {
+        // Trace + LDE: full LDE includes the trace itself, so factor = (1 + B).
+        let main_lde = rows * main_cols * GOLDILOCKS_BYTES * (1 + b);
+        let aux_lde = rows * aux_cols * CUBIC_EXT_BYTES * (1 + b);
+        // Merkle: 2N nodes (binary tree over N = rows × blowup leaves) × 32 B.
+        let main_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
+        let aux_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
+        // Composition: one ext-field column on the LDE domain + its Merkle.
+        let composition_lde = rows * b * CUBIC_EXT_BYTES;
+        let composition_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
+        // FRI evals across all layers (in-place fold halves each layer, but
+        // each FriLayer struct keeps its own clone of pre-fold evals; geometric
+        // series 1 + 1/2 + 1/4 + … = 2).
+        let fri_evals = 2 * rows * b * CUBIC_EXT_BYTES;
+        // FRI Merkle uses PairKeccak256 (one leaf per pair of evals), so first
+        // layer has rows × blowup / 2 leaves → ~rows × blowup nodes × 32 B.
+        // Geometric sum × 2 across layers.
+        let fri_merkle = 2 * rows * b * KECCAK_NODE_BYTES;
+
+        main_lde
+            + aux_lde
+            + main_merkle
+            + aux_merkle
+            + composition_lde
+            + composition_merkle
+            + fri_evals
+            + fri_merkle
+    };
+
+    let aux = |bus_count: usize| -> u64 { bus_count.div_ceil(2) as u64 };
+
+    let bitwise_rows = BITWISE_ROWS as u64;
+    let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
+    let halt_rows = 1u64;
+    let page_rows = PAGE_SIZE as u64;
+
+    let mut total = 0u64;
+    total += table_bytes(
+        lengths.cpu_padded_rows,
+        CPU_COLS as u64,
+        aux(cpu_buses().len()),
+    );
+    total += table_bytes(
+        lengths.memw_padded_rows,
+        MEMW_COLS as u64,
+        aux(memw_buses().len()),
+    );
+    total += table_bytes(
+        lengths.memw_aligned_padded_rows,
+        MEMW_A_COLS as u64,
+        aux(memw_a_buses().len()),
+    );
+    total += table_bytes(
+        lengths.memw_register_padded_rows,
+        MEMW_R_COLS as u64,
+        aux(memw_r_buses().len()),
+    );
+    total += table_bytes(
+        lengths.load_padded_rows,
+        LOAD_COLS as u64,
+        aux(load_buses().len()),
+    );
+    total += table_bytes(
+        lengths.lt_padded_rows,
+        LT_COLS as u64,
+        aux(lt_buses().len()),
+    );
+    total += table_bytes(
+        lengths.shift_padded_rows,
+        SHIFT_COLS as u64,
+        aux(shift_buses().len()),
+    );
+    total += table_bytes(
+        lengths.mul_padded_rows,
+        MUL_COLS as u64,
+        aux(mul_buses().len()),
+    );
+    total += table_bytes(
+        lengths.dvrm_padded_rows,
+        DVRM_COLS as u64,
+        aux(dvrm_buses().len()),
+    );
+    total += table_bytes(
+        lengths.branch_padded_rows,
+        BRANCH_COLS as u64,
+        aux(branch_buses().len()),
+    );
+    total += table_bytes(
+        lengths.commit_padded_rows,
+        COMMIT_COLS as u64,
+        aux(commit_buses().len()),
+    );
+    total += table_bytes(
+        bitwise_rows,
+        (BITWISE_COLS - BITWISE_PRE) as u64,
+        aux(bitwise_buses().len()),
+    );
+    total += table_bytes(
+        lengths.decode_rows,
+        (DECODE_COLS - DECODE_PRE) as u64,
+        aux(decode_buses().len()),
+    );
+    total += table_bytes(halt_rows, HALT_COLS as u64, aux(halt_buses().len()));
+    total += table_bytes(
+        register_rows,
+        (REGISTER_COLS - REGISTER_PRE) as u64,
+        aux(register_buses().len()),
+    );
+    // Each unique 256 KB page gets its own PAGE table of `PAGE_SIZE` rows.
+    let page_main = (PAGE_COLS - PAGE_PRE) as u64;
+    let page_aux = aux(page_buses(0).len());
+    total += lengths.unique_page_count * table_bytes(page_rows, page_main, page_aux);
+
+    // State kept alive across the prove call.
+    total += lengths.unique_byte_count * MEMORY_CELL_BYTES;
+    total += lengths.cycle_count * LOG_STRUCT_BYTES;
+    total += lengths.decode_rows * INSTRUCTION_MAP_BYTES_PER_ROW;
+
+    total
 }
 
 /// Effective RAM budget against which the estimate is compared.
@@ -111,26 +274,30 @@ mod tests {
         TableLengths::default()
     }
 
-    /// Even an "empty" trace pays the BITWISE 2^20-row baseline plus HALT and
-    /// REGISTER constants. The formula is exact, so the test reproduces it
-    /// by calling `total_main_elements`/`total_aux_elements` directly.
+    /// Adding rows to a single chunked table must increase `peak_bytes` by
+    /// exactly `delta_rows × table_bytes(1, main_cols, aux_cols)` from the
+    /// formula in the module doc. Verifies the per-table breakdown is exact
+    /// rather than an averaged approximation.
     #[test]
-    fn peak_bytes_matches_per_element_formula() {
+    fn peak_bytes_per_table_increment_is_exact() {
         let blowup = 2u8;
-        let lengths = empty_lengths();
-        let main = lengths.total_main_elements();
-        let aux = lengths.total_aux_elements();
-        let expected =
-            main * (8 + 8 * blowup as u64 + 2) + aux * (24 + 24 * blowup as u64 + 3) + 2 * GB;
-        assert_eq!(peak_bytes(&lengths, blowup), expected);
+        let b = blowup as u64;
+
+        let baseline = peak_bytes(&empty_lengths(), blowup);
 
         let mut lengths = empty_lengths();
-        lengths.cpu_padded_rows = 4; // CPU has 76 main cols + aux cols.
-        let main = lengths.total_main_elements();
-        let aux = lengths.total_aux_elements();
-        let expected =
-            main * (8 + 8 * blowup as u64 + 2) + aux * (24 + 24 * blowup as u64 + 3) + 2 * GB;
-        assert_eq!(peak_bytes(&lengths, blowup), expected);
+        lengths.cpu_padded_rows = 4;
+        let bumped = peak_bytes(&lengths, blowup);
+        let cpu_main = CPU_COLS as u64;
+        let cpu_aux = cpu_buses().len().div_ceil(2) as u64;
+        let per_row = cpu_main * GOLDILOCKS_BYTES * (1 + b)
+            + cpu_aux * CUBIC_EXT_BYTES * (1 + b)
+            + 2 * 2 * b * KECCAK_NODE_BYTES // main + aux Merkle (Batched: 2N nodes per N leaves = N rows × B)
+            + b * CUBIC_EXT_BYTES            // composition LDE
+            + 2 * b * KECCAK_NODE_BYTES      // composition Merkle
+            + 2 * b * CUBIC_EXT_BYTES        // FRI evals (geometric × 2)
+            + 2 * b * KECCAK_NODE_BYTES; // FRI Merkle (Pair backend, geometric × 2)
+        assert_eq!(bumped - baseline, 4 * per_row);
     }
 
     /// Higher blowup_factor should produce a strictly larger estimate.

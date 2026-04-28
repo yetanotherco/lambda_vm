@@ -2146,9 +2146,11 @@ fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     total
 }
 
-/// Per-table row counts (post-chunking + post-padding) plus DECODE row count
-/// and unique-page count. Computed by [`count_table_lengths`] without allocating
-/// any operation vectors or trace tables.
+/// Per-table row counts (post-chunking + post-padding) plus the auxiliary
+/// quantities needed to compute peak heap usage analytically: DECODE row count,
+/// unique-page count, executor cycle count, and unique-byte-address count.
+/// Computed by [`count_table_lengths`] without allocating any operation
+/// vectors or trace tables.
 #[derive(Debug, Default, Clone)]
 pub struct TableLengths {
     pub cpu_padded_rows: u64,
@@ -2164,6 +2166,12 @@ pub struct TableLengths {
     pub commit_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
+    /// Executor cycle count. Equals `logs.len()` and bounds `Vec<Log>` size.
+    pub cycle_count: u64,
+    /// Unique byte addresses touched (ELF + private input + runtime). Sized
+    /// by `MemoryState.cells.len()` and is the dominant non-trace heap term
+    /// for memory-heavy programs.
+    pub unique_byte_count: u64,
 }
 
 impl TableLengths {
@@ -2448,6 +2456,8 @@ pub fn count_table_lengths(
     lt_count += dvrm_count;
 
     let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
+    let unique_byte_count = memory_state.cells.len() as u64;
+    let cycle_count = logs.len() as u64;
 
     Ok(TableLengths {
         cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
@@ -2463,6 +2473,8 @@ pub fn count_table_lengths(
         commit_padded_rows: commit_count.next_power_of_two().max(4) as u64,
         decode_rows,
         unique_page_count,
+        cycle_count,
+        unique_byte_count,
     })
 }
 
