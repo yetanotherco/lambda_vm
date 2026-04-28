@@ -269,10 +269,12 @@
 
 #let render_chip_assumptions(chip, config) = {
   let tag(assumption) = {
-    let with_index(x) = ((x,) + iters_of(assumption).map(it => it.at(0))).join(".")
-    let lbl = [#chip.name\-A]
-    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
-    cref(assumption)[#figure(kind: chip.name + "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
+    let code = if "code" in chip {chip.code} else {chip.name}
+    let index = (("",) + iters_of(assumption).map(it => it.at(0))).join(`.`)
+    let lbl(idx) = raw(code + "-A" + str(idx))
+
+    show figure: (it) => align(left, block[#context lbl(it.counter.get().at(0))#index])
+    cref(assumption)[#figure(kind: code + "assumption", numbering: (i) => lbl(i), supplement: [], [])]
   }
 
   show figure: set block(breakable: true)
