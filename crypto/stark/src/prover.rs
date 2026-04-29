@@ -541,12 +541,11 @@ pub trait IsStarkProver<
     /// Compute main LDE, commit, and return the Merkle tree/root along with the
     /// owned LDE columns (consumed later in Phase D).
     #[allow(clippy::type_complexity)]
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut, unused_variables))]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        storage_mode: StorageMode,
+        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -578,6 +577,7 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[allow(unused_mut)]
         let (mut tree, root) =
             Self::commit_columns_bit_reversed(&columns).ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
@@ -594,14 +594,13 @@ pub trait IsStarkProver<
 
     /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
     #[allow(clippy::type_complexity)]
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut, unused_variables))]
     fn commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
-        storage_mode: StorageMode,
+        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -631,10 +630,12 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[allow(unused_mut)]
         let (mut precomputed_tree, precomputed_root) =
             Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
+        #[allow(unused_mut)]
         let (mut mult_tree, mult_root) =
             Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
                 .ok_or(ProvingError::EmptyCommitment)?;
@@ -1571,7 +1572,6 @@ pub trait IsStarkProver<
 
     /// Same as `multi_prove` but lets callers back intermediate state with mmap
     /// files to cap peak RAM usage.
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
     fn multi_prove_with_mode(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
@@ -1858,6 +1858,7 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
+                        #[allow(unused_mut)]
                         let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
