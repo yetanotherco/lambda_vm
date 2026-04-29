@@ -318,6 +318,11 @@ pub fn select_storage_mode(
     cap: Option<u64>,
 ) -> StorageMode {
     let Some(budget) = effective_budget(available, cap) else {
+        log::warn!(
+            "Auto disk-spill: no RAM budget available (OS did not report available memory \
+             and no cap set) — staying in Ram. Pass an explicit cap to force Disk in \
+             memory-constrained environments."
+        );
         return StorageMode::Ram;
     };
     let threshold = budget.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;

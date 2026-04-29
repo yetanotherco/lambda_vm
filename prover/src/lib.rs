@@ -602,12 +602,6 @@ pub fn prove_with_options_and_inputs(
 
         log::info!("predicted_peak_bytes: {estimated_peak}");
 
-        if available.is_none() && proof_options.max_ram_bytes.is_none() {
-            log::warn!(
-                "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
-                 Set ProofOptions::max_ram_bytes to force Disk in memory-constrained environments."
-            );
-        }
         if mode == StorageMode::Disk {
             let budget =
                 auto_storage::effective_budget(available, proof_options.max_ram_bytes).unwrap_or(0);
