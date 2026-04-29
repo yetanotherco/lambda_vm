@@ -297,22 +297,22 @@ pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64>
 
 /// Pick a storage mode given the estimate and the machine's available RAM.
 ///
-/// Uses 80% of the effective budget as the cutoff so there's headroom for the
+/// Uses 90% of the effective budget as the cutoff so there's headroom for the
 /// OS, other processes, and allocator fragmentation. `cap` is an optional
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
 ///
 /// `available` is a one-shot sample. If a concurrent process allocates between
 /// this call and phase 5, this function may pick `Ram` and the prover OOMs.
-/// The 80% headroom covers background jitter; under contention, pass
+/// The 90% headroom covers background jitter; under contention, pass
 /// `ProofOptions::max_ram_bytes` for a hard cap.
 pub fn select_storage_mode(
     estimated: u64,
     available: Option<u64>,
     cap: Option<u64>,
 ) -> StorageMode {
-    const SAFETY_FRACTION_NUM: u64 = 4;
-    const SAFETY_FRACTION_DEN: u64 = 5;
+    const SAFETY_FRACTION_NUM: u64 = 9;
+    const SAFETY_FRACTION_DEN: u64 = 10;
 
     let Some(budget) = effective_budget(available, cap) else {
         return StorageMode::Ram;
@@ -412,14 +412,14 @@ mod tests {
 
     #[test]
     fn select_ram_when_estimate_below_threshold() {
-        // 10 GB estimated, 32 GB available → threshold 25.6 GB → Ram.
+        // 10 GB estimated, 32 GB available → threshold 28.8 GB → Ram.
         let mode = select_storage_mode(10 * GB, Some(32 * GB), None);
         assert_eq!(mode, StorageMode::Ram);
     }
 
     #[test]
     fn select_disk_when_estimate_exceeds_threshold() {
-        // 30 GB estimated, 32 GB available → threshold 25.6 GB → Disk.
+        // 30 GB estimated, 32 GB available → threshold 28.8 GB → Disk.
         let mode = select_storage_mode(30 * GB, Some(32 * GB), None);
         assert_eq!(mode, StorageMode::Disk);
     }
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn cap_forces_disk_when_smaller_than_available() {
         // 10 GB estimated, 64 GB available (would be Ram), but cap=4 GB
-        // → threshold = 4 × 0.8 = 3.2 GB → Disk.
+        // → threshold = 4 × 0.9 = 3.6 GB → Disk.
         let mode = select_storage_mode(10 * GB, Some(64 * GB), Some(4 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn cap_ignored_when_larger_than_available() {
         // available=8 GB dominates a cap of 64 GB.
-        // threshold = 8 × 0.8 = 6.4 GB, estimate 10 GB → Disk.
+        // threshold = 8 × 0.9 = 7.2 GB, estimate 10 GB → Disk.
         let mode = select_storage_mode(10 * GB, Some(8 * GB), Some(64 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
