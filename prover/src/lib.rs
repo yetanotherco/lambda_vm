@@ -600,7 +600,7 @@ pub fn prove_with_options_and_inputs(
             proof_options.max_ram_bytes,
         );
 
-        eprintln!("predicted_peak_bytes: {estimated_peak}");
+        log::info!("predicted_peak_bytes: {estimated_peak}");
 
         if available.is_none() && proof_options.max_ram_bytes.is_none() {
             log::warn!(

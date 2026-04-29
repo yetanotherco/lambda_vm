@@ -28,7 +28,7 @@ printf '\n'
 
 for elf in "$@"; do
     name=$(basename "$elf")
-    /usr/bin/time -v "$CLI" prove "$elf" -o "$OUT/proof.bin" \
+    RUST_LOG=info /usr/bin/time -v "$CLI" prove "$elf" -o "$OUT/proof.bin" \
         > "$OUT/out.txt" 2> "$OUT/err.txt" || {
             echo "FAIL: $name"
             tail -5 "$OUT/err.txt"
