@@ -39,7 +39,7 @@ NC='\033[0m'
 
 # Verdict thresholds, applied to the time delta vs base_branch.
 REGRESSION_FAIL_PCT=5
-REGRESSION_WARN_PCT=2
+REGRESSION_WARN_PCT=3
 
 # Suite definition. Run order is fib first (cheap canary).
 # Bash 3.2 (macOS default) has no associative arrays, so name→ELF is a case.

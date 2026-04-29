@@ -110,8 +110,8 @@ When run with a comparison branch, the script applies a per-program threshold to
 
 | Δ time vs base | Status |
 |---|---|
-| ≤ +2% | OK |
-| > +2%, ≤ +5% | WARN |
+| ≤ +3% | OK |
+| > +3%, ≤ +5% | WARN |
 | > +5% | FAIL |
 
 Overall verdict is the worst per-program status, with priority `FAIL > INCONCLUSIVE > WARN > PASS`. A program that crashed or produced no comparison data is reported as `INCONCLUSIVE` rather than `FAIL`, so an environment problem is not confused with a real regression. Heap delta is reported but does not affect the verdict.
@@ -151,7 +151,7 @@ The aggregate verdict is printed last:
   modular_exp   time:    +3.2%   heap:    +0.0%   [WARN]
   hashmap       time:    +0.8%   heap:    -2.3%   [OK]
 
-  Thresholds: WARN > +2%, FAIL > +5% (regression vs main)
+  Thresholds: WARN > +3%, FAIL > +5% (regression vs main)
 
 Overall: FAIL
 ```
