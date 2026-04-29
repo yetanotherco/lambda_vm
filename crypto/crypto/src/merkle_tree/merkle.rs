@@ -26,7 +26,7 @@ impl std::error::Error for Error {}
 ///
 /// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
 /// node access goes through this mmap instead.
-#[cfg(feature = "std")]
+#[cfg(feature = "disk-spill")]
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
     node_count: usize,
@@ -42,12 +42,12 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
-#[cfg_attr(not(feature = "std"), derive(Clone))]
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
 }
@@ -92,7 +92,7 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         })
     }
@@ -100,7 +100,7 @@ where
     /// Total number of nodes in the tree (inner + leaves).
     #[inline]
     fn node_count(&self) -> usize {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             return backing.node_count;
         }
@@ -112,7 +112,7 @@ where
     /// Returns `None` if `idx` is out of bounds.
     #[inline]
     fn node_get(&self, idx: usize) -> Option<&B::Node> {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
                 // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
@@ -268,54 +268,63 @@ where
 
     /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
     /// Node access methods read from the mmap after this call.
+    ///
+    /// No-op when the `disk-spill` feature is off.
     #[cfg(feature = "std")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
         B::Node: Copy,
     {
-        const {
-            assert!(
-                align_of::<B::Node>() == 1,
-                "B::Node must have alignment 1 for mmap safety"
-            )
+        #[cfg(not(feature = "disk-spill"))]
+        return Ok(());
+
+        #[cfg(feature = "disk-spill")]
+        {
+            const {
+                assert!(
+                    align_of::<B::Node>() == 1,
+                    "B::Node must have alignment 1 for mmap safety"
+                )
+            }
+
+            if self.nodes.is_empty() {
+                return Ok(());
+            }
+
+            let node_size = core::mem::size_of::<B::Node>();
+            let node_count = self.nodes.len();
+            let total_bytes = node_count * node_size;
+
+            let file = tempfile::tempfile()?;
+            file.set_len(total_bytes as u64)?;
+
+            // Write directly through a writable mmap, then downgrade to read-only.
+            // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
+            // under memory pressure could produce partially-zeroed reads from the
+            // read-only mmap.
+            //
+            // SAFETY: tempfile() creates an anonymous file with no filesystem
+            // path, so no other process can open or modify it.
+            let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+            // the contiguous Vec to a byte slice is valid.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
+            };
+            mmap_mut.copy_from_slice(bytes);
+            mmap_mut.flush()?;
+            let mmap = mmap_mut.make_read_only()?;
+
+            // Free the heap allocation
+            self.nodes = Vec::new();
+
+            self.mmap_backing = Some(MmapNodeBacking {
+                mmap,
+                node_count,
+                node_size,
+            });
+
+            Ok(())
         }
-
-        if self.nodes.is_empty() {
-            return Ok(());
-        }
-
-        let node_size = core::mem::size_of::<B::Node>();
-        let node_count = self.nodes.len();
-        let total_bytes = node_count * node_size;
-
-        let file = tempfile::tempfile()?;
-        file.set_len(total_bytes as u64)?;
-
-        // Write directly through a writable mmap, then downgrade to read-only.
-        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
-        // under memory pressure could produce partially-zeroed reads from the
-        // read-only mmap.
-        //
-        // SAFETY: tempfile() creates an anonymous file with no filesystem
-        // path, so no other process can open or modify it.
-        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
-        // the contiguous Vec to a byte slice is valid.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes) };
-        mmap_mut.copy_from_slice(bytes);
-        mmap_mut.flush()?;
-        let mmap = mmap_mut.make_read_only()?;
-
-        // Free the heap allocation
-        self.nodes = Vec::new();
-
-        self.mmap_backing = Some(MmapNodeBacking {
-            mmap,
-            node_count,
-            node_size,
-        });
-
-        Ok(())
     }
 }

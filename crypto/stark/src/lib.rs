@@ -1,11 +1,8 @@
 // `StorageMode::Disk` is implemented via `memmap2`, which doesn't compile on
 // wasm32. Fail loudly at the top of the crate rather than via a confusing
 // transitive memmap2 error deeper in the dep graph.
-#[cfg(target_arch = "wasm32")]
-compile_error!(
-    "wasm32 targets are not supported: StorageMode::Disk requires memmap2, \
-     which does not compile on wasm32"
-);
+#[cfg(all(target_arch = "wasm32", feature = "disk-spill"))]
+compile_error!("the `disk-spill` feature requires memmap2, which does not compile on wasm32");
 
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;

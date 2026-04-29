@@ -4,6 +4,7 @@ use math::{
     traits::AsBytes,
 };
 
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 pub struct FriLayer<F, B>
 where
     F: IsField,
