@@ -103,6 +103,7 @@ pub enum ProvingError {
     EmptyCommitment,
     /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
     /// typically out of disk space, fd exhaustion, or mmap failure.
+    #[cfg(feature = "disk-spill")]
     DiskSpill(String),
 }
 
