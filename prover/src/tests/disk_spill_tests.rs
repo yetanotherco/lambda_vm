@@ -110,6 +110,13 @@ fn assert_count_is_upper_bound_on_built_trace(program_name: &str) {
         main_via_count >= main_via_traces,
         "count ({main_via_count}) underestimated built trace ({main_via_traces}) on {program_name}"
     );
+
+    let aux_via_count = lengths.total_aux_elements();
+    let aux_via_traces = traces.total_auxiliary_field_elements();
+    assert!(
+        aux_via_count >= aux_via_traces,
+        "count ({aux_via_count}) underestimated built aux trace ({aux_via_traces}) on {program_name}"
+    );
 }
 
 #[test]
