@@ -1557,7 +1557,6 @@ pub trait IsStarkProver<
     /// # Warning
     ///
     /// The transcript must be safely initialized before passing it to this method.
-    /// Default entry point. Proves with all intermediate state in RAM.
     fn multi_prove(
         air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
