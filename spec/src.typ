@@ -167,6 +167,26 @@
   // number of characters in constraint ID
   let CONSTRAINT_ID_CHAR_COUNT = 4;
 
+  // Map hash digest to ID
+  let digest_to_id(hash_bytes) = {
+    // Character set used to represent ID
+    let CHARS = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
+    assert(CHARS.len() == 32, message: "invalid CHARS length")
+
+    let min_bytes_len = 2 * CONSTRAINT_ID_CHAR_COUNT
+    assert(
+      hash_bytes.len() >= min_bytes_len, 
+      message: "too few bytes to digest: " + repr(hash_bytes) + " has " + str(hash_bytes.len()) + " where " + str(min_bytes_len) + " is required."
+    )
+
+    let int = int.from-bytes(hash_bytes.slice(0, count: min_bytes_len))
+    for _ in range(CONSTRAINT_ID_CHAR_COUNT) {
+      let idx = int.bit-and(31)
+      int = int.bit-rshift(5)
+      (CHARS.at(idx), )
+    }.sum()
+  }
+
   /// Digests a variable based on its location and type.
   let digest_variable(chip, group, idx, var) = {
     /// Flatten the type of a variable into a string
@@ -180,8 +200,7 @@
     
     let flattened_type = lower(flatten_vartype(var.type))    
     let input = (chip, group, str(idx), flattened_type).join("\x00")
-    let digest = bytes-to-hex(nchf(input))
-    digest.slice(0, count: 8)
+    digest_to_id(nchf(input))
   }
 
   // Map variables to their ID
@@ -223,20 +242,6 @@
     repr(id_tagged)
       .replace("\n", "")
       .replace(" ", "")
-  }
-
-  // Map hash digest to ID
-  let digest_to_id(hash_bytes) = {
-    let CHARS = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
-    assert(CHARS.len() == 32, message: "invalid CHARS length")
-
-    assert(hash_bytes.len() >= 8, message: "too few bytes to digest: " + repr(hash_bytes))
-    let int = int.from-bytes(hash_bytes.slice(0, count: 8))
-    for i in range(CONSTRAINT_ID_CHAR_COUNT) {
-      let idx = int.bit-and(31)
-      int = int.bit-rshift(5)
-      (CHARS.at(idx), )
-    }.sum()
   }
 
   // Add an ID to each constraint
