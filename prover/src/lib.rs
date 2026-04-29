@@ -573,44 +573,59 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Stream over logs once to compute exact per-table row counts without
-    // allocating any op vectors. Use the resulting `TableLengths` to estimate
-    // peak heap analytically and pick a storage mode.
-    let lengths = crate::tables::trace_builder::count_table_lengths(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-    )?;
+    // Pick where trace buffers and Merkle tree nodes live for this proof.
+    // With the `disk-spill` feature enabled, the analytical estimate decides
+    // between Ram and Disk; without it, we never spill.
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        // Stream over logs once to compute exact per-table row counts without
+        // allocating any op vectors. Use the resulting `TableLengths` to
+        // estimate peak heap analytically and pick a storage mode.
+        let lengths = crate::tables::trace_builder::count_table_lengths(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+        )?;
 
-    let available = auto_storage::available_ram_bytes();
-    let estimated_peak = auto_storage::peak_bytes(
-        &lengths,
-        proof_options.blowup_factor,
-        stark::prover::table_parallelism(),
-    );
-    let storage_mode =
-        auto_storage::select_storage_mode(estimated_peak, available, proof_options.max_ram_bytes);
-
-    eprintln!("predicted_peak_bytes: {estimated_peak}");
-
-    if available.is_none() && proof_options.max_ram_bytes.is_none() {
-        log::warn!(
-            "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
-             Set ProofOptions::max_ram_bytes to force Disk in memory-constrained environments."
+        let available = auto_storage::available_ram_bytes();
+        let estimated_peak = auto_storage::peak_bytes(
+            &lengths,
+            proof_options.blowup_factor,
+            stark::prover::table_parallelism(),
         );
-    }
-    if storage_mode == StorageMode::Disk {
-        let budget =
-            auto_storage::effective_budget(available, proof_options.max_ram_bytes).unwrap_or(0);
-        let percent = auto_storage::SAFETY_FRACTION_NUM * 100 / auto_storage::SAFETY_FRACTION_DEN;
-        log::info!(
-            "Auto disk-spill: estimated peak {} MB exceeds {}% of {} MB budget",
-            estimated_peak / 1_000_000,
-            percent,
-            budget / 1_000_000,
+        let mode = auto_storage::select_storage_mode(
+            estimated_peak,
+            available,
+            proof_options.max_ram_bytes,
         );
-    }
+
+        eprintln!("predicted_peak_bytes: {estimated_peak}");
+
+        if available.is_none() && proof_options.max_ram_bytes.is_none() {
+            log::warn!(
+                "Auto disk-spill: OS did not report available memory — staying in Ram mode. \
+                 Set ProofOptions::max_ram_bytes to force Disk in memory-constrained environments."
+            );
+        }
+        if mode == StorageMode::Disk {
+            let budget =
+                auto_storage::effective_budget(available, proof_options.max_ram_bytes).unwrap_or(0);
+            let percent =
+                auto_storage::SAFETY_FRACTION_NUM * 100 / auto_storage::SAFETY_FRACTION_DEN;
+            log::info!(
+                "Auto disk-spill: estimated peak {} MB exceeds {}% of {} MB budget",
+                estimated_peak / 1_000_000,
+                percent,
+                budget / 1_000_000,
+            );
+        }
+
+        mode
+    };
+
+    #[cfg(not(feature = "disk-spill"))]
+    let storage_mode = StorageMode::Ram;
 
     // Phase 5: build the full traces with the chosen mode. `Disk` spills each
     // chunk as it's built, so the trace never fully materializes in RAM.
