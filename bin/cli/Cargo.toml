@@ -15,5 +15,5 @@ env_logger = "0.11"
 
 [features]
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
-instruments = ["prover/instruments", "stark/instruments"]
 disk-spill = ["prover/disk-spill"]
+instruments = ["prover/instruments", "stark/instruments"]
