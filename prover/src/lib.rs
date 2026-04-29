@@ -603,9 +603,11 @@ pub fn prove_with_options_and_inputs(
     if storage_mode == StorageMode::Disk {
         let budget =
             auto_storage::effective_budget(available, proof_options.max_ram_bytes).unwrap_or(0);
+        let percent = auto_storage::SAFETY_FRACTION_NUM * 100 / auto_storage::SAFETY_FRACTION_DEN;
         log::info!(
-            "Auto disk-spill: estimated peak {} MB exceeds 80% of {} MB budget",
+            "Auto disk-spill: estimated peak {} MB exceeds {}% of {} MB budget",
             estimated_peak / 1_000_000,
+            percent,
             budget / 1_000_000,
         );
     }

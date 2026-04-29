@@ -87,6 +87,12 @@ const LOG_STRUCT_BYTES: u64 = 40;
 const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
+/// Fraction of the effective RAM budget below which `Ram` is kept. The
+/// remainder is headroom for the OS, other processes, and allocator
+/// fragmentation.
+pub const SAFETY_FRACTION_NUM: u64 = 9;
+pub const SAFETY_FRACTION_DEN: u64 = 10;
+
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
 
@@ -311,9 +317,6 @@ pub fn select_storage_mode(
     available: Option<u64>,
     cap: Option<u64>,
 ) -> StorageMode {
-    const SAFETY_FRACTION_NUM: u64 = 9;
-    const SAFETY_FRACTION_DEN: u64 = 10;
-
     let Some(budget) = effective_budget(available, cap) else {
         return StorageMode::Ram;
     };
