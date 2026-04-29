@@ -1,0 +1,31 @@
+[package]
+name = "ethrex-crypto"
+version = "9.0.0"
+edition = "2024"
+authors = ["LambdaClass"]
+documentation = "https://docs.ethrex.xyz"
+
+[lib]
+path = "./lib.rs"
+
+[dependencies]
+# TODO(#1102): Move to Lambdaworks in the future
+c-kzg = { version = "2.1.1", default-features = false, optional = true }
+kzg-rs = { version = "0.2.7", optional = true }
+openvm-kzg = { git = "https://github.com/axiom-crypto/openvm-kzg.git", rev = "530a6ed413def5296b7e4967650ba4fc8fd92ea1", optional = true } # v1.4.1
+thiserror = "2.0.9"
+
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../../../../../syscalls" }
+
+[features]
+default = ["kzg-rs"]
+c-kzg = ["c-kzg/std", "c-kzg/ethereum_kzg_settings"]
+openvm-kzg = ["dep:openvm-kzg"]
+kzg-rs = ["dep:kzg-rs"]
+
+risc0 = ["c-kzg/std", "c-kzg/ethereum_kzg_settings", "c-kzg/portable"]
+openvm = ["openvm-kzg"]
+

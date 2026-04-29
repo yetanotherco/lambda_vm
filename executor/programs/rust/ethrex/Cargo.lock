@@ -991,10 +991,10 @@ dependencies = [
 [[package]]
 name = "ethrex-crypto"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git#a9de3e8b405dbf406cac31b930fd1ffdc216a429"
 dependencies = [
  "c-kzg",
  "kzg-rs",
+ "lambda-vm-syscalls",
  "thiserror 2.0.18",
  "tiny-keccak",
 ]

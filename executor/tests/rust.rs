@@ -227,6 +227,23 @@ fn test_keccak() {
 }
 
 #[test]
+fn test_keccak_precompile() {
+    use tiny_keccak::Hasher;
+    let input_a = b"hello world";
+    let input_b = b"!";
+    let mut output = [0u8; 32];
+    let mut hasher = tiny_keccak::Keccak::v256();
+    hasher.update(input_a);
+    hasher.update(input_b);
+    hasher.finalize(&mut output);
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak_precompile.elf",
+        output.to_vec(),
+        vec![],
+    );
+}
+
+#[test]
 fn test_stdin_read_panics() {
     let result = run_program_without_expect("./program_artifacts/rust/stdin_read.elf", vec![]);
     assert!(result.is_err());

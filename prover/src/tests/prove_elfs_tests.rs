@@ -2311,3 +2311,18 @@ fn test_count_elements_nonzero() {
         "total_auxiliary_field_elements should be nonzero (got {aux})"
     );
 }
+
+#[test]
+fn test_prove_elfs_keccak() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
+    // RAM (stack memory), which requires PAGE tables for Memory bus balance.
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak prove/verify failed"
+    );
+}

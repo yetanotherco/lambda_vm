@@ -14,3 +14,6 @@ c-kzg = { version = "2.1.1", features = ["eip-7594"] }
 [patch.crates-io]
 c-kzg = { git = "https://github.com/risc0/c-kzg-4844", tag = "c-kzg/v2.1.1-risczero.0" }
 
+[patch."https://github.com/lambdaclass/ethrex.git"]
+ethrex-crypto = { path = "patches/ethrex-crypto" }
+
