@@ -164,7 +164,7 @@ jobs:
 
       - name: Run stark disk-spill tests
         run: |
-          cargo test --release -p stark disk_spill
+          cargo test --release -p stark --features disk-spill disk_spill
 
       - name: Run prover disk-spill tests
         run: |
