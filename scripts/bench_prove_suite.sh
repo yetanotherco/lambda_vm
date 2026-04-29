@@ -185,8 +185,8 @@ if ! $COMPARE; then
     printf "  %-12s  %12s  %12s\n" "program" "time(median)" "heap(median)"
     for n in "${SELECTED[@]}"; do
         LOG="$TMP_DIR/${n}.log"
-        TIME_MED=$(grep -E "current[[:space:]]+time\(mean\)" "$LOG" | sed -E 's/.*time\(median\):[[:space:]]+([0-9.]+s).*/\1/' | tail -1)
-        HEAP_MED=$(grep -E "current[[:space:]]+time\(mean\)" "$LOG" | sed -E 's/.*heap\(median\):[[:space:]]+([0-9]+ MB).*/\1/' | tail -1)
+        TIME_MED=$(grep -E "current[[:space:]]+time\(mean\)" "$LOG" 2>/dev/null | sed -E 's/.*time\(median\):[[:space:]]+([0-9.]+s).*/\1/' | tail -1 || true)
+        HEAP_MED=$(grep -E "current[[:space:]]+time\(mean\)" "$LOG" 2>/dev/null | sed -E 's/.*heap\(median\):[[:space:]]+([0-9]+ MB).*/\1/' | tail -1 || true)
         printf "  %-12s  %12s  %12s\n" "$n" "${TIME_MED:-N/A}" "${HEAP_MED:-N/A}"
     done
     echo ""
@@ -199,8 +199,9 @@ PROGRAM_LINES=()
 
 for n in "${SELECTED[@]}"; do
     LOG="$TMP_DIR/${n}.log"
-    TIME_DELTA=$(grep -E "^[[:space:]]+Time:[[:space:]]+[+-]" "$LOG" | tail -1 | sed -E 's/.*Time:[[:space:]]+([+-][0-9.]+)%.*/\1/')
-    HEAP_DELTA=$(grep -E "^[[:space:]]+Heap:" "$LOG" | tail -1 | sed -E 's/.*\(([+-][0-9.]+)%\).*/\1/')
+    # || true: a missing pattern (e.g. crashed run, partial log) must not abort the script.
+    TIME_DELTA=$(grep -E "^[[:space:]]+Time:[[:space:]]+[+-]" "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*Time:[[:space:]]+([+-][0-9.]+)%.*/\1/' || true)
+    HEAP_DELTA=$(grep -E "^[[:space:]]+Heap:" "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*\(([+-][0-9.]+)%\).*/\1/' || true)
 
     if [ -z "$TIME_DELTA" ]; then
         PROGRAM_LINES+=("$(printf "  %-12s  %s" "$n" "(no comparison data — see log)")")
