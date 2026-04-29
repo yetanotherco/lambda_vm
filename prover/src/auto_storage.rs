@@ -290,10 +290,9 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
 /// Effective RAM budget against which the estimate is compared.
 ///
 /// Returns `None` when sysinfo can't read system memory and the user hasn't
-/// set a cap. The caller should default to `Disk` in that case — sysinfo
-/// failure correlates with stripped-down containers where Ram would OOM.
-/// Otherwise the budget is the user's cap (if set), clamped down by what the
-/// OS reports available.
+/// set a cap. The caller should default to `Disk`: sysinfo fails in
+/// stripped-down containers where Ram would OOM. Otherwise the budget is
+/// the user's cap (if set), clamped down by what the OS reports available.
 pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     match (cap, available) {
         (Some(c), Some(a)) => Some(c.min(a)),
@@ -309,9 +308,9 @@ pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64>
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
 ///
-/// When neither `available` nor `cap` is known, defaults to `Disk` — sysinfo
-/// failure typically means a minimal container where Ram would OOM. Pass a
-/// large `max_ram_bytes` to opt out if you know the machine has enough RAM.
+/// When neither `available` nor `cap` is known, defaults to `Disk`: sysinfo
+/// fails in stripped-down containers where Ram would OOM. Pass a large
+/// `max_ram_bytes` to opt out if you know the machine has enough RAM.
 ///
 /// `available` is a one-shot sample. If a concurrent process allocates between
 /// this call and phase 5, this function may pick `Ram` and the prover OOMs.
@@ -324,8 +323,8 @@ pub fn select_storage_mode(
 ) -> StorageMode {
     let Some(budget) = effective_budget(available, cap) else {
         log::warn!(
-            "Auto disk-spill: sysinfo could not read system memory and no cap set — \
-             defaulting to Disk for safety. Pass max_ram_bytes if the machine has enough RAM."
+            "Auto disk-spill: sysinfo could not read system memory and no cap set, \
+             defaulting to Disk. Pass max_ram_bytes if the machine has enough RAM."
         );
         return StorageMode::Disk;
     };
@@ -338,17 +337,16 @@ pub fn select_storage_mode(
     }
 }
 
-/// Query the OS for currently available RAM (not total) in bytes. Returns
-/// `None` only when sysinfo can't read system memory at all (e.g. inside
-/// containers without `/proc/meminfo`); a genuine zero free reading on a
-/// near-OOM system returns `Some(0)` so the caller forces Disk instead of
-/// silently falling back to Ram and OOMing.
+/// Query the OS for available (not total) RAM in bytes. Returns `None` when
+/// sysinfo can't read system memory (e.g. inside containers without
+/// `/proc/meminfo`); a zero free reading on a near-OOM system returns
+/// `Some(0)` so the caller forces Disk instead of falling back to Ram and
+/// OOMing.
 pub fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    // total_memory disambiguates: it's a hardware constant sysinfo can always
-    // read when it has any data. If total is 0, sysinfo failed entirely; if
-    // total is non-zero, available's value (including 0) is real.
+    // total_memory disambiguates: 0 means sysinfo can't read system memory;
+    // non-zero means available's value (including 0) is real.
     if sys.total_memory() == 0 {
         None
     } else {
@@ -470,9 +468,9 @@ mod tests {
 
     #[test]
     fn unknown_available_with_no_cap_defaults_to_disk() {
-        // sysinfo failed and no cap was set. Default to Disk for safety:
-        // sysinfo typically fails in stripped-down containers, where Ram would
-        // OOM. Users with a known-sized machine can pass max_ram_bytes.
+        // sysinfo failed and no cap was set. Default to Disk: sysinfo fails
+        // in stripped-down containers where Ram would OOM. Pass max_ram_bytes
+        // to opt out on a known-sized machine.
         let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None, None);
         assert_eq!(mode, StorageMode::Disk);
     }
