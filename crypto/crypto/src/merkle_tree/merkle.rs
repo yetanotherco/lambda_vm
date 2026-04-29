@@ -268,63 +268,54 @@ where
 
     /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
     /// Node access methods read from the mmap after this call.
-    ///
-    /// No-op when the `disk-spill` feature is off.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
         B::Node: Copy,
     {
-        #[cfg(not(feature = "disk-spill"))]
-        return Ok(());
-
-        #[cfg(feature = "disk-spill")]
-        {
-            const {
-                assert!(
-                    align_of::<B::Node>() == 1,
-                    "B::Node must have alignment 1 for mmap safety"
-                )
-            }
-
-            if self.nodes.is_empty() {
-                return Ok(());
-            }
-
-            let node_size = core::mem::size_of::<B::Node>();
-            let node_count = self.nodes.len();
-            let total_bytes = node_count * node_size;
-
-            let file = tempfile::tempfile()?;
-            file.set_len(total_bytes as u64)?;
-
-            // Write directly through a writable mmap, then downgrade to read-only.
-            // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
-            // under memory pressure could produce partially-zeroed reads from the
-            // read-only mmap.
-            //
-            // SAFETY: tempfile() creates an anonymous file with no filesystem
-            // path, so no other process can open or modify it.
-            let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-            // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
-            // the contiguous Vec to a byte slice is valid.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes)
-            };
-            mmap_mut.copy_from_slice(bytes);
-            mmap_mut.flush()?;
-            let mmap = mmap_mut.make_read_only()?;
-
-            // Free the heap allocation
-            self.nodes = Vec::new();
-
-            self.mmap_backing = Some(MmapNodeBacking {
-                mmap,
-                node_count,
-                node_size,
-            });
-
-            Ok(())
+        const {
+            assert!(
+                align_of::<B::Node>() == 1,
+                "B::Node must have alignment 1 for mmap safety"
+            )
         }
+
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+
+        let node_size = core::mem::size_of::<B::Node>();
+        let node_count = self.nodes.len();
+        let total_bytes = node_count * node_size;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes as u64)?;
+
+        // Write directly through a writable mmap, then downgrade to read-only.
+        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
+        // under memory pressure could produce partially-zeroed reads from the
+        // read-only mmap.
+        //
+        // SAFETY: tempfile() creates an anonymous file with no filesystem
+        // path, so no other process can open or modify it.
+        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+        // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
+        // the contiguous Vec to a byte slice is valid.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes) };
+        mmap_mut.copy_from_slice(bytes);
+        mmap_mut.flush()?;
+        let mmap = mmap_mut.make_read_only()?;
+
+        // Free the heap allocation
+        self.nodes = Vec::new();
+
+        self.mmap_backing = Some(MmapNodeBacking {
+            mmap,
+            node_count,
+            node_size,
+        });
+
+        Ok(())
     }
 }

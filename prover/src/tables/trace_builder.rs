@@ -1698,6 +1698,7 @@ struct CollectedOps {
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
+#[cfg_attr(not(feature = "disk-spill"), allow(unused_mut, unused_variables))]
 fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
@@ -1712,6 +1713,7 @@ fn chunk_and_generate<T>(
     let mut tables = Vec::with_capacity(op_chunks.len());
     for chunk in op_chunks {
         let mut t = generate(chunk);
+        #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             t.main_table
                 .spill_to_disk()
@@ -2684,6 +2686,7 @@ impl Traces {
     ///
     /// Frees RAM by memory-mapping the main trace data for every table.
     /// This is a no-op for tables that are already spilled or empty.
+    #[cfg(feature = "disk-spill")]
     pub fn spill_all_main_to_disk(&mut self) -> Result<(), Error> {
         let spill = |t: &mut TraceTable<GoldilocksField, GoldilocksExtension>| {
             t.main_table

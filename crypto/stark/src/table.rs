@@ -263,92 +263,80 @@ impl<F: IsField> Table<F> {
     }
 
     /// Returns true if this table's data has been spilled to disk via mmap.
-    /// Always `false` when the `disk-spill` feature is disabled.
+    #[cfg(feature = "disk-spill")]
     pub fn is_spilled(&self) -> bool {
-        #[cfg(feature = "disk-spill")]
-        return self.mmap_backing.is_some();
-        #[cfg(not(feature = "disk-spill"))]
-        false
+        self.mmap_backing.is_some()
     }
 
     /// Spill the table's row-major data to a temp file and mmap it back.
     /// Frees the heap `data` Vec while preserving access through `get()`,
     /// `get_row()`, `columns()`, and `extract_columns_into()`.
     ///
-    /// No-op if the table is empty, already spilled, or `disk-spill` is off.
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
+    /// No-op if the table is empty or already spilled.
+    #[cfg(feature = "disk-spill")]
     pub fn spill_to_disk(&mut self) -> std::io::Result<()> {
-        #[cfg(not(feature = "disk-spill"))]
-        return Ok(());
-
-        #[cfg(feature = "disk-spill")]
-        {
-            const {
-                assert!(
-                    std::mem::size_of::<FieldElement<F>>()
-                        .is_multiple_of(std::mem::align_of::<FieldElement<F>>()),
-                    "FieldElement<F> size must be a multiple of its alignment for mmap interior reads to be aligned"
-                )
-            }
-
-            if self.data.is_empty() || self.mmap_backing.is_some() {
-                return Ok(());
-            }
-
-            let elem_size = std::mem::size_of::<FieldElement<F>>();
-            let total_bytes = (self.data.len() as u64)
-                .checked_mul(elem_size as u64)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "spill_to_disk: byte count overflows u64",
-                    )
-                })?;
-
-            let file = tempfile::tempfile()?;
-            file.set_len(total_bytes)?;
-
-            // Write directly through a writable mmap, then downgrade to read-only.
-            // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
-            // under memory pressure could produce partially-zeroed reads from the
-            // read-only mmap (the previous implementation relied on that handoff).
-            //
-            // SAFETY: tempfile() creates an anonymous file with no filesystem
-            // path, so no other process can open or modify it.
-            let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
-            // The Vec has the same byte layout as a contiguous array.
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    self.data.as_ptr() as *const u8,
-                    self.data.len() * elem_size,
-                )
-            };
-            mmap_mut.copy_from_slice(bytes);
-            mmap_mut.flush()?;
-            let mmap = mmap_mut.make_read_only()?;
-
-            self.mmap_backing = Some(TableMmapBacking {
-                mmap,
-                width: self.width,
-                height: self.height,
-                elem_size,
-            });
-
-            // Free heap allocation
-            self.data = Vec::new();
-
-            Ok(())
+        const {
+            assert!(
+                std::mem::size_of::<FieldElement<F>>()
+                    .is_multiple_of(std::mem::align_of::<FieldElement<F>>()),
+                "FieldElement<F> size must be a multiple of its alignment for mmap interior reads to be aligned"
+            )
         }
+
+        if self.data.is_empty() || self.mmap_backing.is_some() {
+            return Ok(());
+        }
+
+        let elem_size = std::mem::size_of::<FieldElement<F>>();
+        let total_bytes = (self.data.len() as u64)
+            .checked_mul(elem_size as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "spill_to_disk: byte count overflows u64",
+                )
+            })?;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes)?;
+
+        // Write directly through a writable mmap, then downgrade to read-only.
+        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
+        // under memory pressure could produce partially-zeroed reads from the
+        // read-only mmap (the previous implementation relied on that handoff).
+        //
+        // SAFETY: tempfile() creates an anonymous file with no filesystem
+        // path, so no other process can open or modify it.
+        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+        // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
+        // The Vec has the same byte layout as a contiguous array.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * elem_size)
+        };
+        mmap_mut.copy_from_slice(bytes);
+        mmap_mut.flush()?;
+        let mmap = mmap_mut.make_read_only()?;
+
+        self.mmap_backing = Some(TableMmapBacking {
+            mmap,
+            width: self.width,
+            height: self.height,
+            elem_size,
+        });
+
+        // Free heap allocation
+        self.data = Vec::new();
+
+        Ok(())
     }
 
     /// Advise the kernel to drop mmap pages from the page cache.
     /// Call after reading spilled data into pool buffers so the same
     /// data doesn't occupy RAM in both places.
     ///
-    /// No-op on non-Unix targets and when `disk-spill` is off.
+    /// Unix-only: no-op on non-Unix targets.
+    #[cfg(all(feature = "disk-spill", unix))]
     pub fn advise_drop_cache(&self) {
-        #[cfg(all(feature = "disk-spill", unix))]
         if let Some(ref backing) = self.mmap_backing {
             // SAFETY: pointer and length are from a valid mmap.
             // MADV_DONTNEED is advisory and cannot cause UB.
@@ -361,6 +349,9 @@ impl<F: IsField> Table<F> {
             }
         }
     }
+
+    #[cfg(all(feature = "disk-spill", not(unix)))]
+    pub fn advise_drop_cache(&self) {}
 
     /// Given a step size, converts the given table into a `Frame`.
     /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
