@@ -289,10 +289,11 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
 
 /// Effective RAM budget against which the estimate is compared.
 ///
-/// Returns `None` when the OS can't report available memory and the user
-/// hasn't set a cap; in that case the caller should default to `Ram` rather
-/// than force Disk on every proof. Otherwise the budget is the user's cap (if
-/// set), clamped down by what the OS reports available.
+/// Returns `None` when sysinfo can't read system memory and the user hasn't
+/// set a cap. The caller should default to `Disk` in that case — sysinfo
+/// failure correlates with stripped-down containers where Ram would OOM.
+/// Otherwise the budget is the user's cap (if set), clamped down by what the
+/// OS reports available.
 pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     match (cap, available) {
         (Some(c), Some(a)) => Some(c.min(a)),
@@ -308,6 +309,10 @@ pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64>
 /// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
 /// machine's reported available RAM when smaller.
 ///
+/// When neither `available` nor `cap` is known, defaults to `Disk` — sysinfo
+/// failure typically means a minimal container where Ram would OOM. Pass a
+/// large `max_ram_bytes` to opt out if you know the machine has enough RAM.
+///
 /// `available` is a one-shot sample. If a concurrent process allocates between
 /// this call and phase 5, this function may pick `Ram` and the prover OOMs.
 /// The 90% headroom covers background jitter; under contention, pass
@@ -319,11 +324,10 @@ pub fn select_storage_mode(
 ) -> StorageMode {
     let Some(budget) = effective_budget(available, cap) else {
         log::warn!(
-            "Auto disk-spill: no RAM budget available (OS did not report available memory \
-             and no cap set) — staying in Ram. Pass an explicit cap to force Disk in \
-             memory-constrained environments."
+            "Auto disk-spill: sysinfo could not read system memory and no cap set — \
+             defaulting to Disk for safety. Pass max_ram_bytes if the machine has enough RAM."
         );
-        return StorageMode::Ram;
+        return StorageMode::Disk;
     };
     let threshold = budget.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;
 
@@ -335,14 +339,20 @@ pub fn select_storage_mode(
 }
 
 /// Query the OS for currently available RAM (not total) in bytes. Returns
-/// `None` when the OS can't report a figure (e.g. inside containers without
-/// `/proc/meminfo`).
+/// `None` only when sysinfo can't read system memory at all (e.g. inside
+/// containers without `/proc/meminfo`); a genuine zero free reading on a
+/// near-OOM system returns `Some(0)` so the caller forces Disk instead of
+/// silently falling back to Ram and OOMing.
 pub fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    match sys.available_memory() {
-        0 => None,
-        n => Some(n),
+    // total_memory disambiguates: it's a hardware constant sysinfo can always
+    // read when it has any data. If total is 0, sysinfo failed entirely; if
+    // total is non-zero, available's value (including 0) is real.
+    if sys.total_memory() == 0 {
+        None
+    } else {
+        Some(sys.available_memory())
     }
 }
 
@@ -459,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_available_with_no_cap_falls_back_to_ram() {
-        // OS can't report available memory. Without a cap we can't make an
-        // informed decision, so stay in Ram rather than forcing Disk on every
-        // proof.
+    fn unknown_available_with_no_cap_defaults_to_disk() {
+        // sysinfo failed and no cap was set. Default to Disk for safety:
+        // sysinfo typically fails in stripped-down containers, where Ram would
+        // OOM. Users with a known-sized machine can pass max_ram_bytes.
         let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None, None);
-        assert_eq!(mode, StorageMode::Ram);
+        assert_eq!(mode, StorageMode::Disk);
     }
 
     #[test]
