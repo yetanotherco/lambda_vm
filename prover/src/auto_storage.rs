@@ -97,13 +97,33 @@ pub const SAFETY_FRACTION_DEN: u64 = 10;
 type TableSpec = (u64, u64, u64, u64);
 
 /// Bytes alive for the duration of phase D (LDE columns + main/aux Merkle).
+///
+/// Saturating arithmetic: any future table whose product exceeds `u64::MAX`
+/// saturates and forces Disk via `peak_bytes`, the safe direction. Wrapping
+/// would produce a small estimate and pick Ram on a proof that would OOM.
 fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, main_cols, aux_cols, main_trees) = spec;
-    let main_lde = rows * main_cols * GOLDILOCKS_BYTES * (1 + blowup);
-    let aux_lde = rows * aux_cols * CUBIC_EXT_BYTES * (1 + blowup);
-    let main_merkle = main_trees * 2 * rows * blowup * KECCAK_NODE_BYTES;
-    let aux_merkle = 2 * rows * blowup * KECCAK_NODE_BYTES;
-    main_lde + aux_lde + main_merkle + aux_merkle
+    let main_lde = rows
+        .saturating_mul(main_cols)
+        .saturating_mul(GOLDILOCKS_BYTES)
+        .saturating_mul(1 + blowup);
+    let aux_lde = rows
+        .saturating_mul(aux_cols)
+        .saturating_mul(CUBIC_EXT_BYTES)
+        .saturating_mul(1 + blowup);
+    let main_merkle = main_trees
+        .saturating_mul(2)
+        .saturating_mul(rows)
+        .saturating_mul(blowup)
+        .saturating_mul(KECCAK_NODE_BYTES);
+    let aux_merkle = 2u64
+        .saturating_mul(rows)
+        .saturating_mul(blowup)
+        .saturating_mul(KECCAK_NODE_BYTES);
+    main_lde
+        .saturating_add(aux_lde)
+        .saturating_add(main_merkle)
+        .saturating_add(aux_merkle)
 }
 
 /// Bytes alive only while one chunk of `k` tables is in rounds 2-4. Sums:
@@ -112,13 +132,17 @@ fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
 /// and the geometric-sum FRI evals + FRI Merkle.
 fn transient_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, _, _, _) = spec;
-    let lde_size = rows * blowup;
-    let constraint_evals = lde_size * CUBIC_EXT_BYTES;
-    let composition_lde = 2 * lde_size * CUBIC_EXT_BYTES;
-    let composition_merkle = lde_size * KECCAK_NODE_BYTES;
-    let fri_evals = lde_size * CUBIC_EXT_BYTES;
-    let fri_merkle = lde_size * KECCAK_NODE_BYTES;
-    constraint_evals + composition_lde + composition_merkle + fri_evals + fri_merkle
+    let lde_size = rows.saturating_mul(blowup);
+    let constraint_evals = lde_size.saturating_mul(CUBIC_EXT_BYTES);
+    let composition_lde = lde_size.saturating_mul(2).saturating_mul(CUBIC_EXT_BYTES);
+    let composition_merkle = lde_size.saturating_mul(KECCAK_NODE_BYTES);
+    let fri_evals = lde_size.saturating_mul(CUBIC_EXT_BYTES);
+    let fri_merkle = lde_size.saturating_mul(KECCAK_NODE_BYTES);
+    constraint_evals
+        .saturating_add(composition_lde)
+        .saturating_add(composition_merkle)
+        .saturating_add(fri_evals)
+        .saturating_add(fri_merkle)
 }
 
 /// Bytes for one (trace_length, blowup, coset_offset) entry in the prover's
@@ -126,7 +150,8 @@ fn transient_per_table(spec: TableSpec, blowup: u64) -> u64 {
 /// `lde_roots_of_unity_coset` (N×B). LdeTwiddles holds `inv` (~N), `fwd`
 /// (~N×B), and `coset_weights` (N). All in base field (Goldilocks, 8 B).
 fn domain_cache_bytes(rows: u64, blowup: u64) -> u64 {
-    rows * (3 + 2 * blowup) * GOLDILOCKS_BYTES
+    rows.saturating_mul(3 + 2 * blowup)
+        .saturating_mul(GOLDILOCKS_BYTES)
 }
 
 fn aux_cols(bus_count: usize) -> u64 {
@@ -256,7 +281,10 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
     let specs = table_specs(lengths);
 
     // Persistent: every table's LDE + main/aux Merkle is alive across phase D.
-    let persistent_total: u64 = specs.iter().map(|s| persistent_per_table(*s, blowup)).sum();
+    let persistent_total: u64 = specs
+        .iter()
+        .map(|s| persistent_per_table(*s, blowup))
+        .fold(0u64, u64::saturating_add);
 
     // Transient: only k tables run round 2-4 in parallel. Conservative bound is
     // the top-k tables by transient bytes (worst possible chunk assignment).
@@ -265,7 +293,11 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
         .map(|s| transient_per_table(*s, blowup))
         .collect();
     transient_per.sort_unstable_by(|a, b| b.cmp(a));
-    let transient_total: u64 = transient_per.iter().take(k).sum();
+    let transient_total: u64 = transient_per
+        .iter()
+        .take(k)
+        .copied()
+        .fold(0u64, u64::saturating_add);
 
     // Domain + LdeTwiddles cache: one entry per unique padded-row count
     // (blowup_factor and coset_offset are constant across tables in this
@@ -276,15 +308,24 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
     let domain_total: u64 = unique_rows
         .iter()
         .map(|&r| domain_cache_bytes(r, blowup))
-        .sum();
+        .fold(0u64, u64::saturating_add);
 
     // State alive across the prove call (memory cells, log Vec, instruction
     // map). Independent of trace shape.
-    let state_total = lengths.unique_byte_count * MEMORY_CELL_BYTES
-        + lengths.cycle_count * LOG_STRUCT_BYTES
-        + lengths.decode_rows * INSTRUCTION_MAP_BYTES_PER_ROW;
+    let state_total = lengths
+        .unique_byte_count
+        .saturating_mul(MEMORY_CELL_BYTES)
+        .saturating_add(lengths.cycle_count.saturating_mul(LOG_STRUCT_BYTES))
+        .saturating_add(
+            lengths
+                .decode_rows
+                .saturating_mul(INSTRUCTION_MAP_BYTES_PER_ROW),
+        );
 
-    persistent_total + transient_total + domain_total + state_total
+    persistent_total
+        .saturating_add(transient_total)
+        .saturating_add(domain_total)
+        .saturating_add(state_total)
 }
 
 /// Effective RAM budget against which the estimate is compared.
