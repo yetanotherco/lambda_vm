@@ -262,6 +262,48 @@ fn test_args_panics() {
     }
 }
 
+#[test]
+fn test_ethrex_empty_block() {
+    let inputs = std::fs::read("tests/ethrex_empty_block.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex empty block should execute successfully");
+}
+
+#[test]
+fn test_ethrex_simple_tx() {
+    let inputs = std::fs::read("tests/ethrex_simple_tx.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex simple tx should execute successfully");
+}
+
+#[test]
+fn test_ethrex_2_txs() {
+    let inputs = std::fs::read("tests/ethrex_2_txs.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex 2 txs should execute successfully");
+}
+
+#[test]
+fn test_ethrex_5_txs() {
+    let inputs = std::fs::read("tests/ethrex_5_txs.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex 5 txs should execute successfully");
+}
+
+#[test]
+fn test_ethrex_10_txs() {
+    let inputs = std::fs::read("tests/ethrex_10_txs.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex 10 txs should execute successfully");
+}
+
+#[test]
+fn test_ethrex_erc20_transfer() {
+    let inputs = std::fs::read("tests/ethrex_erc20_transfer.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)
+        .expect("ethrex erc20 transfer should execute successfully");
+}
+
 #[ignore = "Ignored until the vm is fast enough to run this test"]
 #[test]
 fn test_ethrex() {

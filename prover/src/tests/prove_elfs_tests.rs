@@ -1957,6 +1957,24 @@ fn test_pure_commit_rust() {
     assert_eq!(proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
 }
 
+/// Minimal ecrecover reproducer — exercises k256 secp256k1 recovery.
+/// Used to debug LogUp bus imbalance in larger crypto-heavy traces.
+#[test]
+fn test_prove_ecrecover_only() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecrecover_only.elf"))
+            .expect("ecrecover_only.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "ecrecover_only should verify"
+    );
+}
+
 /// Backward-compatibility: `prove_with_inputs` with empty input must match `prove`.
 #[test]
 fn test_prove_with_input_empty() {
@@ -2167,6 +2185,102 @@ fn test_proof_does_not_contain_private_input_field() {
     assert!(
         vm_proof.num_private_input_pages <= 1,
         "Only the page count is stored, not the bytes"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_simple_tx() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_simple_tx.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex simple tx should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_2_txs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_2_txs.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex 2 txs should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_5_txs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_5_txs.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex 5 txs should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_10_txs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_10_txs.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex 10 txs should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_erc20_transfer() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_erc20_transfer.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex erc20 transfer should verify"
     );
 }
 

@@ -40,10 +40,10 @@ pub fn print_string(_: &str) {
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sys_write(_fildes: i32, buf: *const u8, size: usize) -> isize {
-    print_string("sys_write called\n");
-    let content = unsafe { core::slice::from_raw_parts(buf, size) };
-    print_string(&("SYS_WRITE: ".to_owned() + str::from_utf8(content).unwrap_or("<invalid utf8>"))); // Does the print of the sys write
+pub unsafe extern "C" fn sys_write(_fildes: i32, _buf: *const u8, size: usize) -> isize {
+    // NOTE: no print_string here — the Print ecall (syscall 1) has no receiver
+    // on the Ecall bus and would cause a verification failure. Pretend the
+    // write succeeded so rust std doesn't retry.
     size.try_into().unwrap_or(-1)
 }
 

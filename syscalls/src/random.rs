@@ -5,8 +5,6 @@ use lazy_static::lazy_static;
 use rand::Rng;
 use rand::{SeedableRng, rngs::StdRng};
 
-use crate::syscalls::print_string;
-
 const RANDOM_SEED: u64 = 0x1234567890abcdef;
 
 lazy_static! {
@@ -19,9 +17,8 @@ lazy_static! {
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_rand(buf: *mut u8, len: usize) {
-    print_string("sys_rand called\n");
-    print_string("WARNING: Using sys_rand is insecure\n");
-
+    // NOTE: no print_string here — the Print ecall (syscall 1) has no
+    // receiver on the Ecall bus and would cause a verification failure.
     let mut rng = RNG.lock().unwrap();
     for i in 0..len {
         unsafe {

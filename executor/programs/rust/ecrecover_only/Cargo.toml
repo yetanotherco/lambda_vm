@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "ecrecover_only"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = { version = "0.10" }
