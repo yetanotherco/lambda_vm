@@ -61,7 +61,7 @@ In short:
 
 `bench_prove.sh` measures one program at a time. By default everyone benches `fib_iterative_*`, but `fib` is a loop of 5 instructions: it activates only the `cpu`, `branch`, `register`, and `decode` chips. Chips like `shift`, `mul`, `dvrm`, `bitwise`, `load`, `memw`, `page`, and `commit` end up at 0% real usage on a fib run. A PR that improves the ALU+branch path by 3% but silently regresses `shift` (5 lookups per row, the costliest per-instruction chip) by 8% can ship green if `fib` is the only signal.
 
-`bench_prove_suite.sh` runs `bench_prove.sh` across one or more programs that, together, exercise every chip. Default keeps fib alone (cheap canary); opt in to `--all` for full coverage.
+`bench_prove_suite.sh` runs `bench_prove.sh` across one or more programs that, together, exercise every chip. Default keeps fib alone (canary, ~10 min on the bench server vs ~30–60 min for `--all`); opt in to `--all` for full coverage.
 
 ## Quick start
 
@@ -78,7 +78,7 @@ The script wraps `bench_prove.sh`, so the `<runs>` and `<base_branch>` arguments
 
 ## Programs in the suite
 
-| Name | ELF | Stress dominante | Steps |
+| Name | ELF | Dominant stress | Steps |
 |---|---|---|---|
 | `fib` | `executor/program_artifacts/asm/fib_iterative_8M.elf` | cpu + branch + register + decode (canary) | ~8M |
 | `keccak` | `executor/program_artifacts/bench/keccak.elf` | shift (5×HWSL/row) + bitwise AND/OR/XOR + memw | ~3.6M |
@@ -114,7 +114,12 @@ When run with a comparison branch, the script applies a per-program threshold to
 | > +2%, ≤ +5% | WARN |
 | > +5% | FAIL |
 
-Overall verdict is the worst per-program status. Exit code is non-zero only on FAIL. Heap delta is reported but does not affect the verdict.
+Overall verdict is the worst per-program status, with priority `FAIL > INCONCLUSIVE > WARN > PASS`. A program that crashed or produced no comparison data is reported as `INCONCLUSIVE` rather than `FAIL`, so an environment problem is not confused with a real regression. Heap delta is reported but does not affect the verdict.
+
+Exit codes:
+- `0` — `PASS` or `WARN`
+- `1` — `FAIL` (real regression detected)
+- `2` — `INCONCLUSIVE` (one or more programs produced no comparison data), missing ELF artifact, or invalid arguments
 
 These thresholds are deliberately loose for a 1–3 run sample. For a contested PR, re-run with `--only <program> 5 main` (or higher) to tighten confidence.
 
@@ -133,11 +138,13 @@ If an ELF is missing, `bench_prove_suite.sh` exits with a clear error pointing t
 
 ## Output
 
-Per-program logs are saved under `/tmp/bench_prove_suite/<name>.log`. The aggregate verdict is printed last:
+Per-program logs are saved under `/tmp/bench_prove_suite/<name>.log`. When `--instruments` is passed, each program's instrumented run is also preserved as `/tmp/bench_prove_suite/<name>_instruments.txt` (the underlying `bench_prove.sh` only keeps the most recent one in `/tmp/bench_prove/instruments.txt`, which would otherwise be overwritten between programs).
+
+The aggregate verdict is printed last:
 
 ```
-program       time delta        heap delta        status
-----------------------------------------------------------------
+  program       time delta        heap delta        status
+  ----------------------------------------------------------------
   fib           time:    +0.3%   heap:   -12.6%   [OK]
   keccak        time:    +6.7%   heap:    +0.1%   [FAIL]
   quicksort     time:    -1.1%   heap:    -0.4%   [OK]

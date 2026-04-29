@@ -64,11 +64,21 @@ SKIP_LIST=""
 INSTRUMENTS_FLAG=""
 POSITIONAL=()
 
+require_value_arg() {
+    local flag=$1 val=${2:-}
+    case "$val" in
+        ""|--*)
+            echo -e "${RED}ERROR: $flag requires a non-empty list of program names (got '$val')${NC}" >&2
+            exit 2
+            ;;
+    esac
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --all)         SELECT_ALL=true; shift ;;
-        --only)        ONLY_LIST=${2:-}; shift 2 ;;
-        --skip)        SKIP_LIST=${2:-}; shift 2 ;;
+        --only)        require_value_arg "--only" "${2:-}"; ONLY_LIST=$2; shift 2 ;;
+        --skip)        require_value_arg "--skip" "${2:-}"; SKIP_LIST=$2; shift 2 ;;
         --instruments) INSTRUMENTS_FLAG="--instruments"; shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
@@ -82,6 +92,16 @@ done
 
 RUNS=${POSITIONAL[0]:-1}
 BASE_BRANCH=${POSITIONAL[1]:-main}
+
+if [[ ! "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
+    echo -e "${RED}ERROR: runs must be a positive integer (got '$RUNS')${NC}" >&2
+    exit 2
+fi
+
+if [ -n "$ONLY_LIST" ] && { $SELECT_ALL || [ -n "$SKIP_LIST" ]; }; then
+    echo -e "${RED}ERROR: --only is mutually exclusive with --all and --skip${NC}" >&2
+    exit 2
+fi
 
 # --- Resolve which programs to run ----------------------------------------
 
@@ -170,6 +190,11 @@ for n in "${SELECTED[@]}"; do
     if ! "$SCRIPT_DIR/bench_prove.sh" "$(elf_for "$n")" "$RUNS" "$BASE_BRANCH" $INSTRUMENTS_FLAG 2>&1 | tee "$LOG"; then
         echo -e "${RED}WARN: bench_prove.sh exited non-zero for $n${NC}" >&2
     fi
+    # bench_prove.sh writes to /tmp/bench_prove/instruments.txt and clobbers it
+    # on the next invocation; preserve a per-program copy here.
+    if [ -n "$INSTRUMENTS_FLAG" ] && [ -f "/tmp/bench_prove/instruments.txt" ]; then
+        cp "/tmp/bench_prove/instruments.txt" "$TMP_DIR/${n}_instruments.txt"
+    fi
 done
 
 # --- Aggregate verdict -----------------------------------------------------
@@ -204,8 +229,8 @@ for n in "${SELECTED[@]}"; do
     HEAP_DELTA=$(grep -E "^[[:space:]]+Heap:" "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*\(([+-][0-9.]+)%\).*/\1/' || true)
 
     if [ -z "$TIME_DELTA" ]; then
-        PROGRAM_LINES+=("$(printf "  %-12s  %s" "$n" "(no comparison data — see log)")")
-        OVERALL=FAIL
+        PROGRAM_LINES+=("$(printf "  %-12s  ${YELLOW}[%s]${NC} (no comparison data — see log)" "$n" "INCONCLUSIVE")")
+        case "$OVERALL" in PASS|WARN) OVERALL=INCONCLUSIVE ;; esac
         continue
     fi
 
@@ -233,11 +258,16 @@ echo -e "  Thresholds: WARN > +${REGRESSION_WARN_PCT}%, FAIL > +${REGRESSION_FAI
 echo ""
 
 case $OVERALL in
-    PASS) echo -e "${GREEN}${BOLD}Overall: PASS${NC}" ;;
-    WARN) echo -e "${YELLOW}${BOLD}Overall: WARN${NC}" ;;
-    FAIL) echo -e "${RED}${BOLD}Overall: FAIL${NC}" ;;
+    PASS)         echo -e "${GREEN}${BOLD}Overall: PASS${NC}" ;;
+    WARN)         echo -e "${YELLOW}${BOLD}Overall: WARN${NC}" ;;
+    INCONCLUSIVE) echo -e "${YELLOW}${BOLD}Overall: INCONCLUSIVE${NC} (one or more programs produced no comparison data)" ;;
+    FAIL)         echo -e "${RED}${BOLD}Overall: FAIL${NC}" ;;
 esac
 echo ""
 echo "Per-program logs in $TMP_DIR/"
 
-[ "$OVERALL" = FAIL ] && exit 1 || exit 0
+case $OVERALL in
+    FAIL)         exit 1 ;;
+    INCONCLUSIVE) exit 2 ;;
+    *)            exit 0 ;;
+esac
