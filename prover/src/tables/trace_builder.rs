@@ -102,6 +102,7 @@ impl MemoryState {
     /// Count unique memory pages touched during execution. Used by the
     /// main-elements estimator to account for PAGE-table rows without
     /// allocating the trace tables. O(N) in `cells.len()`.
+    #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
         let mask = !(page_size - 1);
         let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
@@ -2151,6 +2152,7 @@ fn generate_traces(
 /// Row count for a chunked table after `chunk_and_generate` padding: each
 /// chunk is rounded up to `len.next_power_of_two().max(4)`. Matches the
 /// per-table `generate_*_trace` calls exactly.
+#[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     if ops_count == 0 {
         return 4; // empty-chunk tables still allocate one 4-row padded chunk
@@ -2170,6 +2172,7 @@ fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
 /// unique-page count, executor cycle count, and unique-byte-address count.
 /// Computed by [`count_table_lengths`] without allocating any operation
 /// vectors or trace tables.
+#[cfg(feature = "disk-spill")]
 #[derive(Debug, Default, Clone)]
 pub struct TableLengths {
     pub cpu_padded_rows: u64,
@@ -2208,6 +2211,7 @@ pub struct TableLengths {
 ///
 /// The two places that must stay in sync when the trace shape changes: this
 /// function and `Traces::from_elf_and_logs`.
+#[cfg(feature = "disk-spill")]
 pub fn count_table_lengths(
     elf: &Elf,
     logs: &[Log],
