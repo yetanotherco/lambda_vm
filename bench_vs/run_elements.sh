@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Compare main-trace field elements: Lambda VM vs SP1 v6 vs SP1 v5 — Fibonacci.
+# Compare main-trace field elements: Lambda VM vs SP1 v6 vs SP1 v5 vs ZisK — Fibonacci.
 #
 # "Field elements to prove" = sum over all AIR tables of (padded_rows × num_columns).
 # More elements = larger trace = more work for the prover.
 #
 # Usage: ./bench_vs/run_elements.sh [-n 100000 200000 400000]
-#                                   [--lambda-only | --sp1-only]
+#                                   [--lambda-only | --sp1-only | --zisk-only]
 #                                   [--report-dir DIR] [--no-color]
 #
 # Prerequisites:
 #   - Lambda VM CLI build dependencies available
 #   - SP1 toolchain installed (sp1up)
+#   - ZisK toolchain installed (ziskup) — provides ~/.zisk/provingKey/ and the
+#     +zisk Rust toolchain used to cross-compile the guest. macOS uses emulator
+#     mode automatically; only Linux x86_64 supports the asm backend.
 #   - Rust stable installed
 #   - python3 installed
 
@@ -33,6 +36,7 @@ DEFAULT_SERIES=(100000 200000 400000)
 SERIES=()
 RUN_LAMBDA=true
 RUN_SP1=true
+RUN_ZISK=true
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -45,9 +49,28 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lambda-only)
             RUN_SP1=false
+            RUN_ZISK=false
             shift
             ;;
         --sp1-only)
+            RUN_LAMBDA=false
+            RUN_ZISK=false
+            shift
+            ;;
+        --zisk-only)
+            RUN_LAMBDA=false
+            RUN_SP1=false
+            shift
+            ;;
+        --no-sp1)
+            RUN_SP1=false
+            shift
+            ;;
+        --no-zisk)
+            RUN_ZISK=false
+            shift
+            ;;
+        --no-lambda)
             RUN_LAMBDA=false
             shift
             ;;
@@ -61,7 +84,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-n N1 N2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--no-color]"
+            echo "Usage: $0 [-n N1 N2 ...] [--lambda-only | --sp1-only | --zisk-only]"
+            echo "          [--no-lambda | --no-sp1 | --no-zisk] [--report-dir DIR] [--no-color]"
             exit 0
             ;;
         *)
@@ -69,7 +93,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! $RUN_LAMBDA && ! $RUN_SP1; then
+if ! $RUN_LAMBDA && ! $RUN_SP1 && ! $RUN_ZISK; then
     echo "At least one prover must be enabled"
     exit 1
 fi
@@ -112,6 +136,9 @@ SP1_V6_BIN="$SP1_V6_DIR/target/release/fibonacci-script"
 SP1_V5_DIR="$SCRIPT_DIR/sp1_v5/fibonacci"
 SP1_V5_BIN="$SP1_V5_DIR/target/release/fibonacci-script-v5"
 SP1_V5_GUEST_ELF="$SP1_V5_DIR/target/riscv32im-succinct-zkvm-elf/release/fibonacci-program-v5"
+
+ZISK_DIR="$SCRIPT_DIR/zisk/fibonacci"
+ZISK_HOST_BIN="$ZISK_DIR/target/release/fibonacci-zisk-host"
 
 write_u64_le() {
     local value=$1
@@ -166,6 +193,77 @@ else:
 fmt_num() {
     [ "$1" = "n/a" ] && { echo "n/a"; return; }
     python3 -c "print(f'{$1:,}')"
+}
+
+# Verify everything ZisK needs before triggering the (slow) C++ build of zisk-sdk.
+# Exits with a copy-pasteable install command if anything is missing.
+check_zisk_prereqs() {
+    local missing=()
+    local fix_lines=()
+
+    # 1. ziskup-installed toolchain (cargo-zisk binary + +zisk Rust toolchain)
+    if ! command -v cargo-zisk >/dev/null 2>&1 && [ ! -x "$HOME/.zisk/bin/cargo-zisk" ]; then
+        missing+=("ziskup (cargo-zisk binary + +zisk Rust toolchain)")
+        fix_lines+=("curl -L https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash")
+        fix_lines+=("ziskup    # choose option 1 (default) to install the proving key")
+    fi
+
+    # 2. Proving key (populated by ziskup option 1)
+    if [ ! -d "$HOME/.zisk/provingKey" ] || [ -z "$(ls -A "$HOME/.zisk/provingKey" 2>/dev/null)" ]; then
+        missing+=("proving key at ~/.zisk/provingKey/ (run \`ziskup\` and choose option 1)")
+    fi
+
+    # 3. System C++ headers/libs needed by proofman-starks-lib-c
+    case "$(uname -s)" in
+        Darwin)
+            if ! command -v brew >/dev/null 2>&1; then
+                missing+=("Homebrew (https://brew.sh)")
+            else
+                # llvm@15 is required because the prebuilt cargo-zisk binary for
+                # darwin-arm64 is dynamically linked against /opt/homebrew/opt/llvm@15/lib/libunwind.1.dylib.
+                # Without it the binary aborts with a dyld error on the first invocation.
+                local brew_missing=()
+                for pkg in libomp nlohmann-json libsodium llvm@15; do
+                    if ! brew list --formula "$pkg" >/dev/null 2>&1; then
+                        brew_missing+=("$pkg")
+                    fi
+                done
+                if [ "${#brew_missing[@]}" -gt 0 ]; then
+                    missing+=("Homebrew formulas: ${brew_missing[*]}")
+                    fix_lines+=("brew install ${brew_missing[*]}")
+                fi
+            fi
+            ;;
+        Linux)
+            local linux_missing=()
+            { [ -f /usr/include/omp.h ] || ls /usr/lib/llvm-*/include/omp.h >/dev/null 2>&1; } || linux_missing+=("libomp-dev")
+            [ -f /usr/include/nlohmann/json.hpp ] || linux_missing+=("nlohmann-json3-dev")
+            [ -f /usr/include/sodium.h ] || linux_missing+=("libsodium-dev")
+            command -v cmake >/dev/null 2>&1 || linux_missing+=("cmake")
+            command -v pkg-config >/dev/null 2>&1 || linux_missing+=("pkg-config")
+            if [ "${#linux_missing[@]}" -gt 0 ]; then
+                missing+=("apt packages: ${linux_missing[*]}")
+                fix_lines+=("sudo apt install -y ${linux_missing[*]}")
+            fi
+            ;;
+    esac
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo -e "${RED}[ZisK] Missing prerequisites:${NC}"
+        for item in "${missing[@]}"; do
+            echo -e "  ${RED}- $item${NC}"
+        done
+        if [ "${#fix_lines[@]}" -gt 0 ]; then
+            echo ""
+            echo -e "${YELLOW}Install with:${NC}"
+            for line in "${fix_lines[@]}"; do
+                echo -e "  ${YELLOW}$line${NC}"
+            done
+        fi
+        echo ""
+        echo -e "${YELLOW}See bench_vs/README.md for the full setup, or skip ZisK with --lambda-only / --sp1-only.${NC}"
+        exit 1
+    fi
 }
 
 # --- Build ------------------------------------------------------------------
@@ -226,8 +324,19 @@ if $RUN_SP1; then
     fi
 fi
 
+if $RUN_ZISK; then
+    check_zisk_prereqs
+    echo -e "${GREEN}[ZisK] Building host (first run compiles the C++ STARK lib, ~10 min)...${NC}"
+    (cd "$ZISK_DIR/host" && cargo build --release 2>&1 | tail -5)
+    if [ ! -f "$ZISK_HOST_BIN" ]; then
+        echo -e "${RED}[ZisK] Build failed — fibonacci-zisk-host binary not found${NC}"
+        echo -e "${YELLOW}See bench_vs/README.md for setup; \`./bench_vs/run_elements.sh --zisk-only\` re-runs the prereq check.${NC}"
+        exit 1
+    fi
+fi
+
 echo ""
-echo -e "${BOLD}=== Counting field elements: Lambda VM vs SP1 v6 vs SP1 v5 ===${NC}"
+echo -e "${BOLD}=== Counting field elements: Lambda VM vs SP1 v6 vs SP1 v5 vs ZisK ===${NC}"
 echo -e "Series: ${YELLOW}${SERIES[*]}${NC}"
 echo ""
 
@@ -238,6 +347,7 @@ RESULT_LAMBDA_AUX=()
 RESULT_SP1_V6=()
 RESULT_SP1_V5=()
 RESULT_SP1_V5_AUX=()
+RESULT_ZISK=()
 
 for n in "${SERIES[@]}"; do
     echo -e "${BOLD}--- n = $n iterations ---${NC}"
@@ -249,6 +359,7 @@ for n in "${SERIES[@]}"; do
     sp1v6_elems="n/a"
     sp1v5_elems="n/a"
     sp1v5_aux="n/a"
+    zisk_elems="n/a"
 
     if $RUN_LAMBDA; then
         echo -e "  ${GREEN}[Lambda VM] Counting elements...${NC}"
@@ -320,12 +431,33 @@ for n in "${SERIES[@]}"; do
         fi
     fi
 
+    if $RUN_ZISK; then
+        echo -e "  ${GREEN}[ZisK] Executing to extract element count...${NC}"
+        zisk_out_file="$TMP_DIR/zisk_${n}.out"
+        if "$ZISK_HOST_BIN" "$n" > "$zisk_out_file" 2>&1; then
+            zisk_elems=$(extract_elements < "$zisk_out_file")
+            if [ -z "$zisk_elems" ]; then
+                echo -e "  ${RED}[ZisK] FAILED to parse element count${NC}"
+                exit 1
+            fi
+            echo -e "  ZisK:      ${BOLD}${zisk_elems}${NC} main elements"
+        else
+            echo -e "  ${RED}[ZisK] FAILED${NC}"
+            cat "$zisk_out_file"
+            exit 1
+        fi
+        if [ -n "$REPORT_DIR" ]; then
+            cp "$zisk_out_file" "$REPORT_DIR/raw/zisk_${n}.out"
+        fi
+    fi
+
     RESULT_N+=("$n")
     RESULT_LAMBDA+=("$lambda_elems")
     RESULT_LAMBDA_AUX+=("$lambda_aux")
     RESULT_SP1_V6+=("$sp1v6_elems")
     RESULT_SP1_V5+=("$sp1v5_elems")
     RESULT_SP1_V5_AUX+=("$sp1v5_aux")
+    RESULT_ZISK+=("$zisk_elems")
     echo ""
 done
 
@@ -336,27 +468,30 @@ print_main_table() {
     echo "=== Summary: Main-Trace Field Elements (base field, rows × cols) ==="
     echo "  Program : Fibonacci (u64 wrapping)"
     echo "  Metric  : sum of padded_rows × num_columns across all AIR tables"
-    echo "  Fields  : Lambda VM = Goldilocks 64-bit | SP1 = BabyBear 32-bit"
+    echo "  Fields  : Lambda VM = Goldilocks 64-bit | SP1 = BabyBear 32-bit | ZisK = Goldilocks 64-bit"
     echo ""
-    printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s\n" \
-        "Fibonacci n" "Lambda VM" "SP1 v6" "SP1 v5" "vs SP1 v6" "vs SP1 v5"
-    printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s\n" \
-        "-------------" "------------------" "------------------" "------------------" "-----------" "-----------"
+    printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s  %${W_R}s\n" \
+        "Fibonacci n" "Lambda VM" "SP1 v6" "SP1 v5" "ZisK" "vs SP1 v6" "vs SP1 v5" "vs ZisK"
+    printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s  %${W_R}s\n" \
+        "-------------" "------------------" "------------------" "------------------" "------------------" "-----------" "-----------" "-----------"
     for i in "${!RESULT_N[@]}"; do
         lam="${RESULT_LAMBDA[$i]}"
         v6="${RESULT_SP1_V6[$i]}"
         v5="${RESULT_SP1_V5[$i]}"
-        printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s\n" \
+        zk="${RESULT_ZISK[$i]}"
+        printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_E}s  %${W_R}s  %${W_R}s  %${W_R}s\n" \
             "$(fmt_num "${RESULT_N[$i]}")" \
             "$(fmt_num "$lam")" \
             "$(fmt_num "$v6")" \
             "$(fmt_num "$v5")" \
+            "$(fmt_num "$zk")" \
             "$(format_ratio "$lam" "$v6")" \
-            "$(format_ratio "$lam" "$v5")"
+            "$(format_ratio "$lam" "$v5")" \
+            "$(format_ratio "$lam" "$zk")"
     done
     echo ""
-    echo "  +Nx = Lambda has N× more elements than SP1"
-    echo "  -Nx = SP1 has N× more elements than Lambda"
+    echo "  +Nx = Lambda has N× more elements than the other prover"
+    echo "  -Nx = the other prover has N× more elements than Lambda"
     echo ""
 }
 
@@ -365,7 +500,8 @@ print_aux_table() {
     echo "  Metric  : sum of padded_rows × committed_EF_columns across all AIR tables"
     echo "  Unit    : EF columns (Lambda VM = ⌈bus_interactions/2⌉, SP1 v5 = permutation_width)"
     echo "  Fields  : Lambda VM = Goldilocks cubic EF (3 BF/EF) | SP1 v5 = BabyBear quartic EF (4 BF/EF)"
-    echo "  Note    : SP1 v6 has no committed interaction columns (GKR-based bus)"
+    echo "  Note    : SP1 v6 and ZisK have no committed interaction columns to compare"
+    echo "            (SP1 v6 uses a GKR-based bus; ZisK rolls lookup columns into its main trace)"
     echo ""
     printf "  %-${W_N}s  %${W_E}s  %${W_E}s  %${W_R}s\n" \
         "Fibonacci n" "Lambda VM" "SP1 v5" "vs SP1 v5"

@@ -20,6 +20,42 @@ Compares proving time for an identical u64 wrapping Fibonacci computation.
    rustup toolchain install nightly
    ```
 
+4. **ZisK toolchain and dependencies** (Polygon's prover — only required for `run_elements.sh`).
+
+   The host binary at `bench_vs/zisk/fibonacci/host` depends on `zisk-sdk`, which
+   transitively builds a C++ STARK library (rapidsnark + goldilocks + bn128). Install
+   the system headers it needs first:
+
+   **macOS**:
+   ```bash
+   brew install libomp nlohmann-json libsodium llvm@15
+   ```
+   (`llvm@15` is required because ziskup's prebuilt `cargo-zisk` binary for darwin-arm64
+   is dynamically linked against `/opt/homebrew/opt/llvm@15/lib/libunwind.1.dylib`.)
+
+   **Linux (Debian/Ubuntu)**:
+   ```bash
+   sudo apt install -y libomp-dev nlohmann-json3-dev libsodium-dev cmake pkg-config build-essential
+   ```
+
+   Then install ziskup:
+   ```bash
+   curl -L https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
+   ziskup    # choose option 1 (default) to install the proving key
+   ```
+
+   `ziskup` provides:
+   - the `+zisk` Rust toolchain used by `zisk-build` to cross-compile the guest to `riscv64ima-zisk-zkvm-elf`,
+   - the proving key in `~/.zisk/provingKey/` consumed by `client.setup()`,
+   - the `cargo-zisk` binary in `~/.zisk/bin/`.
+
+   The first build of the host crate compiles the C++ side of the prover (~10 min,
+   cached afterwards). On macOS the emulator backend is selected automatically; the
+   asm backend is Linux x86_64 only.
+
+   `run_elements.sh` checks all of the above before triggering any compile and bails
+   with a copy-pasteable install command if anything is missing.
+
 ## Usage
 
 ```bash

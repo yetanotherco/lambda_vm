@@ -1,0 +1,11 @@
+[package]
+name = "fibonacci-zisk-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zisk-sdk = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v0.16.1" }
+anyhow = "1"
+
+[build-dependencies]
+zisk-build = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v0.16.1" }
