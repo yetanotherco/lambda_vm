@@ -437,6 +437,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        max_ram_bytes: None,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
