@@ -86,10 +86,10 @@ pub struct Prover<
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
-    PI,
-> IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
+        Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+        FieldExtension: Send + Sync + IsField,
+        PI,
+    > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
 where
     FieldElement<Field>: math::traits::ByteConversion,
     FieldElement<FieldExtension>: math::traits::ByteConversion,

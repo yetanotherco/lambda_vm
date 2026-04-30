@@ -50,8 +50,38 @@ impl<F: IsField> FieldElement<F> {
     // Source: https://en.wikipedia.org/wiki/Modular_multiplicative_inverse#Multiple_inverses
     /// Computes the multiplicative inverses of a slice of field elements
     /// The algorithm just performs one inversion and several multiplications and should be used
-    /// when wanting to invert several elements together
+    /// when wanting to invert several elements together.
+    ///
+    /// On `Err(InvZeroError)` the input slice is left unchanged (all-or-nothing).
+    /// The parallel path enforces this with a zero pre-scan; the sequential
+    /// path checks before any mutation.
     pub fn inplace_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError> {
+        #[cfg(feature = "parallel")]
+        {
+            // Montgomery batch inverse has a serial prefix-product dependency, but
+            // chunks are independent — each chunk inverts its own elements without
+            // needing values from other chunks. Trade K-1 extra field inversions
+            // (negligible vs ~2N mults per chunk) for K-way parallelism.
+            const PARALLEL_BATCH_INV_THRESHOLD: usize = 1 << 16;
+            if numbers.len() >= PARALLEL_BATCH_INV_THRESHOLD {
+                use rayon::prelude::*;
+                // Pre-scan for zeros so the mutation step is all-or-nothing.
+                // Without this, a chunk containing zero would return Err while
+                // sibling chunks may have already overwritten their elements.
+                let zero = Self::zero();
+                if numbers.par_iter().any(|x| x == &zero) {
+                    return Err(FieldError::InvZeroError);
+                }
+                let chunk_size = numbers.len().div_ceil(rayon::current_num_threads().max(1));
+                return numbers
+                    .par_chunks_mut(chunk_size)
+                    .try_for_each(Self::inplace_batch_inverse_sequential);
+            }
+        }
+        Self::inplace_batch_inverse_sequential(numbers)
+    }
+
+    fn inplace_batch_inverse_sequential(numbers: &mut [Self]) -> Result<(), FieldError> {
         if numbers.is_empty() {
             return Ok(());
         }
