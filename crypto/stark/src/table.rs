@@ -208,31 +208,6 @@ impl<F: IsField> Table<F> {
         .collect()
     }
 
-    /// Extract columns directly into pre-allocated output buffers.
-    ///
-    /// Each `output[col_idx]` is cleared and filled with the column data.
-    /// When `output[col_idx].capacity() >= height`, no heap allocation occurs.
-    /// This eliminates the T1 transpose allocation that `columns()` performs.
-    pub fn extract_columns_into(&self, output: &mut [Vec<FieldElement<F>>]) {
-        debug_assert!(
-            output.len() >= self.width,
-            "output has {} buffers but table has {} columns",
-            output.len(),
-            self.width
-        );
-        #[cfg(feature = "parallel")]
-        let iter = output[..self.width].par_iter_mut().enumerate();
-        #[cfg(not(feature = "parallel"))]
-        let iter = output[..self.width].iter_mut().enumerate();
-        iter.for_each(|(col_idx, buf)| {
-            buf.clear();
-            buf.reserve(self.height.saturating_sub(buf.capacity()));
-            for row_idx in 0..self.height {
-                buf.push(self.get(row_idx, col_idx).clone());
-            }
-        });
-    }
-
     /// Given row and column indexes, returns the stored field element in that position of the table.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
@@ -270,7 +245,7 @@ impl<F: IsField> Table<F> {
 
     /// Spill the table's row-major data to a temp file and mmap it back.
     /// Frees the heap `data` Vec while preserving access through `get()`,
-    /// `get_row()`, `columns()`, and `extract_columns_into()`.
+    /// `get_row()`, and `columns()`.
     ///
     /// No-op if the table is empty or already spilled.
     #[cfg(feature = "disk-spill")]
