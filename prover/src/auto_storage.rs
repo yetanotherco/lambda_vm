@@ -40,8 +40,8 @@ const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 /// Fraction of the effective RAM budget below which `Ram` is kept. The
 /// remainder is headroom for the OS, other processes, and allocator
 /// fragmentation.
-pub const SAFETY_FRACTION_NUM: u64 = 9;
-pub const SAFETY_FRACTION_DEN: u64 = 10;
+const SAFETY_FRACTION_NUM: u64 = 9;
+const SAFETY_FRACTION_DEN: u64 = 10;
 
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
@@ -284,7 +284,7 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
 /// set a cap. The caller should default to `Disk`: sysinfo fails in
 /// stripped-down containers where Ram would OOM. Otherwise the budget is
 /// the user's cap (if set), clamped down by what the OS reports available.
-pub fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
+fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     match (cap, available) {
         (Some(c), Some(a)) => Some(c.min(a)),
         (Some(c), None) => Some(c),

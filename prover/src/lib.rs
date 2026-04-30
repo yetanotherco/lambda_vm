@@ -30,8 +30,6 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -605,20 +603,7 @@ pub fn prove_with_options_and_inputs(
             proof_options.max_ram_bytes,
         );
 
-        log::info!("predicted_peak_bytes: {estimated_peak}");
-
-        if mode == StorageMode::Disk {
-            let budget =
-                auto_storage::effective_budget(available, proof_options.max_ram_bytes).unwrap_or(0);
-            let percent =
-                auto_storage::SAFETY_FRACTION_NUM * 100 / auto_storage::SAFETY_FRACTION_DEN;
-            log::info!(
-                "Auto disk-spill: estimated peak {} MB exceeds {}% of {} MB budget",
-                estimated_peak / 1_000_000,
-                percent,
-                budget / 1_000_000,
-            );
-        }
+        log::info!("predicted_peak_bytes: {estimated_peak}, storage_mode: {mode:?}");
 
         mode
     };
