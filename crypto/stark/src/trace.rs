@@ -1,4 +1,4 @@
-use crate::domain::Domain;
+use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
@@ -377,20 +377,16 @@ where
 /// Taking every blowup_factor-th point gives N evaluations on the trace-size coset
 /// {g * w_trace^i}, which is sufficient to interpolate a degree < N polynomial.
 ///
-/// Accepts precomputed `coset_points`, `coset_offset_pow_n`, `n_inv`, and `g_n_inv`
-/// to avoid redundant computation when these are already available from the caller
-/// (e.g., round_3 in prover.rs computes identical values for composition poly eval).
-#[allow(clippy::too_many_arguments)]
+/// Accepts a [`DomainConstants`] to avoid redundant computation when the caller
+/// has already derived these values (e.g., round_3 shares them with composition
+/// poly evaluation).
 pub fn get_trace_evaluations_from_lde<F, E>(
     lde_trace: &LDETraceTable<F, E>,
     domain: &Domain<F>,
     z: &FieldElement<E>,
     frame_offsets: &[usize],
     step_size: usize,
-    coset_points: &[FieldElement<F>],
-    coset_offset_pow_n: &FieldElement<F>,
-    n_inv: &FieldElement<F>,
-    g_n_inv: &FieldElement<F>,
+    dc: &DomainConstants<F>,
 ) -> Table<E>
 where
     F: IsSubFieldOf<E> + IsFFTField,
@@ -402,21 +398,18 @@ where
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
 
-    // Caller-supplied barycentric scalars must match the domain they describe.
-    // A mismatch would silently produce wrong evaluations (if too short) or panic
-    // with an opaque index-out-of-bounds in the LDE stride access below.
     debug_assert_eq!(
-        coset_points.len(),
+        dc.points.len(),
         n,
-        "coset_points length must equal domain.interpolation_domain_size"
+        "DomainConstants.points length must equal domain.interpolation_domain_size"
     );
 
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
     let evaluation_points =
         compute_frame_evaluation_points(z, frame_offsets, &domain.trace_primitive_root, step_size);
 
-    // Precompute n_inv * g_n_inv once — shared across all eval points and columns.
-    let n_inv_g_n_inv: FieldElement<F> = n_inv * g_n_inv;
+    // Precompute size_inv * offset_pow_n_inv once — shared across all eval points and columns.
+    let n_inv_g_n_inv: FieldElement<F> = &dc.size_inv * &dc.offset_pow_n_inv;
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
@@ -424,16 +417,17 @@ where
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
-        // vanishing_factor = (z^N - g^N) * n_inv * g_n_inv — shared across all columns
-        let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
+        // vanishing_factor = (z^N - offset^N) * size_inv * offset_pow_n_inv
+        let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
         let vanishing_factor = &n_inv_g_n_inv * &vanishing;
 
         // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
-        let inv_denoms = barycentric_inv_denoms(eval_point, coset_points);
+        let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
 
-        // Precompute col_scale[i] = coset_point[i] * inv_denom[i] — shared across ALL columns.
+        // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
         // This eliminates N redundant F×E multiplies per column.
-        let col_scale: Vec<FieldElement<E>> = coset_points
+        let col_scale: Vec<FieldElement<E>> = dc
+            .points
             .iter()
             .zip(inv_denoms.iter())
             .map(|(point, inv_d)| point * inv_d)
