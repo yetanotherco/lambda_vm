@@ -43,13 +43,42 @@ pub(crate) struct MmapNodeBacking {
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
 #[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serde", not(feature = "disk-spill")),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    all(feature = "serde", feature = "disk-spill"),
+    derive(serde::Deserialize)
+)]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
+}
+
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> serde::Serialize for MerkleTree<B>
+where
+    B::Node: serde::Serialize + Copy,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MerkleTree", 2)?;
+        s.serialize_field("root", &self.root)?;
+        if let Some(ref backing) = self.mmap_backing {
+            let mut materialized = Vec::with_capacity(backing.node_count);
+            for i in 0..backing.node_count {
+                materialized.push(*self.node_get(i).expect("index in bounds"));
+            }
+            s.serialize_field("nodes", &materialized)?;
+        } else {
+            s.serialize_field("nodes", &self.nodes)?;
+        }
+        s.end()
+    }
 }
 
 const ROOT: usize = 0;
@@ -325,5 +354,41 @@ where
         });
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "serde", feature = "disk-spill"))]
+mod disk_spill_serde_tests {
+    use super::*;
+    use crate::merkle_tree::backends::field_element::FieldElementBackend;
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+    use sha3::Keccak256;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+    type Backend = FieldElementBackend<F, Keccak256, 32>;
+
+    /// Serializing a spilled MerkleTree must produce identical bytes to
+    /// serializing the same tree before spilling, and round-trip back to an
+    /// equal tree.
+    #[test]
+    fn test_serialize_spilled_merkle_tree_matches_unspilled() {
+        let values: Vec<FE> = (1..17).map(FE::from).collect();
+        let unspilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
+        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
+
+        let mut spilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
+        spilled.spill_nodes_to_disk().expect("spill_nodes_to_disk");
+        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
+
+        assert_eq!(
+            spilled_bytes, unspilled_bytes,
+            "spilled and unspilled trees must serialize to identical bytes"
+        );
+
+        let restored: MerkleTree<Backend> =
+            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
+        assert!(restored.mmap_backing.is_none());
+        assert_eq!(restored.root, unspilled.root);
     }
 }

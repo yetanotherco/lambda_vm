@@ -39,6 +39,7 @@ serde_cbor = { version = "0.11.1" }
 criterion = { version = "0.4", default-features = false }
 env_logger = "*"
 test-log = { version = "0.2.11", features = ["log"] }
+bincode = "1"
 
 [features]
 test-utils = []

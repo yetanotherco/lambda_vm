@@ -38,8 +38,8 @@ impl std::fmt::Debug for TableMmapBacking {
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
-#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
+#[derive(Default, Debug, serde::Deserialize)]
+#[cfg_attr(not(feature = "disk-spill"), derive(serde::Serialize, Clone))]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -48,6 +48,31 @@ pub struct Table<F: IsField> {
     #[cfg(feature = "disk-spill")]
     #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
+}
+
+#[cfg(feature = "disk-spill")]
+impl<F: IsField> serde::Serialize for Table<F>
+where
+    FieldElement<F>: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Table", 3)?;
+        if self.mmap_backing.is_some() {
+            let mut materialized = Vec::with_capacity(self.width * self.height);
+            for r in 0..self.height {
+                for elem in self.get_row(r) {
+                    materialized.push(elem.clone());
+                }
+            }
+            s.serialize_field("data", &materialized)?;
+        } else {
+            s.serialize_field("data", &self.data)?;
+        }
+        s.serialize_field("width", &self.width)?;
+        s.serialize_field("height", &self.height)?;
+        s.end()
+    }
 }
 
 /// Cloning a spilled table reads its mmap bytes into a fresh heap `Vec`
@@ -488,5 +513,33 @@ mod disk_spill_tests {
         assert_eq!(cloned.width, width);
         assert_eq!(cloned.height, height);
         assert_eq!(cloned, table, "clone must equal source element-wise");
+    }
+
+    /// Serializing a spilled table must produce identical bytes to serializing
+    /// the same table before spilling, and round-trip back to an equal table.
+    #[test]
+    fn test_serialize_spilled_table_matches_unspilled() {
+        let width = 4;
+        let height = 8;
+        let data: Vec<FieldElement<F>> = (0..width * height)
+            .map(|i| FieldElement::<F>::from(i as u64))
+            .collect();
+
+        let unspilled = Table::new(data.clone(), width);
+        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
+
+        let mut spilled = Table::new(data, width);
+        spilled.spill_to_disk().expect("spill_to_disk failed");
+        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
+
+        assert_eq!(
+            spilled_bytes, unspilled_bytes,
+            "spilled and unspilled tables must serialize to identical bytes"
+        );
+
+        let restored: Table<F> =
+            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
+        assert!(!restored.is_spilled());
+        assert_eq!(restored, unspilled);
     }
 }
