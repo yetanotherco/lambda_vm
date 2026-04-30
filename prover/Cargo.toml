@@ -8,10 +8,6 @@ default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
-# Compiles in the auto disk-spill selector. With the feature off the prover
-# always uses `StorageMode::Ram` and skips the analytical peak-RAM estimate,
-# which is useful for benchmarks that want to exercise the pure-Ram path.
-# Forwards into stark/disk-spill, which pulls in memmap2/tempfile/libc.
 disk-spill = ["stark/disk-spill"]
 
 [dependencies]
