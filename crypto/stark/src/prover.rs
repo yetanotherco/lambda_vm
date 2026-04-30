@@ -33,7 +33,7 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::Domain;
+use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -989,25 +989,12 @@ pub trait IsStarkProver<
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
-        // === Composition poly parts: barycentric evaluation at z^num_parts ===
-        // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
-        // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
-        let coset_points: Vec<FieldElement<Field>> = (0..domain_size)
-            .map(|i| domain.lde_roots_of_unity_coset[i * blowup_factor].clone())
-            .collect();
-        // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
-        // functions use F×E→E mixed arithmetic, avoiding field conversions.
-        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(domain_size);
-        let domain_size_inv: FieldElement<Field> = FieldElement::<Field>::from(domain_size as u64)
-            .inv()
-            .expect("domain_size is a power of two, hence non-zero in the field");
-        let g_n_inv: FieldElement<Field> = coset_offset_pow_n
-            .inv()
-            .expect("coset_offset_pow_n is non-zero");
+        // === Shared domain constants for barycentric evaluation ===
+        let dc = DomainConstants::from_domain(domain);
 
-        // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
+        // === Composition poly parts: barycentric evaluation at z^num_parts ===
         let comp_z_pow_n = z_power.pow(domain_size);
-        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
+        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
             .lde_composition_poly_evaluations
@@ -1019,10 +1006,10 @@ pub trait IsStarkProver<
                     .collect();
                 math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
-                    &coset_offset_pow_n,
-                    &domain_size_inv,
-                    &g_n_inv,
-                    &coset_points,
+                    &dc.offset_pow_n,
+                    &dc.size_inv,
+                    &dc.offset_pow_n_inv,
+                    &dc.points,
                     &evals,
                     &comp_inv_denoms,
                 )
@@ -1030,20 +1017,13 @@ pub trait IsStarkProver<
             .collect();
 
         // === Trace polynomials: barycentric evaluation via LDE ===
-        // Uses get_trace_evaluations_from_lde which performs barycentric interpolation
-        // on the LDE trace data, avoiding the need for coefficient-form trace_polys.
-        // Reuses coset_points, coset_offset_pow_n, domain_size_inv, g_n_inv already
-        // computed above for composition poly evaluation — avoids redundant work.
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
             &round_1_result.lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
             air.step_size(),
-            &coset_points,
-            &coset_offset_pow_n,
-            &domain_size_inv,
-            &g_n_inv,
+            &dc,
         );
 
         Round3 {
