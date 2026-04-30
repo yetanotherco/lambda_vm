@@ -1831,25 +1831,23 @@ fn collect_all_ops(
     }
 }
 
-/// Result of phases 3-4: extended ops + derived metadata used by phase 5
-/// and by the main-elements estimator.
-struct DerivedOps {
-    ops: CollectedOps,
-    public_output_bytes: Vec<u8>,
-    num_padding_rows: usize,
-    halt_timestamp: u64,
-}
-
-/// Phases 3-4: Extend `lt_ops` with MEMW-derived LT ops, extend `bitwise_ops`
-/// with derivations from every other table, compute public-output bytes and
-/// halt timestamp. Cheap compared to phase 5 — no trace tables allocated.
-fn derive_ops(
+/// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
+///
+/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
+/// and PAGE bitwise lookups; `None` produces empty page tables.
+#[allow(clippy::too_many_arguments)]
+fn build_traces(
     ops: CollectedOps,
     elf: Option<&Elf>,
     memory_state: &MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
-) -> Result<DerivedOps, Error> {
+) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -1903,102 +1901,17 @@ fn derive_ops(
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
-    // Extract halt timestamp from the last ECALL instruction (needed by phase 5).
+    // =====================================================================
+    // PHASE 5: Generate final traces (parallelized)
+    // =====================================================================
+
+    // Extract halt timestamp from the last ECALL instruction
     let halt_op = cpu_ops
         .iter()
         .rev()
         .find(|op| op.decode.op_ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
-
-    Ok(DerivedOps {
-        ops: CollectedOps {
-            cpu_ops,
-            memw_ops,
-            memw_aligned_ops,
-            memw_register_ops,
-            load_ops,
-            lt_ops,
-            shift_ops,
-            bitwise_ops,
-            branch_ops,
-            mul_ops,
-            dvrm_ops,
-            commit_ops,
-        },
-        public_output_bytes,
-        num_padding_rows,
-        halt_timestamp,
-    })
-}
-
-/// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
-///
-/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
-/// and PAGE bitwise lookups; `None` produces empty page tables.
-#[allow(clippy::too_many_arguments)]
-fn build_traces(
-    ops: CollectedOps,
-    elf: Option<&Elf>,
-    memory_state: &MemoryState,
-    entry_point: u64,
-    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
-    max_rows: &super::MaxRowsConfig,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    private_input: &[u8],
-) -> Result<Traces, Error> {
-    let derived = derive_ops(ops, elf, memory_state, max_rows, private_input)?;
-    generate_traces(
-        derived,
-        elf,
-        memory_state,
-        entry_point,
-        decode_trace,
-        decode_pc_to_row,
-        register_state,
-        max_rows,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-        private_input,
-    )
-}
-
-/// Phase 5: allocate trace tables (this is the heavy phase for memory).
-#[allow(clippy::too_many_arguments)]
-fn generate_traces(
-    derived: DerivedOps,
-    elf: Option<&Elf>,
-    memory_state: &MemoryState,
-    entry_point: u64,
-    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
-    max_rows: &super::MaxRowsConfig,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    private_input: &[u8],
-) -> Result<Traces, Error> {
-    let DerivedOps {
-        ops:
-            CollectedOps {
-                cpu_ops,
-                memw_ops,
-                memw_aligned_ops,
-                memw_register_ops,
-                load_ops,
-                lt_ops,
-                shift_ops,
-                bitwise_ops,
-                branch_ops,
-                mul_ops,
-                dvrm_ops,
-                commit_ops,
-            },
-        public_output_bytes,
-        num_padding_rows,
-        halt_timestamp,
-    } = derived;
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -2834,12 +2747,9 @@ impl Traces {
             &mut register_state,
         );
 
-        // Phases 3-4
-        let derived = derive_ops(ops, Some(elf), &memory_state, max_rows, private_input)?;
-
-        // Phase 5
-        generate_traces(
-            derived,
+        // Phases 3-5
+        build_traces(
+            ops,
             Some(elf),
             &memory_state,
             elf.entry_point,
