@@ -720,6 +720,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // --- Theta: Cxz chain XOR_BYTE (160) ---
+    // TODO(spec opt #5, keccak.typ:114-115): collapse the 4-stage Cxz chain
+    // into a 3-way XOR lookup. Would save ~80 XOR_BYTE interactions and 80
+    // intermediate Cxz columns per round. Requires a new BITWISE entry
+    // indexed by (a, b, c) ∈ Byte^3, i.e. a 2^24-row table — 16× the current
+    // 2^20 rows — so the BITWISE commitment cost likely outweighs the
+    // per-round savings. Deferred for this PoC.
     // Stage 0: XOR(start[x,0,z], start[x,1,z]) → Cxz[x,0,z]
     for x in 0..5 {
         for b in 0..8 {
