@@ -37,9 +37,7 @@ const LOG_STRUCT_BYTES: u64 = 40;
 const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
-/// Fraction of the effective RAM budget below which `Ram` is kept. The
-/// remainder is headroom for the OS, other processes, and allocator
-/// fragmentation.
+/// 9/10 budget headroom for OS, other processes, and allocator slack.
 const SAFETY_FRACTION_NUM: u64 = 9;
 const SAFETY_FRACTION_DEN: u64 = 10;
 
@@ -47,10 +45,6 @@ const SAFETY_FRACTION_DEN: u64 = 10;
 type TableSpec = (u64, u64, u64, u64);
 
 /// Bytes alive for the duration of phase D (LDE columns + main/aux Merkle).
-///
-/// Saturating arithmetic: any future table whose product exceeds `u64::MAX`
-/// saturates and forces Disk via `peak_bytes`, the safe direction. Wrapping
-/// would produce a small estimate and pick Ram on a proof that would OOM.
 fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, main_cols, aux_cols, main_trees) = spec;
     let main_lde = rows
@@ -76,10 +70,7 @@ fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
         .saturating_add(aux_merkle)
 }
 
-/// Bytes alive only while one chunk of `k` tables is in rounds 2-4. Sums:
-/// `constraint_evaluations` (transient mid-round 2), the two LDE-size
-/// composition parts (d=2 path, every current AIR), the composition Merkle,
-/// and the geometric-sum FRI evals + FRI Merkle.
+/// Bytes (constraint evals, composition, FRI) alive during rounds 2-4 for one chunk.
 fn transient_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, _, _, _) = spec;
     let lde_size = rows.saturating_mul(blowup);
@@ -95,10 +86,7 @@ fn transient_per_table(spec: TableSpec, blowup: u64) -> u64 {
         .saturating_add(fri_merkle)
 }
 
-/// Bytes for one (trace_length, blowup, coset_offset) entry in the prover's
-/// Domain/LdeTwiddles cache. Domain holds `trace_roots_of_unity` (N elts) and
-/// `lde_roots_of_unity_coset` (N×B). LdeTwiddles holds `inv` (~N), `fwd`
-/// (~N×B), and `coset_weights` (N). All in base field (Goldilocks, 8 B).
+/// Bytes for one Domain/LdeTwiddles cache entry.
 fn domain_cache_bytes(rows: u64, blowup: u64) -> u64 {
     rows.saturating_mul(3 + 2 * blowup)
         .saturating_mul(GOLDILOCKS_BYTES)
@@ -108,8 +96,7 @@ fn aux_cols(bus_count: usize) -> u64 {
     bus_count.div_ceil(2) as u64
 }
 
-/// Build the full per-table table list for a given `TableLengths`. Order
-/// matches the order tables are added to `air_trace_pairs` in `prove`.
+/// Per-table specs in the same order as `air_trace_pairs` in `prove`.
 fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
@@ -278,12 +265,7 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
         .saturating_add(state_total)
 }
 
-/// Effective RAM budget against which the estimate is compared.
-///
-/// Returns `None` when sysinfo can't read system memory and the user hasn't
-/// set a cap. The caller should default to `Disk`: sysinfo fails in
-/// stripped-down containers where Ram would OOM. Otherwise the budget is
-/// the user's cap (if set), clamped down by what the OS reports available.
+/// User cap ∩ OS available, or None if both are unknown.
 fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     match (cap, available) {
         (Some(c), Some(a)) => Some(c.min(a)),
@@ -292,21 +274,8 @@ fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Pick a storage mode given the estimate and the machine's available RAM.
-///
-/// Uses 90% of the effective budget as the cutoff so there's headroom for the
-/// OS, other processes, and allocator fragmentation. `cap` is an optional
-/// user-imposed limit (see `ProofOptions::max_ram_bytes`) which overrides the
-/// machine's reported available RAM when smaller.
-///
-/// When neither `available` nor `cap` is known, defaults to `Disk`: sysinfo
-/// fails in stripped-down containers where Ram would OOM. Pass a large
-/// `max_ram_bytes` to opt out if you know the machine has enough RAM.
-///
-/// `available` is a one-shot sample. If a concurrent process allocates between
-/// this call and phase 5, this function may pick `Ram` and the prover OOMs.
-/// The 90% headroom covers background jitter; under contention, pass
-/// `ProofOptions::max_ram_bytes` for a hard cap.
+/// Disk if `estimated` exceeds 90% of the effective budget, else Ram.
+/// Defaults to Disk when budget is unknown (sysinfo failure + no cap).
 pub fn select_storage_mode(
     estimated: u64,
     available: Option<u64>,
@@ -328,16 +297,12 @@ pub fn select_storage_mode(
     }
 }
 
-/// Query the OS for available (not total) RAM in bytes. Returns `None` when
-/// sysinfo can't read system memory (e.g. inside containers without
-/// `/proc/meminfo`); a zero free reading on a near-OOM system returns
-/// `Some(0)` so the caller forces Disk instead of falling back to Ram and
-/// OOMing.
+/// OS-available RAM, or None if sysinfo can't read it (e.g. stripped containers).
+/// Returns `Some(0)` on near-OOM so callers force Disk rather than fall back to Ram.
 pub fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    // total_memory disambiguates: 0 means sysinfo can't read system memory;
-    // non-zero means available's value (including 0) is real.
+    // total_memory == 0 means sysinfo can't read; otherwise available is real.
     if sys.total_memory() == 0 {
         None
     } else {

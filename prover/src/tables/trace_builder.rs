@@ -99,9 +99,7 @@ impl MemoryState {
         Self { cells }
     }
 
-    /// Count unique memory pages touched during execution. Used by the
-    /// main-elements estimator to account for PAGE-table rows without
-    /// allocating the trace tables. O(N) in `cells.len()`.
+    /// Count unique memory pages touched during execution.
     #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
         let mask = !(page_size - 1);
@@ -2062,9 +2060,7 @@ fn build_traces(
     })
 }
 
-/// Row count for a chunked table after `chunk_and_generate` padding: each
-/// chunk is rounded up to `len.next_power_of_two().max(4)`. Matches the
-/// per-table `generate_*_trace` calls exactly.
+/// Padded row count after chunking: each chunk rounds up to `next_power_of_two().max(4)`.
 #[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     if ops_count == 0 {
@@ -2080,11 +2076,7 @@ fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     total
 }
 
-/// Per-table row counts (post-chunking + post-padding) plus the auxiliary
-/// quantities needed to compute peak heap usage analytically: DECODE row count,
-/// unique-page count, executor cycle count, and unique-byte-address count.
-/// Computed by [`count_table_lengths`] without allocating any operation
-/// vectors or trace tables.
+/// Per-table padded row counts plus auxiliary metrics for peak-heap estimation.
 #[cfg(feature = "disk-spill")]
 #[derive(Debug, Default, Clone)]
 pub struct TableLengths {
@@ -2101,29 +2093,15 @@ pub struct TableLengths {
     pub commit_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
-    /// Executor cycle count. Equals `logs.len()` and bounds `Vec<Log>` size.
+    /// Executor cycle count.
     pub cycle_count: u64,
-    /// Unique byte addresses touched (ELF + private input + runtime). Sized
-    /// by `MemoryState.cells.len()` and is the dominant non-trace heap term
-    /// for memory-heavy programs.
+    /// Unique byte addresses touched (dominant non-trace heap term).
     pub unique_byte_count: u64,
 }
 
-/// Stream `logs` once and compute upper-bound per-table row counts the trace
-/// builder would produce, without allocating the `Vec<*Operation>`
-/// intermediates.
-///
-/// Mirrors the same partition + derivation logic as `Traces::from_elf_and_logs`
-/// (phases 0–4: ELF decode, op collection, MEMW partitioning, LT/MUL/DVRM
-/// derivation), but every per-cycle struct lives on the stack and is dropped
-/// immediately after the partition predicate runs. Heap usage during this
-/// pass is `O(unique_pages + 32)` (memory + register state), not `O(N)`.
-///
-/// Returns an upper bound (not exact) for tables whose `generate_*_trace`
-/// deduplicates identical operations: LT, MUL, DVRM, BRANCH.
-///
-/// The two places that must stay in sync when the trace shape changes: this
-/// function and `Traces::from_elf_and_logs`.
+/// Compute upper-bound per-table row counts without allocating op vectors.
+/// Returns bounds (not exact) for tables that dedup ops: LT, MUL, DVRM, BRANCH.
+/// Must stay in sync with `Traces::from_elf_and_logs`.
 #[cfg(feature = "disk-spill")]
 pub fn count_table_lengths(
     elf: &Elf,

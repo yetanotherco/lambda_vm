@@ -566,8 +566,7 @@ pub trait IsStarkProver<
         let mut columns = trace.extract_columns_main(lde_size);
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
-            // Data is now in `columns`. Evict the mmap pages from the OS page
-            // cache so the same data doesn't occupy RAM in both places.
+            // Evict mmap pages so spilled data doesn't occupy heap + cache.
             trace.main_table.advise_drop_cache();
         }
         #[cfg(feature = "instruments")]
@@ -1622,9 +1621,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
-        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
-        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        // Deduplicate Domain/LdeTwiddles by (trace_length, blowup, coset).
         type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
         let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
             std::collections::HashMap::new();
@@ -1656,15 +1653,11 @@ pub trait IsStarkProver<
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
-        // Free the HashMap (which holds extra strong Arc references) before the
-        // long proving rounds begin. `domains` and `twiddle_caches` already hold
-        // the only surviving Arcs we care about.
         drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
 
-        // Spill all main trace tables to mmap before any Round 1 LDE work.
-        // Freeing heap makes room for LDE columns built below.
+        // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             #[cfg(feature = "parallel")]

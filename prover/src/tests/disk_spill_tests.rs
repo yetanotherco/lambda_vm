@@ -1,9 +1,5 @@
-//! End-to-end tests forcing `StorageMode::Disk` via a tiny `max_ram_bytes` cap.
-//!
-//! These exercise the same code paths the auto-detector would select for a
-//! large program on a memory-constrained machine: trace spill, LDE spill, and
-//! Merkle-tree spill. We pin the cap to 1 MB so even the smallest ELF crosses
-//! the threshold deterministically.
+//! End-to-end tests forcing Disk storage via a 1 MB `max_ram_bytes` cap, so
+//! even the smallest ELF deterministically crosses the threshold.
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
@@ -18,9 +14,7 @@ fn options_forcing_disk() -> stark::proof::options::ProofOptions {
     opts
 }
 
-/// Prove + verify a small program end-to-end with Disk storage forced.
-/// This exercises the full pipeline: trace generation, main-trace spill,
-/// LDE spill, Merkle-tree spill, and verification.
+/// Prove + verify a small program with Disk storage forced.
 #[test]
 fn test_disk_spill_prove_and_verify_small() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -31,9 +25,7 @@ fn test_disk_spill_prove_and_verify_small() {
     assert!(ok, "verification returned false");
 }
 
-/// Prove + verify with `MaxRowsConfig::small()` (tiny chunks) to force many
-/// chunks. Ensures disk-spill works across chunk boundaries where pool
-/// buffers are reused and main traces are spilled per-chunk.
+/// Prove + verify with small chunks to exercise spill across chunk boundaries.
 #[test]
 fn test_disk_spill_prove_and_verify_with_chunks() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -44,8 +36,7 @@ fn test_disk_spill_prove_and_verify_with_chunks() {
     assert!(ok, "verification returned false");
 }
 
-/// Prove, serialize with bincode, deserialize, then verify.
-/// Reproduces the CLI path: prove → write → read → verify.
+/// Prove, serialize, deserialize, verify (CLI roundtrip).
 #[test]
 fn test_disk_spill_serialization_roundtrip() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -59,8 +50,7 @@ fn test_disk_spill_serialization_roundtrip() {
     assert!(valid, "verification failed after serialization roundtrip");
 }
 
-/// Test prove+verify with a larger program (2M instructions).
-/// Catches bugs that only manifest at scale (multiple chunks, larger tables).
+/// Prove + verify a 2M-instruction program to catch scale-only bugs.
 #[test]
 fn test_disk_spill_prove_and_verify_2m() {
     let _ = env_logger::builder().is_test(true).try_init();
