@@ -10,6 +10,7 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+#[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
@@ -658,12 +659,14 @@ pub fn prove_with_options_and_inputs(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove_with_mode(
-        airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
-        storage_mode,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let air_pairs = airs.air_trace_pairs(&mut traces);
+    let transcript = &mut DefaultTranscript::<E>::new(&[]);
+    #[cfg(feature = "disk-spill")]
+    let proof = Prover::multi_prove_with_mode(air_pairs, transcript, storage_mode)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(not(feature = "disk-spill"))]
+    let proof =
+        Prover::multi_prove(air_pairs, transcript).map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     #[cfg(feature = "instruments")]
     {

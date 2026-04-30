@@ -1566,15 +1566,29 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        Self::multi_prove_with_mode(air_trace_pairs, transcript, StorageMode::Ram)
+        Self::multi_prove_inner(air_trace_pairs, transcript, StorageMode::Ram)
     }
 
     /// Same as `multi_prove` but lets callers back intermediate state with mmap
     /// files to cap peak RAM usage.
+    #[cfg(feature = "disk-spill")]
     fn multi_prove_with_mode(
-        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         storage_mode: StorageMode,
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        Self::multi_prove_inner(air_trace_pairs, transcript, storage_mode)
+    }
+
+    fn multi_prove_inner(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
