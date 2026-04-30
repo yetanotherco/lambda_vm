@@ -16,34 +16,6 @@
 //!    `multi_prove_with_mode` (see prover.rs around the
 //!    `domain_cache` HashMap).
 //!
-//! Per-table contributions, given padded row count `N`, blowup `B`, full main
-//! columns `C_m` (including precomputed/multiplicity columns kept in the LDE),
-//! aux columns `C_a`, and `T` main Merkle trees (1 for the unified path, 2 for
-//! the preprocessed path that builds precomputed_tree + mult_tree):
-//!
-//! ```text
-//! main LDE          : N × C_m × 8 × (1+B)              (Goldilocks = 8 B)
-//! main Merkle       : T × 2 × N × B × 32               (Keccak256 node = 32 B)
-//! aux trace + LDE   : N × C_a × 24 × (1+B)             (cubic ext = 24 B)
-//! aux Merkle        : 2 × N × B × 32
-//! constraint evals  : N × B × 24                       (round 2 transient)
-//! composition LDE   : 2 × N × B × 24                   (d=2 → two parts)
-//! composition Merkle: N × B × 32                       (PairKeccak: N/2 leaves)
-//! FRI evals         : N × B × 24                       (geometric ≈ 1)
-//! FRI Merkle        : N × B × 32                       (geometric ≈ 1)
-//! ```
-//!
-//! `aux_cols = ⌈bus_interactions.len() / 2⌉` — the LogUp committed-pair count
-//! used by `Traces::total_auxiliary_field_elements`.
-//!
-//! Plus state kept alive across the prove call:
-//!
-//! ```text
-//! MemoryState.cells : unique_byte_count × 32   (HashMap<u64, (u8,u64)> ≈ 32 B/entry)
-//! Log Vec           : cycle_count × 40         (Log struct = 5 × u64)
-//! Instructions map  : decode_rows × 32
-//! ```
-//!
 //! Per-table row counts and the state-driving counters all come from
 //! [`TableLengths`] via [`count_table_lengths`], itself derived from the
 //! execution logs without allocating any operation vectors.
