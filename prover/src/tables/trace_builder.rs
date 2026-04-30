@@ -102,6 +102,10 @@ impl MemoryState {
     /// Count unique memory pages touched during execution.
     #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
+        debug_assert!(
+            page_size.is_power_of_two(),
+            "page_size must be a power of two for the bitmask to work"
+        );
         let mask = !(page_size - 1);
         let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
         pages.len() as u64
