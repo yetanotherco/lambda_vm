@@ -48,6 +48,7 @@ mod fft_helpers_test {
 mod fft_polynomial_tests {
     use crate::field::traits::IsField;
 
+    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
     use crate::fft::cpu::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
@@ -227,6 +228,17 @@ mod fft_polynomial_tests {
                 prop_assert_eq!(poly, new_poly);
             }
 
+            // Property-based test that ensures evaluate_fft_bit_reversed returns the same
+            // values as evaluate_fft followed by an in-place bit-reverse permutation,
+            // across varying blowup factors.
+            #[test]
+            fn test_fft_bit_reversed_matches_evaluate_fft_then_permute(poly in poly(6), blowup_factor in powers_of_two(4)) {
+                let mut expected = Polynomial::evaluate_fft::<F>(&poly, blowup_factor, None).unwrap();
+                in_place_bit_reverse_permute(&mut expected);
+                let got = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, blowup_factor, None).unwrap();
+                prop_assert_eq!(got, expected);
+            }
+
             #[test]
             fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
                 prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
@@ -252,6 +264,24 @@ mod fft_polynomial_tests {
                 compose_fft::<F, F>(&p, &q),
                 Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(2)])
             );
+        }
+
+        #[test]
+        fn fft_bit_reversed_handles_domain_size_greater_than_coeff_len() {
+            let poly = Polynomial::new(&[FE::new(1), FE::new(2), FE::new(3)]);
+            let domain_size = 32;
+            let mut expected = Polynomial::evaluate_fft::<F>(&poly, 1, Some(domain_size)).unwrap();
+            in_place_bit_reverse_permute(&mut expected);
+            let got =
+                Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 1, Some(domain_size)).unwrap();
+            assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn fft_bit_reversed_returns_zeros_for_empty_polynomial() {
+            let poly: Polynomial<FE> = Polynomial::new(&[]);
+            let got = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 1, Some(8)).unwrap();
+            assert_eq!(got, vec![FE::zero(); 8]);
         }
     }
 
