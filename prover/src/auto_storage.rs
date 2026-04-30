@@ -299,6 +299,9 @@ pub fn select_storage_mode(
 
 /// OS-available RAM, or None if sysinfo can't read it (e.g. stripped containers).
 /// Returns `Some(0)` on near-OOM so callers force Disk rather than fall back to Ram.
+///
+/// Reads host `/proc/meminfo`, not cgroup limits — set `max_ram_bytes` in
+/// containerized environments to bound the budget to the container's limit.
 pub fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
