@@ -281,11 +281,13 @@ impl<F: IsField> Table<F> {
     where
         F::BaseType: Copy,
     {
+        // mmap base is page-aligned (typically 4096); any element with smaller
+        // alignment is therefore aligned at every offset, since size_of is
+        // always a multiple of align_of by Rust layout rules.
         const {
             assert!(
-                std::mem::size_of::<FieldElement<F>>()
-                    .is_multiple_of(std::mem::align_of::<FieldElement<F>>()),
-                "FieldElement<F> size must be a multiple of its alignment for mmap interior reads to be aligned"
+                std::mem::align_of::<FieldElement<F>>() <= 4096,
+                "FieldElement<F> alignment must fit within mmap page alignment"
             )
         }
 
