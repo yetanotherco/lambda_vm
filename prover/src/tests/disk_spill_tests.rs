@@ -7,10 +7,7 @@
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::Traces;
 use crate::test_utils::asm_elf_bytes;
-use executor::elf::Elf;
-use executor::vm::execution::Executor;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 const FORCE_DISK_CAP: u64 = 1_000_000;
@@ -73,64 +70,6 @@ fn test_disk_spill_prove_and_verify_2m() {
         .expect("prove failed");
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
     assert!(ok, "verification returned false for fib_iterative_2M");
-}
-
-/// `count_table_lengths().total_main_elements()` must be a safe upper bound
-/// on the post-build `Traces::total_field_elements`, so the pre-build
-/// Disk/Ram decision never under-predicts peak (i.e. never picks Ram on a
-/// proof that would actually OOM).
-///
-/// Equality does not hold: LT/MUL/DVRM/BRANCH `generate_*_trace` functions
-/// deduplicate identical operations into one row plus a multiplicity. The
-/// streaming counter pass tracks raw op counts, which are `>=` the unique
-/// counts the trace builder uses.
-fn assert_count_is_upper_bound_on_built_trace(program_name: &str) {
-    let elf_bytes = asm_elf_bytes(program_name);
-    let program = Elf::load(&elf_bytes).expect("elf load");
-    let executor = Executor::new(&program, Vec::new()).expect("executor");
-    let result = executor.run().expect("run");
-    let max_rows = MaxRowsConfig::default();
-
-    let lengths =
-        crate::tables::trace_builder::count_table_lengths(&program, &result.logs, &max_rows, &[])
-            .expect("count_table_lengths");
-    let main_via_count = lengths.total_main_elements();
-
-    let traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[])
-        .expect("from_elf_and_logs");
-    let main_via_traces = traces.total_field_elements();
-
-    assert!(
-        main_via_count >= main_via_traces,
-        "count ({main_via_count}) underestimated built trace ({main_via_traces}) on {program_name}"
-    );
-
-    let aux_via_count = lengths.total_aux_elements();
-    let aux_via_traces = traces.total_auxiliary_field_elements();
-    assert!(
-        aux_via_count >= aux_via_traces,
-        "count ({aux_via_count}) underestimated built aux trace ({aux_via_traces}) on {program_name}"
-    );
-}
-
-#[test]
-fn test_count_is_upper_bound_sub() {
-    assert_count_is_upper_bound_on_built_trace("sub");
-}
-
-#[test]
-fn test_count_is_upper_bound_mul() {
-    assert_count_is_upper_bound_on_built_trace("mul");
-}
-
-#[test]
-fn test_count_is_upper_bound_divu() {
-    assert_count_is_upper_bound_on_built_trace("divu");
-}
-
-#[test]
-fn test_count_is_upper_bound_fib_iterative_160k() {
-    assert_count_is_upper_bound_on_built_trace("fib_iterative_160k");
 }
 
 /// Same as roundtrip test but with small chunks.

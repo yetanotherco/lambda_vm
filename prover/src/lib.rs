@@ -524,13 +524,16 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let lengths = crate::tables::trace_builder::count_table_lengths(
+    let traces = Traces::from_elf_and_logs(
         &program,
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
     )?;
-    Ok((lengths.total_main_elements(), lengths.total_aux_elements()))
+    Ok((
+        traces.total_field_elements(),
+        traces.total_auxiliary_field_elements(),
+    ))
 }
 
 /// Prove an ELF binary execution with custom proof options and max rows config.

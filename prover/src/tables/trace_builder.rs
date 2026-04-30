@@ -2193,110 +2193,6 @@ pub struct TableLengths {
     pub unique_byte_count: u64,
 }
 
-impl TableLengths {
-    /// Upper bound on main-trace (base-field) elements. Mirrors
-    /// [`Traces::total_field_elements`] column-for-column.
-    ///
-    /// This is *not* exact for tables whose `generate_*_trace` deduplicates
-    /// identical operations into a single row with a multiplicity (LT, MUL,
-    /// DVRM, BRANCH). For those, the streaming counter pass tracks the raw op
-    /// count, which is `>=` the post-dedup unique count. The result is an
-    /// upper bound — safe for the [`peak_bytes`] decision (errs toward Disk).
-    ///
-    /// [`peak_bytes`]: crate::auto_storage::peak_bytes
-    pub fn total_main_elements(&self) -> u64 {
-        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
-        use super::bitwise::NUM_ROWS as BITWISE_ROWS;
-        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
-        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
-        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
-        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
-        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
-        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
-        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
-        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
-        use super::lt::cols::NUM_COLUMNS as LT_COLS;
-        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
-        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
-        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
-        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
-        use super::page::DEFAULT_PAGE_SIZE as PAGE_SIZE;
-        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
-        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
-        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
-        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
-        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
-
-        let register_rows = super::register::NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
-
-        self.cpu_padded_rows * CPU_COLS as u64
-            + self.memw_padded_rows * MEMW_COLS as u64
-            + self.memw_aligned_padded_rows * MEMW_A_COLS as u64
-            + self.memw_register_padded_rows * MEMW_R_COLS as u64
-            + self.load_padded_rows * LOAD_COLS as u64
-            + self.lt_padded_rows * LT_COLS as u64
-            + self.shift_padded_rows * SHIFT_COLS as u64
-            + self.mul_padded_rows * MUL_COLS as u64
-            + self.dvrm_padded_rows * DVRM_COLS as u64
-            + self.branch_padded_rows * BRANCH_COLS as u64
-            + self.commit_padded_rows * COMMIT_COLS as u64
-            + (BITWISE_ROWS * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64
-            + self.decode_rows * (DECODE_COLS - DECODE_PRECOMPUTED) as u64
-            + HALT_COLS as u64
-            + register_rows * (REGISTER_COLS - REGISTER_PREPROCESSED) as u64
-            + self.unique_page_count * PAGE_SIZE as u64 * (PAGE_COLS - PAGE_PREPROCESSED) as u64
-    }
-
-    /// Upper bound on auxiliary-trace (extension-field) elements. Mirrors
-    /// [`Traces::total_auxiliary_field_elements`] column-for-column. Inherits
-    /// the upper-bound looseness of [`Self::total_main_elements`] for
-    /// deduplicated tables.
-    pub fn total_aux_elements(&self) -> u64 {
-        fn aux_cols(n: usize) -> usize {
-            n.div_ceil(2)
-        }
-
-        let n_cpu = aux_cols(super::cpu::bus_interactions().len()) as u64;
-        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len()) as u64;
-        let n_lt = aux_cols(super::lt::bus_interactions().len()) as u64;
-        let n_shift = aux_cols(super::shift::bus_interactions().len()) as u64;
-        let n_memw = aux_cols(super::memw::bus_interactions().len()) as u64;
-        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len()) as u64;
-        let n_load = aux_cols(super::load::bus_interactions().len()) as u64;
-        let n_decode = aux_cols(super::decode::bus_interactions().len()) as u64;
-        let n_mul = aux_cols(super::mul::bus_interactions().len()) as u64;
-        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len()) as u64;
-        let n_branch = aux_cols(super::branch::bus_interactions().len()) as u64;
-        let n_halt = aux_cols(super::halt::bus_interactions().len()) as u64;
-        let n_commit = aux_cols(super::commit::bus_interactions().len()) as u64;
-        let n_register = aux_cols(super::register::bus_interactions().len()) as u64;
-        let n_page = aux_cols(super::page::bus_interactions(0).len()) as u64;
-        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len()) as u64;
-
-        let bitwise_rows = super::bitwise::NUM_ROWS as u64;
-        let register_rows = super::register::NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
-        let halt_rows = 1u64;
-
-        self.cpu_padded_rows * n_cpu
-            + self.memw_padded_rows * n_memw
-            + self.memw_aligned_padded_rows * n_memw_a
-            + self.memw_register_padded_rows * n_memw_r
-            + self.load_padded_rows * n_load
-            + self.lt_padded_rows * n_lt
-            + self.shift_padded_rows * n_shift
-            + self.mul_padded_rows * n_mul
-            + self.dvrm_padded_rows * n_dvrm
-            + self.branch_padded_rows * n_branch
-            + self.commit_padded_rows * n_commit
-            + bitwise_rows * n_bitwise
-            + self.decode_rows * n_decode
-            + halt_rows * n_halt
-            + register_rows * n_register
-            + self.unique_page_count * super::page::DEFAULT_PAGE_SIZE as u64 * n_page
-    }
-}
-
 /// Stream `logs` once and compute upper-bound per-table row counts the trace
 /// builder would produce, without allocating the `Vec<*Operation>`
 /// intermediates.
@@ -2308,8 +2204,7 @@ impl TableLengths {
 /// pass is `O(unique_pages + 32)` (memory + register state), not `O(N)`.
 ///
 /// Returns an upper bound (not exact) for tables whose `generate_*_trace`
-/// deduplicates identical operations: LT, MUL, DVRM, BRANCH. See
-/// [`TableLengths::total_main_elements`].
+/// deduplicates identical operations: LT, MUL, DVRM, BRANCH.
 ///
 /// The two places that must stay in sync when the trace shape changes: this
 /// function and `Traces::from_elf_and_logs`.
