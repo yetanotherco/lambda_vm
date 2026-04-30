@@ -34,9 +34,7 @@ impl<F: IsFFTField> DomainConstants<F> {
         let size_inv = FieldElement::<F>::from(n as u64)
             .inv()
             .expect("domain size is non-zero; field characteristic must not divide n");
-        let offset_pow_n_inv = offset_pow_n
-            .inv()
-            .expect("coset_offset_pow_n is non-zero");
+        let offset_pow_n_inv = offset_pow_n.inv().expect("coset_offset_pow_n is non-zero");
         Self {
             points,
             offset_pow_n,

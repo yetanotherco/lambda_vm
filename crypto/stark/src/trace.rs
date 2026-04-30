@@ -411,7 +411,8 @@ where
 
         // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
         // This eliminates N redundant F×E multiplies per column.
-        let col_scale: Vec<FieldElement<E>> = dc.points
+        let col_scale: Vec<FieldElement<E>> = dc
+            .points
             .iter()
             .zip(inv_denoms.iter())
             .map(|(point, inv_d)| point * inv_d)

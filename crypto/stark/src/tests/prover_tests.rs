@@ -172,14 +172,8 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
     let dc = DomainConstants::from_domain(&domain);
 
     // Barycentric evaluation (new path)
-    let result = get_trace_evaluations_from_lde(
-        &lde_trace,
-        &domain,
-        &z,
-        &frame_offsets,
-        step_size,
-        &dc,
-    );
+    let result =
+        get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size, &dc);
 
     assert_eq!(result.width, expected.width);
     assert_eq!(result.height, expected.height);
