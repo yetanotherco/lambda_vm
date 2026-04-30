@@ -774,6 +774,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "digest",
+ "libc",
  "math",
  "memmap2",
  "rand 0.8.5",

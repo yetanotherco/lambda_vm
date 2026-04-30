@@ -33,6 +33,23 @@ pub(crate) struct MmapNodeBacking {
     node_size: usize,
 }
 
+/// Resize `file` to `total_bytes` and reserve disk blocks where supported, so
+/// later mmap writes fault with `ENOSPC` from this call instead of `SIGBUS`
+/// after the temp filesystem fills up.
+#[cfg(feature = "disk-spill")]
+fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
+    file.set_len(total_bytes)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, total_bytes as i64) };
+        if ret != 0 {
+            return Err(std::io::Error::from_raw_os_error(ret));
+        }
+    }
+    Ok(())
+}
+
 /// The struct for the Merkle tree, consisting of the root and the nodes.
 /// A typical tree would look like this
 ///                 root
@@ -325,7 +342,7 @@ where
             })?;
 
         let file = tempfile::tempfile()?;
-        file.set_len(total_bytes)?;
+        reserve_file_blocks(&file, total_bytes)?;
 
         // Write directly through a writable mmap, then downgrade to read-only.
         // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
