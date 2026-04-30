@@ -7,6 +7,5 @@
 pub enum StorageMode {
     #[default]
     Ram,
-    #[cfg(feature = "disk-spill")]
     Disk,
 }
