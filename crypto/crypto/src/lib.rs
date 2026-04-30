@@ -10,6 +10,8 @@ extern crate alloc;
 pub mod fiat_shamir;
 pub mod hash;
 pub mod merkle_tree;
+#[cfg(feature = "disk-spill")]
+pub mod mmap_util;
 
 #[cfg(test)]
 pub mod tests;
