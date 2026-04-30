@@ -4,7 +4,7 @@
 //! sends input state to the round chip via the Keccak bus, and receives the output
 //! state after 24 rounds.
 //!
-//! ## Column layout (~511 columns)
+//! ## Column layout (~507 columns)
 //!
 //! | Group          | Size | Description                                    |
 //! |----------------|------|------------------------------------------------|
@@ -12,8 +12,12 @@
 //! | addr           |    8 | State address as DWordBL (8 bytes)             |
 //! | input_state    |  200 | Input state bytes [5][5][8]                    |
 //! | output_state   |  200 | Output state bytes [5][5][8]                   |
-//! | state_ptr      |  100 | Per-lane DWordHL addresses [25][4]             |
+//! | state_ptr      |   96 | Per-lane DWordHL addresses for lanes 1..=24    |
 //! | mu             |    1 | Multiplicity flag                              |
+//!
+//! Lane (0,0) (lane_idx=0) shares storage with `addr` (offset = 0), so its
+//! 4 state_ptr halfwords are not stored — saves 4 cols and 4 IS_HALF checks
+//! per call (spec keccak.typ:106).
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
@@ -40,12 +44,13 @@ pub mod cols {
     // output_state[5][5][8] = 200 bytes
     pub const OUTPUT_STATE: usize = INPUT_STATE + 200; // 210
 
-    // state_ptr[25][4] = 100 halfwords (DWordHL per lane)
+    // state_ptr[24][4] = 96 halfwords (DWordHL for lanes 1..=24).
+    // Lane 0 reuses `addr` directly (offset = 0).
     pub const STATE_PTR: usize = OUTPUT_STATE + 200; // 410
 
-    pub const MU: usize = STATE_PTR + 100; // 510
+    pub const MU: usize = STATE_PTR + 96; // 506
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 511
+    pub const NUM_COLUMNS: usize = MU + 1; // 507
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -68,10 +73,14 @@ pub mod cols {
         OUTPUT_STATE + (x + 5 * y) * 8 + byte
     }
 
-    /// Index into state_ptr[lane_idx][halfword] (DWordHL = 4 halfwords)
+    /// Index into state_ptr[lane_idx][halfword] (DWordHL = 4 halfwords).
+    ///
+    /// Only valid for `lane_idx >= 1`. Lane 0's address equals `addr` (offset = 0)
+    /// and is read from the addr bytes directly per spec keccak.typ:106.
     #[inline]
     pub const fn state_ptr(lane_idx: usize, hw: usize) -> usize {
-        STATE_PTR + lane_idx * 4 + hw
+        debug_assert!(lane_idx >= 1, "state_ptr lane 0 reuses addr; no storage");
+        STATE_PTR + (lane_idx - 1) * 4 + hw
     }
 }
 
@@ -134,8 +143,9 @@ pub fn generate_keccak_trace(
             }
         }
 
-        // State pointers: state_ptr[lane] = addr + 8 * lane_idx
-        for lane_idx in 0..25 {
+        // State pointers: state_ptr[lane] = addr + 8 * lane_idx, stored for lanes 1..=24.
+        // Lane 0 reuses addr (offset = 0) — no storage needed (spec keccak.typ:106).
+        for lane_idx in 1..25 {
             let ptr = op.state_addr.wrapping_add(lane_idx as u64 * 8);
             data[base + cols::state_ptr(lane_idx, 0)] = FE::from(ptr & 0xFFFF);
             data[base + cols::state_ptr(lane_idx, 1)] = FE::from((ptr >> 16) & 0xFFFF);
@@ -151,9 +161,10 @@ pub fn generate_keccak_trace(
     // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
     // mu = 0 gates all bus interactions and the ADD constraint, so these values
     // only need to satisfy the pad requirement, not reconstruct a real address.
+    // Lane 0 has no storage (uses addr directly), so iterate from 1.
     for row_idx in n..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
-        for lane_idx in 0..25 {
+        for lane_idx in 1..25 {
             data[base + cols::state_ptr(lane_idx, 0)] = FE::from((lane_idx as u64) * 8);
         }
     }
@@ -332,8 +343,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 4. IS_HALF range checks on state_ptr (100 interactions)
-    for lane_idx in 0..25 {
+    // 4. IS_HALF range checks on state_ptr (96 interactions; lane 0 reuses addr)
+    for lane_idx in 1..25 {
         for hw in 0..4 {
             interactions.push(BusInteraction::sender(
                 BusId::IsHalfword,
@@ -349,31 +360,76 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // 5. MEMW interactions: 25 combined read+write per lane (per spec)
     // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
     // old = input_state (read), value = output_state (write)
+    // Lane 0 (offset = 0): build addr_lo/addr_hi from the 8 addr bytes directly.
+    // Lanes 1..=24: use the dedicated state_ptr halfwords.
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
         let y = lane_idx / 5;
 
-        // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
-        let addr_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::state_ptr(lane_idx, 0),
-            },
-            LinearTerm::Column {
-                coefficient: 65536,
-                column: cols::state_ptr(lane_idx, 1),
-            },
-        ]);
-        let addr_hi = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::state_ptr(lane_idx, 2),
-            },
-            LinearTerm::Column {
-                coefficient: 65536,
-                column: cols::state_ptr(lane_idx, 3),
-            },
-        ]);
+        let (addr_lo, addr_hi) = if lane_idx == 0 {
+            (
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::addr(0),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 256,
+                        column: cols::addr(1),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 65536,
+                        column: cols::addr(2),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 16777216,
+                        column: cols::addr(3),
+                    },
+                ]),
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::addr(4),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 256,
+                        column: cols::addr(5),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 65536,
+                        column: cols::addr(6),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 16777216,
+                        column: cols::addr(7),
+                    },
+                ]),
+            )
+        } else {
+            // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
+            (
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::state_ptr(lane_idx, 0),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 65536,
+                        column: cols::state_ptr(lane_idx, 1),
+                    },
+                ]),
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::state_ptr(lane_idx, 2),
+                    },
+                    LinearTerm::Column {
+                        coefficient: 65536,
+                        column: cols::state_ptr(lane_idx, 3),
+                    },
+                ]),
+            )
+        };
 
         let mut values = Vec::with_capacity(24);
         // old[0..8] = input_state bytes (the value being read)
@@ -428,8 +484,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// Per spec (keccak:c:state_ptr): ADD template for each lane:
 ///   state_ptr[lane] = addr + 8 * lane_idx
 ///
-/// 25 lane pointers × 2 constraints per ADD = 50 constraints total.
-/// Conditional on mu (only real rows).
+/// Lane 0 has offset = 0 (state_ptr[0] = addr) so its ADD constraint is
+/// trivial and its storage is dropped (spec keccak.typ:106). 24 lanes × 2
+/// constraints per ADD = 48 constraints total. Conditional on mu (only real rows).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -438,13 +495,13 @@ pub fn create_constraints(
 ) {
     let mut constraints: Vec<
         Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(50);
+    > = Vec::with_capacity(48);
     let mut idx = constraint_idx_start;
 
-    // state_ptr[lane] = addr + 8*lane_idx
+    // state_ptr[lane] = addr + 8*lane_idx for lane in 1..=24.
     // addr is DWordBL (8 bytes), state_ptr is DWordHL (4 halfwords)
     // ADD: lhs = addr (DWordBL→DWordWL), rhs = 8*lane_idx (constant), sum = state_ptr (DWordHL→DWordWL)
-    for lane_idx in 0..25 {
+    for lane_idx in 1..25 {
         let offset = (lane_idx * 8) as i64;
         let (c0, c1) = AddConstraint::new_pair(
             vec![cols::MU], // conditional on mu

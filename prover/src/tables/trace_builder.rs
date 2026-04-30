@@ -1650,8 +1650,9 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
     for kop in keccak_ops {
         let state_addr = kop.state_addr;
 
-        // IS_HALF for state_ptr halfwords (100 per call)
-        for lane_idx in 0..25 {
+        // IS_HALF for state_ptr halfwords (96 per call; lane 0 reuses addr,
+        // spec keccak.typ:106).
+        for lane_idx in 1..25 {
             let ptr = state_addr.wrapping_add(lane_idx as u64 * 8);
             for shift in [0, 16, 32, 48] {
                 let half = ((ptr >> shift) & 0xFFFF) as u16;
@@ -2899,8 +2900,9 @@ mod keccak_tests {
         assert_eq!(is_byte, 24 * 424, "IsByte count");
         // Skip ρ on (0,0): 4 fewer HWSL/round.
         assert_eq!(hwsl, 24 * 116, "Hwsl count");
-        assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 100 + 24 * 1344, "Total bitwise ops");
+        // Drop state_ptr lane 0 (reuses addr; spec keccak.typ:106): 96, was 100.
+        assert_eq!(is_half, 96, "IsHalf count");
+        assert_eq!(ops.len(), 96 + 24 * 1344, "Total bitwise ops");
     }
 
     #[test]
@@ -2993,8 +2995,9 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            129,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 Keccak send + 1 Keccak recv"
+            125,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 96 IS_HALF + 1 Keccak send + 1 Keccak recv \
+             (drop state_ptr lane 0; spec keccak.typ:106)"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
@@ -3011,7 +3014,11 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_column_counts() {
-        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(
+            core_cols::NUM_COLUMNS,
+            507,
+            "KECCAK core columns (drop state_ptr lane 0; spec keccak.typ:106)"
+        );
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
             1456,
@@ -3024,7 +3031,11 @@ mod keccak_tests {
     #[test]
     fn test_keccak_constraint_counts() {
         let (core_constraints, _) = keccak::create_constraints(0);
-        assert_eq!(core_constraints.len(), 50, "KECCAK core: 25 ADD pairs");
+        assert_eq!(
+            core_constraints.len(),
+            48,
+            "KECCAK core: 24 ADD pairs (lane 0 trivial; spec keccak.typ:106)"
+        );
 
         let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
         assert_eq!(
