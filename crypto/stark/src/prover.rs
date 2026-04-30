@@ -1601,6 +1601,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        <Field as IsField>::BaseType: Copy,
+        <FieldExtension as IsField>::BaseType: Copy,
     {
         Self::multi_prove_inner(
             air_trace_pairs,
@@ -1622,6 +1624,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        <Field as IsField>::BaseType: Copy,
+        <FieldExtension as IsField>::BaseType: Copy,
     {
         Self::multi_prove_inner(air_trace_pairs, transcript, storage_mode)
     }
@@ -1635,6 +1639,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        <Field as IsField>::BaseType: Copy,
+        <FieldExtension as IsField>::BaseType: Copy,
     {
         info!("Started proof generation...");
 
@@ -2114,6 +2120,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        <Field as IsField>::BaseType: Copy,
+        <FieldExtension as IsField>::BaseType: Copy,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
         Self::multi_prove(air_trace_pairs, transcript)

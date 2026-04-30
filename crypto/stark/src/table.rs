@@ -164,7 +164,8 @@ impl<F: IsField> Table<F> {
             let offset = row_idx * backing.width * backing.elem_size;
             // SAFETY: spill_to_disk writes the table in row-major layout, so
             // width elements at this offset are contiguous. FieldElement<F>
-            // is #[repr(transparent)].
+            // is #[repr(transparent)] and spill_to_disk requires
+            // F::BaseType: Copy, ruling out indirection or non-trivial drop.
             return unsafe {
                 std::slice::from_raw_parts(
                     backing.mmap.as_ptr().add(offset) as *const FieldElement<F>,
@@ -225,7 +226,9 @@ impl<F: IsField> Table<F> {
             let offset = (row * backing.width + col) * backing.elem_size;
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The mmap is page-aligned and elements are contiguously packed.
-            // The data was written from identical types on the same machine.
+            // The data was written from identical types on the same machine,
+            // and spill_to_disk requires F::BaseType: Copy so the byte
+            // representation has no indirection or non-trivial drop.
             return unsafe { &*(backing.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         let idx = row * self.width + col;
@@ -249,7 +252,10 @@ impl<F: IsField> Table<F> {
     ///
     /// No-op if the table is empty or already spilled.
     #[cfg(feature = "disk-spill")]
-    pub fn spill_to_disk(&mut self) -> std::io::Result<()> {
+    pub fn spill_to_disk(&mut self) -> std::io::Result<()>
+    where
+        F::BaseType: Copy,
+    {
         const {
             assert!(
                 std::mem::size_of::<FieldElement<F>>()

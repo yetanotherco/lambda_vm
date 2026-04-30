@@ -150,12 +150,18 @@ where
     /// Write main trace data to a temp file and free the in-memory vector.
     /// Accessors read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
-    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
+    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
+    where
+        F::BaseType: Copy,
+    {
         self.main_table.spill_to_disk()
     }
 
     #[cfg(feature = "disk-spill")]
-    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()> {
+    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
+    where
+        E::BaseType: Copy,
+    {
         self.aux_table.spill_to_disk()
     }
 
