@@ -1,12 +1,4 @@
-#![no_std]
-#![no_main]
-
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+use lambda_vm_syscalls as syscalls;
 
 const SIZE: usize = 17000;
 
@@ -73,21 +65,19 @@ fn verify_sorted(arr: &[u32; SIZE]) -> bool {
     true
 }
 
-#[unsafe(no_mangle)]
-pub fn main() -> u32 {
+pub fn main() {
     let mut arr = [0u32; SIZE];
 
-    // Initialize with pseudo-random values
     init_array(&mut arr, 42);
-
-    // Sort
     quicksort_range(&mut arr, 0, SIZE);
 
-    // Verify and return checksum
-    if verify_sorted(&arr) {
-        // Return first + last + middle elements as checksum
-        arr[0].wrapping_add(arr[SIZE - 1]).wrapping_add(arr[SIZE / 2])
+    let checksum = if verify_sorted(&arr) {
+        arr[0]
+            .wrapping_add(arr[SIZE - 1])
+            .wrapping_add(arr[SIZE / 2])
     } else {
-        0 // Sort failed
-    }
+        0
+    };
+
+    syscalls::syscalls::commit(&checksum.to_le_bytes());
 }
