@@ -1031,14 +1031,8 @@ fn test_decode_soundness_same_elf_accepted() {
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
-    let mut traces = Traces::from_elf_and_logs(
-        &prover_elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&prover_elf, &result.logs, &Default::default(), &[]).unwrap();
     let table_counts = traces.table_counts();
     let prover_airs = VmAirs::new(
         &prover_elf,

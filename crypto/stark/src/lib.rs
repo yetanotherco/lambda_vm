@@ -20,6 +20,7 @@ pub mod instruments;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
+#[cfg(feature = "disk-spill")]
 pub mod storage_mode;
 pub mod table;
 pub mod trace;

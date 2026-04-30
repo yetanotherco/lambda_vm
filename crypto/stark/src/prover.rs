@@ -28,6 +28,7 @@ use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+#[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
@@ -545,7 +546,7 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -600,7 +601,7 @@ pub trait IsStarkProver<
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
-        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -1566,7 +1567,12 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        Self::multi_prove_inner(air_trace_pairs, transcript, StorageMode::Ram)
+        Self::multi_prove_inner(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
     }
 
     /// Same as `multi_prove` but lets callers back intermediate state with mmap
@@ -1588,7 +1594,7 @@ pub trait IsStarkProver<
     fn multi_prove_inner(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-        #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1714,10 +1720,17 @@ pub trait IsStarkProver<
                             air.precomputed_commitment(),
                             air.num_precomputed_columns(),
                             twiddles,
+                            #[cfg(feature = "disk-spill")]
                             storage_mode,
                         )
                     } else {
-                        Self::commit_main_trace(*trace, domain, twiddles, storage_mode)
+                        Self::commit_main_trace(
+                            *trace,
+                            domain,
+                            twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                        )
                     }
                 })
                 .collect();

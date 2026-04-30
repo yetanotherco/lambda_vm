@@ -31,6 +31,7 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
+#[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
@@ -1702,7 +1703,7 @@ fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_variables))] storage_mode: StorageMode,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
         vec![&[][..]]
@@ -1944,7 +1945,7 @@ fn build_traces(
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
-    storage_mode: StorageMode,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
 ) -> Result<Traces, Error> {
     let derived = derive_ops(ops, elf, memory_state, max_rows, private_input)?;
@@ -1957,6 +1958,7 @@ fn build_traces(
         decode_pc_to_row,
         register_state,
         max_rows,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
         private_input,
     )
@@ -1973,7 +1975,7 @@ fn generate_traces(
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
-    storage_mode: StorageMode,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
 ) -> Result<Traces, Error> {
     let DerivedOps {
@@ -2001,55 +2003,70 @@ fn generate_traces(
         &cpu_ops,
         max_rows.cpu,
         cpu::generate_cpu_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let memws = chunk_and_generate(
         &memw_ops,
         max_rows.memw,
         memw::generate_memw_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
         max_rows.memw_aligned,
         memw_aligned::generate_memw_aligned_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let memw_registers = chunk_and_generate(
         &memw_register_ops,
         max_rows.memw_register,
         memw_register::generate_memw_register_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let loads = chunk_and_generate(
         &load_ops,
         max_rows.load,
         load::generate_load_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace, storage_mode)?;
+    let lts = chunk_and_generate(
+        &lt_ops,
+        max_rows.lt,
+        lt::generate_lt_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
     let shifts = chunk_and_generate(
         &shift_ops,
         max_rows.shift,
         shift::generate_shift_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let muls = chunk_and_generate(
         &mul_ops,
         max_rows.mul,
         mul::generate_mul_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let dvrms = chunk_and_generate(
         &dvrm_ops,
         max_rows.dvrm,
         dvrm::generate_dvrm_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let branches = chunk_and_generate(
         &branch_ops,
         max_rows.branch,
         branch::generate_branch_trace,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
 
@@ -2860,7 +2877,35 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
+    ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_inner(
+            elf,
+            logs,
+            max_rows,
+            private_input,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+    }
+
+    /// Same as `from_elf_and_logs` but lets the caller pick a storage mode.
+    #[cfg(feature = "disk-spill")]
+    pub fn from_elf_and_logs_with_mode(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
         storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_inner(elf, logs, max_rows, private_input, storage_mode)
+    }
+
+    fn from_elf_and_logs_inner(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
@@ -2903,6 +2948,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            #[cfg(feature = "disk-spill")]
             storage_mode,
             private_input,
         )
@@ -2953,6 +2999,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
             &[],
         )

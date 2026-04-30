@@ -96,14 +96,8 @@ fn assert_count_is_upper_bound_on_built_trace(program_name: &str) {
             .expect("count_table_lengths");
     let main_via_count = lengths.total_main_elements();
 
-    let traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("from_elf_and_logs");
+    let traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[])
+        .expect("from_elf_and_logs");
     let main_via_traces = traces.total_field_elements();
 
     assert!(

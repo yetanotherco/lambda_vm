@@ -158,14 +158,7 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -604,14 +597,7 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -621,14 +607,7 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memws.is_empty(),
         "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
@@ -645,14 +624,7 @@ fn test_prove_elfs_test_sb_sh_8() {
 #[test]
 fn test_prove_elfs_lw_sw() {
     let (elf, logs, _instructions) = run_asm_elf("lw_sw");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memw_aligneds.is_empty(),
         "lw_sw should produce MEMW_A rows for aligned word accesses"
@@ -672,14 +644,7 @@ fn test_prove_elfs_lw_sw() {
 #[test]
 fn test_prove_elfs_test_memw_split_ts() {
     let (elf, logs, _instructions) = run_asm_elf("test_memw_split_ts");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memws.is_empty(),
         "test_memw_split_ts should produce MEMW rows (split old_timestamps from sb+sb+lh)"
@@ -718,14 +683,7 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -773,14 +731,8 @@ fn test_prove_elfs_test_commit_4() {
         "Public output should match committed bytes"
     );
 
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -805,14 +757,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs
     let table_counts = traces.table_counts();
@@ -1182,14 +1128,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
@@ -1520,14 +1459,7 @@ fn test_debug_memory_tokens_sb_sh() {
 #[test]
 fn test_deep_stack_passes() {
     let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1548,14 +1480,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1614,14 +1540,8 @@ fn test_deep_stack_missing_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
@@ -1672,14 +1592,7 @@ fn test_deep_stack_missing_pages_rejected() {
 #[test]
 fn test_heap_alloc_passes() {
     let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
     // Verify runtime_page_ranges includes the heap page
     let ranges = traces.runtime_page_ranges();
@@ -1707,14 +1620,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &result.logs,
-        &Default::default(),
-        &[],
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();

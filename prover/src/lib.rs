@@ -30,6 +30,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
+#[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -619,18 +620,18 @@ pub fn prove_with_options_and_inputs(
         mode
     };
 
-    #[cfg(not(feature = "disk-spill"))]
-    let storage_mode = StorageMode::Ram;
-
     // Phase 5: build the full traces with the chosen mode. `Disk` spills each
     // chunk as it's built, so the trace never fully materializes in RAM.
-    let mut traces = Traces::from_elf_and_logs(
+    #[cfg(feature = "disk-spill")]
+    let mut traces = Traces::from_elf_and_logs_with_mode(
         &program,
         &result.logs,
         max_rows,
         private_inputs,
         storage_mode,
     )?;
+    #[cfg(not(feature = "disk-spill"))]
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     drop(result);
 
     #[cfg(feature = "instruments")]
