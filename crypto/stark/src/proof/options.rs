@@ -40,8 +40,9 @@ impl fmt::Display for ProofOptionsError {
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `max_ram_bytes`: optional ceiling on prover RAM usage. When set, the
 ///   prover spills trace tables and Merkle-tree nodes to mmap if the
-///   estimated peak exceeds this cap (or 80% of system-available RAM,
-///   whichever is smaller). LDE column vectors remain in RAM regardless.
+///   estimated peak exceeds this cap or system-available RAM (less a safety
+///   margin), whichever is smaller. LDE column vectors remain in RAM
+///   regardless.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProofOptions {
