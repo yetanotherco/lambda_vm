@@ -2216,10 +2216,11 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
-            let count = u32::try_from(cpu_op.commit_count).expect("commit_count exceeds u32 range");
+            let count = u32::try_from(cpu_op.commit_count)
+                .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
             current_commit_index = current_commit_index
                 .checked_add(count)
-                .expect("commit index exceeds u32 range");
+                .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
         // CPU-side per-instruction-kind counters
