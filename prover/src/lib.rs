@@ -582,8 +582,9 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
         // Stream over logs once to compute exact per-table row counts without
-        // allocating any op vectors. Use the resulting `TableLengths` to
-        // estimate peak heap analytically and pick a storage mode.
+        // building per-instruction op vectors (the decode trace is still built
+        // for the row count). Use the resulting `TableLengths` to estimate
+        // peak heap analytically and pick a storage mode.
         let lengths = crate::tables::trace_builder::count_table_lengths(
             &program,
             &result.logs,
