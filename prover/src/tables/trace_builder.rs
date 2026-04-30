@@ -1776,8 +1776,10 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // rho: HWSL (96) + IS_BYTE (384). Lane (0,0) is skipped — rnc=0
-            // makes ρ the identity, π references theta directly.
+            // rho: HWSL (96) + IS_BYTE (288). Lane (0,0) is skipped — rnc=0
+            // makes ρ the identity, π references theta directly. Per spec
+            // keccak.typ:109-111, one byte per HWSL output halfword is always
+            // zero given the constant rnc; those IS_BYTE checks are skipped.
             for x in 0..5 {
                 for y in 0..5 {
                     if x == 0 && y == 0 {
@@ -1799,24 +1801,32 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                             ((halfword >> 8) & 0xFF) as u8,
                             rnc_val,
                         ));
-                        // IS_BYTE for rot_left
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
-                            (shifted & 0xFF) as u8,
-                        ));
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
-                            ((shifted >> 8) & 0xFF) as u8,
-                        ));
-                        // IS_BYTE for rot_right
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
-                            (carry & 0xFF) as u8,
-                        ));
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
-                            ((carry >> 8) & 0xFF) as u8,
-                        ));
+                        // IS_BYTE for rot_left / rot_right — skip the
+                        // always-zero positions (one per halfword output).
+                        if super::keccak_rnd::cols::rot_left(x, y, hw * 2).is_some() {
+                            ops.push(BitwiseOperation::single_byte(
+                                BitwiseOperationType::IsByte,
+                                (shifted & 0xFF) as u8,
+                            ));
+                        }
+                        if super::keccak_rnd::cols::rot_left(x, y, hw * 2 + 1).is_some() {
+                            ops.push(BitwiseOperation::single_byte(
+                                BitwiseOperationType::IsByte,
+                                ((shifted >> 8) & 0xFF) as u8,
+                            ));
+                        }
+                        if super::keccak_rnd::cols::rot_right(x, y, hw * 2).is_some() {
+                            ops.push(BitwiseOperation::single_byte(
+                                BitwiseOperationType::IsByte,
+                                (carry & 0xFF) as u8,
+                            ));
+                        }
+                        if super::keccak_rnd::cols::rot_right(x, y, hw * 2 + 1).is_some() {
+                            ops.push(BitwiseOperation::single_byte(
+                                BitwiseOperationType::IsByte,
+                                ((carry >> 8) & 0xFF) as u8,
+                            ));
+                        }
                     }
                 }
             }
@@ -2896,13 +2906,14 @@ mod keccak_tests {
         assert_eq!(xor, 24 * 604, "XorByte count");
         assert_eq!(and, 24 * 200, "AndByte count");
         // Cxz_right Byte→Bit (drops 40 IS_BYTE/round) +
-        // skip ρ on (0,0) (drops 16 IS_BYTE/round).
-        assert_eq!(is_byte, 24 * 424, "IsByte count");
+        // skip ρ on (0,0) (drops 16 IS_BYTE/round) +
+        // drop 96 always-zero rot bytes (spec keccak.typ:109-111).
+        assert_eq!(is_byte, 24 * 328, "IsByte count");
         // Skip ρ on (0,0): 4 fewer HWSL/round.
         assert_eq!(hwsl, 24 * 116, "Hwsl count");
         // Drop state_ptr lane 0 (reuses addr; spec keccak.typ:106): 96, was 100.
         assert_eq!(is_half, 96, "IsHalf count");
-        assert_eq!(ops.len(), 96 + 24 * 1344, "Total bitwise ops");
+        assert_eq!(ops.len(), 96 + 24 * 1248, "Total bitwise ops");
     }
 
     #[test]
@@ -3001,9 +3012,10 @@ mod keccak_tests {
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
-            1347,
-            "KECCAK_RND: 3 IO + 460 theta + 480 rho + 400 chi + 4 iota \
-             (Cxz_right Byte→Bit + drop rc[2,4,5,6] + skip ρ on (0,0))"
+            1251,
+            "KECCAK_RND: 3 IO + 460 theta + 384 rho + 400 chi + 4 iota \
+             (Cxz_right Byte→Bit + drop rc[2,4,5,6] + skip ρ on (0,0) + \
+             drop 96 always-zero rot bytes; spec keccak.typ:109-111)"
         );
         assert_eq!(
             keccak_rc::bus_interactions().len(),
@@ -3021,9 +3033,10 @@ mod keccak_tests {
         );
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
-            1456,
+            1360,
             "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed; \
-             rc[2,4,5,6] dropped; ρ skipped on (0,0))"
+             rc[2,4,5,6] dropped; ρ skipped on (0,0); drop 96 always-zero rot bytes; \
+             spec keccak.typ:109-111)"
         );
         assert_eq!(keccak_rc::cols::NUM_COLUMNS, 6, "KECCAK_RC columns");
     }

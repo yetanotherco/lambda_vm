@@ -3,7 +3,7 @@
 //! One row per round (24 rows per keccak call). All bitwise operations are
 //! delegated to BITWISE lookup tables (XOR_BYTE, AND_BYTE, HWSL, IS_BYTE).
 //!
-//! ## Column layout (1,456 columns)
+//! ## Column layout (1,360 columns)
 //!
 //! | Group          | Size | Description                                       |
 //! |----------------|------|---------------------------------------------------|
@@ -15,8 +15,7 @@
 //! | Cxz_right      |   20 | Carry bits of HWSL(C[x],1) [5][4]                 |
 //! | Dxz            |   40 | D values [5][8]                                   |
 //! | theta          |  200 | State after θ [5][5][8]                           |
-//! | rot_left       |  192 | Left half of ρ rotation, 24 non-(0,0) lanes [8]   |
-//! | rot_right      |  192 | Right half of ρ rotation, 24 non-(0,0) lanes [8]  |
+//! | rot            |  288 | ρ rotation halves, 24 non-(0,0) lanes × 12 bytes  |
 //! | chi_ands       |  200 | AND results for χ [5][5][8]                       |
 //! | chi            |  200 | State after χ [5][5][8]                           |
 //! | rc             |    4 | Non-zero round constant bytes (positions 0,1,3,7) |
@@ -33,6 +32,14 @@
 //! ρ is the identity on lane (0,0) (`KECCAK_RHO[0][0] = 0`), so `rot_left[0][0]`
 //! and `rot_right[0][0]` are not stored; π for that lane references
 //! `theta[0][0]` directly (spec keccak.typ optimization note).
+//!
+//! Per spec keccak.typ:109-111, for each lane `(x,y) != (0,0)` the constant
+//! `rnc = KECCAK_RHO[x][y] % 16` makes one byte per HWSL output halfword
+//! always zero — `rot_left[hw*2]` for `rnc >= 8` (shifted_low cleared by the
+//! shift) or `rot_right[hw*2+1]` for `rnc < 8` (carry fits in one byte).
+//! Those 4 always-zero bytes per lane × 24 lanes = 96 columns are not stored;
+//! constraint references substitute the literal 0 and IS_BYTE checks are
+//! skipped for them. Lane storage is uniformly 12 cols/lane.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
@@ -46,6 +53,8 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // =========================================================================
 
 pub mod cols {
+    use executor::vm::instruction::execution::KECCAK_RHO;
+
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
     pub const ROUND: usize = 2;
@@ -69,34 +78,36 @@ pub mod cols {
     // theta[5][5][8] = 200 bytes — state after θ
     pub const THETA: usize = DXZ + 40; // 463
 
-    // rot_left[24][8] = 192 bytes (lane (0,0) skipped; ρ is identity there).
-    pub const ROT_LEFT: usize = THETA + 200; // 663
-
-    // rot_right[24][8] = 192 bytes
-    pub const ROT_RIGHT: usize = ROT_LEFT + 192; // 855
+    // rot[24][12] = 288 bytes — ρ rotation halves for 24 non-(0,0) lanes.
+    // Per spec keccak.typ:109-111, one byte per HWSL output halfword is
+    // always zero given the constant `rnc`; those 4 bytes/lane (96 total)
+    // are not stored. See `rot_left()` / `rot_right()` helpers below.
+    pub const ROT: usize = THETA + 200; // 663
+    pub const ROT_LANE_COLS: usize = 12;
+    pub const ROT_TOTAL: usize = 24 * ROT_LANE_COLS; // 288
 
     // chi_ands[5][5][8] = 200 bytes
     // (pi is a spec [[variables.virtual]] — inlined as rot_left + rot_right at
     // compile-resolved offsets, not materialized as columns.)
-    pub const CHI_ANDS: usize = ROT_RIGHT + 192; // 1047
+    pub const CHI_ANDS: usize = ROT + ROT_TOTAL; // 951
 
     // chi[5][5][8] = 200 bytes — state after χ
-    pub const CHI: usize = CHI_ANDS + 200; // 1247
+    pub const CHI: usize = CHI_ANDS + 200; // 1151
 
     // rc[4] — non-zero round constant bytes (positions 0, 1, 3, 7).
     // Index `i ∈ 0..4` corresponds to byte position `RC_NONZERO_BYTES[i]`.
-    pub const RC: usize = CHI + 200; // 1447
+    pub const RC: usize = CHI + 200; // 1351
 
     // iota[4] — χ[0][0][b] ⊕ rc[b] for b ∈ {0, 1, 3, 7}.
     // For b ∈ {2, 4, 5, 6}, ι output equals χ[0][0][b] (rc[b] = 0).
-    pub const IOTA: usize = RC + 4; // 1451
+    pub const IOTA: usize = RC + 4; // 1355
 
     // mu — multiplicity flag.
     // rnc and rbc (spec [[variables.constant]]) are inlined as compile-time
     // constants from KECCAK_RHO, not allocated as columns.
-    pub const MU: usize = IOTA + 4; // 1455
+    pub const MU: usize = IOTA + 4; // 1359
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 1456
+    pub const NUM_COLUMNS: usize = MU + 1; // 1360
 
     /// Byte positions of the round constant that are non-zero across all 24
     /// rounds (the others are constant zero and not stored).
@@ -155,38 +166,77 @@ pub mod cols {
         THETA + (x + 5 * y) * 8 + byte
     }
 
-    /// Lane offset for `rot_left`/`rot_right`. Lane (0,0) is skipped because
-    /// `KECCAK_RHO[0][0] = 0` (ρ is the identity there), so we avoid storing
-    /// 16 always-redundant bytes (8 in rot_left + 8 in rot_right). Only valid
-    /// for lanes other than (0,0).
+    /// Rotation constant `rnc[x][y] = KECCAK_RHO[x][y] % 16`. For lane (0,0)
+    /// `rnc = 0` (ρ is identity); other lanes have `rnc ∈ 1..=15`.
     #[inline]
-    const fn rot_lane_offset(x: usize, y: usize) -> usize {
+    pub const fn rnc(x: usize, y: usize) -> u32 {
+        KECCAK_RHO[x][y] % 16
+    }
+
+    /// Lane base column for `rot[x][y]` storage (12 cols/lane; lane (0,0) skipped).
+    #[inline]
+    const fn rot_lane_base(x: usize, y: usize) -> usize {
         let lane = x + 5 * y;
-        debug_assert!(lane != 0, "rot_left/rot_right not stored for lane (0,0)");
-        (lane - 1) * 8
+        debug_assert!(lane != 0, "rot not stored for lane (0,0)");
+        ROT + (lane - 1) * ROT_LANE_COLS
     }
 
-    /// Index into `rot_left[x][y][byte]`. Panics for lane (0,0).
+    /// Column index of `rot_left[x][y][byte]`, or `None` if it is the always-zero
+    /// position dropped by spec keccak.typ:109-111.
+    ///
+    /// Per-lane internal layout:
+    /// - `rnc < 8`: rot_left bytes 0..=7 → lane offsets 0..=7.
+    /// - `rnc >= 8`: only odd `byte` indices stored (low byte of shifted half is
+    ///   always zero); bytes 1,3,5,7 → lane offsets 0..=3.
     #[inline]
-    pub const fn rot_left(x: usize, y: usize, byte: usize) -> usize {
-        ROT_LEFT + rot_lane_offset(x, y) + byte
+    pub const fn rot_left(x: usize, y: usize, byte: usize) -> Option<usize> {
+        let lane = x + 5 * y;
+        if lane == 0 {
+            return None;
+        }
+        let base = rot_lane_base(x, y);
+        if rnc(x, y) < 8 {
+            Some(base + byte)
+        } else if byte & 1 == 0 {
+            None
+        } else {
+            Some(base + byte / 2)
+        }
     }
 
-    /// Index into `rot_right[x][y][byte]`. Panics for lane (0,0).
+    /// Column index of `rot_right[x][y][byte]`, or `None` if always zero.
+    ///
+    /// Per-lane internal layout:
+    /// - `rnc < 8`: only even `byte` indices stored (carry high byte is always
+    ///   zero); bytes 0,2,4,6 → lane offsets 8..=11.
+    /// - `rnc >= 8`: rot_right bytes 0..=7 → lane offsets 4..=11.
     #[inline]
-    pub const fn rot_right(x: usize, y: usize, byte: usize) -> usize {
-        ROT_RIGHT + rot_lane_offset(x, y) + byte
+    pub const fn rot_right(x: usize, y: usize, byte: usize) -> Option<usize> {
+        let lane = x + 5 * y;
+        if lane == 0 {
+            return None;
+        }
+        let base = rot_lane_base(x, y);
+        if rnc(x, y) < 8 {
+            if byte & 1 == 1 {
+                None
+            } else {
+                Some(base + 8 + byte / 2)
+            }
+        } else {
+            Some(base + 4 + byte)
+        }
     }
 
     /// Source-lane info for resolving `pi[x][y][z]` (spec virtual).
     ///
     /// - For source lane `(0,0)` returns `PiSource::Theta(theta_col)`: ρ is the
     ///   identity there (`KECCAK_RHO[0][0] = 0`) so π takes θ directly.
-    /// - For all other source lanes returns
-    ///   `PiSource::RotPair { left_col, right_col }`: the usual HWSL split.
+    /// - Otherwise returns `PiSource::RotPair { left_col, right_col }` with
+    ///   each column wrapped in `Option` (None if that byte is the always-zero
+    ///   position dropped by spec keccak.typ:109-111).
     #[inline]
     pub fn pi_src(x: usize, y: usize, z: usize) -> PiSource {
-        use executor::vm::instruction::execution::KECCAK_RHO;
         let sx = (x + 3 * y) % 5;
         let sy = x;
         if sx == 0 && sy == 0 {
@@ -210,13 +260,18 @@ pub mod cols {
     /// Linear-term resolution of `pi[x][y][z]` (spec virtual variable).
     ///
     /// For lane (0,0) it's a single `theta` column; for all other lanes it's
-    /// the sum of one `rot_left` and one `rot_right` column.
+    /// the sum of one `rot_left` and one `rot_right` column, either of which
+    /// may be `None` (always zero, contributes nothing).
     #[derive(Clone, Copy, Debug)]
     pub enum PiSource {
         /// Single column: `theta(0, 0, z)` (ρ is identity for lane (0,0)).
         Theta(usize),
-        /// Two columns whose sum equals `pi[x][y][z]`.
-        RotPair { left_col: usize, right_col: usize },
+        /// Two columns whose sum equals `pi[x][y][z]`. `None` means the byte
+        /// is the always-zero position dropped by spec keccak.typ:109-111.
+        RotPair {
+            left_col: Option<usize>,
+            right_col: Option<usize>,
+        },
     }
 
     /// Index into chi_ands[x][y][byte]
@@ -284,7 +339,8 @@ pub mod cols {
 /// Linear-term decomposition of the spec virtual variable `pi[x][y][z]`,
 /// each term with coefficient 1. Resolves to a single `theta(0,0,z)` column
 /// for source lane (0,0) (ρ is identity), or to a `(rot_left, rot_right)`
-/// pair otherwise.
+/// pair otherwise — where either side may be omitted when its byte is the
+/// always-zero position dropped by spec keccak.typ:109-111.
 fn pi_terms(x: usize, y: usize, z: usize) -> Vec<LinearTerm> {
     match cols::pi_src(x, y, z) {
         cols::PiSource::Theta(c) => vec![LinearTerm::Column {
@@ -294,16 +350,22 @@ fn pi_terms(x: usize, y: usize, z: usize) -> Vec<LinearTerm> {
         cols::PiSource::RotPair {
             left_col,
             right_col,
-        } => vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: left_col,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: right_col,
-            },
-        ],
+        } => {
+            let mut terms = Vec::with_capacity(2);
+            if let Some(column) = left_col {
+                terms.push(LinearTerm::Column {
+                    coefficient: 1,
+                    column,
+                });
+            }
+            if let Some(column) = right_col {
+                terms.push(LinearTerm::Column {
+                    coefficient: 1,
+                    column,
+                });
+            }
+            terms
+        }
     }
 }
 
@@ -468,7 +530,9 @@ pub fn generate_keccak_rnd_trace(
             // === ρ (rho) ===
             // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
             // Lane (0,0) has rnc=0 (ρ is identity); rot_left/rot_right are
-            // not stored and π references theta[0][0] directly.
+            // not stored and π references theta[0][0] directly. Per spec
+            // keccak.typ:109-111, one byte per HWSL output halfword is
+            // always zero given rnc; those columns are not stored.
             for x in 0..5 {
                 for y in 0..5 {
                     if x == 0 && y == 0 {
@@ -480,14 +544,18 @@ pub fn generate_keccak_rnd_trace(
                     for hw in 0..4 {
                         let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
                         let (shifted, carry) = hwsl(halfword, rnc_val);
-                        data[base + cols::rot_left(x, y, hw * 2)] =
-                            FE::from((shifted & 0xFF) as u64);
-                        data[base + cols::rot_left(x, y, hw * 2 + 1)] =
-                            FE::from((shifted >> 8) as u64);
-                        data[base + cols::rot_right(x, y, hw * 2)] =
-                            FE::from((carry & 0xFF) as u64);
-                        data[base + cols::rot_right(x, y, hw * 2 + 1)] =
-                            FE::from((carry >> 8) as u64);
+                        if let Some(col) = cols::rot_left(x, y, hw * 2) {
+                            data[base + col] = FE::from((shifted & 0xFF) as u64);
+                        }
+                        if let Some(col) = cols::rot_left(x, y, hw * 2 + 1) {
+                            data[base + col] = FE::from((shifted >> 8) as u64);
+                        }
+                        if let Some(col) = cols::rot_right(x, y, hw * 2) {
+                            data[base + col] = FE::from((carry & 0xFF) as u64);
+                        }
+                        if let Some(col) = cols::rot_right(x, y, hw * 2 + 1) {
+                            data[base + col] = FE::from((carry >> 8) as u64);
+                        }
                     }
                 }
             }
@@ -824,6 +892,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // --- Rho: HWSL (96) ---
     // HWSL(theta[x][y] halfword[hw], rnc[x][y]) → (rot_left, rot_right).
     // Lane (0,0) is skipped: KECCAK_RHO[0][0] = 0 makes ρ the identity.
+    // For each halfword, one byte per HWSL output side is always zero given
+    // the constant rnc (spec keccak.typ:109-111); those terms are omitted from
+    // the linear combination (implicit zero contribution).
     for x in 0..5 {
         for y in 0..5 {
             if x == 0 && y == 0 {
@@ -831,6 +902,32 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             }
             let rnc_val = (KECCAK_RHO[x][y] % 16) as u64;
             for hw in 0..4 {
+                let mut left_terms = Vec::with_capacity(2);
+                if let Some(col) = cols::rot_left(x, y, hw * 2) {
+                    left_terms.push(LinearTerm::Column {
+                        coefficient: 1,
+                        column: col,
+                    });
+                }
+                if let Some(col) = cols::rot_left(x, y, hw * 2 + 1) {
+                    left_terms.push(LinearTerm::Column {
+                        coefficient: 256,
+                        column: col,
+                    });
+                }
+                let mut right_terms = Vec::with_capacity(2);
+                if let Some(col) = cols::rot_right(x, y, hw * 2) {
+                    right_terms.push(LinearTerm::Column {
+                        coefficient: 1,
+                        column: col,
+                    });
+                }
+                if let Some(col) = cols::rot_right(x, y, hw * 2 + 1) {
+                    right_terms.push(LinearTerm::Column {
+                        coefficient: 256,
+                        column: col,
+                    });
+                }
                 interactions.push(BusInteraction::sender(
                     BusId::Hwsl,
                     Multiplicity::Column(cols::MU),
@@ -846,56 +943,43 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             },
                         ]),
                         BusValue::constant(rnc_val),
-                        BusValue::linear(vec![
-                            LinearTerm::Column {
-                                coefficient: 1,
-                                column: cols::rot_left(x, y, hw * 2),
-                            },
-                            LinearTerm::Column {
-                                coefficient: 256,
-                                column: cols::rot_left(x, y, hw * 2 + 1),
-                            },
-                        ]),
-                        BusValue::linear(vec![
-                            LinearTerm::Column {
-                                coefficient: 1,
-                                column: cols::rot_right(x, y, hw * 2),
-                            },
-                            LinearTerm::Column {
-                                coefficient: 256,
-                                column: cols::rot_right(x, y, hw * 2 + 1),
-                            },
-                        ]),
+                        BusValue::linear(left_terms),
+                        BusValue::linear(right_terms),
                     ],
                 ));
             }
         }
     }
 
-    // --- Rho: IS_BYTE range checks on rot_left + rot_right (384) ---
-    // Lane (0,0) skipped (no rot_left/rot_right stored).
+    // --- Rho: IS_BYTE range checks on rot_left + rot_right (288) ---
+    // Lane (0,0) skipped (no rot_left/rot_right stored). Always-zero byte
+    // positions per spec keccak.typ:109-111 are skipped (4 fewer per lane).
     for x in 0..5 {
         for y in 0..5 {
             if x == 0 && y == 0 {
                 continue;
             }
             for b in 0..8 {
-                interactions.push(BusInteraction::sender(
-                    BusId::IsByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_left(x, y, b),
-                        packing: Packing::Direct,
-                    }],
-                ));
-                interactions.push(BusInteraction::sender(
-                    BusId::IsByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_right(x, y, b),
-                        packing: Packing::Direct,
-                    }],
-                ));
+                if let Some(col) = cols::rot_left(x, y, b) {
+                    interactions.push(BusInteraction::sender(
+                        BusId::IsByte,
+                        Multiplicity::Column(cols::MU),
+                        vec![BusValue::Packed {
+                            start_column: col,
+                            packing: Packing::Direct,
+                        }],
+                    ));
+                }
+                if let Some(col) = cols::rot_right(x, y, b) {
+                    interactions.push(BusInteraction::sender(
+                        BusId::IsByte,
+                        Multiplicity::Column(cols::MU),
+                        vec![BusValue::Packed {
+                            start_column: col,
+                            packing: Packing::Direct,
+                        }],
+                    ));
+                }
             }
         }
     }
@@ -1078,8 +1162,14 @@ mod tests {
                             left_col,
                             right_col,
                         } => {
-                            &trace.main_table.data[base + left_col]
-                                + &trace.main_table.data[base + right_col]
+                            let mut sum = FE::zero();
+                            if let Some(c) = left_col {
+                                sum = &sum + &trace.main_table.data[base + c];
+                            }
+                            if let Some(c) = right_col {
+                                sum = &sum + &trace.main_table.data[base + c];
+                            }
+                            sum
                         }
                     };
                     let expected = FE::from((rotated >> (z * 8)) & 0xFF);
