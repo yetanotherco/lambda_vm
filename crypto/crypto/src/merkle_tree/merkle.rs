@@ -286,10 +286,17 @@ where
 
         let node_size = core::mem::size_of::<B::Node>();
         let node_count = self.nodes.len();
-        let total_bytes = node_count * node_size;
+        let total_bytes = (node_count as u64)
+            .checked_mul(node_size as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "spill_nodes_to_disk: byte count overflows u64",
+                )
+            })?;
 
         let file = tempfile::tempfile()?;
-        file.set_len(total_bytes as u64)?;
+        file.set_len(total_bytes)?;
 
         // Write directly through a writable mmap, then downgrade to read-only.
         // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
@@ -301,8 +308,9 @@ where
         let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
         // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
         // the contiguous Vec to a byte slice is valid.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, total_bytes) };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, node_count * node_size)
+        };
         mmap_mut.copy_from_slice(bytes);
         mmap_mut.flush()?;
         let mmap = mmap_mut.make_read_only()?;
