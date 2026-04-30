@@ -287,6 +287,13 @@ fn test_ethrex_empty_block() {
 }
 
 #[test]
+fn test_ethrex_empty_block_no_precompile() {
+    let inputs = std::fs::read("tests/ethrex_empty_block.bin").unwrap();
+    run_program_without_expect("./program_artifacts/rust/ethrex_no_precompile.elf", inputs)
+        .expect("ethrex empty block (no precompile) should execute successfully");
+}
+
+#[test]
 fn test_ethrex_simple_tx() {
     let inputs = std::fs::read("tests/ethrex_simple_tx.bin").unwrap();
     run_program_without_expect("./program_artifacts/rust/ethrex.elf", inputs)

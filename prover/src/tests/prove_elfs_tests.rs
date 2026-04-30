@@ -2057,6 +2057,28 @@ fn test_prove_ethrex_empty_block() {
     assert_eq!(proof.public_output.len(), 160);
 }
 
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_empty_block_no_precompile() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes = std::fs::read(
+        workspace_root.join("executor/program_artifacts/rust/ethrex_no_precompile.elf"),
+    )
+    .expect("need ethrex_no_precompile.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex empty block (no precompile) should verify"
+    );
+    assert_eq!(proof.public_output.len(), 160);
+}
+
 // =============================================================================
 // Security: private-input tamper tests
 // =============================================================================
