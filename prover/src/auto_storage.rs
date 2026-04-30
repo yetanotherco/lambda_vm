@@ -1,26 +1,4 @@
 //! Automatic `StorageMode` selection from an analytical peak-RAM estimate.
-//!
-//! [`peak_bytes`] models the live working set of `multi_prove_with_mode` as the
-//! sum of three things:
-//!
-//! 1. **Persistent across phase D** — every cached LDE and its main/aux Merkle
-//!    tree, summed over all tables. These are built in phase A/C and stay
-//!    alive until the chunk that owns them runs in phase D.
-//! 2. **Concurrent transient** — composition LDE + composition Merkle + FRI
-//!    evals + FRI Merkle + the round-2 `constraint_evaluations` Vec, summed
-//!    over the *worst-case chunk*. `multi_prove_with_mode` runs `k =
-//!    table_parallelism()` tables of round 2-4 in parallel; only those k have
-//!    transient state alive at once.
-//! 3. **Domain + LdeTwiddles caches** — one entry per unique
-//!    `(trace_length, blowup, coset_offset)`, deduplicated by
-//!    `multi_prove_with_mode` (see prover.rs around the
-//!    `domain_cache` HashMap).
-//!
-//! Per-table row counts and the state-driving counters all come from
-//! [`TableLengths`] via [`count_table_lengths`], itself derived from the
-//! execution logs without allocating any operation vectors.
-//!
-//! [`count_table_lengths`]: crate::tables::trace_builder::count_table_lengths
 
 use crate::tables::bitwise::{
     NUM_ROWS as BITWISE_ROWS, bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
