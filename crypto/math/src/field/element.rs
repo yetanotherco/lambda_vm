@@ -40,8 +40,8 @@ use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
 ///
-/// `#[repr(transparent)]` is required for soundness: the `disk-spill`
-/// feature in `crypto/stark` casts raw mmap bytes to `*const FieldElement<F>`
+/// `#[repr(transparent)]` is required for soundness: `StorageMode::Disk`
+/// in `crypto/stark` casts raw mmap bytes to `*const FieldElement<F>`
 /// (see `table.rs::get`, `trace.rs`). Changing the `repr`, adding
 /// fields, or introducing padding makes those casts UB.
 #[allow(clippy::derived_hash_with_manual_eq)]

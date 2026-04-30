@@ -7,8 +7,8 @@ edition = "2024"
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
-disk-spill = ["stark/disk-spill"]
 instruments = ["stark/instruments"]
+disk-spill = ["stark/disk-spill"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
@@ -17,6 +17,8 @@ math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 serde = { version = "1.0", features = ["derive"] }
 rayon = { version = "1.8.0", optional = true }
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+log = "0.4"
 
 [dev-dependencies]
 env_logger = "*"

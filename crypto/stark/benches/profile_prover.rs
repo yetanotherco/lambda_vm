@@ -21,6 +21,7 @@ fn main() {
         fri_number_of_queries: 100,
         coset_offset: 3,
         grinding_factor: 0,
+        max_ram_bytes: None,
     };
 
     let num_columns = 16;

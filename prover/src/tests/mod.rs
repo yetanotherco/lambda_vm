@@ -24,6 +24,8 @@ pub mod lt_bus_tests;
 pub mod lt_tests;
 #[cfg(test)]
 pub mod mul_tests;
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod peak_bytes_calibration_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]

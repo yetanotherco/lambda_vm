@@ -174,6 +174,7 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -377,10 +378,6 @@ fn cmd_prove(
 
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
-
-    if cfg!(feature = "disk-spill") {
-        eprintln!("Disk-spill: enabled");
-    }
 
     #[cfg(all(feature = "jemalloc-stats", feature = "instruments"))]
     stark::instruments::set_heap_reader(|| {

@@ -10,6 +10,8 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+#[cfg(feature = "disk-spill")]
+pub mod auto_storage;
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
@@ -574,16 +576,51 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Generate all traces from ELF and execution logs.
-    // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
-
-    drop(result);
-
+    // Pick where trace buffers and Merkle tree nodes live for this proof.
+    // With the `disk-spill` feature enabled, the analytical estimate decides
+    // between Ram and Disk; without it, we never spill.
     #[cfg(feature = "disk-spill")]
-    traces
-        .spill_all_main_to_disk()
-        .map_err(|e| Error::Prover(format!("disk-spill traces: {e}")))?;
+    let storage_mode = {
+        // Stream over logs once to compute exact per-table row counts without
+        // allocating any op vectors. Use the resulting `TableLengths` to
+        // estimate peak heap analytically and pick a storage mode.
+        let lengths = crate::tables::trace_builder::count_table_lengths(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+        )?;
+
+        let available = auto_storage::available_ram_bytes();
+        let estimated_peak = auto_storage::peak_bytes(
+            &lengths,
+            proof_options.blowup_factor,
+            stark::prover::table_parallelism(),
+        );
+        let mode = auto_storage::select_storage_mode(
+            estimated_peak,
+            available,
+            proof_options.max_ram_bytes,
+        );
+
+        log::info!("predicted_peak_bytes: {estimated_peak}, storage_mode: {mode:?}");
+
+        mode
+    };
+
+    // Phase 5: build the full traces with the chosen mode. `Disk` spills each
+    // chunk as it's built, so the trace never fully materializes in RAM.
+    #[cfg(feature = "disk-spill")]
+    let mut traces = Traces::from_elf_and_logs_with_mode(
+        &program,
+        &result.logs,
+        max_rows,
+        private_inputs,
+        storage_mode,
+    )?;
+    #[cfg(not(feature = "disk-spill"))]
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
+    drop(result);
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -611,11 +648,14 @@ pub fn prove_with_options_and_inputs(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let air_pairs = airs.air_trace_pairs(&mut traces);
+    let transcript = &mut DefaultTranscript::<E>::new(&[]);
+    #[cfg(feature = "disk-spill")]
+    let proof = Prover::multi_prove_with_mode(air_pairs, transcript, storage_mode)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(not(feature = "disk-spill"))]
+    let proof =
+        Prover::multi_prove(air_pairs, transcript).map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     #[cfg(feature = "instruments")]
     {

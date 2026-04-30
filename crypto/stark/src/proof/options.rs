@@ -38,6 +38,10 @@ impl fmt::Display for ProofOptionsError {
 /// - `fri_number_of_queries`: the number of queries for the FRI layer
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
+/// - `max_ram_bytes`: optional ceiling on prover RAM usage. When set, the
+///   prover spills trace tables and Merkle-tree nodes to mmap if the
+///   estimated peak exceeds this cap (or 80% of system-available RAM,
+///   whichever is smaller). LDE column vectors remain in RAM regardless.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProofOptions {
@@ -45,6 +49,8 @@ pub struct ProofOptions {
     pub fri_number_of_queries: usize,
     pub coset_offset: u64,
     pub grinding_factor: u8,
+    #[serde(default)]
+    pub max_ram_bytes: Option<u64>,
 }
 
 impl ProofOptions {
@@ -56,6 +62,7 @@ impl ProofOptions {
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
+            max_ram_bytes: None,
         }
     }
 }
@@ -112,6 +119,7 @@ impl GoldilocksCubicProofOptions {
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
+            max_ram_bytes: None,
         })
     }
 }

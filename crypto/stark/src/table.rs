@@ -39,6 +39,7 @@ impl std::fmt::Debug for TableMmapBacking {
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
 #[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -53,9 +54,9 @@ pub struct Table<F: IsField> {
 /// and returns an unspilled clone. This is cold — callers pay the full
 /// materialization cost — but avoids the runtime panic a derived impl
 /// would produce on `TableMmapBacking`.
+#[cfg(feature = "disk-spill")]
 impl<F: IsField> Clone for Table<F> {
     fn clone(&self) -> Self {
-        #[cfg(feature = "disk-spill")]
         if self.mmap_backing.is_some() {
             let mut data = Vec::with_capacity(self.width * self.height);
             for row in 0..self.height {
@@ -74,7 +75,6 @@ impl<F: IsField> Clone for Table<F> {
             data: self.data.clone(),
             width: self.width,
             height: self.height,
-            #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         }
     }
@@ -263,15 +263,9 @@ impl<F: IsField> Table<F> {
     }
 
     /// Returns true if this table's data has been spilled to disk via mmap.
+    #[cfg(feature = "disk-spill")]
     pub fn is_spilled(&self) -> bool {
-        #[cfg(feature = "disk-spill")]
-        {
-            self.mmap_backing.is_some()
-        }
-        #[cfg(not(feature = "disk-spill"))]
-        {
-            false
-        }
+        self.mmap_backing.is_some()
     }
 
     /// Spill the table's row-major data to a temp file and mmap it back.
@@ -340,9 +334,7 @@ impl<F: IsField> Table<F> {
     /// Call after reading spilled data into pool buffers so the same
     /// data doesn't occupy RAM in both places.
     ///
-    /// Unix-only: `madvise(MADV_DONTNEED)` has no direct Windows equivalent,
-    /// so this is a no-op on non-Unix targets (callers rely on natural
-    /// page-cache reclaim there).
+    /// Unix-only: no-op on non-Unix targets.
     #[cfg(all(feature = "disk-spill", unix))]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {

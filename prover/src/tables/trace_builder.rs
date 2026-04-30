@@ -31,6 +31,8 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
+#[cfg(feature = "disk-spill")]
+use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
@@ -95,6 +97,14 @@ impl MemoryState {
             }
         }
         Self { cells }
+    }
+
+    /// Count unique memory pages touched during execution.
+    #[cfg(feature = "disk-spill")]
+    fn unique_page_count(&self, page_size: u64) -> u64 {
+        let mask = !(page_size - 1);
+        let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
+        pages.len() as u64
     }
 
     /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
@@ -1685,25 +1695,14 @@ struct CollectedOps {
     commit_ops: Vec<CommitOperation>,
 }
 
-/// Chunk raw ops and generate one trace table per chunk.
-#[cfg(not(feature = "disk-spill"))]
+/// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
+/// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
+/// is built so peak heap usage stays bounded.
 fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
-) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
-    if ops.is_empty() {
-        vec![generate(&[])]
-    } else {
-        ops.chunks(max_rows).map(generate).collect()
-    }
-}
-
-#[cfg(feature = "disk-spill")]
-fn chunk_generate_and_spill<T>(
-    ops: &[T],
-    max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
         vec![&[][..]]
@@ -1712,10 +1711,14 @@ fn chunk_generate_and_spill<T>(
     };
     let mut tables = Vec::with_capacity(op_chunks.len());
     for chunk in op_chunks {
+        #[allow(unused_mut)]
         let mut t = generate(chunk);
-        t.main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            t.main_table
+                .spill_to_disk()
+                .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        }
         tables.push(t);
     }
     Ok(tables)
@@ -1840,6 +1843,7 @@ fn build_traces(
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
 ) -> Result<Traces, Error> {
     let CollectedOps {
@@ -1907,39 +1911,76 @@ fn build_traces(
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
-    // Dispatch macro: disk-spill variant spills main_table to mmap as tables are generated,
-    // freeing the heap buffers before the next chunk is built.
-    macro_rules! gen_traces {
-        ($ops:expr, $max:expr, $gen:expr) => {{
-            #[cfg(feature = "disk-spill")]
-            {
-                chunk_generate_and_spill($ops, $max, $gen)?
-            }
-            #[cfg(not(feature = "disk-spill"))]
-            {
-                chunk_and_generate($ops, $max, $gen)
-            }
-        }};
-    }
-
-    let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-    let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-    let memw_aligneds = gen_traces!(
+    let cpus = chunk_and_generate(
+        &cpu_ops,
+        max_rows.cpu,
+        cpu::generate_cpu_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let memws = chunk_and_generate(
+        &memw_ops,
+        max_rows.memw,
+        memw::generate_memw_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
         max_rows.memw_aligned,
-        memw_aligned::generate_memw_aligned_trace
-    );
-    let memw_registers = gen_traces!(
+        memw_aligned::generate_memw_aligned_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let memw_registers = chunk_and_generate(
         &memw_register_ops,
         max_rows.memw_register,
-        memw_register::generate_memw_register_trace
-    );
-    let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
-    let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-    let shifts = gen_traces!(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-    let muls = gen_traces!(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-    let dvrms = gen_traces!(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-    let branches = gen_traces!(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        memw_register::generate_memw_register_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let loads = chunk_and_generate(
+        &load_ops,
+        max_rows.load,
+        load::generate_load_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let lts = chunk_and_generate(
+        &lt_ops,
+        max_rows.lt,
+        lt::generate_lt_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let shifts = chunk_and_generate(
+        &shift_ops,
+        max_rows.shift,
+        shift::generate_shift_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let muls = chunk_and_generate(
+        &mul_ops,
+        max_rows.mul,
+        mul::generate_mul_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let dvrms = chunk_and_generate(
+        &dvrm_ops,
+        max_rows.dvrm,
+        dvrm::generate_dvrm_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let branches = chunk_and_generate(
+        &branch_ops,
+        max_rows.branch,
+        branch::generate_branch_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
 
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -2016,6 +2057,234 @@ fn build_traces(
         halt: halt_trace,
         commit: commit_trace,
         memw_registers,
+    })
+}
+
+/// Padded row count after chunking: each chunk rounds up to `next_power_of_two().max(4)`.
+#[cfg(feature = "disk-spill")]
+fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
+    if ops_count == 0 {
+        return 4; // empty-chunk tables still allocate one 4-row padded chunk
+    }
+    let mut total: u64 = 0;
+    let mut remaining = ops_count;
+    while remaining > 0 {
+        let chunk_size = remaining.min(max_rows);
+        total += chunk_size.next_power_of_two().max(4) as u64;
+        remaining -= chunk_size;
+    }
+    total
+}
+
+/// Per-table padded row counts plus auxiliary metrics for peak-heap estimation.
+#[cfg(feature = "disk-spill")]
+#[derive(Debug, Default, Clone)]
+pub struct TableLengths {
+    pub cpu_padded_rows: u64,
+    pub memw_padded_rows: u64,
+    pub memw_aligned_padded_rows: u64,
+    pub memw_register_padded_rows: u64,
+    pub load_padded_rows: u64,
+    pub lt_padded_rows: u64,
+    pub shift_padded_rows: u64,
+    pub mul_padded_rows: u64,
+    pub dvrm_padded_rows: u64,
+    pub branch_padded_rows: u64,
+    pub commit_padded_rows: u64,
+    pub decode_rows: u64,
+    pub unique_page_count: u64,
+    /// Executor cycle count.
+    pub cycle_count: u64,
+    /// Unique byte addresses touched (dominant non-trace heap term).
+    pub unique_byte_count: u64,
+}
+
+/// Compute upper-bound per-table row counts without allocating op vectors.
+/// Returns bounds (not exact) for tables that dedup ops: LT, MUL, DVRM, BRANCH.
+/// Must stay in sync with `Traces::from_elf_and_logs`.
+#[cfg(feature = "disk-spill")]
+pub fn count_table_lengths(
+    elf: &Elf,
+    logs: &[Log],
+    max_rows: &super::MaxRowsConfig,
+    private_input: &[u8],
+) -> Result<TableLengths, Error> {
+    // Phase 0: ELF → instructions + DECODE row count.
+    let instructions = decode::instructions_from_elf(elf)
+        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+    let (decode_trace, _decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+    let decode_rows = decode_trace.num_rows() as u64;
+
+    // Memory + register state for partition predicates that need timestamps.
+    let mut memory_state = MemoryState::from_elf(elf);
+    memory_state.add_private_input(private_input);
+    let mut register_state = RegisterState::new(elf.entry_point);
+
+    // Raw counts (pre-chunking + pre-padding).
+    let mut cpu_count = 0usize;
+    // memw_by_width[i] for i in 0..4 maps width 1/2/4/8 → wide-MEMW counts.
+    // Used by the LT-from-MEMW derivation: each wide-MEMW op contributes
+    // 1, 2, 4, or 8 LT ops based on its width.
+    let mut memw_by_width: [usize; 4] = [0; 4];
+    let mut memw_aligned_count = 0usize;
+    let mut memw_register_count = 0usize;
+    let mut load_count = 0usize;
+    let mut lt_count = 0usize;
+    let mut shift_count = 0usize;
+    let mut mul_count = 0usize;
+    let mut dvrm_count = 0usize;
+    let mut branch_count = 0usize;
+    let mut commit_count = 0usize;
+    let mut current_commit_index = 0u32;
+
+    let partition_memw = |op: &MemwOperation,
+                          by_width: &mut [usize; 4],
+                          aligned: &mut usize,
+                          register: &mut usize| {
+        if is_register_op(op) {
+            *register += 1;
+        } else if is_aligned_op(op) {
+            *aligned += 1;
+        } else {
+            let idx = match op.width {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                _ => return,
+            };
+            by_width[idx] += 1;
+        }
+    };
+
+    for (i, log) in logs.iter().enumerate() {
+        let timestamp = (i as u64) * 4 + 4;
+        let instruction = instructions
+            .get(&log.current_pc)
+            .copied()
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        let cpu_op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
+        cpu_count += 1;
+
+        // Memory ops from load/store
+        if cpu_op.decode.op_load {
+            let (memw_op, _load_op, _bitwise) =
+                collect_load_op_from_cpu(&cpu_op, &mut memory_state);
+            partition_memw(
+                &memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+            load_count += 1;
+        } else if cpu_op.decode.op_store {
+            let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
+            partition_memw(
+                &memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+        }
+
+        // Register accesses (M1 read rs1, M3 read rs2, M5 write rd).
+        let reg_memw_ops = collect_register_ops_from_cpu(&cpu_op, &mut register_state);
+        for memw_op in &reg_memw_ops {
+            partition_memw(
+                memw_op,
+                &mut memw_by_width,
+                &mut memw_aligned_count,
+                &mut memw_register_count,
+            );
+        }
+
+        // ECALL Commit
+        if cpu_op.ecall_commit {
+            let commit_ops = expand_commit_operations_for_ecall(
+                &cpu_op,
+                &memory_state,
+                current_commit_index as u64,
+            );
+            commit_count += commit_ops.len();
+            let reg_commit_ops =
+                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
+            for memw_op in &reg_commit_ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            let count = u32::try_from(cpu_op.commit_count)
+                .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
+            current_commit_index = current_commit_index
+                .checked_add(count)
+                .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
+        }
+
+        // CPU-side per-instruction-kind counters
+        if cpu_op.decode.op_slt || cpu_op.decode.op_blt {
+            lt_count += 1;
+        }
+        if cpu_op.decode.op_shift {
+            shift_count += 1;
+        }
+        if cpu_op.decode.op_mul {
+            mul_count += 1;
+        }
+        if cpu_op.decode.op_divrem {
+            dvrm_count += 1;
+        }
+        if cpu_op.branch_cond {
+            branch_count += 1;
+        }
+    }
+
+    // HALT finalization: 32 register MEMW ops at ts=u64::MAX. Their timestamp
+    // delta vs old_timestamp is enormous, so they fail `is_register_op`'s
+    // `<= 0x10000` check and fall through to wide MEMW.
+    let halt_memw_ops = collect_halt_ops(&mut register_state);
+    for memw_op in &halt_memw_ops {
+        partition_memw(
+            memw_op,
+            &mut memw_by_width,
+            &mut memw_aligned_count,
+            &mut memw_register_count,
+        );
+    }
+
+    // LT-from-MEMW: per wide-MEMW op, 1/2/4/8 LT ops by width.
+    // LT-from-MEMW_A: 1 LT op per memw_aligned op.
+    let memw_count = memw_by_width.iter().sum::<usize>();
+    let lt_from_memw =
+        memw_by_width[0] + 2 * memw_by_width[1] + 4 * memw_by_width[2] + 8 * memw_by_width[3];
+    lt_count += lt_from_memw + memw_aligned_count;
+
+    // DVRM-derived: 2 mul ops (lo + hi) and 1 lt op (|r| < |d|) per dvrm.
+    mul_count += 2 * dvrm_count;
+    lt_count += dvrm_count;
+
+    let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
+    let unique_byte_count = memory_state.cells.len() as u64;
+    let cycle_count = logs.len() as u64;
+
+    Ok(TableLengths {
+        cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
+        memw_padded_rows: padded_chunked_rows(memw_count, max_rows.memw),
+        memw_aligned_padded_rows: padded_chunked_rows(memw_aligned_count, max_rows.memw_aligned),
+        memw_register_padded_rows: padded_chunked_rows(memw_register_count, max_rows.memw_register),
+        load_padded_rows: padded_chunked_rows(load_count, max_rows.load),
+        lt_padded_rows: padded_chunked_rows(lt_count, max_rows.lt),
+        shift_padded_rows: padded_chunked_rows(shift_count, max_rows.shift),
+        mul_padded_rows: padded_chunked_rows(mul_count, max_rows.mul),
+        dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
+        branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
+        commit_padded_rows: commit_count.next_power_of_two().max(4) as u64,
+        decode_rows,
+        unique_page_count,
+        cycle_count,
+        unique_byte_count,
     })
 }
 
@@ -2400,6 +2669,35 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
     ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_inner(
+            elf,
+            logs,
+            max_rows,
+            private_input,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+    }
+
+    /// Same as `from_elf_and_logs` but lets the caller pick a storage mode.
+    #[cfg(feature = "disk-spill")]
+    pub fn from_elf_and_logs_with_mode(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_inner(elf, logs, max_rows, private_input, storage_mode)
+    }
+
+    fn from_elf_and_logs_inner(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
@@ -2438,6 +2736,8 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
             private_input,
         )
     }
@@ -2487,6 +2787,8 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
             &[],
         )
     }
