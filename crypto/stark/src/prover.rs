@@ -10,6 +10,7 @@ use math::fft::errors::FFTError;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
+use math::spill_safe::SpillSafe;
 use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -1581,8 +1582,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
-        <Field as IsField>::BaseType: Copy,
-        <FieldExtension as IsField>::BaseType: Copy,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         Self::multi_prove_inner(
             air_trace_pairs,
@@ -1604,8 +1605,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
-        <Field as IsField>::BaseType: Copy,
-        <FieldExtension as IsField>::BaseType: Copy,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         Self::multi_prove_inner(air_trace_pairs, transcript, storage_mode)
     }
@@ -1619,8 +1620,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
-        <Field as IsField>::BaseType: Copy,
-        <FieldExtension as IsField>::BaseType: Copy,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
 
@@ -2100,8 +2101,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
-        <Field as IsField>::BaseType: Copy,
-        <FieldExtension as IsField>::BaseType: Copy,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
         Self::multi_prove(air_trace_pairs, transcript)

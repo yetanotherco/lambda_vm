@@ -4,6 +4,8 @@ use crate::merkle_tree::proof::BatchProof;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
 use alloc::{collections::BTreeSet, vec::Vec};
+#[cfg(feature = "disk-spill")]
+use math::spill_safe::SpillSafe;
 
 #[derive(Debug)]
 pub enum Error {
@@ -300,7 +302,7 @@ where
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
-        B::Node: Copy,
+        B::Node: SpillSafe,
     {
         const {
             assert!(

@@ -4,6 +4,8 @@ use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::polynomial::barycentric_inv_denoms;
+#[cfg(feature = "disk-spill")]
+use math::spill_safe::SpillSafe;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -152,7 +154,7 @@ where
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
     where
-        F::BaseType: Copy,
+        F::BaseType: SpillSafe,
     {
         self.main_table.spill_to_disk()
     }
@@ -160,7 +162,7 @@ where
     #[cfg(feature = "disk-spill")]
     pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
     where
-        E::BaseType: Copy,
+        E::BaseType: SpillSafe,
     {
         self.aux_table.spill_to_disk()
     }
