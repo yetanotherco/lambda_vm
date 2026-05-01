@@ -16,8 +16,8 @@ OUT="/tmp/calibrate_threshold"
 mkdir -p "$OUT"
 rm -f "$OUT"/*.txt
 
-echo "Building CLI with jemalloc-stats..."
-cargo build --release -p cli --features jemalloc-stats --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
+echo "Building CLI with jemalloc-stats and disk-spill..."
+cargo build --release -p cli --features jemalloc-stats,disk-spill --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
 
 CLI="$ROOT_DIR/target/release/cli"
 
