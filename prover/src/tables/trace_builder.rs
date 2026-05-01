@@ -2116,8 +2116,9 @@ pub fn count_table_lengths(
     // Phase 0: ELF → instructions + DECODE row count.
     let instructions = decode::instructions_from_elf(elf)
         .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-    let (decode_trace, _decode_pc_to_row) = decode::generate_decode_trace(&instructions);
-    let decode_rows = decode_trace.num_rows() as u64;
+    // Mirrors the padding inside `generate_decode_trace`: +1 for the CPU
+    // padding entry, then round up to the next power of two with floor 2.
+    let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
 
     // Memory + register state for partition predicates that need timestamps.
     let mut memory_state = MemoryState::from_elf(elf);
