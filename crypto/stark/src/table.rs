@@ -264,6 +264,11 @@ impl<F: IsField> Table<F> {
     }
 
     pub fn set(&mut self, row: usize, col: usize, value: FieldElement<F>) {
+        #[cfg(feature = "disk-spill")]
+        debug_assert!(
+            self.mmap_backing.is_none(),
+            "Table::set on a spilled table — backing mmap is read-only"
+        );
         let idx = row * self.width + col;
         self.data[idx] = value;
     }
