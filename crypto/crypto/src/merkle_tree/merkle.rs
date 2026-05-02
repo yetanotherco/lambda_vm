@@ -54,6 +54,30 @@ where
         Self::build_from_hashed_leaves(hashed_leaves)
     }
 
+    /// Build a `MerkleTree` from an already-filled node vector whose layout
+    /// matches [`build_from_hashed_leaves`] output:
+    ///
+    ///   - `nodes.len() == 2 * leaves_len - 1` where `leaves_len` is a power of two
+    ///   - `nodes[0]` is the root
+    ///   - `nodes[leaves_len - 1 .. 2*leaves_len - 1]` are the leaves
+    ///
+    /// Useful when the tree was constructed elsewhere (e.g. on a GPU) and
+    /// the caller just wants to hand the finished layout to the stark prover.
+    /// Performs no hashing.
+    pub fn from_precomputed_nodes(nodes: Vec<B::Node>) -> Option<Self> {
+        if nodes.is_empty() {
+            return None;
+        }
+        // Validate (cheap) that (nodes.len() + 1) is a power of two: there
+        // must be `leaves_len - 1 + leaves_len = 2*leaves_len - 1` entries.
+        let total = nodes.len();
+        if !(total + 1).is_power_of_two() {
+            return None;
+        }
+        let root = nodes[ROOT].clone();
+        Some(MerkleTree { root, nodes })
+    }
+
     /// Create a Merkle tree from pre-hashed leaf nodes.
     ///
     /// This skips the `hash_leaves` step, useful when leaves have already been

@@ -177,6 +177,28 @@ cargo test --release -p lambda-vm-prover --features debug-checks -- --nocapture
 
 The feature is defined in `crypto/stark/Cargo.toml` and forwarded through `prover/Cargo.toml`. It has zero overhead when disabled.
 
+## GPU acceleration (experimental)
+
+A CUDA backend for the per-column coset LDE (the `coset_lde_full_expand` hot path) lives in the `math-cuda` crate and is gated behind the `cuda` feature on `stark` / `lambda-vm-prover`. Requires CUDA 13.x with a visible NVIDIA GPU. Covers the Goldilocks base field only; extension-field columns and small LDEs transparently fall back to the CPU path.
+
+```sh
+# Unit tests for the GPU kernels (parity against CPU, sizes up to 2^20):
+make test-cuda
+
+# Full workspace check including the CUDA feature:
+make check-cuda
+
+# `test-fast` with GPU LDE enabled:
+make test-fast-cuda
+```
+
+Behaviour:
+- The GPU path fires only when `buffer.len() * blowup_factor >= 2^19` and the column is `FieldElement<GoldilocksField>`. Tune with `LAMBDA_VM_GPU_LDE_THRESHOLD=<n>` at runtime.
+- If the `cuda` feature is enabled and CUDA initialisation fails, the process panics with a clear message — there is no transparent fallback to CPU.
+- The CPU-only build (default) is bit-for-bit identical to before; the feature is zero overhead when disabled.
+
+Status: on a single RTX 5090 with ~46 CPU cores and the current kernel set, end-to-end prove time ties the rayon-parallel CPU path on 1M–4M-instruction proofs. Wins on single-column LDE are ~16× at 2^18 sizes but are swallowed by CPU parallelism and per-call kernel launch overhead. Next steps for a real speedup are kernel fusion across NTT levels, CUDA graphs to amortise launch, keeping LDE on device through Merkle, and moving Keccak/constraint evaluation to GPU.
+
 ## Roadmap for the virtual machine
 
 This project is under active development. Our primary objective is to have a first working version for the virtual machine. Priorities and features might change as we continue developing.

@@ -8,10 +8,14 @@ pub mod domain;
 pub mod examples;
 pub mod frame;
 pub mod fri;
+#[cfg(feature = "cuda")]
+pub mod gpu_lde;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 pub mod lookup;
+#[cfg(feature = "cuda")]
+pub mod logup_gpu;
 pub mod proof;
 pub mod prover;
 pub mod table;

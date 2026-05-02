@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check clippy fmt lint
+test-fast test-prover test-prover-all build check clippy fmt lint test-cuda check-cuda
 
 UNAME := $(shell uname)
 
@@ -193,3 +193,17 @@ lint:
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
+
+# === CUDA ===
+# Run math-cuda tests (requires CUDA + a visible GPU).
+test-cuda:
+	cargo test -p math-cuda
+
+check-cuda:
+	cargo check -p math-cuda
+	cargo check -p stark --features cuda
+	cargo check -p lambda-vm-prover --features cuda
+
+# Fast test suite with GPU LDE enabled (drop-in replacement for `test-fast`).
+test-fast-cuda:
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel,stark/cuda
