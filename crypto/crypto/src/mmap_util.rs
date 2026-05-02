@@ -1,6 +1,11 @@
 /// Resize `file` to `total_bytes` and reserve disk blocks where supported, so
 /// later mmap writes fault with `ENOSPC` from this call instead of `SIGBUS`
 /// after the temp filesystem fills up.
+///
+/// Block reservation only runs on Linux (`posix_fallocate`). On other
+/// platforms `set_len` extends the inode but does not reserve blocks: if
+/// the temp filesystem fills during the subsequent mmap write, the process
+/// is killed by `SIGBUS` with no Rust-level error path.
 pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
     file.set_len(total_bytes)?;
     #[cfg(target_os = "linux")]
