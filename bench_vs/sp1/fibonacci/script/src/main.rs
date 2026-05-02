@@ -40,6 +40,25 @@ fn main() {
 
     println!("Proving time: {:.3}s", elapsed.as_secs_f64());
 
+    // Count main-trace field elements from the proof shards.
+    // round 0 = preprocessed, round 1 = main trace.
+    let total_elements: usize = match &proof.proof {
+        sp1_sdk::SP1Proof::Core(shards) => shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .evaluation_proof
+                    .row_counts_and_column_counts
+                    .get(1)
+                    .map(|round| round.iter().map(|&(r, c)| r * c).sum::<usize>())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        _ => 0,
+    };
+    println!("Elements: {}", total_elements);
+
+
     // Verify (outside the timer, same as Lambda).
     client
         .verify(&proof, pk.verifying_key(), None)

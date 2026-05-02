@@ -97,6 +97,18 @@ impl MemoryState {
         Self { cells }
     }
 
+    /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
+    fn add_private_input(&mut self, private_input: &[u8]) {
+        if private_input.is_empty() {
+            return;
+        }
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let start = PRIVATE_INPUT_START_INDEX;
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
+            self.cells.insert(start + i as u64, (b, 0));
+        }
+    }
+
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
         self.cells.get(&address).copied().unwrap_or((0, 0))
@@ -140,14 +152,16 @@ struct RegisterState {
 
 impl RegisterState {
     fn new(entry_point: u64) -> Self {
-        let mut regs = [(0u64, 0u64); 32];
+        // Per spec/memory.typ: "register initialization happens at timestamp 1"
+        // to enable loading of the PC via the CPU memory argument.
+        let mut regs = [(0u64, 1u64); 32];
         // SP (x2) starts at STACK_TOP
-        regs[2] = (page::STACK_TOP, 0);
+        regs[2] = (page::STACK_TOP, 1);
         Self {
             regs,
-            index_register: (0, 0),
-            // PC register (x255) starts at entry_point, timestamp 0
-            pc_register: (entry_point, 0),
+            index_register: (0, 1),
+            // PC register (x255) starts at entry_point, timestamp 1
+            pc_register: (entry_point, 1),
         }
     }
 
@@ -290,7 +304,10 @@ fn collect_cpu_ops(
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
-    // for the first access to any register/memory location (where old_timestamp=0).
+    // for the first access to any register/memory location. The +4 stride reserves
+    // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
+    // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
+    // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
@@ -591,20 +608,9 @@ fn collect_register_ops_from_cpu(
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
-    // CM54: PC register read-write at timestamp+1
-    // Every non-padding CPU row sends a MEMW for x255 (address 510).
-    // old = pc (current), value = next_pc (new).
-    {
-        let pc_value = pack_register_value(op.decode.pc);
-        let next_pc_value = pack_register_value(op.next_pc);
-        let (_old_val, old_ts) = register_state.read_pc();
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
-            .with_old(pc_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write_pc(op.next_pc, op.timestamp + 1);
-    }
+    // PC register state update (needed for M1 reads when rs1=255, i.e. AUIPC/JAL).
+    // The actual PC read/write is now inline in the CPU via memory bus interactions.
+    register_state.write_pc(op.next_pc, op.timestamp + 1);
 
     memw_ops
 }
@@ -1240,7 +1246,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - IS_BYTE[next_pc_low[1]] - range check bits 8-15
+/// - IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
 /// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
@@ -1260,7 +1266,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
 
-        // IS_BYTE[next_pc_low[1]] - range check for byte value
+        // IS_BYTE[next_pc_low[1], 0] - range check for byte value
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             next_pc_low_1,
@@ -1302,20 +1308,34 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Generates IS_BYTE ops for CPU padding rows.
 ///
 /// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
-/// Since the CPU bus interactions use Multiplicity::One for byte checks,
+/// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 27 IsByte(0) = 27 ops.
+/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
+/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
     }
 
-    let mut ops = Vec::with_capacity(num_padding_rows * 27);
+    let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        for _ in 0..27 {
-            ops.push(BitwiseOperation::single_byte(
+        // IS_BYTE[RS1, RS2] pair (both zero in padding)
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::IsByte,
+            0,
+            0,
+        ));
+        // IS_BYTE[RD, 0] single (zero in padding)
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            0,
+        ));
+        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
+        for _ in 0..12 {
+            ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
+                0,
                 0,
             ));
         }
@@ -1325,37 +1345,66 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
-/// Each PAGE byte generates 2 IS_BYTE lookups:
-/// - C1: IS_BYTE[init] for initialization range check
-/// - C2: IS_BYTE[fini] for finalization range check
+/// Each PAGE row generates 1 batched IS_BYTE lookup:
+/// - C1+C2: IS_BYTE[init, fini] — range-checks both bytes in one interaction
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
-fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
-    use std::collections::BTreeSet;
+///
+/// Encode private input as `[len_u32_LE][data]` — the canonical wire format.
+/// Must match `executor::vm::memory::Memory::store_private_inputs`.
+fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
+    let len_bytes = (private_input.len() as u32).to_le_bytes();
+    len_bytes
+        .iter()
+        .chain(private_input.iter())
+        .copied()
+        .collect()
+}
 
+fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut bitwise_ops = Vec::new();
-
-    // Collect ELF page init data
-    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
-
+    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
             let word_addr = segment.base_addr + (i as u64 * 4);
             for byte_offset in 0..4u64 {
                 let byte_addr = word_addr + byte_offset;
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-
                 let page_base = page::page_base_for_address(byte_addr, page_size);
                 let offset = page::offset_in_page(byte_addr, page_size);
-
-                let page_data = elf_page_data
+                let page_data = init_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
             }
         }
     }
+    if !private_input.is_empty() {
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
+            let addr = PRIVATE_INPUT_START_INDEX + i as u64;
+            let page_base = page::page_base_for_address(addr, page_size);
+            let offset = page::offset_in_page(addr, page_size);
+            let page_data = init_page_data
+                .entry(page_base)
+                .or_insert_with(|| vec![0u8; page_size]);
+            page_data[offset] = b;
+        }
+    }
+    init_page_data
+}
+
+fn collect_bitwise_from_page(
+    elf: &Elf,
+    memory_state: &MemoryState,
+    private_input: &[u8],
+) -> Vec<BitwiseOperation> {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let mut bitwise_ops = Vec::new();
+
+    let elf_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
@@ -1383,15 +1432,10 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1: IS_BYTE[init]
-            bitwise_ops.push(BitwiseOperation::single_byte(
+            // C1+C2: IS_BYTE[init, fini] — batched range check for both bytes
+            bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
                 init,
-            ));
-
-            // C2: IS_BYTE[fini]
-            bitwise_ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
                 fini,
             ));
         }
@@ -1505,6 +1549,7 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
+    private_input: &[u8],
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1513,27 +1558,8 @@ fn generate_page_tables(
 
     let page_size = page::DEFAULT_PAGE_SIZE;
 
-    // Collect ELF page init data (needed for PageConfig::with_data)
-    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
-
-    for segment in &elf.data {
-        for (i, &word) in segment.values.iter().enumerate() {
-            let word_addr = segment.base_addr + (i as u64 * 4);
-
-            for byte_offset in 0..4u64 {
-                let byte_addr = word_addr + byte_offset;
-                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-
-                let page_base = page::page_base_for_address(byte_addr, page_size);
-                let offset = page::offset_in_page(byte_addr, page_size);
-
-                let page_data = elf_page_data
-                    .entry(page_base)
-                    .or_insert_with(|| vec![0u8; page_size]);
-                page_data[offset] = byte_value;
-            }
-        }
-    }
+    // Collect init data from ELF segments + private input region
+    let init_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
@@ -1552,8 +1578,22 @@ fn generate_page_tables(
     let mut pages = Vec::new();
     let mut page_configs = Vec::new();
 
+    // Determine which page bases hold private input data.
+    let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let total_bytes = 4 + private_input.len(); // length prefix + data
+        (0..total_bytes)
+            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size))
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
     for &page_base in &page_bases {
-        let config = if let Some(init_data) = elf_page_data.get(&page_base) {
+        let config = if private_input_page_bases.contains(&page_base) {
+            let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
+            PageConfig::with_private_input(page_base, page_size, init_data)
+        } else if let Some(init_data) = init_page_data.get(&page_base) {
             PageConfig::with_data(page_base, page_size, init_data.clone())
         } else {
             PageConfig::zero_init(page_base, page_size)
@@ -1777,6 +1817,7 @@ fn build_traces(
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
+    private_input: &[u8],
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -1810,9 +1851,9 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+    // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
     if let Some(elf) = elf {
-        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
     }
 
     let public_output_bytes: Vec<u8> = commit_ops
@@ -1887,7 +1928,7 @@ fn build_traces(
             || {
                 rayon::join(
                     || match elf {
-                        Some(elf) => generate_page_tables(elf, memory_state),
+                        Some(elf) => generate_page_tables(elf, memory_state, private_input),
                         None => (Vec::new(), Vec::new()),
                     },
                     || register::generate_register_trace(&register_final_state, entry_point),
@@ -1905,7 +1946,7 @@ fn build_traces(
     {
         match elf {
             Some(elf) => {
-                let (p, c) = generate_page_tables(elf, memory_state);
+                let (p, c) = generate_page_tables(elf, memory_state, private_input);
                 pages = p;
                 page_configs = c;
             }
@@ -1941,6 +1982,191 @@ fn build_traces(
 }
 
 impl Traces {
+    /// Returns the total number of main-trace field elements across all tables.
+    ///
+    /// Counts only the main (base-field) trace columns — equivalent to SP1's
+    /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    ///
+    /// Preprocessed columns (committed in a separate PCS round during setup, not at
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (2), PAGE (2).
+    pub fn total_field_elements(&self) -> u64 {
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
+        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * CPU_COLS) as u64;
+        }
+        total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        for t in lts {
+            total += (t.num_rows() * LT_COLS) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * SHIFT_COLS) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * MEMW_COLS) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * MEMW_A_COLS) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * LOAD_COLS) as u64;
+        }
+        total += (decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
+        for t in muls {
+            total += (t.num_rows() * MUL_COLS) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * DVRM_COLS) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * BRANCH_COLS) as u64;
+        }
+        total += (halt.num_rows() * HALT_COLS) as u64;
+        total += (commit.num_rows() * COMMIT_COLS) as u64;
+        total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
+        for t in pages {
+            total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * MEMW_R_COLS) as u64;
+        }
+        total
+    }
+
+    /// Returns the total number of auxiliary-trace field elements (extension field)
+    /// across all tables.
+    ///
+    /// The LogUp layout packs N bus interactions into ⌈N/2⌉ EF columns
+    /// (`num_committed_pairs + 1` accumulated column). Each EF column costs one
+    /// extension-field element per row.
+    pub fn total_auxiliary_field_elements(&self) -> u64 {
+        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
+        let n_lt = aux_cols(super::lt::bus_interactions().len());
+        let n_shift = aux_cols(super::shift::bus_interactions().len());
+        let n_memw = aux_cols(super::memw::bus_interactions().len());
+        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
+        let n_load = aux_cols(super::load::bus_interactions().len());
+        let n_decode = aux_cols(super::decode::bus_interactions().len());
+        let n_mul = aux_cols(super::mul::bus_interactions().len());
+        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
+        let n_branch = aux_cols(super::branch::bus_interactions().len());
+        let n_halt = aux_cols(super::halt::bus_interactions().len());
+        let n_commit = aux_cols(super::commit::bus_interactions().len());
+        let n_register = aux_cols(super::register::bus_interactions().len());
+        // page::bus_interactions count is constant regardless of page_base.
+        let n_page = aux_cols(super::page::bus_interactions(0).len());
+        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
+
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            register,
+            branches,
+            halt,
+            commit,
+            memw_registers,
+            page_configs: _,
+            public_output_bytes: _,
+        } = self;
+
+        let mut total: u64 = 0;
+        for t in cpus {
+            total += (t.num_rows() * n_cpu) as u64;
+        }
+        total += (bitwise.num_rows() * n_bitwise) as u64;
+        for t in lts {
+            total += (t.num_rows() * n_lt) as u64;
+        }
+        for t in shifts {
+            total += (t.num_rows() * n_shift) as u64;
+        }
+        for t in memws {
+            total += (t.num_rows() * n_memw) as u64;
+        }
+        for t in memw_aligneds {
+            total += (t.num_rows() * n_memw_a) as u64;
+        }
+        for t in loads {
+            total += (t.num_rows() * n_load) as u64;
+        }
+        total += (decode.num_rows() * n_decode) as u64;
+        for t in muls {
+            total += (t.num_rows() * n_mul) as u64;
+        }
+        for t in dvrms {
+            total += (t.num_rows() * n_dvrm) as u64;
+        }
+        for t in branches {
+            total += (t.num_rows() * n_branch) as u64;
+        }
+        total += (halt.num_rows() * n_halt) as u64;
+        total += (commit.num_rows() * n_commit) as u64;
+        total += (register.num_rows() * n_register) as u64;
+        for t in pages {
+            total += (t.num_rows() * n_page) as u64;
+        }
+        for t in memw_registers {
+            total += (t.num_rows() * n_memw_r) as u64;
+        }
+        total
+    }
+
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
         crate::TableCounts {
@@ -1966,31 +2192,14 @@ impl Traces {
         use std::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
-        let mut page_bases: BTreeSet<u64> = BTreeSet::new();
-        let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+        let init_page_data = build_init_page_data(elf, &[]);
 
-        for segment in &elf.data {
-            for (i, &word) in segment.values.iter().enumerate() {
-                let word_addr = segment.base_addr + (i as u64 * 4);
-                for byte_offset in 0..4u64 {
-                    let byte_addr = word_addr + byte_offset;
-                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                    let page_base = page::page_base_for_address(byte_addr, page_size);
-                    let offset = page::offset_in_page(byte_addr, page_size);
-                    page_bases.insert(page_base);
-
-                    let page_data = elf_page_data
-                        .entry(page_base)
-                        .or_insert_with(|| vec![0u8; page_size]);
-                    page_data[offset] = byte_value;
-                }
-            }
-        }
+        let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
 
         page_bases
             .into_iter()
             .map(|base| {
-                if let Some(init_data) = elf_page_data.get(&base) {
+                if let Some(init_data) = init_page_data.get(&base) {
                     PageConfig::with_data(base, page_size, init_data.clone())
                 } else {
                     PageConfig::zero_init(base, page_size)
@@ -1999,18 +2208,22 @@ impl Traces {
             .collect()
     }
 
-    /// Reconstruct page configs from ELF and runtime page ranges.
+    /// Reconstruct page configs from ELF, runtime page ranges, and private-input page count.
     ///
     /// Used by the verifier to reconstruct the full PAGE table layout.
-    /// Combines deterministic ELF pages with prover-provided runtime
-    /// page ranges (zero-initialized: stack, heap, etc.).
-    /// Each range is `(base, count)` — `count` contiguous 4KB pages from `base`.
+    /// Combines:
+    /// - Deterministic ELF pages (preprocessed, init from binary)
+    /// - Runtime pages from prover hints (preprocessed, zero-init)
+    /// - Private-input pages (NOT preprocessed, verifier doesn't see init values)
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
+        num_private_input_pages: usize,
     ) -> Vec<PageConfig> {
         let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
+
+        // Add zero-init runtime pages (stack, heap)
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
             for i in 0..count {
@@ -2020,6 +2233,21 @@ impl Traces {
                 ));
             }
         }
+
+        // Add private-input pages (non-preprocessed, verifier doesn't know init values)
+        if num_private_input_pages > 0 {
+            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
+            for i in 0..num_private_input_pages {
+                configs.push(PageConfig {
+                    page_base: first_page_base + i as u64 * page_size as u64,
+                    page_size,
+                    init_values: None, // Verifier doesn't know these
+                    is_private_input: true,
+                });
+            }
+        }
+
         configs.sort_by_key(|c| c.page_base);
         configs
     }
@@ -2078,6 +2306,7 @@ impl Traces {
         elf: &Elf,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
     ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
@@ -2091,6 +2320,7 @@ impl Traces {
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_elf(elf);
+        memory_state.add_private_input(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
@@ -2116,6 +2346,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            private_input,
         )
     }
 
@@ -2164,6 +2395,7 @@ impl Traces {
             decode_pc_to_row,
             register_state,
             max_rows,
+            &[],
         )
     }
 

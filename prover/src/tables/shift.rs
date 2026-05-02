@@ -23,7 +23,6 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
@@ -181,8 +180,14 @@ impl ShiftOperation {
         let left = !self.direction;
         let right = self.direction;
 
-        // is_negative = MSB of in[3]
-        let is_negative = (self.in_halves[3] >> 15) & 1 == 1;
+        // is_negative is the MSB of in[3] BUT gated by `signed`. The SHIFT
+        // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
+        // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
+        // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
+        // so the extension contribution in `compute_shifted_half` naturally
+        // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
+        // the top-bit value of the input.
+        let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
         let extension: u16 = if is_negative { 0xFFFF } else { 0 };
 
         // bit_shift
@@ -786,21 +791,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 

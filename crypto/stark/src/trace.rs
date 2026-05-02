@@ -1,12 +1,9 @@
-use crate::domain::Domain;
+use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::polynomial::{
-    barycentric_inv_denoms, interpolate_coset_eval_ext_with_g_n_inv,
-    interpolate_coset_eval_with_g_n_inv,
-};
+use math::polynomial::barycentric_inv_denoms;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -402,12 +399,17 @@ where
 /// The key insight: the LDE contains evaluations on a coset of size N*blowup_factor.
 /// Taking every blowup_factor-th point gives N evaluations on the trace-size coset
 /// {g * w_trace^i}, which is sufficient to interpolate a degree < N polynomial.
+///
+/// Accepts a [`DomainConstants`] to avoid redundant computation when the caller
+/// has already derived these values (e.g., round_3 shares them with composition
+/// poly evaluation).
 pub fn get_trace_evaluations_from_lde<F, E>(
     lde_trace: &LDETraceTable<F, E>,
     domain: &Domain<F>,
     z: &FieldElement<E>,
     frame_offsets: &[usize],
     step_size: usize,
+    dc: &DomainConstants<F>,
 ) -> Table<E>
 where
     F: IsSubFieldOf<E> + IsFFTField,
@@ -419,72 +421,18 @@ where
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
 
-    // Extract trace-size coset points: {g * w_trace^i} = lde_coset[i * blowup_factor]
-    let coset_points: Vec<FieldElement<F>> = (0..n)
-        .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
-        .collect();
-
-    // Precompute constants for barycentric formula.
-    // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
-    // functions use F×E→E mixed arithmetic, avoiding field conversions.
-    let coset_offset_pow_n: FieldElement<F> = domain.coset_offset.pow(n);
-    let n_inv: FieldElement<F> = FieldElement::<F>::from(n as u64)
-        .inv()
-        .expect("n is a power of two, hence non-zero in the field");
-    // Precompute (g^N)^{-1} once in base field — shared across all columns and eval points.
-    let g_n_inv: FieldElement<F> = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero");
+    debug_assert_eq!(
+        dc.points.len(),
+        n,
+        "DomainConstants.points length must equal domain.interpolation_domain_size"
+    );
 
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
     let evaluation_points =
         compute_frame_evaluation_points(z, frame_offsets, &domain.trace_primitive_root, step_size);
 
-    // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
-
-    // Extract trace-size evaluations from LDE for each column (stride = blowup_factor).
-    // Skip the extraction when the GPU path will handle it — the kernels
-    // read the LDE directly from device handles via stride.
-    #[cfg(feature = "cuda")]
-    let gpu_main_available = lde_trace.gpu_main().is_some();
-    #[cfg(not(feature = "cuda"))]
-    let gpu_main_available = false;
-    #[cfg(feature = "cuda")]
-    let gpu_aux_available = lde_trace.gpu_aux().is_some();
-    #[cfg(not(feature = "cuda"))]
-    let gpu_aux_available = false;
-
-    let main_col_evals: Vec<Vec<FieldElement<F>>> = if gpu_main_available {
-        Vec::new()
-    } else {
-        #[cfg(feature = "parallel")]
-        let main_iter = (0..num_main_cols).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let main_iter = 0..num_main_cols;
-        main_iter
-            .map(|col| {
-                (0..n)
-                    .map(|i| lde_trace.get_main(i * bf, col).clone())
-                    .collect()
-            })
-            .collect()
-    };
-
-    let aux_col_evals: Vec<Vec<FieldElement<E>>> = if gpu_aux_available {
-        Vec::new()
-    } else {
-        #[cfg(feature = "parallel")]
-        let aux_iter = (0..num_aux_cols).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = 0..num_aux_cols;
-        aux_iter
-            .map(|col| {
-                (0..n)
-                    .map(|i| lde_trace.get_aux(i * bf, col).clone())
-                    .collect()
-            })
-            .collect()
-    };
+    // Precompute size_inv * offset_pow_n_inv once — shared across all eval points and columns.
+    let n_inv_g_n_inv: FieldElement<F> = &dc.size_inv * &dc.offset_pow_n_inv;
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
@@ -492,23 +440,28 @@ where
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
+        // vanishing_factor = (z^N - offset^N) * size_inv * offset_pow_n_inv
+        let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
+        let vanishing_factor = &n_inv_g_n_inv * &vanishing;
+
         // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns.
         // Stays on CPU: batch-invert cost at this scale (n × num_eval_points ≈ 3 × 2^18 per
         // table) is already rayon-parallelised across 7 tables, and a GPU port regressed
         // wall time in a 2×15-trial A/B due to stream contention from 21 concurrent launches.
-        let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
+        let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
 
         // GPU fast path: batched strided barycentric over the main-trace
-        // LDE already on device. Avoids the per-column CPU vec allocation
-        // above when the R1 fused path ran.
+        // LDE already on device. Falls through if the GPU LDE handles
+        // aren't populated (small tables, cuda feature off, or the CPU
+        // path filled the LDE).
         #[cfg(feature = "cuda")]
         let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
             lde_trace,
             bf,
-            &coset_points,
-            &coset_offset_pow_n,
-            &n_inv,
-            &g_n_inv,
+            &dc.points,
+            &dc.offset_pow_n,
+            &dc.size_inv,
+            &dc.offset_pow_n_inv,
             &z_pow_n,
             &inv_denoms,
         );
@@ -518,24 +471,36 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
-            // Evaluate all main columns (parallel when feature enabled)
+            // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
+            // This eliminates N redundant F×E multiplies per column.
+            let col_scale: Vec<FieldElement<E>> = dc
+                .points
+                .iter()
+                .zip(inv_denoms.iter())
+                .map(|(point, inv_d)| point * inv_d)
+                .collect();
+
+            // Evaluate all main columns directly from LDE (no extraction copy).
+            // For main columns (base field F): sum = Σ col_scale[i] * lde_col[i*bf]
+            // lde_col[i*bf] is F, col_scale[i] is E; use F×E → E mixed arithmetic.
             #[cfg(feature = "parallel")]
-            let main_iter = main_col_evals.par_iter();
+            let main_iter = (0..num_main_cols).into_par_iter();
             #[cfg(not(feature = "parallel"))]
-            let main_iter = main_col_evals.iter();
-            main_iter
-                .map(|col_evals| {
-                    interpolate_coset_eval_with_g_n_inv(
-                        &z_pow_n,
-                        &coset_offset_pow_n,
-                        &n_inv,
-                        &g_n_inv,
-                        &coset_points,
-                        col_evals,
-                        &inv_denoms,
-                    )
+            let main_iter = 0..num_main_cols;
+            let main_evals: Vec<FieldElement<E>> = main_iter
+                .map(|col_idx| {
+                    let lde_col = &lde_trace.main_columns[col_idx];
+                    let sum =
+                        col_scale
+                            .iter()
+                            .enumerate()
+                            .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                                acc + &lde_col[i * bf] * scale
+                            });
+                    &vanishing_factor * &sum
                 })
-                .collect()
+                .collect();
+            main_evals
         };
         table_data.extend(main_evals);
 
@@ -544,10 +509,10 @@ where
         let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
             lde_trace,
             bf,
-            &coset_points,
-            &coset_offset_pow_n,
-            &n_inv,
-            &g_n_inv,
+            &dc.points,
+            &dc.offset_pow_n,
+            &dc.size_inv,
+            &dc.offset_pow_n_inv,
             &z_pow_n,
             &inv_denoms,
         );
@@ -557,23 +522,35 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
+            // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across all aux columns.
+            let col_scale: Vec<FieldElement<E>> = dc
+                .points
+                .iter()
+                .zip(inv_denoms.iter())
+                .map(|(point, inv_d)| point * inv_d)
+                .collect();
+
+            // Evaluate all aux columns directly from LDE (no extraction copy).
+            // For aux columns (extension field E): sum = Σ col_scale[i] * lde_col[i*bf]
+            // Both col_scale and lde_col are in E, so each multiply is E×E → E.
             #[cfg(feature = "parallel")]
-            let aux_iter = aux_col_evals.par_iter();
+            let aux_iter = (0..num_aux_cols).into_par_iter();
             #[cfg(not(feature = "parallel"))]
-            let aux_iter = aux_col_evals.iter();
-            aux_iter
-                .map(|col_evals| {
-                    interpolate_coset_eval_ext_with_g_n_inv(
-                        &z_pow_n,
-                        &coset_offset_pow_n,
-                        &n_inv,
-                        &g_n_inv,
-                        &coset_points,
-                        col_evals,
-                        &inv_denoms,
-                    )
+            let aux_iter = 0..num_aux_cols;
+            let aux_evals: Vec<FieldElement<E>> = aux_iter
+                .map(|col_idx| {
+                    let lde_col = &lde_trace.aux_columns[col_idx];
+                    let sum =
+                        col_scale
+                            .iter()
+                            .enumerate()
+                            .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                                acc + scale * &lde_col[i * bf]
+                            });
+                    &vanishing_factor * &sum
                 })
-                .collect()
+                .collect();
+            aux_evals
         };
         table_data.extend(aux_evals);
     }
