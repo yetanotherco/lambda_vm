@@ -2003,8 +2003,8 @@ fn build_traces(
 
     // Generate remaining traces in parallel (page, register, halt, commit).
     // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-    let commit_trace = commit::generate_commit_trace(&commit_ops);
-    let (pages, page_configs, register_trace, halt_trace);
+    let mut commit_trace = commit::generate_commit_trace(&commit_ops);
+    let (mut pages, page_configs, mut register_trace, mut halt_trace);
     #[cfg(feature = "parallel")]
     {
         let ((pages_val, register_val), halt_val) = rayon::join(
@@ -2040,6 +2040,38 @@ fn build_traces(
         }
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
         halt_trace = halt::generate_halt_trace(halt_timestamp);
+    }
+
+    // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
+    // so spill them here before returning. Without this, peak heap holds every
+    // PAGE table until `multi_prove_inner` spills them later.
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        bitwise
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill bitwise: {e}")))?;
+        decode
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill decode: {e}")))?;
+        commit_trace
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill commit: {e}")))?;
+        register_trace
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill register: {e}")))?;
+        halt_trace
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill halt: {e}")))?;
+        for page in &mut pages {
+            page.main_table
+                .spill_to_disk()
+                .map_err(|e| Error::Prover(format!("disk-spill page: {e}")))?;
+        }
     }
 
     Ok(Traces {
