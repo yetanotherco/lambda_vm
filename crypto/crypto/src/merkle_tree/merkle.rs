@@ -171,12 +171,15 @@ where
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
-                // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
-                // to this mmap. The mmap is page-aligned (>= 4096) and
-                // spill_nodes_to_disk asserts align_of::<B::Node>() <= 4096, so
-                // every offset idx * node_size lands on an aligned address.
-                // SpillSafe (a super-trait of B::Node here) guarantees no
-                // padding and any-bit-pattern validity.
+                // SAFETY: spill_nodes_to_disk is the only function that populates
+                // mmap_backing, and its where-clause requires B::Node: SpillSafe.
+                // Reaching this branch means that bound was checked at construction,
+                // so B::Node carries no padding and every bit pattern is valid.
+                //
+                // Alignment: the mmap base is page-aligned (>= 4096), spill_nodes_to_disk
+                // asserts align_of::<B::Node>() <= 4096, and Rust guarantees
+                // size_of::<B::Node> is a multiple of align_of::<B::Node>, so every
+                // offset idx * node_size lands on an aligned address.
                 let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
