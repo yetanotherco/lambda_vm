@@ -64,22 +64,45 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
 #[cfg(all(feature = "serde", feature = "disk-spill"))]
 impl<B: IsMerkleTreeBackend> serde::Serialize for MerkleTree<B>
 where
-    B::Node: serde::Serialize + Copy,
+    B::Node: serde::Serialize,
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("MerkleTree", 2)?;
         s.serialize_field("root", &self.root)?;
-        if let Some(ref backing) = self.mmap_backing {
-            let mut materialized = Vec::with_capacity(backing.node_count);
-            for i in 0..backing.node_count {
-                materialized.push(*self.node_get(i).expect("index in bounds"));
-            }
-            s.serialize_field("nodes", &materialized)?;
+        if self.mmap_backing.is_some() {
+            s.serialize_field("nodes", &MmapNodesSeq(self))?;
         } else {
             s.serialize_field("nodes", &self.nodes)?;
         }
         s.end()
+    }
+}
+
+/// Serializes the spilled nodes as a length-prefixed sequence by reading them
+/// one at a time from the mmap, avoiding a transient `Vec<B::Node>` allocation
+/// the size of the entire tree.
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+struct MmapNodesSeq<'a, B: IsMerkleTreeBackend>(&'a MerkleTree<B>);
+
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> serde::Serialize for MmapNodesSeq<'_, B>
+where
+    B::Node: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let backing = self
+            .0
+            .mmap_backing
+            .as_ref()
+            .expect("MmapNodesSeq is only constructed when mmap_backing is Some");
+        let n = backing.node_count;
+        let mut seq = serializer.serialize_seq(Some(n))?;
+        for i in 0..n {
+            seq.serialize_element(self.0.node_get(i).expect("index in bounds"))?;
+        }
+        seq.end()
     }
 }
 
