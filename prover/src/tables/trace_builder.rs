@@ -2241,12 +2241,11 @@ pub fn count_table_lengths(
 
         // ECALL Commit
         if cpu_op.ecall_commit {
-            let commit_ops = expand_commit_operations_for_ecall(
-                &cpu_op,
-                &memory_state,
-                current_commit_index as u64,
-            );
-            commit_count += commit_ops.len();
+            // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
+            // without materializing the op vector.
+            commit_count += (cpu_op.commit_count as usize)
+                .checked_add(1)
+                .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
                 collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
             for memw_op in &reg_commit_ops {
