@@ -293,7 +293,7 @@ pub fn select_storage_mode(
     if estimated > threshold {
         StorageMode::Disk
     } else {
-        if cap.is_none() && estimated.saturating_mul(2) >= available.unwrap_or(0) {
+        if cap.is_none() && estimated.saturating_mul(2) >= available.unwrap() {
             log::warn!(
                 "Auto disk-spill picked Ram with estimated_peak={estimated} bytes near \
                  available={available:?}. Set max_ram_bytes to bound the budget to a \
