@@ -2103,6 +2103,7 @@ fn build_traces(
 /// Padded row count after chunking: each chunk rounds up to `next_power_of_two().max(4)`.
 #[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
+    debug_assert!(max_rows > 0, "max_rows must be positive");
     if ops_count == 0 {
         return 4; // empty-chunk tables still allocate one 4-row padded chunk
     }
