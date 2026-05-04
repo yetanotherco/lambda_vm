@@ -45,26 +45,36 @@ fn build_mmcs() -> (ValMmcs, ChallengeMmcs, ByteHash) {
     (val_mmcs, challenge_mmcs, byte_hash)
 }
 
-/// Creates a Plonky3 STARK config with parameters matched to Lambda's
-/// production config `GoldilocksCubicProofOptions::with_blowup(2)`:
-/// blowup=2, 219 FRI queries, grinding=0 (excluded from benchmark).
-pub fn matched_params_config() -> P3Config {
+/// Creates a Plonky3 STARK config with parameters matched to Lambda's proof
+/// options. `blowup` must be a power of two because Plonky3 stores it as
+/// `log_blowup`.
+pub fn params_config(blowup: u8, queries: usize, grinding: u8) -> P3Config {
+    assert!(
+        blowup.is_power_of_two(),
+        "blowup must be a power of two for Plonky3"
+    );
+
     let (val_mmcs, challenge_mmcs, byte_hash) = build_mmcs();
     let dft = Dft::default();
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
-    // Match Lambda production: blowup=2, queries=219, grinding=0.
-    // Grinding excluded from benchmark (identical PoW on both sides).
     let fri_params = FriParameters {
-        log_blowup: 1, // blowup = 2
+        log_blowup: blowup.trailing_zeros() as usize,
         log_final_poly_len: 0,
         max_log_arity: 1,
-        num_queries: 219,
-        commit_proof_of_work_bits: 0,
+        num_queries: queries,
+        commit_proof_of_work_bits: grinding as usize,
         query_proof_of_work_bits: 0,
         mmcs: challenge_mmcs,
     };
 
     let pcs = Pcs::new(dft, val_mmcs, fri_params);
     P3Config::new(pcs, challenger)
+}
+
+/// Creates a Plonky3 STARK config with parameters matched to Lambda's
+/// production config `GoldilocksCubicProofOptions::with_blowup(2)`:
+/// blowup=2, 219 FRI queries, grinding=0.
+pub fn matched_params_config() -> P3Config {
+    params_config(2, 219, 0)
 }

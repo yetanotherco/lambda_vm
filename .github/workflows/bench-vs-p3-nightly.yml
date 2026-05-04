@@ -34,7 +34,7 @@ jobs:
           bash ./bench_vs_plonky3/run.sh \
             --log-rows 19 \
             --num-sequences 16 \
-            --runs 3 \
+            --runs 10 \
             --scalar \
             --report-dir bench_vs_p3_artifacts \
             --no-color

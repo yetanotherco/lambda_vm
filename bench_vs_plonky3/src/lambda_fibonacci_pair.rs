@@ -180,7 +180,8 @@ where
 }
 
 /// Public inputs: initial `(a, b) = (left, right)` pair for each sequence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct FibonacciPairPublicInputs<F: IsFFTField> {
     pub initial_values: Vec<(FieldElement<F>, FieldElement<F>)>,
 }
@@ -207,6 +208,10 @@ where
 
     fn step_size(&self) -> usize {
         1
+    }
+
+    fn name(&self) -> &str {
+        "fib_pair"
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
