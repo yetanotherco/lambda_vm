@@ -5,7 +5,7 @@
 //! (e.g. `bool`, `NonZeroU32`).
 //!
 //! Implementing this trait is a deliberate `unsafe impl` — the implementer
-//! vouches that the layout invariants hold, the compiler does not check.
+//! asserts the layout invariants hold, the compiler does not check.
 
 use crate::field::{element::FieldElement, traits::IsField};
 

@@ -329,8 +329,8 @@ where
         auth_path_set.into_iter().rev().collect()
     }
 
-    /// Write tree nodes to a temp file, mmap it, and free the in-memory vector.
-    /// Node access methods read from the mmap after this call.
+    /// Mmap a temp file, copy the tree nodes into the mapping, and free the
+    /// in-memory vector. Node access methods read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
@@ -369,8 +369,8 @@ where
         // SAFETY: tempfile() creates an anonymous file with no filesystem
         // path, so no other process can open or modify it.
         let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        // SAFETY: B::Node is a plain byte array ([u8; N]), so casting
-        // the contiguous Vec to a byte slice is valid.
+        // SAFETY: SpillSafe's safety contract requires no padding on B::Node, so
+        // the contiguous Vec bytes are initialized and reading them as &[u8] is sound.
         let bytes = unsafe {
             core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, node_count * node_size)
         };
