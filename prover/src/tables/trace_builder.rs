@@ -2530,60 +2530,6 @@ impl Traces {
         }
     }
 
-    /// Spill all trace table main columns to disk.
-    ///
-    /// Frees RAM by memory-mapping the main trace data for every table.
-    /// This is a no-op for tables that are already spilled or empty.
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_all_main_to_disk(&mut self) -> Result<(), Error> {
-        let spill = |t: &mut TraceTable<GoldilocksField, GoldilocksExtension>| {
-            t.main_table
-                .spill_to_disk()
-                .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))
-        };
-
-        for t in &mut self.cpus {
-            spill(t)?;
-        }
-        spill(&mut self.bitwise)?;
-        for t in &mut self.lts {
-            spill(t)?;
-        }
-        for t in &mut self.shifts {
-            spill(t)?;
-        }
-        for t in &mut self.memws {
-            spill(t)?;
-        }
-        for t in &mut self.memw_aligneds {
-            spill(t)?;
-        }
-        for t in &mut self.memw_registers {
-            spill(t)?;
-        }
-        for t in &mut self.loads {
-            spill(t)?;
-        }
-        spill(&mut self.decode)?;
-        for t in &mut self.muls {
-            spill(t)?;
-        }
-        for t in &mut self.dvrms {
-            spill(t)?;
-        }
-        for t in &mut self.pages {
-            spill(t)?;
-        }
-        spill(&mut self.register)?;
-        for t in &mut self.branches {
-            spill(t)?;
-        }
-        spill(&mut self.halt)?;
-        spill(&mut self.commit)?;
-
-        Ok(())
-    }
-
     /// Extract page configurations from ELF only (deterministic from binary).
     ///
     /// Returns PageConfigs for pages covered by ELF segments, with their
