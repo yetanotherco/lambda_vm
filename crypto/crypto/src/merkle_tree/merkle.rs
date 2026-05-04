@@ -311,7 +311,7 @@ where
             )
         }
 
-        if self.nodes.is_empty() {
+        if self.nodes.is_empty() || self.mmap_backing.is_some() {
             return Ok(());
         }
 
