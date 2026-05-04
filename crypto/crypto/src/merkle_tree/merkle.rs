@@ -61,6 +61,11 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     mmap_backing: Option<MmapNodeBacking>,
 }
 
+// `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,
+// so the default derive would emit `{root, nodes: []}` and lose the tree.
+//
+// Output matches the non-disk-spill derive byte-for-byte, so a proof from either
+// storage mode deserializes with the same `Deserialize` impl.
 #[cfg(all(feature = "serde", feature = "disk-spill"))]
 impl<B: IsMerkleTreeBackend> serde::Serialize for MerkleTree<B>
 where
