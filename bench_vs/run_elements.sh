@@ -241,11 +241,34 @@ check_zisk_prereqs() {
             find /usr/lib /usr/include -maxdepth 8 -name omp.h -print -quit 2>/dev/null | grep -q . || linux_missing+=("libomp-dev")
             [ -f /usr/include/nlohmann/json.hpp ] || linux_missing+=("nlohmann-json3-dev")
             [ -f /usr/include/sodium.h ] || linux_missing+=("libsodium-dev")
+            [ -f /usr/include/gmpxx.h ] || linux_missing+=("libgmp-dev")
             command -v cmake >/dev/null 2>&1 || linux_missing+=("cmake")
             command -v pkg-config >/dev/null 2>&1 || linux_missing+=("pkg-config")
             command -v g++ >/dev/null 2>&1 || linux_missing+=("build-essential")
-            # Prebuilt cargo-zisk_linux_amd64 dynamically links libmpi.so.40 (OpenMPI 4.x).
-            ldconfig -p 2>/dev/null | grep -q "libmpi.so.40" || linux_missing+=("libopenmpi-dev" "openmpi-bin")
+            command -v clang >/dev/null 2>&1 || linux_missing+=("clang")
+            command -v nasm >/dev/null 2>&1 || linux_missing+=("nasm")
+            # mpicc ships with libopenmpi-dev and is more reliable than `ldconfig -p` —
+            # Debian puts OpenMPI libs under /usr/lib/x86_64-linux-gnu/openmpi/lib/, often
+            # outside the ldconfig cache, so the cache check false-flags the package.
+            command -v mpicc >/dev/null 2>&1 || linux_missing+=("libopenmpi-dev" "openmpi-bin")
+            # mpi-sys's bindgen needs libclang at build time; without it it falls back to
+            # opaque struct fields and the build fails with "no field MPI_SOURCE on type
+            # ompi_status_public_t". Auto-export LIBCLANG_PATH on first match so users don't
+            # have to set it manually before `cargo build`.
+            local libclang_dir=""
+            for d in /usr/lib/llvm-14/lib /usr/lib/llvm-15/lib /usr/lib/llvm-16/lib \
+                     /usr/lib/llvm-17/lib /usr/lib/llvm-18/lib /usr/lib/x86_64-linux-gnu; do
+                if compgen -G "$d/libclang.so*" >/dev/null 2>&1 \
+                    || compgen -G "$d/libclang-*.so*" >/dev/null 2>&1; then
+                    libclang_dir="$d"
+                    break
+                fi
+            done
+            if [ -n "$libclang_dir" ]; then
+                [ -z "${LIBCLANG_PATH:-}" ] && export LIBCLANG_PATH="$libclang_dir"
+            else
+                linux_missing+=("libclang-14-dev")
+            fi
             if [ "${#linux_missing[@]}" -gt 0 ]; then
                 missing+=("apt packages: ${linux_missing[*]}")
                 fix_lines+=("sudo apt install -y ${linux_missing[*]}")
