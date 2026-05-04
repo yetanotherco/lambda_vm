@@ -84,9 +84,8 @@ where
     }
 }
 
-/// Serializes the spilled nodes as a length-prefixed sequence by reading them
-/// one at a time from the mmap, avoiding a transient `Vec<B::Node>` allocation
-/// the size of the entire tree.
+/// Streams the spilled nodes through `serialize_seq` instead of buffering them
+/// into a `Vec<B::Node>` the size of the tree.
 #[cfg(all(feature = "serde", feature = "disk-spill"))]
 struct MmapNodesSeq<'a, B: IsMerkleTreeBackend>(&'a MerkleTree<B>);
 
