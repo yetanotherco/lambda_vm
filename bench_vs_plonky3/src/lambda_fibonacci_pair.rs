@@ -25,7 +25,7 @@ use math::field::{
 use stark::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -61,7 +61,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for FibPairShiftConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for FibPairShiftConstraint<F, E>
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
@@ -78,7 +78,11 @@ where
         1
     }
 
-    fn evaluate(&self, eval_ctx: &TransitionEvaluationContext<F, E>, out: &mut [FieldElement<E>]) {
+    fn evaluate_verifier(
+        &self,
+        eval_ctx: &TransitionEvaluationContext<F, E>,
+        out: &mut [FieldElement<E>],
+    ) {
         match eval_ctx {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let s0 = frame.get_evaluation_step(0);
@@ -130,7 +134,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for FibPairSumConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for FibPairSumConstraint<F, E>
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
@@ -147,7 +151,11 @@ where
         1
     }
 
-    fn evaluate(&self, eval_ctx: &TransitionEvaluationContext<F, E>, out: &mut [FieldElement<E>]) {
+    fn evaluate_verifier(
+        &self,
+        eval_ctx: &TransitionEvaluationContext<F, E>,
+        out: &mut [FieldElement<E>],
+    ) {
         match eval_ctx {
             TransitionEvaluationContext::Prover { frame, .. } => {
                 let s0 = frame.get_evaluation_step(0);
@@ -184,7 +192,7 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
     num_sequences: usize,
 }
 
@@ -209,7 +217,7 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, E>>> {
+    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> {
         &self.constraints
     }
 
@@ -251,7 +259,7 @@ where
     E: IsField + Send + Sync + 'static,
 {
     pub fn with_num_sequences(proof_options: &ProofOptions, num_sequences: usize) -> Self {
-        let mut constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
             Vec::with_capacity(2 * num_sequences);
         for seq in 0..num_sequences {
             constraints.push(Box::new(FibPairShiftConstraint::new(seq, 2 * seq)));
