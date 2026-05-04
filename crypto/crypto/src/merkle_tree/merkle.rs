@@ -157,7 +157,6 @@ where
     }
 
     /// Total number of nodes in the tree (inner + leaves).
-    #[inline]
     fn node_count(&self) -> usize {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
@@ -169,7 +168,6 @@ where
     /// Access a node by index, returning a reference.
     ///
     /// Returns `None` if `idx` is out of bounds.
-    #[inline]
     fn node_get(&self, idx: usize) -> Option<&B::Node> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
