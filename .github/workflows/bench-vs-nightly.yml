@@ -33,10 +33,10 @@ jobs:
       - name: Install SP1 toolchain
         run: |
           export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
-          if ! cargo prove --version >/dev/null 2>&1; then
+          if ! cargo prove --version 2>/dev/null | grep -qE '\b6\.0\.1\b'; then
             curl -L https://sp1up.succinct.xyz | bash
             export PATH="$HOME/.sp1/bin:$PATH"
-            sp1up
+            sp1up --version v6.0.1
           fi
           cargo prove --version
 
@@ -56,3 +56,9 @@ jobs:
 
       - name: Publish summary
         run: cat bench_vs_artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post results to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"

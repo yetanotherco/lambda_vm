@@ -6,6 +6,44 @@ use math::{
     },
 };
 
+/// Precomputed constants for barycentric interpolation on the trace-size coset.
+///
+/// Derived from a [`Domain`]: the N evaluation points at stride `blowup_factor`
+/// within the LDE coset, plus the field scalars that appear in every barycentric
+/// evaluation. Computed once in round 3 and shared across composition-poly and
+/// trace OOD evaluations.
+pub struct DomainConstants<F: IsField> {
+    /// The N trace-size coset points: `lde_coset[i * blowup_factor]` for `i in 0..N`.
+    pub points: Vec<FieldElement<F>>,
+    /// `coset_offset ^ N`.
+    pub offset_pow_n: FieldElement<F>,
+    /// `1 / N` in the base field.
+    pub size_inv: FieldElement<F>,
+    /// `(coset_offset ^ N) ^ -1`.
+    pub offset_pow_n_inv: FieldElement<F>,
+}
+
+impl<F: IsFFTField> DomainConstants<F> {
+    pub fn from_domain(domain: &Domain<F>) -> Self {
+        let n = domain.interpolation_domain_size;
+        let bf = domain.blowup_factor;
+        let points = (0..n)
+            .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+            .collect();
+        let offset_pow_n = domain.coset_offset.pow(n);
+        let size_inv = FieldElement::<F>::from(n as u64)
+            .inv()
+            .expect("domain size is non-zero; field characteristic must not divide n");
+        let offset_pow_n_inv = offset_pow_n.inv().expect("coset_offset_pow_n is non-zero");
+        Self {
+            points,
+            offset_pow_n,
+            size_inv,
+            offset_pow_n_inv,
+        }
+    }
+}
+
 use super::traits::AIR;
 
 /// Full domain with pre-computed roots of unity. Used by the prover which needs
