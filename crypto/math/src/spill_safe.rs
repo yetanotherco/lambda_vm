@@ -1,9 +1,8 @@
 //! Marker trait for types whose in-memory bytes can be reinterpreted as the
 //! same type without UB: no padding, every bit pattern valid, no indirection.
 //!
-//! Used by `crypto/stark` and `crypto/crypto` to gate the byte-cast in
-//! mmap-backed disk spilling. Stricter than `Copy`, which permits types with
-//! restricted bit patterns (e.g. `bool`, `NonZeroU32`).
+//! Stricter than `Copy`, which permits types with restricted bit patterns
+//! (e.g. `bool`, `NonZeroU32`).
 //!
 //! Implementing this trait is a deliberate `unsafe impl` — the implementer
 //! vouches that the layout invariants hold, the compiler does not check.
