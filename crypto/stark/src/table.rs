@@ -61,19 +61,36 @@ where
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("Table", 3)?;
         if self.mmap_backing.is_some() {
-            let mut materialized = Vec::with_capacity(self.width * self.height);
-            for r in 0..self.height {
-                for elem in self.get_row(r) {
-                    materialized.push(elem.clone());
-                }
-            }
-            s.serialize_field("data", &materialized)?;
+            s.serialize_field("data", &MmapDataSeq(self))?;
         } else {
             s.serialize_field("data", &self.data)?;
         }
         s.serialize_field("width", &self.width)?;
         s.serialize_field("height", &self.height)?;
         s.end()
+    }
+}
+
+/// Streams the spilled table elements through `serialize_seq` instead of
+/// buffering them into a `Vec<FieldElement<F>>` the size of the trace.
+#[cfg(feature = "disk-spill")]
+struct MmapDataSeq<'a, F: IsField>(&'a Table<F>);
+
+#[cfg(feature = "disk-spill")]
+impl<F: IsField> serde::Serialize for MmapDataSeq<'_, F>
+where
+    FieldElement<F>: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let table = self.0;
+        let mut seq = serializer.serialize_seq(Some(table.width * table.height))?;
+        for r in 0..table.height {
+            for elem in table.get_row(r) {
+                seq.serialize_element(elem)?;
+            }
+        }
+        seq.end()
     }
 }
 
