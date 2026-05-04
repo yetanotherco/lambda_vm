@@ -32,7 +32,6 @@ impl std::error::Error for Error {}
 pub(crate) struct MmapNodeBacking {
     mmap: memmap2::Mmap,
     node_count: usize,
-    node_size: usize,
 }
 
 /// The struct for the Merkle tree, consisting of the root and the nodes.
@@ -180,7 +179,7 @@ where
                 // asserts align_of::<B::Node>() <= 4096, and Rust guarantees
                 // size_of::<B::Node> is a multiple of align_of::<B::Node>, so every
                 // offset idx * node_size lands on an aligned address.
-                let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
+                let ptr = unsafe { backing.mmap.as_ptr().add(idx * size_of::<B::Node>()) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
             return None;
@@ -347,10 +346,9 @@ where
             return Ok(());
         }
 
-        let node_size = core::mem::size_of::<B::Node>();
         let node_count = self.nodes.len();
         let total_bytes = (node_count as u64)
-            .checked_mul(node_size as u64)
+            .checked_mul(size_of::<B::Node>() as u64)
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -372,7 +370,10 @@ where
         // SAFETY: SpillSafe's safety contract requires no padding on B::Node, so
         // the contiguous Vec bytes are initialized and reading them as &[u8] is sound.
         let bytes = unsafe {
-            core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, node_count * node_size)
+            core::slice::from_raw_parts(
+                self.nodes.as_ptr() as *const u8,
+                node_count * size_of::<B::Node>(),
+            )
         };
         mmap_mut.copy_from_slice(bytes);
         let mmap = mmap_mut.make_read_only()?;
@@ -380,11 +381,7 @@ where
         // Free the heap allocation
         self.nodes = Vec::new();
 
-        self.mmap_backing = Some(MmapNodeBacking {
-            mmap,
-            node_count,
-            node_size,
-        });
+        self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
 
         Ok(())
     }
