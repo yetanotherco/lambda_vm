@@ -147,7 +147,11 @@ where
         if let Some(ref backing) = self.mmap_backing {
             if idx < backing.node_count {
                 // SAFETY: spill_nodes_to_disk writes self.nodes as contiguous bytes
-                // to this mmap and asserts align_of::<B::Node>() == 1 at compile time.
+                // to this mmap. The mmap is page-aligned (>= 4096) and
+                // spill_nodes_to_disk asserts align_of::<B::Node>() <= 4096, so
+                // every offset idx * node_size lands on an aligned address.
+                // SpillSafe (a super-trait of B::Node here) guarantees no
+                // padding and any-bit-pattern validity.
                 let ptr = unsafe { backing.mmap.as_ptr().add(idx * backing.node_size) };
                 return Some(unsafe { &*(ptr as *const B::Node) });
             }
@@ -306,8 +310,8 @@ where
     {
         const {
             assert!(
-                align_of::<B::Node>() == 1,
-                "B::Node must have alignment 1 for mmap safety"
+                align_of::<B::Node>() <= 4096,
+                "B::Node alignment must fit within mmap page alignment"
             )
         }
 
