@@ -284,7 +284,7 @@ pub fn select_storage_mode(
     let Some(budget) = effective_budget(available, cap) else {
         log::warn!(
             "Auto disk-spill: sysinfo could not read system memory and no cap set, \
-             defaulting to Disk. Pass max_ram_bytes if the machine has enough RAM."
+             defaulting to Disk."
         );
         return StorageMode::Disk;
     };
