@@ -1,14 +1,9 @@
-/// Resize `file` to `total_bytes` and reserve disk blocks via `posix_fallocate`
-/// on Linux, so later mmap writes fault with `ENOSPC` from this call instead
-/// of `SIGBUS` after the temp filesystem fills up.
+/// Reserve disk blocks up front so this call fails on a full disk.
+/// Without reservation, the kernel sends SIGBUS during the later mmap write.
 ///
-/// Linux returns `EOPNOTSUPP` (or sometimes `EINVAL`) on filesystems that
-/// can't pre-allocate (NFS, some overlay/FUSE mounts). We surface those as
-/// errors so callers fail fast rather than risk a SIGBUS during the write.
-///
-/// On non-Linux targets `set_len` extends the inode but does not reserve
-/// blocks: if the temp filesystem fills during the subsequent mmap write,
-/// the process is killed by `SIGBUS` with no Rust-level error path.
+/// Linux only, using `posix_fallocate`. On other platforms we only call
+/// `set_len` and skip reservation, so the kernel can still send SIGBUS if
+/// the disk fills mid-write.
 pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
     file.set_len(total_bytes)?;
     #[cfg(target_os = "linux")]
