@@ -35,8 +35,10 @@ Compares proving time for an identical u64 wrapping Fibonacci computation.
 
    **Linux (Debian/Ubuntu)**:
    ```bash
-   sudo apt install -y libomp-dev nlohmann-json3-dev libsodium-dev cmake pkg-config build-essential
+   sudo apt install -y libomp-dev nlohmann-json3-dev libsodium-dev cmake pkg-config build-essential libopenmpi-dev openmpi-bin
    ```
+   (`libopenmpi-dev` and `openmpi-bin` are required because the prebuilt `cargo-zisk_linux_amd64`
+   binary is dynamically linked against `libmpi.so.40` — OpenMPI 4.x.)
 
    Then install ziskup:
    ```bash

@@ -236,11 +236,16 @@ check_zisk_prereqs() {
             ;;
         Linux)
             local linux_missing=()
-            { [ -f /usr/include/omp.h ] || ls /usr/lib/llvm-*/include/omp.h >/dev/null 2>&1; } || linux_missing+=("libomp-dev")
+            # Debian installs omp.h under /usr/lib/llvm-NN/lib/clang/NN.N.N/include or /usr/lib/gcc/.../include;
+            # Ubuntu/older Debian put a symlink at /usr/include/omp.h. Use find to cover all variants.
+            find /usr/lib /usr/include -maxdepth 8 -name omp.h -print -quit 2>/dev/null | grep -q . || linux_missing+=("libomp-dev")
             [ -f /usr/include/nlohmann/json.hpp ] || linux_missing+=("nlohmann-json3-dev")
             [ -f /usr/include/sodium.h ] || linux_missing+=("libsodium-dev")
             command -v cmake >/dev/null 2>&1 || linux_missing+=("cmake")
             command -v pkg-config >/dev/null 2>&1 || linux_missing+=("pkg-config")
+            command -v g++ >/dev/null 2>&1 || linux_missing+=("build-essential")
+            # Prebuilt cargo-zisk_linux_amd64 dynamically links libmpi.so.40 (OpenMPI 4.x).
+            ldconfig -p 2>/dev/null | grep -q "libmpi.so.40" || linux_missing+=("libopenmpi-dev" "openmpi-bin")
             if [ "${#linux_missing[@]}" -gt 0 ]; then
                 missing+=("apt packages: ${linux_missing[*]}")
                 fix_lines+=("sudo apt install -y ${linux_missing[*]}")
