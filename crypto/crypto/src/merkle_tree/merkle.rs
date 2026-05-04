@@ -347,7 +347,6 @@ where
             core::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, node_count * node_size)
         };
         mmap_mut.copy_from_slice(bytes);
-        mmap_mut.flush()?;
         let mmap = mmap_mut.make_read_only()?;
 
         // Free the heap allocation

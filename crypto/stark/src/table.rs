@@ -330,7 +330,6 @@ impl<F: IsField> Table<F> {
             std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * elem_size)
         };
         mmap_mut.copy_from_slice(bytes);
-        mmap_mut.flush()?;
         let mmap = mmap_mut.make_read_only()?;
 
         self.mmap_backing = Some(TableMmapBacking {
