@@ -298,7 +298,7 @@ pub fn select_storage_mode(
     } else {
         // `cap.is_none()` plus an `effective_budget` that returned `Some` means
         // `available` must be `Some` (see `effective_budget`).
-        if cap.is_none() && estimated.saturating_mul(2) >= available.unwrap() {
+        if cap.is_none() && estimated.saturating_mul(4) >= available.unwrap().saturating_mul(3) {
             log::warn!(
                 "Auto disk-spill picked Ram with estimated_peak={estimated} bytes near \
                  available={available:?}. Set max_ram_bytes to bound the budget to a \
