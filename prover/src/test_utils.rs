@@ -31,6 +31,9 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::byte_ops::{
+    bus_interactions as byte_ops_bus_interactions, cols as byte_ops_cols,
+};
 use crate::tables::commit::{
     bus_interactions as commit_bus_interactions, cols as commit_cols,
     create_constraints as commit_constraints,
@@ -504,6 +507,25 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("BITWISE")
+}
+
+/// Create BYTE_OPS AIR. Step 1 wires it through with no bus interactions
+/// (BITWISE still owns every receiver); Step 2 will move them here.
+pub fn create_byte_ops_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: byte_ops_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        byte_ops_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("BYTE_OPS")
 }
 
 /// Create LT AIR with bus interactions.

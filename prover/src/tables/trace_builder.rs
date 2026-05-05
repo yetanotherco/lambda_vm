@@ -1619,6 +1619,9 @@ pub struct Traces {
     /// BITWISE precomputed lookup table (2^20 rows)
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// BYTE_OPS precomputed lookup table for byte-pair ops (2^16 rows)
+    pub byte_ops: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// LT comparison traces (split into chunks of max_rows::LT)
     pub lts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1906,6 +1909,9 @@ fn build_traces(
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
+    let mut byte_ops = super::byte_ops::generate_byte_ops_trace();
+    super::byte_ops::update_multiplicities(&mut byte_ops, &bitwise_ops);
+
     // Update DECODE multiplicities
     // Each CPU operation looks up the DECODE table once
     // Padding rows also look up pc=1 (the CPU padding entry)
@@ -1962,6 +1968,7 @@ fn build_traces(
     Ok(Traces {
         cpus,
         bitwise,
+        byte_ops,
         lts,
         shifts,
         memws,
@@ -1993,6 +2000,8 @@ impl Traces {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::byte_ops::NUM_PRECOMPUTED_COLS as BYTE_OPS_PRECOMPUTED;
+        use super::byte_ops::cols::NUM_COLUMNS as BYTE_OPS_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
@@ -2014,6 +2023,7 @@ impl Traces {
         let Traces {
             cpus,
             bitwise,
+            byte_ops,
             lts,
             shifts,
             memws,
@@ -2037,6 +2047,7 @@ impl Traces {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        total += (byte_ops.num_rows() * (BYTE_OPS_COLS - BYTE_OPS_PRECOMPUTED)) as u64;
         for t in lts {
             total += (t.num_rows() * LT_COLS) as u64;
         }
@@ -2088,6 +2099,7 @@ impl Traces {
 
         let n_cpu = aux_cols(super::cpu::bus_interactions().len());
         let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
+        let n_byte_ops = aux_cols(super::byte_ops::bus_interactions().len());
         let n_lt = aux_cols(super::lt::bus_interactions().len());
         let n_shift = aux_cols(super::shift::bus_interactions().len());
         let n_memw = aux_cols(super::memw::bus_interactions().len());
@@ -2107,6 +2119,7 @@ impl Traces {
         let Traces {
             cpus,
             bitwise,
+            byte_ops,
             lts,
             shifts,
             memws,
@@ -2130,6 +2143,7 @@ impl Traces {
             total += (t.num_rows() * n_cpu) as u64;
         }
         total += (bitwise.num_rows() * n_bitwise) as u64;
+        total += (byte_ops.num_rows() * n_byte_ops) as u64;
         for t in lts {
             total += (t.num_rows() * n_lt) as u64;
         }

@@ -33,16 +33,17 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
+use crate::tables::byte_ops;
 use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_byte_ops_air, create_commit_air,
+    create_cpu_air, create_decode_air, create_dvrm_air, create_halt_air, create_load_air,
+    create_lt_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
+    create_mul_air, create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -189,6 +190,7 @@ type AirTracePair<'a> = (
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
     pub bitwise: VmAir,
+    pub byte_ops: VmAir,
     pub lts: Vec<VmAir>,
     pub shifts: Vec<VmAir>,
     pub memws: Vec<VmAir>,
@@ -210,6 +212,7 @@ impl VmAirs {
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
+            (&self.byte_ops, &mut traces.byte_ops, &()),
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
@@ -265,6 +268,7 @@ impl VmAirs {
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.bitwise,
+            &self.byte_ops,
             &self.decode,
             &self.halt,
             &self.commit,
@@ -332,6 +336,14 @@ impl VmAirs {
                 bitwise::NUM_PRECOMPUTED_COLS,
             )
         };
+        let byte_ops = if minimal_bitwise {
+            create_byte_ops_air(proof_options)
+        } else {
+            create_byte_ops_air(proof_options).with_preprocessed(
+                byte_ops::preprocessed_commitment(proof_options),
+                byte_ops::NUM_PRECOMPUTED_COLS,
+            )
+        };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
             .collect();
@@ -395,6 +407,7 @@ impl VmAirs {
         Self {
             cpus,
             bitwise,
+            byte_ops,
             lts,
             shifts,
             memws,

@@ -23,6 +23,7 @@ pub mod types;
 
 pub mod bitwise;
 pub mod branch;
+pub mod byte_ops;
 pub mod commit;
 pub mod cpu;
 pub mod decode;
