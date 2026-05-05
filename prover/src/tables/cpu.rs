@@ -240,8 +240,33 @@ pub mod cols {
     /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
     pub const PC_DOUBLE_READ: usize = 75;
 
-    /// Total number of columns
-    pub const NUM_COLUMNS: usize = 76;
+    // -------------------------------------------------------------------------
+    // Phase 2: u32 limb representation of arg1/arg2/res
+    //
+    // The byte cells (ARG1_0..ARG1_7, ARG2_0..ARG2_7, RES_0..RES_7) are
+    // being replaced by u32 limb pairs. During Phase 2 migration both
+    // representations coexist: the trace builder populates both and
+    // constraints/senders are migrated incrementally. At the end of
+    // Phase 2 the byte cells are removed and these u32 cols renumbered
+    // into the freed slots.
+    // -------------------------------------------------------------------------
+
+    /// arg1 as u32 lower 32 bits (replaces ARG1_0..ARG1_3 bytewise pack)
+    pub const ARG1_LO: usize = 76;
+    /// arg1 as u32 upper 32 bits (replaces ARG1_4..ARG1_7)
+    pub const ARG1_HI: usize = 77;
+    /// arg2 as u32 lower 32 bits
+    pub const ARG2_LO: usize = 78;
+    /// arg2 as u32 upper 32 bits
+    pub const ARG2_HI: usize = 79;
+    /// res as u32 lower 32 bits
+    pub const RES_LO: usize = 80;
+    /// res as u32 upper 32 bits
+    pub const RES_HI: usize = 81;
+
+    /// Total number of columns (will shrink to 58 after Phase 2 byte
+    /// cells are removed at end of migration).
+    pub const NUM_COLUMNS: usize = 82;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -834,11 +859,15 @@ pub fn generate_cpu_trace(
         let rv1_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_EXT_BIT] = FE::from(rv1_ext_bit as u64);
 
-        // Compute and store arg1 as DWordBL (8 bytes)
+        // Compute and store arg1 as DWordBL (8 bytes) AND as u32 limbs.
+        // During Phase 2 migration both representations coexist; consumers
+        // are switched from byte cells to u32 limbs incrementally.
         let arg1 = op.compute_arg1();
         for i in 0..8 {
             data[base + cols::ARG1[i]] = FE::from((arg1 >> (i * 8)) & 0xFF);
         }
+        data[base + cols::ARG1_LO] = FE::from(arg1 & 0xFFFF_FFFF);
+        data[base + cols::ARG1_HI] = FE::from(arg1 >> 32);
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
@@ -847,6 +876,8 @@ pub fn generate_cpu_trace(
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
         }
+        data[base + cols::ARG2_LO] = FE::from(arg2 & 0xFFFF_FFFF);
+        data[base + cols::ARG2_HI] = FE::from(arg2 >> 32);
 
         // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
         let res = op.compute_res();
@@ -855,6 +886,8 @@ pub fn generate_cpu_trace(
         for i in 0..8 {
             data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
         }
+        data[base + cols::RES_LO] = FE::from(res & 0xFFFF_FFFF);
+        data[base + cols::RES_HI] = FE::from(res >> 32);
 
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
