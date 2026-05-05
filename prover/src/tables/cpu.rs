@@ -522,7 +522,8 @@ impl CpuOperation {
     /// The CPU sends:
     /// - 1 IS_BYTE lookup for (RS1, RS2) batched as a pair
     /// - 1 IS_BYTE lookup for RD encoded as (RD, 0)
-    /// - 12 IS_BYTE lookups for adjacent byte pairs in ARG1, ARG2, and RES
+    /// - 12 IS_HALFWORD lookups for adjacent byte pairs in ARG1, ARG2, and RES
+    ///   (each pair packs into one halfword `lo + 256*hi`)
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
@@ -543,15 +544,17 @@ impl CpuOperation {
             self.decode.rd,
         ));
 
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs
-        // Each pair sends [lo, hi] as two separate bus values, so the LogUp
-        // fingerprint forces each byte to match individually against BITWISE X, Y.
+        // 12 IS_HALFWORD lookups for ARG1/ARG2/RES byte pairs.
+        // Each pair packs as halfword = lo + 256*hi, sent as a single bus
+        // element to the IS_HALFWORD bus. The byte_ops table indexes by (X, Y)
+        // identical to IS_BYTE, but the receiver combines them into one
+        // halfword fingerprint via Multiplicity::Column(MU_IS_HALF).
         for value in [arg1, arg2, res] {
             for i in 0..4 {
                 let lo = ((value >> (i * 16)) & 0xFF) as u8;
                 let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
-                ops.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::IsByte,
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
                     lo,
                     hi,
                 ));
@@ -1962,15 +1965,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Range checks (14 total):
     // CPU-CR29: IS_BYTE[rs1, rs2], CPU-CR30: IS_BYTE[rd, 0]
-    // CPU-CR31.i: IS_BYTE[arg1[2i], arg1[2i+1]] (i=0..3)
-    // CPU-CR32.i: IS_BYTE[arg2[2i], arg2[2i+1]] (i=0..3)
-    // CPU-CR33.i: IS_BYTE[res[2i], res[2i+1]] (i=0..3)
+    // CPU-CR31.i: IS_HALFWORD[arg1[2i] + 256*arg1[2i+1]] (i=0..3)
+    // CPU-CR32.i: IS_HALFWORD[arg2[2i] + 256*arg2[2i+1]] (i=0..3)
+    // CPU-CR33.i: IS_HALFWORD[res[2i]  + 256*res[2i+1]]  (i=0..3)
     // -------------------------------------------------------------------------
-    // RS1 and RS2 share one IS_BYTE check; RD uses 0 as the second argument.
-    // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
-    // batched into IS_BYTE checks. Each pair sends two separate bus values
-    // [lo, hi], so the LogUp fingerprint forces each byte to match individually
-    // against the BITWISE table's X in [0,255] and Y in [0,255].
+    // RS1 and RS2 share one IS_BYTE check; RD uses 0 as the second argument
+    // (register indices are individually byte-bounded by spec).
+    //
+    // ARG1/ARG2/RES are 8-byte little-endian values. Each adjacent byte pair
+    // packs into one halfword (lo + 256*hi) sent as a single bus element to
+    // the IS_HALFWORD bus. The byte_ops table indexes by (X, Y) the same way
+    // as IS_BYTE but the receiver combines them into one halfword via
+    // BusValue::linear(coefficient: 1 X, coefficient: 256 Y), keeping the
+    // range-check fingerprint identical to a halfword in [0, 2^16).
+    //
     // Every CPU row (including padding) sends with Multiplicity::One.
     interactions.push(BusInteraction::sender(
         BusId::IsByte,
@@ -2000,18 +2008,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
-                BusId::IsByte,
+                BusId::IsHalfword,
                 Multiplicity::One,
-                vec![
-                    BusValue::Packed {
-                        start_column: arr[2 * i],
-                        packing: Packing::Direct,
+                vec![BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: arr[2 * i],
                     },
-                    BusValue::Packed {
-                        start_column: arr[2 * i + 1],
-                        packing: Packing::Direct,
+                    LinearTerm::Column {
+                        coefficient: 256,
+                        column: arr[2 * i + 1],
                     },
-                ],
+                ])],
             ));
         }
     }
@@ -2075,9 +2083,10 @@ pub fn bus_interactions_without_bitwise() -> Vec<BusInteraction> {
 /// row actually uses. Drops every other class's declarations so the
 /// bitwise chip's effective width stays as small as possible.
 pub fn bus_interactions_bitwise_chip() -> Vec<BusInteraction> {
-    let keep: [u64; 6] = [
+    let keep: [u64; 7] = [
         BusId::Decode.into(),
         BusId::IsByte.into(),
+        BusId::IsHalfword.into(), // ARG/RES range checks (Phase 2 step 7)
         BusId::Bitwise.into(),
         BusId::Msb16.into(), // ANDW/ORW/XORW set word_instr=1, triggering MSB16 lookups
         BusId::Memw.into(),

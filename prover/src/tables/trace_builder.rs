@@ -1312,7 +1312,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// padding rows also send, so we need matching bitwise ops.
 ///
 /// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
-/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// 12 IsHalf(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -1331,10 +1331,12 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
             BitwiseOperationType::IsByte,
             0,
         ));
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
+        // 12 IS_HALFWORD lookups for ARG1/ARG2/RES byte pairs (all zero in
+        // padding) — must match the IsHalf ops emitted by collect_byte_check_ops
+        // for non-padding rows so MU_IS_HALF multiplicities line up.
         for _ in 0..12 {
-            ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsByte,
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 0,
                 0,
             ));
