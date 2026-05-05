@@ -24,32 +24,6 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
 
-/// Pack 4 consecutive byte-column values into a 32-bit word field element.
-/// `col0 + col1*2^8 + col2*2^16 + col3*2^24`
-#[inline]
-fn pack_bytes_to_word<F, E>(
-    step: &TableView<F, E>,
-    col0: usize,
-    col1: usize,
-    col2: usize,
-    col3: usize,
-) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let b0 = step.get_main_evaluation_element(0, col0);
-    let b1 = step.get_main_evaluation_element(0, col1);
-    let b2 = step.get_main_evaluation_element(0, col2);
-    let b3 = step.get_main_evaluation_element(0, col3);
-
-    let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-    let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-    let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-    b0 + b1 * &shift_8 + b2 * &shift_16 + b3 * shift_24
-}
-
 // =========================================================================
 // CPU Constraint Collection
 // =========================================================================
@@ -289,8 +263,8 @@ impl Arg1LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_lo =
-            pack_bytes_to_word(step, cols::ARG1_0, cols::ARG1_1, cols::ARG1_2, cols::ARG1_3);
+        // Phase 2: u32 limb cells directly.
+        let arg1_lo = step.get_main_evaluation_element(0, cols::ARG1_LO).clone();
 
         // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
@@ -339,8 +313,8 @@ impl Arg1UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_hi =
-            pack_bytes_to_word(step, cols::ARG1_4, cols::ARG1_5, cols::ARG1_6, cols::ARG1_7);
+        // Phase 2: u32 limb cells directly.
+        let arg1_hi = step.get_main_evaluation_element(0, cols::ARG1_HI).clone();
 
         // rv1 is DWordWHH: rv1[2] IS the upper 32 bits directly (Word)
         let rv1_upper = step.get_main_evaluation_element(0, cols::RV1_2);
@@ -644,13 +618,8 @@ impl Arg2LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg2_lo = pack_bytes_to_word(
-            step,
-            cols::ARG2[0],
-            cols::ARG2[1],
-            cols::ARG2[2],
-            cols::ARG2[3],
-        );
+        // Phase 2: u32 limb cells directly.
+        let arg2_lo = step.get_main_evaluation_element(0, cols::ARG2_LO).clone();
 
         // rv2 is DWordWHH: rv2[:2] = rv2[0] + rv2[1] * 2^16
         let rv2_0 = step.get_main_evaluation_element(0, cols::RV2_0);
@@ -713,13 +682,8 @@ impl Arg2UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg2_hi = pack_bytes_to_word(
-            step,
-            cols::ARG2[4],
-            cols::ARG2[5],
-            cols::ARG2[6],
-            cols::ARG2[7],
-        );
+        // Phase 2: u32 limb cells directly.
+        let arg2_hi = step.get_main_evaluation_element(0, cols::ARG2_HI).clone();
 
         // rv2 is DWordWHH: rv2[2] IS the upper 32 bits directly (Word)
         let rv2_upper = step.get_main_evaluation_element(0, cols::RV2_2);
@@ -796,8 +760,8 @@ impl RvdLowerConstraint {
         // rvd[0] is lower word
         let rvd_0 = step.get_main_evaluation_element(0, cols::RVD_0);
 
-        let res_lo =
-            pack_bytes_to_word(step, cols::RES[0], cols::RES[1], cols::RES[2], cols::RES[3]);
+        // Phase 2: u32 limb cells directly.
+        let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let one = FieldElement::<F>::one();
@@ -847,8 +811,8 @@ impl RvdUpperConstraint {
         // rvd[1] is upper word
         let rvd_1 = step.get_main_evaluation_element(0, cols::RVD_1);
 
-        let res_hi =
-            pack_bytes_to_word(step, cols::RES[4], cols::RES[5], cols::RES[6], cols::RES[7]);
+        // Phase 2: u32 limb cells directly.
+        let res_hi = step.get_main_evaluation_element(0, cols::RES_HI).clone();
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);
