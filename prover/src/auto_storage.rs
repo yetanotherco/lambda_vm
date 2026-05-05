@@ -60,10 +60,13 @@ fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
         .saturating_mul(rows)
         .saturating_mul(blowup)
         .saturating_mul(KECCAK_NODE_BYTES);
-    let aux_merkle = 2u64
-        .saturating_mul(rows)
-        .saturating_mul(blowup)
-        .saturating_mul(KECCAK_NODE_BYTES);
+    let aux_merkle = if aux_cols > 0 {
+        2u64.saturating_mul(rows)
+            .saturating_mul(blowup)
+            .saturating_mul(KECCAK_NODE_BYTES)
+    } else {
+        0
+    };
     main_lde
         .saturating_add(aux_lde)
         .saturating_add(main_merkle)
