@@ -116,11 +116,13 @@ pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConst
 /// Returns the constraints and the next available constraint index.
 pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
     // For ADD/LOAD operations, we compute: arg1 + arg2 = res
-    // All operands are DWordBL (8 bytes), need to cast to DWordWL (2 words)
+    // Phase 2: operands are now DWordWL on the u32 limb cols (ARG1_LO/HI etc).
+    // The carry chain shrinks from 8 byte carries to 2 u32 carries — handled
+    // automatically by AddConstraint::new_pair on DWordWL inputs.
 
-    let lhs = AddOperand::from_dword_bl(cols::ARG1_0);
-    let rhs = AddOperand::from_dword_bl(cols::ARG2_0);
-    let sum = AddOperand::from_dword_bl(cols::RES_0);
+    let lhs = AddOperand::dword(cols::ARG1_LO);
+    let rhs = AddOperand::dword(cols::ARG2_LO);
+    let sum = AddOperand::dword(cols::RES_LO);
 
     // Condition: ADD + LOAD (active when any of these flags is set)
     let cond_cols = vec![cols::ADD, cols::LOAD];
@@ -128,10 +130,9 @@ pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
     let (add_c0, add_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
 
     // STORE: res = arg1 + imm (separate ADD, because arg2 now holds rv2)
-    // arg1 is DWordBL, imm is DWordWL, res is DWordBL
-    let store_lhs = AddOperand::from_dword_bl(cols::ARG1_0);
+    let store_lhs = AddOperand::dword(cols::ARG1_LO);
     let store_rhs = AddOperand::dword(cols::IMM_0);
-    let store_sum = AddOperand::from_dword_bl(cols::RES_0);
+    let store_sum = AddOperand::dword(cols::RES_LO);
     let store_cond = vec![cols::STORE];
     let (store_c0, store_c1) = AddConstraint::new_pair(
         store_cond,
@@ -957,15 +958,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 ///
 /// Returns the constraints and the next available constraint index.
 pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // SUB is verified as: arg2 + res = arg1
-    // This is the ADD template with swapped roles:
-    // - lhs = arg2
-    // - rhs = res
-    // - sum = arg1
-
-    let lhs = AddOperand::from_dword_bl(cols::ARG2_0); // First addend
-    let rhs = AddOperand::from_dword_bl(cols::RES_0); // Second addend (the difference)
-    let sum = AddOperand::from_dword_bl(cols::ARG1_0); // Result of addition (original minuend)
+    // SUB is verified as: arg2 + res = arg1.
+    // Phase 2: u32-limb operands; AddConstraint::new_pair emits 2 carry
+    // constraints instead of 8 byte carries.
+    let lhs = AddOperand::dword(cols::ARG2_LO);
+    let rhs = AddOperand::dword(cols::RES_LO);
+    let sum = AddOperand::dword(cols::ARG1_LO);
 
     // Condition: SUB + BEQ (active when either flag is set)
     let cond_cols = vec![cols::SUB, cols::BEQ];
@@ -1002,8 +1000,8 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
         vec![], // hi = 0
     );
 
-    // res is stored as DWordBL (8 bytes)
-    let res = AddOperand::from_dword_bl(cols::RES_0);
+    // res is stored as u32 limbs (Phase 2)
+    let res = AddOperand::dword(cols::RES_LO);
 
     // Condition: JALR
     let cond_cols = vec![cols::JALR];
