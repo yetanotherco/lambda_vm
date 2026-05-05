@@ -358,25 +358,21 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
 }
 
 // =========================================================================
-// SLT/BLT Zero Upper Bytes Constraint
+// SLT/BLT Zero Upper Bytes Constraints (u32-limb form)
 // =========================================================================
 
-/// Constraint: when SLT + BLT = 1, res[i] = 0 for i in 1..8
+/// Constraint: when SLT + BLT = 1, the upper three bytes of `res_lo` are zero.
 ///
-/// The LT result is a single bit stored in res[0], upper bytes must be zero.
-pub struct SltResZeroConstraint {
-    /// Which byte index (1-7) this constraint applies to
-    byte_idx: usize,
+/// Equivalent to `(SLT + BLT) * (RES_LO - RES[0]) = 0`. Together with
+/// `SltResHiZeroConstraint` this replaces the seven byte-level constraints
+/// `(SLT + BLT) * RES[i] = 0` for i in 1..8.
+pub struct SltResLoUpperBytesZeroConstraint {
     constraint_idx: usize,
 }
 
-impl SltResZeroConstraint {
-    pub fn new(byte_idx: usize, constraint_idx: usize) -> Self {
-        assert!((1..=7).contains(&byte_idx));
-        Self {
-            byte_idx,
-            constraint_idx,
-        }
+impl SltResLoUpperBytesZeroConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -386,16 +382,17 @@ impl SltResZeroConstraint {
     {
         let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
         let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
-        let res_i = step
-            .get_main_evaluation_element(0, cols::RES[self.byte_idx])
-            .clone();
+        let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
+        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]).clone();
 
-        // (SLT + BLT) * res[i] = 0
-        (slt + blt) * res_i
+        // (SLT + BLT) * (RES_LO - RES[0]) = 0
+        (slt + blt) * (res_lo - res_0)
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroConstraint {
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
+    for SltResLoUpperBytesZeroConstraint
+{
     fn degree(&self) -> usize {
         2
     }
@@ -413,16 +410,68 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
     }
 }
 
-/// Creates all SLT/BLT zero constraints for res[1..8].
+/// Constraint: when SLT + BLT = 1, the entire `res_hi` is zero.
+///
+/// Equivalent to `(SLT + BLT) * RES_HI = 0`.
+pub struct SltResHiZeroConstraint {
+    constraint_idx: usize,
+}
+
+impl SltResHiZeroConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
+        let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
+        let res_hi = step.get_main_evaluation_element(0, cols::RES_HI).clone();
+
+        // (SLT + BLT) * RES_HI = 0
+        (slt + blt) * res_hi
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResHiZeroConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+}
+
+/// Creates the two SLT/BLT zero constraints over u32 limbs.
+///
+/// Returns boxed evaluators so the two distinct constraint types can be
+/// stored in the same `other` constraint vector.
 pub fn create_slt_res_zero_constraints(
     constraint_idx_start: usize,
-) -> (Vec<SltResZeroConstraint>, usize) {
-    let constraints: Vec<_> = (1..8)
-        .enumerate()
-        .map(|(i, byte_idx)| SltResZeroConstraint::new(byte_idx, constraint_idx_start + i))
-        .collect();
+) -> (
+    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
+    usize,
+) {
+    let constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = vec![
+        SltResLoUpperBytesZeroConstraint::new(constraint_idx_start).boxed(),
+        SltResHiZeroConstraint::new(constraint_idx_start + 1).boxed(),
+    ];
 
-    (constraints, constraint_idx_start + 7)
+    (constraints, constraint_idx_start + 2)
 }
 
 // =========================================================================
@@ -1008,18 +1057,18 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - Arg2 upper: 1
 /// - Rvd lower: 1
 /// - Rvd upper: 1
-/// - SLT res zero: 7 (bytes 1-7)
+/// - SLT res zero: 2 (u32-limb form: res_lo upper bytes + res_hi)
 /// - Ext bit zero (SIGN template): 3 (rv1_ext_bit, rv2_ext_bit, res_ext_bit)
 /// - rv1 zero-forcing (CM48): 3 (rv1[0..2] when read_register1 = 0)
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
+/// Total: 63 constraints (34 IS_BIT + 8 ADD + 21 other)
 /// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
 /// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
 /// are required.)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1101,9 +1150,7 @@ pub fn create_all_cpu_constraints() -> (
     // SLT res zero constraints
     let (slt_zero, next) = create_slt_res_zero_constraints(next_idx);
     next_idx = next;
-    for c in slt_zero {
-        other.push(c.boxed());
-    }
+    other.extend(slt_zero);
 
     // Extension bit zero constraints (SIGN template: !word_instr => ext_bit = 0)
     other.push(ExtBitZeroConstraint::new(next_idx, cols::RV1_EXT_BIT).boxed());

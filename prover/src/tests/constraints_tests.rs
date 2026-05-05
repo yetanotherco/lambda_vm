@@ -566,9 +566,10 @@ fn test_create_add_constraints() {
 fn test_create_slt_res_zero_constraints() {
     let (constraints, next_idx) = create_slt_res_zero_constraints(0);
 
-    // Should create 7 constraints (for bytes 1-7)
-    assert_eq!(constraints.len(), 7);
-    assert_eq!(next_idx, 7);
+    // Phase 2: collapsed from 7 byte-level to 2 u32-limb constraints
+    // (res_lo upper bytes zero + res_hi zero).
+    assert_eq!(constraints.len(), 2);
+    assert_eq!(next_idx, 2);
 
     for (i, c) in constraints.iter().enumerate() {
         assert_eq!(c.constraint_idx(), i);
@@ -625,11 +626,11 @@ fn test_create_all_cpu_constraints() {
     assert_eq!(is_bit.len(), 34);
     // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
     assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
-    assert_eq!(other.len(), 26);
+    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(2) + ext_bit_zero(3) + next_pc(2) = 21
+    assert_eq!(other.len(), 21);
 
-    // Total should be 34 + 8 + 26 = 68
-    assert_eq!(total, 68);
+    // Total should be 34 + 8 + 21 = 63
+    assert_eq!(total, 63);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 
