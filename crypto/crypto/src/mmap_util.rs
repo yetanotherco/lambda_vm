@@ -6,6 +6,9 @@ use math::spill_safe::SpillSafe;
 /// Linux only, using `posix_fallocate`. On other platforms we only call
 /// `set_len` and skip reservation, so the kernel can still send SIGBUS if
 /// the disk fills mid-write.
+///
+/// `/tmp` is often tmpfs (RAM-backed) on systemd-default distros; set
+/// `TMPDIR` to a disk-backed path so spill files actually live on disk.
 pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
     file.set_len(total_bytes)?;
     #[cfg(target_os = "linux")]
@@ -61,9 +64,8 @@ pub fn spill_slice_to_mmap<T: SpillSafe>(slice: &[T]) -> std::io::Result<memmap2
     let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
     // SAFETY: SpillSafe's safety contract requires no padding on T, so
     // `slice`'s bytes are initialized and reading them as &[u8] is sound.
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(slice.as_ptr() as *const u8, size_of_val(slice))
-    };
+    let bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(slice.as_ptr() as *const u8, size_of_val(slice)) };
     mmap_mut.copy_from_slice(bytes);
     mmap_mut.make_read_only()
 }
