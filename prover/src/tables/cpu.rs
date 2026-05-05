@@ -1233,30 +1233,33 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // multiplicity = SLT + BLT
     //
     // LT bus uses 2 elements per 64-bit operand: [lo32, hi32]
-    // arg1/arg2 are DWordBL (8 bytes) - use Packing::DWordBL to produce 2 elements
+    // arg1/arg2/res live in u32 limb cols (ARG1_LO/HI etc.) — Packing::DWordWL
+    // pairs the two consecutive Direct words into the same 2-element fingerprint
+    // that Packing::DWordBL produced from the 8 byte cells.
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         // SLT + BLT using Multiplicity::Sum
         Multiplicity::Sum(cols::SLT, cols::BLT),
         vec![
-            // arg1 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            // arg1 as DWordWL (2 words → 2 elements: [lo32, hi32])
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_LO,
+                packing: Packing::DWordWL,
             },
-            // arg2 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            // arg2 as DWordWL (2 words → 2 elements: [lo32, hi32])
             BusValue::Packed {
-                start_column: cols::ARG2[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG2_LO,
+                packing: Packing::DWordWL,
             },
             // signed flag
             BusValue::Packed {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // lt result (res[0])
+            // lt result lives in res_lo (= res[0] when SLT+BLT = 1, enforced by
+            // SltResLoUpperBytesZeroConstraint).
             BusValue::Packed {
-                start_column: cols::RES[0],
+                start_column: cols::RES_LO,
                 packing: Packing::Direct,
             },
         ],
@@ -1268,8 +1271,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // MUL[arg1, signed, arg2, mp_selector, rvd, muldiv_selector] per spec CPU-CA44
     // multiplicity = MUL
     //
-    // The MUL table expects DWordHL (4 halfwords), but CPU has DWordBL (8 bytes).
-    // Both pack to 2 words (lo32, hi32), so the signatures match for the same values.
+    // The MUL table expects DWordHL (4 halfwords); CPU now sends DWordWL on the
+    // u32 limb cols (ARG1_LO/HI etc.). Both pack to 2 words (lo32, hi32), so the
+    // signatures match for the same values.
     //
     // rhs_signed = mp_selector per spec:
     // - MUL/MULH: mp_selector=1 (both operands signed)
@@ -1280,32 +1284,32 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Mul,
         Multiplicity::Column(cols::MUL),
         vec![
-            // arg1 (lhs) as DWordBL (8 bytes → 2 elements)
+            // arg1 (lhs) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_LO,
+                packing: Packing::DWordWL,
             },
             // lhs_signed = signed
             BusValue::Packed {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // arg2 (rhs) as DWordBL (8 bytes → 2 elements)
+            // arg2 (rhs) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG2[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG2_LO,
+                packing: Packing::DWordWL,
             },
             // rhs_signed = mp_selector
             BusValue::Packed {
                 start_column: cols::MP_SELECTOR,
                 packing: Packing::Direct,
             },
-            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
+            // result (res) as DWordWL (2 words → 2 elements) per spec CPU-CA44.
             // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
             // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_LO,
+                packing: Packing::DWordWL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1324,27 +1328,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Dvrm,
         Multiplicity::Column(cols::DIVREM),
         vec![
-            // arg1 (numerator n) as DWordBL (8 bytes → 2 elements)
+            // arg1 (numerator n) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_LO,
+                packing: Packing::DWordWL,
             },
-            // arg2 (denominator d) as DWordBL (8 bytes → 2 elements)
+            // arg2 (denominator d) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG2[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG2_LO,
+                packing: Packing::DWordWL,
             },
             // signed
             BusValue::Packed {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
+            // result (res) as DWordWL (2 words → 2 elements) per spec CPU-CA45.
             // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
             // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_LO,
+                packing: Packing::DWordWL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
@@ -1363,17 +1367,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Shift,
         Multiplicity::Column(cols::SHIFT),
         vec![
-            // res (result) as DWordBL (8 bytes → 2 elements, same as DWordWL)
+            // res (result) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_LO,
+                packing: Packing::DWordWL,
             },
-            // arg1 (input) as DWordBL (8 bytes → 2 elements)
+            // arg1 (input) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_LO,
+                packing: Packing::DWordWL,
             },
-            // arg2[0] (shift amount byte)
+            // arg2[0] (shift amount byte). Stays on the byte cell because the
+            // SHIFT receiver expects a single 0..256 element; ARG2_LO carries the
+            // full 32-bit operand whose upper bytes may be nonzero. Will be
+            // reworked in the byte-cell drop step.
             BusValue::Packed {
                 start_column: cols::ARG2[0],
                 packing: Packing::Direct,
@@ -1629,10 +1636,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RVD_0,
                 packing: Packing::DWordWL,
             },
-            // base_address = res (computed address) as DWordBL (8 bytes → 2 elements)
+            // base_address = res (computed address) as DWordWL (2 words → 2 elements)
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_LO,
+                packing: Packing::DWordWL,
             },
             // timestamp as DWordWL: [timestamp, 0]
             BusValue::Packed {
@@ -1677,10 +1684,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // is_register = 0 (memory access)
             BusValue::constant(0),
-            // base_address = res as DWordBL → 2 elements [lo32, hi32]
+            // base_address = res as DWordWL → 2 elements [lo32, hi32]
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_LO,
+                packing: Packing::DWordWL,
             },
             // value[0..7] = arg2 bytes (8 individual Direct elements)
             BusValue::Packed {
@@ -1934,46 +1941,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IMM_1,
                 packing: Packing::Direct,
             },
-            // register[0] = arg1[0..4] repacked as Word
-            // arg1_word0 = arg1[0] + 2^8*arg1[1] + 2^16*arg1[2] + 2^24*arg1[3]
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[0],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::ARG1[1],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::ARG1[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::ARG1[3],
-                },
-            ]),
-            // register[1] = arg1[4..8] repacked as Word
-            // arg1_word1 = arg1[4] + 2^8*arg1[5] + 2^16*arg1[6] + 2^24*arg1[7]
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[4],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::ARG1[5],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::ARG1[6],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::ARG1[7],
-                },
-            ]),
+            // register[0] = arg1_lo (low 32 bits)
+            BusValue::Packed {
+                start_column: cols::ARG1_LO,
+                packing: Packing::Direct,
+            },
+            // register[1] = arg1_hi (high 32 bits)
+            BusValue::Packed {
+                start_column: cols::ARG1_HI,
+                packing: Packing::Direct,
+            },
             // JALR flag
             BusValue::Packed {
                 start_column: cols::JALR,
