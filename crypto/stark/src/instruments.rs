@@ -60,6 +60,19 @@ pub struct Round1SubOps {
     pub aux_merkle: Duration,
 }
 
+/// Per-table accounting captured during rounds 2-4. Includes shape (rows ×
+/// main/aux cols) so callers can compute total main-trace cells (the
+/// `sum(rows × main_cols)` headline metric used to compare against ZisK / SP1).
+#[derive(Clone, Debug, Default)]
+pub struct TableTiming {
+    pub name: String,
+    pub rows: usize,
+    pub main_cols: usize,
+    pub aux_cols: usize,
+    pub duration: Duration,
+    pub sub_ops: TableSubOps,
+}
+
 /// Timing data collected inside `multi_prove`.
 pub struct MultiProveTiming {
     pub prepass: Duration,
@@ -69,8 +82,8 @@ pub struct MultiProveTiming {
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).
     pub round1_sub: Round1SubOps,
-    /// (name, rows, duration, sub_ops) per table for rounds 2-4.
-    pub table_timings: Vec<(String, usize, Duration, TableSubOps)>,
+    /// Shape + timing for every AIR proven this run.
+    pub table_timings: Vec<TableTiming>,
     pub heap_snapshots: Vec<HeapSnapshot>,
 }
 

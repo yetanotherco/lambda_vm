@@ -1855,12 +1855,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let mut table_timings: Vec<(
-            String,
-            usize,
-            std::time::Duration,
-            crate::instruments::TableSubOps,
-        )> = Vec::with_capacity(num_airs);
+        let mut table_timings: Vec<crate::instruments::TableTiming> = Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
         let mut lde_drain = cached_ldes.into_iter();
@@ -1919,12 +1914,14 @@ pub trait IsStarkProver<
                     #[cfg(feature = "instruments")]
                     let table_timing = {
                         let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
+                        crate::instruments::TableTiming {
+                            name: air.name().to_string(),
+                            rows: trace.num_rows(),
+                            main_cols: trace.num_main_columns,
+                            aux_cols: trace.num_aux_columns,
+                            duration: table_start.elapsed(),
                             sub_ops,
-                        )
+                        }
                     };
 
                     #[cfg(feature = "instruments")]

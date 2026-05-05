@@ -11,6 +11,18 @@ fn fmt_rows(rows: usize) -> String {
     }
 }
 
+fn fmt_cells(cells: u128) -> String {
+    if cells >= 1_000_000_000 {
+        format!("{:.2}G", cells as f64 / 1_000_000_000.0)
+    } else if cells >= 1_000_000 {
+        format!("{:.1}M", cells as f64 / 1_000_000.0)
+    } else if cells >= 1_000 {
+        format!("{}K", (cells + 500) / 1_000)
+    } else {
+        format!("{cells}")
+    }
+}
+
 fn pct(dur: Duration, total: Duration) -> f64 {
     if total > Duration::ZERO {
         dur.as_secs_f64() / total.as_secs_f64() * 100.0
@@ -94,25 +106,25 @@ pub fn print_report(
 
         // Merge split tables: MEMW[0..4] → MEMW x5
         let mut merged: BTreeMap<String, MergedTable> = BTreeMap::new();
-        for (name, rows, dur, sub_ops) in &mp.table_timings {
-            let base = base_name(name).to_string();
+        for tt in &mp.table_timings {
+            let base = base_name(&tt.name).to_string();
             let entry = merged.entry(base).or_insert(MergedTable {
                 total_dur: Duration::ZERO,
                 total_rows: 0,
                 count: 0,
                 sub_ops: stark::instruments::TableSubOps::default(),
             });
-            entry.total_dur += *dur;
-            entry.total_rows += rows;
+            entry.total_dur += tt.duration;
+            entry.total_rows += tt.rows;
             entry.count += 1;
-            entry.sub_ops.constraints += sub_ops.constraints;
-            entry.sub_ops.comp_decompose += sub_ops.comp_decompose;
-            entry.sub_ops.comp_commit += sub_ops.comp_commit;
-            entry.sub_ops.ood += sub_ops.ood;
-            entry.sub_ops.deep_comp += sub_ops.deep_comp;
-            entry.sub_ops.deep_extend += sub_ops.deep_extend;
-            entry.sub_ops.fri_commit += sub_ops.fri_commit;
-            entry.sub_ops.queries += sub_ops.queries;
+            entry.sub_ops.constraints += tt.sub_ops.constraints;
+            entry.sub_ops.comp_decompose += tt.sub_ops.comp_decompose;
+            entry.sub_ops.comp_commit += tt.sub_ops.comp_commit;
+            entry.sub_ops.ood += tt.sub_ops.ood;
+            entry.sub_ops.deep_comp += tt.sub_ops.deep_comp;
+            entry.sub_ops.deep_extend += tt.sub_ops.deep_extend;
+            entry.sub_ops.fri_commit += tt.sub_ops.fri_commit;
+            entry.sub_ops.queries += tt.sub_ops.queries;
         }
 
         let mut sorted: Vec<_> = merged.into_iter().collect();
@@ -211,6 +223,72 @@ pub fn print_report(
             "Total Merkle",
             total_merkle.as_secs_f64(),
             pct(total_merkle, total)
+        );
+
+        // Per-AIR main-trace cell breakdown. The headline metric used to
+        // compare against ZisK / SP1 is the sum of `rows × main_cols` across
+        // all AIRs. Aux cells are printed separately because they reflect
+        // LogUp/permutation overhead and don't contribute to the ZisK-style
+        // "main-trace cells" baseline.
+        let mut by_table: BTreeMap<String, (usize, usize, u128, u128, usize)> = BTreeMap::new();
+        for tt in &mp.table_timings {
+            let base = base_name(&tt.name).to_string();
+            let entry = by_table.entry(base).or_insert((0, tt.main_cols, 0, 0, 0));
+            entry.0 += tt.rows;
+            entry.2 += (tt.rows as u128) * (tt.main_cols as u128);
+            entry.3 += (tt.rows as u128) * (tt.aux_cols as u128);
+            entry.4 += 1;
+            // tt.aux_cols may differ across instances of a split table; track the
+            // last value seen (split tables share aux_col count by construction).
+            entry.1 = tt.main_cols;
+        }
+        let mut cell_rows: Vec<(String, usize, usize, u128, u128, usize)> = by_table
+            .into_iter()
+            .map(|(name, (rows, main_cols, main_cells, aux_cells, count))| {
+                (name, rows, main_cols, main_cells, aux_cells, count)
+            })
+            .collect();
+        cell_rows.sort_by(|a, b| b.3.cmp(&a.3));
+
+        let mut total_main_cells: u128 = 0;
+        let mut total_aux_cells: u128 = 0;
+        let mut total_table_rows: usize = 0;
+        for r in &cell_rows {
+            total_main_cells += r.3;
+            total_aux_cells += r.4;
+            total_table_rows += r.1;
+        }
+
+        eprintln!();
+        eprintln!("=== TRACE CELLS (rows × main_cols) ===");
+        eprintln!(
+            "  {:<22} {:>6} {:>5} {:>10} {:>10}",
+            "Table", "rows", "cols", "main", "aux",
+        );
+        eprintln!("  {}", "─".repeat(58));
+        for (name, rows, main_cols, main_cells, aux_cells, count) in &cell_rows {
+            let display_name = if *count > 1 {
+                format!("{name} x{count}")
+            } else {
+                name.clone()
+            };
+            eprintln!(
+                "  {:<22} {:>6} {:>5} {:>10} {:>10}",
+                display_name,
+                fmt_rows(*rows),
+                main_cols,
+                fmt_cells(*main_cells),
+                fmt_cells(*aux_cells),
+            );
+        }
+        eprintln!("  {}", "─".repeat(58));
+        eprintln!(
+            "  {:<22} {:>6} {:>5} {:>10} {:>10}",
+            "TOTAL",
+            fmt_rows(total_table_rows),
+            "",
+            fmt_cells(total_main_cells),
+            fmt_cells(total_aux_cells),
         );
     }
 
