@@ -362,11 +362,12 @@ impl<F: IsField> Table<F> {
         Ok(())
     }
 
-    /// Advise the kernel to drop mmap pages from the page cache.
+    /// Hint the kernel to drop mmap pages from the page cache.
     /// Call after reading spilled data into pool buffers so the same
     /// data doesn't occupy RAM in both places.
     ///
-    /// Unix-only: no-op on non-Unix targets.
+    /// Reliable on Linux for clean file-backed mappings; on other Unix
+    /// (macOS/BSD) the hint may be a no-op. No-op on non-Unix targets.
     #[cfg(all(feature = "disk-spill", unix))]
     pub fn advise_drop_cache(&self) {
         if let Some(ref backing) = self.mmap_backing {
