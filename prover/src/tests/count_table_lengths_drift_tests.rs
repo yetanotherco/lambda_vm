@@ -90,4 +90,7 @@ fn count_table_lengths_matches_traces() {
         traces.pages.len() as u64,
         "unique_page_count"
     );
+
+    // Mirrors hardcoded `halt_rows = 1` in `auto_storage::table_specs`.
+    assert_eq!(traces.halt.main_table.height, 1, "halt_rows");
 }

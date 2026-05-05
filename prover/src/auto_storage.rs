@@ -103,7 +103,7 @@ fn aux_cols(bus_count: usize) -> u64 {
 fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
-    let halt_rows = 4u64;
+    let halt_rows = 1u64;
     let page_rows = PAGE_SIZE as u64;
 
     let mut specs = vec![
