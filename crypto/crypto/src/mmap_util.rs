@@ -31,10 +31,6 @@ pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::R
 /// Mmap a fresh temp file, copy `slice` into the mapping, downgrade to
 /// read-only, and return it.
 ///
-/// Writes through the writable mmap rather than via `write(2)` + remap,
-/// which on Linux under memory pressure could otherwise produce
-/// partially-zeroed reads from the read-only mmap.
-///
 /// Alignment: the mmap base is page-aligned (>= 4096), this function
 /// asserts `align_of::<T>() <= 4096`, and Rust guarantees `size_of::<T>()`
 /// is a multiple of `align_of::<T>()`, so every element offset is aligned.
