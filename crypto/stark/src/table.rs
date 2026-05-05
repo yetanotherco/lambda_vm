@@ -41,7 +41,10 @@ impl std::fmt::Debug for TableMmapBacking {
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
 #[derive(Default, Debug, serde::Deserialize)]
-#[cfg_attr(not(feature = "disk-spill"), derive(serde::Serialize, Clone))]
+#[cfg_attr(
+    not(feature = "disk-spill"),
+    derive(serde::Serialize, Clone, PartialEq, Eq)
+)]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
@@ -126,6 +129,7 @@ impl<F: IsField> Clone for Table<F> {
 
 /// Element-wise comparison via `get()`, so spilled tables compare by field
 /// equality (canonicalized per `F::eq`) rather than raw mmap bytes.
+#[cfg(feature = "disk-spill")]
 impl<F: IsField> PartialEq for Table<F> {
     fn eq(&self, other: &Self) -> bool {
         if self.width != other.width || self.height != other.height {
@@ -142,6 +146,7 @@ impl<F: IsField> PartialEq for Table<F> {
     }
 }
 
+#[cfg(feature = "disk-spill")]
 impl<F: IsField> Eq for Table<F> {}
 
 impl<F: IsField> Table<F> {
