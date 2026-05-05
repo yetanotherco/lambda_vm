@@ -268,11 +268,11 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check AND multiplicity was updated for (0x12, 0x34) in BYTE_OPS
-    // (byte-pair receivers moved out of BITWISE).
-    let row_idx = byte_ops::row_index(0x12, 0x34);
+    // Check unified Bitwise multiplicity at (op_id=AND, X=0x12, Y=0x34).
+    // The byte_ops table now has 4 op_id slices; AND lookups land on slice 1.
+    let row_idx = byte_ops::bitwise_row_index(0x12, 0x34, 1);
     let row = traces.byte_ops.main_table.get_row(row_idx);
-    assert_eq!(row[byte_ops::cols::MU_AND], FE::one());
+    assert_eq!(row[byte_ops::cols::MU_BITWISE], FE::one());
 }
 
 #[test]

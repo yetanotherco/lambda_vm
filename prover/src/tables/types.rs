@@ -54,6 +54,12 @@ pub enum BusId {
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
+    /// Unified byte-bitwise lookup: BITWISE[op_id, X, Y] -> RESULT.
+    /// `op_id ∈ {1, 2, 4}` selects AND, OR, XOR respectively (disjoint-bit
+    /// encoding so `op_id = AND + 2*OR + 4*XOR`). Replaces AndByte/OrByte/
+    /// XorByte. The receiver carries one row per (X, Y, op_id) so the
+    /// `RESULT` column varies by op_id.
+    Bitwise,
     /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
     AndByte,
     /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
@@ -119,6 +125,7 @@ impl BusId {
             BusId::IsByte => "IsByte",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
+            BusId::Bitwise => "Bitwise",
             BusId::AndByte => "AndByte",
             BusId::OrByte => "OrByte",
             BusId::XorByte => "XorByte",
@@ -169,6 +176,7 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
+            22 => Ok(BusId::Bitwise),
             other => Err(other),
         }
     }

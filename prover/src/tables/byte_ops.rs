@@ -1,23 +1,24 @@
 //! BYTE_OPS precomputed lookup table for byte-pair operations.
 //!
-//! Holds every `(X, Y) ∈ [0, 256)²` and the precomputed result of the
-//! byte-pair lookups that BITWISE used to multiplex into its 2²⁰ rows. The
-//! 16× factor was driven only by 20-bit ops (HWSL/IS_B20/ZERO); pulling these
-//! out into a dedicated 2¹⁶ table cuts ~12M cells.
+//! Holds every `(X, Y) ∈ [0, 256)²` across four `OP_ID` slices and serves
+//! the byte-pair lookups that BITWISE used to multiplex into its 2²⁰ rows.
 //!
-//! ## Operations served (Step 2 will wire the receivers)
-//! - `AND_BYTE[X, Y]` -> X & Y
-//! - `OR_BYTE[X, Y]` -> X | Y
-//! - `XOR_BYTE[X, Y]` -> X ^ Y
-//! - `MSB8[X]` -> most significant bit of byte (Y = 0)
-//! - `MSB16[X + 256*Y]` -> most significant bit of halfword
-//! - `IS_BYTE[X, Y]` -> range check on a byte pair
-//! - `IS_HALF[X + 256*Y]` -> range check on a halfword
+//! ## Layout (4 slices × 256² = 2¹⁸ rows, power of two)
 //!
-//! ## Table Structure
+//! | Slice | OP_ID | Role                           | RESULT col holds |
+//! |-------|------:|--------------------------------|------------------|
+//! | 0     | 0     | non-bitwise (MSB8/MSB16/range) | 0 (unused)       |
+//! | 1     | 1     | AND                            | X & Y            |
+//! | 2     | 2     | OR                             | X \| Y           |
+//! | 3     | 4     | XOR                            | X ^ Y            |
 //!
-//! 2¹⁶ = 65,536 rows indexed by `(X: Byte, Y: Byte)`. All lookups are received
-//! with negative multiplicity (other tables send to this one).
+//! `OP_ID = 1 / 2 / 4` is the disjoint-bit encoding `AND + 2*OR + 4*XOR`.
+//! Senders emit `(op_id, X, Y, RESULT)` against `BusId::Bitwise`; the row
+//! at the matching slice has the right RESULT precomputed.
+//!
+//! Non-bitwise multiplicities (MU_IS_BYTE, MU_IS_HALF, MU_MSB8, MU_MSB16)
+//! live exclusively on the slice-0 rows so each (X, Y) has a single
+//! canonical home; the senders for those buses don't include an op_id.
 
 use std::sync::OnceLock;
 
@@ -44,41 +45,59 @@ pub mod cols {
     pub const X: usize = 0;
     /// Y: Byte input (0-255)
     pub const Y: usize = 1;
-    /// AND result: X & Y
-    pub const AND: usize = 2;
-    /// OR result: X | Y
-    pub const OR: usize = 3;
-    /// XOR result: X ^ Y
-    pub const XOR: usize = 4;
+    /// OP_ID: ∈ {0, 1, 2, 4}. 0 = non-bitwise slice, 1/2/4 = AND/OR/XOR.
+    pub const OP_ID: usize = 2;
+    /// RESULT: precomputed result for the slice's op (0 on slice 0).
+    pub const RESULT: usize = 3;
     /// MSB of byte X: (X >> 7) & 1
-    pub const MSB8: usize = 5;
-    /// MSB of halfword X + 256*Y: ((X + 256*Y) >> 15) & 1
-    pub const MSB16: usize = 6;
+    pub const MSB8: usize = 4;
+    /// MSB of halfword (X + 256*Y): ((X + 256*Y) >> 15) & 1
+    pub const MSB16: usize = 5;
 
-    /// Multiplicity for AND_BYTE lookups
-    pub const MU_AND: usize = 7;
-    /// Multiplicity for OR_BYTE lookups
-    pub const MU_OR: usize = 8;
-    /// Multiplicity for XOR_BYTE lookups
-    pub const MU_XOR: usize = 9;
-    /// Multiplicity for MSB8 lookups
-    pub const MU_MSB8: usize = 10;
-    /// Multiplicity for MSB16 lookups
-    pub const MU_MSB16: usize = 11;
-    /// Multiplicity for IS_BYTE lookups
-    pub const MU_IS_BYTE: usize = 12;
-    /// Multiplicity for IS_HALF lookups
-    pub const MU_IS_HALF: usize = 13;
+    /// Multiplicity for the unified Bitwise lookup (AND/OR/XOR).
+    pub const MU_BITWISE: usize = 6;
+    /// Multiplicity for IS_BYTE lookups (only fired on slice 0).
+    pub const MU_IS_BYTE: usize = 7;
+    /// Multiplicity for IS_HALF lookups (only fired on slice 0).
+    pub const MU_IS_HALF: usize = 8;
+    /// Multiplicity for MSB8 lookups (only fired on slice 0).
+    pub const MU_MSB8: usize = 9;
+    /// Multiplicity for MSB16 lookups (only fired on slice 0).
+    pub const MU_MSB16: usize = 10;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 14;
+    pub const NUM_COLUMNS: usize = 11;
 }
 
-/// 2¹⁶ rows = 65,536.
-pub const NUM_ROWS: usize = 256 * 256;
+/// 256² × 4 slices = 262,144 rows (2¹⁸).
+pub const NUM_ROWS: usize = 256 * 256 * 4;
 
 /// Number of precomputed (non-multiplicity) columns.
-pub const NUM_PRECOMPUTED_COLS: usize = 7;
+pub const NUM_PRECOMPUTED_COLS: usize = 6;
+
+/// Number of slices in the table (op_id discriminator).
+pub const NUM_SLICES: usize = 4;
+
+/// Maps a slice index `s ∈ [0, 4)` to its `OP_ID` value.
+const fn slice_to_op_id(s: usize) -> u32 {
+    match s {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => 0,
+    }
+}
+
+/// Inverse: given an op_id ∈ {1, 2, 4}, return its slice index.
+const fn op_id_to_slice(op_id: u8) -> usize {
+    match op_id {
+        1 => 1,
+        2 => 2,
+        4 => 3,
+        _ => 0,
+    }
+}
 
 // =========================================================================
 // Compile-time row generation
@@ -86,15 +105,21 @@ pub const NUM_PRECOMPUTED_COLS: usize = 7;
 
 /// Generate one row of the byte_ops table.
 ///
-/// Index encoding: `index = x + y * 256` with `x, y ∈ [0, 255]`.
+/// Index encoding: `index = x + 256 * y + 65536 * slice` where
+/// `x, y ∈ [0, 255]` and `slice ∈ [0, 4)`.
 #[inline]
 pub const fn generate_byte_ops_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
     let x = (index & 0xFF) as u32;
     let y = ((index >> 8) & 0xFF) as u32;
+    let slice = (index >> 16) & 0x3;
+    let op_id = slice_to_op_id(slice);
 
-    let and_val = x & y;
-    let or_val = x | y;
-    let xor_val = x ^ y;
+    let result = match op_id {
+        1 => x & y,
+        2 => x | y,
+        4 => x ^ y,
+        _ => 0,
+    };
 
     let msb8 = (x >> 7) & 1;
     let halfword = x + y * 256;
@@ -103,15 +128,13 @@ pub const fn generate_byte_ops_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] 
     [
         x as u64,
         y as u64,
-        and_val as u64,
-        or_val as u64,
-        xor_val as u64,
+        op_id as u64,
+        result as u64,
         msb8 as u64,
         msb16 as u64,
     ]
 }
 
-/// Whether this table is preprocessed (commitment is hardcoded).
 pub const fn is_preprocessed() -> bool {
     true
 }
@@ -124,9 +147,9 @@ static BYTE_OPS_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle commitment over the precomputed byte_ops columns.
 ///
-/// Mirrors [`bitwise::compute_preprocessed_commitment`] — see that for the
-/// rationale (LDE-rooted commitment is required so FRI queries at any
-/// blow-up index can be opened against this precomputed table).
+/// Mirrors [`bitwise::compute_preprocessed_commitment`] — the LDE-rooted
+/// commitment is required so FRI queries at any blow-up index can be opened
+/// against this preprocessed table.
 fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     #[cfg(feature = "parallel")]
     let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
@@ -225,76 +248,99 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 pub fn generate_byte_ops_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let mut data = vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS];
 
-    for x in 0u32..256 {
-        for y in 0u32..256 {
-            let row_idx = (x as usize) + (y as usize) * 256;
-            let base = row_idx * cols::NUM_COLUMNS;
+    for slice in 0..NUM_SLICES {
+        let op_id = slice_to_op_id(slice);
+        for x in 0u32..256 {
+            for y in 0u32..256 {
+                let row_idx = (x as usize) + (y as usize) * 256 + slice * 65536;
+                let base = row_idx * cols::NUM_COLUMNS;
 
-            data[base + cols::X] = FE::from(x as u64);
-            data[base + cols::Y] = FE::from(y as u64);
-            data[base + cols::AND] = FE::from((x & y) as u64);
-            data[base + cols::OR] = FE::from((x | y) as u64);
-            data[base + cols::XOR] = FE::from((x ^ y) as u64);
+                data[base + cols::X] = FE::from(x as u64);
+                data[base + cols::Y] = FE::from(y as u64);
+                data[base + cols::OP_ID] = FE::from(op_id as u64);
 
-            let msb8 = (x >> 7) & 1;
-            let halfword = x + y * 256;
-            let msb16 = (halfword >> 15) & 1;
-            data[base + cols::MSB8] = FE::from(msb8 as u64);
-            data[base + cols::MSB16] = FE::from(msb16 as u64);
+                let result = match op_id {
+                    1 => x & y,
+                    2 => x | y,
+                    4 => x ^ y,
+                    _ => 0,
+                };
+                data[base + cols::RESULT] = FE::from(result as u64);
 
-            // Multiplicity columns initialized to zero by the vec! above.
+                let msb8 = (x >> 7) & 1;
+                let halfword = x + y * 256;
+                let msb16 = (halfword >> 15) & 1;
+                data[base + cols::MSB8] = FE::from(msb8 as u64);
+                data[base + cols::MSB16] = FE::from(msb16 as u64);
+
+                // Multiplicity columns are zero-initialized by `vec!` above.
+            }
         }
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+/// Slice-0 row index for a given (x, y), used by non-bitwise senders that
+/// don't include an op_id.
 #[inline]
 pub fn row_index(x: u8, y: u8) -> usize {
     (x as usize) + (y as usize) * 256
 }
 
+/// Row index for a bitwise op (AND/OR/XOR) at the matching op_id slice.
+#[inline]
+pub fn bitwise_row_index(x: u8, y: u8, op_id: u8) -> usize {
+    let slice = op_id_to_slice(op_id);
+    (x as usize) + (y as usize) * 256 + slice * 65536
+}
+
 /// Apply lookups to multiplicity columns.
 ///
-/// Routes byte-pair events (AndByte/OrByte/XorByte/Msb8/Msb16/IsByte/IsHalf)
-/// into byte_ops; events for the 20-bit ops (Zero/IsB20/Hwsl) stay in
-/// `bitwise::update_multiplicities` and are skipped here.
+/// Routes the byte-pair operations into their canonical rows:
+/// - AndByte/OrByte/XorByte → MU_BITWISE on the matching op_id slice
+/// - Msb8/Msb16/IsByte/IsHalf → MU_* on slice 0 (single canonical home per (X, Y))
+/// - 20-bit ops (Zero/IsB20/Hwsl) stay on the BITWISE table.
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     ops: &[BitwiseOperation],
 ) {
     for op in ops {
-        let mu_col = match op.lookup_type {
-            BitwiseOperationType::AndByte => cols::MU_AND,
-            BitwiseOperationType::OrByte => cols::MU_OR,
-            BitwiseOperationType::XorByte => cols::MU_XOR,
-            BitwiseOperationType::Msb8 => cols::MU_MSB8,
-            BitwiseOperationType::Msb16 => cols::MU_MSB16,
-            BitwiseOperationType::IsByte => cols::MU_IS_BYTE,
-            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
+        let (mu_col, row) = match op.lookup_type {
+            BitwiseOperationType::AndByte => (cols::MU_BITWISE, bitwise_row_index(op.x, op.y, 1)),
+            BitwiseOperationType::OrByte => (cols::MU_BITWISE, bitwise_row_index(op.x, op.y, 2)),
+            BitwiseOperationType::XorByte => (cols::MU_BITWISE, bitwise_row_index(op.x, op.y, 4)),
+            BitwiseOperationType::Msb8 => (cols::MU_MSB8, row_index(op.x, op.y)),
+            BitwiseOperationType::Msb16 => (cols::MU_MSB16, row_index(op.x, op.y)),
+            BitwiseOperationType::IsByte => (cols::MU_IS_BYTE, row_index(op.x, op.y)),
+            BitwiseOperationType::IsHalf => (cols::MU_IS_HALF, row_index(op.x, op.y)),
             BitwiseOperationType::Zero
             | BitwiseOperationType::IsB20
             | BitwiseOperationType::Hwsl => continue,
         };
-        let row = row_index(op.x, op.y);
         let current = trace.main_table.get_row(row)[mu_col];
         trace.set_main(row, mu_col, current + FE::one());
     }
 }
 
 // =========================================================================
-// Bus interactions (empty in Step 1; populated in Step 2)
+// Bus interactions
 // =========================================================================
 
-/// Receivers for byte-pair lookups. The 20-bit ops (Zero/IsB20/Hwsl) stay
-/// on the BITWISE table.
+/// Receivers for byte-pair lookups. The unified Bitwise receiver matches
+/// `(op_id, X, Y, RESULT)`; non-bitwise receivers stay separate but only
+/// receive on slice-0 rows where their multiplicity is non-zero.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // AND_BYTE[X, Y] -> AND
+        // Bitwise[op_id, X, Y, RESULT]
         BusInteraction::receiver(
-            BusId::AndByte,
-            Multiplicity::Column(cols::MU_AND),
+            BusId::Bitwise,
+            Multiplicity::Column(cols::MU_BITWISE),
             vec![
+                BusValue::Packed {
+                    start_column: cols::OP_ID,
+                    packing: Packing::Direct,
+                },
                 BusValue::Packed {
                     start_column: cols::X,
                     packing: Packing::Direct,
@@ -304,45 +350,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::AND,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // OR_BYTE[X, Y] -> OR
-        BusInteraction::receiver(
-            BusId::OrByte,
-            Multiplicity::Column(cols::MU_OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // XOR_BYTE[X, Y] -> XOR
-        BusInteraction::receiver(
-            BusId::XorByte,
-            Multiplicity::Column(cols::MU_XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::XOR,
+                    start_column: cols::RESULT,
                     packing: Packing::Direct,
                 },
             ],
@@ -384,7 +392,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ),
         // IS_BYTE[X, Y] - range check two byte values, no output.
-        // Single-byte checks send the second argument as 0.
         BusInteraction::receiver(
             BusId::IsByte,
             Multiplicity::Column(cols::MU_IS_BYTE),

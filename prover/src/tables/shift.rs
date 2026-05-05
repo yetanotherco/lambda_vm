@@ -396,11 +396,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
+    // SHIFT-C1: Bitwise[op_id=1, shift, 15] → bit_shift | left (= μ - direction)
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::Bitwise,
         Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
+            BusValue::constant(1),
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
@@ -413,15 +414,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
+    // SHIFT-C2: Bitwise[op_id=1, 256 - zbs*16 - shift, 15] → bit_shift | right (= direction)
     // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
     // [0,255].
     // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
     // 256 - 16 - shift ∈ [0,255].
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::Bitwise,
         Multiplicity::Column(cols::DIRECTION),
         vec![
+            BusValue::constant(1),
             BusValue::linear(vec![
                 LinearTerm::Constant(256),
                 LinearTerm::Column {
@@ -519,13 +521,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
+    // SHIFT-C11: Bitwise[op_id=1, shift, mask] → encoded_limb | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
     // mask = 48 - 32 * word_instr
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::Bitwise,
         Multiplicity::Column(cols::MU),
         vec![
+            BusValue::constant(1),
             // first input: shift
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
