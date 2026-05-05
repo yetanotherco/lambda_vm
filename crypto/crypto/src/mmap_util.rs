@@ -9,7 +9,7 @@ use math::spill_safe::SpillSafe;
 ///
 /// `/tmp` is often tmpfs (RAM-backed) on systemd-default distros; set
 /// `TMPDIR` to a disk-backed path so spill files actually live on disk.
-pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
+fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::Result<()> {
     file.set_len(total_bytes)?;
     #[cfg(target_os = "linux")]
     {
