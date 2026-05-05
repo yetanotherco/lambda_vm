@@ -1,3 +1,5 @@
+use math::spill_safe::SpillSafe;
+
 /// Reserve disk blocks up front so this call fails on a full disk.
 /// Without reservation, the kernel sends SIGBUS during the later mmap write.
 ///
@@ -21,4 +23,47 @@ pub fn reserve_file_blocks(file: &std::fs::File, total_bytes: u64) -> std::io::R
         }
     }
     Ok(())
+}
+
+/// Mmap a fresh temp file, copy `slice` into the mapping, downgrade to
+/// read-only, and return it.
+///
+/// Writes through the writable mmap rather than via `write(2)` + remap,
+/// which on Linux under memory pressure could otherwise produce
+/// partially-zeroed reads from the read-only mmap.
+///
+/// Alignment: the mmap base is page-aligned (>= 4096), this function
+/// asserts `align_of::<T>() <= 4096`, and Rust guarantees `size_of::<T>()`
+/// is a multiple of `align_of::<T>()`, so every element offset is aligned.
+pub fn spill_slice_to_mmap<T: SpillSafe>(slice: &[T]) -> std::io::Result<memmap2::Mmap> {
+    const {
+        assert!(
+            std::mem::align_of::<T>() <= 4096,
+            "T alignment must fit within mmap page alignment"
+        )
+    }
+
+    let elem_size = std::mem::size_of::<T>();
+    let total_bytes = (slice.len() as u64)
+        .checked_mul(elem_size as u64)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "spill_slice_to_mmap: byte count overflows u64",
+            )
+        })?;
+
+    let file = tempfile::tempfile()?;
+    reserve_file_blocks(&file, total_bytes)?;
+
+    // SAFETY: tempfile() creates an anonymous file with no filesystem path,
+    // so no other process can open or modify it.
+    let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+    // SAFETY: SpillSafe's safety contract requires no padding on T, so
+    // `slice`'s bytes are initialized and reading them as &[u8] is sound.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(slice.as_ptr() as *const u8, size_of_val(slice))
+    };
+    mmap_mut.copy_from_slice(bytes);
+    mmap_mut.make_read_only()
 }

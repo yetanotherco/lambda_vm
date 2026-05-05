@@ -1582,6 +1582,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
@@ -1605,6 +1607,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
@@ -1620,6 +1624,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
@@ -2101,6 +2107,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {

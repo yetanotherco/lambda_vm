@@ -304,59 +304,20 @@ impl<F: IsField> Table<F> {
     #[cfg(feature = "disk-spill")]
     pub fn spill_to_disk(&mut self) -> std::io::Result<()>
     where
+        F: Copy + 'static,
         F::BaseType: SpillSafe,
     {
-        // mmap base is page-aligned (typically 4096); any element with smaller
-        // alignment is therefore aligned at every offset, since size_of is
-        // always a multiple of align_of by Rust layout rules.
-        const {
-            assert!(
-                std::mem::align_of::<FieldElement<F>>() <= 4096,
-                "FieldElement<F> alignment must fit within mmap page alignment"
-            )
-        }
-
         if self.data.is_empty() || self.mmap_backing.is_some() {
             return Ok(());
         }
 
-        let elem_size = std::mem::size_of::<FieldElement<F>>();
-        let total_bytes = (self.data.len() as u64)
-            .checked_mul(elem_size as u64)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "spill_to_disk: byte count overflows u64",
-                )
-            })?;
-
-        let file = tempfile::tempfile()?;
-        crypto::mmap_util::reserve_file_blocks(&file, total_bytes)?;
-
-        // Write directly through a writable mmap, then downgrade to read-only.
-        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
-        // under memory pressure could produce partially-zeroed reads from the
-        // read-only mmap (the previous implementation relied on that handoff).
-        //
-        // SAFETY: tempfile() creates an anonymous file with no filesystem
-        // path, so no other process can open or modify it.
-        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
-        // The Vec has the same byte layout as a contiguous array.
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * elem_size)
-        };
-        mmap_mut.copy_from_slice(bytes);
-        let mmap = mmap_mut.make_read_only()?;
-
+        let mmap = crypto::mmap_util::spill_slice_to_mmap(&self.data)?;
         self.mmap_backing = Some(TableMmapBacking {
             mmap,
             width: self.width,
             height: self.height,
-            elem_size,
+            elem_size: std::mem::size_of::<FieldElement<F>>(),
         });
-
-        // Free heap allocation
         self.data = Vec::new();
 
         Ok(())

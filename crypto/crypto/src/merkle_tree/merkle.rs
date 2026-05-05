@@ -175,7 +175,7 @@ where
                 // Reaching this branch means that bound was checked at construction,
                 // so B::Node carries no padding and every bit pattern is valid.
                 //
-                // Alignment: the mmap base is page-aligned (>= 4096), spill_nodes_to_disk
+                // Alignment: the mmap base is page-aligned (>= 4096), spill_slice_to_mmap
                 // asserts align_of::<B::Node>() <= 4096, and Rust guarantees
                 // size_of::<B::Node> is a multiple of align_of::<B::Node>, so every
                 // offset idx * node_size lands on an aligned address.
@@ -328,59 +328,20 @@ where
         auth_path_set.into_iter().rev().collect()
     }
 
-    /// Mmap a temp file, copy the tree nodes into the mapping, and free the
-    /// in-memory vector. Node access methods read from the mmap after this call.
+    /// Spill the node vector to a temp-file-backed mmap and free the heap
+    /// allocation. Node access methods read from the mmap after this call.
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where
         B::Node: SpillSafe,
     {
-        const {
-            assert!(
-                align_of::<B::Node>() <= 4096,
-                "B::Node alignment must fit within mmap page alignment"
-            )
-        }
-
         if self.nodes.is_empty() || self.mmap_backing.is_some() {
             return Ok(());
         }
 
         let node_count = self.nodes.len();
-        let total_bytes = (node_count as u64)
-            .checked_mul(size_of::<B::Node>() as u64)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "spill_nodes_to_disk: byte count overflows u64",
-                )
-            })?;
-
-        let file = tempfile::tempfile()?;
-        crate::mmap_util::reserve_file_blocks(&file, total_bytes)?;
-
-        // Write directly through a writable mmap, then downgrade to read-only.
-        // Avoids the write(2) → page-cache → mmap hand-off, which on Linux
-        // under memory pressure could produce partially-zeroed reads from the
-        // read-only mmap.
-        //
-        // SAFETY: tempfile() creates an anonymous file with no filesystem
-        // path, so no other process can open or modify it.
-        let mut mmap_mut = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        // SAFETY: SpillSafe's safety contract requires no padding on B::Node, so
-        // the contiguous Vec bytes are initialized and reading them as &[u8] is sound.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                self.nodes.as_ptr() as *const u8,
-                node_count * size_of::<B::Node>(),
-            )
-        };
-        mmap_mut.copy_from_slice(bytes);
-        let mmap = mmap_mut.make_read_only()?;
-
-        // Free the heap allocation
+        let mmap = crate::mmap_util::spill_slice_to_mmap(&self.nodes)?;
         self.nodes = Vec::new();
-
         self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
 
         Ok(())

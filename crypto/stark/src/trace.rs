@@ -154,6 +154,7 @@ where
     #[cfg(feature = "disk-spill")]
     pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
     where
+        F: Copy + 'static,
         F::BaseType: SpillSafe,
     {
         self.main_table.spill_to_disk()
@@ -162,6 +163,7 @@ where
     #[cfg(feature = "disk-spill")]
     pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
     where
+        E: Copy + 'static,
         E::BaseType: SpillSafe,
     {
         self.aux_table.spill_to_disk()
