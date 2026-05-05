@@ -28,8 +28,8 @@ desc = "the left-rotated component of `rotated_Cxz`"
 
 [[variables.auxiliary]]
 name = "Cxz_right"
-type = [["Byte", 8], 5]
-desc = "the right-rotated component of `rotated_Cxz`"
+type = [["Bit", 4], 5]
+desc = "the right-rotated component of `rotated_Cxz` (which is a single bit)"
 
 [[variables.auxiliary]]
 name = "Dxz"
@@ -75,7 +75,16 @@ desc = "state update following from step $iota$."
 name = "rotated_Cxz"
 type = [["Byte", 8], 5]
 desc = "$#`Cxz[x,`3#`,z]` <<< 1$"
-def = {iters=[["x", 0, 4], ["z", 0, 7]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], ["mod", ["-", "z", 1], 8]]]}
+def = {polys=[
+    {iters=[["x", 0, 4], ["z", 0]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 3]]},
+    {iters=[["x", 0, 4], ["z", 1]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 2]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 0]]},
+    {iters=[["x", 0, 4], ["z", 3]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 4]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 1]]},
+    {iters=[["x", 0, 4], ["z", 5]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 6]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 2]]},
+    {iters=[["x", 0, 4], ["z", 7]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+]}
 
 [[variables.virtual]]
 name = "out"
@@ -91,7 +100,7 @@ def = {polys=[
 [[variables.virtual]]
 name = "rho"
 type = [[["Byte", 8], 5], 5]
-desc = "$(rho compose theta)(#`start`)$; the state state after applying $rho$"
+desc = "$(rho compose theta)(#`start`)$; the state after applying $rho$"
 def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
     "+", 
     ["*", 
@@ -99,7 +108,7 @@ def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
         ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1]],
         ["+",
             ["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"], 
-            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 1], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 2], 8]],
         ]
     ],
     ["*", 
@@ -107,7 +116,7 @@ def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
         ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1]],
         ["+",
             ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 2], 8]], 
-            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 3], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 4], 8]],
         ]
     ],
     ["*",
@@ -115,7 +124,7 @@ def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
         ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1],
         ["+",
             ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 4], 8]], 
-            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 5], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 6], 8]],
         ]
     ],
     ["*", 
@@ -123,7 +132,7 @@ def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
         ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1],
         ["+",
             ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 6], 8]], 
-            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 7], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"],
         ]
     ],
 ]}
@@ -202,7 +211,10 @@ ref = "keccak:c:theta_cxz"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", ["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordHL"], "z"], 1]
-output = ["arr", ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"], ["idx", ["cast", ["idx", "Cxz_right", "x"], "DWordHL"], "z"]]
+output = ["arr", 
+    ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"], 
+    ["cast", ["idx", ["idx", "Cxz_right", "x"], "z"], "Half"]
+]
 iters = [["x", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
 
@@ -219,10 +231,9 @@ cond = "μ"
 
 [[constraints.theta]]
 kind = "template"
-tag = "IS_BYTE"
+tag = "IS_BIT"
 input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
-iters = [["x", 0, 4], ["z", 0, 7]]
-cond = "μ"
+iters = [["x", 0, 4], ["z", 0, 3]]
 
 [[constraints.theta]]
 kind = "interaction"
@@ -251,6 +262,7 @@ input = [["idx", ["cast", ["idx", ["idx", "theta", "x"], "y"], "DWordHL"], "z"],
 output = ["arr", ["idx", ["cast", ["idx", ["idx", "rot_left", "x"], "y"], "DWordHL"], "z"], ["idx", ["cast", ["idx", ["idx", "rot_right", "x"], "y"], "DWordHL"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
+ref = "keccak:c:rho_rotation"
 
 # Note: these IS_BYTE checks are necessary.
 # Without them, it is possible to prove 0 <<< S evaluates to -1 by setting
@@ -260,8 +272,9 @@ multiplicity = "μ"
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
-iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]] 
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 cond = "μ"
+ref = "keccak:c:range_rot_left"
 
 [[constraints.rho]]
 kind = "template"
@@ -269,6 +282,7 @@ tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 cond = "μ"
+ref = "keccak:c:range_rot_right"
 
 [[constraint_groups]]
 name = "chi"

@@ -105,6 +105,11 @@ Lastly, the round chip contributes the following interactions to the lookup:
 == Notes/potential optimizations
 - one does not have to repeat `addr` in `state_ptr`; this saves 4 columns and 4 `IS_HALF` checks.
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
+- when the output of `HWSL` are `Byte`s mapped as `Half`s, we find that out of every four output bytes, at least one is zero. 
+  Since `rnc` is constant, @keccak:c:rho_rotation makes those zero-bytes show up in `rot_left` and `rot_right` at constant locations.
+  This means 96 columns can be removed from the chip at no cost.
+  Likewise, 96 `IS_BYTE` interactions can be dropped from @keccak:c:range_rot_left and @keccak:c:range_rot_right.
+  - the shift-constants are equivalent to $1 mod 16$ for $(#`x`, #`y`) = (1, 0)$ and $-1 mod 16$ for $(2, 3)$. This means that for those lanes it suffices to constrain `rot_left`/`rot_right` as `Bit`s rather than `Byte`s, saving an additional 8 `IS_BYTE` interactions.
 - $#`rc[2]` = #`rc[4]` = #`rc[5]` = #`rc[6]` = 0$. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the $iota$-step. This saves 8 columns and 4 `XOR_BYTE` interactions.
 - when executed in large volumnes, `KECCAK_RND` could benefit from having a three-way XOR lookup table. With this in place, the 80 interactions in @keccak:c:theta_cxz_start and @keccak:c:theta_cxz could be dropped.
   Likewise, 80 columns could be removed from the chip (a \~5% savings).
