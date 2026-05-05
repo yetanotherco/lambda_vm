@@ -4,8 +4,8 @@
 //! Stricter than `Copy`, which permits types with restricted bit patterns
 //! (e.g. `bool`, `NonZeroU32`).
 //!
-//! Implementing this trait is a deliberate `unsafe impl` — the implementer
-//! asserts the layout invariants hold, the compiler does not check.
+//! `unsafe impl` puts the layout invariants on the implementer. The
+//! compiler does not check.
 
 use crate::field::{element::FieldElement, traits::IsField};
 
