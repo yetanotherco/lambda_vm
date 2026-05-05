@@ -370,21 +370,21 @@ pub fn update_multiplicities(
     ops: &[BitwiseOperation],
 ) {
     for op in ops {
-        let row = row_index(op.x, op.y, op.z);
         let mu_col = match op.lookup_type {
-            BitwiseOperationType::AndByte => cols::MU_AND,
-            BitwiseOperationType::OrByte => cols::MU_OR,
-            BitwiseOperationType::XorByte => cols::MU_XOR,
-            BitwiseOperationType::Msb8 => cols::MU_MSB8,
-            BitwiseOperationType::Msb16 => cols::MU_MSB16,
             BitwiseOperationType::Zero => cols::MU_ZERO,
-            BitwiseOperationType::IsByte => cols::MU_IS_BYTE,
-            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
+            // Byte-pair ops are received by `byte_ops::update_multiplicities`.
+            BitwiseOperationType::AndByte
+            | BitwiseOperationType::OrByte
+            | BitwiseOperationType::XorByte
+            | BitwiseOperationType::Msb8
+            | BitwiseOperationType::Msb16
+            | BitwiseOperationType::IsByte
+            | BitwiseOperationType::IsHalf => continue,
         };
 
-        // Increment multiplicity
+        let row = row_index(op.x, op.y, op.z);
         let current = trace.main_table.get_row(row)[mu_col];
         trace.set_main(row, mu_col, current + FE::one());
     }
@@ -543,106 +543,11 @@ impl BitwiseOperation {
 
 /// Creates all bus interactions for the BITWISE table.
 ///
-/// The BITWISE table is a **receiver** for all lookups (negative multiplicity
-/// in the spec corresponds to receiving lookups from other tables).
+/// BITWISE keeps only the 20-bit-space lookups (Zero / IsB20 / Hwsl) that
+/// genuinely need the Z dimension. Byte-pair lookups (And/Or/Xor/Msb8/Msb16/
+/// IsByte/IsHalfword) live in [`super::byte_ops`] now.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // AND_BYTE[X, Y] -> AND
-        BusInteraction::receiver(
-            BusId::AndByte,
-            Multiplicity::Column(cols::MU_AND),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::AND,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // OR_BYTE[X, Y] -> OR
-        BusInteraction::receiver(
-            BusId::OrByte,
-            Multiplicity::Column(cols::MU_OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // XOR_BYTE[X, Y] -> XOR
-        BusInteraction::receiver(
-            BusId::XorByte,
-            Multiplicity::Column(cols::MU_XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::XOR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // MSB8[X] -> MSB8
-        BusInteraction::receiver(
-            BusId::Msb8,
-            Multiplicity::Column(cols::MU_MSB8),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::MSB8,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // MSB16[X + 256*Y] -> MSB16
-        // Input is packed as Word2L (X + 2^8 * Y would need custom, but spec says X + 256*Y)
-        // Since X and Y are bytes, we use a linear combination
-        BusInteraction::receiver(
-            BusId::Msb16,
-            Multiplicity::Column(cols::MU_MSB16),
-            vec![
-                // X + 256*Y as linear combination
-                BusValue::linear(vec![
-                    stark::lookup::LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::X,
-                    },
-                    stark::lookup::LinearTerm::Column {
-                        coefficient: 256,
-                        column: cols::Y,
-                    },
-                ]),
-                BusValue::Packed {
-                    start_column: cols::MSB16,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
         // ZERO[X + 256*Y + 65536*Z] -> ZERO
         BusInteraction::receiver(
             BusId::Zero,
@@ -667,37 +572,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
             ],
-        ),
-        // IS_BYTE[X, Y] - range check two byte values, no output.
-        // Single-byte checks send the second argument as 0.
-        BusInteraction::receiver(
-            BusId::IsByte,
-            Multiplicity::Column(cols::MU_IS_BYTE),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // IS_HALF[X + 256*Y] - range check for halfword
-        BusInteraction::receiver(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU_IS_HALF),
-            vec![BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::X,
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::Y,
-                },
-            ])],
         ),
         // IS_B20[X + 256*Y + 65536*Z] - range check for 20-bit
         BusInteraction::receiver(

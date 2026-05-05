@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
-use stark::lookup::BusInteraction;
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
@@ -33,7 +33,7 @@ use stark::trace::{TraceTable, columns2rows};
 use rayon::prelude::*;
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
-use super::types::{FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Column indices for BYTE_OPS table
@@ -256,24 +256,163 @@ pub fn row_index(x: u8, y: u8) -> usize {
 
 /// Apply lookups to multiplicity columns.
 ///
-/// Step 1 leaves this as a no-op — BITWISE still receives every byte-pair
-/// bus, so byte_ops's multiplicity columns stay zeroed. Step 2 will route
-/// AndByte/OrByte/XorByte/Msb8/Msb16/IsByte/IsHalf events here using the
-/// same `BitwiseOperation` stream the BITWISE generator already produces.
+/// Routes byte-pair events (AndByte/OrByte/XorByte/Msb8/Msb16/IsByte/IsHalf)
+/// into byte_ops; events for the 20-bit ops (Zero/IsB20/Hwsl) stay in
+/// `bitwise::update_multiplicities` and are skipped here.
 pub fn update_multiplicities(
-    _trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    _ops: &[BitwiseOperation],
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ops: &[BitwiseOperation],
 ) {
-    // No-op until Step 2.
-    let _ = BitwiseOperationType::AndByte; // keep import live
+    for op in ops {
+        let mu_col = match op.lookup_type {
+            BitwiseOperationType::AndByte => cols::MU_AND,
+            BitwiseOperationType::OrByte => cols::MU_OR,
+            BitwiseOperationType::XorByte => cols::MU_XOR,
+            BitwiseOperationType::Msb8 => cols::MU_MSB8,
+            BitwiseOperationType::Msb16 => cols::MU_MSB16,
+            BitwiseOperationType::IsByte => cols::MU_IS_BYTE,
+            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
+            BitwiseOperationType::Zero
+            | BitwiseOperationType::IsB20
+            | BitwiseOperationType::Hwsl => continue,
+        };
+        let row = row_index(op.x, op.y);
+        let current = trace.main_table.get_row(row)[mu_col];
+        trace.set_main(row, mu_col, current + FE::one());
+    }
 }
 
 // =========================================================================
 // Bus interactions (empty in Step 1; populated in Step 2)
 // =========================================================================
 
-/// Receivers for byte-pair lookups. Step 1 returns an empty list — BITWISE
-/// keeps all receivers; Step 2 moves them here.
+/// Receivers for byte-pair lookups. The 20-bit ops (Zero/IsB20/Hwsl) stay
+/// on the BITWISE table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    Vec::new()
+    vec![
+        // AND_BYTE[X, Y] -> AND
+        BusInteraction::receiver(
+            BusId::AndByte,
+            Multiplicity::Column(cols::MU_AND),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::AND,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // OR_BYTE[X, Y] -> OR
+        BusInteraction::receiver(
+            BusId::OrByte,
+            Multiplicity::Column(cols::MU_OR),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OR,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // XOR_BYTE[X, Y] -> XOR
+        BusInteraction::receiver(
+            BusId::XorByte,
+            Multiplicity::Column(cols::MU_XOR),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::XOR,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // MSB8[X] -> MSB8
+        BusInteraction::receiver(
+            BusId::Msb8,
+            Multiplicity::Column(cols::MU_MSB8),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::MSB8,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // MSB16[X + 256*Y] -> MSB16
+        BusInteraction::receiver(
+            BusId::Msb16,
+            Multiplicity::Column(cols::MU_MSB16),
+            vec![
+                BusValue::linear(vec![
+                    stark::lookup::LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::X,
+                    },
+                    stark::lookup::LinearTerm::Column {
+                        coefficient: 256,
+                        column: cols::Y,
+                    },
+                ]),
+                BusValue::Packed {
+                    start_column: cols::MSB16,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // IS_BYTE[X, Y] - range check two byte values, no output.
+        // Single-byte checks send the second argument as 0.
+        BusInteraction::receiver(
+            BusId::IsByte,
+            Multiplicity::Column(cols::MU_IS_BYTE),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // IS_HALF[X + 256*Y] - range check for halfword
+        BusInteraction::receiver(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU_IS_HALF),
+            vec![BusValue::linear(vec![
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::X,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::Y,
+                },
+            ])],
+        ),
+    ]
 }
