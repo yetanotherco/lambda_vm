@@ -41,9 +41,10 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_byte_ops_air, create_commit_air,
-    create_cpu_air, create_decode_air, create_dvrm_air, create_halt_air, create_load_air,
-    create_lt_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
-    create_mul_air, create_page_air, create_register_air, create_shift_air,
+    create_cpu_air, create_cpu_bitwise_air, create_decode_air, create_dvrm_air, create_halt_air,
+    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
+    create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -189,6 +190,7 @@ type AirTracePair<'a> = (
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
+    pub cpu_bitwise: VmAir,
     pub bitwise: VmAir,
     pub byte_ops: VmAir,
     pub lts: Vec<VmAir>,
@@ -213,6 +215,7 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.byte_ops, &mut traces.byte_ops, &()),
+            (&self.cpu_bitwise, &mut traces.cpu_bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
@@ -269,6 +272,7 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.bitwise,
             &self.byte_ops,
+            &self.cpu_bitwise,
             &self.decode,
             &self.halt,
             &self.commit,
@@ -328,6 +332,7 @@ impl VmAirs {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
             .collect();
+        let cpu_bitwise = create_cpu_bitwise_air(proof_options);
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
@@ -406,6 +411,7 @@ impl VmAirs {
 
         Self {
             cpus,
+            cpu_bitwise,
             bitwise,
             byte_ops,
             lts,
@@ -703,11 +709,14 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables = 7: bitwise, byte_ops, cpu_bitwise, decode, halt, commit, register.
+    // Plus one page table per page_config.
+    const NUM_FIXED_TABLES: usize = 7;
+    let expected_proof_count =
+        vm_proof.table_counts.total() + NUM_FIXED_TABLES + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + {NUM_FIXED_TABLES} fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

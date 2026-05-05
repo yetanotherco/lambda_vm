@@ -343,8 +343,10 @@ fn test_mixed_instructions() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // 5 ops (4 + ecall) padded to 8
-    assert_eq!(traces.cpus[0].main_table.height, 8);
+    // After Phase 4 the AND row is routed to CPU_BITWISE; CPU keeps the
+    // remaining 4 (ADD, SLT, BLT, ECALL) padded to 4.
+    assert_eq!(traces.cpus[0].main_table.height, 4);
+    assert_eq!(traces.cpu_bitwise.main_table.height, 4); // 1 AND padded to min 4
     assert_eq!(
         traces.bitwise.main_table.height,
         crate::tables::bitwise::NUM_ROWS

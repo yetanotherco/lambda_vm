@@ -1796,7 +1796,10 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 5);
+    // Always-present singletons: BITWISE, BYTE_OPS, CPU_BITWISE, DECODE,
+    // HALT, COMMIT, REGISTER. Vec'd tables (CPU/LT/etc) are empty under
+    // zero-counts.
+    assert_eq!(verifier_air_refs.len(), 7);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 

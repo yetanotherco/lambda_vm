@@ -2044,6 +2044,42 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
+// Bus interaction filters for the CPU / CPU_BITWISE chip split
+// =========================================================================
+
+/// Bus interactions for the main CPU chip after the AND/OR/XOR rows are
+/// routed to a dedicated `CPU_BITWISE` chip.
+///
+/// Filters out the 8 unified `BusId::Bitwise` sender declarations (Diego's
+/// collapsed bitwise bus). Non-bitwise CPU rows then no longer pay aux EF
+/// cells for those declarations.
+pub fn bus_interactions_without_bitwise() -> Vec<BusInteraction> {
+    let bitwise_id: u64 = BusId::Bitwise.into();
+    bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id != bitwise_id)
+        .collect()
+}
+
+/// Bus interactions for the CPU_BITWISE chip — only the buses an AND/OR/XOR
+/// row actually uses. Drops every other class's declarations so the
+/// bitwise chip's effective width stays as small as possible.
+pub fn bus_interactions_bitwise_chip() -> Vec<BusInteraction> {
+    let keep: [u64; 6] = [
+        BusId::Decode.into(),
+        BusId::IsByte.into(),
+        BusId::Bitwise.into(),
+        BusId::Msb16.into(), // ANDW/ORW/XORW set word_instr=1, triggering MSB16 lookups
+        BusId::Memw.into(),
+        BusId::Memory.into(), // inline PC read/write
+    ];
+    bus_interactions()
+        .into_iter()
+        .filter(|i| keep.contains(&i.bus_id))
+        .collect()
+}
+
+// =========================================================================
 // Constraints (placeholder - will be implemented in constraints/)
 // =========================================================================
 

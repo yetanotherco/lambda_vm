@@ -38,8 +38,9 @@ use crate::tables::commit::{
     create_constraints as commit_constraints,
 };
 use crate::tables::cpu::{
-    CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
+    CpuOperation, bus_interactions_without_bitwise as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::cpu_bitwise::bus_interactions as cpu_bitwise_bus_interactions;
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
@@ -413,6 +414,27 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("BITWISE")
+}
+
+/// Create CPU_BITWISE AIR. Phase 4 — handles AND/OR/XOR rows (and `*W`
+/// 32-bit variants). Reuses CPU's column layout but declares only the
+/// buses an AND/OR/XOR row actually fires (Decode, IsByte, Bitwise, Msb16,
+/// Memw, Memory).
+pub fn create_cpu_bitwise_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: cpu_bitwise_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        cpu_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("CPU_BITWISE")
 }
 
 /// Create BYTE_OPS AIR. Step 1 wires it through with no bus interactions

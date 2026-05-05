@@ -26,6 +26,7 @@ pub mod branch;
 pub mod byte_ops;
 pub mod commit;
 pub mod cpu;
+pub mod cpu_bitwise;
 pub mod decode;
 pub mod dvrm;
 pub mod halt;

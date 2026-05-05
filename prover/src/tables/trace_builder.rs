@@ -1613,8 +1613,12 @@ fn generate_page_tables(
 
 /// All generated trace tables.
 pub struct Traces {
-    /// CPU execution traces (split into chunks of max_rows::CPU)
+    /// CPU execution traces (split into chunks of max_rows::CPU).
+    /// Excludes AND/OR/XOR rows after Phase 4 — those go to `cpu_bitwise`.
     pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// CPU_BITWISE chip — holds AND/OR/XOR rows peeled from the main CPU.
+    pub cpu_bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// BITWISE precomputed lookup table (2^20 rows)
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -1867,12 +1871,23 @@ fn build_traces(
     // COMMIT table sends IsByte and IsHalfword lookups
     bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
-    // CPU padding rows send IS_BYTE with all-zero values.
-    // Add corresponding ops so the bitwise table multiplicities balance.
-    let num_padding_rows: usize = cpu_ops
+    // Phase 4: split cpu_ops by op_and/op_or/op_xor so AND/OR/XOR rows live
+    // on the dedicated CPU_BITWISE chip; the main CPU chunks hold everything
+    // else.
+    let (bitwise_cpu_ops, non_bitwise_cpu_ops): (Vec<CpuOperation>, Vec<CpuOperation>) = cpu_ops
+        .iter()
+        .cloned()
+        .partition(|op| op.decode.op_and || op.decode.op_or || op.decode.op_xor);
+
+    // CPU + CPU_BITWISE padding rows both emit IS_BYTE with all-zero values.
+    // Sum padding across both tables so byte_ops multiplicities balance.
+    let cpu_padding: usize = non_bitwise_cpu_ops
         .chunks(max_rows.cpu)
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
+    let cpu_bitwise_padding: usize =
+        bitwise_cpu_ops.len().next_power_of_two().max(4) - bitwise_cpu_ops.len();
+    let num_padding_rows = cpu_padding + cpu_bitwise_padding;
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
     // =====================================================================
@@ -1887,7 +1902,8 @@ fn build_traces(
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
-    let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+    let cpus = chunk_and_generate(&non_bitwise_cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+    let cpu_bitwise = cpu::generate_cpu_trace(&bitwise_cpu_ops);
     let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
     let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
@@ -1967,6 +1983,7 @@ fn build_traces(
 
     Ok(Traces {
         cpus,
+        cpu_bitwise,
         bitwise,
         byte_ops,
         lts,
@@ -2022,6 +2039,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            cpu_bitwise,
             bitwise,
             byte_ops,
             lts,
@@ -2046,6 +2064,7 @@ impl Traces {
         for t in cpus {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
+        total += (cpu_bitwise.num_rows() * CPU_COLS) as u64;
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
         total += (byte_ops.num_rows() * (BYTE_OPS_COLS - BYTE_OPS_PRECOMPUTED)) as u64;
         for t in lts {
@@ -2098,6 +2117,7 @@ impl Traces {
         }
 
         let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_cpu_bitwise = aux_cols(super::cpu_bitwise::bus_interactions().len());
         let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
         let n_byte_ops = aux_cols(super::byte_ops::bus_interactions().len());
         let n_lt = aux_cols(super::lt::bus_interactions().len());
@@ -2118,6 +2138,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            cpu_bitwise,
             bitwise,
             byte_ops,
             lts,
@@ -2142,6 +2163,7 @@ impl Traces {
         for t in cpus {
             total += (t.num_rows() * n_cpu) as u64;
         }
+        total += (cpu_bitwise.num_rows() * n_cpu_bitwise) as u64;
         total += (bitwise.num_rows() * n_bitwise) as u64;
         total += (byte_ops.num_rows() * n_byte_ops) as u64;
         for t in lts {
