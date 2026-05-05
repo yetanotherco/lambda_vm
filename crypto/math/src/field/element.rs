@@ -40,10 +40,11 @@ use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
 ///
-/// `#[repr(transparent)]` is required for soundness: `StorageMode::Disk`
-/// in `crypto/stark` casts raw mmap bytes to `*const FieldElement<F>`
-/// (see `table.rs::get`, `trace.rs`). Changing the `repr`, adding
-/// fields, or introducing padding makes those casts UB.
+/// `#[repr(transparent)]` is required for soundness: it makes
+/// `FieldElement<F>` byte-identical to `F::BaseType`, satisfying the
+/// no-padding requirement of [`SpillSafe`](crate::spill_safe::SpillSafe).
+/// Changing the `repr`, adding fields, or introducing padding breaks
+/// this contract — UB in any function that requires `T: SpillSafe`.
 #[allow(clippy::derived_hash_with_manual_eq)]
 #[repr(transparent)]
 #[derive(Debug, Clone, Hash, Copy)]
