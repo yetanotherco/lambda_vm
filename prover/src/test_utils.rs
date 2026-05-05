@@ -418,10 +418,16 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create CPU_BITWISE AIR. Phase 4 — handles AND/OR/XOR rows (and `*W`
 /// 32-bit variants). Reuses CPU's column layout but declares only the
-/// buses an AND/OR/XOR row actually fires (Decode, IsByte, Bitwise, Msb16,
-/// Memw, Memory).
+/// buses an AND/OR/XOR row actually fires (Decode, IsByte, IsHalfword,
+/// Bitwise, Msb16, Memw, Memory).
+///
+/// Phase 2 step 8: installs six packing constraints (one per u32 limb)
+/// linking the byte cells consumed by the bitwise lookup with the u32 limbs
+/// consumed by the register-write path, closing the soundness gap where a
+/// malicious prover could populate them inconsistently.
 pub fn create_cpu_bitwise_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        crate::constraints::cpu_bitwise::create_all_cpu_bitwise_constraints();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: cpu_bitwise_bus_interactions(),
