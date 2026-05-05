@@ -45,7 +45,9 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // Column indices for BITWISE table
 // =========================================================================
 
-/// Input columns (precomputed)
+/// Input columns (precomputed). After splitting byte-pair ops into
+/// [`super::byte_ops`], BITWISE only retains the 20-bit-space data needed
+/// by the ZERO / IS_B20 / HWSL receivers.
 pub mod cols {
     /// X: Byte input (0-255)
     pub const X: usize = 0;
@@ -53,55 +55,29 @@ pub mod cols {
     pub const Y: usize = 1;
     /// Z: 4-bit input (0-15) for shift amount
     pub const Z: usize = 2;
-
-    /// AND result: X & Y
-    pub const AND: usize = 3;
-    /// OR result: X | Y
-    pub const OR: usize = 4;
-    /// XOR result: X ^ Y
-    pub const XOR: usize = 5;
-    /// MSB of byte X: (X >> 7) & 1
-    pub const MSB8: usize = 6;
-    /// MSB of halfword (X + 256*Y): ((X + 256*Y) >> 15) & 1
-    pub const MSB16: usize = 7;
-    /// Zero check: (X == 0 && Y == 0) ? 1 : 0
-    pub const ZERO: usize = 8;
+    /// Zero check: (X == 0 && Y == 0 && Z == 0) ? 1 : 0
+    pub const ZERO: usize = 3;
     /// Shift left result: ((X + 256*Y) << Z) & 0xFFFF
-    pub const SLL: usize = 9;
+    pub const SLL: usize = 4;
     /// Shift left carry: (X + 256*Y) >> (16 - Z)
-    pub const SLLC: usize = 10;
+    pub const SLLC: usize = 5;
 
-    // Multiplicity columns for each lookup type
-    /// Multiplicity for AND_BYTE lookups
-    pub const MU_AND: usize = 11;
-    /// Multiplicity for OR_BYTE lookups
-    pub const MU_OR: usize = 12;
-    /// Multiplicity for XOR_BYTE lookups
-    pub const MU_XOR: usize = 13;
-    /// Multiplicity for MSB8 lookups
-    pub const MU_MSB8: usize = 14;
-    /// Multiplicity for MSB16 lookups
-    pub const MU_MSB16: usize = 15;
     /// Multiplicity for ZERO lookups
-    pub const MU_ZERO: usize = 16;
-    /// Multiplicity for IS_BYTE lookups. Each lookup checks X and Y; pass Y=0
-    /// for a single-byte range check.
-    pub const MU_IS_BYTE: usize = 17;
-    /// Multiplicity for IS_HALF lookups
-    pub const MU_IS_HALF: usize = 18;
+    pub const MU_ZERO: usize = 6;
     /// Multiplicity for IS_B20 lookups
-    pub const MU_IS_B20: usize = 19;
+    pub const MU_IS_B20: usize = 7;
     /// Multiplicity for HWSL lookups
-    pub const MU_HWSL: usize = 20;
+    pub const MU_HWSL: usize = 8;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 21;
+    pub const NUM_COLUMNS: usize = 9;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
 pub const NUM_ROWS: usize = 256 * 256 * 16;
 
 /// Number of precomputed (non-multiplicity) columns
-pub const NUM_PRECOMPUTED_COLS: usize = 11;
+pub const NUM_PRECOMPUTED_COLS: usize = 6;
 
 // =========================================================================
 // Compile-time row generation
@@ -115,22 +91,14 @@ pub const NUM_PRECOMPUTED_COLS: usize = 11;
 /// Index encoding: `index = x + y * 256 + z * 65536`
 /// where x, y ∈ [0, 255] and z ∈ [0, 15]
 ///
-/// Returns the 11 precomputed columns: [X, Y, Z, AND, OR, XOR, MSB8, MSB16, ZERO, SLL, SLLC]
+/// Returns the 6 precomputed columns: [X, Y, Z, ZERO, SLL, SLLC]
 #[inline]
 pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
     let x = (index & 0xFF) as u32;
     let y = ((index >> 8) & 0xFF) as u32;
     let z = ((index >> 16) & 0xF) as u32;
 
-    // Bitwise operations on bytes
-    let and_val = x & y;
-    let or_val = x | y;
-    let xor_val = x ^ y;
-
-    // MSB extractions
-    let msb8 = (x >> 7) & 1;
     let halfword = x + y * 256;
-    let msb16 = (halfword >> 15) & 1;
 
     // Zero check (X + 256*Y + 65536*Z must be zero)
     let is_zero = if x == 0 && y == 0 && z == 0 { 1 } else { 0 };
@@ -147,11 +115,6 @@ pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
         x as u64,       // X
         y as u64,       // Y
         z as u64,       // Z
-        and_val as u64, // AND
-        or_val as u64,  // OR
-        xor_val as u64, // XOR
-        msb8 as u64,    // MSB8
-        msb16 as u64,   // MSB16
         is_zero as u64, // ZERO
         sll as u64,     // SLL
         sllc as u64,    // SLLC
@@ -306,25 +269,12 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
             for z in 0u32..16 {
                 let row_idx = (x as usize) + (y as usize) * 256 + (z as usize) * 256 * 256;
                 let base = row_idx * cols::NUM_COLUMNS;
+                let halfword = x + y * 256;
 
-                // Input columns
                 data[base + cols::X] = FE::from(x as u64);
                 data[base + cols::Y] = FE::from(y as u64);
                 data[base + cols::Z] = FE::from(z as u64);
 
-                // Bitwise operation results
-                data[base + cols::AND] = FE::from((x & y) as u64);
-                data[base + cols::OR] = FE::from((x | y) as u64);
-                data[base + cols::XOR] = FE::from((x ^ y) as u64);
-
-                // MSB extractions
-                let msb8 = (x >> 7) & 1;
-                let halfword = x + y * 256;
-                let msb16 = (halfword >> 15) & 1;
-                data[base + cols::MSB8] = FE::from(msb8 as u64);
-                data[base + cols::MSB16] = FE::from(msb16 as u64);
-
-                // Zero check (X + 256*Y + 65536*Z must be zero)
                 let is_zero = if x == 0 && y == 0 && z == 0 {
                     1u64
                 } else {
@@ -332,7 +282,6 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 };
                 data[base + cols::ZERO] = FE::from(is_zero);
 
-                // Shift operations on halfword
                 let sll = if z == 0 {
                     halfword
                 } else {
@@ -342,8 +291,7 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 data[base + cols::SLL] = FE::from(sll as u64);
                 data[base + cols::SLLC] = FE::from(sllc as u64);
 
-                // Multiplicity columns start at zero
-                // They will be updated by update_multiplicities()
+                // Multiplicity columns are zero-initialized by `vec!` above.
             }
         }
     }
@@ -417,8 +365,7 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (indices 11-20)
-            (cols::MU_AND..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
+            (cols::MU_ZERO..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 

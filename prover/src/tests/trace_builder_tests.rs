@@ -1,6 +1,6 @@
 //! Tests for the trace builder module.
 
-use crate::tables::bitwise;
+use crate::tables::byte_ops;
 use crate::tables::cpu::cols;
 use crate::tables::lt;
 use crate::tables::memw_register;
@@ -268,10 +268,11 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check AND multiplicity was updated for (0x12, 0x34, 0)
-    let row_idx = bitwise::row_index(0x12, 0x34, 0);
-    let row = traces.bitwise.main_table.get_row(row_idx);
-    assert_eq!(row[bitwise::cols::MU_AND], FE::one());
+    // Check AND multiplicity was updated for (0x12, 0x34) in BYTE_OPS
+    // (byte-pair receivers moved out of BITWISE).
+    let row_idx = byte_ops::row_index(0x12, 0x34);
+    let row = traces.byte_ops.main_table.get_row(row_idx);
+    assert_eq!(row[byte_ops::cols::MU_AND], FE::one());
 }
 
 #[test]
@@ -344,7 +345,10 @@ fn test_mixed_instructions() {
 
     // 5 ops (4 + ecall) padded to 8
     assert_eq!(traces.cpus[0].main_table.height, 8);
-    assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
+    assert_eq!(
+        traces.bitwise.main_table.height,
+        crate::tables::bitwise::NUM_ROWS
+    );
     // 1 SLT + 1 BLT = 2 LT ops
     assert!(traces.lts[0].main_table.height >= 2);
 }
@@ -482,13 +486,13 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
     );
 
     // Register ops use IS_HALF for timestamp ordering instead of LT.
-    // Verify the bitwise table has at least one IS_HALF entry with non-zero
+    // Verify the byte_ops table has at least one IS_HALF entry with non-zero
     // multiplicity, proving that MEMW_R's IS_HALF lookups were emitted.
-    let has_is_half_entry = (0..traces.bitwise.main_table.height)
-        .any(|i| traces.bitwise.main_table.get_row(i)[bitwise::cols::MU_IS_HALF] != FE::zero());
+    let has_is_half_entry = (0..traces.byte_ops.main_table.height)
+        .any(|i| traces.byte_ops.main_table.get_row(i)[byte_ops::cols::MU_IS_HALF] != FE::zero());
     assert!(
         has_is_half_entry,
-        "MEMW_R register ops should produce IS_HALF bitwise entries"
+        "MEMW_R register ops should produce IS_HALF byte_ops entries"
     );
 
     // The LT table should still have ops from non-register MEMW accesses
@@ -553,11 +557,11 @@ fn test_lt_generates_bitwise_lookups() {
     let lhs_sub_rhs = 0x1234u64.wrapping_sub(0x5678);
     let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16; // 0xBBBC
 
-    // Check IS_HALF multiplicity for lhs_sub_rhs[0]
-    let row_idx = bitwise::row_index((sub_0 & 0xFF) as u8, (sub_0 >> 8) as u8, 0);
-    let row = traces.bitwise.main_table.get_row(row_idx);
+    // Check IS_HALF multiplicity for lhs_sub_rhs[0] (now lives in BYTE_OPS).
+    let row_idx = byte_ops::row_index((sub_0 & 0xFF) as u8, (sub_0 >> 8) as u8);
+    let row = traces.byte_ops.main_table.get_row(row_idx);
     assert_ne!(
-        row[bitwise::cols::MU_IS_HALF],
+        row[byte_ops::cols::MU_IS_HALF],
         FE::zero(),
         "IS_HALF lookup for lhs_sub_rhs[0] should have non-zero multiplicity"
     );

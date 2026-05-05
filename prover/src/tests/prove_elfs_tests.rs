@@ -1411,21 +1411,21 @@ fn test_debug_memory_tokens_sb_sh() {
     // (e.g. CPU's paired IS_BYTE checks) also bump this same MU_IS_BYTE
     // column and may hit the same (X, Y) rows, so this is a coarse sanity
     // check (BITWISE mult >= PAGE's contribution), not an exact balance.
-    use crate::tables::bitwise::cols as bitwise_cols;
-    let bitwise_is_byte_mult_over_page_pairs: u64 = page_pair_counts
+    use crate::tables::byte_ops::cols as byte_ops_cols;
+    let byte_ops_is_byte_mult_over_page_pairs: u64 = page_pair_counts
         .keys()
         .map(|&(x, y)| {
             let row = x as usize + 256 * y as usize;
             traces
-                .bitwise
+                .byte_ops
                 .main_table
-                .get(row, bitwise_cols::MU_IS_BYTE)
+                .get(row, byte_ops_cols::MU_IS_BYTE)
                 .to_raw()
         })
         .sum();
     println!(
-        "Bitwise IS_BYTE mult summed over PAGE (init, fini) rows: {}",
-        bitwise_is_byte_mult_over_page_pairs
+        "byte_ops IS_BYTE mult summed over PAGE (init, fini) rows: {}",
+        byte_ops_is_byte_mult_over_page_pairs
     );
     println!(
         "Total IS_BYTE lookups from PAGE (counted): {}",
@@ -1435,7 +1435,7 @@ fn test_debug_memory_tokens_sb_sh() {
     // hit some of the same (init, fini) rows. It should never be negative.
     println!(
         "Difference: {} (>= 0 expected; PAGE pairs may also receive from CPU)",
-        bitwise_is_byte_mult_over_page_pairs as i64 - page_is_byte_total as i64
+        byte_ops_is_byte_mult_over_page_pairs as i64 - page_is_byte_total as i64
     );
 
     // === Verify PAGE AIR uses correct page_base ===
