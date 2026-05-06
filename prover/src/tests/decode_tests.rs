@@ -867,7 +867,6 @@ fn test_instructions_from_elf_includes_all_executable() {
 fn test_decode_soundness_different_elf_rejected() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
     use stark::traits::AIR;
     use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -948,8 +947,9 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
-    let proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-        .expect("Prover failed to generate proof");
+    let proof =
+        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("Prover failed to generate proof");
 
     // =========================================================================
     // VERIFIER: Has ELF B (different program!), computes commitment from it
@@ -999,7 +999,6 @@ fn test_decode_soundness_different_elf_rejected() {
 fn test_decode_soundness_same_elf_accepted() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
     use stark::verifier::{IsStarkVerifier, Verifier};
 
     use crate::VmAirs;
@@ -1042,7 +1041,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::test_utils::multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )

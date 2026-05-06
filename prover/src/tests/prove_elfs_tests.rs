@@ -18,7 +18,6 @@ use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -60,11 +59,13 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(_) => return false,
-        };
+    let multi_proof = match crate::test_utils::multi_prove_ram(
+        air_trace_pairs,
+        &mut DefaultTranscript::<E>::new(&[]),
+    ) {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -125,8 +126,9 @@ fn test_cpu_only_no_bus() {
         _,
     )> = vec![(&cpu_air, &mut cpu_trace, &())];
 
-    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-        .expect("Prover failed");
+    let multi_proof =
+        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("Prover failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
@@ -769,7 +771,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::test_utils::multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1497,7 +1499,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::test_utils::multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1552,7 +1554,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::test_utils::multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1641,7 +1643,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::test_utils::multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1813,7 +1815,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         (&airs.decode, &mut decode_trace, &()),
     ];
 
-    let proof = Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = crate::test_utils::multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Proof generation should succeed");
 
     assert_eq!(proof.proofs.len(), 2);

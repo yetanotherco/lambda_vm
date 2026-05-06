@@ -651,12 +651,13 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     let air_pairs = airs.air_trace_pairs(&mut traces);
     let transcript = &mut DefaultTranscript::<E>::new(&[]);
-    #[cfg(feature = "disk-spill")]
-    let proof = Prover::multi_prove_with_mode(air_pairs, transcript, storage_mode)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    #[cfg(not(feature = "disk-spill"))]
-    let proof =
-        Prover::multi_prove(air_pairs, transcript).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = Prover::multi_prove(
+        air_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     #[cfg(feature = "instruments")]
     {

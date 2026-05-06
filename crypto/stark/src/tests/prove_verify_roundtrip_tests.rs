@@ -137,7 +137,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace, &()),
         ];
 
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================

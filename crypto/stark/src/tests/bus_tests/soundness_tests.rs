@@ -79,7 +79,7 @@ fn test_wrong_result_value() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -142,7 +142,7 @@ fn test_off_by_one() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -205,7 +205,7 @@ fn test_swapped_operands() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -268,7 +268,7 @@ fn test_single_column_wrong() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -335,7 +335,7 @@ fn test_over_report_multiplicity() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -398,7 +398,7 @@ fn test_under_report_multiplicity() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -461,7 +461,7 @@ fn test_zero_multiplicity_skip() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -528,7 +528,7 @@ fn test_phantom_receive() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -591,7 +591,7 @@ fn test_missing_receiver() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -662,7 +662,7 @@ fn test_tampered_table_contribution() {
     ];
 
     let mut multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Corrupt table_contribution in the ADD table's bus public inputs.
     // This changes the per-row offset L/N used in the circular constraint,
@@ -742,7 +742,7 @@ fn test_tampered_acc_ood_evaluation() {
     ];
 
     let mut multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Corrupt the acc column OOD evaluation in the ADD table proof.
     // With batching + absorption, ADD has 4 main columns and 1 aux column
@@ -827,7 +827,7 @@ fn test_missing_bus_public_inputs_rejected() {
     ];
 
     let mut multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Remove bus_public_inputs from the ADD table proof entirely.
     multi_proof.proofs[1].bus_public_inputs = None;
@@ -948,7 +948,7 @@ fn test_zeroed_table_contribution_rejected() {
     ];
 
     let mut multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Zero out table_contribution for the ADD table.
     let add_proof = &mut multi_proof.proofs[1];
@@ -1026,7 +1026,7 @@ fn test_one_of_many_wrong() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -1134,7 +1134,7 @@ fn test_full_scenario_wrong_add() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -1208,7 +1208,7 @@ fn test_wrong_table_consumes_value_rejected() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -1324,7 +1324,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -1429,7 +1429,7 @@ fn test_packing_mismatch_element_count() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -1531,7 +1531,7 @@ fn test_packing_mismatch_shift_constant() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -1634,7 +1634,7 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -1727,7 +1727,7 @@ fn test_compound_equals_primitive_expansion() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -1843,7 +1843,7 @@ fn test_full_scenario_wrong_mul() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];

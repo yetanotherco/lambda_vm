@@ -113,7 +113,7 @@ fn test_multiplicity_one() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -223,7 +223,7 @@ fn test_multiplicity_sum() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -331,7 +331,7 @@ fn test_multiplicity_negated() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];

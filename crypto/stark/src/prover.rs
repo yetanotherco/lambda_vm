@@ -1574,47 +1574,6 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        PI: Send + Sync + Clone,
-        Field: Copy + 'static,
-        FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
-    {
-        Self::multi_prove_inner(
-            air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )
-    }
-
-    /// Same as `multi_prove` but lets callers back intermediate state with mmap
-    /// files to cap peak RAM usage.
-    #[cfg(feature = "disk-spill")]
-    fn multi_prove_with_mode(
-        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-        storage_mode: StorageMode,
-    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        PI: Send + Sync + Clone,
-        Field: Copy + 'static,
-        FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
-    {
-        Self::multi_prove_inner(air_trace_pairs, transcript, storage_mode)
-    }
-
-    fn multi_prove_inner(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -2094,6 +2053,29 @@ pub trait IsStarkProver<
         Ok(MultiProof { proofs })
     }
 
+    /// Multi-AIR prove with `StorageMode::Ram`. Test convenience.
+    #[cfg(test)]
+    fn multi_prove_ram(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        Self::multi_prove(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+    }
+
     /// Generate a STARK proof for a single AIR/trace.
     /// This is equivalent to calling `multi_prove` with a single-element slice.
     fn prove(
@@ -2112,8 +2094,13 @@ pub trait IsStarkProver<
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(air_trace_pairs, transcript)
-            .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+        .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations

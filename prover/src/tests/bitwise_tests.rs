@@ -589,8 +589,11 @@ mod soundness_tests {
             (&receiver_air, &mut receiver_trace, &()),
         ];
 
-        let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        let multi_proof = crate::test_utils::multi_prove_ram(
+            air_trace_pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
@@ -637,8 +640,11 @@ mod soundness_tests {
             (&receiver_air, &mut receiver_trace, &()),
         ];
 
-        let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        let multi_proof = crate::test_utils::multi_prove_ram(
+            air_trace_pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
@@ -707,8 +713,11 @@ mod soundness_tests {
             (&prover_receiver_air, &mut malicious_trace, &()),
         ];
 
-        let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        let multi_proof = crate::test_utils::multi_prove_ram(
+            air_trace_pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =

@@ -122,7 +122,7 @@ fn test_multi_table_proof() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -185,7 +185,7 @@ fn test_all_padding() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -248,7 +248,7 @@ fn test_single_operation() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -311,7 +311,7 @@ fn test_duplicate_operations() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -374,7 +374,7 @@ fn test_serialization_roundtrip() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Serialize and deserialize
     let serialized = serde_cbor::to_vec(&multi_proof).expect("serialization failed");
@@ -519,7 +519,7 @@ fn test_bus_value_features() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        Prover::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
