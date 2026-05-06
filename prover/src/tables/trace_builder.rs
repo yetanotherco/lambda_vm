@@ -2100,7 +2100,7 @@ fn build_traces(
     })
 }
 
-/// Padded row count after chunking: each chunk rounds up to `next_power_of_two().max(4)`.
+/// Padded row count after chunking.
 #[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
     // `max_rows <= 0` would loop forever. Called internally with const values > 0.
