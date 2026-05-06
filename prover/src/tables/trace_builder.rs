@@ -25,7 +25,9 @@
 //! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "disk-spill")]
+use std::collections::HashSet;
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
@@ -2003,8 +2005,6 @@ fn build_traces(
 
     // Generate remaining traces in parallel (page, register, halt, commit).
     // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-    // `mut` is only used by the disk-spill block below; #[allow] keeps the
-    // non-disk-spill build warning-free.
     #[allow(unused_mut)]
     let mut commit_trace = commit::generate_commit_trace(&commit_ops);
     #[allow(unused_mut)]
