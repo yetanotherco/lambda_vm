@@ -580,15 +580,9 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Pick where trace buffers and Merkle tree nodes live for this proof.
-    // With the `disk-spill` feature enabled, the analytical estimate decides
-    // between Ram and Disk; without it, we never spill.
+    // Pick storage mode from analytical heap estimate.
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
-        // Stream over logs once to compute exact per-table row counts without
-        // building per-instruction op vectors (the decode trace is still built
-        // for the row count). Use the resulting `TableLengths` to estimate
-        // peak heap analytically and pick a storage mode.
         let lengths = crate::tables::trace_builder::count_table_lengths(
             &program,
             &result.logs,
