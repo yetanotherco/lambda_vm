@@ -25,7 +25,7 @@
 //! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
@@ -107,7 +107,7 @@ impl MemoryState {
             "page_size must be a power of two for the bitmask to work"
         );
         let mask = !(page_size - 1);
-        let pages: std::collections::HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
+        let pages: HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
         pages.len() as u64
     }
 
