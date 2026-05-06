@@ -2047,8 +2047,7 @@ fn build_traces(
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
-    // so spill them here before returning. Without this, peak heap holds every
-    // PAGE table until `multi_prove_inner` spills them later.
+    // so spill them here before returning.
     #[cfg(feature = "disk-spill")]
     if storage_mode == StorageMode::Disk {
         bitwise
