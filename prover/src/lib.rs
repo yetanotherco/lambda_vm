@@ -30,6 +30,8 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
+#[cfg(feature = "disk-spill")]
+use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -527,6 +529,8 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
     )?;
     Ok((
         traces.total_field_elements(),
@@ -611,16 +615,14 @@ pub fn prove_with_options_and_inputs(
 
     // Phase 5: build the full traces with the chosen mode. `Disk` spills each
     // chunk as it's built, so the trace never fully materializes in RAM.
-    #[cfg(feature = "disk-spill")]
-    let mut traces = Traces::from_elf_and_logs_with_mode(
+    let mut traces = Traces::from_elf_and_logs(
         &program,
         &result.logs,
         max_rows,
         private_inputs,
+        #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    #[cfg(not(feature = "disk-spill"))]
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     drop(result);
 
     #[cfg(feature = "instruments")]

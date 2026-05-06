@@ -12,6 +12,7 @@ use crate::tables::decode::{
 use crate::tables::types::{FE, packed_decode as bits};
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
+use crate::test_utils::traces_from_elf_and_logs_ram;
 
 // =========================================================================
 // Packed decode tests
@@ -1002,7 +1003,6 @@ fn test_decode_soundness_same_elf_accepted() {
     use stark::verifier::{IsStarkVerifier, Verifier};
 
     use crate::VmAirs;
-    use crate::tables::trace_builder::Traces;
     use crate::tables::types::GoldilocksExtension;
 
     type E = GoldilocksExtension;
@@ -1031,7 +1031,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let result = executor.run().expect("Failed to run program");
 
     let mut traces =
-        Traces::from_elf_and_logs(&prover_elf, &result.logs, &Default::default(), &[]).unwrap();
+        traces_from_elf_and_logs_ram(&prover_elf, &result.logs, &Default::default(), &[]).unwrap();
     let table_counts = traces.table_counts();
     let prover_airs = VmAirs::new(
         &prover_elf,

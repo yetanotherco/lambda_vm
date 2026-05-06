@@ -2647,34 +2647,6 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
-    ) -> Result<Self, Error> {
-        Self::from_elf_and_logs_inner(
-            elf,
-            logs,
-            max_rows,
-            private_input,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )
-    }
-
-    /// Same as `from_elf_and_logs` but lets the caller pick a storage mode.
-    #[cfg(feature = "disk-spill")]
-    pub fn from_elf_and_logs_with_mode(
-        elf: &Elf,
-        logs: &[Log],
-        max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
-        storage_mode: StorageMode,
-    ) -> Result<Self, Error> {
-        Self::from_elf_and_logs_inner(elf, logs, max_rows, private_input, storage_mode)
-    }
-
-    fn from_elf_and_logs_inner(
-        elf: &Elf,
-        logs: &[Log],
-        max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
