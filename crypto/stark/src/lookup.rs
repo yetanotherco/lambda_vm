@@ -1239,9 +1239,95 @@ pub enum Multiplicity {
     /// ])
     /// ```
     Linear(Vec<LinearTerm>),
+
+    /// Per-op dispatch via a witness "match" column.
+    ///
+    /// Used by the op-byte dispatch pattern (see CPU compress plan, Phase 1):
+    /// a single `op:u8` column replaces 16 one-hot ALU selectors. Each per-op
+    /// bus interaction uses `OpMatch { match_column }` where `match_column` is
+    /// a witness bit constrained to `1` iff the row's `op` equals the target
+    /// for this interaction.
+    ///
+    /// Functionally equivalent to `Multiplicity::Column(match_column)` — the
+    /// indicator polynomial is the column itself — but the named variant
+    /// documents the contract for reviewers and tooling, and keeps a single
+    /// place to plug in a future Lagrange or bit-decomposed implementation
+    /// without changing call sites.
+    ///
+    /// ## Soundness contract — all three are mandatory
+    ///
+    /// The AIR using this variant MUST commit `match_column` and MUST add
+    /// transition constraints enforcing all three properties below. The
+    /// LogUp framework does not enforce any of them; bus balance alone is
+    /// **not** sufficient (see "Why bus balance is not enough" further
+    /// down).
+    ///
+    /// 1. **Boolean**: `match_column * (1 - match_column) = 0`.
+    ///    Without this, the prover can set `match_column` to an arbitrary
+    ///    field element and forge a fractional or negative multiplicity.
+    /// 2. **Match implies target**:
+    ///    `match_column * (op_column - target) = 0`.
+    ///    Without this, the prover can set `match_column = 1` on a row
+    ///    where `op != target`, routing the row's data to the wrong
+    ///    receiver. The bus balance does not catch this if the genuine
+    ///    target's row is *also* served (e.g. by another sender or by an
+    ///    over-permissive receiver).
+    /// 3. **Coverage / no false negatives**: every execution row where
+    ///    `op == target` MUST have `match_column = 1`.
+    ///    The AIR is responsible for this — it is **not** an automatic
+    ///    consequence of the LogUp argument. Phase 1's CPU AIR enforces it
+    ///    via a per-op-byte tally (sum of `match_column` over rows for that
+    ///    op equals the row count for that op). Without coverage, a prover
+    ///    can silently drop dispatches whenever the corresponding receiver
+    ///    has *some other* matching tuple available (e.g. range checks,
+    ///    duplicates).
+    ///
+    /// ### Why bus balance is not enough
+    ///
+    /// Bus balance only catches a missing send if the receiver strictly
+    /// demands the missing tuple and no other sender provides it. Many
+    /// receivers — range checks, indexed lookups, FrequentOps — accept
+    /// any value in their domain. Skipping a single send to such a
+    /// receiver leaves the bus balanced but the witness incorrect. The AIR
+    /// constraints are the only mechanism that *forces* the prover to
+    /// fire the dispatch when the dispatch is semantically required.
+    ///
+    /// ## Why not Lagrange?
+    ///
+    /// A Lagrange indicator polynomial `Π_{k != target}(op - k) / Π(target - k)`
+    /// over the 16-symbol alphabet has degree 15. With Lambda's
+    /// `blowup_factor = 2`, the LDE size cannot fit a constraint of that
+    /// degree (the composition polynomial breaks beyond the LDE rate). Going
+    /// to `blowup_factor = 16` would 8× LDE memory and FFT time across the
+    /// whole prover. The helper-column form keeps constraint degree at 1,
+    /// at the cost of one witness column per per-op interaction in Phase 1.
+    OpMatch { match_column: usize },
 }
 
 impl Multiplicity {
+    /// Polynomial degree of this multiplicity in main-trace columns.
+    ///
+    /// Drives `composition_poly_degree_bound` via the LogUp constraints
+    /// (`LookupBatchedTermConstraint`, `LookupAccumulatedConstraint`),
+    /// which both compute their own degree as a function of this value.
+    /// All current variants have degree at most 1, so the LogUp constraints
+    /// stay at degree 2 or 3. If a future variant raises this above 1
+    /// (e.g. a Lagrange indicator), the AIR's composition-poly FFT count
+    /// grows proportionally and the LDE blowup factor must be at least
+    /// the new max constraint degree.
+    pub(crate) fn degree(&self) -> usize {
+        match self {
+            Multiplicity::One => 0,
+            Multiplicity::Column(_)
+            | Multiplicity::Sum(_, _)
+            | Multiplicity::Negated(_)
+            | Multiplicity::Diff(_, _)
+            | Multiplicity::Sum3(_, _, _)
+            | Multiplicity::Linear(_)
+            | Multiplicity::OpMatch { .. } => 1,
+        }
+    }
+
     /// Evaluate the multiplicity for a single row.
     #[inline]
     fn evaluate_at_row<F: IsField>(
@@ -1289,6 +1375,7 @@ impl Multiplicity {
                 }
                 result
             }
+            Multiplicity::OpMatch { match_column } => main_segment_cols[*match_column][row].clone(),
         }
     }
 }
@@ -1797,6 +1884,9 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
             }
             result
         }
+        Multiplicity::OpMatch { match_column } => {
+            step.get_main_evaluation_element(0, *match_column).clone()
+        }
     }
 }
 
@@ -1861,7 +1951,12 @@ where
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        3 // c * fp_a * fp_b
+        // Constraint: c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
+        //   c * fp_a * fp_b -> degree 3
+        //   m_i * fp_j      -> degree multiplicity_i.degree() + 1
+        let m_a = self.interaction_a.multiplicity.degree();
+        let m_b = self.interaction_b.multiplicity.degree();
+        [3, m_a + 1, m_b + 1].into_iter().max().unwrap()
     }
 
     fn constraint_idx(&self) -> usize {
@@ -1988,7 +2083,20 @@ where
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        1 + self.absorbed.len() // 2 for 1 absorbed, 3 for 2 absorbed
+        // Constraint shape:
+        //   N=0: acc_next - acc_curr - Σterms = 0          (degree 1)
+        //   N=1: (acc - Σterms) · f - sign · m = 0         (degree max(2, deg(m)))
+        //   N=2: (acc - Σterms) · f₁ · f₂
+        //         - sign₁ · m₁ · f₂ - sign₂ · m₂ · f₁ = 0  (degree max(3, deg(m_i) + 1))
+        let n_absorbed = self.absorbed.len();
+        let acc_part = 1 + n_absorbed;
+        let absorbed_term = self
+            .absorbed
+            .iter()
+            .map(|i| i.multiplicity.degree() + n_absorbed.saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        acc_part.max(absorbed_term)
     }
 
     fn constraint_idx(&self) -> usize {

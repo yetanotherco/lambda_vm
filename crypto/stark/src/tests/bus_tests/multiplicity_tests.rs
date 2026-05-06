@@ -346,3 +346,277 @@ fn test_multiplicity_negated() {
         "Multiplicity::Negated should work for skipping flagged rows"
     );
 }
+
+// =============================================================================
+// Multiplicity::OpMatch tests
+// =============================================================================
+//
+// OpMatch(match_column) reads multiplicity from a witness column that the
+// AIR is responsible for constraining (caller-provided via transition
+// constraints — boolean and `match_col * (op - target) = 0`). Functionally
+// identical to `Multiplicity::Column`; the tests document the dispatch
+// pattern and ensure the variant routes via the named contract.
+//
+// We exercise the variant standalone here. Phase 1 of the CPU refactor
+// adds the witness column and its sibling constraints in the prover crate,
+// where the op range and target encoding live.
+
+/// Common helper: build a sender AIR whose single bus interaction uses
+/// `OpMatch { match_column: 1 }`. Trace shape: column 0 is `value`,
+/// column 1 is the per-row indicator bit (1 on rows that should dispatch).
+fn op_match_sender_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: vec![BusInteraction::sender(
+            TEST_BUS,
+            Multiplicity::OpMatch { match_column: 1 },
+            Packing::Direct.columns(&[0]),
+        )],
+    };
+    AirWithBuses::new(
+        2, // value, match
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Receiver AIR: receives `value` rows with multiplicity from column 1.
+fn op_match_receiver_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: vec![BusInteraction::receiver(
+            TEST_BUS,
+            Multiplicity::Column(1),
+            Packing::Direct.columns(&[0]),
+        )],
+    };
+    AirWithBuses::new(
+        2, // value, mu
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Run prove + verify for an `OpMatch` sender plus matching receiver. The
+/// sender trace has 4 rows; only row index `match_row` has its match bit
+/// set. The receiver receives the corresponding `value` once.
+fn run_op_match_roundtrip(match_row: usize, value: u64) -> bool {
+    let mut val_col = vec![FE::zero(); 4];
+    let mut match_col = vec![FE::zero(); 4];
+    val_col[match_row] = FE::from(value);
+    match_col[match_row] = FE::one();
+
+    let mut recv_val = vec![FE::zero(); 4];
+    let mut recv_mu = vec![FE::zero(); 4];
+    recv_val[0] = FE::from(value);
+    recv_mu[0] = FE::one();
+
+    let mut sender_trace = TraceTable::from_columns_main(vec![val_col, match_col], 1);
+    let mut receiver_trace = TraceTable::from_columns_main(vec![recv_val, recv_mu], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = op_match_sender_air(&proof_options);
+    let receiver = op_match_receiver_air(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
+}
+
+/// Smoke test: a single matching row sends; receiver picks it up.
+#[test_log::test]
+fn test_multiplicity_op_match_single_dispatch() {
+    assert!(
+        run_op_match_roundtrip(2, 42),
+        "OpMatch must dispatch the matching row's value to the receiver"
+    );
+}
+
+/// Boundary: match on row 0 (start of trace).
+#[test_log::test]
+fn test_multiplicity_op_match_first_row() {
+    assert!(
+        run_op_match_roundtrip(0, 1234),
+        "OpMatch must work when the matching row is row 0"
+    );
+}
+
+/// Boundary: match on the last row (last of a power-of-two-sized trace).
+#[test_log::test]
+fn test_multiplicity_op_match_last_row() {
+    assert!(
+        run_op_match_roundtrip(3, 5678),
+        "OpMatch must work when the matching row is the final row"
+    );
+}
+
+/// Soundness: a row whose match bit is 0 must NOT send. We construct a
+/// receiver expecting a value that only the would-be-matched (but not
+/// dispatched) row carries. Bus must fail to balance.
+#[test_log::test]
+fn test_multiplicity_op_match_unmatched_row_does_not_send() {
+    // Row 1 has value=99 but match bit = 0 → must not send.
+    let val_col: Vec<FE> = vec![FE::zero(), FE::from(99u64), FE::zero(), FE::zero()];
+    let match_col: Vec<FE> = vec![FE::zero(); 4];
+
+    // Receiver demands one copy of value=99.
+    let mut recv_val = vec![FE::zero(); 4];
+    let mut recv_mu = vec![FE::zero(); 4];
+    recv_val[0] = FE::from(99u64);
+    recv_mu[0] = FE::one();
+
+    let mut sender_trace = TraceTable::from_columns_main(vec![val_col, match_col], 1);
+    let mut receiver_trace = TraceTable::from_columns_main(vec![recv_val, recv_mu], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = op_match_sender_air(&proof_options);
+    let receiver = op_match_receiver_air(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Verifier must reject when match bit is 0 yet receiver expected the value"
+    );
+}
+
+/// Forged dispatch: prover sets match=1 on a row whose value differs from
+/// what the receiver demands. Bus balance must reject. Concretely
+/// demonstrates that the OpMatch contract relies on AIR-level constraints
+/// (`match_column * (op - target) = 0`) to prevent the prover from routing
+/// the wrong row's data — the LogUp framework alone does not stop this.
+#[test_log::test]
+fn test_multiplicity_op_match_forged_dispatch_rejected() {
+    // Sender row 0 carries value=11, row 1 carries value=22, only row 0 has
+    // match=1. The prover legitimately dispatches value=11.
+    let val_col: Vec<FE> = vec![FE::from(11u64), FE::from(22u64), FE::zero(), FE::zero()];
+    let match_col: Vec<FE> = vec![FE::one(), FE::zero(), FE::zero(), FE::zero()];
+
+    // Receiver expects value=22 (the other row's value). With no constraint
+    // tying match to the row's data, this is what a "wrong target" forgery
+    // would look like — the prover sent value=11, the bus has no copy of
+    // value=22, balance fails.
+    let mut recv_val = vec![FE::zero(); 4];
+    let mut recv_mu = vec![FE::zero(); 4];
+    recv_val[0] = FE::from(22u64);
+    recv_mu[0] = FE::one();
+
+    let mut sender_trace = TraceTable::from_columns_main(vec![val_col, match_col], 1);
+    let mut receiver_trace = TraceTable::from_columns_main(vec![recv_val, recv_mu], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = op_match_sender_air(&proof_options);
+    let receiver = op_match_receiver_air(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Verifier must reject when the sent value does not match the receiver's demand"
+    );
+}
+
+/// Multiple matching rows: every row's match bit fires; each row's value
+/// reaches the receiver with multiplicity 1.
+#[test_log::test]
+fn test_multiplicity_op_match_all_rows_dispatch() {
+    let val_col: Vec<FE> = (1u64..=4).map(FE::from).collect();
+    let match_col: Vec<FE> = vec![FE::one(); 4];
+
+    let recv_val = val_col.clone();
+    let recv_mu: Vec<FE> = vec![FE::one(); 4];
+
+    let mut sender_trace = TraceTable::from_columns_main(vec![val_col, match_col], 1);
+    let mut receiver_trace = TraceTable::from_columns_main(vec![recv_val, recv_mu], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = op_match_sender_air(&proof_options);
+    let receiver = op_match_receiver_air(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    assert!(
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Verifier must accept when every row dispatches and the receiver matches"
+    );
+}
