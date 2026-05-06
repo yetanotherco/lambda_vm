@@ -52,7 +52,7 @@ fn cpu_lde(evals: &[u64], blowup_factor: usize, coset_offset: u64) -> Vec<u64> {
 }
 
 fn canon(xs: &[u64]) -> Vec<u64> {
-    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
+    xs.iter().map(GoldilocksField::canonical).collect()
 }
 
 fn assert_lde_match(log_n: u64, blowup_factor: usize, seed: u64) {

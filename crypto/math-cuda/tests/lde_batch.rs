@@ -41,7 +41,7 @@ fn cpu_lde_one(
 }
 
 fn canon(xs: &[u64]) -> Vec<u64> {
-    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
+    xs.iter().map(GoldilocksField::canonical).collect()
 }
 
 fn assert_batch(log_n: u64, blowup: usize, m: usize, seed: u64) {

@@ -47,7 +47,7 @@ fn u64s_to_ext3(raw: &[u64]) -> Vec<Fp3> {
     let mut out = Vec::with_capacity(raw.len() / 3);
     for i in 0..raw.len() / 3 {
         out.push(Fp3::new([
-            Fp::from_raw(raw[i * 3 + 0]),
+            Fp::from_raw(raw[i * 3]),
             Fp::from_raw(raw[i * 3 + 1]),
             Fp::from_raw(raw[i * 3 + 2]),
         ]));

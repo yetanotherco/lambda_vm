@@ -21,7 +21,7 @@ fn cpu_fft(coeffs: &[u64]) -> Vec<u64> {
 }
 
 fn canonicalize(xs: &[u64]) -> Vec<u64> {
-    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
+    xs.iter().map(GoldilocksField::canonical).collect()
 }
 
 fn assert_ntt_match(log_n: u64, seed: u64) {

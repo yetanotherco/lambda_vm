@@ -78,7 +78,7 @@ fn gpu_gl_mul_matches_cpu() {
 #[test]
 fn gpu_gl_neg_matches_cpu() {
     let a = sample_inputs(7);
-    let expected: Vec<u64> = a.iter().map(|x| GoldilocksField::neg(x)).collect();
+    let expected: Vec<u64> = a.iter().map(GoldilocksField::neg).collect();
     let actual = math_cuda::gl_neg_u64(&a).expect("GPU gl_neg");
     assert_raw_eq("gl_neg", &expected, &actual);
 }
@@ -112,11 +112,9 @@ fn gpu_goldilocks_edge_cases() {
         }
     }
 
-    let cases: &[(
-        &str,
-        fn(&[u64], &[u64]) -> math_cuda::Result<Vec<u64>>,
-        fn(&u64, &u64) -> u64,
-    )] = &[
+    type GpuOp = fn(&[u64], &[u64]) -> math_cuda::Result<Vec<u64>>;
+    type CpuOp = fn(&u64, &u64) -> u64;
+    let cases: &[(&str, GpuOp, CpuOp)] = &[
         ("gl_add", math_cuda::gl_add_u64, GoldilocksField::add),
         ("gl_sub", math_cuda::gl_sub_u64, GoldilocksField::sub),
         ("gl_mul", math_cuda::gl_mul_u64, GoldilocksField::mul),

@@ -329,13 +329,19 @@ pub fn coset_lde_batch_base(
     // Split pinned → per-column Vec<u64>s. The first write to each virgin
     // Vec page-faults, which can dominate total time (~75 ms for 128 MB).
     // Parallelise so the fault cost spreads across CPU cores.
-    use rayon::prelude::*;
     let pinned_ptr = pinned.as_ptr() as usize;
     let out: Vec<Vec<u64>> = (0..m)
         .into_par_iter()
         .map(|c| {
-            let mut v = Vec::<u64>::with_capacity(lde_size);
-            unsafe { v.set_len(lde_size) };
+            // set_len skips the O(N) zero-init that vec![0; n] would do
+            // (saves ~75 ms per 128 MB at prover scale). copy_from_slice
+            // below writes every slot before any reader sees the Vec.
+            #[allow(clippy::uninit_vec)]
+            let mut v = {
+                let mut v = Vec::<u64>::with_capacity(lde_size);
+                unsafe { v.set_len(lde_size) };
+                v
+            };
             let src = unsafe {
                 std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
             };
@@ -772,7 +778,7 @@ pub fn coset_lde_batch_ext3_into(
     columns.par_iter().enumerate().for_each(|(c, col)| {
         // SAFETY: disjoint regions per c; staging lock held.
         let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 0) * n), n)
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
         };
         let slab_b = unsafe {
             std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
@@ -781,7 +787,7 @@ pub fn coset_lde_batch_ext3_into(
             std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
         };
         for i in 0..n {
-            slab_a[i] = col[i * 3 + 0];
+            slab_a[i] = col[i * 3];
             slab_b[i] = col[i * 3 + 1];
             slab_c[i] = col[i * 3 + 2];
         }
@@ -885,7 +891,7 @@ pub fn coset_lde_batch_ext3_into(
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let slab_a = unsafe {
             std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 0) * lde_size),
+                (pinned_const as *const u64).add((c * 3) * lde_size),
                 lde_size,
             )
         };
@@ -902,7 +908,7 @@ pub fn coset_lde_batch_ext3_into(
             )
         };
         for i in 0..lde_size {
-            dst[i * 3 + 0] = slab_a[i];
+            dst[i * 3] = slab_a[i];
             dst[i * 3 + 1] = slab_b[i];
             dst[i * 3 + 2] = slab_c[i];
         }
