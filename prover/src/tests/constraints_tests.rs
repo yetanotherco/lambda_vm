@@ -515,8 +515,7 @@ fn test_dword_bl_repack_formula() {
 use crate::constraints::cpu::{
     Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
     EbreakConstraint, ExtBitZeroConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint,
-    create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
-    create_slt_res_zero_constraints,
+    create_all_cpu_constraints, create_is_bit_constraints, create_slt_res_zero_constraints,
 };
 
 use crate::tables::cpu::cols as cpu_cols;
@@ -548,19 +547,10 @@ fn test_create_is_bit_constraints() {
     }
 }
 
-#[test]
-fn test_create_add_constraints() {
-    let (constraints, next_idx) = create_add_constraints(0);
-
-    // Should create 4 constraints: 2 for ADD+LOAD, 2 for STORE (res = arg1 + imm)
-    assert_eq!(constraints.len(), 4);
-    assert_eq!(next_idx, 4);
-
-    assert_eq!(constraints[0].constraint_idx(), 0);
-    assert_eq!(constraints[1].constraint_idx(), 1);
-    assert_eq!(constraints[2].constraint_idx(), 2);
-    assert_eq!(constraints[3].constraint_idx(), 3);
-}
+// Phase 2 step 4 removed `create_add_constraints` (and its SUB/JALR siblings)
+// because the BinaryAdd AIR now validates `lhs + rhs = sum (mod 2^64)` for
+// every ADD/LOAD/STORE/SUB/BEQ/JALR CPU dispatch via `BusId::BinaryAdd`.
+// The corresponding test here is gone for the same reason.
 
 #[test]
 fn test_create_slt_res_zero_constraints() {
@@ -620,29 +610,26 @@ fn test_next_pc_add_constraint_new_pair() {
 
 #[test]
 fn test_create_all_cpu_constraints() {
-    let (is_bit, add, other, total) = create_all_cpu_constraints();
+    let (is_bit, other, total) = create_all_cpu_constraints();
 
     assert_eq!(is_bit.len(), 34);
-    // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
-    assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
+    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3)
+    //      + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
     assert_eq!(other.len(), 26);
 
-    // Total should be 34 + 8 + 26 = 68
-    assert_eq!(total, 68);
+    // Phase 2 step 4: ADD/SUB/JALR carry constraints (8) moved to the
+    // BinaryAdd AIR. Total now: 34 IS_BIT + 26 other = 60.
+    assert_eq!(total, 60);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 
 #[test]
 fn test_cpu_constraint_indices_are_unique() {
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
+    let (is_bit, other, _) = create_all_cpu_constraints();
 
     let mut indices: Vec<usize> = Vec::new();
 
     for c in &is_bit {
-        indices.push(c.constraint_idx());
-    }
-    for c in &add {
         indices.push(c.constraint_idx());
     }
     for c in &other {

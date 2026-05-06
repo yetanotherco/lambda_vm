@@ -22,7 +22,7 @@ use stark::table::TableView;
 use crate::tables::cpu::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
-use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
+use super::templates::IsBitConstraint;
 
 /// Pack 4 consecutive byte-column values into a 32-bit word field element.
 /// `col0 + col1*2^8 + col2*2^16 + col3*2^24`
@@ -101,50 +101,6 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// Returns the constraints and the next available constraint index.
 pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConstraint>, usize) {
     super::templates::new_is_bit_constraints(BIT_FLAG_COLUMNS, constraint_idx_start)
-}
-
-// =========================================================================
-// ALU ADD Constraints
-// =========================================================================
-
-/// Creates ADD constraints for the CPU table.
-///
-/// ADD template is used when: ADD + LOAD + STORE > 0
-/// - ADD: arg1 + arg2 = res (arithmetic addition)
-/// - LOAD/STORE: base_address + offset = effective_address (in res)
-///
-/// Returns the constraints and the next available constraint index.
-pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // For ADD/LOAD operations, we compute: arg1 + arg2 = res
-    // All operands are DWordBL (8 bytes), need to cast to DWordWL (2 words)
-
-    let lhs = AddOperand::from_dword_bl(cols::ARG1_0);
-    let rhs = AddOperand::from_dword_bl(cols::ARG2_0);
-    let sum = AddOperand::from_dword_bl(cols::RES_0);
-
-    // Condition: ADD + LOAD (active when any of these flags is set)
-    let cond_cols = vec![cols::ADD, cols::LOAD];
-
-    let (add_c0, add_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
-
-    // STORE: res = arg1 + imm (separate ADD, because arg2 now holds rv2)
-    // arg1 is DWordBL, imm is DWordWL, res is DWordBL
-    let store_lhs = AddOperand::from_dword_bl(cols::ARG1_0);
-    let store_rhs = AddOperand::dword(cols::IMM_0);
-    let store_sum = AddOperand::from_dword_bl(cols::RES_0);
-    let store_cond = vec![cols::STORE];
-    let (store_c0, store_c1) = AddConstraint::new_pair(
-        store_cond,
-        store_lhs,
-        store_rhs,
-        store_sum,
-        constraint_idx_start + 2,
-    );
-
-    (
-        vec![add_c0, add_c1, store_c0, store_c1],
-        constraint_idx_start + 4,
-    )
 }
 
 // =========================================================================
@@ -947,73 +903,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 // SUB Constraints
 // =========================================================================
 
-/// Creates SUB constraints for the CPU table.
-///
-/// SUB template is used when: SUB + BEQ > 0
-/// - SUB: res = arg1 - arg2
-/// - BEQ: computes arg1 - arg2 to check equality (res = 0 means equal)
-///
-/// Verifies: arg2 + res = arg1 (subtraction expressed as addition)
-///
-/// Returns the constraints and the next available constraint index.
-pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // SUB is verified as: arg2 + res = arg1
-    // This is the ADD template with swapped roles:
-    // - lhs = arg2
-    // - rhs = res
-    // - sum = arg1
-
-    let lhs = AddOperand::from_dword_bl(cols::ARG2_0); // First addend
-    let rhs = AddOperand::from_dword_bl(cols::RES_0); // Second addend (the difference)
-    let sum = AddOperand::from_dword_bl(cols::ARG1_0); // Result of addition (original minuend)
-
-    // Condition: SUB + BEQ (active when either flag is set)
-    let cond_cols = vec![cols::SUB, cols::BEQ];
-
-    let (sub_c0, sub_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
-
-    (vec![sub_c0, sub_c1], constraint_idx_start + 2)
-}
-
-// =========================================================================
-// JALR Result Constraint
-// =========================================================================
-
-/// Creates JALR result constraints using the ADD template.
-///
-/// JALR: res = pc + instr_size (return address)
-/// where instr_size = 4 - 2 * c_type_instruction
-///
-/// This uses proper 64-bit addition with carry handling.
-pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // pc is stored as DWordWL (2 consecutive columns)
-    let pc = AddOperand::dword(cols::PC_0);
-
-    // instr_size = 4 - 2 * c_type_instruction
-    // This is a linear expression with only a low word (hi = 0)
-    let instr_size = AddOperand::linear(
-        vec![
-            AddLinearTerm::Constant(4),
-            AddLinearTerm::Column {
-                coefficient: -2,
-                column: cols::C_TYPE_INSTRUCTION,
-            },
-        ],
-        vec![], // hi = 0
-    );
-
-    // res is stored as DWordBL (8 bytes)
-    let res = AddOperand::from_dword_bl(cols::RES_0);
-
-    // Condition: JALR
-    let cond_cols = vec![cols::JALR];
-
-    let (jalr_c0, jalr_c1) =
-        AddConstraint::new_pair(cond_cols, pc, instr_size, res, constraint_idx_start);
-
-    (vec![jalr_c0, jalr_c1], constraint_idx_start + 2)
-}
-
 // =========================================================================
 // Inline PC Constraints
 // =========================================================================
@@ -1033,11 +922,7 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 
 /// Total number of CPU constraints.
 ///
-/// - IS_BIT: 32 (all bit flags, including read_register1/2)
-/// - ADD carry: 2 (for ADD + LOAD)
-/// - STORE ADD carry: 2 (for STORE: res = arg1 + imm)
-/// - SUB carry: 2 (for SUB + BEQ)
-/// - JALR carry: 2 (res = pc + instr_size)
+/// - IS_BIT: 34 (all bit flags, including read_register1/2 and inline-PC bits)
 /// - Branch cond: 1
 /// - EBREAK: 1
 /// - Arg1 lower: 1
@@ -1052,20 +937,26 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
+/// Total: 60 constraints (34 IS_BIT + 26 other).
+///
+/// **Phase 2 step 4:** removed the 8 inline ADD-style carry constraints
+/// (ADD/LOAD = 2, STORE = 2, SUB/BEQ = 2, JALR = 2). They are now enforced
+/// by the BinaryAdd AIR via `BusId::BinaryAdd` dispatches — every CPU
+/// row that has one of those selectors set sends to BinaryAdd, whose
+/// own carry-chain constraints validate `lhs + rhs = sum (mod 2^64)`.
 /// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
 /// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
 /// are required.)
-pub const NUM_CPU_CONSTRAINTS: usize =
-    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+pub const NUM_CPU_CONSTRAINTS: usize = 34 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///
-/// Returns a tuple of (is_bit_constraints, add_constraints, other_constraints, next_idx)
+/// Returns `(is_bit_constraints, other_constraints, next_idx)`. The ADD-style
+/// carry constraints that used to live here moved to the `BinaryAdd` AIR
+/// in Phase 2 step 4.
 #[allow(clippy::type_complexity)]
 pub fn create_all_cpu_constraints() -> (
     Vec<IsBitConstraint>,
-    Vec<AddConstraint>,
     Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
@@ -1074,20 +965,6 @@ pub fn create_all_cpu_constraints() -> (
     // IS_BIT constraints
     let (is_bit, next) = create_is_bit_constraints(next_idx);
     next_idx = next;
-
-    // ADD constraints (for ADD + LOAD + STORE)
-    let (mut add_constraints, next) = create_add_constraints(next_idx);
-    next_idx = next;
-
-    // SUB constraints (for SUB + BEQ)
-    let (sub, next) = create_sub_constraints(next_idx);
-    next_idx = next;
-    add_constraints.extend(sub);
-
-    // JALR constraints (res = pc + instr_size)
-    let (jalr, next) = create_jalr_constraints(next_idx);
-    next_idx = next;
-    add_constraints.extend(jalr);
 
     // Other constraints
     let mut other: Vec<
@@ -1157,5 +1034,5 @@ pub fn create_all_cpu_constraints() -> (
     other.push(next_pc_1.boxed());
     next_idx += 2;
 
-    (is_bit, add_constraints, other, next_idx)
+    (is_bit, other, next_idx)
 }

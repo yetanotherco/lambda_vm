@@ -1,16 +1,19 @@
 //! BinaryAdd AIR — proves `lhs + rhs = sum (mod 2^64)` for ADD-style ops
 //! that the CPU dispatches via [`BusId::BinaryAdd`].
 //!
-//! ## Phase 2 progress
+//! ## Phase 2 progress (all complete)
 //!
-//! - **Step 1** (✓): skeleton AIR + bus ID + wiring.
-//! - **Step 2** (this commit): carry-chain transition constraints, halfword
-//!   range-check senders, and the `Multiplicity::Sum(MU_ADD, MU_SUB)`
-//!   receiver on [`BusId::BinaryAdd`]. Trace-builder collects ADD/LOAD
-//!   ops from CPU and emits one row per unique `(lhs, rhs, sum)` tuple
-//!   with `MU_ADD` set; `MU_SUB` stays at 0 until step 3.
-//! - **Step 3**: trace-builder also collects STORE/SUB/BEQ/JALR.
-//! - **Step 4**: drop the now-redundant inline carry constraints from CPU.
+//! - **Step 1**: skeleton AIR + bus ID + wiring.
+//! - **Step 2**: carry-chain transition constraints, halfword range-check
+//!   senders, `MU_ADD` receiver. Trace-builder collected ADD/LOAD ops.
+//! - **Step 3**: trace-builder extended to STORE/JALR (forward) and
+//!   SUB/BEQ (reverse, via the `MU_SUB` receiver). IS_HALFWORD senders
+//!   switched to `Multiplicity::Sum(MU_ADD, MU_SUB)` once both columns
+//!   were anchored by their respective receivers.
+//! - **Step 4**: dropped CPU's inline `create_add_constraints`,
+//!   `create_sub_constraints`, `create_jalr_constraints` — BinaryAdd is
+//!   now the sole validator of `lhs + rhs = sum (mod 2^64)` for those
+//!   six op families.
 //!
 //! ## Column layout (14 total)
 //!

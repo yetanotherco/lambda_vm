@@ -1229,8 +1229,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //   Forward (MU_ADD receiver): ADD/LOAD/STORE/JALR.
     //   Reverse (MU_SUB receiver): SUB/BEQ — operands swap on send so the
     //                              receiver's lhs+rhs=sum proves arg2+res=arg1.
-    // CPU's inline AddConstraint is still active (will be dropped in step 4),
-    // so BinaryAdd currently double-validates these op families.
+    // Carry arithmetic for ADD-style ops is enforced exclusively by BinaryAdd's
+    // transition constraints (Phase 2 step 4 dropped the inline path from CPU).
 
     // ADD/LOAD: lhs=arg1, rhs=arg2, sum=res.
     interactions.push(BusInteraction::sender(
@@ -2182,5 +2182,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 //
 // These will be implemented using:
 // - IsBitConstraint template for flags
-// - AddConstraint template for ADD, SUB, next_pc
+// - AddConstraint template for next_pc (ADD/SUB/JALR moved to BinaryAdd AIR
+//   in Phase 2 step 4)
 // - Custom constraints for extension logic

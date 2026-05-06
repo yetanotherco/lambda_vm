@@ -1833,7 +1833,8 @@ fn collect_all_ops(
     // Phase 2 step 3: collect BinaryAdd dispatches for all six op families.
     //   ADD/LOAD/STORE/JALR -> Add flavour (forward: lhs + rhs = sum).
     //   SUB/BEQ            -> Sub flavour (reverse: arg2 + res = arg1).
-    // CPU's inline AddConstraint still fires (will be removed in step 4).
+    // CPU has no inline carry constraints for these ops anymore — BinaryAdd's
+    // transition constraints + bus balance are the sole enforcement.
     let mut binary_add_ops: Vec<(
         super::binary_add::BinaryAddOperation,
         super::binary_add::BinaryAddFlavour,

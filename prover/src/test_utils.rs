@@ -459,15 +459,12 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
 /// Create CPU AIR with all constraints and bus interactions.
 pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
-    // Get all CPU constraints
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
+    // Get all CPU constraints. Phase 2 step 4 dropped the ADD-style carry
+    // path — that work now lives in the BinaryAdd AIR's own constraints.
+    let (is_bit, other, _) = create_all_cpu_constraints();
 
-    // All CPU constraints
     let mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = Vec::new();
     for c in is_bit {
-        transition_constraints.push(c.boxed());
-    }
-    for c in add {
         transition_constraints.push(c.boxed());
     }
     for c in other {
