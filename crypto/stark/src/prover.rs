@@ -567,7 +567,6 @@ pub trait IsStarkProver<
         let mut columns = trace.extract_columns_main(lde_size);
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
-            // Evict mmap pages so spilled data doesn't occupy heap + cache.
             trace.main_table.advise_drop_cache();
         }
         #[cfg(feature = "instruments")]
