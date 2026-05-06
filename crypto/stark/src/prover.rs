@@ -1608,7 +1608,9 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        // Deduplicate Domain/LdeTwiddles by (trace_length, blowup, coset).
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
+        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
         type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
         let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
             std::collections::HashMap::new();
