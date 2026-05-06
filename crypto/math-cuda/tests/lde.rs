@@ -69,7 +69,11 @@ fn assert_lde_match(log_n: u64, blowup_factor: usize, seed: u64) {
     let cpu = cpu_lde(&evals, blowup_factor, coset_offset);
     let gpu = math_cuda::lde::coset_lde_base(&evals, blowup_factor, &weights).expect("gpu lde");
 
-    assert_eq!(cpu.len(), gpu.len(), "length mismatch (log_n={log_n}, blowup={blowup_factor})");
+    assert_eq!(
+        cpu.len(),
+        gpu.len(),
+        "length mismatch (log_n={log_n}, blowup={blowup_factor})"
+    );
     let cpu_c = canon(&cpu);
     let gpu_c = canon(&gpu);
     for (i, (e, a)) in cpu_c.iter().zip(&gpu_c).enumerate() {

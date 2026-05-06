@@ -30,14 +30,7 @@ fn compile_ptx(src: &str, out_name: &str) {
     let arch = env::var("CUDARC_NVCC_ARCH").unwrap_or_else(|_| "compute_89".to_string());
 
     let status = Command::new(nvcc_path())
-        .args([
-            "--ptx",
-            "-O3",
-            "-std=c++17",
-            "-arch",
-            &arch,
-            "-o",
-        ])
+        .args(["--ptx", "-O3", "-std=c++17", "-arch", &arch, "-o"])
         .arg(&out_path)
         .arg(&src_path)
         .status()

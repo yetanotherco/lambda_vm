@@ -40,11 +40,7 @@ impl PinnedStaging {
         }
     }
 
-    pub fn ensure_capacity(
-        &mut self,
-        min_elems: usize,
-        ctx: &CudaContext,
-    ) -> Result<()> {
+    pub fn ensure_capacity(&mut self, min_elems: usize, ctx: &CudaContext) -> Result<()> {
         if self.capacity_elems >= min_elems {
             return Ok(());
         }

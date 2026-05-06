@@ -25,7 +25,13 @@ fn coset_weights(n: usize, g: u64) -> Vec<u64> {
     w
 }
 
-fn cpu_lde_one(col: &[u64], blowup: usize, weights_fp: &[Fp], inv_tw: &LayerTwiddles<GoldilocksField>, fwd_tw: &LayerTwiddles<GoldilocksField>) -> Vec<u64> {
+fn cpu_lde_one(
+    col: &[u64],
+    blowup: usize,
+    weights_fp: &[Fp],
+    inv_tw: &LayerTwiddles<GoldilocksField>,
+    fwd_tw: &LayerTwiddles<GoldilocksField>,
+) -> Vec<u64> {
     let mut buf: Vec<Fp> = col.iter().map(|&x| Fp::from_raw(x)).collect();
     Polynomial::coset_lde_full_expand::<GoldilocksField>(
         &mut buf, blowup, weights_fp, inv_tw, fwd_tw,

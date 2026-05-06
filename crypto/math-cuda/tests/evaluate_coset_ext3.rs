@@ -81,13 +81,8 @@ fn assert_evaluate_coset(log_n: u64, blowup: usize, m: usize, offset: u64, seed:
         .iter()
         .map(|coefs| {
             let p = Polynomial::new(coefs);
-            Polynomial::evaluate_offset_fft::<GoldilocksField>(
-                &p,
-                blowup,
-                Some(n),
-                &offset_fp,
-            )
-            .unwrap()
+            Polynomial::evaluate_offset_fft::<GoldilocksField>(&p, blowup, Some(n), &offset_fp)
+                .unwrap()
         })
         .collect();
 
@@ -114,7 +109,10 @@ fn assert_evaluate_coset(log_n: u64, blowup: usize, m: usize, offset: u64, seed:
         for i in 0..gpu.len() {
             let g = canon_fp3(&gpu[i]);
             let cc = canon_fp3(&cpu[c][i]);
-            assert_eq!(g, cc, "eval mismatch col={c} row={i} log_n={log_n} blowup={blowup}");
+            assert_eq!(
+                g, cc,
+                "eval mismatch col={c} row={i} log_n={log_n} blowup={blowup}"
+            );
         }
     }
 }

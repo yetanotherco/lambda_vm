@@ -21,9 +21,7 @@ fn cpu_fft(coeffs: &[u64]) -> Vec<u64> {
 }
 
 fn canonicalize(xs: &[u64]) -> Vec<u64> {
-    xs.iter()
-        .map(|x| GoldilocksField::canonical(x))
-        .collect()
+    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
 }
 
 fn assert_ntt_match(log_n: u64, seed: u64) {
@@ -81,9 +79,12 @@ fn assert_intt_match(log_n: u64, seed: u64) {
     let evals: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>()).collect();
 
     let elems: Vec<Fp> = evals.iter().map(|&x| Fp::from_raw(x)).collect();
-    let cpu_poly =
-        Polynomial::interpolate_fft::<GoldilocksField>(&elems).expect("cpu intt");
-    let cpu: Vec<u64> = cpu_poly.coefficients.into_iter().map(|e| *e.value()).collect();
+    let cpu_poly = Polynomial::interpolate_fft::<GoldilocksField>(&elems).expect("cpu intt");
+    let cpu: Vec<u64> = cpu_poly
+        .coefficients
+        .into_iter()
+        .map(|e| *e.value())
+        .collect();
 
     let gpu = math_cuda::ntt::inverse(&evals).expect("gpu intt");
 
@@ -124,7 +125,9 @@ fn ntt_round_trip() {
     let log_n = 14;
     let n = 1usize << log_n;
     let mut rng = ChaCha8Rng::seed_from_u64(42);
-    let x: Vec<u64> = (0..n).map(|_| rng.r#gen::<u64>() % 0xFFFF_FFFF_0000_0001).collect();
+    let x: Vec<u64> = (0..n)
+        .map(|_| rng.r#gen::<u64>() % 0xFFFF_FFFF_0000_0001)
+        .collect();
 
     let evals = math_cuda::ntt::forward(&x).expect("forward");
     let back = math_cuda::ntt::inverse(&evals).expect("inverse");
@@ -133,4 +136,3 @@ fn ntt_round_trip() {
     let back_c = canonicalize(&back);
     assert_eq!(x_c, back_c, "round trip failed");
 }
-

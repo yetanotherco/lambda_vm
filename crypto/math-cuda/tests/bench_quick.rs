@@ -15,7 +15,10 @@ use rayon::prelude::*;
 type Fp = FieldElement<GoldilocksField>;
 
 fn coset_weights(n: usize, g: u64) -> Vec<u64> {
-    let inv_n = *FieldElement::<GoldilocksField>::from(n as u64).inv().unwrap().value();
+    let inv_n = *FieldElement::<GoldilocksField>::from(n as u64)
+        .inv()
+        .unwrap()
+        .value();
     let mut w = Vec::with_capacity(n);
     let mut cur = inv_n;
     for _ in 0..n {
@@ -54,7 +57,11 @@ fn bench_lde_2_to_18_blowup_4() {
     for _ in 0..TRIALS {
         let mut buf: Vec<Fp> = input.iter().map(|&x| Fp::from_raw(x)).collect();
         Polynomial::coset_lde_full_expand::<GoldilocksField>(
-            &mut buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+            &mut buf,
+            blowup,
+            &weights_fp,
+            &inv_tw,
+            &fwd_tw,
         )
         .unwrap();
         std::hint::black_box(&buf);
@@ -101,12 +108,7 @@ fn bench_lde_multi_column_parallel() {
     let num_cols = 64;
 
     // Warm up.
-    let _ = math_cuda::lde::coset_lde_base(
-        &vec![0u64; n],
-        blowup,
-        &coset_weights(n, 7),
-    )
-    .unwrap();
+    let _ = math_cuda::lde::coset_lde_base(&vec![0u64; n], blowup, &coset_weights(n, 7)).unwrap();
 
     // Build input data.
     let mut rng = ChaCha8Rng::seed_from_u64(11);
@@ -134,7 +136,11 @@ fn bench_lde_multi_column_parallel() {
     let t0 = Instant::now();
     cpu_bufs.par_iter_mut().for_each(|buf| {
         Polynomial::coset_lde_full_expand::<GoldilocksField>(
-            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+            buf,
+            blowup,
+            &weights_fp,
+            &inv_tw,
+            &fwd_tw,
         )
         .unwrap();
     });
@@ -164,15 +170,12 @@ fn bench_lde_batched_prover_scale() {
     let weights = coset_weights(n, 7);
     let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
     let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
-    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(
-        (n * blowup).trailing_zeros() as u64,
-    )
-    .unwrap();
+    let fwd_tw =
+        LayerTwiddles::<GoldilocksField>::new((n * blowup).trailing_zeros() as u64).unwrap();
 
     let warm_slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
     for _ in 0..8 {
-        let _ =
-            math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
+        let _ = math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
     }
 
     let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
@@ -194,7 +197,11 @@ fn bench_lde_batched_prover_scale() {
         let t0 = Instant::now();
         cpu_bufs.par_iter_mut().for_each(|buf| {
             Polynomial::coset_lde_full_expand::<GoldilocksField>(
-                buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+                buf,
+                blowup,
+                &weights_fp,
+                &inv_tw,
+                &fwd_tw,
             )
             .unwrap();
         });
@@ -227,15 +234,12 @@ fn bench_lde_batched_vs_rayon_cpu() {
     // one-time pinned staging alloc cost.
     let warm_slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
     for _ in 0..64 {
-        let _ =
-            math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
+        let _ = math_cuda::lde::coset_lde_batch_base(&warm_slices, blowup, &weights).unwrap();
     }
     let weights_fp: Vec<Fp> = weights.iter().map(|&w| Fp::from_raw(w)).collect();
     let inv_tw = LayerTwiddles::<GoldilocksField>::new_inverse(log_n as u64).unwrap();
-    let fwd_tw = LayerTwiddles::<GoldilocksField>::new(
-        (n * blowup).trailing_zeros() as u64,
-    )
-    .unwrap();
+    let fwd_tw =
+        LayerTwiddles::<GoldilocksField>::new((n * blowup).trailing_zeros() as u64).unwrap();
 
     // GPU batched — first run may include lazy device init; do a few to stabilise.
     let slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
@@ -254,7 +258,11 @@ fn bench_lde_batched_vs_rayon_cpu() {
     let t0 = Instant::now();
     cpu_bufs.par_iter_mut().for_each(|buf| {
         Polynomial::coset_lde_full_expand::<GoldilocksField>(
-            buf, blowup, &weights_fp, &inv_tw, &fwd_tw,
+            buf,
+            blowup,
+            &weights_fp,
+            &inv_tw,
+            &fwd_tw,
         )
         .unwrap();
     });
@@ -277,12 +285,7 @@ fn bench_lde_multi_column_serialized_gpu() {
     let n = 1usize << log_n;
     let num_cols = 64;
 
-    let _ = math_cuda::lde::coset_lde_base(
-        &vec![0u64; n],
-        blowup,
-        &coset_weights(n, 7),
-    )
-    .unwrap();
+    let _ = math_cuda::lde::coset_lde_base(&vec![0u64; n], blowup, &coset_weights(n, 7)).unwrap();
 
     let mut rng = ChaCha8Rng::seed_from_u64(13);
     let columns: Vec<Vec<u64>> = (0..num_cols)
@@ -320,12 +323,7 @@ fn bench_lde_multi_column_gpu_limited_threads() {
     let n = 1usize << log_n;
     let num_cols = 64;
 
-    let _ = math_cuda::lde::coset_lde_base(
-        &vec![0u64; n],
-        blowup,
-        &coset_weights(n, 7),
-    )
-    .unwrap();
+    let _ = math_cuda::lde::coset_lde_base(&vec![0u64; n], blowup, &coset_weights(n, 7)).unwrap();
 
     let mut rng = ChaCha8Rng::seed_from_u64(12);
     let columns: Vec<Vec<u64>> = (0..num_cols)

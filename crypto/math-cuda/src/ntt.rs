@@ -87,13 +87,7 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
     // 2. DIT butterfly levels. For log_n >= 8 we fuse 8 levels per kernel via
     // the shmem kernel; for very small sizes (< 256 elements) we stick with
     // the per-level kernel because the shmem block dimensions assume n ≥ 256.
-    run_ntt_body(
-        stream.as_ref(),
-        &mut x_dev,
-        tw_dev.as_ref(),
-        n_u64,
-        log_n,
-    )?;
+    run_ntt_body(stream.as_ref(), &mut x_dev, tw_dev.as_ref(), n_u64, log_n)?;
 
     // 3. For iNTT, multiply by 1/n.
     if !forward {

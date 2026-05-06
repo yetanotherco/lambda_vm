@@ -97,8 +97,7 @@ fn assert_ext3_batch(log_n: u64, blowup: usize, m: usize, seed: u64) {
     let input_slices: Vec<&[u64]> = flat_inputs.iter().map(|v| v.as_slice()).collect();
 
     // Pre-allocate outputs, each 3*lde_size u64s.
-    let mut flat_outputs: Vec<Vec<u64>> =
-        (0..m).map(|_| vec![0u64; 3 * lde_size]).collect();
+    let mut flat_outputs: Vec<Vec<u64>> = (0..m).map(|_| vec![0u64; 3 * lde_size]).collect();
     {
         let mut out_slices: Vec<&mut [u64]> =
             flat_outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
@@ -132,7 +131,13 @@ fn assert_ext3_batch(log_n: u64, blowup: usize, m: usize, seed: u64) {
     }
     // Also sanity-check raw canonical equality per column.
     for (c, col) in columns.iter().enumerate() {
-        let cpu_raw = ext3_to_u64s(&cpu_lde_one_ext3(col, blowup, &weights_fp, &inv_tw, &fwd_tw));
+        let cpu_raw = ext3_to_u64s(&cpu_lde_one_ext3(
+            col,
+            blowup,
+            &weights_fp,
+            &inv_tw,
+            &fwd_tw,
+        ));
         assert_eq!(canon(&cpu_raw), canon(&flat_outputs[c]));
     }
 }

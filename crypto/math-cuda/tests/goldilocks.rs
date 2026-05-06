@@ -112,12 +112,15 @@ fn gpu_goldilocks_edge_cases() {
         }
     }
 
-    let cases: &[(&str, fn(&[u64], &[u64]) -> math_cuda::Result<Vec<u64>>, fn(&u64, &u64) -> u64)] =
-        &[
-            ("gl_add", math_cuda::gl_add_u64, GoldilocksField::add),
-            ("gl_sub", math_cuda::gl_sub_u64, GoldilocksField::sub),
-            ("gl_mul", math_cuda::gl_mul_u64, GoldilocksField::mul),
-        ];
+    let cases: &[(
+        &str,
+        fn(&[u64], &[u64]) -> math_cuda::Result<Vec<u64>>,
+        fn(&u64, &u64) -> u64,
+    )] = &[
+        ("gl_add", math_cuda::gl_add_u64, GoldilocksField::add),
+        ("gl_sub", math_cuda::gl_sub_u64, GoldilocksField::sub),
+        ("gl_mul", math_cuda::gl_mul_u64, GoldilocksField::mul),
+    ];
 
     for (op, gpu_fn, cpu_fn) in cases {
         let expected: Vec<u64> = a.iter().zip(&b).map(|(x, y)| cpu_fn(x, y)).collect();

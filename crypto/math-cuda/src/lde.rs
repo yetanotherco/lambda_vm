@@ -38,15 +38,14 @@ pub struct GpuLdeExt3 {
     pub lde_size: usize,
 }
 
-pub fn coset_lde_base(
-    evals: &[u64],
-    blowup_factor: usize,
-    weights: &[u64],
-) -> Result<Vec<u64>> {
+pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
     let n = evals.len();
     assert!(n.is_power_of_two(), "evals length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match evals");
-    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -130,7 +129,10 @@ pub fn coset_lde_batch_base(
     let n = columns[0].len();
     assert!(n.is_power_of_two(), "column length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match column length");
-    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
     for c in columns.iter() {
         assert_eq!(c.len(), n, "all columns must be the same size");
     }
@@ -147,7 +149,11 @@ pub fn coset_lde_batch_base(
     let staging_slot = be.pinned_staging();
 
     let debug_phases = std::env::var("MATH_CUDA_PHASE_TIMING").is_ok();
-    let t_start = if debug_phases { Some(std::time::Instant::now()) } else { None };
+    let t_start = if debug_phases {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let phase = |label: &str, prev: &mut Option<std::time::Instant>| {
         if let Some(p) = prev.as_ref() {
             let now = std::time::Instant::now();
@@ -165,7 +171,9 @@ pub fn coset_lde_batch_base(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     // SAFETY: staging is locked, the slice alias ends before we unlock.
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
-    if debug_phases { phase("staging lock + grow", &mut last); }
+    if debug_phases {
+        phase("staging lock + grow", &mut last);
+    }
 
     // Pack columns into first m*n slots of the pinned buffer. Parallel: pinned
     // writes are DRAM-bandwidth bound, saturates at ~8 cores on modern
@@ -176,32 +184,39 @@ pub fn coset_lde_batch_base(
         // SAFETY: each task writes to a disjoint `[c*n..c*n+n]` region of
         // `pinned`, and the outer `staging` lock guarantees no other call is
         // using the buffer concurrently.
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(
-                (pinned_base_ptr as *mut u64).add(c * n),
-                n,
-            )
-        };
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n) };
         dst.copy_from_slice(col);
     });
-    if debug_phases { phase("host pack (pinned, rayon)", &mut last); }
+    if debug_phases {
+        phase("host pack (pinned, rayon)", &mut last);
+    }
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
     // tail of each column is already the zero-pad the CPU path does.
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    if debug_phases { stream.synchronize()?; phase("alloc_zeros", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("alloc_zeros", &mut last);
+    }
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
-    if debug_phases { stream.synchronize()?; phase("H2D cols (pinned)", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("H2D cols (pinned)", &mut last);
+    }
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
-    if debug_phases { stream.synchronize()?; phase("twiddles + weights", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("twiddles + weights", &mut last);
+    }
 
     let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
@@ -227,7 +242,10 @@ pub fn coset_lde_batch_base(
         }
     }
 
-    if debug_phases { stream.synchronize()?; phase("bit_reverse N", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("bit_reverse N", &mut last);
+    }
     // === 2. iNTT body over all columns ===
     run_batched_ntt_body(
         stream.as_ref(),
@@ -238,7 +256,10 @@ pub fn coset_lde_batch_base(
         col_stride_u64,
         m_u32,
     )?;
-    if debug_phases { stream.synchronize()?; phase("iNTT body", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("iNTT body", &mut last);
+    }
 
     // === 3. Pointwise multiply by coset weights (includes 1/N) ===
     {
@@ -278,7 +299,10 @@ pub fn coset_lde_batch_base(
         }
     }
 
-    if debug_phases { stream.synchronize()?; phase("pointwise + bit_reverse LDE", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("pointwise + bit_reverse LDE", &mut last);
+    }
     // === 5. Forward NTT on full LDE of every column ===
     run_batched_ntt_body(
         stream.as_ref(),
@@ -289,13 +313,18 @@ pub fn coset_lde_batch_base(
         col_stride_u64,
         m_u32,
     )?;
-    if debug_phases { stream.synchronize()?; phase("forward NTT body", &mut last); }
+    if debug_phases {
+        stream.synchronize()?;
+        phase("forward NTT body", &mut last);
+    }
 
     // Single big D2H into the reusable pinned staging buffer — pinned, one
     // call to the driver, saturates PCIe.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
-    if debug_phases { phase("D2H (one shot into pinned)", &mut last); }
+    if debug_phases {
+        phase("D2H (one shot into pinned)", &mut last);
+    }
 
     // Split pinned → per-column Vec<u64>s. The first write to each virgin
     // Vec page-faults, which can dominate total time (~75 ms for 128 MB).
@@ -308,16 +337,15 @@ pub fn coset_lde_batch_base(
             let mut v = Vec::<u64>::with_capacity(lde_size);
             unsafe { v.set_len(lde_size) };
             let src = unsafe {
-                std::slice::from_raw_parts(
-                    (pinned_ptr as *const u64).add(c * lde_size),
-                    lde_size,
-                )
+                std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
             };
             v.copy_from_slice(src);
             v
         })
         .collect();
-    if debug_phases { phase("copy out (rayon pinned → Vecs)", &mut last); }
+    if debug_phases {
+        phase("copy out (rayon pinned → Vecs)", &mut last);
+    }
     drop(staging);
     Ok(out)
 }
@@ -341,7 +369,10 @@ pub fn coset_lde_batch_base_into(
     let n = columns[0].len();
     assert!(n.is_power_of_two(), "column length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match column length");
-    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
     for c in columns.iter() {
         assert_eq!(c.len(), n, "all columns must be the same size");
     }
@@ -461,18 +492,12 @@ pub fn coset_lde_batch_base_into(
     #[allow(unused_imports)]
     use rayon::prelude::*;
     let pinned_ptr = pinned.as_ptr() as usize;
-    outputs
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(c, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts(
-                    (pinned_ptr as *const u64).add(c * lde_size),
-                    lde_size,
-                )
-            };
-            dst.copy_from_slice(src);
-        });
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        let src = unsafe {
+            std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
+        };
+        dst.copy_from_slice(src);
+    });
     drop(staging);
     Ok(())
 }
@@ -497,15 +522,8 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
-    evaluate_poly_coset_batch_ext3_into_inner(
-        coefs,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        false,
-    )
-    .map(|_| ())
+    evaluate_poly_coset_batch_ext3_into_inner(coefs, n, blowup_factor, weights, outputs, false)
+        .map(|_| ())
 }
 
 /// Same as [`evaluate_poly_coset_batch_ext3_into`] but retains the de-
@@ -519,14 +537,8 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<GpuLdeExt3> {
-    let opt = evaluate_poly_coset_batch_ext3_into_inner(
-        coefs,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        true,
-    )?;
+    let opt =
+        evaluate_poly_coset_batch_ext3_into_inner(coefs, n, blowup_factor, weights, outputs, true)?;
     Ok(opt.expect("keep_device_buf=true must return Some"))
 }
 
@@ -724,7 +736,10 @@ pub fn coset_lde_batch_ext3_into(
     assert_eq!(outputs.len(), m, "outputs must match columns count");
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
-    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
     for c in columns.iter() {
         assert_eq!(c.len(), 3 * n, "each ext3 column must be 3*n u64s");
     }
@@ -757,22 +772,13 @@ pub fn coset_lde_batch_ext3_into(
     columns.par_iter().enumerate().for_each(|(c, col)| {
         // SAFETY: disjoint regions per c; staging lock held.
         let slab_a = unsafe {
-            std::slice::from_raw_parts_mut(
-                (pinned_ptr_u as *mut u64).add((c * 3 + 0) * n),
-                n,
-            )
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 0) * n), n)
         };
         let slab_b = unsafe {
-            std::slice::from_raw_parts_mut(
-                (pinned_ptr_u as *mut u64).add((c * 3 + 1) * n),
-                n,
-            )
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
         };
         let slab_c = unsafe {
-            std::slice::from_raw_parts_mut(
-                (pinned_ptr_u as *mut u64).add((c * 3 + 2) * n),
-                n,
-            )
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
         };
         for i in 0..n {
             slab_a[i] = col[i * 3 + 0];
@@ -981,4 +987,3 @@ fn run_batched_ntt_body(
     }
     Ok(())
 }
-
