@@ -287,8 +287,8 @@ impl<F: IsField> Table<F> {
     }
 
     /// Spill the table's row-major data to a temp file and mmap it back.
-    /// Frees the heap `data` Vec while preserving access through `get()`,
-    /// `get_row()`, and `columns()`.
+    /// Frees the heap `data` Vec while preserving access through
+    /// [`Self::get`], [`Self::get_row`], and [`Self::columns`].
     ///
     /// No-op if the table is empty or already spilled.
     #[cfg(feature = "disk-spill")]
