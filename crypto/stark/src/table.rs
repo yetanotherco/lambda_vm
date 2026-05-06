@@ -234,7 +234,8 @@ impl<F: IsField> Table<F> {
     /// Extract columns as owned vectors, with each allocated at `capacity`.
     ///
     /// `capacity` is a hint sized for downstream LDE expansion so the FFT grows
-    /// in place without a second allocation.
+    /// in place without a second allocation. Avoids the T1 transpose `columns()`
+    /// performs.
     pub fn extract_columns(&self, capacity: usize) -> Vec<Vec<FieldElement<F>>> {
         let capacity = capacity.max(self.height);
         #[cfg(feature = "parallel")]
