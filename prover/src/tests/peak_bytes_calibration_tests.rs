@@ -1,7 +1,7 @@
-//! Asserts predicted [`peak_bytes`](crate::auto_storage::peak_bytes) stays
-//! within 2× of measured RSS during a proof. The 2× bound is loose: RSS
-//! counts mmaps, code segment, and allocator slack that the heap-only
-//! estimator doesn't model.
+//! Asserts predicted [`peak_bytes`](crate::auto_storage::peak_bytes) does not
+//! underestimate jemalloc-measured heap during a proof. Under-estimation is
+//! the safety-critical direction: if it grows beyond `SAFETY_FRACTION`, the
+//! runtime's `Disk` vs `Ram` decision becomes unsafe.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,21 +9,23 @@ use std::thread;
 use std::time::Duration;
 
 use stark::proof::options::GoldilocksCubicProofOptions;
+use tikv_jemalloc_ctl::{epoch, stats};
 
 use crate::auto_storage;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::test_utils::{asm_elf_bytes, run_asm_elf};
 
-fn current_rss_bytes() -> Option<usize> {
-    let pid = sysinfo::get_current_pid().ok()?;
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]));
-    sys.process(pid).map(|p| p.memory() as usize)
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn allocated_bytes() -> usize {
+    epoch::advance().ok();
+    stats::allocated::read().unwrap_or(0)
 }
 
 #[test]
-fn peak_bytes_within_2x_of_measured_rss() {
+fn peak_bytes_does_not_underestimate_measured_heap() {
     let (elf, logs, _) = run_asm_elf("fib_iterative_372k");
     let elf_bytes = asm_elf_bytes("fib_iterative_372k");
 
@@ -38,10 +40,9 @@ fn peak_bytes_within_2x_of_measured_rss() {
         stark::prover::table_parallelism(),
     ) as usize;
 
-    // Drop logs etc. before sampling baseline so they don't inflate it.
     drop(logs);
 
-    let baseline = current_rss_bytes().expect("RSS reader works on this platform");
+    let baseline = allocated_bytes();
     let peak = Arc::new(AtomicUsize::new(baseline));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -50,10 +51,8 @@ fn peak_bytes_within_2x_of_measured_rss() {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                if let Some(rss) = current_rss_bytes() {
-                    peak.fetch_max(rss, Ordering::Relaxed);
-                }
-                thread::sleep(Duration::from_millis(50));
+                peak.fetch_max(allocated_bytes(), Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(10));
             }
         })
     };
@@ -67,17 +66,15 @@ fn peak_bytes_within_2x_of_measured_rss() {
     let measured = peak.load(Ordering::Relaxed).saturating_sub(baseline);
 
     eprintln!(
-        "peak_bytes calibration: predicted={predicted} bytes, measured_above_baseline={measured} bytes"
+        "peak_bytes calibration: predicted={predicted} bytes, measured_heap={measured} bytes, ratio={:.2}",
+        predicted as f64 / measured as f64
     );
 
+    let safety_num = auto_storage::SAFETY_FRACTION_NUM as usize;
+    let safety_den = auto_storage::SAFETY_FRACTION_DEN as usize;
     assert!(
-        predicted.saturating_mul(2) >= measured,
-        "peak_bytes underestimates measured RSS by more than 2×: \
-         predicted={predicted}, measured={measured}"
-    );
-    assert!(
-        predicted <= measured.saturating_mul(2),
-        "peak_bytes overestimates measured RSS by more than 2×: \
+        predicted.saturating_mul(safety_den) >= measured.saturating_mul(safety_num),
+        "peak_bytes underestimates measured heap below SAFETY_FRACTION ({safety_num}/{safety_den}): \
          predicted={predicted}, measured={measured}"
     );
 }

@@ -38,8 +38,8 @@ const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
 /// 9/10 budget headroom for OS, other processes, and allocator slack.
-const SAFETY_FRACTION_NUM: u64 = 9;
-const SAFETY_FRACTION_DEN: u64 = 10;
+pub(crate) const SAFETY_FRACTION_NUM: u64 = 9;
+pub(crate) const SAFETY_FRACTION_DEN: u64 = 10;
 
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);

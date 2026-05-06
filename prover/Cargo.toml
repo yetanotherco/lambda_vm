@@ -24,6 +24,8 @@ log = "0.4"
 env_logger = "*"
 criterion = { version = "0.5", default-features = false }
 bincode = "1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [[bench]]
 name = "vm_prover_benchmark"

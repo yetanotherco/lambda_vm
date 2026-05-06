@@ -1954,6 +1954,8 @@ dependencies = [
  "serde",
  "stark",
  "sysinfo",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
 ]
 
 [[package]]
