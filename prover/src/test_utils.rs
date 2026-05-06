@@ -86,7 +86,7 @@ type GoldilocksPair<'a, PI> = (
     &'a PI,
 );
 
-/// Multi-AIR prove with `StorageMode::Ram`. Test convenience.
+/// Multi-AIR prove with `StorageMode::Ram`.
 pub fn multi_prove_ram<PI>(
     air_trace_pairs: Vec<GoldilocksPair<'_, PI>>,
     transcript: &mut (impl IsStarkTranscript<E, F> + Clone + Send),
