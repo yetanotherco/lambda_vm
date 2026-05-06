@@ -1,7 +1,5 @@
 //! Asserts predicted [`peak_bytes`](crate::auto_storage::peak_bytes) does not
-//! underestimate jemalloc-measured heap during a proof. Under-estimation is
-//! the safety-critical direction: if it grows beyond `SAFETY_FRACTION`, the
-//! runtime's `Disk` vs `Ram` decision becomes unsafe.
+//! underestimate jemalloc-measured heap during a proof.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
