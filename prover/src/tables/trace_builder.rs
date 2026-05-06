@@ -2235,7 +2235,6 @@ pub fn count_table_lengths(
             );
         }
 
-        // ECALL Commit
         if cpu_op.ecall_commit {
             // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
             // without materializing the op vector.
