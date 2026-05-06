@@ -134,6 +134,11 @@ pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 ///             + BEQ * (is_equal XOR mp_selector)
 ///
 /// Where XOR is computed as: a XOR b = a + b - 2*a*b
+///
+/// Phase 2 step 9: `res[0]` is treated as a bit (0 or 1) here — it's the
+/// LT outcome from the SLT/BLT bus. `SltResLoUpperBytesZeroConstraint`
+/// guarantees `RES_LO ∈ {0, 1}` and `RES_HI = 0` under SLT/BLT, so
+/// `RES_LO == res[0]` and we can read the u32 limb directly.
 pub struct BranchCondConstraint {
     constraint_idx: usize,
 }
@@ -154,7 +159,7 @@ impl BranchCondConstraint {
         let mp_selector = step
             .get_main_evaluation_element(0, cols::MP_SELECTOR)
             .clone();
-        let res_0 = step.get_main_evaluation_element(0, cols::RES_0).clone();
+        let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
         let is_equal = step.get_main_evaluation_element(0, cols::IS_EQUAL).clone();
         let branch_cond = step
             .get_main_evaluation_element(0, cols::BRANCH_COND)
@@ -163,8 +168,8 @@ impl BranchCondConstraint {
         let two = FieldElement::<F>::from(2u64);
 
         // XOR computation: a XOR b = a + b - 2*a*b
-        // res[0] XOR mp_selector
-        let res_xor_mp = &res_0 + &mp_selector - &two * &res_0 * &mp_selector;
+        // res_lo XOR mp_selector  (res_lo is 0 or 1 under BLT)
+        let res_xor_mp = &res_lo + &mp_selector - &two * &res_lo * &mp_selector;
         // is_equal XOR mp_selector
         let eq_xor_mp = &is_equal + &mp_selector - &two * &is_equal * &mp_selector;
 
@@ -179,6 +184,116 @@ impl BranchCondConstraint {
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondConstraint {
     fn degree(&self) -> usize {
         // BLT * res_0 * mp_selector has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+}
+
+// =========================================================================
+// BEQ zero-test constraints (replaces ZERO bus sender, Phase 2 step 9A)
+// =========================================================================
+//
+// `is_equal` must equal `(res == 0)` on BEQ rows. The prior implementation
+// sent `(sum(res[0..7]), is_equal)` to the BITWISE-hosted ZERO bus, which
+// only covers a 20-bit input space. To migrate off the byte decomposition
+// without widening the preprocessed table, we use a witness-inverse
+// pattern over `sum = RES_LO + RES_HI` (each limb in [0, 2^32), so
+// sum == 0 iff res == 0):
+//
+//   sum_constraint:    BEQ * IS_EQUAL * (RES_LO + RES_HI) = 0
+//   witness_constraint: BEQ * (1 - IS_EQUAL - (RES_LO + RES_HI) * RES_INV) = 0
+//
+// On non-BEQ rows both vanish (BEQ = 0), leaving IS_EQUAL unconstrained
+// — same as before. On BEQ rows:
+//   * sum = 0:     is_equal must be 1 (sum_constraint trivially holds;
+//                  witness_constraint forces 1 - is_equal = 0).
+//   * sum != 0:    is_equal must be 0 (sum_constraint forces it; the
+//                  prover witnesses RES_INV = 1/sum to satisfy
+//                  witness_constraint).
+// IS_EQUAL is already IS_BIT-constrained globally, so 0/1 valuation is
+// unconditionally enforced.
+
+/// `BEQ * IS_EQUAL * (RES_LO + RES_HI) = 0`
+pub struct BeqIsEqualSumZeroConstraint {
+    constraint_idx: usize,
+}
+
+impl BeqIsEqualSumZeroConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let beq = step.get_main_evaluation_element(0, cols::BEQ).clone();
+        let is_equal = step.get_main_evaluation_element(0, cols::IS_EQUAL).clone();
+        let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
+        let res_hi = step.get_main_evaluation_element(0, cols::RES_HI).clone();
+
+        beq * is_equal * (res_lo + res_hi)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BeqIsEqualSumZeroConstraint {
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+}
+
+/// `BEQ * (1 - IS_EQUAL - (RES_LO + RES_HI) * RES_INV) = 0`
+pub struct BeqIsEqualWitnessConstraint {
+    constraint_idx: usize,
+}
+
+impl BeqIsEqualWitnessConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let beq = step.get_main_evaluation_element(0, cols::BEQ).clone();
+        let is_equal = step.get_main_evaluation_element(0, cols::IS_EQUAL).clone();
+        let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
+        let res_hi = step.get_main_evaluation_element(0, cols::RES_HI).clone();
+        let res_inv = step.get_main_evaluation_element(0, cols::RES_INV).clone();
+
+        let one = FieldElement::<F>::one();
+        beq * (one - is_equal - (res_lo + res_hi) * res_inv)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BeqIsEqualWitnessConstraint {
+    fn degree(&self) -> usize {
         3
     }
 
@@ -361,11 +476,15 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
 // SLT/BLT Zero Upper Bytes Constraints (u32-limb form)
 // =========================================================================
 
-/// Constraint: when SLT + BLT = 1, the upper three bytes of `res_lo` are zero.
+/// Constraint: when SLT + BLT = 1, RES_LO is 0 or 1.
 ///
-/// Equivalent to `(SLT + BLT) * (RES_LO - RES[0]) = 0`. Together with
-/// `SltResHiZeroConstraint` this replaces the seven byte-level constraints
-/// `(SLT + BLT) * RES[i] = 0` for i in 1..8.
+/// LT outputs a single bit. Combined with `SltResHiZeroConstraint` this
+/// guarantees the full 64-bit `res` is in `{0, 1}` under SLT/BLT.
+///
+/// Phase 2 step 9: prior form was `(SLT + BLT) * (RES_LO - RES[0]) = 0`,
+/// which read the now-removed byte cell `RES[0]`. The boolean check
+/// `RES_LO * (RES_LO - 1) = 0` is the direct u32-limb expression of the
+/// same invariant.
 pub struct SltResLoUpperBytesZeroConstraint {
     constraint_idx: usize,
 }
@@ -383,10 +502,10 @@ impl SltResLoUpperBytesZeroConstraint {
         let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
         let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
         let res_lo = step.get_main_evaluation_element(0, cols::RES_LO).clone();
-        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]).clone();
 
-        // (SLT + BLT) * (RES_LO - RES[0]) = 0
-        (slt + blt) * (res_lo - res_0)
+        let one = FieldElement::<F>::one();
+        // (SLT + BLT) * RES_LO * (RES_LO - 1) = 0
+        (slt + blt) * &res_lo * (res_lo - one)
     }
 }
 
@@ -394,7 +513,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
     for SltResLoUpperBytesZeroConstraint
 {
     fn degree(&self) -> usize {
-        2
+        3
     }
 
     fn constraint_idx(&self) -> usize {
@@ -1063,12 +1182,26 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 63 constraints (34 IS_BIT + 8 ADD + 21 other)
+/// Total: 65 constraints (34 IS_BIT + 8 ADD + 23 other)
 /// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
 /// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
 /// are required.)
-pub const NUM_CPU_CONSTRAINTS: usize =
-    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 3 + 3 + 3 + 2;
+///
+/// "other" includes: branch_cond (1), BEQ zero-test (2 — sum and witness),
+/// ebreak (1), arg1/arg2/rvd lower+upper (6), SLT res zero (2), ext bit
+/// zero (3), rv1/rv2 zero-forcing (6), next_pc (2).
+pub const NUM_CPU_CONSTRAINTS: usize = 34   // IS_BIT
+    + 2 + 2 + 2 + 2                          // ADD: ADD/LOAD + STORE addr + SUB/BEQ + JALR
+    + 1                                      // branch_cond
+    + 2                                      // BEQ zero-test (sum + witness)
+    + 1                                      // ebreak
+    + 3 + 3                                  // rv1/rv2 zero-forcing
+    + 1 + 1                                  // arg1 lower/upper
+    + 1 + 1                                  // arg2 lower/upper
+    + 1 + 1                                  // rvd lower/upper
+    + 2                                      // SLT res zero (lo bit + hi zero)
+    + 3                                      // ext bit zero (rv1, rv2, res)
+    + 2; // next_pc (cond + uncond)
 
 /// Creates all CPU constraints.
 ///
@@ -1107,6 +1240,12 @@ pub fn create_all_cpu_constraints() -> (
 
     // Branch condition
     other.push(BranchCondConstraint::new(next_idx).boxed());
+    next_idx += 1;
+
+    // BEQ zero-test (replaces ZERO bus, Phase 2 step 9A)
+    other.push(BeqIsEqualSumZeroConstraint::new(next_idx).boxed());
+    next_idx += 1;
+    other.push(BeqIsEqualWitnessConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // EBREAK

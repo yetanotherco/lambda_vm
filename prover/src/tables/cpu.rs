@@ -264,9 +264,14 @@ pub mod cols {
     /// res as u32 upper 32 bits
     pub const RES_HI: usize = 81;
 
-    /// Total number of columns (will shrink to 58 after Phase 2 byte
+    /// Multiplicative inverse of `RES_LO + RES_HI` when the sum is nonzero;
+    /// arbitrary (zero) otherwise. Aux witness for the BEQ zero-test that
+    /// replaces the byte-summing ZERO bus sender (Phase 2 step 9A).
+    pub const RES_INV: usize = 82;
+
+    /// Total number of columns (will shrink to ~58 after Phase 2 byte
     /// cells are removed at end of migration).
-    pub const NUM_COLUMNS: usize = 82;
+    pub const NUM_COLUMNS: usize = 83;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -604,16 +609,9 @@ impl CpuOperation {
             ));
         }
 
-        // ZERO lookup for is_equal (when BEQ=1)
-        if self.decode.op_beq {
-            // Sum of all result bytes
-            let mut sum: u64 = 0;
-            for i in 0..8 {
-                sum += (self.res >> (i * 8)) & 0xFF;
-            }
-            // Sum fits in 11 bits (max 8 * 255 = 2040), well within ZERO's 20-bit range
-            lookups.push(BitwiseOperation::zero(sum as u32));
-        }
+        // BEQ zero-test no longer uses BITWISE's ZERO lookup — handled
+        // inline by `BeqIsEqualSumZeroConstraint` + `BeqIsEqualWitnessConstraint`
+        // (Phase 2 step 9A).
 
         // AND/OR/XOR lookups (×8 each for each byte)
         let arg1 = self.compute_arg1();
@@ -891,6 +889,21 @@ pub fn generate_cpu_trace(
         }
         data[base + cols::RES_LO] = FE::from(res & 0xFFFF_FFFF);
         data[base + cols::RES_HI] = FE::from(res >> 32);
+
+        // RES_INV witness for the BEQ zero-test (Phase 2 step 9A).
+        // sum = RES_LO + RES_HI ∈ [0, 2^33-2). Both are non-negative, so
+        // sum == 0 iff res == 0. We commit (1 / sum) when sum != 0; any
+        // value (we use 0) when sum == 0 since it's gated by BEQ in the
+        // constraint and never read in that branch.
+        let res_lo = res & 0xFFFF_FFFF;
+        let res_hi = res >> 32;
+        let sum = res_lo + res_hi;
+        let res_inv = if sum != 0 {
+            FE::from(sum).inv().expect("nonzero element has inverse")
+        } else {
+            FE::zero()
+        };
+        data[base + cols::RES_INV] = res_inv;
 
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
@@ -1179,55 +1192,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // ZERO interaction for is_equal (BEQ)
+    // BEQ zero-test (replaces the prior `ZERO[sum(res[0..7])]` bus sender)
     // -------------------------------------------------------------------------
-    // ZERO[sum(res[0..7])] -> is_equal, multiplicity = BEQ
-    // If all 8 bytes of res are zero, sum = 0, is_equal = 1
-    interactions.push(BusInteraction::sender(
-        BusId::Zero,
-        Multiplicity::Column(cols::BEQ),
-        vec![
-            // Sum of all 8 result bytes as linear combination
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[0],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[1],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[2],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[3],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[5],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[7],
-                },
-            ]),
-            BusValue::Packed {
-                start_column: cols::IS_EQUAL,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+    // The check `is_equal == (res == 0)` is now enforced inline via two
+    // constraints in `prover/src/constraints/cpu.rs`
+    // (`BeqIsEqualSumZeroConstraint` and `BeqIsEqualWitnessConstraint`)
+    // using a witness-inverse pattern over `RES_LO + RES_HI`. No bus
+    // sender needed.
 
     // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT)

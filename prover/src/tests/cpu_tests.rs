@@ -310,12 +310,9 @@ fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
     // Expected interactions:
-    // - 8 AND_BYTE
-    // - 8 OR_BYTE
-    // - 8 XOR_BYTE
+    // - 8 BITWISE (unified bus: 8 byte pairs × 1 send each, op_id ∈ {1,2,4})
     // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
     // - 1 MSB8 (res_sign_bit)
-    // - 1 ZERO (is_equal for BEQ)
     // - 1 LT (less-than comparison)
     // - 1 M1 (MEMW read rs1 register)
     // - 1 M3 (MEMW read rs2 register)
@@ -331,15 +328,19 @@ fn test_bus_interactions_count() {
     // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
     // - 1 IS_BYTE for (RS1, RS2) paired
     // - 1 IS_BYTE for (RD, 0)
-    // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
-    // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 58
-    assert_eq!(interactions.len(), 58);
+    // - 12 IS_HALFWORD (ARG1/ARG2/RES u32 limb pairs: 4 pairs × 3 arrays;
+    //   migrated from IS_BYTE in Phase 2 step 7)
+    // AndByte/OrByte/XorByte (24 sends pre-split) collapsed into 8 unified
+    // BusId::Bitwise sends in commit 95e4d4b3.
+    // ZERO bus (1 send) replaced by 2 inline witness-inverse constraints
+    // in Phase 2 step 9A (BeqIsEqualSumZero + BeqIsEqualWitness).
+    // Total: 8 + 3 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 14 = 41
+    assert_eq!(interactions.len(), 41);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 76);
+    assert_eq!(cols::NUM_COLUMNS, 83);
 }
 
 #[test]
