@@ -193,6 +193,30 @@ where
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     main: Vec<Vec<FieldElement<Field>>>,
     aux: Vec<Vec<FieldElement<FieldExtension>>>,
+    /// Device-side main LDE buffer, populated only when the R1 GPU fused
+    /// pipeline ran for this table. Kept so R2/R3/R4 GPU paths can read
+    /// the LDE without re-H2D.
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    #[cfg(feature = "cuda")]
+    gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+}
+
+/// Result of `commit_main_trace` / `commit_preprocessed_trace`. Wraps the
+/// commitment Merkle data plus the owned LDE columns, and — when the R1
+/// fused GPU pipeline ran — the retained device LDE handle.
+pub struct MainTraceCommitResult<Field: IsFFTField>
+where
+    FieldElement<Field>: AsBytes,
+{
+    tree: BatchedMerkleTree<Field>,
+    root: Commitment,
+    precomputed_tree: Option<BatchedMerkleTree<Field>>,
+    precomputed_root: Option<Commitment>,
+    num_precomputed_cols: usize,
+    columns: Vec<Vec<FieldElement<Field>>>,
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
 }
 
 impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
@@ -210,7 +234,18 @@ where
         blowup_factor: usize,
         has_aux_trace: bool,
     ) -> Round1<Field, FieldExtension> {
-        let lde_trace = LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
+        #[allow(unused_mut)]
+        let mut lde_trace =
+            LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(h) = lde.gpu_main {
+                lde_trace.set_gpu_main(h);
+            }
+            if let Some(h) = lde.gpu_aux {
+                lde_trace.set_gpu_aux(h);
+            }
+        }
 
         let main = Round1CommitmentData::<Field> {
             lde_trace_merkle_tree: Arc::clone(&self.main_merkle_tree),
@@ -517,6 +552,19 @@ pub trait IsStarkProver<
             return;
         }
 
+        // GPU batched fast path: all columns at once in one pipeline on one
+        // stream. Falls through to per-column rayon when the table is too
+        // small, the element type isn't Goldilocks, or the `cuda` feature is
+        // off.
+        #[cfg(feature = "cuda")]
+        if crate::gpu_lde::try_expand_columns_batched::<Field, E>(
+            columns,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+        ) {
+            return;
+        }
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
@@ -534,29 +582,52 @@ pub trait IsStarkProver<
     }
 
     /// Compute main LDE, commit, and return the Merkle tree/root along with the
-    /// owned LDE columns (consumed later in Phase D).
+    /// owned LDE columns (consumed later in Phase D). When the fused GPU
+    /// pipeline runs, the device LDE buffer is also kept alive and returned so
+    /// downstream rounds can read it without a re-H2D.
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-    ) -> Result<
-        (
-            BatchedMerkleTree<Field>,
-            Commitment,
-            Option<BatchedMerkleTree<Field>>,
-            Option<Commitment>,
-            usize,
-            Vec<Vec<FieldElement<Field>>>,
-        ),
-        ProvingError,
-    >
+    ) -> Result<MainTraceCommitResult<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+
+        #[cfg(feature = "cuda")]
+        {
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            if let Some((tree, handle)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_batched_keep::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
+            {
+                #[cfg(feature = "instruments")]
+                let main_lde_dur = t_sub.elapsed();
+                #[cfg(feature = "instruments")]
+                let zero = std::time::Duration::from_secs(0);
+                let root = tree.root;
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(main_lde_dur, zero);
+                return Ok(MainTraceCommitResult {
+                    tree,
+                    root,
+                    precomputed_tree: None,
+                    precomputed_root: None,
+                    num_precomputed_cols: 0,
+                    columns,
+                    gpu_main: Some(handle),
+                });
+            }
+        }
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -570,7 +641,16 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
-        Ok((tree, root, None, None, 0, columns))
+        Ok(MainTraceCommitResult {
+            tree,
+            root,
+            precomputed_tree: None,
+            precomputed_root: None,
+            num_precomputed_cols: 0,
+            columns,
+            #[cfg(feature = "cuda")]
+            gpu_main: None,
+        })
     }
 
     /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
@@ -581,17 +661,7 @@ pub trait IsStarkProver<
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
-    ) -> Result<
-        (
-            BatchedMerkleTree<Field>,
-            Commitment,
-            Option<BatchedMerkleTree<Field>>,
-            Option<Commitment>,
-            usize,
-            Vec<Vec<FieldElement<Field>>>,
-        ),
-        ProvingError,
-    >
+    ) -> Result<MainTraceCommitResult<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -621,14 +691,16 @@ pub trait IsStarkProver<
             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
         );
 
-        Ok((
-            mult_tree,
-            mult_root,
-            Some(precomputed_tree),
-            Some(precomputed_root),
+        Ok(MainTraceCommitResult {
+            tree: mult_tree,
+            root: mult_root,
+            precomputed_tree: Some(precomputed_tree),
+            precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
             columns,
-        ))
+            #[cfg(feature = "cuda")]
+            gpu_main: None,
+        })
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -840,6 +912,18 @@ pub trait IsStarkProver<
         // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
         // The squared coset offset is g² (= coset_offset²).
         let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
+
+        // GPU fast path: batch both halves into one ext3 LDE call. Requires
+        // `cuda` feature and a qualifying size; falls through to CPU when not.
+        #[cfg(feature = "cuda")]
+        if let Some((lde_h0, lde_h1)) = crate::gpu_lde::try_extend_two_halves_gpu(
+            &h0_evals,
+            &h1_evals,
+            &coset_offset_squared,
+            domain,
+        ) {
+            return vec![lde_h0, lde_h1];
+        }
 
         #[cfg(feature = "parallel")]
         let (lde_h0, lde_h1) = rayon::join(
@@ -1626,6 +1710,9 @@ pub trait IsStarkProver<
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
+        #[cfg(feature = "cuda")]
+        let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
+            Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1658,19 +1745,21 @@ pub trait IsStarkProver<
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
             for result in chunk_results {
-                let (tree, root, pre_tree, pre_root, n_pre, cached_main) = result?;
-                if let Some(ref pre_r) = pre_root {
+                let r = result?;
+                if let Some(ref pre_r) = r.precomputed_root {
                     transcript.append_bytes(pre_r);
                 }
-                transcript.append_bytes(&root);
+                transcript.append_bytes(&r.root);
                 main_commits.push(MainCommitData {
-                    main_tree: Arc::new(tree),
-                    main_root: root,
-                    precomputed_tree: pre_tree.map(Arc::new),
-                    precomputed_root: pre_root,
-                    num_precomputed_cols: n_pre,
+                    main_tree: Arc::new(r.tree),
+                    main_root: r.root,
+                    precomputed_tree: r.precomputed_tree.map(Arc::new),
+                    precomputed_root: r.precomputed_root,
+                    num_precomputed_cols: r.num_precomputed_cols,
                 });
-                main_ldes.push(cached_main);
+                main_ldes.push(r.columns);
+                #[cfg(feature = "cuda")]
+                main_gpu_handles.push(r.gpu_main);
             }
         }
 
@@ -1747,13 +1836,24 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K
-        #[allow(clippy::type_complexity)]
-        let mut aux_results: Vec<(
-            Option<Arc<BatchedMerkleTree<FieldExtension>>>,
+        // Parallel aux commit in chunks of K. Fourth field is an optional
+        // GPU ext3 LDE handle retained when the R1 fused pipeline fires.
+        #[cfg(feature = "cuda")]
+        type AuxResult<FE> = (
+            Option<Arc<BatchedMerkleTree<FE>>>,
             Option<Commitment>,
-            Vec<Vec<FieldElement<FieldExtension>>>,
-        )> = Vec::with_capacity(num_airs);
+            Vec<Vec<FieldElement<FE>>>,
+            Option<math_cuda::lde::GpuLdeExt3>,
+        );
+        #[cfg(not(feature = "cuda"))]
+        type AuxResult<FE> = (
+            Option<Arc<BatchedMerkleTree<FE>>>,
+            Option<Commitment>,
+            Vec<Vec<FieldElement<FE>>>,
+            (),
+        );
+        #[allow(clippy::type_complexity)]
+        let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1773,6 +1873,40 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
                         let mut columns = trace.extract_columns_aux(lde_size);
+
+                        // GPU combined path: ext3 LDE + Keccak-256 leaf
+                        // hashing + Merkle tree build in one on-device
+                        // pipeline. The fused `_keep` variant also returns
+                        // the device LDE handle for downstream GPU rounds.
+                        #[cfg(feature = "cuda")]
+                        {
+                            #[cfg(feature = "instruments")]
+                            let t_sub = Instant::now();
+                            if let Some((tree, handle)) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3_keep::<
+                                    Field,
+                                    FieldExtension,
+                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                >(
+                                    &mut columns, domain.blowup_factor, &twiddles.coset_weights
+                                )
+                            {
+                                #[cfg(feature = "instruments")]
+                                let aux_lde_dur = t_sub.elapsed();
+                                #[cfg(feature = "instruments")]
+                                let zero = std::time::Duration::from_secs(0);
+                                let root = tree.root;
+                                #[cfg(feature = "instruments")]
+                                crate::instruments::accum_r1_aux(aux_lde_dur, zero);
+                                return Ok((
+                                    Some(Arc::new(tree)),
+                                    Some(root),
+                                    columns,
+                                    Some(handle),
+                                ));
+                            }
+                        }
+
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_columns_to_lde::<FieldExtension>(
@@ -1789,20 +1923,28 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
 
-                        Ok((Some(Arc::new(tree)), Some(root), columns))
+                        #[cfg(feature = "cuda")]
+                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
+                        #[cfg(not(feature = "cuda"))]
+                        let aux_gpu: () = ();
+                        Ok((Some(Arc::new(tree)), Some(root), columns, aux_gpu))
                     } else {
-                        Ok((None, None, Vec::new()))
+                        #[cfg(feature = "cuda")]
+                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
+                        #[cfg(not(feature = "cuda"))]
+                        let aux_gpu: () = ();
+                        Ok((None, None, Vec::new(), aux_gpu))
                     }
                 })
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_tree, aux_root, cached_aux) = result?;
+                let (aux_tree, aux_root, cached_aux, aux_gpu) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-                aux_results.push((aux_tree, aux_root, cached_aux));
+                aux_results.push((aux_tree, aux_root, cached_aux, aux_gpu));
             }
         }
 
@@ -1811,12 +1953,25 @@ pub trait IsStarkProver<
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
-            main_commits
-                .into_iter()
-                .zip(main_ldes)
-                .zip(aux_results)
-                .zip(bus_inputs_vec)
+        // Zip in the optional GPU handles so the Lde constructor always
+        // has a value for its gpu_main/gpu_aux. Under `cfg(not(cuda))` the
+        // handles are `()` (see AuxResult type alias) — we just discard them.
+        #[cfg(feature = "cuda")]
+        let main_gpu_iter: Box<dyn Iterator<Item = Option<math_cuda::lde::GpuLdeBase>>> =
+            Box::new(main_gpu_handles.into_iter());
+        #[cfg(not(feature = "cuda"))]
+        let main_gpu_iter: Box<dyn Iterator<Item = ()>> =
+            Box::new(std::iter::repeat_with(|| ()).take(num_airs));
+
+        for (
+            (((main_commit, main_lde), main_gpu_h), (aux_tree, aux_root, cached_aux, aux_gpu_h)),
+            bus_public_inputs,
+        ) in main_commits
+            .into_iter()
+            .zip(main_ldes)
+            .zip(main_gpu_iter)
+            .zip(aux_results)
+            .zip(bus_inputs_vec)
         {
             commitments.push(Round1Commitments {
                 main_merkle_tree: main_commit.main_tree,
@@ -1829,10 +1984,22 @@ pub trait IsStarkProver<
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
             });
+            #[cfg(feature = "cuda")]
             cached_ldes.push(Lde {
                 main: main_lde,
                 aux: cached_aux,
+                gpu_main: main_gpu_h,
+                gpu_aux: aux_gpu_h,
             });
+            #[cfg(not(feature = "cuda"))]
+            {
+                #[allow(clippy::let_unit_value)]
+                let _ = (main_gpu_h, aux_gpu_h);
+                cached_ldes.push(Lde {
+                    main: main_lde,
+                    aux: cached_aux,
+                });
+            }
         }
 
         #[cfg(feature = "instruments")]
