@@ -4,8 +4,8 @@
 # Usage: calibrate_threshold.sh elf1.elf [elf2.elf ...]
 #
 # Builds CLI with jemalloc-stats, runs each ELF under `/usr/bin/time -v`,
-# and prints predicted vs measured peak. The max of rss/pred is r_max;
-# set the threshold in select_storage_mode to ~1/r_max minus a small margin.
+# and prints predicted vs measured peak. Use the rss/pred ratio to adjust
+# the safety margin in `auto_storage.rs`.
 
 set -euo pipefail
 
@@ -50,5 +50,4 @@ for elf in "$@"; do
 done
 
 echo ""
-echo "Take the max rss/pred across runs as r_max."
-echo "Set threshold in select_storage_mode to ~1/r_max minus margin (e.g. 0.05)."
+echo "Use the rss/pred ratio to adjust the safety margin in auto_storage.rs."
