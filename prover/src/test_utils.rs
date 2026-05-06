@@ -708,9 +708,9 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BRANCH")
 }
 
-/// Create BinaryAdd AIR (Phase 2 step 1 skeleton — no constraints, no buses).
+/// Create BinaryAdd AIR with carry-chain constraints and bus interactions.
 pub fn create_binary_add_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let transition_constraints = crate::tables::binary_add::binary_add_constraints();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: crate::tables::binary_add::bus_interactions(),

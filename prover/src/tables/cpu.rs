@@ -1223,6 +1223,35 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
+    // BinaryAdd interaction (Phase 2 step 2: forward-add for ADD, LOAD)
+    // -------------------------------------------------------------------------
+    // BinaryAdd[lhs, rhs, sum] proves lhs + rhs = sum (mod 2^64).
+    //   ADD:  lhs=arg1, rhs=arg2, sum=res (arithmetic addition)
+    //   LOAD: lhs=arg1, rhs=arg2 (offset), sum=res (effective address)
+    // Step 3 will extend to STORE/SUB/BEQ/JALR (some via the SUB receiver).
+    // The inline AddConstraint in CPU also still validates these on-row, so
+    // BinaryAdd is currently a redundant validator until step 4 drops the
+    // inline path.
+    interactions.push(BusInteraction::sender(
+        BusId::BinaryAdd,
+        Multiplicity::Sum(cols::ADD, cols::LOAD),
+        vec![
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT)
     // -------------------------------------------------------------------------
     // LT[arg1, arg2, signed] -> res[0]

@@ -1017,6 +1017,37 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     bitwise_ops
 }
 
+/// Collects IS_HALFWORD bitwise lookups from BinaryAdd operations.
+///
+/// BinaryAdd sends 12 IS_HALFWORD lookups per dispatched op (4 halfwords each
+/// for lhs / rhs / sum) so that the carry-chain constraints can rely on each
+/// halfword being in `[0, 2^16)`. The multiplicity on the BinaryAdd side is
+/// `Sum(MU_ADD, MU_SUB)`, but the bitwise table only sees raw counts — one
+/// lookup per raw op-flavour pair.
+///
+/// Returns: Vec of bitwise lookups (12 × len(ops)).
+fn collect_bitwise_from_binary_add(
+    ops: &[(
+        super::binary_add::BinaryAddOperation,
+        super::binary_add::BinaryAddFlavour,
+    )],
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 12);
+    for (op, _flavour) in ops {
+        for &value in &[op.lhs, op.rhs, op.sum] {
+            for shift in [0u32, 16, 32, 48] {
+                let half = ((value >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+    }
+    bitwise_ops
+}
+
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
 ///
 /// MUL sends MSB16 lookups when signed=1 to extract sign bits,
@@ -1689,6 +1720,12 @@ struct CollectedOps {
     mul_ops: Vec<(MulOperation, bool)>,
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
+    /// (Phase 2 step 2) ADD/LOAD CPU rows that dispatch to `BusId::BinaryAdd`.
+    /// Step 3 will append STORE/JALR (forward) and SUB/BEQ (reverse).
+    binary_add_ops: Vec<(
+        super::binary_add::BinaryAddOperation,
+        super::binary_add::BinaryAddFlavour,
+    )>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1793,6 +1830,23 @@ fn collect_all_ops(
         mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
     }
 
+    // Phase 2 step 2: collect BinaryAdd dispatches for ADD/LOAD CPU rows.
+    // The CPU's existing AddConstraint still fires inline (carry validation
+    // happens twice until step 4 drops the inline path); this adds the
+    // BinaryAdd-side absorption so the new bus balances.
+    let binary_add_ops: Vec<_> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.op_add || op.decode.op_load)
+        .map(|op| {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            (
+                super::binary_add::BinaryAddOperation::for_add(arg1, arg2),
+                super::binary_add::BinaryAddFlavour::Add,
+            )
+        })
+        .collect();
+
     CollectedOps {
         cpu_ops,
         memw_ops,
@@ -1806,6 +1860,7 @@ fn collect_all_ops(
         mul_ops,
         dvrm_ops,
         commit_ops,
+        binary_add_ops,
     }
 }
 
@@ -1838,6 +1893,7 @@ fn build_traces(
         mul_ops,
         dvrm_ops,
         commit_ops,
+        binary_add_ops,
     } = ops;
 
     // =====================================================================
@@ -1855,6 +1911,7 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+    bitwise_ops.extend(collect_bitwise_from_binary_add(&binary_add_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
     // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
@@ -1984,7 +2041,7 @@ fn build_traces(
         halt: halt_trace,
         commit: commit_trace,
         memw_registers,
-        binary_add: super::binary_add::generate_binary_add_trace(),
+        binary_add: super::binary_add::generate_binary_add_trace(&binary_add_ops),
         binary: super::binary::generate_binary_trace(),
     })
 }

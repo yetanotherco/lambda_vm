@@ -1,93 +1,301 @@
 //! BinaryAdd AIR — proves `lhs + rhs = sum (mod 2^64)` for ADD-style ops
-//! that the CPU dispatches via `BusId::BinaryAdd`.
+//! that the CPU dispatches via [`BusId::BinaryAdd`].
 //!
-//! ## Status
+//! ## Phase 2 progress
 //!
-//! **Phase 2 step 1: skeleton only.** Column layout and module wiring are
-//! in place; no transition constraints, no bus interactions, no real
-//! witness generation. The AIR proves trivially against a padded zero
-//! trace and absorbs nothing. Subsequent steps fill in:
+//! - **Step 1** (✓): skeleton AIR + bus ID + wiring.
+//! - **Step 2** (this commit): carry-chain transition constraints, halfword
+//!   range-check senders, and the `Multiplicity::Sum(MU_ADD, MU_SUB)`
+//!   receiver on [`BusId::BinaryAdd`]. Trace-builder collects ADD/LOAD
+//!   ops from CPU and emits one row per unique `(lhs, rhs, sum)` tuple
+//!   with `MU_ADD` set; `MU_SUB` stays at 0 until step 3.
+//! - **Step 3**: trace-builder also collects STORE/SUB/BEQ/JALR.
+//! - **Step 4**: drop the now-redundant inline carry constraints from CPU.
 //!
-//! - **Step 2** — carry-chain transition constraints + receiver on
-//!   `BusId::BinaryAdd` for ADD/LOAD ops.
-//! - **Step 3** — extend the receiver to STORE/SUB/BEQ/JALR.
-//! - **Step 4** — drop the now-redundant inline carry constraints from
-//!   the CPU AIR.
+//! ## Column layout (14 total)
 //!
-//! ## Eventual column layout (target after step 2)
+//! Operands are stored as 4 halfwords each (DWordHL). Each halfword is
+//! range-checked via an `IS_HALFWORD` sender; the carry chain itself uses
+//! [`AddConstraint`]'s virtual-carry trick (no committed carry columns).
 //!
 //! | Range | Cols | Description |
 //! |---|---:|---|
-//! | `LHS_LO, LHS_HI` | 2 | lhs as DWordWL |
-//! | `RHS_LO, RHS_HI` | 2 | rhs as DWordWL |
-//! | `SUM_LO, SUM_HI` | 2 | sum as DWordWL |
-//! | `CARRY_0, CARRY_1` | 2 | bit (carry between word boundaries) |
-//! | `MU_ADD, MU_SUB` | 2 | per-flavour multiplicities |
-//! | **NUM_COLUMNS** | **10** | |
+//! | `LHS_0..3` | 4 | lhs as DWordHL halfwords |
+//! | `RHS_0..3` | 4 | rhs as DWordHL halfwords |
+//! | `SUM_0..3` | 4 | `lhs + rhs (mod 2^64)` as DWordHL halfwords |
+//! | `MU_ADD`   | 1 | multiplicity for forward-add (ADD/LOAD/STORE/JALR) |
+//! | `MU_SUB`   | 1 | multiplicity for reverse-add (SUB/BEQ) |
 
-use stark::lookup::BusInteraction;
+use std::collections::HashMap;
+
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::constraints::templates::{AddConstraint, AddOperand};
+
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
-// Column indices for BinaryAdd table
+// Column layout
 // =========================================================================
 
 /// Column definitions for the BinaryAdd table.
 pub mod cols {
-    /// lhs (low word) — DWordWL[0]
-    pub const LHS_LO: usize = 0;
-    /// lhs (high word) — DWordWL[1]
-    pub const LHS_HI: usize = 1;
+    /// lhs halfword 0 (bits 0..16)
+    pub const LHS_0: usize = 0;
+    /// lhs halfword 1 (bits 16..32)
+    pub const LHS_1: usize = 1;
+    /// lhs halfword 2 (bits 32..48)
+    pub const LHS_2: usize = 2;
+    /// lhs halfword 3 (bits 48..64)
+    pub const LHS_3: usize = 3;
 
-    /// rhs (low word)
-    pub const RHS_LO: usize = 2;
-    /// rhs (high word)
-    pub const RHS_HI: usize = 3;
+    pub const RHS_0: usize = 4;
+    pub const RHS_1: usize = 5;
+    pub const RHS_2: usize = 6;
+    pub const RHS_3: usize = 7;
 
-    /// sum = lhs + rhs (low word)
-    pub const SUM_LO: usize = 4;
-    /// sum (high word)
-    pub const SUM_HI: usize = 5;
+    pub const SUM_0: usize = 8;
+    pub const SUM_1: usize = 9;
+    pub const SUM_2: usize = 10;
+    pub const SUM_3: usize = 11;
 
-    /// Bit: carry from `LHS_LO + RHS_LO` into the high word.
-    pub const CARRY_0: usize = 6;
-    /// Bit: overflow carry from `LHS_HI + RHS_HI + CARRY_0` (discarded by mod 2^64).
-    pub const CARRY_1: usize = 7;
+    /// Multiplicity for forward-add (ADD/LOAD/STORE/JALR).
+    pub const MU_ADD: usize = 12;
+    /// Multiplicity for reverse-add (SUB/BEQ): the row absorbs CPU senders that
+    /// supply `(arg2, res, arg1)` as `(lhs, rhs, sum)` to prove `arg2+res=arg1`.
+    pub const MU_SUB: usize = 13;
 
-    /// Multiplicity for the forward-add flavour (ADD/LOAD/STORE/JALR send here).
-    pub const MU_ADD: usize = 8;
-    /// Multiplicity for the reverse-add flavour (SUB/BEQ send here, with operands swapped).
-    pub const MU_SUB: usize = 9;
-
-    /// Total column count.
-    pub const NUM_COLUMNS: usize = 10;
+    pub const NUM_COLUMNS: usize = 14;
 }
 
 // =========================================================================
-// Trace generation (skeleton)
+// BinaryAddOperation — input to trace generation
 // =========================================================================
 
-/// Generates an empty BinaryAdd trace.
+/// A single (lhs, rhs, sum) triple with `lhs + rhs = sum (mod 2^64)`.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct BinaryAddOperation {
+    pub lhs: u64,
+    pub rhs: u64,
+    pub sum: u64,
+}
+
+impl BinaryAddOperation {
+    pub fn new(lhs: u64, rhs: u64, sum: u64) -> Self {
+        debug_assert_eq!(
+            lhs.wrapping_add(rhs),
+            sum,
+            "BinaryAddOperation invariant: lhs + rhs == sum (mod 2^64)"
+        );
+        Self { lhs, rhs, sum }
+    }
+
+    /// Build the ADD-flavour op for an ADD/LOAD CPU row (`res = arg1 + arg2`).
+    pub fn for_add(arg1: u64, arg2: u64) -> Self {
+        let sum = arg1.wrapping_add(arg2);
+        Self {
+            lhs: arg1,
+            rhs: arg2,
+            sum,
+        }
+    }
+}
+
+/// Which receiver flavour absorbs a given CPU op. Forwards (ADD/LOAD/STORE/JALR)
+/// dispatch with `(lhs, rhs, sum) = (arg1, arg2, res)`. Reverses (SUB/BEQ)
+/// dispatch with `(lhs, rhs, sum) = (arg2, res, arg1)`, proving `arg2+res=arg1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryAddFlavour {
+    Add,
+    Sub,
+}
+
+// =========================================================================
+// Trace generation
+// =========================================================================
+
+/// Generates the BinaryAdd trace from a list of (op, flavour) pairs.
 ///
-/// **Step 1**: returns a 4-row zero trace (the minimum the framework
-/// accepts). Real witness generation lands in step 2 alongside the
-/// receiver and constraints.
-pub fn generate_binary_add_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = 4;
-    let data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+/// Operations are deduplicated by `(lhs, rhs, sum)`. Each unique row tracks
+/// separate multiplicities for the ADD and SUB flavours.
+pub fn generate_binary_add_trace(
+    operations: &[(BinaryAddOperation, BinaryAddFlavour)],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let mut multiplicities: HashMap<BinaryAddOperation, (u64, u64)> = HashMap::new();
+    for (op, flavour) in operations {
+        let entry = multiplicities.entry(*op).or_insert((0, 0));
+        match flavour {
+            BinaryAddFlavour::Add => entry.0 += 1,
+            BinaryAddFlavour::Sub => entry.1 += 1,
+        }
+    }
+
+    let unique_ops: Vec<_> = multiplicities.into_iter().collect();
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+
+    for (row_idx, (op, (mu_add, mu_sub))) in unique_ops.iter().enumerate() {
+        let base = row_idx * cols::NUM_COLUMNS;
+        write_op_halfwords(&mut data, base + cols::LHS_0, op.lhs);
+        write_op_halfwords(&mut data, base + cols::RHS_0, op.rhs);
+        write_op_halfwords(&mut data, base + cols::SUM_0, op.sum);
+        data[base + cols::MU_ADD] = FE::from(*mu_add);
+        data[base + cols::MU_SUB] = FE::from(*mu_sub);
+    }
+
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+#[inline]
+fn write_op_halfwords(data: &mut [FE], start: usize, value: u64) {
+    data[start] = FE::from(value & 0xFFFF);
+    data[start + 1] = FE::from((value >> 16) & 0xFFFF);
+    data[start + 2] = FE::from((value >> 32) & 0xFFFF);
+    data[start + 3] = FE::from((value >> 48) & 0xFFFF);
+}
+
 // =========================================================================
-// Bus interactions (skeleton)
+// Constraints
+// =========================================================================
+
+/// Returns the BinaryAdd transition constraints.
+///
+/// Two unconditional carry-chain constraints (from `AddConstraint`)
+/// enforce `LHS + RHS = SUM (mod 2^64)` on every row. On padding rows
+/// (all zeros) the constraint trivially evaluates to `0 = 0`.
+pub fn binary_add_constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let lhs = AddOperand::from_dword_hl(cols::LHS_0);
+    let rhs = AddOperand::from_dword_hl(cols::RHS_0);
+    let sum = AddOperand::from_dword_hl(cols::SUM_0);
+    let (carry_0, carry_1) = AddConstraint::new_pair(Vec::new(), lhs, rhs, sum, 0);
+    vec![carry_0.boxed(), carry_1.boxed()]
+}
+
+// =========================================================================
+// Bus interactions
 // =========================================================================
 
 /// Returns the BinaryAdd bus interactions.
 ///
-/// **Step 1**: empty — AIR absorbs nothing yet. Step 2 adds the
-/// `BusId::BinaryAdd` receiver.
+/// **Senders (12)**: one `IS_HALFWORD` per halfword column. The senders
+/// fire on every active row (multiplicity = `MU_ADD + MU_SUB`, both 0 on
+/// padding). This range-checks each halfword to `[0, 2^16)`, which the
+/// carry constraints rely on for soundness.
+///
+/// **Receiver (1, step 2)**: `BusId::BinaryAdd` with multiplicity `MU_ADD`,
+/// carrying `(lhs::DWordHL, rhs::DWordHL, sum::DWordHL)`. CPU's ADD/LOAD
+/// senders (forward flavour) are absorbed here. Step 3 will add a second
+/// receiver on the same bus with multiplicity `MU_SUB`.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    Vec::new()
+    let mut interactions = Vec::with_capacity(13);
+
+    let halfword_cols = [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+        cols::SUM_0,
+        cols::SUM_1,
+        cols::SUM_2,
+        cols::SUM_3,
+    ];
+    for col in halfword_cols {
+        // SECURITY: Step 2 uses Multiplicity::Column(MU_ADD), not Sum(MU_ADD, MU_SUB).
+        // MU_SUB is an unused witness column in step 2 (no SUB receiver exists yet)
+        // — adding it to this Sum would let a malicious prover set MU_SUB = p - MU_ADD
+        // so the effective multiplicity is 0 in the field, silently disabling halfword
+        // range checks and breaking carry-chain soundness. Step 3 must (a) add the
+        // BinaryAdd receiver with Multiplicity::Column(MU_SUB) so MU_SUB participates
+        // in bus balance, AND (b) at the same commit switch this back to
+        // Sum(MU_ADD, MU_SUB) so SUB-flavour rows also fire IS_HALFWORD.
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU_ADD),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    interactions.push(BusInteraction::receiver(
+        BusId::BinaryAdd,
+        Multiplicity::Column(cols::MU_ADD),
+        vec![
+            BusValue::Packed {
+                start_column: cols::LHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::RHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::SUM_0,
+                packing: Packing::DWordHL,
+            },
+        ],
+    ));
+
+    interactions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_invariant_holds_for_for_add() {
+        let op = BinaryAddOperation::for_add(5, 7);
+        assert_eq!(op.lhs, 5);
+        assert_eq!(op.rhs, 7);
+        assert_eq!(op.sum, 12);
+    }
+
+    #[test]
+    fn op_invariant_wraps_at_u64() {
+        let op = BinaryAddOperation::for_add(u64::MAX, 1);
+        assert_eq!(op.sum, 0);
+    }
+
+    #[test]
+    fn trace_dedupes_by_operand_tuple() {
+        let op = BinaryAddOperation::for_add(3, 4);
+        let ops = vec![
+            (op, BinaryAddFlavour::Add),
+            (op, BinaryAddFlavour::Add),
+            (op, BinaryAddFlavour::Sub),
+        ];
+        let trace = generate_binary_add_trace(&ops);
+        // First (and only meaningful) row.
+        let row = trace.main_table.get_row(0);
+        assert_eq!(*row[cols::MU_ADD].value(), 2);
+        assert_eq!(*row[cols::MU_SUB].value(), 1);
+    }
+
+    #[test]
+    fn trace_columns_match_layout() {
+        let op = BinaryAddOperation::for_add(0x1122_3344_5566_7788, 0x1);
+        let trace = generate_binary_add_trace(&[(op, BinaryAddFlavour::Add)]);
+        let row = trace.main_table.get_row(0);
+        assert_eq!(*row[cols::LHS_0].value(), 0x7788);
+        assert_eq!(*row[cols::LHS_1].value(), 0x5566);
+        assert_eq!(*row[cols::LHS_2].value(), 0x3344);
+        assert_eq!(*row[cols::LHS_3].value(), 0x1122);
+        assert_eq!(*row[cols::RHS_0].value(), 0x1);
+        assert_eq!(*row[cols::SUM_0].value(), 0x7789);
+    }
+
+    #[test]
+    fn empty_ops_produces_padded_trace() {
+        let trace = generate_binary_add_trace(&[]);
+        assert_eq!(trace.main_table.height, 4);
+    }
 }
