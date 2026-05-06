@@ -10,7 +10,6 @@ use rayon::prelude::*;
 
 /// Mmap-backed storage for a spilled Table.
 ///
-/// The table data is written row-major to a temp file and mmapped back.
 /// Access goes through pointer arithmetic on the mmap, matching the
 /// original `data[row * width + col]` layout.
 #[cfg(feature = "disk-spill")]
