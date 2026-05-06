@@ -253,7 +253,6 @@ impl<F: IsField> Table<F> {
     }
 
     /// Given row and column indexes, returns the stored field element in that position of the table.
-    #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
