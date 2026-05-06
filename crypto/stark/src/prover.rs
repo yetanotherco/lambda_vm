@@ -2058,29 +2058,6 @@ pub trait IsStarkProver<
         Ok(MultiProof { proofs })
     }
 
-    /// Multi-AIR prove with `StorageMode::Ram`. Test convenience.
-    #[cfg(test)]
-    fn multi_prove_ram(
-        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        PI: Send + Sync + Clone,
-        Field: Copy + 'static,
-        FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
-    {
-        Self::multi_prove(
-            air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )
-    }
-
     /// Generate a STARK proof for a single AIR/trace.
     /// This is equivalent to calling `multi_prove` with a single-element slice.
     fn prove(

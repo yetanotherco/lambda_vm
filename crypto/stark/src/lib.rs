@@ -27,6 +27,8 @@ pub mod traits;
 pub mod verifier;
 
 #[cfg(test)]
+pub mod test_utils;
+#[cfg(test)]
 pub mod tests;
 
 /// Configurations of the Prover available in compile time
