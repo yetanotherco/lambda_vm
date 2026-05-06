@@ -2151,8 +2151,7 @@ pub fn count_table_lengths(
     // Phase 0: ELF → instructions + DECODE row count.
     let instructions = decode::instructions_from_elf(elf)
         .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-    // Mirrors the padding inside `generate_decode_trace`: +1 for the CPU
-    // padding entry, then round up to the next power of two with floor 2.
+    // Mirrors the padding inside `generate_decode_trace`.
     let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
 
     // Memory + register state for partition predicates that need timestamps.
@@ -2162,9 +2161,7 @@ pub fn count_table_lengths(
 
     // Raw counts (pre-chunking + pre-padding).
     let mut cpu_count = 0usize;
-    // memw_by_width[i] for i in 0..4 maps width 1/2/4/8 → wide-MEMW counts.
-    // Used by the LT-from-MEMW derivation: each wide-MEMW op contributes
-    // 1, 2, 4, or 8 LT ops based on its width.
+    // Wide-MEMW counts bucketed by width, used by the LT-from-MEMW derivation.
     let mut memw_by_width: [usize; 4] = [0; 4];
     let mut memw_aligned_count = 0usize;
     let mut memw_register_count = 0usize;
@@ -2227,7 +2224,7 @@ pub fn count_table_lengths(
             );
         }
 
-        // Register accesses (M1 read rs1, M3 read rs2, M5 write rd).
+        // Register accesses.
         let reg_memw_ops = collect_register_ops_from_cpu(&cpu_op, &mut register_state);
         for memw_op in &reg_memw_ops {
             partition_memw(
@@ -2280,9 +2277,7 @@ pub fn count_table_lengths(
         }
     }
 
-    // HALT finalization: 32 register MEMW ops at ts=u64::MAX. Their timestamp
-    // delta vs old_timestamp is enormous, so they fail `is_register_op`'s
-    // `<= 0x10000` check and fall through to wide MEMW.
+    // HALT finalization. Halt ops fall through to wide MEMW.
     let halt_memw_ops = collect_halt_ops(&mut register_state);
     for memw_op in &halt_memw_ops {
         partition_memw(
@@ -2293,14 +2288,13 @@ pub fn count_table_lengths(
         );
     }
 
-    // LT-from-MEMW: per wide-MEMW op, 1/2/4/8 LT ops by width.
-    // LT-from-MEMW_A: 1 LT op per memw_aligned op.
+    // LT ops derived from wide-MEMW and memw_aligned ops.
     let memw_count = memw_by_width.iter().sum::<usize>();
     let lt_from_memw =
         memw_by_width[0] + 2 * memw_by_width[1] + 4 * memw_by_width[2] + 8 * memw_by_width[3];
     lt_count += lt_from_memw + memw_aligned_count;
 
-    // DVRM-derived: 2 mul ops (lo + hi) and 1 lt op (|r| < |d|) per dvrm.
+    // DVRM derives mul and lt ops.
     mul_count += 2 * dvrm_count;
     lt_count += dvrm_count;
 
