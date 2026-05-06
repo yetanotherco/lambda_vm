@@ -1223,15 +1223,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // BinaryAdd interaction (Phase 2 step 2: forward-add for ADD, LOAD)
+    // BinaryAdd interactions (Phase 2 step 3: 4 forward + 1 reverse senders)
     // -------------------------------------------------------------------------
     // BinaryAdd[lhs, rhs, sum] proves lhs + rhs = sum (mod 2^64).
-    //   ADD:  lhs=arg1, rhs=arg2, sum=res (arithmetic addition)
-    //   LOAD: lhs=arg1, rhs=arg2 (offset), sum=res (effective address)
-    // Step 3 will extend to STORE/SUB/BEQ/JALR (some via the SUB receiver).
-    // The inline AddConstraint in CPU also still validates these on-row, so
-    // BinaryAdd is currently a redundant validator until step 4 drops the
-    // inline path.
+    //   Forward (MU_ADD receiver): ADD/LOAD/STORE/JALR.
+    //   Reverse (MU_SUB receiver): SUB/BEQ — operands swap on send so the
+    //                              receiver's lhs+rhs=sum proves arg2+res=arg1.
+    // CPU's inline AddConstraint is still active (will be dropped in step 4),
+    // so BinaryAdd currently double-validates these op families.
+
+    // ADD/LOAD: lhs=arg1, rhs=arg2, sum=res.
     interactions.push(BusInteraction::sender(
         BusId::BinaryAdd,
         Multiplicity::Sum(cols::ADD, cols::LOAD),
@@ -1246,6 +1247,73 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+        ],
+    ));
+
+    // STORE: lhs=arg1, rhs=imm (arg2 holds rv2 for stores), sum=res.
+    interactions.push(BusInteraction::sender(
+        BusId::BinaryAdd,
+        Multiplicity::Column(cols::STORE),
+        vec![
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+        ],
+    ));
+
+    // JALR: lhs=pc, rhs=instr_size = 4 - 2*c_type_instruction (low word; hi=0),
+    // sum=res. instr_size is small enough to live entirely in the low 32 bits.
+    interactions.push(BusInteraction::sender(
+        BusId::BinaryAdd,
+        Multiplicity::Column(cols::JALR),
+        vec![
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::linear(vec![
+                LinearTerm::Constant(4),
+                LinearTerm::Column {
+                    coefficient: -2,
+                    column: cols::C_TYPE_INSTRUCTION,
+                },
+            ]),
+            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+        ],
+    ));
+
+    // SUB/BEQ (reverse flavour): CPU sends (arg2, res, arg1) so the receiver
+    // proves arg2 + res = arg1, i.e. res = arg1 - arg2. BEQ uses the same
+    // identity to expose `is_equal` via res being zero.
+    interactions.push(BusInteraction::sender(
+        BusId::BinaryAdd,
+        Multiplicity::Sum(cols::SUB, cols::BEQ),
+        vec![
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
                 packing: Packing::DWordBL,
             },
         ],

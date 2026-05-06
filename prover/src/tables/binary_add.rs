@@ -101,6 +101,18 @@ impl BinaryAddOperation {
             sum,
         }
     }
+
+    /// Build the SUB-flavour op for a SUB/BEQ CPU row. The CPU's row has
+    /// `res = arg1 - arg2 (mod 2^64)`; the BinaryAdd row's `(lhs, rhs, sum)`
+    /// is `(arg2, res, arg1)` so that `lhs + rhs = sum` proves the SUB.
+    pub fn for_sub(arg1: u64, arg2: u64) -> Self {
+        let res = arg1.wrapping_sub(arg2);
+        Self {
+            lhs: arg2,
+            rhs: res,
+            sum: arg1,
+        }
+    }
 }
 
 /// Which receiver flavour absorbs a given CPU op. Forwards (ADD/LOAD/STORE/JALR)
@@ -180,15 +192,21 @@ pub fn binary_add_constraints()
 
 /// Returns the BinaryAdd bus interactions.
 ///
-/// **Senders (12)**: one `IS_HALFWORD` per halfword column. The senders
-/// fire on every active row (multiplicity = `MU_ADD + MU_SUB`, both 0 on
-/// padding). This range-checks each halfword to `[0, 2^16)`, which the
-/// carry constraints rely on for soundness.
+/// **Senders (12)**: one `IS_HALFWORD` per halfword column with multiplicity
+/// `Sum(MU_ADD, MU_SUB)`. Range-checks each halfword to `[0, 2^16)`, which
+/// the carry constraints rely on for soundness. The `Sum` is safe because
+/// both `MU_*` columns are anchored by their respective receivers below —
+/// a malicious prover cannot inflate one to cancel the other without
+/// breaking bus balance on `BusId::BinaryAdd`.
 ///
-/// **Receiver (1, step 2)**: `BusId::BinaryAdd` with multiplicity `MU_ADD`,
-/// carrying `(lhs::DWordHL, rhs::DWordHL, sum::DWordHL)`. CPU's ADD/LOAD
-/// senders (forward flavour) are absorbed here. Step 3 will add a second
-/// receiver on the same bus with multiplicity `MU_SUB`.
+/// **Receivers (2)** on `BusId::BinaryAdd`, both carrying
+/// `(lhs::DWordHL, rhs::DWordHL, sum::DWordHL)`:
+/// - `Multiplicity::Column(MU_ADD)` — absorbs forward-flavour CPU senders
+///   (ADD/LOAD/STORE/JALR), where `(lhs, rhs, sum) = (arg1, arg2, res)` or
+///   `(arg1, imm, res)` or `(pc, instr_size, res)` per family.
+/// - `Multiplicity::Column(MU_SUB)` — absorbs reverse-flavour CPU senders
+///   (SUB/BEQ) which transmit `(arg2, res, arg1)` so the row's `lhs+rhs=sum`
+///   proves `arg2 + res = arg1`, i.e. `res = arg1 - arg2`.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(13);
 
@@ -207,17 +225,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         cols::SUM_3,
     ];
     for col in halfword_cols {
-        // SECURITY: Step 2 uses Multiplicity::Column(MU_ADD), not Sum(MU_ADD, MU_SUB).
-        // MU_SUB is an unused witness column in step 2 (no SUB receiver exists yet)
-        // — adding it to this Sum would let a malicious prover set MU_SUB = p - MU_ADD
-        // so the effective multiplicity is 0 in the field, silently disabling halfword
-        // range checks and breaking carry-chain soundness. Step 3 must (a) add the
-        // BinaryAdd receiver with Multiplicity::Column(MU_SUB) so MU_SUB participates
-        // in bus balance, AND (b) at the same commit switch this back to
-        // Sum(MU_ADD, MU_SUB) so SUB-flavour rows also fire IS_HALFWORD.
+        // Step 3: now safe to use Sum(MU_ADD, MU_SUB) because both columns
+        // are anchored by their respective BusId::BinaryAdd receivers below.
+        // A malicious prover cannot set MU_SUB = p - MU_ADD without breaking
+        // bus balance on BusId::BinaryAdd's MU_SUB receiver.
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU_ADD),
+            Multiplicity::Sum(cols::MU_ADD, cols::MU_SUB),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -225,9 +239,36 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
+    // Forward-flavour receiver (ADD/LOAD/STORE/JALR senders absorbed here).
+    // CPU sends `(arg1, arg2, res)`; the row stores `(lhs, rhs, sum)` with the
+    // same numeric values, validated by the carry-chain constraints.
     interactions.push(BusInteraction::receiver(
         BusId::BinaryAdd,
         Multiplicity::Column(cols::MU_ADD),
+        vec![
+            BusValue::Packed {
+                start_column: cols::LHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::RHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::SUM_0,
+                packing: Packing::DWordHL,
+            },
+        ],
+    ));
+
+    // Reverse-flavour receiver (SUB/BEQ senders absorbed here). CPU swaps
+    // operands on send: it transmits `(arg2, res, arg1)` so this row's
+    // `(lhs, rhs, sum)` again satisfies `lhs + rhs = sum` — proving
+    // `arg2 + res = arg1`, i.e. SUB semantics. Same row data shape as the
+    // forward receiver; only the multiplicity column differs.
+    interactions.push(BusInteraction::receiver(
+        BusId::BinaryAdd,
+        Multiplicity::Column(cols::MU_SUB),
         vec![
             BusValue::Packed {
                 start_column: cols::LHS_0,

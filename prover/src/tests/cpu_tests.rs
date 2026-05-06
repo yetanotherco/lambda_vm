@@ -333,9 +333,9 @@ fn test_bus_interactions_count() {
     // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
     // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
-    // Phase 2 step 2 adds: +1 BinaryAdd sender (ADD/LOAD forward).
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 + 1 = 59
-    assert_eq!(interactions.len(), 59);
+    // Phase 2 step 3 BinaryAdd senders: +1 ADD/LOAD, +1 STORE, +1 JALR, +1 SUB/BEQ = +4.
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 + 4 = 62
+    assert_eq!(interactions.len(), 62);
 }
 
 #[test]

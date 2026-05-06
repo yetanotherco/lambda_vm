@@ -1830,22 +1830,48 @@ fn collect_all_ops(
         mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
     }
 
-    // Phase 2 step 2: collect BinaryAdd dispatches for ADD/LOAD CPU rows.
-    // The CPU's existing AddConstraint still fires inline (carry validation
-    // happens twice until step 4 drops the inline path); this adds the
-    // BinaryAdd-side absorption so the new bus balances.
-    let binary_add_ops: Vec<_> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.op_add || op.decode.op_load)
-        .map(|op| {
-            let arg1 = op.compute_arg1();
-            let arg2 = op.compute_arg2();
-            (
+    // Phase 2 step 3: collect BinaryAdd dispatches for all six op families.
+    //   ADD/LOAD/STORE/JALR -> Add flavour (forward: lhs + rhs = sum).
+    //   SUB/BEQ            -> Sub flavour (reverse: arg2 + res = arg1).
+    // CPU's inline AddConstraint still fires (will be removed in step 4).
+    let mut binary_add_ops: Vec<(
+        super::binary_add::BinaryAddOperation,
+        super::binary_add::BinaryAddFlavour,
+    )> = Vec::with_capacity(cpu_ops.len());
+    for op in &cpu_ops {
+        let arg1 = op.compute_arg1();
+        let arg2 = op.compute_arg2();
+
+        if op.decode.op_add || op.decode.op_load {
+            binary_add_ops.push((
                 super::binary_add::BinaryAddOperation::for_add(arg1, arg2),
                 super::binary_add::BinaryAddFlavour::Add,
-            )
-        })
-        .collect();
+            ));
+        }
+        if op.decode.op_store {
+            // STORE address: res = arg1 + imm (arg2 holds rv2 for stores).
+            binary_add_ops.push((
+                super::binary_add::BinaryAddOperation::for_add(arg1, op.decode.imm),
+                super::binary_add::BinaryAddFlavour::Add,
+            ));
+        }
+        if op.decode.op_jalr {
+            // JALR return address: res = pc + instr_size (4, or 2 for compressed).
+            let instr_size: u64 = if op.decode.c_type { 2 } else { 4 };
+            binary_add_ops.push((
+                super::binary_add::BinaryAddOperation::for_add(op.decode.pc, instr_size),
+                super::binary_add::BinaryAddFlavour::Add,
+            ));
+        }
+        if op.decode.op_sub || op.decode.op_beq {
+            // Reverse flavour: bus row carries (arg2, res, arg1) so lhs+rhs=sum
+            // proves arg2 + res = arg1, i.e. res = arg1 - arg2.
+            binary_add_ops.push((
+                super::binary_add::BinaryAddOperation::for_sub(arg1, arg2),
+                super::binary_add::BinaryAddFlavour::Sub,
+            ));
+        }
+    }
 
     CollectedOps {
         cpu_ops,
