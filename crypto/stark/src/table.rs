@@ -286,12 +286,6 @@ impl<F: IsField> Table<F> {
         self.data[idx] = value;
     }
 
-    /// Returns true if this table's data has been spilled to disk via mmap.
-    #[cfg(feature = "disk-spill")]
-    pub fn is_spilled(&self) -> bool {
-        self.mmap_backing.is_some()
-    }
-
     /// Spill the table's row-major data to a temp file and mmap it back.
     /// Frees the heap `data` Vec while preserving access through `get()`,
     /// `get_row()`, and `columns()`.
@@ -419,7 +413,7 @@ mod disk_spill_tests {
             .collect();
 
         let mut table = Table::new(data.clone(), width);
-        assert!(!table.is_spilled());
+        assert!(table.mmap_backing.is_none());
 
         // Snapshot values before spill
         let pre_spill: Vec<Vec<FieldElement<F>>> = (0..height)
@@ -427,7 +421,7 @@ mod disk_spill_tests {
             .collect();
 
         table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.is_spilled());
+        assert!(table.mmap_backing.is_some());
         assert!(
             table.data.is_empty(),
             "heap data should be freed after spill"
@@ -457,7 +451,7 @@ mod disk_spill_tests {
         table
             .spill_to_disk()
             .expect("spill_to_disk on empty table failed");
-        assert!(!table.is_spilled());
+        assert!(table.mmap_backing.is_none());
     }
 
     /// Spilling twice is idempotent (second call is a no-op).
@@ -468,10 +462,10 @@ mod disk_spill_tests {
         let mut table = Table::new(data, 4);
 
         table.spill_to_disk().expect("first spill failed");
-        assert!(table.is_spilled());
+        assert!(table.mmap_backing.is_some());
 
         table.spill_to_disk().expect("second spill should be no-op");
-        assert!(table.is_spilled());
+        assert!(table.mmap_backing.is_some());
 
         // Still readable
         assert_eq!(table.get(0, 0), &FieldElement::<F>::from(0u64));
@@ -490,10 +484,10 @@ mod disk_spill_tests {
 
         let mut table = Table::new(data, width);
         table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.is_spilled());
+        assert!(table.mmap_backing.is_some());
 
         let cloned = table.clone();
-        assert!(!cloned.is_spilled(), "clone should not be spilled");
+        assert!(cloned.mmap_backing.is_none(), "clone should not be spilled");
         assert_eq!(cloned.width, width);
         assert_eq!(cloned.height, height);
         assert_eq!(cloned, table, "clone must equal source element-wise");
@@ -523,7 +517,7 @@ mod disk_spill_tests {
 
         let restored: Table<F> =
             bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(!restored.is_spilled());
+        assert!(restored.mmap_backing.is_none());
         assert_eq!(restored, unspilled);
     }
 }
