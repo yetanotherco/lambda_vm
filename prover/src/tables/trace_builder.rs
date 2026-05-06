@@ -2135,9 +2135,7 @@ pub struct TableLengths {
     pub commit_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
-    /// Executor cycle count.
     pub cycle_count: u64,
-    /// Unique byte addresses touched (dominant non-trace heap term).
     pub unique_byte_count: u64,
 }
 
