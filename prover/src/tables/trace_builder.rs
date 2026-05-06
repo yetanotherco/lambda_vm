@@ -99,7 +99,7 @@ impl MemoryState {
         Self { cells }
     }
 
-    /// Count unique memory pages touched during execution.
+    /// Number of distinct pages that contain at least one cell.
     #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
         debug_assert!(
