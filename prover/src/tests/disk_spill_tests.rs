@@ -25,7 +25,7 @@ fn test_disk_spill_prove_and_verify_small() {
 
 #[test]
 fn test_disk_spill_prove_and_verify_with_chunks() {
-    let elf_bytes = asm_elf_bytes("sub");
+    let elf_bytes = asm_elf_bytes("all_instructions_64");
     let opts = options_forcing_disk();
     let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
         .expect("prove failed");
@@ -59,7 +59,7 @@ fn test_disk_spill_prove_and_verify_2m() {
 
 #[test]
 fn test_disk_spill_serialization_roundtrip_chunked() {
-    let elf_bytes = asm_elf_bytes("sub");
+    let elf_bytes = asm_elf_bytes("all_instructions_64");
     let opts = options_forcing_disk();
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
         .expect("prove failed");
