@@ -6,6 +6,7 @@
 
 pub mod device;
 pub mod lde;
+pub mod merkle;
 pub mod ntt;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
