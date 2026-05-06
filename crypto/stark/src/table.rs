@@ -196,8 +196,7 @@ impl<F: IsField> Table<F> {
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            // Guard the unsafe pointer math below; matches the non-spill
-            // path's checked indexing so release builds don't drop the check.
+            // Ensures the unsafe block's read stays within the mmap.
             assert!(
                 row_idx < backing.height,
                 "Table::get_row out of bounds: row={row_idx}, height={}",
@@ -257,8 +256,7 @@ impl<F: IsField> Table<F> {
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            // Guard the unsafe pointer math below; matches the non-spill
-            // path's checked indexing so release builds don't drop the check.
+            // Ensures the unsafe block's read stays within the mmap.
             assert!(
                 row < backing.height && col < backing.width,
                 "Table::get out of bounds: row={row}, col={col}, height={}, width={}",
