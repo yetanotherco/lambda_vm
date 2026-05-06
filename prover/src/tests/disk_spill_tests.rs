@@ -13,7 +13,6 @@ fn options_forcing_disk() -> stark::proof::options::ProofOptions {
     opts
 }
 
-/// Prove + verify a small program with Disk storage forced.
 #[test]
 fn test_disk_spill_prove_and_verify_small() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -24,7 +23,6 @@ fn test_disk_spill_prove_and_verify_small() {
     assert!(ok, "verification returned false");
 }
 
-/// Prove + verify with small chunks to exercise spill across chunk boundaries.
 #[test]
 fn test_disk_spill_prove_and_verify_with_chunks() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -35,7 +33,6 @@ fn test_disk_spill_prove_and_verify_with_chunks() {
     assert!(ok, "verification returned false");
 }
 
-/// Prove, serialize, deserialize, verify (CLI roundtrip).
 #[test]
 fn test_disk_spill_serialization_roundtrip() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -49,7 +46,6 @@ fn test_disk_spill_serialization_roundtrip() {
     assert!(valid, "verification failed after serialization roundtrip");
 }
 
-/// Prove + verify a 2M-instruction program to catch scale-only bugs.
 #[test]
 fn test_disk_spill_prove_and_verify_2m() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -61,7 +57,6 @@ fn test_disk_spill_prove_and_verify_2m() {
     assert!(ok, "verification returned false for fib_iterative_2M");
 }
 
-/// Same as roundtrip test but with small chunks.
 #[test]
 fn test_disk_spill_serialization_roundtrip_chunked() {
     let elf_bytes = asm_elf_bytes("sub");
