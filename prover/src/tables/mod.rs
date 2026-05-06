@@ -21,6 +21,8 @@
 
 pub mod types;
 
+pub mod binary;
+pub mod binary_add;
 pub mod bitwise;
 pub mod branch;
 pub mod commit;

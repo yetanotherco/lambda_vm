@@ -39,10 +39,11 @@ use crate::tables::register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air,
+    E, F, VmAir, create_binary_add_air, create_binary_air, create_bitwise_air, create_branch_air,
+    create_commit_air, create_cpu_air, create_decode_air, create_dvrm_air, create_halt_air,
+    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
+    create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -203,6 +204,8 @@ pub(crate) struct VmAirs {
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
+    pub binary_add: VmAir,
+    pub binary: VmAir,
 }
 
 impl VmAirs {
@@ -214,6 +217,8 @@ impl VmAirs {
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
             (&self.register, &mut traces.register, &()),
+            (&self.binary_add, &mut traces.binary_add, &()),
+            (&self.binary, &mut traces.binary, &()),
         ];
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
@@ -269,6 +274,8 @@ impl VmAirs {
             &self.halt,
             &self.commit,
             &self.register,
+            &self.binary_add,
+            &self.binary,
         ];
 
         for air in &self.cpus {
@@ -388,6 +395,8 @@ impl VmAirs {
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
             .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
             .collect();
+        let binary_add = create_binary_add_air(proof_options);
+        let binary = create_binary_air(proof_options);
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -409,6 +418,8 @@ impl VmAirs {
             register,
             pages,
             memw_registers,
+            binary_add,
+            binary,
         }
     }
 }
@@ -690,11 +701,12 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, register, binary_add, binary) = 7,
+    // plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 7 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 7 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

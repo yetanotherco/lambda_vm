@@ -708,6 +708,42 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BRANCH")
 }
 
+/// Create BinaryAdd AIR (Phase 2 step 1 skeleton — no constraints, no buses).
+pub fn create_binary_add_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: crate::tables::binary_add::bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        crate::tables::binary_add::cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("BINARY_ADD")
+}
+
+/// Create Binary AIR (Phase 2 step 1 skeleton — no constraints, no buses).
+pub fn create_binary_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: crate::tables::binary::bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        crate::tables::binary::cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("BINARY")
+}
+
 /// Create HALT AIR with bus interactions (no transition constraints).
 pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];

@@ -1666,6 +1666,12 @@ pub struct Traces {
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// BinaryAdd AIR (Phase 2 step 1: empty skeleton; populated in step 2).
+    pub binary_add: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// Binary AIR for whole-64-bit AND/OR/XOR (Phase 2 step 1: empty skeleton).
+    pub binary: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -1978,6 +1984,8 @@ fn build_traces(
         halt: halt_trace,
         commit: commit_trace,
         memw_registers,
+        binary_add: super::binary_add::generate_binary_add_trace(),
+        binary: super::binary::generate_binary_trace(),
     })
 }
 
@@ -2028,6 +2036,8 @@ impl Traces {
             halt,
             commit,
             memw_registers,
+            binary_add,
+            binary,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -2037,6 +2047,8 @@ impl Traces {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
+        total += (binary_add.num_rows() * super::binary_add::cols::NUM_COLUMNS) as u64;
+        total += (binary.num_rows() * super::binary::cols::NUM_COLUMNS) as u64;
         for t in lts {
             total += (t.num_rows() * LT_COLS) as u64;
         }
@@ -2104,6 +2116,9 @@ impl Traces {
         let n_page = aux_cols(super::page::bus_interactions(0).len());
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
 
+        let n_binary_add = aux_cols(super::binary_add::bus_interactions().len());
+        let n_binary = aux_cols(super::binary::bus_interactions().len());
+
         let Traces {
             cpus,
             bitwise,
@@ -2121,6 +2136,8 @@ impl Traces {
             halt,
             commit,
             memw_registers,
+            binary_add,
+            binary,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -2130,6 +2147,8 @@ impl Traces {
             total += (t.num_rows() * n_cpu) as u64;
         }
         total += (bitwise.num_rows() * n_bitwise) as u64;
+        total += (binary_add.num_rows() * n_binary_add) as u64;
+        total += (binary.num_rows() * n_binary) as u64;
         for t in lts {
             total += (t.num_rows() * n_lt) as u64;
         }

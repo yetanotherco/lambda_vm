@@ -110,6 +110,17 @@ pub enum BusId {
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit,
+
+    // =========================================================================
+    // Phase 2 — ALU sub-AIRs receiving from CPU. Appended at the end so the
+    // existing bus IDs above stay numerically stable for committed traces.
+    // =========================================================================
+    /// 64-bit add: `BinaryAdd[lhs, rhs, sum]` proves `lhs + rhs = sum (mod 2^64)`.
+    /// Used by ADD/LOAD/STORE/JALR (forward) and SUB/BEQ (operands swapped).
+    BinaryAdd,
+    /// 64-bit bitwise: `Binary[op, lhs, rhs, res]` proves `lhs op rhs = res`
+    /// for op ∈ {AND, OR, XOR}.
+    Binary,
 }
 
 impl BusId {
@@ -138,6 +149,8 @@ impl BusId {
             BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::BinaryAdd => "BinaryAdd",
+            BusId::Binary => "Binary",
         }
     }
 }
@@ -169,6 +182,8 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
+            22 => Ok(BusId::BinaryAdd),
+            23 => Ok(BusId::Binary),
             other => Err(other),
         }
     }
