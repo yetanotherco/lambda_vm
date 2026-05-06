@@ -603,8 +603,6 @@ pub fn prove_with_options_and_inputs(
         mode
     };
 
-    // Phase 5: build the full traces with the chosen mode. `Disk` spills each
-    // chunk as it's built, so the trace never fully materializes in RAM.
     let mut traces = Traces::from_elf_and_logs(
         &program,
         &result.logs,
