@@ -404,8 +404,6 @@ mod disk_spill_tests {
 
     type F = GoldilocksField;
 
-    /// Create a Table, spill it to disk, and verify that `get()` and `get_row()`
-    /// return the same values as before the spill.
     #[test]
     fn test_table_spill_roundtrip() {
         let width = 4;
@@ -446,7 +444,6 @@ mod disk_spill_tests {
         }
     }
 
-    /// Spilling an empty table is a no-op.
     #[test]
     fn test_table_spill_empty_is_noop() {
         let mut table = Table::<F>::new(Vec::new(), 0);
@@ -456,7 +453,6 @@ mod disk_spill_tests {
         assert!(table.mmap_backing.is_none());
     }
 
-    /// Spilling twice is idempotent (second call is a no-op).
     #[test]
     fn test_table_spill_idempotent() {
         let data: Vec<FieldElement<F>> =
@@ -474,8 +470,6 @@ mod disk_spill_tests {
         assert_eq!(table.get(3, 3), &FieldElement::<F>::from(15u64));
     }
 
-    /// Cloning a spilled table materializes bytes into a fresh heap Vec,
-    /// yielding an unspilled clone with the same element values.
     #[test]
     fn test_clone_spilled_table_materializes_to_heap() {
         let width = 4;
@@ -495,8 +489,6 @@ mod disk_spill_tests {
         assert_eq!(cloned, table, "clone must equal source element-wise");
     }
 
-    /// Serializing a spilled table must produce identical bytes to serializing
-    /// the same table before spilling, and round-trip back to an equal table.
     #[test]
     fn test_serialize_spilled_table_matches_unspilled() {
         let width = 4;
