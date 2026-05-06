@@ -41,6 +41,8 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+#[cfg(feature = "disk-spill")]
+use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
@@ -583,12 +585,7 @@ pub fn prove_with_options_and_inputs(
     // Pick storage mode from analytical heap estimate.
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
-        let lengths = crate::tables::trace_builder::count_table_lengths(
-            &program,
-            &result.logs,
-            max_rows,
-            private_inputs,
-        )?;
+        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
 
         let available = auto_storage::available_ram_bytes();
         let estimated_peak = auto_storage::peak_bytes(
