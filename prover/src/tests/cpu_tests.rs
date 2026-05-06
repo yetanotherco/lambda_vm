@@ -330,17 +330,19 @@ fn test_bus_interactions_count() {
     // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_HALFWORD (ARG1/ARG2/RES u32 limb pairs: 4 pairs × 3 arrays;
     //   migrated from IS_BYTE in Phase 2 step 7)
+    // - 2 IS_HALFWORD (RES_LO halfword decomposition for the MSB16
+    //   res-ext-bit sender; Phase 2 step 9B)
     // AndByte/OrByte/XorByte (24 sends pre-split) collapsed into 8 unified
     // BusId::Bitwise sends in commit 95e4d4b3.
     // ZERO bus (1 send) replaced by 2 inline witness-inverse constraints
     // in Phase 2 step 9A (BeqIsEqualSumZero + BeqIsEqualWitness).
-    // Total: 8 + 3 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 14 = 41
-    assert_eq!(interactions.len(), 41);
+    // Total: 8 + 3 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 14 + 2 = 43
+    assert_eq!(interactions.len(), 43);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 83);
+    assert_eq!(cols::NUM_COLUMNS, 84);
 }
 
 #[test]

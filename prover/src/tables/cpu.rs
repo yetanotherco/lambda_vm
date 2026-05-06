@@ -269,9 +269,17 @@ pub mod cols {
     /// replaces the byte-summing ZERO bus sender (Phase 2 step 9A).
     pub const RES_INV: usize = 82;
 
+    /// Bits 16-31 of `RES_LO` (the upper halfword of the low 32 bits of res).
+    /// Aux witness for the MSB16 res-ext-bit sender that previously read
+    /// `RES[2] + 256 * RES[3]` (Phase 2 step 9B). Range-checked to halfword
+    /// via IS_HALFWORD; the lower halfword `RES_LO - 65536 * RES_LO_HALF_HI`
+    /// is also IS_HALFWORD-checked, forcing this column to be exactly bits
+    /// 16-31 of RES_LO.
+    pub const RES_LO_HALF_HI: usize = 83;
+
     /// Total number of columns (will shrink to ~58 after Phase 2 byte
     /// cells are removed at end of migration).
-    pub const NUM_COLUMNS: usize = 83;
+    pub const NUM_COLUMNS: usize = 84;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -565,6 +573,23 @@ impl CpuOperation {
                 ));
             }
         }
+
+        // 2 IS_HALFWORD lookups for the RES_LO halfword decomposition that
+        // backs the MSB16 res-ext-bit sender (Phase 2 step 9B): the upper
+        // halfword `RES_LO_HALF_HI = (res >> 16) & 0xFFFF` and the implicit
+        // lower halfword `res & 0xFFFF`. Both are unconditional (mult = One).
+        let res_half_hi = ((res >> 16) & 0xFFFF) as u16;
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (res_half_hi & 0xFF) as u8,
+            ((res_half_hi >> 8) & 0xFF) as u8,
+        ));
+        let res_half_lo = (res & 0xFFFF) as u16;
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (res_half_lo & 0xFF) as u8,
+            ((res_half_lo >> 8) & 0xFF) as u8,
+        ));
 
         ops
     }
@@ -890,6 +915,10 @@ pub fn generate_cpu_trace(
         data[base + cols::RES_LO] = FE::from(res & 0xFFFF_FFFF);
         data[base + cols::RES_HI] = FE::from(res >> 32);
 
+        // Aux halfword: bits 16-31 of RES_LO. Used by the MSB16 res-ext-bit
+        // sender (Phase 2 step 9B) to avoid reading RES[2]+256*RES[3].
+        data[base + cols::RES_LO_HALF_HI] = FE::from((res >> 16) & 0xFFFF);
+
         // RES_INV witness for the BEQ zero-test (Phase 2 step 9A).
         // sum = RES_LO + RES_HI ∈ [0, 2^33-2). Both are non-negative, so
         // sum == 0 iff res == 0. We commit (1 / sum) when sum != 0; any
@@ -1168,27 +1197,54 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // MSB16 interaction for res extension bit extraction
     // -------------------------------------------------------------------------
-    // MSB16[res::DWordHL[1]] -> res_ext_bit, multiplicity = word_instr
-    // res::DWordHL[1] is the half at bits 16-31 = res[2] + 256*res[3]
+    // MSB16[RES_LO_HALF_HI] -> res_ext_bit, multiplicity = word_instr
+    //
+    // RES_LO_HALF_HI is the upper halfword of RES_LO (bits 16-31 of res).
+    // Phase 2 step 9B replaced the prior `RES[2] + 256*RES[3]` byte-pair
+    // form. The column is range-checked to halfword by the unconditional
+    // IS_HALFWORD sends below, alongside `RES_LO - 65536 * RES_LO_HALF_HI`
+    // (the implicit lower halfword), which together force the column to
+    // be exactly bits 16-31 of RES_LO.
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::WORD_INSTR),
         vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[3],
-                },
-            ]),
+            BusValue::Packed {
+                start_column: cols::RES_LO_HALF_HI,
+                packing: Packing::Direct,
+            },
             BusValue::Packed {
                 start_column: cols::RES_EXT_BIT,
                 packing: Packing::Direct,
             },
         ],
+    ));
+
+    // RES_LO_HALF_HI range-check via IS_HALFWORD (always fires).
+    interactions.push(BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::One,
+        vec![BusValue::Packed {
+            start_column: cols::RES_LO_HALF_HI,
+            packing: Packing::Direct,
+        }],
+    ));
+
+    // Implicit lower halfword (RES_LO - 65536 * RES_LO_HALF_HI) range-check
+    // via IS_HALFWORD. Forces RES_LO_HALF_HI = bits 16-31 of RES_LO.
+    interactions.push(BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::One,
+        vec![BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::RES_LO,
+            },
+            LinearTerm::Column {
+                coefficient: -(65536i64),
+                column: cols::RES_LO_HALF_HI,
+            },
+        ])],
     ));
 
     // -------------------------------------------------------------------------

@@ -1311,14 +1311,15 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
-/// 12 IsHalf(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD,
+/// 12 IsHalf(0,0) for ARG1/ARG2/RES byte pairs, and 2 IsHalf(0,0) for the
+/// RES_LO halfword decomposition (Phase 2 step 9B) = 16 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
     }
 
-    let mut ops = Vec::with_capacity(num_padding_rows * 14);
+    let mut ops = Vec::with_capacity(num_padding_rows * 16);
     for _ in 0..num_padding_rows {
         // IS_BYTE[RS1, RS2] pair (both zero in padding)
         ops.push(BitwiseOperation::byte_op(
@@ -1341,6 +1342,18 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
                 0,
             ));
         }
+        // 2 IS_HALFWORD lookups for the RES_LO halfword decomposition
+        // (RES_LO_HALF_HI + implicit lower halfword), Phase 2 step 9B.
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            0,
+            0,
+        ));
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            0,
+            0,
+        ));
     }
     ops
 }
