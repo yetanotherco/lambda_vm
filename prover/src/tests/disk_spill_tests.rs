@@ -1,5 +1,4 @@
-//! End-to-end tests forcing Disk storage via a 1 MB `max_ram_bytes` cap, so
-//! even the smallest ELF deterministically crosses the threshold.
+//! End-to-end tests forcing `StorageMode::Disk` via a low `max_ram_bytes` cap.
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
