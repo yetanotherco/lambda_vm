@@ -1,7 +1,4 @@
-//! Drift guard: `count_table_lengths` must stay aligned with the actual
-//! `Traces::from_elf_and_logs` output. Adding a new table or changing a
-//! row-count rule on either side without updating the other should fail
-//! this test.
+//! Asserts `count_table_lengths` matches `Traces::from_elf_and_logs` row counts.
 
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::count_table_lengths;
