@@ -16,6 +16,7 @@ use crate::lookup::{
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
+use crate::test_utils::multi_prove_ram;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
 
@@ -134,8 +135,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace, &()),
         ];
 
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap()
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================

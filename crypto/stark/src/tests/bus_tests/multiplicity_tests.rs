@@ -15,6 +15,7 @@ use crate::lookup::{
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
+use crate::test_utils::multi_prove_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
@@ -112,8 +113,7 @@ fn test_multiplicity_one() {
     ];
 
     let multi_proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -223,8 +223,7 @@ fn test_multiplicity_sum() {
     ];
 
     let multi_proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -332,8 +331,7 @@ fn test_multiplicity_negated() {
     ];
 
     let multi_proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];

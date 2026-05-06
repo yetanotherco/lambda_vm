@@ -23,6 +23,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::branch::{BranchOperation, cols, generate_branch_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::test_utils::multi_prove_ram;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -339,8 +340,7 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
     ];
 
     let multi_proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
@@ -430,8 +430,7 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
     ];
 
     let multi_proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];

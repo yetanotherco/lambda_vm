@@ -10,6 +10,7 @@ use crate::tables::decode::{
     update_multiplicities,
 };
 use crate::tables::types::{FE, packed_decode as bits};
+use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
 // =========================================================================
@@ -947,9 +948,8 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
-    let proof =
-        crate::test_utils::multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-            .expect("Prover failed to generate proof");
+    let proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Prover failed to generate proof");
 
     // =========================================================================
     // VERIFIER: Has ELF B (different program!), computes commitment from it
@@ -1041,7 +1041,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
 
-    let proof = crate::test_utils::multi_prove_ram(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
