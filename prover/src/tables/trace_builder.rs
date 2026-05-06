@@ -2237,7 +2237,7 @@ pub fn count_table_lengths(
 
         if cpu_op.ecall_commit {
             // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
-            // without materializing the op vector.
+            // without building the op vector.
             commit_count += (cpu_op.commit_count as usize)
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
