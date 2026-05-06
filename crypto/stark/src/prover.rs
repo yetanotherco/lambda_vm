@@ -1642,6 +1642,9 @@ pub trait IsStarkProver<
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
+        // Free the HashMap (which holds extra strong Arc references) before the
+        // long proving rounds begin. `domains` and `twiddle_caches` already hold
+        // the only surviving Arcs we care about.
         drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
