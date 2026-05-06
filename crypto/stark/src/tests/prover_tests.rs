@@ -32,6 +32,7 @@ fn test_domain_constructor() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
@@ -124,6 +125,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor: 0,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
@@ -196,6 +198,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
@@ -257,6 +260,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
     let proof_options_7 = ProofOptions {
@@ -264,6 +268,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         fri_number_of_queries: 3,
         coset_offset: 7,
         grinding_factor: 1,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
@@ -329,6 +334,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
@@ -420,6 +426,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        #[cfg(feature = "disk-spill")]
         max_ram_bytes: None,
     };
 
