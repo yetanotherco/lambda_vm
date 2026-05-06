@@ -10,12 +10,14 @@ use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::spill_safe::SpillSafe;
 use math::traits::{AsBytes, ByteConversion};
 
+type AirTracePair<'a, Field, FieldExtension, PI> = (
+    &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    &'a mut TraceTable<Field, FieldExtension>,
+    &'a PI,
+);
+
 pub fn multi_prove_ram<Field, FieldExtension, PI>(
-    air_trace_pairs: Vec<(
-        &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        &mut TraceTable<Field, FieldExtension>,
-        &PI,
-    )>,
+    air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
     transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
 ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
 where
