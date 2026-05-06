@@ -14,7 +14,7 @@ pub fn spill_slice_to_mmap<T: SpillSafe>(slice: &[T]) -> std::io::Result<memmap2
         )
     }
 
-    let elem_size = std::mem::size_of::<T>();
+    let elem_size = size_of::<T>();
     let total_bytes = (slice.len() as u64)
         .checked_mul(elem_size as u64)
         .ok_or_else(|| {

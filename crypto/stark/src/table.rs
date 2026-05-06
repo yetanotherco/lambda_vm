@@ -1,4 +1,6 @@
 use crate::frame::Frame;
+#[cfg(feature = "disk-spill")]
+use crypto::mmap_util::spill_slice_to_mmap;
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
@@ -301,12 +303,12 @@ impl<F: IsField> Table<F> {
             return Ok(());
         }
 
-        let mmap = crypto::mmap_util::spill_slice_to_mmap(&self.data)?;
+        let mmap = spill_slice_to_mmap(&self.data)?;
         self.mmap_backing = Some(TableMmapBacking {
             mmap,
             width: self.width,
             height: self.height,
-            elem_size: std::mem::size_of::<FieldElement<F>>(),
+            elem_size: size_of::<FieldElement<F>>(),
         });
         self.data = Vec::new();
 
