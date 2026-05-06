@@ -1,13 +1,7 @@
-//! Calibration test: predicted [`peak_bytes`] vs measured RSS during a real proof.
-//!
-//! Runs a small fib_iterative proof, samples the process's RSS while the proof
-//! is running, and asserts the prediction is within 2× of the measured peak
-//! (after subtracting the pre-proof baseline). RSS includes mmap'd files, the
-//! code segment, and allocator slack on top of the heap-only quantity that
-//! [`peak_bytes`] models, so the bound is intentionally loose; the test is a
-//! regression guard against silent drift, not a tightness measure.
-//!
-//! [`peak_bytes`]: crate::auto_storage::peak_bytes
+//! Asserts predicted [`peak_bytes`](crate::auto_storage::peak_bytes) stays
+//! within 2× of measured RSS during a proof. The 2× bound is loose: RSS
+//! counts mmaps, code segment, and allocator slack that the heap-only
+//! estimator doesn't model.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
