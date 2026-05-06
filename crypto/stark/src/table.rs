@@ -122,8 +122,6 @@ impl<F: IsField> Clone for Table<F> {
     }
 }
 
-/// Element-wise comparison via `get()`, so spilled tables compare by field
-/// equality (canonicalized per `F::eq`) rather than raw mmap bytes.
 #[cfg(feature = "disk-spill")]
 impl<F: IsField> PartialEq for Table<F> {
     fn eq(&self, other: &Self) -> bool {
