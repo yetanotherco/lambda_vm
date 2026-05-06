@@ -639,11 +639,9 @@ pub fn prove_with_options_and_inputs(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
-    let air_pairs = airs.air_trace_pairs(&mut traces);
-    let transcript = &mut DefaultTranscript::<E>::new(&[]);
     let proof = Prover::multi_prove(
-        air_pairs,
-        transcript,
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
