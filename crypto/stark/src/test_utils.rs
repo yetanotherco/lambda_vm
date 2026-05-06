@@ -10,7 +10,6 @@ use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::spill_safe::SpillSafe;
 use math::traits::{AsBytes, ByteConversion};
 
-/// Multi-AIR prove with `StorageMode::Ram`.
 pub fn multi_prove_ram<Field, FieldExtension, PI>(
     air_trace_pairs: Vec<(
         &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
