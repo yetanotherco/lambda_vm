@@ -96,10 +96,8 @@ where
     }
 }
 
-/// Cloning a spilled table reads its mmap bytes into a fresh heap `Vec`
-/// and returns an unspilled clone. This is cold — callers pay the full
-/// materialization cost — but avoids the runtime panic a derived impl
-/// would produce on `TableMmapBacking`.
+/// Cloning a spilled table copies its mmap bytes into a fresh heap `Vec`
+/// and returns an unspilled clone.
 #[cfg(feature = "disk-spill")]
 impl<F: IsField> Clone for Table<F> {
     fn clone(&self) -> Self {
