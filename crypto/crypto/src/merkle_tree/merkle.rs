@@ -83,8 +83,6 @@ where
     }
 }
 
-/// Streams the spilled nodes through `serialize_seq` instead of buffering them
-/// into a `Vec<B::Node>` the size of the tree.
 #[cfg(all(feature = "serde", feature = "disk-spill"))]
 struct MmapNodesSeq<'a, B: IsMerkleTreeBackend>(&'a MerkleTree<B>);
 

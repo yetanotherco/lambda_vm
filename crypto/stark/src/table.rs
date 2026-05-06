@@ -73,8 +73,6 @@ where
     }
 }
 
-/// Streams the spilled table elements through `serialize_seq` instead of
-/// buffering them into a `Vec<FieldElement<F>>` the size of the trace.
 #[cfg(feature = "disk-spill")]
 struct MmapDataSeq<'a, F: IsField>(&'a Table<F>);
 
