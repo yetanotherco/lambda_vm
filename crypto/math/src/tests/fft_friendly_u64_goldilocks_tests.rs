@@ -585,3 +585,65 @@ fn mul_non_canonical_inputs() {
         );
     }
 }
+
+#[test]
+fn test_inv_matches_addition_chain() {
+    // Cross-check the new Pornin-style xgcd inverse against the addition-chain
+    // reference for a wide range of inputs (boundary cases + a deterministic
+    // pseudorandom stream). Both algorithms must agree on every canonical
+    // representative, and a * inv(a) must canonicalize to 1.
+    let mut inputs: Vec<u64> = vec![
+        1,
+        2,
+        3,
+        EPSILON,
+        EPSILON + 1,
+        GOLDILOCKS_PRIME - 1,
+        GOLDILOCKS_PRIME, // canonicalizes to 0; inv() returns InvZeroError
+        GOLDILOCKS_PRIME + 1,
+        GOLDILOCKS_PRIME + 5,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+
+    // Deterministic LCG (Numerical Recipes) — no extra dep, fully reproducible.
+    let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    for _ in 0..10_000 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        inputs.push(state);
+    }
+
+    for x in inputs {
+        match F::inv(&x) {
+            Ok(inv_new) => {
+                let canonical = F::canonical(&x);
+                assert_ne!(
+                    canonical, 0,
+                    "inv() returned Ok for canonical zero (x={:#x})",
+                    x
+                );
+                let inv_ref = inv_addition_chain(canonical);
+                assert_eq!(
+                    F::canonical(&inv_new),
+                    F::canonical(&inv_ref),
+                    "inv mismatch for x={:#x} (canonical={:#x})",
+                    x,
+                    canonical,
+                );
+                let product = F::mul(&x, &inv_new);
+                assert_eq!(F::canonical(&product), 1, "x * inv(x) != 1 for x={:#x}", x,);
+            }
+            Err(_) => {
+                // Only the canonical-zero case may fail.
+                assert_eq!(
+                    F::canonical(&x),
+                    0,
+                    "inv unexpectedly errored for x={:#x}",
+                    x
+                );
+            }
+        }
+    }
+}
