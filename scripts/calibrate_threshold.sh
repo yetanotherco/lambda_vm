@@ -1,5 +1,5 @@
 #!/bin/bash
-# Calibrate the auto-disk-spill threshold: actual RSS / predicted_peak_bytes.
+# Calibrate the auto-disk-spill threshold: actual RSS / estimated_peak_bytes.
 #
 # Usage: calibrate_threshold.sh elf1.elf [elf2.elf ...]
 #
@@ -35,7 +35,7 @@ for elf in "$@"; do
             continue
         }
 
-    pred=$(grep -o 'predicted_peak_bytes: [0-9]*' "$OUT/err.txt" | awk '{print $2}')
+    pred=$(grep -o 'estimated_peak_bytes: [0-9]*' "$OUT/err.txt" | awk '{print $2}')
     heap_mb=$(grep -o 'Peak heap: [0-9]*' "$OUT/out.txt" | awk '{print $3}')
     rss_kb=$(grep "Maximum resident set size" "$OUT/err.txt" | awk '{print $NF}')
 

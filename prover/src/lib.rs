@@ -29,8 +29,6 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-#[cfg(feature = "disk-spill")]
-use stark::prover::table_parallelism;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -584,23 +582,10 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Pick storage mode from analytical heap estimate.
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
         let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
-
-        let available = auto_storage::available_ram_bytes();
-        let estimated_peak =
-            auto_storage::peak_bytes(&lengths, proof_options.blowup_factor, table_parallelism());
-        let mode = auto_storage::select_storage_mode(
-            estimated_peak,
-            available,
-            proof_options.max_ram_bytes,
-        );
-
-        log::info!("predicted_peak_bytes: {estimated_peak}, storage_mode: {mode:?}");
-
-        mode
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
     let mut traces = Traces::from_elf_and_logs(

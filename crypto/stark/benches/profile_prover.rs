@@ -21,8 +21,6 @@ fn main() {
         fri_number_of_queries: 100,
         coset_offset: 3,
         grinding_factor: 0,
-        #[cfg(feature = "disk-spill")]
-        max_ram_bytes: None,
     };
 
     let num_columns = 16;

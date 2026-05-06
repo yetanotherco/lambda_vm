@@ -1,4 +1,7 @@
 //! Automatic `StorageMode` selection from an analytical peak-RAM estimate.
+//!
+//! `FORCE_DISK_SPILL` env var forces `StorageMode::Disk` regardless of the
+//! estimate.
 
 use crate::tables::bitwise::{
     NUM_ROWS as BITWISE_ROWS, bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
@@ -27,6 +30,7 @@ use crate::tables::register::{
 };
 use crate::tables::shift::{bus_interactions as shift_buses, cols::NUM_COLUMNS as SHIFT_COLS};
 use crate::tables::trace_builder::TableLengths;
+use stark::prover::table_parallelism;
 use stark::storage_mode::StorageMode;
 use sysinfo::System;
 
@@ -38,8 +42,8 @@ const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
 /// 9/10 budget headroom for OS, other processes, and allocator slack.
-pub(crate) const SAFETY_FRACTION_NUM: u64 = 9;
-pub(crate) const SAFETY_FRACTION_DEN: u64 = 10;
+const SAFETY_FRACTION_NUM: u64 = 9;
+const SAFETY_FRACTION_DEN: u64 = 10;
 
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
@@ -209,13 +213,22 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     specs
 }
 
+/// Estimates heap from `lengths` and `blowup_factor`. Picks `Disk` if the
+/// estimate is greater than available RAM, else `Ram`. `FORCE_DISK_SPILL` env
+/// var forces `Disk`.
+pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
+    if std::env::var("FORCE_DISK_SPILL").is_ok() {
+        log::info!("storage_mode: Disk (forced via FORCE_DISK_SPILL)");
+        return StorageMode::Disk;
+    }
+    let estimated = peak_bytes(lengths, blowup_factor, table_parallelism());
+    let mode = select_storage_mode(estimated, available_ram_bytes());
+    log::info!("estimated_peak_bytes: {estimated}, storage_mode: {mode:?}");
+    mode
+}
+
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
-///
-/// `blowup_factor` is `ProofOptions::blowup_factor`. `table_parallelism` is the
-/// `k` used by `multi_prove_with_mode` to chunk rounds 2-4; pass
-/// `stark::prover::table_parallelism()` so the worst-case-chunk transient term
-/// matches the runtime.
-pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
+fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
     let blowup = blowup_factor as u64;
     let k = table_parallelism.max(1);
     let specs = table_specs(lengths);
@@ -268,53 +281,23 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
         .saturating_add(state_total)
 }
 
-/// User cap ∩ OS available, or None if both are unknown.
-fn effective_budget(available: Option<u64>, cap: Option<u64>) -> Option<u64> {
-    match (cap, available) {
-        (Some(c), Some(a)) => Some(c.min(a)),
-        (Some(c), None) => Some(c),
-        (None, a) => a,
-    }
-}
-
-/// Disk if `estimated` exceeds 90% of the effective budget, else Ram.
-/// Defaults to Disk when budget is unknown (sysinfo failure + no cap).
-pub fn select_storage_mode(
-    estimated: u64,
-    available: Option<u64>,
-    cap: Option<u64>,
-) -> StorageMode {
-    let Some(budget) = effective_budget(available, cap) else {
-        log::warn!(
-            "Auto disk-spill: sysinfo could not read system memory and no cap set, \
-             defaulting to Disk."
-        );
+/// `Disk` if `estimated` exceeds `available` minus a safety margin, else
+/// `Ram`. Defaults to `Disk` when `available` is `None`.
+fn select_storage_mode(estimated: u64, available: Option<u64>) -> StorageMode {
+    let Some(available) = available else {
+        log::warn!("Auto disk-spill: sysinfo could not read system memory, defaulting to Disk.");
         return StorageMode::Disk;
     };
-    let threshold = budget.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;
-
+    let threshold = available.saturating_mul(SAFETY_FRACTION_NUM) / SAFETY_FRACTION_DEN;
     if estimated > threshold {
         StorageMode::Disk
     } else {
-        // `cap.is_none()` plus an `effective_budget` that returned `Some` means
-        // `available` must be `Some` (see `effective_budget`).
-        if cap.is_none() && estimated.saturating_mul(4) >= available.unwrap().saturating_mul(3) {
-            log::warn!(
-                "Auto disk-spill picked Ram with estimated_peak={estimated} bytes near \
-                 available={available:?}. Set max_ram_bytes to bound the budget to a \
-                 cgroup limit if running in a container."
-            );
-        }
         StorageMode::Ram
     }
 }
 
-/// OS-available RAM, or None if sysinfo can't read it (e.g. stripped containers).
-/// Returns `Some(0)` on near-OOM so callers force Disk rather than fall back to Ram.
-///
-/// Reads host `/proc/meminfo`, not cgroup limits — set `max_ram_bytes` in
-/// containerized environments to bound the budget to the container's limit.
-pub fn available_ram_bytes() -> Option<u64> {
+/// OS-available RAM, or `None` if sysinfo can't read it.
+fn available_ram_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
     // total_memory == 0 means sysinfo can't read; otherwise available is real.
@@ -400,56 +383,93 @@ mod tests {
     #[test]
     fn select_ram_when_estimate_below_threshold() {
         // 10 GB estimated, 32 GB available → threshold 28.8 GB → Ram.
-        let mode = select_storage_mode(10 * GB, Some(32 * GB), None);
+        let mode = select_storage_mode(10 * GB, Some(32 * GB));
         assert_eq!(mode, StorageMode::Ram);
     }
 
     #[test]
     fn select_disk_when_estimate_exceeds_threshold() {
         // 30 GB estimated, 32 GB available → threshold 28.8 GB → Disk.
-        let mode = select_storage_mode(30 * GB, Some(32 * GB), None);
+        let mode = select_storage_mode(30 * GB, Some(32 * GB));
         assert_eq!(mode, StorageMode::Disk);
     }
 
     #[test]
-    fn cap_forces_disk_when_smaller_than_available() {
-        // 10 GB estimated, 64 GB available (would be Ram), but cap=4 GB
-        // → threshold = 4 × 0.9 = 3.6 GB → Disk.
-        let mode = select_storage_mode(10 * GB, Some(64 * GB), Some(4 * GB));
+    fn unknown_available_defaults_to_disk() {
+        let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None);
         assert_eq!(mode, StorageMode::Disk);
     }
 
-    #[test]
-    fn cap_ignored_when_larger_than_available() {
-        // available=8 GB dominates a cap of 64 GB.
-        // threshold = 8 × 0.9 = 7.2 GB, estimate 10 GB → Disk.
-        let mode = select_storage_mode(10 * GB, Some(8 * GB), Some(64 * GB));
-        assert_eq!(mode, StorageMode::Disk);
-    }
+    /// Asserts predicted [`peak_bytes`] does not underestimate jemalloc-measured
+    /// heap during a proof.
+    mod calibration {
+        use super::*;
+        use crate::tables::MaxRowsConfig;
+        use crate::tables::trace_builder::count_table_lengths;
+        use crate::test_utils::{asm_elf_bytes, run_asm_elf};
+        use stark::proof::options::GoldilocksCubicProofOptions;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+        use tikv_jemalloc_ctl::{epoch, stats};
 
-    #[test]
-    fn tiny_cap_always_forces_disk() {
-        let mode = select_storage_mode(
-            peak_bytes(&empty_lengths(), 2, ALL_TABLES),
-            Some(64 * GB),
-            Some(1_000_000),
-        );
-        assert_eq!(mode, StorageMode::Disk);
-    }
+        #[global_allocator]
+        static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-    #[test]
-    fn unknown_available_with_no_cap_defaults_to_disk() {
-        // sysinfo failed and no cap was set. Default to Disk: sysinfo fails
-        // in stripped-down containers where Ram would OOM. Pass max_ram_bytes
-        // to opt out on a known-sized machine.
-        let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None, None);
-        assert_eq!(mode, StorageMode::Disk);
-    }
+        fn allocated_bytes() -> usize {
+            epoch::advance().ok();
+            stats::allocated::read().unwrap_or(0)
+        }
 
-    #[test]
-    fn unknown_available_with_cap_uses_cap_as_budget() {
-        // OS can't report; cap is the whole budget.
-        let mode = select_storage_mode(10 * GB, None, Some(4 * GB));
-        assert_eq!(mode, StorageMode::Disk);
+        #[test]
+        fn peak_bytes_does_not_underestimate_measured_heap() {
+            let (elf, logs, _) = run_asm_elf("fib_iterative_372k");
+            let elf_bytes = asm_elf_bytes("fib_iterative_372k");
+
+            let max_rows = MaxRowsConfig::default();
+            let lengths = count_table_lengths(&elf, &logs, &max_rows, &[])
+                .expect("count_table_lengths succeeds");
+
+            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+            let predicted = peak_bytes(&lengths, opts.blowup_factor, table_parallelism()) as usize;
+
+            drop(logs);
+
+            let baseline = allocated_bytes();
+            let peak = Arc::new(AtomicUsize::new(baseline));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let sampler = {
+                let peak = Arc::clone(&peak);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        peak.fetch_max(allocated_bytes(), Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                })
+            };
+
+            let _proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &opts, &max_rows)
+                .expect("proof succeeds");
+
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().expect("sampler joins");
+
+            let measured = peak.load(Ordering::Relaxed).saturating_sub(baseline);
+
+            eprintln!(
+                "peak_bytes calibration: predicted={predicted} bytes, measured_heap={measured} bytes, ratio={:.2}",
+                predicted as f64 / measured as f64
+            );
+
+            let safety_num = SAFETY_FRACTION_NUM as usize;
+            let safety_den = SAFETY_FRACTION_DEN as usize;
+            assert!(
+                predicted.saturating_mul(safety_den) >= measured.saturating_mul(safety_num),
+                "peak_bytes underestimates measured heap: predicted={predicted}, measured={measured}"
+            );
+        }
     }
 }

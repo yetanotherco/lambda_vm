@@ -61,8 +61,6 @@ fn benchmark_proof_options() -> ProofOptions {
         fri_number_of_queries: 30,
         coset_offset: 3,
         grinding_factor: 0,
-        #[cfg(feature = "disk-spill")]
-        max_ram_bytes: None,
     }
 }
 
