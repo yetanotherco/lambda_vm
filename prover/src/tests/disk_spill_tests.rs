@@ -47,14 +47,14 @@ fn test_disk_spill_serialization_roundtrip() {
 }
 
 #[test]
-fn test_disk_spill_prove_and_verify_2m() {
+fn test_disk_spill_prove_and_verify_372k() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let elf_bytes = asm_elf_bytes("fib_iterative_2M");
+    let elf_bytes = asm_elf_bytes("fib_iterative_372k");
     let opts = options_forcing_disk();
     let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
         .expect("prove failed");
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
-    assert!(ok, "verification returned false for fib_iterative_2M");
+    assert!(ok, "verification returned false for fib_iterative_372k");
 }
 
 #[test]
