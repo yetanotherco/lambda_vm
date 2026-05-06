@@ -13,7 +13,7 @@ use rayon::prelude::*;
 /// Access goes through pointer arithmetic on the mmap, matching the
 /// original `data[row * width + col]` layout.
 #[cfg(feature = "disk-spill")]
-pub(crate) struct TableMmapBacking {
+struct TableMmapBacking {
     mmap: memmap2::Mmap,
     /// Number of columns per row.
     width: usize,
@@ -51,7 +51,7 @@ pub struct Table<F: IsField> {
     pub height: usize,
     #[cfg(feature = "disk-spill")]
     #[serde(skip)]
-    pub(crate) mmap_backing: Option<TableMmapBacking>,
+    mmap_backing: Option<TableMmapBacking>,
 }
 
 #[cfg(feature = "disk-spill")]
