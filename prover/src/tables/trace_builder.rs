@@ -2138,8 +2138,8 @@ pub struct TableLengths {
     pub unique_byte_count: u64,
 }
 
-/// Compute upper-bound per-table row counts without allocating op vectors.
-/// Returns bounds (not exact) for tables that dedup ops: LT, MUL, DVRM, BRANCH.
+/// Per-table row counts from `logs`, without building op vectors.
+/// Exact for tables that don't dedup; upper bound for LT, MUL, DVRM, BRANCH.
 /// Must stay in sync with `Traces::from_elf_and_logs`.
 #[cfg(feature = "disk-spill")]
 pub fn count_table_lengths(
