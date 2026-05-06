@@ -723,9 +723,10 @@ pub fn create_binary_add_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BINARY_ADD")
 }
 
-/// Create Binary AIR (Phase 2 step 1 skeleton — no constraints, no buses).
+/// Create Binary AIR with op-selector IsBit constraints and per-byte
+/// AND_BYTE/OR_BYTE/XOR_BYTE senders + the BusId::Binary receiver.
 pub fn create_binary_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let transition_constraints = crate::tables::binary::binary_constraints();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: crate::tables::binary::bus_interactions(),

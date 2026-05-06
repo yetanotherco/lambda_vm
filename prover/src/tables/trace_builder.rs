@@ -1017,6 +1017,32 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     bitwise_ops
 }
 
+/// Collects per-byte AND_BYTE/OR_BYTE/XOR_BYTE bitwise lookups for the
+/// Binary AIR's senders.
+///
+/// Each `BinaryOperation` produces 8 bitwise lookups on its op-specific
+/// bus. Binary's per-row multiplicity for those senders is the matching
+/// `IS_*` selector (1 on the active op's row, 0 otherwise), so the
+/// bitwise table sees exactly one increment per byte position per CPU
+/// AND/OR/XOR row — replacing the 24 per-row CPU sends that step 5
+/// removed from `cpu.rs`.
+fn collect_bitwise_from_binary(ops: &[super::binary::BinaryOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 8);
+    for op in ops {
+        let kind = match op.op {
+            super::binary::BinaryOp::And => BitwiseOperationType::AndByte,
+            super::binary::BinaryOp::Or => BitwiseOperationType::OrByte,
+            super::binary::BinaryOp::Xor => BitwiseOperationType::XorByte,
+        };
+        for byte_idx in 0..8 {
+            let a = ((op.lhs >> (byte_idx * 8)) & 0xFF) as u8;
+            let b = ((op.rhs >> (byte_idx * 8)) & 0xFF) as u8;
+            bitwise_ops.push(BitwiseOperation::byte_op(kind, a, b));
+        }
+    }
+    bitwise_ops
+}
+
 /// Collects IS_HALFWORD bitwise lookups from BinaryAdd operations.
 ///
 /// BinaryAdd sends 12 IS_HALFWORD lookups per dispatched op (4 halfwords each
@@ -1726,6 +1752,8 @@ struct CollectedOps {
         super::binary_add::BinaryAddOperation,
         super::binary_add::BinaryAddFlavour,
     )>,
+    /// (Phase 2 step 5) AND/OR/XOR CPU rows that dispatch to `BusId::Binary`.
+    binary_ops: Vec<super::binary::BinaryOperation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1874,6 +1902,29 @@ fn collect_all_ops(
         }
     }
 
+    // Phase 2 step 5: collect AND/OR/XOR dispatches for BusId::Binary.
+    // CPU's per-byte AND_BYTE/OR_BYTE/XOR_BYTE senders moved to the Binary
+    // AIR; CPU now sends one Binary message per AND/OR/XOR row carrying
+    // (op, lhs, rhs, res). Binary's per-byte BITWISE traffic is emitted by
+    // `collect_bitwise_from_binary` further below in `build_traces`.
+    let mut binary_ops: Vec<super::binary::BinaryOperation> = Vec::new();
+    for op in &cpu_ops {
+        let kind = if op.decode.op_and {
+            Some(super::binary::BinaryOp::And)
+        } else if op.decode.op_or {
+            Some(super::binary::BinaryOp::Or)
+        } else if op.decode.op_xor {
+            Some(super::binary::BinaryOp::Xor)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            binary_ops.push(super::binary::BinaryOperation::new(kind, arg1, arg2));
+        }
+    }
+
     CollectedOps {
         cpu_ops,
         memw_ops,
@@ -1888,6 +1939,7 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         binary_add_ops,
+        binary_ops,
     }
 }
 
@@ -1921,6 +1973,7 @@ fn build_traces(
         dvrm_ops,
         commit_ops,
         binary_add_ops,
+        binary_ops,
     } = ops;
 
     // =====================================================================
@@ -1939,6 +1992,7 @@ fn build_traces(
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     bitwise_ops.extend(collect_bitwise_from_binary_add(&binary_add_ops));
+    bitwise_ops.extend(collect_bitwise_from_binary(&binary_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
     // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
@@ -2069,7 +2123,7 @@ fn build_traces(
         commit: commit_trace,
         memw_registers,
         binary_add: super::binary_add::generate_binary_add_trace(&binary_add_ops),
-        binary: super::binary::generate_binary_trace(),
+        binary: super::binary::generate_binary_trace(&binary_ops),
     })
 }
 

@@ -42,7 +42,8 @@
 //! - STORE ADD: for STORE (res = arg1 + imm, separate from main ADD)
 //! - SUB: for SUB, BEQ operations
 //! - LT: for SLT, BLT operations
-//! - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
+//! - Binary: for AND/OR/XOR dispatch (×1, op-encoded; per-byte BITWISE
+//!   traffic now lives in the Binary AIR — Phase 2 step 5)
 //! - SHIFT: for shift operations
 //! - MUL: for multiplication
 //! - DIVREM: for division/remainder
@@ -587,45 +588,9 @@ impl CpuOperation {
             lookups.push(BitwiseOperation::zero(sum as u32));
         }
 
-        // AND/OR/XOR lookups (×8 each for each byte)
-        let arg1 = self.compute_arg1();
-        let arg2 = self.compute_arg2();
-
-        if self.decode.op_and {
-            for i in 0..8 {
-                let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
-                let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::AndByte,
-                    a,
-                    b,
-                ));
-            }
-        }
-
-        if self.decode.op_or {
-            for i in 0..8 {
-                let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
-                let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::OrByte,
-                    a,
-                    b,
-                ));
-            }
-        }
-
-        if self.decode.op_xor {
-            for i in 0..8 {
-                let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
-                let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::XorByte,
-                    a,
-                    b,
-                ));
-            }
-        }
+        // AND/OR/XOR per-byte BITWISE lookups have moved to the Binary AIR
+        // (Phase 2 step 5). They are emitted by `collect_bitwise_from_binary`
+        // in trace_builder, replacing the 24 lookups CPU used to push here.
 
         lookups
     }
@@ -955,13 +920,16 @@ fn linear_term(bit: u32, column: usize) -> LinearTerm {
 ///
 /// The CPU table sends to:
 /// - DECODE: instruction fetch (every row)
-/// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
-///
-/// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
+/// - Binary: AND/OR/XOR dispatch (×1, op-encoded — Phase 2 step 5
+///   moved the per-byte AND_BYTE/OR_BYTE/XOR_BYTE traffic into the
+///   Binary AIR's senders)
+/// - BinaryAdd: ADD/LOAD/STORE/JALR/SUB/BEQ dispatch (Phase 2 step 3)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode as bits;
 
-    let mut interactions = Vec::new();
+    // Pre-sized to silence clippy::vec_init_then_push without needing a
+    // mega-`vec!` macro for the ~40 interactions appended below.
+    let mut interactions: Vec<BusInteraction> = Vec::with_capacity(40);
 
     // -------------------------------------------------------------------------
     // DECODE interaction (instruction fetch)
@@ -1038,76 +1006,41 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // Binary interaction (Phase 2 step 5: AND/OR/XOR dispatch)
     // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::AndByte,
-            Multiplicity::Column(cols::AND),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
+    // BusId::Binary[op, lhs, rhs, res] proves `lhs op rhs = res` for
+    // op ∈ {AND=0, OR=1, XOR=2}. Replaces 24 per-byte AND_BYTE/OR_BYTE/
+    // XOR_BYTE senders that used to live here — those moved to the
+    // Binary AIR's senders, paying their cost only on rows that fire.
+    interactions.push(BusInteraction::sender(
+        BusId::Binary,
+        Multiplicity::Sum3(cols::AND, cols::OR, cols::XOR),
+        vec![
+            // op encoding (matches Binary's receiver): 0·AND + 1·OR + 2·XOR.
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::OR,
                 },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
+                LinearTerm::Column {
+                    coefficient: 2,
+                    column: cols::XOR,
                 },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::OrByte,
-            Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
+            ]),
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // SIGN template: MSB16 interactions for extension bit extraction
