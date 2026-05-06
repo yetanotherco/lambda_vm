@@ -63,7 +63,6 @@ fn test_disk_spill_serialization_roundtrip() {
 #[test]
 fn test_disk_spill_prove_and_verify_372k() {
     let _guard = ForceDiskGuard::new();
-    let _ = env_logger::builder().is_test(true).try_init();
     let elf_bytes = asm_elf_bytes("fib_iterative_372k");
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
     let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
