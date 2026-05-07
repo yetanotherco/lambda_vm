@@ -38,9 +38,10 @@ impl BuildHasher for U64BuildHasher {
 
 pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 
-// TODO: Correctly define this
-const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u64 = 1024;
-const PUBLIC_OUTPUT_START_INDEX: u64 = 0;
+/// Total cap on public output bytes across all `commit_public_output` calls.
+/// The COMMIT AIR concatenates calls via the running `x254` index, so this
+/// is enforced as a running-total budget rather than a per-call limit.
+const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 64 * 1024;
 /// Maximum size of the private input memory region (in bytes).
 pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Fixed high address where private input is mapped. Guest programs can read
@@ -50,19 +51,26 @@ pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]
-pub struct Memory(U64HashMap<[u8; 4]>);
+pub struct Memory {
+    cells: U64HashMap<[u8; 4]>,
+    /// Bytes committed to public output via `commit_public_output`. The
+    /// COMMIT AIR doesn't write to a fixed memory region (it streams bytes
+    /// onto the Commit bus by `index`), so this buffer is purely the
+    /// executor's view used by `read_return_value` and CLI display.
+    public_output: Vec<u8>,
+}
 
 impl Memory {
     pub fn load_byte(&self, address: u64) -> u8 {
         let aligned_address = address - address % 4;
-        let value = self.0.get(&aligned_address).cloned().unwrap_or_default();
+        let value = self.cells.get(&aligned_address).cloned().unwrap_or_default();
         value[(address % 4) as usize]
     }
 
     pub fn store_byte(&mut self, address: u64, value: u8) {
         let aligned_address = address - address % 4;
         let entry = self
-            .0
+            .cells
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         entry[(address % 4) as usize] = value;
@@ -72,7 +80,7 @@ impl Memory {
         if !address.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
-        let bytes = self.0.get(&address).cloned().unwrap_or_default();
+        let bytes = self.cells.get(&address).cloned().unwrap_or_default();
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -81,7 +89,7 @@ impl Memory {
             return Err(MemoryError::UnalignedAccess);
         }
         let bytes = value.to_le_bytes();
-        self.0.insert(address, bytes);
+        self.cells.insert(address, bytes);
         Ok(())
     }
 
@@ -90,8 +98,8 @@ impl Memory {
         if !address.is_multiple_of(8) {
             return Err(MemoryError::UnalignedAccess);
         }
-        let low_bytes = self.0.get(&address).cloned().unwrap_or_default();
-        let high_bytes = self.0.get(&(address + 4)).cloned().unwrap_or_default();
+        let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
+        let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
         let low = u32::from_le_bytes(low_bytes) as u64;
         let high = u32::from_le_bytes(high_bytes) as u64;
         Ok(low | (high << 32))
@@ -104,8 +112,8 @@ impl Memory {
         }
         let low = (value & 0xFFFFFFFF) as u32;
         let high = (value >> 32) as u32;
-        self.0.insert(address, low.to_le_bytes());
-        self.0.insert(address + 4, high.to_le_bytes());
+        self.cells.insert(address, low.to_le_bytes());
+        self.cells.insert(address + 4, high.to_le_bytes());
         Ok(())
     }
 
@@ -117,7 +125,7 @@ impl Memory {
             );
         }
         let aligned_address = address - address % 4;
-        let bytes = self.0.get(&aligned_address).cloned().unwrap_or_default();
+        let bytes = self.cells.get(&aligned_address).cloned().unwrap_or_default();
         let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
         Ok(u16::from_le_bytes(
             value.try_into().map_err(|_| MemoryError::LoadHalf)?,
@@ -130,7 +138,7 @@ impl Memory {
         }
         let aligned_address = address - address % 4;
         let entry = self
-            .0
+            .cells
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         let bytes = value.to_le_bytes();
@@ -139,19 +147,25 @@ impl Memory {
         Ok(())
     }
 
+    /// Append `length` bytes from guest memory starting at `address` to the
+    /// public output. The COMMIT AIR concatenates calls via the running
+    /// `x254` index, and the trace builder accumulates `commit_ops` into
+    /// `VmProof.public_output`; this method maintains the executor's view
+    /// of the same byte stream so `read_return_value` matches.
     pub fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {
-        if length > MAX_PUBLIC_OUTPUT_COMMIT_SIZE {
+        let new_total = (self.public_output.len() as u64)
+            .checked_add(length)
+            .ok_or(MemoryError::CommitSizeExceeded)?;
+        if new_total > MAX_PUBLIC_OUTPUT_TOTAL_SIZE {
             return Err(MemoryError::CommitSizeExceeded);
         }
-        self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
-        let inputs = self.load_bytes(address, length);
-        self.set_bytes_aligned(PUBLIC_OUTPUT_START_INDEX + 4, &inputs)?;
+        let bytes = self.load_bytes(address, length);
+        self.public_output.extend_from_slice(&bytes);
         Ok(())
     }
 
     pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
-        let size = self.load_word(PUBLIC_OUTPUT_START_INDEX)?;
-        Ok(self.load_bytes(PUBLIC_OUTPUT_START_INDEX + 4, size as u64))
+        Ok(self.public_output.clone())
     }
 
     /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
@@ -174,7 +188,7 @@ impl Memory {
         let end = addr + len;
         while addr < end {
             let aligned = addr - (addr % 4);
-            let bytes = self.0.get(&aligned).cloned().unwrap_or_default();
+            let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
             let offset = (addr % 4) as usize;
             let take = std::cmp::min(4 - offset, (end - addr) as usize);
             result.extend_from_slice(&bytes[offset..offset + take]);
@@ -192,7 +206,7 @@ impl Memory {
         for chunk in inputs.chunks(4) {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
-            self.0.insert(addr, bytes);
+            self.cells.insert(addr, bytes);
             addr += 4;
         }
         Ok(())
@@ -234,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_public_output_overwrites() {
+    fn test_commit_public_output_appends() {
         let mut memory = Memory::default();
         memory.store_byte(0x100, b'a');
         memory.store_byte(0x101, b'b');
@@ -248,19 +262,33 @@ mod tests {
             .commit_public_output(0x104, 2)
             .expect("second commit should succeed");
 
-        // Overwrite semantics: second commit replaces first
+        // Append semantics: calls concatenate (EF zkVM IO interface).
         assert_eq!(
             memory
                 .read_return_value()
                 .expect("public output should be readable"),
-            b"cd".to_vec()
+            b"abcd".to_vec()
         );
     }
 
     #[test]
-    fn test_commit_public_output_size_exceeded() {
+    fn test_commit_public_output_total_cap() {
         let mut memory = Memory::default();
-        let err = memory.commit_public_output(0x100, 1025);
-        assert!(err.is_err());
+        // Seed enough source bytes for two 32 KB writes.
+        let chunk = vec![0xAB; 32 * 1024];
+        memory
+            .set_bytes_aligned(0x1_0000, &chunk)
+            .expect("seed should succeed");
+
+        memory
+            .commit_public_output(0x1_0000, 32 * 1024)
+            .expect("first 32 KB commit should succeed");
+        memory
+            .commit_public_output(0x1_0000, 32 * 1024)
+            .expect("second 32 KB commit should succeed (total = 64 KB)");
+
+        // One more byte exceeds the 64 KB total cap.
+        let err = memory.commit_public_output(0x1_0000, 1).unwrap_err();
+        assert!(matches!(err, super::MemoryError::CommitSizeExceeded));
     }
 }
