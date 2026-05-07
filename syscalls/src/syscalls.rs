@@ -9,7 +9,7 @@ use core::arch::asm;
 const PRIVATE_INPUT_START: usize = 0xFF000000;
 
 #[cfg(target_arch = "riscv64")]
-enum SyscallNumbers {
+pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
     Commit = 64,

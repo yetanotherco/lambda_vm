@@ -1999,6 +1999,31 @@ fn test_prove_private_input_different_values() {
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
 
+/// End-to-end: EF zkVM IO interface — demo guest reads its private input via
+/// `read_input` and emits it back through TWO `write_output` calls. The
+/// COMMIT AIR's running `x254` index concatenates them; the resulting proof's
+/// `public_output` must equal the original input.
+#[test]
+fn test_prove_ef_io_demo_concatenates() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_demo.elf"))
+            .expect("ef_io_demo.elf not found — run `make compile-programs-rust`");
+    let input: &[u8] = b"hello world!";
+    let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "ef_io_demo should verify"
+    );
+    assert_eq!(
+        proof.public_output, input,
+        "two write_output calls must concatenate"
+    );
+}
+
 /// End-to-end: Rust std program with private input.
 #[test]
 fn test_prove_commit_sum() {
