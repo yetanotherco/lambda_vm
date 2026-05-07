@@ -1311,50 +1311,64 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD,
-/// 12 IsHalf(0,0) for ARG1/ARG2/RES byte pairs, and 2 IsHalf(0,0) for the
-/// RES_LO halfword decomposition (Phase 2 step 9B) = 16 ops.
-fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
-    if num_padding_rows == 0 {
+/// The IS_HALFWORD send count differs by chip after Phase 2 step C2:
+/// - **Base CPU rows** (and their padding): 12 IsHalf(0,0) per row —
+///   4 ARG2 byte-pair + 4 ARG1 halfword (limb-form) + 2 RES_HI halfword
+///   (limb-form) + 2 RES_LO halfword decomp.
+/// - **CPU_BITWISE rows** (and their padding): 14 IsHalf(0,0) per row —
+///   12 byte-pair (ARG1/ARG2/RES) + 2 RES_LO halfword decomp.
+///
+/// Per padding row both chips also emit 1 IsByte(0,0) for RS1+RS2 and 1
+/// IsByte(0,0) for (RD, 0).
+fn collect_byte_check_ops_for_padding(
+    base_cpu_padding_rows: usize,
+    cpu_bitwise_padding_rows: usize,
+) -> Vec<BitwiseOperation> {
+    let total = base_cpu_padding_rows + cpu_bitwise_padding_rows;
+    if total == 0 {
         return Vec::new();
     }
 
-    let mut ops = Vec::with_capacity(num_padding_rows * 16);
-    for _ in 0..num_padding_rows {
-        // IS_BYTE[RS1, RS2] pair (both zero in padding)
+    // 2 IsByte + (12 or 14) IsHalf per row.
+    let cap = base_cpu_padding_rows * 14 + cpu_bitwise_padding_rows * 16;
+    let mut ops = Vec::with_capacity(cap);
+
+    let push_byte_check_padding = |ops: &mut Vec<BitwiseOperation>| {
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::IsByte,
             0,
             0,
         ));
-        // IS_BYTE[RD, 0] single (zero in padding)
         ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             0,
         ));
-        // 12 IS_HALFWORD lookups for ARG1/ARG2/RES byte pairs (all zero in
-        // padding) — must match the IsHalf ops emitted by collect_byte_check_ops
-        // for non-padding rows so MU_IS_HALF multiplicities line up.
-        for _ in 0..12 {
+    };
+
+    let push_zero_halves = |ops: &mut Vec<BitwiseOperation>, n: usize| {
+        for _ in 0..n {
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 0,
                 0,
             ));
         }
-        // 2 IS_HALFWORD lookups for the RES_LO halfword decomposition
-        // (RES_LO_HALF_HI + implicit lower halfword), Phase 2 step 9B.
-        ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            0,
-            0,
-        ));
-        ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            0,
-            0,
-        ));
+    };
+
+    for _ in 0..base_cpu_padding_rows {
+        push_byte_check_padding(&mut ops);
+        // 4 ARG2 byte-pair + 4 ARG1 halfword + 2 RES_HI halfword + 2 RES_LO
+        // halfword-decomp = 12 IsHalf(0,0) lookups per base padding row.
+        push_zero_halves(&mut ops, 12);
     }
+
+    for _ in 0..cpu_bitwise_padding_rows {
+        push_byte_check_padding(&mut ops);
+        // 12 byte-pair + 2 RES_LO halfword-decomp = 14 IsHalf(0,0) lookups
+        // per CPU_BITWISE padding row.
+        push_zero_halves(&mut ops, 14);
+    }
+
     ops
 }
 
@@ -1903,7 +1917,10 @@ fn build_traces(
     let cpu_bitwise_padding: usize =
         bitwise_cpu_ops.len().next_power_of_two().max(4) - bitwise_cpu_ops.len();
     let num_padding_rows = cpu_padding + cpu_bitwise_padding;
-    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+    bitwise_ops.extend(collect_byte_check_ops_for_padding(
+        cpu_padding,
+        cpu_bitwise_padding,
+    ));
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)

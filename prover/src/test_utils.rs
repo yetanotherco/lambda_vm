@@ -38,7 +38,7 @@ use crate::tables::commit::{
     create_constraints as commit_constraints,
 };
 use crate::tables::cpu::{
-    CpuOperation, bus_interactions_without_bitwise as cpu_bus_interactions, cols as cpu_cols,
+    CpuOperation, bus_interactions_base_chip as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::cpu_bitwise::bus_interactions as cpu_bitwise_bus_interactions;
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};

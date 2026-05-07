@@ -277,9 +277,24 @@ pub mod cols {
     /// 16-31 of RES_LO.
     pub const RES_LO_HALF_HI: usize = 83;
 
-    /// Total number of columns (will shrink to ~58 after Phase 2 byte
-    /// cells are removed at end of migration).
-    pub const NUM_COLUMNS: usize = 84;
+    /// Bits 16-31 of `ARG1_LO`. Aux witness for the base-CPU IS_HALFWORD
+    /// range check that replaces the byte-pair form once the ARG1 byte cells
+    /// are dropped (Phase 2 step C2). Together with the implicit lower
+    /// halfword `ARG1_LO - 65536 * ARG1_LO_HALF_HI`, both halves are sent to
+    /// IS_HALFWORD so the column is forced to bits 16-31 of ARG1_LO.
+    pub const ARG1_LO_HALF_HI: usize = 84;
+
+    /// Bits 16-31 of `ARG1_HI`. Aux witness, same role for the upper 32 bits
+    /// of ARG1 as `ARG1_LO_HALF_HI` plays for the lower 32 bits.
+    pub const ARG1_HI_HALF_HI: usize = 85;
+
+    /// Bits 16-31 of `RES_HI`. Aux witness, same role for the upper 32 bits
+    /// of RES as `RES_LO_HALF_HI` plays for the lower 32 bits.
+    pub const RES_HI_HALF_HI: usize = 86;
+
+    /// Total number of columns. Shrinks once Phase 2 step C3 drops
+    /// ARG1[0..7] and RES[0..7] from the base CPU layout.
+    pub const NUM_COLUMNS: usize = 87;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -530,21 +545,40 @@ impl CpuOperation {
         }
     }
 
-    /// Collects CPU range-check lookups for register indices and byte pairs.
+    /// Whether this op routes to the dedicated CPU_BITWISE chip
+    /// (AND/OR/XOR and their `*W` variants).
+    fn is_bitwise_chip_row(&self) -> bool {
+        self.decode.op_and || self.decode.op_or || self.decode.op_xor
+    }
+
+    /// Collects CPU range-check lookups for register indices, ARG2 byte pairs,
+    /// and the halfword-decomposed limbs that the base/bitwise CPU AIRs send.
     ///
-    /// The CPU sends:
-    /// - 1 IS_BYTE lookup for (RS1, RS2) batched as a pair
-    /// - 1 IS_BYTE lookup for RD encoded as (RD, 0)
-    /// - 12 IS_HALFWORD lookups for adjacent byte pairs in ARG1, ARG2, and RES
-    ///   (each pair packs into one halfword `lo + 256*hi`)
+    /// The exact lookup count depends on which chip the row routes to:
+    ///
+    /// - **CPU_BITWISE rows** (AND/OR/XOR, `is_bitwise_chip_row() == true`)
+    ///   send 14 IS_HALFWORD lookups per row: 12 byte-pair sends for ARG1/
+    ///   ARG2/RES (4 each) plus the 2 RES_LO halfword-decomp sends that back
+    ///   the MSB16 res-ext-bit sender (Phase 2 step 9B).
+    /// - **Base CPU rows** (Phase 2 step C2) send 12 IS_HALFWORD lookups: 4
+    ///   ARG2 byte-pair sends (kept since ARG2 byte cells stay on base CPU
+    ///   for STORE/SHIFT) + 2 RES_LO halfword-decomp + 2 ARG1_LO halfword-
+    ///   decomp + 2 ARG1_HI halfword-decomp + 2 RES_HI halfword-decomp.
+    ///   The ARG1 and RES_HI halfwords are sourced from the u32 limb cells
+    ///   via the HALF_HI aux pattern but produce the same halfword *values*
+    ///   as the byte-pair form.
+    ///
+    /// Both shapes also send 1 IS_BYTE for (RS1, RS2) and 1 IS_BYTE for
+    /// (RD, 0), so the IS_BYTE count per row is unchanged.
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
         let res = self.compute_res();
+        let bitwise_row = self.is_bitwise_chip_row();
 
-        let mut ops = Vec::with_capacity(14);
+        let mut ops = Vec::with_capacity(if bitwise_row { 16 } else { 14 });
 
         // Batch RS1+RS2 as a pair; RD stays single with Y=0.
         ops.push(BitwiseOperation::byte_op(
@@ -557,20 +591,42 @@ impl CpuOperation {
             self.decode.rd,
         ));
 
-        // 12 IS_HALFWORD lookups for ARG1/ARG2/RES byte pairs.
-        // Each pair packs as halfword = lo + 256*hi, sent as a single bus
-        // element to the IS_HALFWORD bus. The byte_ops table indexes by (X, Y)
-        // identical to IS_BYTE, but the receiver combines them into one
-        // halfword fingerprint via Multiplicity::Column(MU_IS_HALF).
-        for value in [arg1, arg2, res] {
+        let push_halfword = |ops: &mut Vec<BitwiseOperation>, value: u64, i: u32| {
+            let lo = ((value >> (i * 16)) & 0xFF) as u8;
+            let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                lo,
+                hi,
+            ));
+        };
+
+        // ARG2 byte-pair sends (4) — kept on both chips since ARG2 byte cells
+        // are still consumed by STORE/SHIFT on base CPU and by the bitwise
+        // lookup on CPU_BITWISE.
+        for i in 0..4 {
+            push_halfword(&mut ops, arg2, i);
+        }
+
+        // ARG1 halfword sends (4). Bitwise chip emits via byte pairs;
+        // base chip emits via the ARG1_LO/HI HALF_HI aux limb decomposition.
+        // Either way the halfword values are identical (4 halfwords of arg1).
+        for i in 0..4 {
+            push_halfword(&mut ops, arg1, i);
+        }
+
+        // RES halfword sends. On the bitwise chip, all 4 RES halfwords come
+        // from byte pairs. On the base chip, only the upper two halfwords
+        // come from the RES_HI limb decomposition (RES_LO already has its
+        // own dedicated sends below).
+        if bitwise_row {
             for i in 0..4 {
-                let lo = ((value >> (i * 16)) & 0xFF) as u8;
-                let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
-                ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    lo,
-                    hi,
-                ));
+                push_halfword(&mut ops, res, i);
+            }
+        } else {
+            // Skip i=0,1 here — they're emitted as RES_LO halfword-decomp below.
+            for i in 2..4 {
+                push_halfword(&mut ops, res, i);
             }
         }
 
@@ -918,6 +974,14 @@ pub fn generate_cpu_trace(
         // Aux halfword: bits 16-31 of RES_LO. Used by the MSB16 res-ext-bit
         // sender (Phase 2 step 9B) to avoid reading RES[2]+256*RES[3].
         data[base + cols::RES_LO_HALF_HI] = FE::from((res >> 16) & 0xFFFF);
+
+        // Aux halfwords: bits 16-31 of ARG1_LO, ARG1_HI, RES_HI. Used by the
+        // base-CPU IS_HALFWORD range checks once the byte cells are dropped
+        // (Phase 2 step C2). On CPU_BITWISE rows these are still populated
+        // for trace-table uniformity but unread.
+        data[base + cols::ARG1_LO_HALF_HI] = FE::from((arg1 >> 16) & 0xFFFF);
+        data[base + cols::ARG1_HI_HALF_HI] = FE::from((arg1 >> 48) & 0xFFFF);
+        data[base + cols::RES_HI_HALF_HI] = FE::from((res >> 48) & 0xFFFF);
 
         // RES_INV witness for the BEQ zero-test (Phase 2 step 9A).
         // sum = RES_LO + RES_HI ∈ [0, 2^33-2). Both are non-negative, so
@@ -2104,6 +2168,78 @@ pub fn bus_interactions_without_bitwise() -> Vec<BusInteraction> {
         .into_iter()
         .filter(|i| i.bus_id != bitwise_id)
         .collect()
+}
+
+/// Bus interactions for the base CPU chip after Phase 2 step C2.
+///
+/// Starts from `bus_interactions_without_bitwise` and replaces the byte-pair
+/// IS_HALFWORD range checks for `ARG1` and `RES` with limb/HALF_HI sends
+/// (the same pattern already used for `RES_LO`). The byte-pair sends for
+/// `ARG2` are kept since the base CPU still carries `ARG2[0..7]` for STORE
+/// and SHIFT (until Step F migrates the MEMW interface to u32 limbs).
+///
+/// Net IS_HALFWORD sends per row: 4 (ARG2 byte pairs) + 6 (3 limb decompositions
+/// for ARG1_LO, ARG1_HI, RES_HI), plus the existing 2 from RES_LO. Total 12,
+/// down from 14 prior to step C2 (12 byte-pair + 2 RES_LO limb).
+pub fn bus_interactions_base_chip() -> Vec<BusInteraction> {
+    let is_halfword_id: u64 = BusId::IsHalfword.into();
+    let arg1_byte_cols: [usize; 8] = cols::ARG1;
+    let res_byte_cols: [usize; 8] = cols::RES;
+
+    let touches_arg1_or_res_byte = |interaction: &BusInteraction| -> bool {
+        if interaction.bus_id != is_halfword_id {
+            return false;
+        }
+        interaction.values.iter().any(|v| match v {
+            BusValue::Linear(terms) => terms.iter().any(|t| match t {
+                LinearTerm::Column { column, .. } => {
+                    arg1_byte_cols.contains(column) || res_byte_cols.contains(column)
+                }
+                _ => false,
+            }),
+            _ => false,
+        })
+    };
+
+    let mut interactions: Vec<BusInteraction> = bus_interactions_without_bitwise()
+        .into_iter()
+        .filter(|i| !touches_arg1_or_res_byte(i))
+        .collect();
+
+    // Append limb-based IS_HALFWORD range checks for ARG1_LO, ARG1_HI, RES_HI.
+    // (RES_LO already has its own limb/HALF_HI sends in `bus_interactions()`.)
+    // For each limb, two sends: HALF_HI directly + (LIMB - 65536*HALF_HI).
+    let limb_pairs: [(usize, usize); 3] = [
+        (cols::ARG1_LO, cols::ARG1_LO_HALF_HI),
+        (cols::ARG1_HI, cols::ARG1_HI_HALF_HI),
+        (cols::RES_HI, cols::RES_HI_HALF_HI),
+    ];
+    for (limb_col, half_hi_col) in limb_pairs {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: half_hi_col,
+                packing: Packing::Direct,
+            }],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: limb_col,
+                },
+                LinearTerm::Column {
+                    coefficient: -(65536i64),
+                    column: half_hi_col,
+                },
+            ])],
+        ));
+    }
+
+    interactions
 }
 
 /// Bus interactions for the CPU_BITWISE chip — only the buses an AND/OR/XOR
