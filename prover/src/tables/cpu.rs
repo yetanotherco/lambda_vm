@@ -191,75 +191,70 @@ pub mod cols {
     /// rv1_ext_bit: Sign bit of rv1 as 32-bit word (for word_instr sign extension)
     pub const RV1_EXT_BIT: usize = 45;
 
-    /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 46;
-    pub const ARG1_1: usize = 47;
-    pub const ARG1_2: usize = 48;
-    pub const ARG1_3: usize = 49;
-    pub const ARG1_4: usize = 50;
-    pub const ARG1_5: usize = 51;
-    pub const ARG1_6: usize = 52;
-    pub const ARG1_7: usize = 53;
+    /// arg1[0..4]: Extended rv1 as DWordHL (4 halfwords)
+    pub const ARG1_HW0: usize = 46;
+    pub const ARG1_HW1: usize = 47;
+    pub const ARG1_HW2: usize = 48;
+    pub const ARG1_HW3: usize = 49;
 
     /// rv2_ext_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used for arg2 sign extension)
-    pub const RV2_EXT_BIT: usize = 54;
+    pub const RV2_EXT_BIT: usize = 50;
 
-    /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 55;
-    pub const ARG2_1: usize = 56;
-    pub const ARG2_2: usize = 57;
-    pub const ARG2_3: usize = 58;
-    pub const ARG2_4: usize = 59;
-    pub const ARG2_5: usize = 60;
-    pub const ARG2_6: usize = 61;
-    pub const ARG2_7: usize = 62;
+    /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes).
+    ///
+    /// Phase 2 step 6b: kept as bytes because STORE's M7 sends 8 individual
+    /// `Direct` field elements into MEMW (which is byte-addressable for
+    /// memory writes) and SHIFT receives `arg2[0]` as a single byte. Both
+    /// receivers would need substantial rework to accept halfwords.
+    pub const ARG2_0: usize = 51;
+    pub const ARG2_1: usize = 52;
+    pub const ARG2_2: usize = 53;
+    pub const ARG2_3: usize = 54;
+    pub const ARG2_4: usize = 55;
+    pub const ARG2_5: usize = 56;
+    pub const ARG2_6: usize = 57;
+    pub const ARG2_7: usize = 58;
 
     /// res_ext_bit: Sign bit of res as 32-bit word (for rvd sign extension)
-    pub const RES_EXT_BIT: usize = 63;
+    pub const RES_EXT_BIT: usize = 59;
 
-    /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 64;
-    pub const RES_1: usize = 65;
-    pub const RES_2: usize = 66;
-    pub const RES_3: usize = 67;
-    pub const RES_4: usize = 68;
-    pub const RES_5: usize = 69;
-    pub const RES_6: usize = 70;
-    pub const RES_7: usize = 71;
+    /// res[0..4]: ALU result as DWordHL (4 halfwords)
+    pub const RES_HW0: usize = 60;
+    pub const RES_HW1: usize = 61;
+    pub const RES_HW2: usize = 62;
+    pub const RES_HW3: usize = 63;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 72;
+    pub const IS_EQUAL: usize = 64;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 73;
+    pub const BRANCH_COND: usize = 65;
 
     /// prev_pc_timestamp_borrow: Borrow bit for the 32-bit subtraction timestamp_lo - 3
     /// in the inline PC prev_ts formula. Fires only when timestamp_lo < 3 and
     /// pc_double_read = 0 (i.e. after timestamp wraps past 2^32 into values 0..2).
-    pub const PREV_PC_TIMESTAMP_BORROW: usize = 74;
+    pub const PREV_PC_TIMESTAMP_BORROW: usize = 66;
 
     /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
-    pub const PC_DOUBLE_READ: usize = 75;
+    pub const PC_DOUBLE_READ: usize = 67;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 76;
+    pub const NUM_COLUMNS: usize = 68;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
     // -------------------------------------------------------------------------
 
-    /// ARG1 byte columns as array
-    pub const ARG1: [usize; 8] = [
-        ARG1_0, ARG1_1, ARG1_2, ARG1_3, ARG1_4, ARG1_5, ARG1_6, ARG1_7,
-    ];
+    /// ARG1 halfword columns as array
+    pub const ARG1_HW: [usize; 4] = [ARG1_HW0, ARG1_HW1, ARG1_HW2, ARG1_HW3];
 
     /// ARG2 byte columns as array
     pub const ARG2: [usize; 8] = [
         ARG2_0, ARG2_1, ARG2_2, ARG2_3, ARG2_4, ARG2_5, ARG2_6, ARG2_7,
     ];
 
-    /// RES byte columns as array
-    pub const RES: [usize; 8] = [RES_0, RES_1, RES_2, RES_3, RES_4, RES_5, RES_6, RES_7];
+    /// RES halfword columns as array
+    pub const RES_HW: [usize; 4] = [RES_HW0, RES_HW1, RES_HW2, RES_HW3];
 }
 
 // =========================================================================
@@ -493,12 +488,14 @@ impl CpuOperation {
         }
     }
 
-    /// Collects CPU range-check lookups for register indices and byte pairs.
+    /// Collects CPU range-check lookups for register indices, halfwords, and ARG2 bytes.
     ///
     /// The CPU sends:
     /// - 1 IS_BYTE lookup for (RS1, RS2) batched as a pair
     /// - 1 IS_BYTE lookup for RD encoded as (RD, 0)
-    /// - 12 IS_BYTE lookups for adjacent byte pairs in ARG1, ARG2, and RES
+    /// - 4 IS_HALFWORD lookups for ARG1_HW[0..3]
+    /// - 4 IS_HALFWORD lookups for RES_HW[0..3]
+    /// - 4 IS_BYTE pair lookups for ARG2 byte pairs
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
@@ -519,19 +516,28 @@ impl CpuOperation {
             self.decode.rd,
         ));
 
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs
-        // Each pair sends [lo, hi] as two separate bus values, so the LogUp
-        // fingerprint forces each byte to match individually against BITWISE X, Y.
-        for value in [arg1, arg2, res] {
+        // IS_HALFWORD for ARG1_HW + RES_HW (4 halfwords each).
+        for value in [arg1, res] {
             for i in 0..4 {
                 let lo = ((value >> (i * 16)) & 0xFF) as u8;
                 let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
-                ops.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::IsByte,
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
                     lo,
                     hi,
                 ));
             }
+        }
+
+        // IS_BYTE pairs for ARG2 (kept as 8 bytes — STORE M7 + SHIFT need byte access).
+        for i in 0..4 {
+            let lo = ((arg2 >> (i * 16)) & 0xFF) as u8;
+            let hi = ((arg2 >> (i * 16 + 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::IsByte,
+                lo,
+                hi,
+            ));
         }
 
         ops
@@ -577,14 +583,14 @@ impl CpuOperation {
             ));
         }
 
-        // ZERO lookup for is_equal (when BEQ=1)
+        // ZERO lookup for is_equal (when BEQ=1).
+        // Bus sends sum of 4 RES_HW halfwords — must match the same sum here.
         if self.decode.op_beq {
-            // Sum of all result bytes
             let mut sum: u64 = 0;
-            for i in 0..8 {
-                sum += (self.res >> (i * 8)) & 0xFF;
+            for i in 0..4 {
+                sum += (self.res >> (i * 16)) & 0xFFFF;
             }
-            // Sum fits in 11 bits (max 8 * 255 = 2040), well within ZERO's 20-bit range
+            // Max 4 * 65535 = 262140, fits in 18 bits (well within ZERO's 20-bit range).
             lookups.push(BitwiseOperation::zero(sum as u32));
         }
 
@@ -799,13 +805,13 @@ pub fn generate_cpu_trace(
         let rv1_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_EXT_BIT] = FE::from(rv1_ext_bit as u64);
 
-        // Compute and store arg1 as DWordBL (8 bytes)
+        // Compute and store arg1 as DWordHL (4 halfwords)
         let arg1 = op.compute_arg1();
-        for i in 0..8 {
-            data[base + cols::ARG1[i]] = FE::from((arg1 >> (i * 8)) & 0xFF);
+        for i in 0..4 {
+            data[base + cols::ARG1_HW[i]] = FE::from((arg1 >> (i * 16)) & 0xFFFF);
         }
 
-        // Compute and store arg2
+        // Compute and store arg2 as DWordBL (8 bytes — STORE/SHIFT need byte access)
         let arg2 = op.compute_arg2();
         let rv2_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
         data[base + cols::RV2_EXT_BIT] = FE::from(rv2_ext_bit as u64);
@@ -813,12 +819,12 @@ pub fn generate_cpu_trace(
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
         }
 
-        // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
+        // Result as DWordHL (4 halfwords)
         let res = op.compute_res();
         let res_ext_bit = d.word_instr && CpuOperation::sign_bit_32(res);
         data[base + cols::RES_EXT_BIT] = FE::from(res_ext_bit as u64);
-        for i in 0..8 {
-            data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
+        for i in 0..4 {
+            data[base + cols::RES_HW[i]] = FE::from((res >> (i * 16)) & 0xFFFF);
         }
 
         // Branch columns
@@ -1028,16 +1034,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
                 start_column: cols::ARG2[0],
                 packing: Packing::DWordBL,
             },
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
         ],
     ));
@@ -1082,21 +1088,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // MSB16 interaction for res extension bit extraction
     // -------------------------------------------------------------------------
     // MSB16[res::DWordHL[1]] -> res_ext_bit, multiplicity = word_instr
-    // res::DWordHL[1] is the half at bits 16-31 = res[2] + 256*res[3]
+    // res::DWordHL[1] is the halfword at bits 16-31.
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::WORD_INSTR),
         vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[3],
-                },
-            ]),
+            BusValue::Packed {
+                start_column: cols::RES_HW1,
+                packing: Packing::Direct,
+            },
             BusValue::Packed {
                 start_column: cols::RES_EXT_BIT,
                 packing: Packing::Direct,
@@ -1107,45 +1107,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // ZERO interaction for is_equal (BEQ)
     // -------------------------------------------------------------------------
-    // ZERO[sum(res[0..7])] -> is_equal, multiplicity = BEQ
-    // If all 8 bytes of res are zero, sum = 0, is_equal = 1
+    // ZERO[sum(res_hw[0..3])] -> is_equal, multiplicity = BEQ
+    // If all 4 halfwords of res are zero, sum = 0, is_equal = 1.
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::BEQ),
         vec![
-            // Sum of all 8 result bytes as linear combination
             BusValue::linear(vec![
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RES[0],
+                    column: cols::RES_HW0,
                 },
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RES[1],
+                    column: cols::RES_HW1,
                 },
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RES[2],
+                    column: cols::RES_HW2,
                 },
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::RES[3],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[5],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[7],
+                    column: cols::RES_HW3,
                 },
             ]),
             BusValue::Packed {
@@ -1171,16 +1154,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Sum(cols::ADD, cols::LOAD),
         vec![
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
                 start_column: cols::ARG2[0],
                 packing: Packing::DWordBL,
             },
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
         ],
     ));
@@ -1191,16 +1174,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Column(cols::STORE),
         vec![
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
                 start_column: cols::IMM_0,
                 packing: Packing::DWordWL,
             },
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
         ],
     ));
@@ -1224,8 +1207,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ]),
             BusValue::constant(0),
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
         ],
     ));
@@ -1242,12 +1225,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::DWordBL,
             },
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
         ],
     ));
@@ -1267,8 +1250,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // arg1 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             // arg2 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
             BusValue::Packed {
@@ -1282,7 +1265,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             // lt result (res[0])
             BusValue::Packed {
-                start_column: cols::RES[0],
+                start_column: cols::RES_HW[0],
                 packing: Packing::Direct,
             },
         ],
@@ -1308,8 +1291,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // arg1 (lhs) as DWordBL (8 bytes → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             // lhs_signed = signed
             BusValue::Packed {
@@ -1330,8 +1313,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
             // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1352,8 +1335,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // arg1 (numerator n) as DWordBL (8 bytes → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             // arg2 (denominator d) as DWordBL (8 bytes → 2 elements)
             BusValue::Packed {
@@ -1369,8 +1352,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
             // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
@@ -1391,13 +1374,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // res (result) as DWordBL (8 bytes → 2 elements, same as DWordWL)
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             // arg1 (input) as DWordBL (8 bytes → 2 elements)
             BusValue::Packed {
-                start_column: cols::ARG1[0],
-                packing: Packing::DWordBL,
+                start_column: cols::ARG1_HW[0],
+                packing: Packing::DWordHL,
             },
             // arg2[0] (shift amount byte)
             BusValue::Packed {
@@ -1657,8 +1640,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             // base_address = res (computed address) as DWordBL (8 bytes → 2 elements)
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             // timestamp as DWordWL: [timestamp, 0]
             BusValue::Packed {
@@ -1705,8 +1688,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // base_address = res as DWordBL → 2 elements [lo32, hi32]
             BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
+                start_column: cols::RES_HW[0],
+                packing: Packing::DWordHL,
             },
             // value[0..7] = arg2 bytes (8 individual Direct elements)
             BusValue::Packed {
@@ -1960,44 +1943,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IMM_1,
                 packing: Packing::Direct,
             },
-            // register[0] = arg1[0..4] repacked as Word
-            // arg1_word0 = arg1[0] + 2^8*arg1[1] + 2^16*arg1[2] + 2^24*arg1[3]
+            // register[0] = arg1::DWordHL[0] = arg1_hw[0] + 2^16 * arg1_hw[1]
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::ARG1[0],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::ARG1[1],
+                    column: cols::ARG1_HW0,
                 },
                 LinearTerm::Column {
                     coefficient: 65536,
-                    column: cols::ARG1[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::ARG1[3],
+                    column: cols::ARG1_HW1,
                 },
             ]),
-            // register[1] = arg1[4..8] repacked as Word
-            // arg1_word1 = arg1[4] + 2^8*arg1[5] + 2^16*arg1[6] + 2^24*arg1[7]
+            // register[1] = arg1::DWordHL[1] = arg1_hw[2] + 2^16 * arg1_hw[3]
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
-                    column: cols::ARG1[4],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::ARG1[5],
+                    column: cols::ARG1_HW2,
                 },
                 LinearTerm::Column {
                     coefficient: 65536,
-                    column: cols::ARG1[6],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::ARG1[7],
+                    column: cols::ARG1_HW3,
                 },
             ]),
             // JALR flag
@@ -2011,15 +1976,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Range checks (14 total):
     // CPU-CR29: IS_BYTE[rs1, rs2], CPU-CR30: IS_BYTE[rd, 0]
-    // CPU-CR31.i: IS_BYTE[arg1[2i], arg1[2i+1]] (i=0..3)
+    // CPU-CR31.i: IS_HALFWORD[arg1_hw[i]] (i=0..3)
     // CPU-CR32.i: IS_BYTE[arg2[2i], arg2[2i+1]] (i=0..3)
-    // CPU-CR33.i: IS_BYTE[res[2i], res[2i+1]] (i=0..3)
+    // CPU-CR33.i: IS_HALFWORD[res_hw[i]] (i=0..3)
     // -------------------------------------------------------------------------
     // RS1 and RS2 share one IS_BYTE check; RD uses 0 as the second argument.
-    // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
-    // batched into IS_BYTE checks. Each pair sends two separate bus values
-    // [lo, hi], so the LogUp fingerprint forces each byte to match individually
-    // against the BITWISE table's X in [0,255] and Y in [0,255].
+    // ARG1/RES are stored as 4 halfword cols each → range-checked via
+    // IS_HALFWORD. ARG2 stays as 8 bytes (STORE M7 + SHIFT need byte access)
+    // → range-checked via 4 IS_BYTE pairs.
     // Every CPU row (including padding) sends with Multiplicity::One.
     interactions.push(BusInteraction::sender(
         BusId::IsByte,
@@ -2046,23 +2010,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
         ],
     ));
-    for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
-        for i in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::IsByte,
-                Multiplicity::One,
-                vec![
-                    BusValue::Packed {
-                        start_column: arr[2 * i],
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: arr[2 * i + 1],
-                        packing: Packing::Direct,
-                    },
-                ],
-            ));
-        }
+    for &col in cols::ARG1_HW.iter().chain(cols::RES_HW.iter()) {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+    for i in 0..4 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::One,
+            vec![
+                BusValue::Packed {
+                    start_column: cols::ARG2[2 * i],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::ARG2[2 * i + 1],
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
     }
 
     // ECALL interaction (single shared bus for HALT and COMMIT)

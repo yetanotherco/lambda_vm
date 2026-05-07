@@ -556,9 +556,9 @@ fn test_create_is_bit_constraints() {
 fn test_create_slt_res_zero_constraints() {
     let (constraints, next_idx) = create_slt_res_zero_constraints(0);
 
-    // Should create 7 constraints (for bytes 1-7)
-    assert_eq!(constraints.len(), 7);
-    assert_eq!(next_idx, 7);
+    // Phase 2 step 6b: 3 halfword constraints (RES_HW1..RES_HW3 = 0 on SLT/BLT rows).
+    assert_eq!(constraints.len(), 3);
+    assert_eq!(next_idx, 3);
 
     for (i, c) in constraints.iter().enumerate() {
         assert_eq!(c.constraint_idx(), i);
@@ -614,12 +614,12 @@ fn test_create_all_cpu_constraints() {
 
     assert_eq!(is_bit.len(), 34);
     // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3)
-    //      + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
-    assert_eq!(other.len(), 26);
+    //      + arg1(2) + arg2(2) + rvd(2) + slt_zero(3) + ext_bit_zero(3) + next_pc(2) = 22
+    assert_eq!(other.len(), 22);
 
-    // Phase 2 step 4: ADD/SUB/JALR carry constraints (8) moved to the
-    // BinaryAdd AIR. Total now: 34 IS_BIT + 26 other = 60.
-    assert_eq!(total, 60);
+    // Phase 2 step 6b: slt_res_zero shrinks from 7 → 3 (halfword form).
+    // Total now: 34 IS_BIT + 22 other = 56.
+    assert_eq!(total, 56);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 

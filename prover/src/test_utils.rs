@@ -46,7 +46,9 @@ use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as hal
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
-use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
+use crate::tables::lt::{
+    LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols, lt_constraints,
+};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
@@ -505,7 +507,9 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create LT AIR with bus interactions.
 pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let (constraints, _) = lt_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: lt_bus_interactions(),

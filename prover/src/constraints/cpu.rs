@@ -50,6 +50,20 @@ where
     b0 + b1 * &shift_8 + b2 * &shift_16 + b3 * shift_24
 }
 
+/// Pack 2 consecutive halfword-column values into a 32-bit word field element.
+/// `lo + hi * 2^16`
+#[inline]
+fn pack_halfwords_to_word<F, E>(step: &TableView<F, E>, lo: usize, hi: usize) -> FieldElement<F>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let h_lo = step.get_main_evaluation_element(0, lo);
+    let h_hi = step.get_main_evaluation_element(0, hi);
+    let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+    h_lo + h_hi * shift_16
+}
+
 // =========================================================================
 // CPU Constraint Collection
 // =========================================================================
@@ -135,7 +149,13 @@ impl BranchCondConstraint {
         let mp_selector = step
             .get_main_evaluation_element(0, cols::MP_SELECTOR)
             .clone();
-        let res_0 = step.get_main_evaluation_element(0, cols::RES_0).clone();
+        // Soundness note: BLT * res_hw0 acts identically to the legacy
+        // BLT * res[0]. On BLT/SLT rows the slt_res_zero constraints force
+        // res_hw[1..3] = 0, and the LT bus pins res_hw0 ∈ {0, 1} via the LT
+        // table's IsBit constraint on its output. So the value read here is
+        // exactly the LT result bit when BLT = 1; on other rows the BLT
+        // multiplier zeroes out the term.
+        let res_0 = step.get_main_evaluation_element(0, cols::RES_HW0).clone();
         let is_equal = step.get_main_evaluation_element(0, cols::IS_EQUAL).clone();
         let branch_cond = step
             .get_main_evaluation_element(0, cols::BRANCH_COND)
@@ -244,8 +264,7 @@ impl Arg1LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_lo =
-            pack_bytes_to_word(step, cols::ARG1_0, cols::ARG1_1, cols::ARG1_2, cols::ARG1_3);
+        let arg1_lo = pack_halfwords_to_word(step, cols::ARG1_HW0, cols::ARG1_HW1);
 
         // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
@@ -294,8 +313,7 @@ impl Arg1UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_hi =
-            pack_bytes_to_word(step, cols::ARG1_4, cols::ARG1_5, cols::ARG1_6, cols::ARG1_7);
+        let arg1_hi = pack_halfwords_to_word(step, cols::ARG1_HW2, cols::ARG1_HW3);
 
         // rv1 is DWordWHH: rv1[2] IS the upper 32 bits directly (Word)
         let rv1_upper = step.get_main_evaluation_element(0, cols::RV1_2);
@@ -342,20 +360,22 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
 // SLT/BLT Zero Upper Bytes Constraint
 // =========================================================================
 
-/// Constraint: when SLT + BLT = 1, res[i] = 0 for i in 1..8
+/// Constraint: when SLT + BLT = 1, res_hw[i] = 0 for i in 1..=3
 ///
-/// The LT result is a single bit stored in res[0], upper bytes must be zero.
+/// The LT result is a single bit stored in the low byte of res; the upper
+/// halfwords must be zero. Combined with the LT bus pinning res_hw[0] to a bit,
+/// this proves res ∈ {0, 1} on SLT/BLT rows.
 pub struct SltResZeroConstraint {
-    /// Which byte index (1-7) this constraint applies to
-    byte_idx: usize,
+    /// Which halfword index (1-3) this constraint applies to
+    hw_idx: usize,
     constraint_idx: usize,
 }
 
 impl SltResZeroConstraint {
-    pub fn new(byte_idx: usize, constraint_idx: usize) -> Self {
-        assert!((1..=7).contains(&byte_idx));
+    pub fn new(hw_idx: usize, constraint_idx: usize) -> Self {
+        assert!((1..=3).contains(&hw_idx));
         Self {
-            byte_idx,
+            hw_idx,
             constraint_idx,
         }
     }
@@ -367,12 +387,14 @@ impl SltResZeroConstraint {
     {
         let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
         let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
-        let res_i = step
-            .get_main_evaluation_element(0, cols::RES[self.byte_idx])
+        let res_hw_i = step
+            .get_main_evaluation_element(0, cols::RES_HW[self.hw_idx])
             .clone();
 
-        // (SLT + BLT) * res[i] = 0
-        (slt + blt) * res_i
+        // (SLT + BLT) * res_hw[i] = 0  for i in 1..=3
+        // Pinning res_hw[1..3] to zero on SLT/BLT rows ensures res = res_hw[0] ∈ {0, 1}
+        // (the LT bus separately constrains res_hw[0] to a bit via LT's IsBit).
+        (slt + blt) * res_hw_i
     }
 }
 
@@ -394,16 +416,16 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
     }
 }
 
-/// Creates all SLT/BLT zero constraints for res[1..8].
+/// Creates SLT/BLT zero constraints for res_hw[1..=3].
 pub fn create_slt_res_zero_constraints(
     constraint_idx_start: usize,
 ) -> (Vec<SltResZeroConstraint>, usize) {
-    let constraints: Vec<_> = (1..8)
+    let constraints: Vec<_> = (1..=3)
         .enumerate()
-        .map(|(i, byte_idx)| SltResZeroConstraint::new(byte_idx, constraint_idx_start + i))
+        .map(|(i, hw_idx)| SltResZeroConstraint::new(hw_idx, constraint_idx_start + i))
         .collect();
 
-    (constraints, constraint_idx_start + 7)
+    (constraints, constraint_idx_start + 3)
 }
 
 // =========================================================================
@@ -751,8 +773,7 @@ impl RvdLowerConstraint {
         // rvd[0] is lower word
         let rvd_0 = step.get_main_evaluation_element(0, cols::RVD_0);
 
-        let res_lo =
-            pack_bytes_to_word(step, cols::RES[0], cols::RES[1], cols::RES[2], cols::RES[3]);
+        let res_lo = pack_halfwords_to_word(step, cols::RES_HW0, cols::RES_HW1);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let one = FieldElement::<F>::one();
@@ -802,8 +823,7 @@ impl RvdUpperConstraint {
         // rvd[1] is upper word
         let rvd_1 = step.get_main_evaluation_element(0, cols::RVD_1);
 
-        let res_hi =
-            pack_bytes_to_word(step, cols::RES[4], cols::RES[5], cols::RES[6], cols::RES[7]);
+        let res_hi = pack_halfwords_to_word(step, cols::RES_HW2, cols::RES_HW3);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);
@@ -931,13 +951,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 /// - Arg2 upper: 1
 /// - Rvd lower: 1
 /// - Rvd upper: 1
-/// - SLT res zero: 7 (bytes 1-7)
+/// - SLT res zero: 3 (halfwords 1-3, after step 6b shrink)
 /// - Ext bit zero (SIGN template): 3 (rv1_ext_bit, rv2_ext_bit, res_ext_bit)
 /// - rv1 zero-forcing (CM48): 3 (rv1[0..2] when read_register1 = 0)
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - Next PC (non-branching): 2
 ///
-/// Total: 60 constraints (34 IS_BIT + 26 other).
+/// Total: 56 constraints (34 IS_BIT + 22 other).
 ///
 /// **Phase 2 step 4:** removed the 8 inline ADD-style carry constraints
 /// (ADD/LOAD = 2, STORE = 2, SUB/BEQ = 2, JALR = 2). They are now enforced
@@ -947,7 +967,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 /// (The inline PC columns PC_DOUBLE_READ and PREV_PC_TIMESTAMP_BORROW are
 /// IS_BIT-constrained; per spec/cpu.typ no additional algebraic constraints
 /// are required.)
-pub const NUM_CPU_CONSTRAINTS: usize = 34 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 3 + 3 + 3 + 2;
+pub const NUM_CPU_CONSTRAINTS: usize = 34 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 3 + 3 + 3 + 2;
 
 /// Creates all CPU constraints.
 ///

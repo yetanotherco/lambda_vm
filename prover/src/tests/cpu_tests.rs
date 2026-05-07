@@ -231,7 +231,7 @@ fn test_trace_generation_rv1_dwordwhh() {
 }
 
 #[test]
-fn test_trace_generation_arg1_dwordbl() {
+fn test_trace_generation_arg1_dwordhl() {
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
             word_instr: false,
@@ -245,22 +245,15 @@ fn test_trace_generation_arg1_dwordbl() {
     let trace = generate_cpu_trace(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    // arg1 stored as DWordBL: 8 bytes
-    assert_eq!(row0[cols::ARG1_0], FE::from(0x01u64));
-    assert_eq!(row0[cols::ARG1_1], FE::from(0x02u64));
-    assert_eq!(row0[cols::ARG1_2], FE::from(0x03u64));
-    assert_eq!(row0[cols::ARG1_3], FE::from(0x04u64));
-    assert_eq!(row0[cols::ARG1_4], FE::from(0x05u64));
-    assert_eq!(row0[cols::ARG1_5], FE::from(0x06u64));
-    assert_eq!(row0[cols::ARG1_6], FE::from(0x07u64));
-    assert_eq!(row0[cols::ARG1_7], FE::from(0x08u64));
+    // arg1 stored as DWordHL: 4 halfwords (little-endian)
+    assert_eq!(row0[cols::ARG1_HW0], FE::from(0x0201u64));
+    assert_eq!(row0[cols::ARG1_HW1], FE::from(0x0403u64));
+    assert_eq!(row0[cols::ARG1_HW2], FE::from(0x0605u64));
+    assert_eq!(row0[cols::ARG1_HW3], FE::from(0x0807u64));
 }
 
 #[test]
-fn test_trace_generation_res_dwordbl() {
-    // For op_add, compute_res() calculates arg1 + arg2 (not using self.res directly).
-    // Set rv1 to the desired result value since arg1 = rv1 when word_instr=false,
-    // and arg2 = 0 (imm default) when rs2=0.
+fn test_trace_generation_res_dwordhl() {
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
             op_add: true,
@@ -274,15 +267,11 @@ fn test_trace_generation_res_dwordbl() {
     let row0 = trace.main_table.get_row(0);
 
     // res = arg1 + arg2 = rv1 + 0 = 0xFEDC_BA98_7654_3210
-    // Stored as DWordBL: 8 bytes (little-endian)
-    assert_eq!(row0[cols::RES_0], FE::from(0x10u64));
-    assert_eq!(row0[cols::RES_1], FE::from(0x32u64));
-    assert_eq!(row0[cols::RES_2], FE::from(0x54u64));
-    assert_eq!(row0[cols::RES_3], FE::from(0x76u64));
-    assert_eq!(row0[cols::RES_4], FE::from(0x98u64));
-    assert_eq!(row0[cols::RES_5], FE::from(0xBAu64));
-    assert_eq!(row0[cols::RES_6], FE::from(0xDCu64));
-    assert_eq!(row0[cols::RES_7], FE::from(0xFEu64));
+    // Stored as DWordHL: 4 halfwords (little-endian)
+    assert_eq!(row0[cols::RES_HW0], FE::from(0x3210u64));
+    assert_eq!(row0[cols::RES_HW1], FE::from(0x7654u64));
+    assert_eq!(row0[cols::RES_HW2], FE::from(0xBA98u64));
+    assert_eq!(row0[cols::RES_HW3], FE::from(0xFEDCu64));
 }
 
 #[test]
@@ -309,53 +298,35 @@ fn test_trace_generation_ext_bits() {
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
-    // Expected interactions (Phase 2 step 5 removed the 24 per-byte
-    // AND_BYTE/OR_BYTE/XOR_BYTE senders — that traffic now lives in
-    // the Binary AIR; CPU only emits the 1 BusId::Binary dispatch):
-    // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
-    // - 1 MSB8 (res_sign_bit)
-    // - 1 ZERO (is_equal for BEQ)
-    // - 1 LT (less-than comparison)
-    // - 1 M1 (MEMW read rs1 register)
-    // - 1 M3 (MEMW read rs2 register)
-    // - 1 M5 (MEMW write rd register)
-    // - 1 M6 (LOAD from memory)
-    // - 1 M7 (STORE to memory)
-    // - 4 inline PC (2 reads + 2 writes to Memory bus for x255)
-    // - 1 DECODE (instruction fetch)
-    // - 1 MUL (multiplication)
-    // - 1 DVRM (division/remainder)
-    // - 1 SHIFT (shift operations)
-    // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
-    // - 1 IS_BYTE for (RS1, RS2) paired
-    // - 1 IS_BYTE for (RD, 0)
-    // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
-    // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
-    // Phase 2 step 3 BinaryAdd senders: +1 ADD/LOAD, +1 STORE, +1 JALR, +1 SUB/BEQ = +4.
-    // Phase 2 step 5: removed 24 per-byte AND_BYTE/OR_BYTE/XOR_BYTE senders,
-    //                 added 1 BusId::Binary sender → net -23.
-    // Total: -8 -8 -8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 + 4 + 1 = 39
+    // Phase 2 step 6b range-checks (8 total + 4 IS_BYTE pairs):
+    //  - 1 IS_BYTE for (RS1, RS2) paired
+    //  - 1 IS_BYTE for (RD, 0)
+    //  - 8 IS_HALFWORD (4 ARG1_HW + 4 RES_HW)  [was: 8 IS_BYTE pairs]
+    //  - 4 IS_BYTE pairs (ARG2 stays as bytes; STORE M7 + SHIFT need byte access)
+    // Other interactions: 2 MSB16 + 1 MSB8 + 1 ZERO + 1 LT + 1 M1 + 1 M3 + 1 M5
+    //  + 1 M6 + 1 M7 + 4 inline-PC + 1 DECODE + 1 MUL + 1 DVRM + 1 SHIFT
+    //  + 1 BRANCH + 1 ECALL + 4 BinaryAdd + 1 Binary = 25.
+    // Total: 25 + 1 + 1 + 8 + 4 = 39.
     assert_eq!(interactions.len(), 39);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 76);
+    assert_eq!(cols::NUM_COLUMNS, 68);
 }
 
 #[test]
 fn test_column_arrays() {
-    // Verify ARG1, ARG2, RES arrays are correct
-    assert_eq!(cols::ARG1.len(), 8);
+    assert_eq!(cols::ARG1_HW.len(), 4);
     assert_eq!(cols::ARG2.len(), 8);
-    assert_eq!(cols::RES.len(), 8);
+    assert_eq!(cols::RES_HW.len(), 4);
 
-    // Check they're consecutive
+    for i in 0..3 {
+        assert_eq!(cols::ARG1_HW[i + 1], cols::ARG1_HW[i] + 1);
+        assert_eq!(cols::RES_HW[i + 1], cols::RES_HW[i] + 1);
+    }
     for i in 0..7 {
-        assert_eq!(cols::ARG1[i + 1], cols::ARG1[i] + 1);
         assert_eq!(cols::ARG2[i + 1], cols::ARG2[i] + 1);
-        assert_eq!(cols::RES[i + 1], cols::RES[i] + 1);
     }
 }
 

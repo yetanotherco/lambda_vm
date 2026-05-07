@@ -1368,8 +1368,9 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
-/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD,
+/// 8 IsHalf(0,0) for ARG1_HW + RES_HW (4 each), and 4 IsByte(0,0) for ARG2
+/// byte pairs = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -1388,8 +1389,16 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
             BitwiseOperationType::IsByte,
             0,
         ));
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
-        for _ in 0..12 {
+        // 8 IS_HALF lookups for ARG1_HW + RES_HW (all zero in padding)
+        for _ in 0..8 {
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                0,
+                0,
+            ));
+        }
+        // 4 IS_BYTE pairs for ARG2 (all zero in padding)
+        for _ in 0..4 {
             ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::IsByte,
                 0,
