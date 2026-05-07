@@ -42,8 +42,8 @@ const MEMORY_CELL_BYTES: u64 = 32;
 const INSTRUCTION_MAP_BYTES_PER_ROW: u64 = 32;
 
 /// 9/10 budget headroom for OS, other processes, and allocator slack.
-const SAFETY_FRACTION_NUM: u64 = 9;
-const SAFETY_FRACTION_DEN: u64 = 10;
+pub const SAFETY_FRACTION_NUM: u64 = 9;
+pub const SAFETY_FRACTION_DEN: u64 = 10;
 
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
@@ -228,7 +228,7 @@ pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
 }
 
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
-fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
+pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
     let blowup = blowup_factor as u64;
     let k = table_parallelism.max(1);
     let specs = table_specs(lengths);
@@ -398,78 +398,5 @@ mod tests {
     fn unknown_available_defaults_to_disk() {
         let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None);
         assert_eq!(mode, StorageMode::Disk);
-    }
-
-    /// Asserts predicted [`peak_bytes`] does not underestimate jemalloc-measured
-    /// heap during a proof.
-    mod calibration {
-        use super::*;
-        use crate::tables::MaxRowsConfig;
-        use crate::tables::trace_builder::count_table_lengths;
-        use crate::test_utils::{asm_elf_bytes, run_asm_elf};
-        use stark::proof::options::GoldilocksCubicProofOptions;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::thread;
-        use std::time::Duration;
-        use tikv_jemalloc_ctl::{epoch, stats};
-
-        #[global_allocator]
-        static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-        fn allocated_bytes() -> usize {
-            epoch::advance().ok();
-            stats::allocated::read().unwrap_or(0)
-        }
-
-        #[test]
-        fn peak_bytes_does_not_underestimate_measured_heap() {
-            let (elf, logs, _) = run_asm_elf("fib_iterative_372k");
-            let elf_bytes = asm_elf_bytes("fib_iterative_372k");
-
-            let max_rows = MaxRowsConfig::default();
-            let lengths = count_table_lengths(&elf, &logs, &max_rows, &[])
-                .expect("count_table_lengths succeeds");
-
-            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
-            let predicted = peak_bytes(&lengths, opts.blowup_factor, table_parallelism()) as usize;
-
-            drop(logs);
-
-            let baseline = allocated_bytes();
-            let peak = Arc::new(AtomicUsize::new(baseline));
-            let stop = Arc::new(AtomicBool::new(false));
-
-            let sampler = {
-                let peak = Arc::clone(&peak);
-                let stop = Arc::clone(&stop);
-                thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        peak.fetch_max(allocated_bytes(), Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                })
-            };
-
-            let _proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &opts, &max_rows)
-                .expect("proof succeeds");
-
-            stop.store(true, Ordering::Relaxed);
-            sampler.join().expect("sampler joins");
-
-            let measured = peak.load(Ordering::Relaxed).saturating_sub(baseline);
-
-            eprintln!(
-                "peak_bytes calibration: predicted={predicted} bytes, measured_heap={measured} bytes, ratio={:.2}",
-                predicted as f64 / measured as f64
-            );
-
-            let safety_num = SAFETY_FRACTION_NUM as usize;
-            let safety_den = SAFETY_FRACTION_DEN as usize;
-            assert!(
-                predicted.saturating_mul(safety_den) >= measured.saturating_mul(safety_num),
-                "peak_bytes underestimates measured heap: predicted={predicted}, measured={measured}"
-            );
-        }
     }
 }
