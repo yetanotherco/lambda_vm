@@ -2313,7 +2313,10 @@ pub fn count_table_lengths(
         mul_padded_rows: padded_chunked_rows(mul_count, max_rows.mul),
         dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
         branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
-        commit_padded_rows: commit_count.next_power_of_two().max(4) as u64,
+        commit_padded_rows: commit_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
         decode_rows,
         unique_page_count,
         cycle_count,
