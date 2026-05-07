@@ -63,7 +63,11 @@ pub struct Memory {
 impl Memory {
     pub fn load_byte(&self, address: u64) -> u8 {
         let aligned_address = address - address % 4;
-        let value = self.cells.get(&aligned_address).cloned().unwrap_or_default();
+        let value = self
+            .cells
+            .get(&aligned_address)
+            .cloned()
+            .unwrap_or_default();
         value[(address % 4) as usize]
     }
 
@@ -125,7 +129,11 @@ impl Memory {
             );
         }
         let aligned_address = address - address % 4;
-        let bytes = self.cells.get(&aligned_address).cloned().unwrap_or_default();
+        let bytes = self
+            .cells
+            .get(&aligned_address)
+            .cloned()
+            .unwrap_or_default();
         let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
         Ok(u16::from_le_bytes(
             value.try_into().map_err(|_| MemoryError::LoadHalf)?,
