@@ -8,9 +8,22 @@
 //! thing it changes is the `bus_interactions` filter — only buses an
 //! AND/OR/XOR row actually fires are declared here.
 
-pub use super::cpu::{CpuOperation, cols, generate_cpu_trace};
+pub use super::cpu::{CpuOperation, generate_cpu_trace};
 
 use stark::lookup::BusInteraction;
+
+/// Column layout for the CPU_BITWISE chip.
+///
+/// For now this re-exports the base CPU `cols` module verbatim so the two
+/// chips share an identical layout. Substep C2 will start adding chip-local
+/// aux cells (halfword decompositions on base CPU only) and C3 will diverge
+/// the layouts entirely (drop ARG1[0..7] and RES[0..7] from base CPU).
+/// Giving CPU_BITWISE its own `cols` symbol now decouples the constraint and
+/// trace files at the symbol level so those later changes don't have to
+/// touch every importer.
+pub mod cols {
+    pub use super::super::cpu::cols::*;
+}
 
 /// Bus interactions for the CPU_BITWISE chip.
 pub fn bus_interactions() -> Vec<BusInteraction> {

@@ -34,7 +34,7 @@ use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::table::TableView;
 
-use crate::tables::cpu::cols;
+use crate::tables::cpu_bitwise::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 /// Packing constraint: `limb_col = byte_cols[0] + 2^8*byte_cols[1] +
