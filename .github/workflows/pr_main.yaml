@@ -162,6 +162,22 @@ jobs:
         run: |
           make compile-programs-asm
 
+      - name: Cache compiled Rust ELF artifacts and build cache
+        id: cache-rust-elfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            executor/program_artifacts/rust
+            executor/shared_target
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          restore-keys: |
+            rust-elf-artifacts-
+
+      - name: Compile Rust programs to ELF
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-programs-rust
+
       - name: Run stark disk-spill tests
         run: |
           cargo test --release -p stark --features disk-spill disk_spill
