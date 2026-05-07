@@ -190,84 +190,63 @@ pub mod cols {
     /// rv1_ext_bit: Sign bit of rv1 as 32-bit word (for word_instr sign extension)
     pub const RV1_EXT_BIT: usize = 45;
 
-    /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 46;
-    pub const ARG1_1: usize = 47;
-    pub const ARG1_2: usize = 48;
-    pub const ARG1_3: usize = 49;
-    pub const ARG1_4: usize = 50;
-    pub const ARG1_5: usize = 51;
-    pub const ARG1_6: usize = 52;
-    pub const ARG1_7: usize = 53;
-
     /// rv2_ext_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used for arg2 sign extension)
-    pub const RV2_EXT_BIT: usize = 54;
+    pub const RV2_EXT_BIT: usize = 46;
 
-    /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 55;
-    pub const ARG2_1: usize = 56;
-    pub const ARG2_2: usize = 57;
-    pub const ARG2_3: usize = 58;
-    pub const ARG2_4: usize = 59;
-    pub const ARG2_5: usize = 60;
-    pub const ARG2_6: usize = 61;
-    pub const ARG2_7: usize = 62;
+    /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes). Kept on the base
+    /// CPU layout because STORE and SHIFT still consume per-byte arg2 cells.
+    /// Will move to u32 limbs in Step F (MEMW interface migration).
+    pub const ARG2_0: usize = 47;
+    pub const ARG2_1: usize = 48;
+    pub const ARG2_2: usize = 49;
+    pub const ARG2_3: usize = 50;
+    pub const ARG2_4: usize = 51;
+    pub const ARG2_5: usize = 52;
+    pub const ARG2_6: usize = 53;
+    pub const ARG2_7: usize = 54;
 
     /// res_ext_bit: Sign bit of res as 32-bit word (for rvd sign extension)
-    pub const RES_EXT_BIT: usize = 63;
-
-    /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 64;
-    pub const RES_1: usize = 65;
-    pub const RES_2: usize = 66;
-    pub const RES_3: usize = 67;
-    pub const RES_4: usize = 68;
-    pub const RES_5: usize = 69;
-    pub const RES_6: usize = 70;
-    pub const RES_7: usize = 71;
+    pub const RES_EXT_BIT: usize = 55;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 72;
+    pub const IS_EQUAL: usize = 56;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 73;
+    pub const BRANCH_COND: usize = 57;
 
     /// prev_pc_timestamp_borrow: Borrow bit for the 32-bit subtraction timestamp_lo - 3
     /// in the inline PC prev_ts formula. Fires only when timestamp_lo < 3 and
     /// pc_double_read = 0 (i.e. after timestamp wraps past 2^32 into values 0..2).
-    pub const PREV_PC_TIMESTAMP_BORROW: usize = 74;
+    pub const PREV_PC_TIMESTAMP_BORROW: usize = 58;
 
     /// pc_double_read: Whether PC is read as rs1 this cycle (AUIPC/JAL)
-    pub const PC_DOUBLE_READ: usize = 75;
+    pub const PC_DOUBLE_READ: usize = 59;
 
     // -------------------------------------------------------------------------
     // Phase 2: u32 limb representation of arg1/arg2/res
     //
-    // The byte cells (ARG1_0..ARG1_7, ARG2_0..ARG2_7, RES_0..RES_7) are
-    // being replaced by u32 limb pairs. During Phase 2 migration both
-    // representations coexist: the trace builder populates both and
-    // constraints/senders are migrated incrementally. At the end of
-    // Phase 2 the byte cells are removed and these u32 cols renumbered
-    // into the freed slots.
+    // Phase 2 step C3 dropped the per-byte arg1/res cells from the base CPU
+    // layout; CPU_BITWISE keeps them locally for AND/OR/XOR. ARG2 byte cells
+    // remain on base CPU until Step F migrates STORE/SHIFT off bytes.
     // -------------------------------------------------------------------------
 
-    /// arg1 as u32 lower 32 bits (replaces ARG1_0..ARG1_3 bytewise pack)
-    pub const ARG1_LO: usize = 76;
-    /// arg1 as u32 upper 32 bits (replaces ARG1_4..ARG1_7)
-    pub const ARG1_HI: usize = 77;
+    /// arg1 as u32 lower 32 bits
+    pub const ARG1_LO: usize = 60;
+    /// arg1 as u32 upper 32 bits
+    pub const ARG1_HI: usize = 61;
     /// arg2 as u32 lower 32 bits
-    pub const ARG2_LO: usize = 78;
+    pub const ARG2_LO: usize = 62;
     /// arg2 as u32 upper 32 bits
-    pub const ARG2_HI: usize = 79;
+    pub const ARG2_HI: usize = 63;
     /// res as u32 lower 32 bits
-    pub const RES_LO: usize = 80;
+    pub const RES_LO: usize = 64;
     /// res as u32 upper 32 bits
-    pub const RES_HI: usize = 81;
+    pub const RES_HI: usize = 65;
 
     /// Multiplicative inverse of `RES_LO + RES_HI` when the sum is nonzero;
     /// arbitrary (zero) otherwise. Aux witness for the BEQ zero-test that
     /// replaces the byte-summing ZERO bus sender (Phase 2 step 9A).
-    pub const RES_INV: usize = 82;
+    pub const RES_INV: usize = 66;
 
     /// Bits 16-31 of `RES_LO` (the upper halfword of the low 32 bits of res).
     /// Aux witness for the MSB16 res-ext-bit sender that previously read
@@ -275,43 +254,34 @@ pub mod cols {
     /// via IS_HALFWORD; the lower halfword `RES_LO - 65536 * RES_LO_HALF_HI`
     /// is also IS_HALFWORD-checked, forcing this column to be exactly bits
     /// 16-31 of RES_LO.
-    pub const RES_LO_HALF_HI: usize = 83;
+    pub const RES_LO_HALF_HI: usize = 67;
 
     /// Bits 16-31 of `ARG1_LO`. Aux witness for the base-CPU IS_HALFWORD
     /// range check that replaces the byte-pair form once the ARG1 byte cells
     /// are dropped (Phase 2 step C2). Together with the implicit lower
     /// halfword `ARG1_LO - 65536 * ARG1_LO_HALF_HI`, both halves are sent to
     /// IS_HALFWORD so the column is forced to bits 16-31 of ARG1_LO.
-    pub const ARG1_LO_HALF_HI: usize = 84;
+    pub const ARG1_LO_HALF_HI: usize = 68;
 
     /// Bits 16-31 of `ARG1_HI`. Aux witness, same role for the upper 32 bits
     /// of ARG1 as `ARG1_LO_HALF_HI` plays for the lower 32 bits.
-    pub const ARG1_HI_HALF_HI: usize = 85;
+    pub const ARG1_HI_HALF_HI: usize = 69;
 
     /// Bits 16-31 of `RES_HI`. Aux witness, same role for the upper 32 bits
     /// of RES as `RES_LO_HALF_HI` plays for the lower 32 bits.
-    pub const RES_HI_HALF_HI: usize = 86;
+    pub const RES_HI_HALF_HI: usize = 70;
 
-    /// Total number of columns. Shrinks once Phase 2 step C3 drops
-    /// ARG1[0..7] and RES[0..7] from the base CPU layout.
-    pub const NUM_COLUMNS: usize = 87;
+    /// Total number of columns on the base CPU table after Phase 2 step C3.
+    pub const NUM_COLUMNS: usize = 71;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
     // -------------------------------------------------------------------------
 
-    /// ARG1 byte columns as array
-    pub const ARG1: [usize; 8] = [
-        ARG1_0, ARG1_1, ARG1_2, ARG1_3, ARG1_4, ARG1_5, ARG1_6, ARG1_7,
-    ];
-
     /// ARG2 byte columns as array
     pub const ARG2: [usize; 8] = [
         ARG2_0, ARG2_1, ARG2_2, ARG2_3, ARG2_4, ARG2_5, ARG2_6, ARG2_7,
     ];
-
-    /// RES byte columns as array
-    pub const RES: [usize; 8] = [RES_0, RES_1, RES_2, RES_3, RES_4, RES_5, RES_6, RES_7];
 }
 
 // =========================================================================
@@ -853,11 +823,13 @@ impl CpuOperation {
 // Trace generation
 // =========================================================================
 
-/// Generates the CPU trace table from a list of operations.
+/// Generates the base CPU trace table from a list of operations.
 ///
-/// Each operation becomes one row in the table. The table is then
-/// padded to the next power of 2.
-pub fn generate_cpu_trace(
+/// Each operation becomes one row in the table. The table is then padded
+/// to the next power of 2. After Phase 2 step C3, this writes the narrow
+/// 71-column layout (no ARG1/RES byte cells); CPU_BITWISE rows go through
+/// `super::cpu_bitwise::generate_cpu_trace_bitwise`.
+pub fn generate_cpu_trace_base(
     operations: &[CpuOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
@@ -941,17 +913,14 @@ pub fn generate_cpu_trace(
         let rv1_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_EXT_BIT] = FE::from(rv1_ext_bit as u64);
 
-        // Compute and store arg1 as DWordBL (8 bytes) AND as u32 limbs.
-        // During Phase 2 migration both representations coexist; consumers
-        // are switched from byte cells to u32 limbs incrementally.
+        // arg1 — only the u32 limbs live on the base CPU layout (ARG1 byte
+        // cells were dropped in Phase 2 step C3 and now live exclusively on
+        // the CPU_BITWISE chip layout).
         let arg1 = op.compute_arg1();
-        for i in 0..8 {
-            data[base + cols::ARG1[i]] = FE::from((arg1 >> (i * 8)) & 0xFF);
-        }
         data[base + cols::ARG1_LO] = FE::from(arg1 & 0xFFFF_FFFF);
         data[base + cols::ARG1_HI] = FE::from(arg1 >> 32);
 
-        // Compute and store arg2
+        // arg2 — both byte cells and u32 limbs are kept until Step F.
         let arg2 = op.compute_arg2();
         let rv2_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
         data[base + cols::RV2_EXT_BIT] = FE::from(rv2_ext_bit as u64);
@@ -961,13 +930,11 @@ pub fn generate_cpu_trace(
         data[base + cols::ARG2_LO] = FE::from(arg2 & 0xFFFF_FFFF);
         data[base + cols::ARG2_HI] = FE::from(arg2 >> 32);
 
-        // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
+        // Result — only the u32 limbs (RES bytes dropped in Phase 2 step C3
+        // alongside ARG1, see ARG1 note above).
         let res = op.compute_res();
         let res_ext_bit = d.word_instr && CpuOperation::sign_bit_32(res);
         data[base + cols::RES_EXT_BIT] = FE::from(res_ext_bit as u64);
-        for i in 0..8 {
-            data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
-        }
         data[base + cols::RES_LO] = FE::from(res & 0xFFFF_FFFF);
         data[base + cols::RES_HI] = FE::from(res >> 32);
 
@@ -1049,7 +1016,7 @@ pub fn generate_cpu_trace_from_logs(
             instruction,
         ));
     }
-    Ok(generate_cpu_trace(&operations))
+    Ok(generate_cpu_trace_base(&operations))
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -1100,6 +1067,7 @@ fn linear_term(bit: u32, column: usize) -> LinearTerm {
 /// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
+#[allow(clippy::vec_init_then_push)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode as bits;
 
@@ -1179,48 +1147,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //     vec![...], // Need Linear to repack DWordBL -> DWordHHW
     // ));
 
-    // -------------------------------------------------------------------------
-    // Unified Bitwise interaction (×8 for each byte)
-    //
-    // Replaces 24 sends (AndByte/OrByte/XorByte ×8 each) with 8 sends to
-    // BusId::Bitwise. Token: (op_id, X, Y, RESULT) with disjoint-bit op_id
-    // = AND + 2*OR + 4*XOR. Multiplicity = AND + OR + XOR (at-most-one).
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::Bitwise,
-            Multiplicity::Sum3(cols::AND, cols::OR, cols::XOR),
-            vec![
-                // op_id = AND + 2*OR + 4*XOR
-                BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::AND,
-                    },
-                    LinearTerm::Column {
-                        coefficient: 2,
-                        column: cols::OR,
-                    },
-                    LinearTerm::Column {
-                        coefficient: 4,
-                        column: cols::XOR,
-                    },
-                ]),
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
+    // BITWISE bus sends are emitted by the CPU_BITWISE chip's own
+    // bus_interactions function (see super::cpu_bitwise) since they read the
+    // ARG1/RES byte cells that no longer exist on the base CPU layout
+    // (Phase 2 step C3).
 
     // -------------------------------------------------------------------------
     // SIGN template: MSB16 interactions for extension bit extraction
@@ -2096,23 +2026,61 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
         ],
     ));
-    for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
-        for i in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
-                Multiplicity::One,
-                vec![BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: arr[2 * i],
-                    },
-                    LinearTerm::Column {
-                        coefficient: 256,
-                        column: arr[2 * i + 1],
-                    },
-                ])],
-            ));
-        }
+    // Only ARG2 byte-pair IS_HALFWORD sends are emitted on the base CPU.
+    // ARG1 and RES halfwords are range-checked via the limb/HALF_HI aux
+    // pattern below (Phase 2 step C2). The CPU_BITWISE chip emits its own
+    // ARG1/RES byte-pair sends locally.
+    for i in 0..4 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG2[2 * i],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::ARG2[2 * i + 1],
+                },
+            ])],
+        ));
+    }
+
+    // Limb-form IS_HALFWORD range checks for ARG1_LO/HI and RES_HI (the
+    // RES_LO halfword decomp is emitted earlier alongside the MSB16 sender
+    // it backs). For each limb: one send for the upper halfword `HALF_HI`
+    // and one for the implicit lower halfword `LIMB - 65536 * HALF_HI`,
+    // forcing both halves into [0, 2^16). Together they pin LIMB to a
+    // u32 (Phase 2 step C2).
+    let limb_pairs: [(usize, usize); 3] = [
+        (cols::ARG1_LO, cols::ARG1_LO_HALF_HI),
+        (cols::ARG1_HI, cols::ARG1_HI_HALF_HI),
+        (cols::RES_HI, cols::RES_HI_HALF_HI),
+    ];
+    for (limb_col, half_hi_col) in limb_pairs {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: half_hi_col,
+                packing: Packing::Direct,
+            }],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: limb_col,
+                },
+                LinearTerm::Column {
+                    coefficient: -(65536i64),
+                    column: half_hi_col,
+                },
+            ])],
+        ));
     }
 
     // ECALL interaction (single shared bus for HALT and COMMIT)
@@ -2152,114 +2120,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 
-// =========================================================================
-// Bus interaction filters for the CPU / CPU_BITWISE chip split
-// =========================================================================
-
-/// Bus interactions for the main CPU chip after the AND/OR/XOR rows are
-/// routed to a dedicated `CPU_BITWISE` chip.
-///
-/// Filters out the 8 unified `BusId::Bitwise` sender declarations (Diego's
-/// collapsed bitwise bus). Non-bitwise CPU rows then no longer pay aux EF
-/// cells for those declarations.
-pub fn bus_interactions_without_bitwise() -> Vec<BusInteraction> {
-    let bitwise_id: u64 = BusId::Bitwise.into();
-    bus_interactions()
-        .into_iter()
-        .filter(|i| i.bus_id != bitwise_id)
-        .collect()
-}
-
-/// Bus interactions for the base CPU chip after Phase 2 step C2.
-///
-/// Starts from `bus_interactions_without_bitwise` and replaces the byte-pair
-/// IS_HALFWORD range checks for `ARG1` and `RES` with limb/HALF_HI sends
-/// (the same pattern already used for `RES_LO`). The byte-pair sends for
-/// `ARG2` are kept since the base CPU still carries `ARG2[0..7]` for STORE
-/// and SHIFT (until Step F migrates the MEMW interface to u32 limbs).
-///
-/// Net IS_HALFWORD sends per row: 4 (ARG2 byte pairs) + 6 (3 limb decompositions
-/// for ARG1_LO, ARG1_HI, RES_HI), plus the existing 2 from RES_LO. Total 12,
-/// down from 14 prior to step C2 (12 byte-pair + 2 RES_LO limb).
-pub fn bus_interactions_base_chip() -> Vec<BusInteraction> {
-    let is_halfword_id: u64 = BusId::IsHalfword.into();
-    let arg1_byte_cols: [usize; 8] = cols::ARG1;
-    let res_byte_cols: [usize; 8] = cols::RES;
-
-    let touches_arg1_or_res_byte = |interaction: &BusInteraction| -> bool {
-        if interaction.bus_id != is_halfword_id {
-            return false;
-        }
-        interaction.values.iter().any(|v| match v {
-            BusValue::Linear(terms) => terms.iter().any(|t| match t {
-                LinearTerm::Column { column, .. } => {
-                    arg1_byte_cols.contains(column) || res_byte_cols.contains(column)
-                }
-                _ => false,
-            }),
-            _ => false,
-        })
-    };
-
-    let mut interactions: Vec<BusInteraction> = bus_interactions_without_bitwise()
-        .into_iter()
-        .filter(|i| !touches_arg1_or_res_byte(i))
-        .collect();
-
-    // Append limb-based IS_HALFWORD range checks for ARG1_LO, ARG1_HI, RES_HI.
-    // (RES_LO already has its own limb/HALF_HI sends in `bus_interactions()`.)
-    // For each limb, two sends: HALF_HI directly + (LIMB - 65536*HALF_HI).
-    let limb_pairs: [(usize, usize); 3] = [
-        (cols::ARG1_LO, cols::ARG1_LO_HALF_HI),
-        (cols::ARG1_HI, cols::ARG1_HI_HALF_HI),
-        (cols::RES_HI, cols::RES_HI_HALF_HI),
-    ];
-    for (limb_col, half_hi_col) in limb_pairs {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::One,
-            vec![BusValue::Packed {
-                start_column: half_hi_col,
-                packing: Packing::Direct,
-            }],
-        ));
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::One,
-            vec![BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: limb_col,
-                },
-                LinearTerm::Column {
-                    coefficient: -(65536i64),
-                    column: half_hi_col,
-                },
-            ])],
-        ));
-    }
-
-    interactions
-}
-
-/// Bus interactions for the CPU_BITWISE chip — only the buses an AND/OR/XOR
-/// row actually uses. Drops every other class's declarations so the
-/// bitwise chip's effective width stays as small as possible.
-pub fn bus_interactions_bitwise_chip() -> Vec<BusInteraction> {
-    let keep: [u64; 7] = [
-        BusId::Decode.into(),
-        BusId::IsByte.into(),
-        BusId::IsHalfword.into(), // ARG/RES range checks (Phase 2 step 7)
-        BusId::Bitwise.into(),
-        BusId::Msb16.into(), // ANDW/ORW/XORW set word_instr=1, triggering MSB16 lookups
-        BusId::Memw.into(),
-        BusId::Memory.into(), // inline PC read/write
-    ];
-    bus_interactions()
-        .into_iter()
-        .filter(|i| keep.contains(&i.bus_id))
-        .collect()
-}
+// After Phase 2 step C3 the base CPU and CPU_BITWISE AIRs build their bus
+// interactions independently: cpu's `bus_interactions()` is used directly by
+// the base CPU AIR (no filter needed), and `super::cpu_bitwise::bus_interactions`
+// builds on top of it for the bitwise chip.
 
 // =========================================================================
 // Constraints (placeholder - will be implemented in constraints/)

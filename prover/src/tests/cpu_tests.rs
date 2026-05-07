@@ -5,7 +5,8 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace_base};
+use crate::tables::cpu_bitwise::{cols as bw_cols, generate_cpu_trace_bitwise};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{DecodeEntry, FE};
 
@@ -170,7 +171,7 @@ fn test_trace_generation_basic() {
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_base(&ops);
 
     assert_eq!(trace.main_table.height, 4);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
@@ -199,7 +200,7 @@ fn test_trace_generation_64bit_pc() {
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_base(&ops);
     let row0 = trace.main_table.get_row(0);
 
     // Check 64-bit PC is split correctly
@@ -221,7 +222,7 @@ fn test_trace_generation_rv1_dwordwhh() {
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_base(&ops);
     let row0 = trace.main_table.get_row(0);
 
     // rv1 stored as DWordWHH: [Half, Half, Word] - Word is MSB
@@ -232,57 +233,56 @@ fn test_trace_generation_rv1_dwordwhh() {
 
 #[test]
 fn test_trace_generation_arg1_dwordbl() {
+    // ARG1[0..7] byte cells live on the CPU_BITWISE chip layout after Phase 2
+    // step C3. Use op_and so the row routes there.
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
             word_instr: false,
-            op_add: true,
+            op_and: true,
             ..Default::default()
         },
         rv1: 0x0807_0605_0403_0201u64,
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_bitwise(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    // arg1 stored as DWordBL: 8 bytes
-    assert_eq!(row0[cols::ARG1_0], FE::from(0x01u64));
-    assert_eq!(row0[cols::ARG1_1], FE::from(0x02u64));
-    assert_eq!(row0[cols::ARG1_2], FE::from(0x03u64));
-    assert_eq!(row0[cols::ARG1_3], FE::from(0x04u64));
-    assert_eq!(row0[cols::ARG1_4], FE::from(0x05u64));
-    assert_eq!(row0[cols::ARG1_5], FE::from(0x06u64));
-    assert_eq!(row0[cols::ARG1_6], FE::from(0x07u64));
-    assert_eq!(row0[cols::ARG1_7], FE::from(0x08u64));
+    assert_eq!(row0[bw_cols::ARG1_0], FE::from(0x01u64));
+    assert_eq!(row0[bw_cols::ARG1_1], FE::from(0x02u64));
+    assert_eq!(row0[bw_cols::ARG1_2], FE::from(0x03u64));
+    assert_eq!(row0[bw_cols::ARG1_3], FE::from(0x04u64));
+    assert_eq!(row0[bw_cols::ARG1_4], FE::from(0x05u64));
+    assert_eq!(row0[bw_cols::ARG1_5], FE::from(0x06u64));
+    assert_eq!(row0[bw_cols::ARG1_6], FE::from(0x07u64));
+    assert_eq!(row0[bw_cols::ARG1_7], FE::from(0x08u64));
 }
 
 #[test]
 fn test_trace_generation_res_dwordbl() {
-    // For op_add, compute_res() calculates arg1 + arg2 (not using self.res directly).
-    // Set rv1 to the desired result value since arg1 = rv1 when word_instr=false,
-    // and arg2 = 0 (imm default) when rs2=0.
+    // RES[0..7] byte cells live on the CPU_BITWISE chip layout after C3.
+    // Use op_xor so res = rv1 XOR 0 = rv1 and the row routes to CPU_BITWISE.
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
-            op_add: true,
+            op_xor: true,
             ..Default::default()
         },
         rv1: 0xFEDC_BA98_7654_3210u64,
+        res: 0xFEDC_BA98_7654_3210u64,
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_bitwise(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    // res = arg1 + arg2 = rv1 + 0 = 0xFEDC_BA98_7654_3210
-    // Stored as DWordBL: 8 bytes (little-endian)
-    assert_eq!(row0[cols::RES_0], FE::from(0x10u64));
-    assert_eq!(row0[cols::RES_1], FE::from(0x32u64));
-    assert_eq!(row0[cols::RES_2], FE::from(0x54u64));
-    assert_eq!(row0[cols::RES_3], FE::from(0x76u64));
-    assert_eq!(row0[cols::RES_4], FE::from(0x98u64));
-    assert_eq!(row0[cols::RES_5], FE::from(0xBAu64));
-    assert_eq!(row0[cols::RES_6], FE::from(0xDCu64));
-    assert_eq!(row0[cols::RES_7], FE::from(0xFEu64));
+    assert_eq!(row0[bw_cols::RES_0], FE::from(0x10u64));
+    assert_eq!(row0[bw_cols::RES_1], FE::from(0x32u64));
+    assert_eq!(row0[bw_cols::RES_2], FE::from(0x54u64));
+    assert_eq!(row0[bw_cols::RES_3], FE::from(0x76u64));
+    assert_eq!(row0[bw_cols::RES_4], FE::from(0x98u64));
+    assert_eq!(row0[bw_cols::RES_5], FE::from(0xBAu64));
+    assert_eq!(row0[bw_cols::RES_6], FE::from(0xDCu64));
+    assert_eq!(row0[bw_cols::RES_7], FE::from(0xFEu64));
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn test_trace_generation_ext_bits() {
         ..Default::default()
     });
 
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace_base(&ops);
     let row0 = trace.main_table.get_row(0);
 
     assert_eq!(row0[cols::RV1_EXT_BIT], FE::one());
@@ -309,54 +309,44 @@ fn test_trace_generation_ext_bits() {
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
-    // Expected interactions:
-    // - 8 BITWISE (unified bus: 8 byte pairs × 1 send each, op_id ∈ {1,2,4})
-    // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
-    // - 1 MSB8 (res_sign_bit)
-    // - 1 LT (less-than comparison)
-    // - 1 M1 (MEMW read rs1 register)
-    // - 1 M3 (MEMW read rs2 register)
-    // - 1 M5 (MEMW write rd register)
-    // - 1 M6 (LOAD from memory)
-    // - 1 M7 (STORE to memory)
-    // - 4 inline PC (2 reads + 2 writes to Memory bus for x255)
-    // - 1 DECODE (instruction fetch)
-    // - 1 MUL (multiplication)
-    // - 1 DVRM (division/remainder)
-    // - 1 SHIFT (shift operations)
-    // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
-    // - 1 IS_BYTE for (RS1, RS2) paired
-    // - 1 IS_BYTE for (RD, 0)
-    // - 12 IS_HALFWORD (ARG1/ARG2/RES u32 limb pairs: 4 pairs × 3 arrays;
-    //   migrated from IS_BYTE in Phase 2 step 7)
-    // - 2 IS_HALFWORD (RES_LO halfword decomposition for the MSB16
-    //   res-ext-bit sender; Phase 2 step 9B)
-    // AndByte/OrByte/XorByte (24 sends pre-split) collapsed into 8 unified
-    // BusId::Bitwise sends in commit 95e4d4b3.
-    // ZERO bus (1 send) replaced by 2 inline witness-inverse constraints
-    // in Phase 2 step 9A (BeqIsEqualSumZero + BeqIsEqualWitness).
-    // Total: 8 + 3 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 14 + 2 = 43
-    assert_eq!(interactions.len(), 43);
+    // Phase 2 step C3 base CPU sends (BITWISE bus + ARG1/RES byte-pair
+    // IS_HALFWORD relocated to the CPU_BITWISE chip):
+    // - 0 BITWISE (now on CPU_BITWISE)
+    // - 2 MSB16 (rv1, rv2 sign-bit) + 1 MSB16 (res via RES_LO_HALF_HI)
+    // - 1 LT
+    // - 1 M1 (MEMW read rs1) + 1 M3 (read rs2) + 1 M5 (write rd) + 1 M6
+    //   (LOAD) + 1 M7 (STORE)
+    // - 4 inline PC (2 Memory reads + 2 writes for x255)
+    // - 1 DECODE
+    // - 1 MUL + 1 DVRM + 1 SHIFT + 1 BRANCH + 1 ECALL
+    // - 1 ADD + 1 SUB + 1 STORE-ADD
+    // - 2 IS_BYTE (RS1/RS2 pair, RD pair)
+    // - 4 IS_HALFWORD (ARG2 byte pairs only; ARG1/RES moved to limb form)
+    // - 2 IS_HALFWORD (RES_LO halfword decomp, Phase 2 step 9B)
+    // - 6 IS_HALFWORD (3 limb decomps for ARG1_LO, ARG1_HI, RES_HI; step C2)
+    assert_eq!(interactions.len(), 33);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 87);
+    assert_eq!(cols::NUM_COLUMNS, 71);
+    assert_eq!(bw_cols::NUM_COLUMNS, 87);
 }
 
 #[test]
 fn test_column_arrays() {
-    // Verify ARG1, ARG2, RES arrays are correct
-    assert_eq!(cols::ARG1.len(), 8);
+    // ARG2 is the only byte-pair array left on the base CPU layout.
     assert_eq!(cols::ARG2.len(), 8);
-    assert_eq!(cols::RES.len(), 8);
-
-    // Check they're consecutive
     for i in 0..7 {
-        assert_eq!(cols::ARG1[i + 1], cols::ARG1[i] + 1);
         assert_eq!(cols::ARG2[i + 1], cols::ARG2[i] + 1);
-        assert_eq!(cols::RES[i + 1], cols::RES[i] + 1);
+    }
+
+    // ARG1 and RES byte arrays live on the CPU_BITWISE layout.
+    assert_eq!(bw_cols::ARG1.len(), 8);
+    assert_eq!(bw_cols::RES.len(), 8);
+    for i in 0..7 {
+        assert_eq!(bw_cols::ARG1[i + 1], bw_cols::ARG1[i] + 1);
+        assert_eq!(bw_cols::RES[i + 1], bw_cols::RES[i] + 1);
     }
 }
 

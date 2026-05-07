@@ -38,9 +38,11 @@ use crate::tables::commit::{
     create_constraints as commit_constraints,
 };
 use crate::tables::cpu::{
-    CpuOperation, bus_interactions_base_chip as cpu_bus_interactions, cols as cpu_cols,
+    CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
-use crate::tables::cpu_bitwise::bus_interactions as cpu_bitwise_bus_interactions;
+use crate::tables::cpu_bitwise::{
+    bus_interactions as cpu_bitwise_bus_interactions, cols as cpu_bitwise_cols,
+};
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
@@ -434,7 +436,7 @@ pub fn create_cpu_bitwise_air(proof_options: &ProofOptions) -> VmAir {
     };
 
     AirWithBuses::new(
-        cpu_cols::NUM_COLUMNS,
+        cpu_bitwise_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

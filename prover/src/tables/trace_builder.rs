@@ -1934,8 +1934,12 @@ fn build_traces(
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
-    let cpus = chunk_and_generate(&non_bitwise_cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-    let cpu_bitwise = cpu::generate_cpu_trace(&bitwise_cpu_ops);
+    let cpus = chunk_and_generate(
+        &non_bitwise_cpu_ops,
+        max_rows.cpu,
+        cpu::generate_cpu_trace_base,
+    );
+    let cpu_bitwise = super::cpu_bitwise::generate_cpu_trace_bitwise(&bitwise_cpu_ops);
     let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
     let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
@@ -2053,6 +2057,7 @@ impl Traces {
         use super::byte_ops::cols::NUM_COLUMNS as BYTE_OPS_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::cpu_bitwise::cols::NUM_COLUMNS as CPU_BITWISE_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
@@ -2096,7 +2101,7 @@ impl Traces {
         for t in cpus {
             total += (t.num_rows() * CPU_COLS) as u64;
         }
-        total += (cpu_bitwise.num_rows() * CPU_COLS) as u64;
+        total += (cpu_bitwise.num_rows() * CPU_BITWISE_COLS) as u64;
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
         total += (byte_ops.num_rows() * (BYTE_OPS_COLS - BYTE_OPS_PRECOMPUTED)) as u64;
         for t in lts {
