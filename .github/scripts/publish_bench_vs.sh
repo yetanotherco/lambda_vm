@@ -89,8 +89,7 @@ if [ -f "$ETHREX_METRICS_FILE" ]; then
         if [ -n "$ETHREX_CYCLES" ] && [ "$ETHREX_CYCLES" != "n/a" ]; then
             ETHREX_MRKDWN="${ETHREX_MRKDWN} (${ETHREX_CYCLES} cycles)"
         fi
-        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex
-Empty"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
+        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex Empty"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
     fi
 fi
 
