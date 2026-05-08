@@ -72,22 +72,18 @@ pub unsafe extern "C" fn write_output(output: *const u8, size: usize) {
     }
 }
 
+/// Host-side stub — Lambda VM's IO interface is only implemented for the
+/// `riscv64` guest target. Not exported with C linkage on host so the
+/// generic name doesn't collide with C dependencies in test builds.
 #[cfg(not(target_arch = "riscv64"))]
-/// # Safety
-///
-/// Host-side stub. Lambda VM's IO interface is only implemented for the
-/// `riscv64` guest target.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn read_input(_buf_ptr: *mut *const u8, _buf_size: *mut usize) {
+pub fn read_input(_buf_ptr: *mut *const u8, _buf_size: *mut usize) {
     unimplemented!("read_input is only implemented for riscv64 targets");
 }
 
+/// Host-side stub — Lambda VM's IO interface is only implemented for the
+/// `riscv64` guest target. Not exported with C linkage on host so the
+/// generic name doesn't collide with C dependencies in test builds.
 #[cfg(not(target_arch = "riscv64"))]
-/// # Safety
-///
-/// Host-side stub. Lambda VM's IO interface is only implemented for the
-/// `riscv64` guest target.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn write_output(_output: *const u8, _size: usize) {
+pub fn write_output(_output: *const u8, _size: usize) {
     unimplemented!("write_output is only implemented for riscv64 targets");
 }

@@ -41,7 +41,7 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// Total cap on public output bytes across all `commit_public_output` calls.
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
-const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 64 * 1024;
+const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
 /// Maximum size of the private input memory region (in bytes).
 pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Fixed high address where private input is mapped. Guest programs can read
@@ -193,7 +193,9 @@ impl Memory {
 
     pub fn load_bytes(&self, mut addr: u64, len: u64) -> Vec<u8> {
         let mut result = Vec::with_capacity(len as usize);
-        let end = addr + len;
+        let end = addr
+            .checked_add(len)
+            .expect("load_bytes: address range exceeds u64::MAX");
         while addr < end {
             let aligned = addr - (addr % 4);
             let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
@@ -282,20 +284,20 @@ mod tests {
     #[test]
     fn test_commit_public_output_total_cap() {
         let mut memory = Memory::default();
-        // Seed enough source bytes for two 32 KB writes.
-        let chunk = vec![0xAB; 32 * 1024];
+        // Seed enough source bytes for two 512 KB writes.
+        let chunk = vec![0xAB; 512 * 1024];
         memory
             .set_bytes_aligned(0x1_0000, &chunk)
             .expect("seed should succeed");
 
         memory
-            .commit_public_output(0x1_0000, 32 * 1024)
-            .expect("first 32 KB commit should succeed");
+            .commit_public_output(0x1_0000, 512 * 1024)
+            .expect("first 512 KB commit should succeed");
         memory
-            .commit_public_output(0x1_0000, 32 * 1024)
-            .expect("second 32 KB commit should succeed (total = 64 KB)");
+            .commit_public_output(0x1_0000, 512 * 1024)
+            .expect("second 512 KB commit should succeed (total = 1 MB)");
 
-        // One more byte exceeds the 64 KB total cap.
+        // One more byte exceeds the 1 MB total cap.
         let err = memory.commit_public_output(0x1_0000, 1).unwrap_err();
         assert!(matches!(err, super::MemoryError::CommitSizeExceeded));
     }
