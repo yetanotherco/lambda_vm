@@ -15,8 +15,9 @@ use math::field::traits::IsFFTField;
 use crate::Result;
 use crate::ntt::{twiddles_forward, twiddles_inverse};
 
-/// Reusable pinned host staging buffer. One per stream; the stream's LDE call
-/// holds its buffer's lock across the D2H + memcpy-to-user-Vecs window.
+/// Reusable pinned host staging buffer. Shared across all streams via a
+/// `Mutex` (see `Backend::pinned_staging`); the LDE call holds the lock
+/// across the D2H + memcpy-to-user-Vecs window.
 ///
 /// Allocated with `cuMemHostAlloc(flags=0)` — portable, non-write-combined,
 /// so both DMA writes from device and CPU reads into user Vecs run at full

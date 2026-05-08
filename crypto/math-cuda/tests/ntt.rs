@@ -1,4 +1,4 @@
-//! Phase-3 parity: GPU forward NTT must agree with `Polynomial::evaluate_fft`
+//! Parity: GPU forward NTT must agree with `Polynomial::evaluate_fft`
 //! as a field element, across a sweep of sizes from 2^4 to 2^20.
 //!
 //! Non-canonical u64s can differ between CPU and GPU while representing the

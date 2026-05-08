@@ -1,4 +1,4 @@
-// Element-wise Goldilocks kernels used by the Phase-2 parity tests. These mirror
+// Element-wise Goldilocks kernels used by the parity tests. These mirror
 // the CPU reference in `crypto/math/src/field/goldilocks.rs` so raw u64 outputs
 // are bit-identical to the CPU path.
 

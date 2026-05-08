@@ -1,4 +1,4 @@
-//! Phase-5 parity: GPU `coset_lde_base` must match the CPU
+//! Parity: GPU `coset_lde_base` must match the CPU
 //! `Polynomial::coset_lde_full_expand` for a sweep of realistic sizes and
 //! blowup factors.
 

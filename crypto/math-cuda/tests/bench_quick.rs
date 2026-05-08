@@ -99,8 +99,9 @@ fn bench_lde_2_to_16_blowup_4() {
 #[test]
 #[ignore = "informal perf probe; run with --ignored"]
 fn bench_lde_multi_column_parallel() {
-    // Simulates the prover's Phase A: many columns processed via rayon.
-    // log_n = 16 keeps memory footprint manageable while still stressing streams.
+    // Simulates a multi-column workload processed via rayon: many columns
+    // dispatched concurrently to stress the stream pool. log_n = 16 keeps
+    // memory footprint manageable.
     let log_n = 16u32;
     let blowup = 4usize;
     let n = 1usize << log_n;
@@ -156,8 +157,8 @@ fn bench_lde_multi_column_parallel() {
 #[test]
 #[ignore = "informal perf probe; run with --ignored"]
 fn bench_lde_batched_prover_scale() {
-    // Realistic large-table shape from the 1M-fib prover: ~1M rows, blowup 4,
-    // a few dozen columns. This is what actually runs in expand_columns_to_lde.
+    // Realistic large-table shape: ~1M rows, blowup 4, a few dozen columns.
+    // Exercises batched LDE at prover-scale sizes.
     let log_n = 20u32; // 1M rows
     let blowup = 4usize;
     let n = 1usize << log_n;

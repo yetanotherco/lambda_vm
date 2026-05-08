@@ -1,5 +1,6 @@
-// Radix-2 DIT NTT over Goldilocks. One kernel per butterfly level; the caller
-// runs `bit_reverse_permute` once before the first level.
+// Radix-2 DIT NTT over Goldilocks: per-level, fused 8-level (shmem), and
+// batched (multi-column) variants. The caller runs `bit_reverse_permute`
+// once before the first butterfly level.
 //
 // Input layout: bit-reversed-order coefficients (after `bit_reverse_permute`).
 // Output layout: natural-order evaluations — matches the CPU `evaluate_fft` contract.
@@ -179,8 +180,9 @@ extern "C" __global__ void scalar_mul_batched(uint64_t *data,
 
 /// One DIT butterfly level. Thread `tid` (of n/2 total) owns exactly one
 /// butterfly pair (i0, i1 = i0 + half). Twiddle picked from the shared full
-/// `tw` table at stride `n / block_size`. Kept for log_n < 8 where shmem
-/// fusion is overkill.
+/// `tw` table at stride `n / block_size`. Used for levels 0..7 when n < 256
+/// (shmem fusion needs at least 256 elements), and for levels >= 8 of any
+/// size (above the shmem-fusion window).
 extern "C" __global__ void ntt_dit_level(uint64_t *x,
                                          const uint64_t *tw,
                                          uint64_t n,
