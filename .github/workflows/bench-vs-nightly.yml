@@ -47,6 +47,12 @@ jobs:
             --report-dir bench_vs_artifacts \
             --no-color
 
+      - name: Run ethrex empty block benchmark
+        run: |
+          bash ./bench_vs/run_ethrex.sh \
+            --report-dir bench_vs_artifacts \
+            --no-color
+
       - name: Upload nightly benchmark artifact
         uses: actions/upload-artifact@v4
         with:

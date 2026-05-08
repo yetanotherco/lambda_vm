@@ -79,6 +79,21 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
     PROJ_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Linear Projection"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$PROJ_MRKDWN"'"}}'
 fi
 
+ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"
+ETHREX_SECTION=""
+if [ -f "$ETHREX_METRICS_FILE" ]; then
+    ETHREX_TIME=$(grep '^ethrex_empty_block_time_s=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+    ETHREX_CYCLES=$(grep '^ethrex_empty_block_cycles=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+    if [ -n "$ETHREX_TIME" ]; then
+        ETHREX_MRKDWN="*Empty block:* Lambda ${ETHREX_TIME}s"
+        if [ -n "$ETHREX_CYCLES" ] && [ "$ETHREX_CYCLES" != "n/a" ]; then
+            ETHREX_MRKDWN="${ETHREX_MRKDWN} (${ETHREX_CYCLES} cycles)"
+        fi
+        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Ethrex
+Block (Lambda VM)"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
+    fi
+fi
+
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION"']}'
