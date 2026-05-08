@@ -1487,9 +1487,8 @@ pub fn evaluate_poly_coset_batch_ext3_into(
 }
 
 /// Same as [`evaluate_poly_coset_batch_ext3_into`] but retains the de-
-/// interleaved LDE device buffer as a `GpuLdeExt3` handle. Lets R2 commit
-/// and R4 DEEP composition read the composition-parts LDE without
-/// re-H2D'ing.
+/// interleaved LDE device buffer as a `GpuLdeExt3` handle so callers can
+/// reuse the LDE without a re-H2D.
 pub fn evaluate_poly_coset_batch_ext3_into_keep(
     coefs: &[&[u64]],
     n: usize,
@@ -1666,7 +1665,8 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 /// the LDE output, builds the R2 composition-polynomial Merkle tree on device
 /// (row-pair Keccak leaves at bit-reversed indices + pair-hash inner tree).
 ///
-/// `merkle_nodes_out` must have byte length `(2 * lde_size - 1) * 32`.
+/// Row-pair commit: each leaf hashes 2 rows, so the tree has `lde_size / 2`
+/// leaves and `merkle_nodes_out` must have byte length `(lde_size - 1) * 32`.
 /// Requires `lde_size >= 2`.
 pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     coefs: &[&[u64]],
@@ -1692,7 +1692,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
         assert_eq!(o.len(), 3 * lde_size);
     }
     assert!(lde_size >= 2);
-    let total_nodes = 2 * lde_size - 1;
+    let total_nodes = lde_size - 1;
     assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
     if n == 0 {
         return Ok(());
@@ -1872,15 +1872,11 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
         }
     });
 
-    // Copy pinned tree → caller nodes_out. `merkle_nodes_out.len() ==
-    // total_nodes * 32` is oversized relative to our tight tree; we write
-    // only the first `tight_total_nodes * 32` bytes and the caller trims.
-    // Expose the tight byte count via the slice length so the caller can
-    // construct the MerkleTree with the right node count.
-    assert!(merkle_nodes_out.len() >= tight_total_nodes * 32);
+    // Copy pinned tree → caller nodes_out.
+    debug_assert_eq!(merkle_nodes_out.len(), tight_total_nodes * 32);
     const CHUNK: usize = 64 * 1024;
     let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
-    merkle_nodes_out[..tight_total_nodes * 32]
+    merkle_nodes_out
         .par_chunks_mut(CHUNK)
         .enumerate()
         .for_each(|(i, dst)| {
