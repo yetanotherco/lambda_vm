@@ -517,10 +517,6 @@ pub fn coset_lde_batch_base_into(
 /// Skips the iFFT stage of [`coset_lde_batch_ext3_into`] (input is
 /// coefficients, not evaluations). Weights encode the coset shift:
 /// `weights[k] = offset^k` (NO 1/N because iFFT normalisation doesn't apply).
-///
-/// Used by the stark prover to GPU-accelerate
-/// `evaluate_polynomial_on_lde_domain` calls inside the
-/// `number_of_parts > 2` branch of the composition-polynomial LDE.
 pub fn evaluate_poly_coset_batch_ext3_into(
     coefs: &[&[u64]],
     n: usize,
