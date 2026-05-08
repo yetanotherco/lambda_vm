@@ -117,8 +117,12 @@ echo""
 echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
 cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 
-echo -e "${GREEN}[Lambda VM] Building ethrex guest ELF...${NC}"
-make -C "$ROOT_DIR" executor/program_artifacts/rust/ethrex.elf 2>&1 | tail -5
+if [ -f "$ETHREX_ELF" ]; then
+    echo -e "${YELLOW}[Lambda VM] Using pre-existing ethrex.elf at $ETHREX_ELF${NC}"
+else
+    echo -e "${GREEN}[Lambda VM] Building ethrex guest ELF...${NC}"
+    make -C "$ROOT_DIR" executor/program_artifacts/rust/ethrex.elf 2>&1 | tail -5
+fi
 
 if [ ! -f "$ETHREX_ELF" ]; then
     echo -e "${RED}[Lambda VM] Build failed — ethrex.elf not found at $ETHREX_ELF${NC}"
