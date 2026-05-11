@@ -46,9 +46,14 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 ETHREX_FILE := executor/tests/ethrex_hoodi.bin
 ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
-SYSROOT_DIR := /opt/lambda-vm-sysroot
+# Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
+# to install the sysroot in a user-writable location and avoid sudo.
+SYSROOT_DIR ?= /opt/lambda-vm-sysroot
 SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+# CFLAGS for ckzg / ethrex guest programs: overrides the hardcoded `/opt/lambda-vm-sysroot`
+# in their .cargo/config.toml so cargo picks up our $(SYSROOT_DIR) instead.
+SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(SYSROOT_DIR)
 
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
@@ -64,14 +69,21 @@ prepare-test-data:
 	fi
 
 prepare-sysroot:
-	@if [ ! -d "$(SYSROOT_DIR)" ]; then \
+	@if [ -d "$(SYSROOT_DIR)" ]; then \
+		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
+	else \
 		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
 		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		SYSROOT_PARENT="$$(dirname '$(SYSROOT_DIR)')"; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
-		sudo mkdir -p /opt && sudo tar -xzf "$(SYSROOT_TARBALL)" -C /opt; \
+		if mkdir -p "$$SYSROOT_PARENT" 2>/dev/null && [ -w "$$SYSROOT_PARENT" ]; then \
+			tar -xzf "$(SYSROOT_TARBALL)" -C "$$SYSROOT_PARENT"; \
+		else \
+			echo "$$SYSROOT_PARENT is not writable; using sudo."; \
+			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
+			sudo mkdir -p "$$SYSROOT_PARENT" && sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$$SYSROOT_PARENT"; \
+		fi; \
 		rm "$(SYSROOT_TARBALL)"; \
-	else \
-		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	fi
 
 compile-programs-asm:
@@ -93,6 +105,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
@@ -105,6 +118,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
