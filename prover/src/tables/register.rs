@@ -18,6 +18,9 @@
 //! | fini | Word | Final value after execution |
 //! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;

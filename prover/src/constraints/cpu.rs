@@ -15,6 +15,9 @@
 //! `JALR` is the `mem_flags` byte read directly: under `BRANCH` only the JALR bit
 //! of `mem_flags` can be set, so `mem_flags ∈ {0,1} = JALR` there.
 
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

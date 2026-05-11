@@ -30,6 +30,9 @@
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use math::field::element::FieldElement;

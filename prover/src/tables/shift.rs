@@ -17,6 +17,8 @@
 //! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
 //! - Receiver: SHIFT (from CPU)
 
+use alloc::vec::Vec;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;

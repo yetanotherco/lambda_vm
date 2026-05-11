@@ -5,21 +5,23 @@ edition = "2024"
 license.workspace = true
 
 [features]
-default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+default = ["std", "prove", "parallel"]
+std = ["stark/std", "math/std", "crypto/std", "executor/std"]
+prove = []
+parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon", "std"]
 cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
-debug-checks = ["stark/debug-checks"]
-instruments = ["stark/instruments"]
+debug-checks = ["stark/debug-checks", "std"]
+instruments = ["stark/instruments", "std"]
 disk-spill = ["stark/disk-spill"]
 
 [dependencies]
-stark = { path = "../crypto/stark" }
-crypto = { path = "../crypto/crypto" }
-math = { path = "../crypto/math" }
-executor = { path = "../executor" }
+stark = { path = "../crypto/stark", default-features = false }
+crypto = { path = "../crypto/crypto", default-features = false, features = ["serde"] }
+math = { path = "../crypto/math", default-features = false, features = ["alloc", "lambdaworks-serde-binary"] }
+executor = { path = "../executor", default-features = false }
 ecsm = { path = "../crypto/ecsm" }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 log = "0.4"

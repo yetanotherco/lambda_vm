@@ -25,13 +25,21 @@
 //! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 #[cfg(feature = "disk-spill")]
 use std::collections::HashSet;
 
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::Instruction;
+#[cfg(feature = "prove")]
 use executor::vm::logs::Log;
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -128,6 +136,7 @@ impl MemoryState {
         if private_input.is_empty() {
             return;
         }
+        #[cfg(feature = "prove")]
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let start = PRIVATE_INPUT_START_INDEX;
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
@@ -1819,6 +1828,7 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
 }
 
 fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
+    #[cfg(feature = "prove")]
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -1856,6 +1866,7 @@ fn collect_bitwise_from_page(
     memory_state: &MemoryState,
     private_input: &[u8],
 ) -> Vec<BitwiseOperation> {
+    #[cfg(feature = "prove")]
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -2084,6 +2095,7 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
     let mut ops = Vec::new();
@@ -2341,6 +2353,7 @@ fn generate_page_tables(
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
 ) {
+    #[cfg(feature = "prove")]
     use std::collections::BTreeSet;
 
     // Collect init data from ELF segments + private input region
@@ -2365,6 +2378,7 @@ fn generate_page_tables(
 
     // Determine which page bases hold private input data.
     let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
+        #[cfg(feature = "prove")]
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let total_bytes = 4 + private_input.len(); // length prefix + data
         (0..total_bytes)
@@ -3557,6 +3571,7 @@ impl Traces {
     /// init data populated. Used by the verifier to reconstruct the ELF
     /// portion of the PAGE table layout.
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
+        #[cfg(feature = "prove")]
         use std::collections::BTreeSet;
 
         let init_page_data = build_init_page_data(elf, &[]);
@@ -3600,6 +3615,7 @@ impl Traces {
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
+            #[cfg(feature = "prove")]
             use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
             let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
             for i in 0..num_private_input_pages {

@@ -8,6 +8,11 @@
 //! committed via a static lookup table (with recompute as fallback for
 //! `ProofOptions` not covered by the static table).
 
+use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "prove")]
+use std::sync::OnceLock;
+
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
 use math::polynomial::Polynomial;

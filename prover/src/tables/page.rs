@@ -30,7 +30,12 @@
 //! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
+#[cfg(feature = "prove")]
+use std::sync::OnceLock;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -50,7 +55,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
 /// Stack top address (where SP starts). Re-exported from executor.
-pub use executor::vm::registers::STACK_TOP;
+pub use executor::constants::STACK_TOP;
 
 // =========================================================================
 // Column indices for PAGE table

@@ -31,8 +31,13 @@
 //!
 //! - **Receiver**: DECODE bus - receives lookups from CPU table
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -85,6 +90,7 @@ pub const NUM_PRECOMPUTED_COLS: usize = 5;
 // Trace generation
 // =========================================================================
 
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 /// Map from PC to row index in the DECODE trace table.

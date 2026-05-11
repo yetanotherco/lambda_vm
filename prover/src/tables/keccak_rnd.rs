@@ -28,6 +28,10 @@
 //! `Cxz_right` is typed `[Bit, 4]` per spec d75944ee — HWSL with shift=1
 //! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -159,6 +163,7 @@ pub mod cols {
     /// pair whose sum equals pi[x][y][z]. rbc is compile-time constant.
     #[inline]
     pub fn pi_src_cols(x: usize, y: usize, z: usize) -> (usize, usize) {
+        #[cfg(feature = "prove")]
         use executor::vm::instruction::execution::KECCAK_RHO;
         let sx = (x + 3 * y) % 5;
         let sy = x;

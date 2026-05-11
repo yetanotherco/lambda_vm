@@ -26,6 +26,8 @@
 //! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
 //!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
+use alloc::vec::Vec;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -161,6 +163,7 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    #[cfg(feature = "prove")]
     use std::collections::HashMap;
 
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity

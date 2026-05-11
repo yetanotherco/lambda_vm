@@ -11,8 +11,11 @@ use crate::tables::types::DecodeEntry;
 use crate::test_utils::asm_elf_bytes;
 use crate::{prove, verify_with_options};
 
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
