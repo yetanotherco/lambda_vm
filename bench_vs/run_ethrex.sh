@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
             echo "Unknown option: $1"
             exit 1
             ;;
-        esac
+    esac
 done
 
 if $NO_COLOR; then
