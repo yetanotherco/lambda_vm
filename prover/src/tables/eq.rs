@@ -21,6 +21,9 @@
 //! four range-checked halves is `0` iff `diff == 0` iff `a == b`), and
 //! `res = eq XOR invert`.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
@@ -120,7 +123,7 @@ impl EqOperation {
 pub fn generate_eq_trace(
     operations: &[EqOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     let mut op_map: HashMap<EqOperation, u64> = HashMap::new();
     for op in operations {

@@ -12,6 +12,9 @@ use crate::{
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -25,8 +28,7 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::collections::HashMap;
-use std::marker::PhantomData;
+use hashbrown::HashMap;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -314,7 +316,7 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_vec())
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings

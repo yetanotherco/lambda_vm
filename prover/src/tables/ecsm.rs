@@ -17,6 +17,9 @@
 //! drops when `µ = 0`). Only that single `µ·b` term is µ-gated. The range checks /
 //! virtual-carry checks remain µ-gated as before.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -261,12 +264,12 @@ fn memw_write(
 
 /// The eight bytes of a 256-bit value at `col + 8*chunk` as MEMW value elements.
 fn dword_bytes(col: usize, chunk: usize) -> [BusValue; 8] {
-    std::array::from_fn(|b| packed(col + 8 * chunk + b))
+    core::array::from_fn(|b| packed(col + 8 * chunk + b))
 }
 
 /// A register value `[lo, hi, 0, 0, 0, 0, 0, 0]` as MEMW value elements.
 fn register_value(lo_col: usize, hi_col: usize) -> [BusValue; 8] {
-    let mut v: [BusValue; 8] = std::array::from_fn(|_| BusValue::constant(0));
+    let mut v: [BusValue; 8] = core::array::from_fn(|_| BusValue::constant(0));
     v[0] = packed(lo_col);
     v[1] = packed(hi_col);
     v
@@ -760,7 +763,7 @@ where
     let inv = FieldElement::<F>::from(INV_SHIFT_32);
     let hl = kind.addend_hl_base();
     let bl = kind.sum_bl_base();
-    let mut c: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
+    let mut c: [FieldElement<F>; 8] = core::array::from_fn(|_| FieldElement::zero());
     let mut prev = FieldElement::<F>::zero();
     for (i, slot) in c.iter_mut().enumerate() {
         // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]

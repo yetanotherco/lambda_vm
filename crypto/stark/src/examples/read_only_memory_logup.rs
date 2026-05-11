@@ -2,7 +2,7 @@
 //! See our blog post for detailed explanation.
 //! <https://blog.lambdaclass.com/logup-lookup-argument-and-its-implementation-using-lambdaworks-for-continuous-read-only-memory/>
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 use crate::{
     constraints::{

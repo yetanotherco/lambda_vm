@@ -1,3 +1,7 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 // `StorageMode::Disk` uses `memmap2`, which does not build on wasm32.
 // Fail at the crate root rather than as a transitive memmap2 error.
 #[cfg(all(target_arch = "wasm32", feature = "disk-spill"))]

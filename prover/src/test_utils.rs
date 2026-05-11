@@ -10,13 +10,24 @@
 //! - Minimal trace generation for testing
 //! - AIR creation helpers
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+
+#[cfg(feature = "prove")]
 use std::path::PathBuf;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::execution::Executor;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::Instruction;
+#[cfg(feature = "prove")]
 use executor::vm::logs::Log;
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
@@ -209,6 +220,7 @@ pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize>
 // =============================================================================
 
 /// Returns the raw ELF bytes for an assembly test program.
+#[cfg(feature = "prove")]
 pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -227,6 +239,7 @@ pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
 /// Helper to run an ELF from the program_artifacts directory.
 ///
 /// Returns the ELF, execution logs, and instruction map.
+#[cfg(feature = "prove")]
 pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
     let elf_data = asm_elf_bytes(name);
     let elf = Elf::load(&elf_data).expect("Failed to load ELF");
@@ -240,6 +253,7 @@ pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
 // =============================================================================
 
 /// Collect bitwise lookups from executor logs for minimal table generation.
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
@@ -258,10 +272,12 @@ pub fn collect_bitwise_ops_from_logs(
 ///
 /// For each instruction that triggers an SLT or BLT operation, creates an LtOperation
 /// with the arg1, arg2, and signed values.
+#[cfg(feature = "prove")]
 pub fn collect_lt_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<LtOperation> {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::{ArithOp, Comparison};
 
     let mut lookups = Vec::new();
@@ -357,10 +373,12 @@ pub fn collect_lt_lookups_from_logs(
 /// Collect LOAD operations from executor logs.
 ///
 /// Creates LoadOperation objects for each Load instruction in the logs.
+#[cfg(feature = "prove")]
 pub fn collect_load_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<crate::tables::load::LoadOperation> {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::LoadStoreWidth;
 
     let mut load_ops = Vec::new();
@@ -423,6 +441,7 @@ pub fn collect_load_ops_from_logs(
 /// The LT table sends:
 /// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
 /// - IS_HALFWORD lookups (×6 per row: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
@@ -481,6 +500,7 @@ pub fn collect_bitwise_ops_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperati
 /// - read2: MSB8[res[1]] -> sign_bit
 /// - read4: MSB8[res[3]] -> sign_bit
 /// - read8: no MSB8 lookup (all 8 bytes are used)
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_load(
     load_ops: &[crate::tables::load::LoadOperation],
 ) -> Vec<BitwiseOperation> {
@@ -500,7 +520,9 @@ pub fn collect_bitwise_ops_from_load(
 ///
 /// **WARNING: FOR TESTING/BENCHMARKING ONLY - NOT PRODUCTION SAFE!**
 /// The verifier expects the full deterministic 2^20 row public table.
+#[cfg(feature = "prove")]
 pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
+    #[cfg(feature = "prove")]
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type

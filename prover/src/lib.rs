@@ -10,6 +10,15 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+// In guest builds (`prove` feature off) the prove-side helpers — trace generators,
+// executor-typed imports, internal Operation structs, etc. — are unreferenced.
+// They're real code, used by the host build, and there's nothing to fix there.
+// Silence the resulting dead_code / unused_imports noise in the guest build only.
+#![cfg_attr(not(feature = "prove"), allow(dead_code, unused_imports))]
+
+extern crate alloc;
+
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod constraints;
@@ -23,14 +32,20 @@ pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
 
-use std::fmt;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
+#[cfg(feature = "prove")]
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -201,7 +216,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Type alias for AIR-trace-public-inputs triples used in multi-table proving.
 type AirTracePair<'a> = (
@@ -243,6 +258,7 @@ pub(crate) struct VmAirs {
 
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
+    #[cfg(feature = "prove")]
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
@@ -650,11 +666,13 @@ pub(crate) fn compute_expected_commit_bus_balance(
 // =============================================================================
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
+#[cfg(feature = "prove")]
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_inputs(elf_bytes, &[])
 }
 
 /// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
+#[cfg(feature = "prove")]
 pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
     prove_with_options_and_inputs(
         elf_bytes,
@@ -672,6 +690,7 @@ pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmPr
 /// is the sum of `rows × ⌈bus_interactions/2⌉` over all tables — i.e. the number
 /// of committed extension-field columns times rows (LogUp batching packs two
 /// interactions per column).
+#[cfg(feature = "prove")]
 pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u64), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
@@ -694,6 +713,7 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
 }
 
 /// Prove an ELF binary execution with custom proof options and max rows config.
+#[cfg(feature = "prove")]
 pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
@@ -704,6 +724,7 @@ pub fn prove_with_options(
 
 /// Prove an ELF binary execution with custom proof options, max rows config,
 /// and explicit private inputs.
+#[cfg(feature = "prove")]
 pub fn prove_with_options_and_inputs(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -892,7 +913,7 @@ pub fn verify_with_options(
     // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
     {
         use crate::tables::page::DEFAULT_PAGE_SIZE;
-        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
+        use executor::constants::MAX_PRIVATE_INPUT_SIZE;
         let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
         if vm_proof.num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
@@ -974,6 +995,7 @@ pub fn verify_with_options(
 }
 
 /// Prove and verify in one call (convenience).
+#[cfg(feature = "prove")]
 pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let vm_proof = prove(elf_bytes)?;
     verify(&vm_proof, elf_bytes)

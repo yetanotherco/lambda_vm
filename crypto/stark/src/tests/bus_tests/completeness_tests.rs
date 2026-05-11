@@ -7,6 +7,7 @@ use math::field::element::FieldElement;
 use math::field::{
     extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
+use minicbor_serde;
 
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
@@ -377,9 +378,9 @@ fn test_serialization_roundtrip() {
         multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Serialize and deserialize
-    let serialized = serde_cbor::to_vec(&multi_proof).expect("serialization failed");
+    let serialized = minicbor_serde::to_vec(&multi_proof).expect("serialization failed");
     let deserialized: crate::proof::stark::MultiProof<F, E, ()> =
-        serde_cbor::from_slice(&serialized).expect("deserialization failed");
+        minicbor_serde::from_slice(&serialized).expect("deserialization failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];

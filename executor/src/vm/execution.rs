@@ -1,4 +1,6 @@
-use std::{cmp::Ordering, fmt::Debug};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::{cmp::Ordering, fmt::Debug};
 
 use crate::{
     elf::Elf,

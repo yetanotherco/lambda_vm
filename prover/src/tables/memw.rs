@@ -29,6 +29,9 @@
 //!
 //! ## Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

@@ -12,6 +12,8 @@
 //!   - `z_scalars = [z_power, z_shifted[0..]]`, length `1 + z_shifted.len()`
 //!   - `denoms[k * lde_size + i] = x_i - z_scalars[k]` (then inverted)
 
+use alloc::vec::Vec;
+
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 

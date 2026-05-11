@@ -15,7 +15,10 @@
 //! | state_ptr      |  100 | Per-lane DWordHL addresses [25][4]             |
 //! | mu             |    1 | Multiplicity flag                              |
 
-use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use executor::constants::KECCAK_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

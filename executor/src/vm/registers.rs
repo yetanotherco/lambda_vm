@@ -1,6 +1,7 @@
-use std::fmt::Display;
+use alloc::vec::Vec;
+use core::fmt::Display;
 
-pub const STACK_TOP: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
+pub use crate::constants::STACK_TOP;
 
 #[derive(Debug)]
 /// Holds the current value of all 32 registers
@@ -48,13 +49,13 @@ impl Registers {
 }
 
 impl Display for Registers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         const REGISTER_NAMES: [&str; 32] = [
             "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3",
             "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
             "t3", "t4", "t5", "t6",
         ];
-        let values = std::iter::once(0u64).chain(self.0.iter().copied());
+        let values = core::iter::once(0u64).chain(self.0.iter().copied());
 
         for (i, chunk) in REGISTER_NAMES
             .iter()

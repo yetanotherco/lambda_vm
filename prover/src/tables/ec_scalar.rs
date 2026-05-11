@@ -16,6 +16,9 @@
 //!
 //! `limb = Σ 2^i · limb_bits[i]` is virtual (a linear combination, never stored).
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
