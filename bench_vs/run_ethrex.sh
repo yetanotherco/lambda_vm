@@ -60,36 +60,6 @@ if [ -n "$REPORT_DIR" ]; then
     mkdir -p "$REPORT_DIR/raw"
 fi
 
-join_slash() {
-    local joined=""
-    local value
-    for value in "$@"; do
-        joined="${joined:+$joined/}$value"
-    done
-    printf "%s\n" "$joined"
-}
-
-format_hours() {
-    local seconds=$1
-    awk -v value="$seconds" 'BEGIN { printf "%.2f\n", value / 3600 }'
-}
-
-write_u64_le() {
-    local value=$1
-    local output_path=$2
-
-    python3 - "$value" "$output_path" <<'PY'
-import struct
-import sys
-
-value = int(sys.argv[1])
-path = sys.argv[2]
-
-with open(path, "wb") as fh:
-    fh.write(struct.pack("<Q", value))
-PY
-}
-
 extract_proving_time() {
     sed -nE '/Proving time: [0-9.]+s/ {
         s/.*Proving time: ([0-9.]+)s.*/\1/
@@ -112,7 +82,7 @@ CLI="$ROOT_DIR/target/release/cli"
 ETHREX_ELF="$ROOT_DIR/executor/program_artifacts/rust/ethrex.elf"
 ETHREX_INPUT="$ROOT_DIR/executor/tests/ethrex_empty_block.bin"
 echo -e "${BOLD}=== Ethrex Empty Block Benchmark: Lambda VM ===${NC}"
-echo""
+echo ""
 
 echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
 cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
@@ -147,7 +117,7 @@ if ! lambda_output=$("$CLI" prove "$ETHREX_ELF" \
         --private-input "$ETHREX_INPUT" \
         --time --cycles 2>"$stderr_file"); then
     echo -e "  ${RED}[Lambda VM] FAILED:${NC}"
-    at "$stderr_file"
+    cat "$stderr_file"
     exit 1
 fi
 rm -f "$proof_file"
@@ -175,39 +145,39 @@ if [ -n "$REPORT_DIR" ]; then
     cp "$stderr_file" "$REPORT_DIR/raw/ethrex_empty_block.stderr"
 fi
 
- # --- Summary table ----------------------------------------------------------
+# --- Summary table ----------------------------------------------------------
 
-  echo ""
-  echo -e "${BOLD}=== Summary ===${NC}"
-  echo -e "Program: ethrex empty block"
-  echo ""
+echo ""
+echo -e "${BOLD}=== Summary ===${NC}"
+echo -e "Program: ethrex empty block"
+echo ""
 
-  printf "  %-22s  %14s  %14s\n" "Program" "Lambda (s)" "Lambda cycles"
-  printf "  %-22s  %14s  %14s\n" "----------------------" "----------" "-------------"
-  printf "  %-22s  %13ss  %14s\n" "ethrex empty block" "$lambda_time" "$lambda_cycles"
+printf "  %-22s  %14s  %14s\n" "Program" "Lambda (s)" "Lambda cycles"
+printf "  %-22s  %14s  %14s\n" "----------------------" "----------" "-------------"
+printf "  %-22s  %13ss  %14s\n" "ethrex empty block" "$lambda_time" "$lambda_cycles"
 
-  echo ""
-  echo -e "Timing window covers single-shot end-to-end proving; excludes verification."
-  echo "Raw data in $TMP_DIR/cd doc"
+echo ""
+echo -e "Timing window covers single-shot end-to-end proving; excludes verification."
+echo "Raw data in $TMP_DIR/"
 
-  # --- Machine-readable report ------------------------------------------------
+# --- Machine-readable report ------------------------------------------------
 
-  if [ -n "$REPORT_DIR" ]; then
-      {
-          echo "program=ethrex_empty_block"
-          echo "input_file=$ETHREX_INPUT"
-          echo "timing_window=single_shot_end_to_end_prove_no_verify"
-          echo "ethrex_empty_block_time_s=$lambda_time"
-          echo "ethrex_empty_block_cycles=$lambda_cycles"
-      } > "$REPORT_DIR/ethrex_metrics.txt"
+if [ -n "$REPORT_DIR" ]; then
+    {
+        echo "program=ethrex_empty_block"
+        echo "input_file=$ETHREX_INPUT"
+        echo "timing_window=single_shot_end_to_end_prove_no_verify"
+        echo "ethrex_empty_block_time_s=$lambda_time"
+        echo "ethrex_empty_block_cycles=$lambda_cycles"
+    } > "$REPORT_DIR/ethrex_metrics.txt"
 
-      {
-          echo "# Ethrex Empty Block — Lambda VM"
-          echo
-          echo "Timing window: \`single-shot end-to-end prove\` (excludes verification)."
-          echo
-          echo "| Program | Lambda VM (s) | Lambda cycles |"
-          echo "|---------|--------------:|--------------:|"
-          printf "| ethrex empty block | %s | %s |\n" "$lambda_time" "$lambda_cycles"
-      } > "$REPORT_DIR/ethrex_summary.md"
-  fi
+    {
+        echo "# Ethrex Empty Block — Lambda VM"
+        echo
+        echo "Timing window: \`single-shot end-to-end prove\` (excludes verification)."
+        echo
+        echo "| Program | Lambda VM (s) | Lambda cycles |"
+        echo "|---------|--------------:|--------------:|"
+        printf "| ethrex empty block | %s | %s |\n" "$lambda_time" "$lambda_cycles"
+    } > "$REPORT_DIR/ethrex_summary.md"
+fi

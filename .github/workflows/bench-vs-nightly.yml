@@ -47,11 +47,12 @@ jobs:
             --report-dir bench_vs_artifacts \
             --no-color
 
-      - name: Restore cached ethrex.elf (TEMPORARY — until /opt/lambda-vm-sysroot is provisioned)
+      - name: Restore cached ethrex.elf (TEMPORARY — until /opt/lambda-vm-sysroot is provisioned on the bench runner)
         run: |
           mkdir -p executor/program_artifacts/rust
           cp /home/app/nicole/ethrex.elf executor/program_artifacts/rust/ethrex.elf
           ls -la executor/program_artifacts/rust/ethrex.elf
+          sha256sum executor/program_artifacts/rust/ethrex.elf
 
       - name: Run ethrex empty block benchmark
         run: |
