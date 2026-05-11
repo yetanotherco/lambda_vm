@@ -74,14 +74,13 @@ prepare-sysroot:
 	else \
 		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
 		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
-		SYSROOT_PARENT="$$(dirname '$(SYSROOT_DIR)')"; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
-		if mkdir -p "$$SYSROOT_PARENT" 2>/dev/null && [ -w "$$SYSROOT_PARENT" ]; then \
-			tar -xzf "$(SYSROOT_TARBALL)" -C "$$SYSROOT_PARENT"; \
+		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
+			tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1; \
 		else \
-			echo "$$SYSROOT_PARENT is not writable; using sudo."; \
+			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
 			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
-			sudo mkdir -p "$$SYSROOT_PARENT" && sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$$SYSROOT_PARENT"; \
+			sudo mkdir -p "$(SYSROOT_DIR)" && sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1; \
 		fi; \
 		rm "$(SYSROOT_TARBALL)"; \
 	fi
