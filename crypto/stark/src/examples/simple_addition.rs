@@ -1,7 +1,7 @@
 //! A minimal AIR with a simple addition constraint: col0 + col1 = col2
 //! This is used to test STARK proving/verification with small traces (1-2 rows).
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 use crate::{
     constraints::{

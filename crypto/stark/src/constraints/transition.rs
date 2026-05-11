@@ -1,4 +1,6 @@
-use std::ops::Div;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use core::ops::Div;
 
 use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
@@ -205,7 +207,7 @@ where
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
 
@@ -246,7 +248,7 @@ where
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
         }

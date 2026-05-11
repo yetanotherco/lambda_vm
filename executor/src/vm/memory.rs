@@ -41,13 +41,7 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u64 = 1024;
 const PUBLIC_OUTPUT_START_INDEX: u64 = 0;
-/// Maximum size of the private input memory region (in bytes).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
-/// Fixed high address where private input is mapped. Guest programs can read
-/// directly from this address (ZisK-style memory-mapped input).
-/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
-/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
-pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+pub use crate::constants::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
 
 #[derive(Default, Debug)]
 pub struct Memory(U64HashMap<[u8; 4]>);

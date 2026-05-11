@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use crate::{table::TableView, trace::LDETraceTable};
 use itertools::Itertools;
 use math::field::element::FieldElement;

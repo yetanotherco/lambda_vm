@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crypto::merkle_tree::proof::Proof;
 use math::field::{
     element::FieldElement,

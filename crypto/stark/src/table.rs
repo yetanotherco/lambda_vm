@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::frame::Frame;
 use math::field::{
     element::FieldElement,

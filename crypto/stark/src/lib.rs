@@ -1,3 +1,7 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;

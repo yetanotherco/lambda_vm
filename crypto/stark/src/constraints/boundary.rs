@@ -1,4 +1,4 @@
-use itertools::Itertools;
+use alloc::vec::Vec;
 use math::{
     field::{element::FieldElement, traits::IsField},
     polynomial::Polynomial,
@@ -80,18 +80,18 @@ impl<F: IsField> BoundaryConstraints<F> {
     }
 
     pub fn steps_for_boundary(&self) -> Vec<usize> {
+        let mut seen = hashbrown::HashSet::new();
         self.constraints
             .iter()
-            .unique_by(|elem| elem.step)
-            .map(|v| v.step)
+            .filter_map(|c| seen.insert(c.step).then_some(c.step))
             .collect()
     }
 
     pub fn cols_for_boundary(&self) -> Vec<usize> {
+        let mut seen = hashbrown::HashSet::new();
         self.constraints
             .iter()
-            .unique_by(|elem| elem.col)
-            .map(|v| v.col)
+            .filter_map(|c| seen.insert(c.col).then_some(c.col))
             .collect()
     }
 

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use super::{
     config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
@@ -25,7 +27,7 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -457,7 +459,7 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_vec())
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,

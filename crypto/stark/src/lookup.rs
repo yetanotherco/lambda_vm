@@ -1,6 +1,10 @@
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec;
 #[cfg(feature = "debug-checks")]
-use std::collections::HashMap;
-use std::marker::PhantomData;
+use hashbrown::HashMap;
+use core::marker::PhantomData;
 
 use crate::{
     constraints::{

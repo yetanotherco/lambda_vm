@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
@@ -16,7 +18,7 @@ use rayon::{
     prelude::{IntoParallelIterator, ParallelIterator},
 };
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 pub struct ConstraintEvaluator<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,

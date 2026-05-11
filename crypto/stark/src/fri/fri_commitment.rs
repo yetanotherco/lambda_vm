@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crypto::merkle_tree::{merkle::MerkleTree, traits::IsMerkleTreeBackend};
 use math::{
     field::{element::FieldElement, traits::IsField},

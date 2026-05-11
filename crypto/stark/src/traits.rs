@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
+use hashbrown::HashMap;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::{
