@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use math::fft::{
     bit_reversing::in_place_bit_reverse_permute, roots_of_unity::get_powers_of_primitive_root_coset,
 };

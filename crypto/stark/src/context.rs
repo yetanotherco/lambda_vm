@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use super::proof::options::ProofOptions;
 
 #[derive(Clone, Debug)]

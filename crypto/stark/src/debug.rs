@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use super::domain::Domain;
 use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
@@ -91,7 +92,7 @@ pub fn validate_trace<
     // --------- VALIDATE TRANSITION CONSTRAINTS -----------
     let n_transition_constraints = air.context().num_transition_constraints;
     let exemption_steps: Vec<usize> =
-        std::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
+        core::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
             .zip(air.transition_constraints())
             .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
             .collect();

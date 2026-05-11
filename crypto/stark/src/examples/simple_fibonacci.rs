@@ -9,7 +9,7 @@ use crate::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use math::field::{element::FieldElement, traits::IsFFTField};
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {

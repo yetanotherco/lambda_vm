@@ -12,7 +12,7 @@ use math::{
     field::{element::FieldElement, traits::IsFFTField},
     traits::AsBytes,
 };
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 #[derive(Clone)]
 struct ShiftedFibTransition1<F: IsFFTField> {

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use super::boundary::BoundaryConstraints;
 use crate::domain::Domain;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
@@ -12,7 +14,7 @@ use rayon::{
     prelude::{IntoParallelIterator, ParallelIterator},
 };
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 pub struct ConstraintEvaluator<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,

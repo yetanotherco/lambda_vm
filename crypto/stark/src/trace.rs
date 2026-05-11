@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 #[cfg(test)]

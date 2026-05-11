@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use alloc::vec;
 use super::{
     config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
@@ -25,8 +27,8 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::collections::HashMap;
-use std::marker::PhantomData;
+use core::marker::PhantomData;
+use hashbrown::HashMap;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -314,7 +316,7 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_vec())
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings

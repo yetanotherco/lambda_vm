@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-pub const STACK_TOP: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
+pub use crate::constants::STACK_TOP;
 
 #[derive(Debug)]
 /// Holds the current value of all 32 registers

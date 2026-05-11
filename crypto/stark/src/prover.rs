@@ -1,5 +1,8 @@
-use std::marker::PhantomData;
-use std::sync::Arc;
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::vec;
+use alloc::sync::Arc;
+use core::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
@@ -1687,8 +1690,8 @@ pub trait IsStarkProver<
         // Many tables share the same domain size (e.g., 7+ tables at 2^20).
         // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
         type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
-        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
-            std::collections::HashMap::new();
+        let mut domain_cache: hashbrown::HashMap<(usize, usize, u64), DomainEntry<Field>> =
+            hashbrown::HashMap::new();
 
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
