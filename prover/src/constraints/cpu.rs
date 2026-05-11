@@ -14,6 +14,9 @@
 //! 3. **Extension**: arg1/arg2/rvd from rv1/rv2/res with sign extension
 //! 4. **Misc**: branch_cond, next_pc computation
 
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

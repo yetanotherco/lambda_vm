@@ -23,6 +23,9 @@
 //! - Sender: MEMW (to read from memory)
 //! - Sender: MSB8 (for sign bit extraction)
 
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

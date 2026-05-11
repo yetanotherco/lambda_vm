@@ -1,7 +1,10 @@
 //! Tests for the DECODE table.
 
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::{ArithOp, Instruction};
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 

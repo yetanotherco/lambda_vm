@@ -25,6 +25,8 @@
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 //! - Receiver: LT (provides less-than results to other tables)
 
+use alloc::vec::Vec;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -128,6 +130,7 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    #[cfg(feature = "prove")]
     use std::collections::HashMap;
 
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity

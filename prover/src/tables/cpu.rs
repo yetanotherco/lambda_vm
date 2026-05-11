@@ -52,8 +52,11 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
+use alloc::vec::Vec;
+use alloc::vec;
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
+#[cfg(feature = "prove")]
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
     logs::Log,

@@ -25,6 +25,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
+#[cfg(feature = "prove")]
 use executor::elf::Elf;
 
 // Import shared utilities
@@ -875,6 +876,7 @@ fn test_prove_elfs_all_instructions_64_full() {
 fn test_debug_memory_bus_tokens() {
     use crate::tables::memw::cols as memw_cols;
     use crate::tables::register::cols as reg_cols;
+    #[cfg(feature = "prove")]
     use std::collections::HashMap;
 
     let (_elf, logs, instructions) = run_asm_elf("sub_neg_result");
@@ -1140,6 +1142,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use crate::tables::memw::cols as memw_cols;
     use crate::tables::page::cols as page_cols;
     use crate::tables::register::cols as reg_cols;
+    #[cfg(feature = "prove")]
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");

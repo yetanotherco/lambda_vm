@@ -29,6 +29,9 @@
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
 //! - Receiver: DVRM (×2 for quotient and remainder results)
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use math::field::element::FieldElement;

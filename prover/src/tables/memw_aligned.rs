@@ -34,6 +34,9 @@
 //! - IS_HALF[base_address[i]] for i ∈ [0, 1]
 //! - IS_WORD[base_address[2]]
 
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

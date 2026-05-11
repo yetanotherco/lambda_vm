@@ -4,17 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
-debug-checks = ["stark/debug-checks"]
-instruments = ["stark/instruments"]
+default = ["std", "prove", "parallel"]
+std = ["stark/std", "math/std", "crypto/std", "executor/std"]
+prove = []
+parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon", "std"]
+debug-checks = ["stark/debug-checks", "std"]
+instruments = ["stark/instruments", "std"]
 
 [dependencies]
-stark = { path = "../crypto/stark" }
-crypto = { path = "../crypto/crypto" }
-math = { path = "../crypto/math" }
-executor = { path = "../executor" }
-serde = { version = "1.0", features = ["derive"] }
+stark = { path = "../crypto/stark", default-features = false }
+crypto = { path = "../crypto/crypto", default-features = false, features = ["serde"] }
+math = { path = "../crypto/math", default-features = false, features = ["alloc", "lambdaworks-serde-binary"] }
+executor = { path = "../executor", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 rayon = { version = "1.8.0", optional = true }
 
 [dev-dependencies]

@@ -4,6 +4,7 @@
 //! - Completeness: Valid lookups to BITWISE are accepted
 //! - Soundness: Invalid lookups to BITWISE are rejected
 
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;

@@ -29,6 +29,9 @@
 //! - Sender: IS_B20 (×4 for carry range checks)
 //! - Receiver: MUL (×2 for lo and hi results)
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use math::field::element::FieldElement;

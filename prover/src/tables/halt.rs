@@ -21,6 +21,8 @@
 //! ## Padding
 //! Single-row table (2^0 = 1), no padding needed.
 
+use alloc::vec::Vec;
+use alloc::vec;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 

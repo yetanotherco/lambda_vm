@@ -26,6 +26,9 @@
 //! All lookups are provided as receivers with negative multiplicity,
 //! meaning other tables send to this table.
 
+use alloc::vec::Vec;
+use alloc::vec;
+#[cfg(feature = "prove")]
 use std::sync::OnceLock;
 
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;

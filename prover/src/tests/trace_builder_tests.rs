@@ -6,8 +6,11 @@ use crate::tables::lt;
 use crate::tables::memw_register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
+#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
+#[cfg(feature = "prove")]
 use executor::vm::logs::Log;
+#[cfg(feature = "prove")]
 use executor::vm::memory::U64HashMap;
 
 fn make_log(pc: u64, rs1_val: u64, rs2_val: u64, dst_val: u64, taken: bool, offset: i32) -> Log {

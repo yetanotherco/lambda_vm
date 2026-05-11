@@ -6,6 +6,7 @@
 //! - Padding: Auto-padding to power of 2 works correctly
 //! - Border cases: Edge values (0, MAX, signed boundaries) work
 
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;

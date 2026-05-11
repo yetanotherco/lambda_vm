@@ -393,7 +393,9 @@ fn test_trace_from_logs_subw() {
 
 #[test]
 fn test_cpu_operation_from_log_arith() {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::ArithOp;
+    #[cfg(feature = "prove")]
     use executor::vm::logs::Log;
 
     let instruction = Instruction::Arith {
@@ -427,7 +429,9 @@ fn test_cpu_operation_from_log_arith() {
 
 #[test]
 fn test_cpu_operation_from_log_branch() {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::Comparison;
+    #[cfg(feature = "prove")]
     use executor::vm::logs::Log;
 
     let instruction = Instruction::Branch {
@@ -459,7 +463,9 @@ fn test_cpu_operation_from_log_branch() {
 
 #[test]
 fn test_cpu_operation_from_log_word_instr() {
+    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::ArithOp;
+    #[cfg(feature = "prove")]
     use executor::vm::logs::Log;
 
     let instruction = Instruction::ArithW {
