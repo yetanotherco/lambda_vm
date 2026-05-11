@@ -43,7 +43,7 @@ jobs:
       - name: Run nightly benchmark
         run: |
           bash ./bench_vs/run.sh \
-            --steps 1000000 2000000 4000000 8000000 \
+            --steps 1000000 2000000 4000000 8000000 16000000 \
             --report-dir bench_vs_artifacts \
             --no-color
 

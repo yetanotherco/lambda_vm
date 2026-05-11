@@ -95,4 +95,4 @@ fi
 
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* Fibonacci  ·  *Device:* CPU"}]},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION"']}'
