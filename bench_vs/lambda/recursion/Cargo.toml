@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "recursion-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-prover = { path = "../../../prover", default-features = false }
+embedded-alloc = "0.6"
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+serde = { version = "=1.0.219", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# Route Keccak-f[1600] through the lambda-vm precompile syscall on the
+# riscv64 guest. On host this patch is irrelevant — the host build comes
+# from the main workspace which uses the upstream `keccak` crate.
+[patch.crates-io]
+keccak = { path = "../keccak-patched" }
