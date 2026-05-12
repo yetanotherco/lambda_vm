@@ -192,8 +192,11 @@ impl Memory {
     }
 
     pub fn load_bytes(&self, mut addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
-        let mut result = Vec::with_capacity(len as usize);
         let end = addr.checked_add(len).ok_or(MemoryError::AddressOverflow)?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(len as usize)
+            .map_err(|_| MemoryError::AllocationFailed)?;
         while addr < end {
             let aligned = addr - (addr % 4);
             let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
@@ -233,6 +236,8 @@ pub enum MemoryError {
     PrivateInputSizeExceeded,
     #[error("Address range exceeds u64::MAX")]
     AddressOverflow,
+    #[error("Failed to allocate memory for load_bytes")]
+    AllocationFailed,
 }
 
 #[cfg(test)]
@@ -302,6 +307,19 @@ mod tests {
             .commit_public_output(u64::MAX, 2)
             .expect_err("address overflow must error, not panic");
         assert!(matches!(err, super::MemoryError::AddressOverflow));
+    }
+
+    #[test]
+    fn test_load_bytes_huge_len_returns_alloc_error() {
+        let memory = Memory::default();
+        // A multi-petabyte allocation request from a guest must fail cleanly,
+        // not abort the host process via OOM. `addr=0` and `len=1<<50` keep
+        // `checked_add` happy so the path reaches the allocation.
+        let huge = 1u64 << 50;
+        let err = memory
+            .load_bytes(0, huge)
+            .expect_err("huge alloc must error, not abort");
+        assert!(matches!(err, super::MemoryError::AllocationFailed));
     }
 
     #[test]

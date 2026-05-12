@@ -33,9 +33,9 @@ use crate::syscalls::{PRIVATE_INPUT_START, SyscallNumbers};
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_input(buf_ptr: *mut *const u8, buf_size: *mut usize) {
-    let len_ptr = PRIVATE_INPUT_START as *const u32;
-    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
     unsafe {
+        let len_ptr = PRIVATE_INPUT_START as *const u32;
+        let len = core::ptr::read_volatile(len_ptr) as usize;
         *buf_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
         *buf_size = len;
     }
