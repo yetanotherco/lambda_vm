@@ -366,7 +366,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // 6. MEMW interactions: 25 combined read+write per lane (per spec)
+    // 6. Range-check every addr byte. The addr columns are reconstructed as a
+    // linear combination (addr_lo = b0 + 256*b1 + 65536*b2 + 2^24*b3, etc.)
+    // for the MEMW lookup and the no-overflow / alignment constraints. Without
+    // an explicit byte range check on each cell, an attacker can keep the
+    // field-element value of that linear combination correct while encoding
+    // arbitrary non-byte values in the individual cells (e.g. addr[0]=0,
+    // addr[1]=V_lo * 256^{-1} mod p), bypassing the alignment check.
+    for b in 0..8 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::addr(b),
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // 7. MEMW interactions: 25 combined read+write per lane (per spec)
     // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
     // old = input_state (read), value = output_state (write)
     for lane_idx in 0..25 {

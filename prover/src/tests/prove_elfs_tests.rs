@@ -771,6 +771,45 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 }
 
+/// Verifier REJECTS a forged trace where an addr byte cell is set to a
+/// non-byte field element.
+///
+/// Without the IS_BYTE range checks on addr(0..7), an attacker could keep
+/// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
+/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// alignment check) and folding the carry into addr(1) as a non-byte
+/// FE-element. This test asserts that mutating addr(1) to a non-byte value
+/// unbalances the verifier's bus checks and the proof is rejected.
+#[test]
+fn test_prove_elfs_keccak_unaligned_state_addr() {
+    use crate::tables::keccak::cols as keccak_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
+    // value outside [0, 256). The new IS_BYTE bus sender will emit this
+    // value with multiplicity MU=1; the IS_BYTE preprocessed table only
+    // contains 0..256, so the bus cannot balance.
+    traces.keccak.main_table.set(
+        0,
+        keccak_cols::addr(1),
+        FieldElement::<GoldilocksField>::from(257u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a keccak proof whose addr cells are not bytes"
+    );
+}
+
 #[test]
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
