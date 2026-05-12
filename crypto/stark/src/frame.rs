@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
-use alloc::vec;
 use crate::{table::TableView, trace::LDETraceTable};
+use alloc::vec;
+use alloc::vec::Vec;
 use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};

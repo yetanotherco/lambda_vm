@@ -25,13 +25,11 @@
 //! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
-use alloc::vec::Vec;
 use alloc::format;
 use alloc::vec;
-#[cfg(feature = "prove")]
-use std::collections::HashMap;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
-#[cfg(feature = "prove")]
 use executor::elf::Elf;
 #[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::Instruction;
@@ -57,8 +55,12 @@ use super::memw::{self, MemwOperation};
 use super::memw_aligned;
 use super::memw_register;
 use super::mul::{self, MulOperation};
-use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
-use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
+use super::page::{self, PageConfig};
+#[cfg(feature = "prove")]
+use super::page::{FinalByteState, FinalStateMap};
+#[cfg(feature = "prove")]
+use super::register::FinalRegisterStateMap;
+use super::register::{self, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
@@ -74,11 +76,13 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
+#[cfg(feature = "prove")]
 struct MemoryState {
     /// Map from byte address to (value, timestamp)
     cells: HashMap<u64, MemoryCell>,
 }
 
+#[cfg(feature = "prove")]
 impl MemoryState {
     fn new() -> Self {
         Self {
@@ -153,6 +157,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
+#[cfg(feature = "prove")]
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
@@ -162,6 +167,7 @@ struct RegisterState {
     pc_register: RegisterCell,
 }
 
+#[cfg(feature = "prove")]
 impl RegisterState {
     fn new(entry_point: u64) -> Self {
         // Per spec/memory.typ: "register initialization happens at timestamp 1"
@@ -282,6 +288,7 @@ impl RegisterState {
 // =============================================================================
 
 /// Get byte count and signed flag from CpuOperation memory flags.
+#[cfg(feature = "prove")]
 fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
     let byte_count = if op.decode.memory_8bytes {
         8
@@ -298,6 +305,7 @@ fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
 /// Pack a 64-bit register value into the MEMW value format.
 ///
 /// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
+#[cfg(feature = "prove")]
 fn pack_register_value(value: u64) -> [u64; 8] {
     [value & 0xFFFF_FFFF, value >> 32, 0, 0, 0, 0, 0, 0]
 }
@@ -309,6 +317,7 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 /// Collects CPU operations from execution logs.
 ///
 /// Returns a vector of CpuOperation, one per log entry.
+#[cfg(feature = "prove")]
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
@@ -349,6 +358,7 @@ fn collect_cpu_ops(
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops)
 #[allow(clippy::type_complexity)]
+#[cfg(feature = "prove")]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -488,6 +498,7 @@ fn collect_ops_from_cpu(
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
 ///
 /// Returns: (memw_op, load_op, bitwise_ops)
+#[cfg(feature = "prove")]
 fn collect_load_op_from_cpu(
     op: &CpuOperation,
     memory_state: &mut MemoryState,
@@ -550,6 +561,7 @@ fn collect_load_op_from_cpu(
 /// Collects a STORE operation as a MEMW write from CpuOperation.
 ///
 /// Returns: memw_op
+#[cfg(feature = "prove")]
 fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) -> MemwOperation {
     // res contains the effective address (base + offset)
     let base_address = op.res;
@@ -590,6 +602,7 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation.
 ///
 /// Returns: Vec of MEMW operations for register accesses
+#[cfg(feature = "prove")]
 fn collect_register_ops_from_cpu(
     op: &CpuOperation,
     register_state: &mut RegisterState,
@@ -672,6 +685,7 @@ fn collect_register_ops_from_cpu(
 /// Note: x17 (syscall number) is read by CPU's M1 interaction (read_register1=true, rs1=17).
 ///
 /// Returns: Vec of MEMW operations
+#[cfg(feature = "prove")]
 fn collect_commit_memw_ops(
     op: &CpuOperation,
     register_state: &mut RegisterState,
@@ -765,6 +779,7 @@ fn collect_commit_memw_ops(
 /// - x255 (PC): write 1 (halted sentinel)
 ///
 /// Also updates `register_state` so `to_final_state_map()` reflects the finalized values.
+#[cfg(feature = "prove")]
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
     let ts = u64::MAX;
@@ -827,6 +842,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 ///
 /// Generates 25 read operations (input lanes at timestamp) and 25 write
 /// operations (output lanes at timestamp+1). Each operation is 8 bytes wide.
+#[cfg(feature = "prove")]
 fn collect_keccak_memw_ops(
     op: &CpuOperation,
     input: &[u64; 25],
@@ -887,6 +903,7 @@ fn collect_keccak_memw_ops(
 /// - MEMW-C4 through MEMW-C7: old_timestamp[i] < timestamp (based on width)
 ///
 /// Returns: Vec of LT operations
+#[cfg(feature = "prove")]
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
     let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
 
@@ -939,6 +956,7 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
 /// Collects LT operations from MEMW_A for timestamp ordering.
 ///
 /// Each aligned operation has a single old_timestamp < timestamp check.
+#[cfg(feature = "prove")]
 fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
     // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
     // Alignment guarantees addr + (width-1) never wraps: the largest width-N
@@ -954,6 +972,7 @@ fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOpe
 /// An operation is aligned if:
 /// 1. For width > 1: base_address is aligned to width (low bits are zero)
 /// 2. All accessed bytes share the same old_timestamp
+#[cfg(feature = "prove")]
 fn is_aligned_op(op: &MemwOperation) -> bool {
     let low = (op.base_address & 0xFFFF_FFFF) as u32;
     let width = op.width as u32;
@@ -980,6 +999,7 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 ///
 /// IS_HALF[base_address[i]] for i ∈ [0, 1] and IS_WORD[base_address[2]] are
 /// assumptions — the caller's (CPU's) responsibility.
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
 
@@ -1023,6 +1043,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 ///
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
+#[cfg(feature = "prove")]
 fn is_register_op(op: &MemwOperation) -> bool {
     if !op.is_register || op.width != 2 {
         return false;
@@ -1044,6 +1065,7 @@ fn is_register_op(op: &MemwOperation) -> bool {
 ///
 /// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
 /// in a halfword (proving the timestamp delta is in range [1, 2^16]).
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     ops.iter()
         .map(|op| {
@@ -1070,6 +1092,7 @@ fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOpera
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
 /// Returns: Vec of bitwise lookups
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
 
@@ -1124,6 +1147,7 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
 ///
 /// Returns: Vec of bitwise lookups
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
 
@@ -1199,6 +1223,7 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 /// not by the DVRM table. Only constraint-level IS_HALF lookups are generated here.
 ///
 /// Returns: Vec of bitwise lookups
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
 
@@ -1352,6 +1377,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
 /// Returns: Vec of bitwise lookups
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(branch_ops.len() * 5);
 
@@ -1414,6 +1440,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 ///
 /// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
 /// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+#[cfg(feature = "prove")]
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -1462,11 +1489,10 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
-    #[cfg(feature = "prove")]
-    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> hashbrown::HashMap<u64, Vec<u8>> {
+    use executor::constants::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut init_page_data: hashbrown::HashMap<u64, Vec<u8>> = hashbrown::HashMap::new();
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
             let word_addr = segment.base_addr + (i as u64 * 4);
@@ -1496,6 +1522,7 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     init_page_data
 }
 
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_page(
     elf: &Elf,
     memory_state: &MemoryState,
@@ -1553,6 +1580,7 @@ fn collect_bitwise_from_page(
 
 /// Expand one Commit ECALL into its per-byte COMMIT rows using the memory state
 /// at the moment the ECALL executes.
+#[cfg(feature = "prove")]
 fn expand_commit_operations_for_ecall(
     ecall: &CpuOperation,
     memory_state: &MemoryState,
@@ -1595,6 +1623,7 @@ fn expand_commit_operations_for_ecall(
 /// - Zero for end detection (1 per real row, mult = mu)
 ///
 /// Note: IsByte for value is intentionally omitted per spec.
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
@@ -1653,6 +1682,7 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 /// interactions; the keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
+#[cfg(feature = "prove")]
 fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
     #[cfg(feature = "prove")]
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
@@ -1889,6 +1919,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
 
 /// every address accessed during execution (ELF init + runtime stores/loads).
 /// ELF pages get their init data from the binary; all others are zero-init.
+#[cfg(feature = "prove")]
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
@@ -2058,6 +2089,7 @@ fn chunk_and_generate<T>(
 /// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
 /// (for HALT finalization), and returns fully-routed ops ready for Phase 3+.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prove")]
 fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
     mut memw_ops: Vec<MemwOperation>,
@@ -2165,6 +2197,7 @@ fn collect_all_ops(
 /// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
 /// and PAGE bitwise lookups; `None` produces empty page tables.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prove")]
 fn build_traces(
     ops: CollectedOps,
     elf: Option<&Elf>,
@@ -2586,8 +2619,7 @@ impl Traces {
     /// init data populated. Used by the verifier to reconstruct the ELF
     /// portion of the PAGE table layout.
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
-        #[cfg(feature = "prove")]
-        use std::collections::BTreeSet;
+        use alloc::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, &[]);
@@ -2634,8 +2666,7 @@ impl Traces {
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
-            #[cfg(feature = "prove")]
-            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+            use executor::constants::PRIVATE_INPUT_START_INDEX;
             let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
             for i in 0..num_private_input_pages {
                 configs.push(PageConfig {
@@ -2701,6 +2732,7 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
+    #[cfg(feature = "prove")]
     pub fn from_elf_and_logs(
         elf: &Elf,
         logs: &[Log],
@@ -2756,6 +2788,7 @@ impl Traces {
     /// as it generates PAGE tables from ELF data.
     ///
     /// Note: This creates empty PAGE tables since no ELF is provided.
+    #[cfg(feature = "prove")]
     pub fn from_logs(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
@@ -2918,7 +2951,7 @@ mod keccak_tests {
 
         let mut ref_state = [0u64; 25];
         for round in 0..24 {
-            let rc = executor::vm::instruction::execution::KECCAK_RC[round];
+            let rc = executor::constants::KECCAK_RC[round];
             let mut c = [0u64; 5];
             for x in 0..5 {
                 c[x] = ref_state[x]
@@ -2937,8 +2970,8 @@ mod keccak_tests {
             let mut b = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
-                    b[y + 5 * ((2 * x + 3 * y) % 5)] = ref_state[x + 5 * y]
-                        .rotate_left(executor::vm::instruction::execution::KECCAK_RHO[x][y]);
+                    b[y + 5 * ((2 * x + 3 * y) % 5)] =
+                        ref_state[x + 5 * y].rotate_left(executor::constants::KECCAK_RHO[x][y]);
                 }
             }
             for x in 0..5 {

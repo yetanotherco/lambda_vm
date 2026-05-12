@@ -7,8 +7,8 @@
 //! Follows the BITWISE preprocessed-table pattern: precomputed columns are
 //! committed once and cached via `OnceLock`.
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use std::sync::OnceLock;
 
@@ -101,6 +101,7 @@ pub const fn generate_row(round: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
 // Preprocessed commitment
 // =========================================================================
 
+#[cfg(feature = "prove")]
 static KECCAK_RC_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
@@ -150,7 +151,14 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    *KECCAK_RC_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
+    #[cfg(feature = "prove")]
+    {
+        *KECCAK_RC_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
+    }
+    #[cfg(not(feature = "prove"))]
+    {
+        compute_preprocessed_commitment(options)
+    }
 }
 
 // =========================================================================

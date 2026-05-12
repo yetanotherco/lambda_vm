@@ -6,5 +6,4 @@ pub mod constants;
 pub mod elf;
 #[cfg(feature = "std")]
 pub mod flamegraph;
-#[cfg(feature = "std")]
 pub mod vm;

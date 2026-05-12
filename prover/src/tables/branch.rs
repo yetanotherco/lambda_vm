@@ -26,8 +26,8 @@
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -157,6 +157,7 @@ impl BranchOperation {
 ///
 /// Duplicate operations (same pc, offset, register, jalr) are merged into a single row
 /// with their multiplicities summed. The table is then padded to the next power of 2.
+#[cfg(feature = "prove")]
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {

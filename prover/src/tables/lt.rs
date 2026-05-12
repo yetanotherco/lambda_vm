@@ -25,8 +25,8 @@
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 //! - Receiver: LT (provides less-than results to other tables)
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -127,6 +127,7 @@ impl LtOperation {
 ///
 /// Duplicate operations (same lhs, rhs, signed) are merged into a single row
 /// with their multiplicities summed. The table is then padded to the next power of 2.
+#[cfg(feature = "prove")]
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {

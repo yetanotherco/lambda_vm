@@ -8,8 +8,8 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{element::FieldElement, traits::IsFFTField};
 use core::marker::PhantomData;
+use math::field::{element::FieldElement, traits::IsFFTField};
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {

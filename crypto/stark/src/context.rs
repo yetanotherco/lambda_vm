@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use super::proof::options::ProofOptions;
+use alloc::vec::Vec;
 
 #[derive(Clone, Debug)]
 pub struct AirContext {

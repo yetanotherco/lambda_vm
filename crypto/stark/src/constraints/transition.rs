@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ops::Div;
 
 use crate::domain::Domain;

@@ -26,8 +26,8 @@
 //! All lookups are provided as receivers with negative multiplicity,
 //! meaning other tables send to this table.
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use std::sync::OnceLock;
 
@@ -178,6 +178,7 @@ pub const fn is_preprocessed() -> bool {
 ///
 /// INVARIANT: All callers within a process must use identical `ProofOptions`.
 /// The cache is keyed only by table content, not by options.
+#[cfg(feature = "prove")]
 static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
@@ -285,7 +286,14 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// Returns the preprocessed commitment for the bitwise table, with caching.
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    *BITWISE_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
+    #[cfg(feature = "prove")]
+    {
+        *BITWISE_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
+    }
+    #[cfg(not(feature = "prove"))]
+    {
+        compute_preprocessed_commitment(options)
+    }
 }
 
 // =========================================================================

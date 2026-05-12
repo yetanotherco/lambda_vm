@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::frame::Frame;
+use alloc::vec::Vec;
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},

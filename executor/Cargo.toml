@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 thiserror = { version = "2.0", default-features = false }
 rustc-demangle = { version = "0.1", optional = true }
+hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
 
 [features]
 default = ["std"]

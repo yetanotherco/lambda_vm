@@ -296,6 +296,7 @@ fn process_fused_block<F, E>(
 /// 2-layer fusion: 8 reads + 8 writes instead of 8+8+8+8 for separate layers.
 #[cfg(feature = "alloc")]
 #[inline]
+#[allow(dead_code)]
 fn process_triple_fused_block<F, E>(
     block: &mut [FieldElement<E>],
     twiddles_l0: &[FieldElement<F>],
@@ -604,6 +605,7 @@ fn process_ifft_fused_block<F, E>(
 /// Process a single block with 3-layer IFFT fusion (DIT radix-8 butterfly).
 #[cfg(feature = "alloc")]
 #[inline]
+#[allow(dead_code)]
 fn process_ifft_triple_fused_block<F, E>(
     block: &mut [FieldElement<E>],
     twiddles_hi: &[FieldElement<F>], // innermost layer (highest index)

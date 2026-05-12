@@ -101,11 +101,24 @@ impl GoldilocksCubicProofOptions {
             });
         }
 
+        #[cfg(feature = "std")]
+        let (sqrt, log2, ceil) = (
+            f64::sqrt as fn(f64) -> f64,
+            f64::log2 as fn(f64) -> f64,
+            f64::ceil as fn(f64) -> f64,
+        );
+        #[cfg(not(feature = "std"))]
+        let (sqrt, log2, ceil) = (
+            libm::sqrt as fn(f64) -> f64,
+            libm::log2 as fn(f64) -> f64,
+            libm::ceil as fn(f64) -> f64,
+        );
+
         let rate = 1.0 / blowup_factor as f64;
-        let proximity = 1.0 - rate.sqrt() - 1.0 / 300.0;
-        let bits_per_query = -(1.0 - proximity).log2();
+        let proximity = 1.0 - sqrt(rate) - 1.0 / 300.0;
+        let bits_per_query = -log2(1.0 - proximity);
         let fri_number_of_queries =
-            ((security_bits as f64 - grinding_factor as f64) / bits_per_query).ceil() as usize;
+            ceil((security_bits as f64 - grinding_factor as f64) / bits_per_query) as usize;
 
         Ok(ProofOptions {
             blowup_factor,

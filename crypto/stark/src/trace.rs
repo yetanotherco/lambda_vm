@@ -1,7 +1,7 @@
-use alloc::vec::Vec;
-use alloc::vec;
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
+use alloc::vec;
+use alloc::vec::Vec;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};

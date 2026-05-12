@@ -15,11 +15,10 @@
 //! | state_ptr      |  100 | Per-lane DWordHL addresses [25][4]             |
 //! | mu             |    1 | Multiplicity flag                              |
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::vec;
-#[cfg(feature = "prove")]
-use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+use alloc::vec::Vec;
+use executor::constants::KECCAK_SYSCALL_NUMBER;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;

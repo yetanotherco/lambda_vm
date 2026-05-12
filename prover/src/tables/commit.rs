@@ -43,9 +43,9 @@
 //! - `count_decr_carry_0`: SUB template carry_0 for count_decr + 1 = count (degree 2)
 //! - `count_decr_carry_1`: SUB template carry_1 for count_decr + 1 = count (degree 2)
 //!
-use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

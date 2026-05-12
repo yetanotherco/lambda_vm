@@ -52,10 +52,10 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
-use alloc::vec::Vec;
-use alloc::vec;
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
+use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -643,6 +643,7 @@ impl CpuOperation {
     ///
     /// The DecodeEntry contains static instruction information. This method
     /// adds runtime values from the Log (register values, branch decisions, etc.).
+    #[cfg(feature = "prove")]
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let ecall_commit = decode.op_ecall && log.src1_val == SyscallNumbers::Commit as u64;
         let (commit_buf_addr, commit_count) = if ecall_commit {
@@ -650,8 +651,8 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
-        let ecall_keccak = decode.op_ecall
-            && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let ecall_keccak =
+            decode.op_ecall && log.src1_val == executor::constants::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
@@ -688,6 +689,7 @@ impl CpuOperation {
     ///
     /// This creates the DecodeEntry internally. Use `from_log` with a pre-built
     /// DecodeEntry when possible to avoid redundant decoding.
+    #[cfg(feature = "prove")]
     pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
         let decode = DecodeEntry::from_instruction(log.current_pc, instruction);
         Self::from_log(log, timestamp, decode)
@@ -700,6 +702,7 @@ impl CpuOperation {
     /// - Branch condition and result computation for BEQ/BLT
     /// - AUIPC special case (rv1 = current_pc)
     /// - JALR branch_cond = true
+    #[cfg(feature = "prove")]
     fn compute_runtime_values(&mut self, log: &Log) {
         // JALR: always jumps
         if self.decode.op_jalr {
@@ -906,6 +909,7 @@ pub fn generate_cpu_trace(
 ///
 /// Returns an error if an instruction is not found for a PC.
 /// Panics if logs.len() is not a power of 2 >= 4.
+#[cfg(feature = "prove")]
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
@@ -935,6 +939,7 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 /// Collects all Bitwise lookups from executor logs.
 ///
 /// Convenience function that converts logs to operations and collects lookups.
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,

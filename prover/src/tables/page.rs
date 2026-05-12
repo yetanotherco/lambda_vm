@@ -30,8 +30,8 @@
 //! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use std::collections::HashMap;
 #[cfg(feature = "prove")]
@@ -103,6 +103,7 @@ pub struct FinalByteState {
 }
 
 /// Map from byte address to final state.
+#[cfg(feature = "prove")]
 pub type FinalStateMap = HashMap<u64, FinalByteState>;
 
 /// Configuration for a single PAGE table instance.
@@ -175,6 +176,7 @@ impl PageConfig {
 /// ## Returns
 ///
 /// The trace table for this page.
+#[cfg(feature = "prove")]
 pub fn generate_page_trace(
     config: &PageConfig,
     final_state: &FinalStateMap,
@@ -234,6 +236,7 @@ pub fn generate_page_trace(
 ///
 /// INVARIANT: All callers within a process must use identical `ProofOptions`.
 /// The cache is keyed only by page content, not by options.
+#[cfg(feature = "prove")]
 static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
@@ -303,9 +306,16 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
 /// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
 /// ELF data pages compute their commitment fresh.
 pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
-    if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
-        *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
-    } else {
+    #[cfg(feature = "prove")]
+    {
+        if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
+            *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
+        } else {
+            compute_precomputed_commitment(config, options)
+        }
+    }
+    #[cfg(not(feature = "prove"))]
+    {
         compute_precomputed_commitment(config, options)
     }
 }

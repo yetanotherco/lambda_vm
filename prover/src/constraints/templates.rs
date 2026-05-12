@@ -11,8 +11,8 @@
 //!   - lhs, rhs, sum: DWordWL (2 × 32-bit words)
 //!   - Embeds carry constraints inline
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::{constraints::transition::TransitionConstraint, table::TableView};
