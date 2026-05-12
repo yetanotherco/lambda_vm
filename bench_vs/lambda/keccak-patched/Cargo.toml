@@ -1,0 +1,14 @@
+[package]
+name = "keccak"
+version = "0.1.5"
+edition = "2018"
+description = "Patched Keccak-f[1600] that routes through the lambda-vm precompile syscall on riscv64 guests; falls back to the upstream pure-Rust implementation otherwise."
+license = "Apache-2.0 OR MIT"
+
+[features]
+asm = []
+no_unroll = []
+simd = []
+
+[target."cfg(target_arch = \"aarch64\")".dependencies]
+cpufeatures = "0.2"
