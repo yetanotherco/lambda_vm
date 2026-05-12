@@ -338,6 +338,26 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     tree.root
 }
 
+/// Returns a page's preprocessed commitment, preferring the cheap path.
+///
+/// Zero-init pages (INIT is all-zero) share a single commitment that depends
+/// only on `(blowup, coset)`, so they resolve to the static lookup in
+/// [`zero_init_preprocessed_commitment`] instead of rebuilding the FFT +
+/// Merkle tree. ELF data pages have program-specific INIT and fall through
+/// to [`compute_precomputed_commitment`]. This mirrors the per-page choice
+/// made in `VmAirs::new_with_vkey`, so a vkey built from this function caches
+/// exactly the commitments the verifier expects.
+///
+/// Private-input pages have no preprocessed commitment; callers must skip
+/// them before calling this.
+pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
+    if config.init_values.is_none() {
+        zero_init_preprocessed_commitment(options)
+    } else {
+        compute_precomputed_commitment(config, options)
+    }
+}
+
 /// Returns the zero-init PAGE preprocessed commitment.
 ///
 /// Looks up `blowup_factor` in [`static_zero_page_commitment`] when

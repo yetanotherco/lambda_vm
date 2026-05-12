@@ -31,6 +31,9 @@ pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
+pub mod vkey;
+
+pub use vkey::VmVerifyingKey;
 
 use alloc::format;
 use alloc::string::String;
@@ -71,7 +74,7 @@ use crate::test_utils::{
     create_register_air, create_shift_air, create_store_air,
 };
 
-use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
@@ -435,16 +438,44 @@ impl VmAirs {
         decode_commitment: Option<Commitment>,
         page_commitments: Option<&[(u64, Commitment)]>,
     ) -> Self {
+        Self::new_with_vkey(
+            elf,
+            proof_options,
+            minimal_bitwise,
+            page_configs,
+            table_counts,
+            decode_commitment,
+            page_commitments,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new`] but accepts a precomputed [`VmVerifyingKey`].
+    /// When `vkey` is `Some`, the bitwise preprocessed commitment is taken
+    /// from it instead of being recomputed from `proof_options` — that
+    /// recomputation is ~87% of verifier cycles inside the recursion guest.
+    pub fn new_with_vkey(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
+        decode_commitment: Option<Commitment>,
+        page_commitments: Option<&[(u64, Commitment)]>,
+        vkey: Option<&VmVerifyingKey>,
+    ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
             .collect();
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
-            create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-            )
+            let commitment = match vkey {
+                Some(vk) => vk.bitwise,
+                None => bitwise::preprocessed_commitment(proof_options),
+            };
+            create_bitwise_air(proof_options)
+                .with_preprocessed(commitment, bitwise::NUM_PRECOMPUTED_COLS)
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
@@ -461,10 +492,12 @@ impl VmAirs {
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
-        let decode_root = decode_commitment.unwrap_or_else(|| {
-            decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment")
-        });
+        let decode_root = decode_commitment
+            .or_else(|| vkey.map(|vk| vk.decode))
+            .unwrap_or_else(|| {
+                decode::commitment_from_elf(elf, proof_options)
+                    .expect("Failed to compute decode commitment")
+            });
         let decode = create_decode_air(proof_options)
             .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS);
         let muls: Vec<_> = (0..table_counts.mul)
@@ -480,17 +513,21 @@ impl VmAirs {
         let commit = create_commit_air(proof_options);
         let keccak = create_keccak_air(proof_options);
         let keccak_rnd = create_keccak_rnd_air(proof_options);
+        let keccak_rc_commitment = vkey
+            .map(|vk| vk.keccak_rc)
+            .unwrap_or_else(|| tables::keccak_rc::preprocessed_commitment(proof_options));
         let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
+            keccak_rc_commitment,
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
         let ecsm = create_ecsm_air(proof_options);
         let ec_scalar = create_ec_scalar_air(proof_options);
         let ecdas = create_ecdas_air(proof_options);
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register_commitment = vkey
+            .map(|vk| vk.register)
+            .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
+        let register = create_register_air(proof_options)
+            .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS);
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -501,7 +538,8 @@ impl VmAirs {
 
         let pages: Vec<_> = page_configs
             .iter()
-            .map(|config| {
+            .enumerate()
+            .map(|(index, config)| {
                 let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
@@ -510,16 +548,21 @@ impl VmAirs {
                     air
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
+                    // `vkey.pages` caches the same static value for these slots,
+                    // so the local lookup is equivalent and equally cheap.
                     air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
-                    // (recursion guest); otherwise recompute from the ELF.
+                    // (recursion guest), then the vkey's cached per-page root
+                    // (indexed parallel to `page_configs`); otherwise recompute
+                    // from the ELF.
                     let commitment = page_commitments
                         .unwrap_or(&[])
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
                         .map(|(_, c)| *c)
+                        .or_else(|| vkey.map(|vk| vk.pages[index]))
                         .unwrap_or_else(|| {
                             page::compute_precomputed_commitment(config, proof_options)
                         });
@@ -905,6 +948,30 @@ pub fn verify_with_options(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
+    verify_with_options_with_vkey(
+        vm_proof,
+        elf_bytes,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+        None,
+    )
+}
+
+/// Same as [`verify_with_options`] but accepts a precomputed
+/// [`VmVerifyingKey`]. When `vkey` is `Some`, the bitwise preprocessed
+/// commitment is taken from it instead of being recomputed inside
+/// `VmAirs::new`. A tampered vkey is caught by Fiat-Shamir: the verifier
+/// feeds the supplied commitment into the transcript, derives different
+/// challenges from what the prover used, and the openings stop matching.
+pub fn verify_with_options_with_vkey(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+    vkey: Option<&VmVerifyingKey>,
+) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
@@ -944,7 +1011,7 @@ pub fn verify_with_options(
         )));
     }
 
-    let airs = VmAirs::new(
+    let airs = VmAirs::new_with_vkey(
         &program,
         proof_options,
         false,
@@ -952,6 +1019,7 @@ pub fn verify_with_options(
         &vm_proof.table_counts,
         decode_commitment,
         page_commitments,
+        vkey,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.

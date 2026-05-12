@@ -43,13 +43,12 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
-/// Maximum size of the private input memory region (in bytes).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
-/// Fixed high address where private input is mapped. Guest programs can read
-/// directly from this address (ZisK-style memory-mapped input).
-/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
-/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
-pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+/// Private-input region size cap and mapped base address. Re-exported from
+/// `constants` (the canonical definitions) rather than redeclared here — the
+/// old local `MAX_PRIVATE_INPUT_SIZE = 6.7 MiB` shadowed the 64 MiB constant
+/// and rejected larger recursion blobs (e.g. multi-query / high-blowup inner
+/// proofs) with `PrivateInputSizeExceeded`.
+pub use crate::constants::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
 
 #[derive(Default, Debug)]
 pub struct Memory {
@@ -203,6 +202,13 @@ impl Memory {
 
     pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
         Ok(self.public_output.clone())
+    }
+
+    /// Read-only access to the underlying 4-byte cell map. Exposed for
+    /// diagnostic tooling (e.g. counting the distinct 4 KB memory pages a
+    /// program touches) — not part of the normal execution interface.
+    pub fn cells(&self) -> &U64HashMap<[u8; 4]> {
+        &self.cells
     }
 
     /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a

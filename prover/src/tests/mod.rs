@@ -59,6 +59,8 @@ pub mod page_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]
+pub mod recursion_smoke_test;
+#[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
 pub mod shift_tests;
@@ -74,3 +76,5 @@ pub mod templates_tests;
 pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+#[cfg(test)]
+pub mod vkey_tests;
