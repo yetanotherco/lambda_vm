@@ -1,7 +1,7 @@
-use alloc::vec::Vec;
 use alloc::string::String;
-use alloc::vec;
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};

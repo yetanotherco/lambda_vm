@@ -1,11 +1,11 @@
-use alloc::vec::Vec;
-use alloc::vec;
 use super::boundary::BoundaryConstraints;
 use crate::domain::Domain;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]

@@ -28,6 +28,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::Error;
+use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -232,7 +234,7 @@ impl CpuOperation {
             (0, 0)
         };
         let ecall_keccak =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+            f.ecall && log.src1_val == executor::constants::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
         // in the trace builder.
@@ -552,6 +554,7 @@ pub fn generate_cpu_trace(
 }
 
 /// Generates the CPU trace table directly from executor logs.
+#[cfg(feature = "prove")]
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
@@ -579,6 +582,7 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 }
 
 /// Collects all BITWISE lookups from executor logs.
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,

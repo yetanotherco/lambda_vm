@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use crate::frame::Frame;
 #[cfg(feature = "disk-spill")]
 use crypto::mmap_util::spill_slice_to_mmap;

@@ -30,8 +30,8 @@
 //! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use std::collections::HashMap;
 #[cfg(feature = "prove")]
@@ -103,6 +103,7 @@ pub struct FinalByteState {
 }
 
 /// Map from byte address to final state.
+#[cfg(feature = "prove")]
 pub type FinalStateMap = HashMap<u64, FinalByteState>;
 
 /// Configuration for a single PAGE table instance.
@@ -168,6 +169,7 @@ impl PageConfig {
 /// ## Returns
 ///
 /// The trace table for this page.
+#[cfg(feature = "prove")]
 pub fn generate_page_trace(
     config: &PageConfig,
     final_state: &FinalStateMap,

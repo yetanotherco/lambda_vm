@@ -38,9 +38,9 @@
 //! - 4 Memory bus tokens (read-old + write-new, per word)
 //! - 2 MEMW output interactions (read + write, from CPU)
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

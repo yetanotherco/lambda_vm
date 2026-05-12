@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;

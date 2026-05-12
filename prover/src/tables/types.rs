@@ -15,7 +15,6 @@
 //! the CPU and DECODE tables. It contains all static decode-time information extracted
 //! from an instruction, excluding runtime values like register contents.
 
-#[cfg(feature = "prove")]
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;

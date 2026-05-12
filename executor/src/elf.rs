@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 const EI_NIDENT: usize = 16;
 // Section header types
 const SHT_SYMTAB: u32 = 2;

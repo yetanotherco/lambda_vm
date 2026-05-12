@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
+use alloc::vec::Vec;
+use core::hash::{BuildHasher, Hasher};
+use hashbrown::HashMap;
 
 /// Fast hasher for u64 keys - uses the key directly as the hash value.
 /// This avoids the overhead of SipHash for integer keys.
@@ -232,7 +233,7 @@ impl Memory {
             let aligned = addr - (addr % 4);
             let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
             let offset = (addr % 4) as usize;
-            let take = std::cmp::min(4 - offset, (end - addr) as usize);
+            let take = core::cmp::min(4 - offset, (end - addr) as usize);
             result.extend_from_slice(&bytes[offset..offset + take]);
             addr += take as u64;
         }

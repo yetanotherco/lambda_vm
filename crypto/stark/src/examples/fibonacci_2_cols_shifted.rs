@@ -8,11 +8,11 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
+use core::marker::PhantomData;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     traits::AsBytes,
 };
-use core::marker::PhantomData;
 
 #[derive(Clone)]
 struct ShiftedFibTransition1<F: IsFFTField> {

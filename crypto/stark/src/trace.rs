@@ -1,8 +1,7 @@
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
-#[cfg(test)]
 use itertools::Itertools;
 #[cfg(test)]
 use math::fft::errors::FFTError;

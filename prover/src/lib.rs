@@ -11,6 +11,11 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// In guest builds (`prove` feature off) the prove-side helpers — trace generators,
+// executor-typed imports, internal Operation structs, etc. — are unreferenced.
+// They're real code, used by the host build, and there's nothing to fix there.
+// Silence the resulting dead_code / unused_imports noise in the guest build only.
+#![cfg_attr(not(feature = "prove"), allow(dead_code, unused_imports))]
 
 extern crate alloc;
 
@@ -29,12 +34,12 @@ pub mod tests;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-#[cfg(feature = "prove")]
 use executor::elf::Elf;
 #[cfg(feature = "prove")]
 use executor::vm::execution::Executor;
@@ -253,6 +258,7 @@ pub(crate) struct VmAirs {
 
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
+    #[cfg(feature = "prove")]
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
@@ -989,6 +995,7 @@ pub fn verify_with_options(
 }
 
 /// Prove and verify in one call (convenience).
+#[cfg(feature = "prove")]
 pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let vm_proof = prove(elf_bytes)?;
     verify(&vm_proof, elf_bytes)

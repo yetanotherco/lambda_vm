@@ -10,8 +10,9 @@
 //! - Minimal trace generation for testing
 //! - AIR creation helpers
 
-use alloc::format;
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(feature = "prove")]

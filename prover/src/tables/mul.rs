@@ -30,8 +30,8 @@
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
 use std::collections::HashMap;
 
@@ -295,6 +295,7 @@ impl MulOperation {
 ///
 /// # Arguments
 /// * `operations` - List of (MulOperation, wants_hi) pairs
+#[cfg(feature = "prove")]
 pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -810,8 +811,8 @@ impl MulConstraint {
 
         // Build sign-extended values
         let sign_fill = FieldElement::<F>::from(SIGN_FILL);
-        let mut lhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-        let mut rhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
+        let mut lhs_ext: [FieldElement<F>; 8] = core::array::from_fn(|_| FieldElement::zero());
+        let mut rhs_ext: [FieldElement<F>; 8] = core::array::from_fn(|_| FieldElement::zero());
 
         lhs_ext[..4].clone_from_slice(&lhs);
         rhs_ext[..4].clone_from_slice(&rhs);

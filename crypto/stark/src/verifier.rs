@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-use alloc::vec;
 use super::{
     config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
@@ -14,6 +12,9 @@ use crate::{
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -27,7 +28,6 @@ use math::{
     },
     traits::AsBytes,
 };
-use core::marker::PhantomData;
 use hashbrown::HashMap;
 #[cfg(feature = "instruments")]
 use std::time::Instant;

@@ -1,10 +1,10 @@
-use alloc::vec::Vec;
 use super::domain::Domain;
 use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::lookup::{LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
+use alloc::vec::Vec;
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
 use math::{

@@ -15,6 +15,7 @@ required-features = ["std"]
 [dependencies]
 thiserror = { version = "2.0", default-features = false }
 rustc-demangle = { version = "0.1", optional = true }
+hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
 ecsm = { path = "../crypto/ecsm" }
 
 [dev-dependencies]
