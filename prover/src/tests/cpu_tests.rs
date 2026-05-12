@@ -328,7 +328,7 @@ fn test_bus_interactions_count() {
     // - 1 DVRM (division/remainder)
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
+    // - 1 ECALL (shared bus for HALT, COMMIT, and KECCAK, mult = ECALL)
     // - 1 IS_BYTE for (RS1, RS2) paired
     // - 1 IS_BYTE for (RD, 0)
     // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
