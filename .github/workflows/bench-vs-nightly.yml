@@ -47,6 +47,17 @@ jobs:
             --report-dir bench_vs_artifacts \
             --no-color
 
+      - name: Refresh Plonky3 to latest main
+        run: |
+          cargo update --manifest-path bench_vs_plonky3/Cargo.toml \
+            -p p3-air -p p3-field -p p3-goldilocks -p p3-matrix \
+            -p p3-commit -p p3-challenger -p p3-symmetric \
+            -p p3-merkle-tree -p p3-keccak -p p3-fri \
+            -p p3-uni-stark -p p3-dft
+
+      - name: Run Plonky3 nightly benchmark
+        run: bash ./bench_vs_plonky3/run_p3_nightly.sh bench_vs_artifacts/p3
+
       - name: Upload nightly benchmark artifact
         uses: actions/upload-artifact@v4
         with:

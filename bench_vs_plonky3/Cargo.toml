@@ -12,28 +12,18 @@ math = { path = "../crypto/math", features = [
     "lambdaworks-serde-binary",
 ] }
 
-# Plonky3: pinned to the yetanotherco fork, branch `feat/goldilocks_deg3`.
-# The branch adds BinomiallyExtendable<3> for Goldilocks (x^3 - 2), matching
-# Lambda's Degree3GoldilocksExtensionField. All p3-* crates MUST resolve to
-# the same git source + ref; declaring any of them as a crates.io dep would
-# pull in a second incompatible p3-field. cargo clones the fork once into
-# ~/.cargo/git/db and Cargo.lock pins the branch HEAD at fetch time.
-p3-air = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-field = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-goldilocks = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-matrix = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-commit = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-challenger = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-symmetric = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-merkle-tree = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-keccak = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-fri = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3" }
-p3-uni-stark = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
-    "parallel",
-] }
-p3-dft = { git = "https://github.com/yetanotherco/Plonky3.git", branch = "feat/goldilocks_deg3", features = [
-    "parallel",
-] }
+p3-air = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
 
 # Tracing for P3 span-based profiling
 tracing = "0.1"
@@ -49,8 +39,8 @@ criterion = { version = "0.4", default-features = false }
 # Both provers run multi-threaded by default: Plonky3's `Radix2DitParallel` DFT
 # uses rayon unconditionally, so Lambda must also enable `parallel` for a fair
 # apples-to-apples comparison. Disable with `--no-default-features` to compare
-# single-threaded. Cubic extension (`x^3 - 2`) matching Lambda is unconditional
-# — the fork ships `BinomiallyExtendable<3>` for Goldilocks natively.
+# single-threaded. The cubic extension is `x^3 - 2` (binomial) on Lambda and
+# `x^3 - x - 1` (trinomial) on upstream Plonky3 — same degree, same soundness.
 default = ["parallel"]
 parallel = ["stark/parallel"]
 instruments = ["stark/instruments"]

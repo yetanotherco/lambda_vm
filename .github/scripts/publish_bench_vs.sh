@@ -79,6 +79,125 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
     PROJ_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Linear Projection"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$PROJ_MRKDWN"'"}}'
 fi
 
+# --- Plonky3 section (optional) --------------------------------------------
+# Built when `bench_vs_artifacts/p3/headline/metrics.txt` exists. The headline
+# row comes from that file; column-scaling rows are read from the per-N
+# subdirs written by the workflow.
+
+p3_parse() {
+    local file=$1
+    local key=$2
+    { grep "^${key}=" "$file" 2>/dev/null || true; } | cut -d= -f2-
+}
+
+p3_fmt_seconds() {
+    LC_NUMERIC=C awk -v s="$1" 'BEGIN {
+        if (s == "") { print "n/a"; exit }
+        if (s + 0 < 1) printf "%.0fms", s * 1000
+        else printf "%.3fs", s
+    }'
+}
+
+p3_fmt_mb() {
+    LC_NUMERIC=C awk -v b="$1" 'BEGIN {
+        if (b == "") { print "n/a"; exit }
+        printf "%.1f MB", b / (1024 * 1024)
+    }'
+}
+
+p3_fmt_gb() {
+    LC_NUMERIC=C awk -v kb="$1" 'BEGIN {
+        if (kb == "") { print "n/a"; exit }
+        printf "%.2f GB", kb / (1024 * 1024)
+    }'
+}
+
+p3_fmt_ratio_pair() {
+    LC_NUMERIC=C awk -v a="$1" -v b="$2" 'BEGIN {
+        if (a == "" || b == "" || b + 0 == 0) { print "n/a"; exit }
+        printf "%.2fx", a / b
+    }'
+}
+
+P3_SECTION=""
+P3_HEADLINE_FILE="bench_vs_artifacts/p3/headline/metrics.txt"
+if [ -f "$P3_HEADLINE_FILE" ]; then
+    H_LOG_ROWS=$(p3_parse "$P3_HEADLINE_FILE" "log_rows_series")
+    H_COLS=$(p3_parse "$P3_HEADLINE_FILE" "columns")
+    H_BLOWUP=$(p3_parse "$P3_HEADLINE_FILE" "blowup")
+    H_QUERIES=$(p3_parse "$P3_HEADLINE_FILE" "fri_queries")
+    H_ROWS=$(p3_parse "$P3_HEADLINE_FILE" "rows_series")
+    H_LAMBDA_PROVE=$(p3_parse "$P3_HEADLINE_FILE" "lambda_prove_medians")
+    H_P3_PROVE=$(p3_parse "$P3_HEADLINE_FILE" "p3_prove_medians")
+    H_LAMBDA_VERIFY=$(p3_parse "$P3_HEADLINE_FILE" "lambda_verify_medians")
+    H_P3_VERIFY=$(p3_parse "$P3_HEADLINE_FILE" "p3_verify_medians")
+    H_LAMBDA_PROOF=$(p3_parse "$P3_HEADLINE_FILE" "lambda_proof_size_medians")
+    H_P3_PROOF=$(p3_parse "$P3_HEADLINE_FILE" "p3_proof_size_medians")
+    H_LAMBDA_RSS=$(p3_parse "$P3_HEADLINE_FILE" "lambda_peak_rss_medians")
+    H_P3_RSS=$(p3_parse "$P3_HEADLINE_FILE" "p3_peak_rss_medians")
+    H_RATIO=$(p3_parse "$P3_HEADLINE_FILE" "ratios_lambda_over_p3")
+
+    H_ROWS_FMT=$(LC_NUMERIC=C awk -v r="$H_ROWS" 'BEGIN {
+        if (r == "") { print "n/a"; exit }
+        if (r + 0 >= 1000000) printf "%.1fM", r / 1000000
+        else if (r + 0 >= 1000) printf "%.0fK", r / 1000
+        else printf "%d", r
+    }')
+
+    PROOF_RATIO=$(p3_fmt_ratio_pair "$H_LAMBDA_PROOF" "$H_P3_PROOF")
+    RSS_RATIO=$(p3_fmt_ratio_pair "$H_LAMBDA_RSS" "$H_P3_RSS")
+    PROVE_RATIO_FMT=$(LC_NUMERIC=C awk -v r="$H_RATIO" 'BEGIN {
+        if (r == "" || r == "n/a") { print "n/a"; exit }
+        printf "%.2fx", r
+    }')
+
+    P3_HEADLINE_MRKDWN="*log_rows=${H_LOG_ROWS} (${H_ROWS_FMT} rows · ${H_COLS} cols · blowup=${H_BLOWUP} · ${H_QUERIES} queries)*"
+    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Lambda:* $(p3_fmt_seconds "$H_LAMBDA_PROVE") prove · $(p3_fmt_seconds "$H_LAMBDA_VERIFY") verify · $(p3_fmt_mb "$H_LAMBDA_PROOF") proof · $(p3_fmt_gb "$H_LAMBDA_RSS") RSS"
+    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Plonky3:* $(p3_fmt_seconds "$H_P3_PROVE") prove · $(p3_fmt_seconds "$H_P3_VERIFY") verify · $(p3_fmt_mb "$H_P3_PROOF") proof · $(p3_fmt_gb "$H_P3_RSS") RSS"
+    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Ratio L/P3:* ${PROVE_RATIO_FMT} prove · ${PROOF_RATIO} proof · ${RSS_RATIO} RSS"
+
+    # Render a `(label|file)` list into a multi-line mrkdwn block with
+    # `*label* Lambda Xs / P3 Ys — Rx` per row. Used by both sweep sections.
+    p3_render_sweep() {
+        local out=""
+        local entry label file lambda_t p3_t ratio ratio_fmt line
+        for entry in "$@"; do
+            label="${entry%%|*}"
+            file="${entry##*|}"
+            if [ ! -f "$file" ]; then
+                line="*${label}* (no data)"
+            else
+                lambda_t=$(p3_parse "$file" "lambda_prove_medians")
+                p3_t=$(p3_parse "$file" "p3_prove_medians")
+                ratio=$(p3_parse "$file" "ratios_lambda_over_p3")
+                ratio_fmt=$(LC_NUMERIC=C awk -v r="$ratio" 'BEGIN {
+                    if (r == "" || r == "n/a") { print "n/a"; exit }
+                    printf "%.2fx", r
+                }')
+                line="*${label}* Lambda $(p3_fmt_seconds "$lambda_t") / P3 $(p3_fmt_seconds "$p3_t") — ${ratio_fmt}"
+            fi
+            if [ -n "$out" ]; then
+                out="${out}\\n${line}"
+            else
+                out="$line"
+            fi
+        done
+        printf '%s' "$out"
+    }
+
+    P3_SIZE_MRKDWN=$(p3_render_sweep \
+        "log_rows=19|bench_vs_artifacts/p3/size_log19/metrics.txt" \
+        "log_rows=20|bench_vs_artifacts/p3/size_log20/metrics.txt" \
+        "log_rows=21|bench_vs_artifacts/p3/headline/metrics.txt")
+
+    P3_COLS_MRKDWN=$(p3_render_sweep \
+        "8 cols (n=4):|bench_vs_artifacts/p3/cols_n4/metrics.txt" \
+        "32 cols (n=16):|bench_vs_artifacts/p3/headline/metrics.txt" \
+        "128 cols (n=64):|bench_vs_artifacts/p3/cols_n64/metrics.txt")
+
+    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3 - Headline"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_HEADLINE_MRKDWN"'"}},{"type":"header","text":{"type":"plain_text","text":"Size scaling @ 32 cols"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_SIZE_MRKDWN"'"}},{"type":"header","text":{"type":"plain_text","text":"Column scaling @ log_rows='"$H_LOG_ROWS"'"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_COLS_MRKDWN"'"}}'
+fi
+
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$P3_SECTION"']}'
