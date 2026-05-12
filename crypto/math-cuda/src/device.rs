@@ -118,6 +118,7 @@ pub struct Backend {
     pub gl_neg: CudaFunction,
     pub ext3_mul: CudaFunction,
     pub ext3_add: CudaFunction,
+    pub ext3_sub: CudaFunction,
 
     // ntt.ptx
     pub bit_reverse_permute: CudaFunction,
@@ -169,6 +170,7 @@ impl Backend {
             gl_neg: arith.load_function("gl_neg_kernel")?,
             ext3_mul: arith.load_function("ext3_mul_kernel")?,
             ext3_add: arith.load_function("ext3_add_kernel")?,
+            ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
