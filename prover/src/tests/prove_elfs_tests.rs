@@ -732,6 +732,46 @@ fn test_prove_elfs_keccak() {
 }
 
 #[test]
+fn test_prove_elfs_keccak_multi_call() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest initializes lane[i] = i + 1 and applies keccak-f[1600] three times.
+    // Cross-check the committed output against tiny-keccak's independent
+    // implementation of the permutation.
+    let mut expected_state: [u64; 25] = core::array::from_fn(|i| (i + 1) as u64);
+    for _ in 0..3 {
+        tiny_keccak::keccakf(&mut expected_state);
+    }
+    let mut expected_bytes = Vec::with_capacity(200);
+    for lane in expected_state {
+        expected_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed state must match tiny-keccak after 3 keccak-f[1600] calls"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak multi-call prove/verify failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");

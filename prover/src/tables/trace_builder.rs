@@ -407,10 +407,15 @@ fn collect_ops_from_cpu(
             let state_addr = op.keccak_state_addr;
             let mut input = [0u64; 25];
             for (i, lane) in input.iter_mut().enumerate() {
-                let addr = state_addr.wrapping_add(i as u64 * 8);
+                let addr = state_addr
+                    .checked_add(i as u64 * 8)
+                    .expect("keccak state address range must be validated by the executor");
                 let mut val = 0u64;
                 for b in 0..8 {
-                    let (byte_val, _ts) = memory_state.read_byte(addr + b as u64);
+                    let byte_addr = addr
+                        .checked_add(b as u64)
+                        .expect("keccak state address range must be validated by the executor");
+                    let (byte_val, _ts) = memory_state.read_byte(byte_addr);
                     val |= (byte_val as u64) << (b * 8);
                 }
                 *lane = val;
@@ -845,13 +850,18 @@ fn collect_keccak_memw_ops(
     // input = [0, state_ptr, output_state, timestamp, 0, 0, 1], output = input_state
     // The MEMW table sees: old=input_state, value=output_state, is_read=true.
     for (lane_idx, (&in_lane, &out_lane)) in input.iter().zip(output.iter()).enumerate() {
-        let lane_addr = state_addr.wrapping_add(lane_idx as u64 * 8);
+        let lane_addr = state_addr
+            .checked_add(lane_idx as u64 * 8)
+            .expect("keccak state address range must be validated by the executor");
 
         let mut old_bytes = [0u64; 8];
         let mut old_timestamps = [0u64; 8];
         for b in 0..8 {
             old_bytes[b] = (in_lane >> (b * 8)) & 0xFF;
-            let (_old_val, old_ts) = memory_state.read_byte(lane_addr + b as u64);
+            let byte_addr = lane_addr
+                .checked_add(b as u64)
+                .expect("keccak state address range must be validated by the executor");
+            let (_old_val, old_ts) = memory_state.read_byte(byte_addr);
             old_timestamps[b] = old_ts;
         }
 
@@ -866,7 +876,10 @@ fn collect_keccak_memw_ops(
 
         // Update memory state
         for (b, &val) in value_bytes.iter().enumerate() {
-            memory_state.write_byte(lane_addr + b as u64, val as u8, ts);
+            let byte_addr = lane_addr
+                .checked_add(b as u64)
+                .expect("keccak state address range must be validated by the executor");
+            memory_state.write_byte(byte_addr, val as u8, ts);
         }
     }
 
@@ -1650,9 +1663,17 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
     for kop in keccak_ops {
         let state_addr = kop.state_addr;
 
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AndByte,
+            (state_addr & 0xFF) as u8,
+            7,
+        ));
+
         // IS_HALF for state_ptr halfwords (100 per call)
         for lane_idx in 0..25 {
-            let ptr = state_addr.wrapping_add(lane_idx as u64 * 8);
+            let ptr = state_addr
+                .checked_add(lane_idx as u64 * 8)
+                .expect("keccak state address range must be validated by the executor");
             for shift in [0, 16, 32, 48] {
                 let half = ((ptr >> shift) & 0xFFFF) as u16;
                 ops.push(BitwiseOperation::halfword(
@@ -2886,12 +2907,12 @@ mod keccak_tests {
             .count();
 
         assert_eq!(xor, 24 * 608, "XorByte count");
-        assert_eq!(and, 24 * 200, "AndByte count");
+        assert_eq!(and, 24 * 200 + 1, "AndByte count");
         // Cxz_right Byte→Bit (spec d75944ee): drops 40 IS_BYTE per round.
         assert_eq!(is_byte, 24 * 440, "IsByte count");
         assert_eq!(hwsl, 24 * 120, "Hwsl count");
         assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 100 + 24 * 1368, "Total bitwise ops");
+        assert_eq!(ops.len(), 101 + 24 * 1368, "Total bitwise ops");
     }
 
     #[test]
@@ -2991,8 +3012,8 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            129,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 Keccak send + 1 Keccak recv"
+            130,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
@@ -3021,7 +3042,11 @@ mod keccak_tests {
     #[test]
     fn test_keccak_constraint_counts() {
         let (core_constraints, _) = keccak::create_constraints(0);
-        assert_eq!(core_constraints.len(), 50, "KECCAK core: 25 ADD pairs");
+        assert_eq!(
+            core_constraints.len(),
+            51,
+            "KECCAK core: 25 ADD pairs + no-overflow"
+        );
 
         let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
         assert_eq!(

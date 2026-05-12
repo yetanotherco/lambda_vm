@@ -18,6 +18,8 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+use executor::vm::instruction::execution::KECCAK_RC;
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -45,34 +47,6 @@ pub const NUM_REAL_ROWS: usize = 24;
 /// Number of rows in the trace (padded to next power of 2).
 pub const NUM_ROWS: usize = 32;
 
-/// Keccak-f[1600] round constants.
-const RC: [u64; 24] = [
-    0x0000000000000001,
-    0x0000000000008082,
-    0x800000000000808A,
-    0x8000000080008000,
-    0x000000000000808B,
-    0x0000000080000001,
-    0x8000000080008081,
-    0x8000000000008009,
-    0x000000000000008A,
-    0x0000000000000088,
-    0x0000000080008009,
-    0x000000008000000A,
-    0x000000008000808B,
-    0x800000000000008B,
-    0x8000000000008089,
-    0x8000000000008003,
-    0x8000000000008002,
-    0x8000000000000080,
-    0x000000000000800A,
-    0x800000008000000A,
-    0x8000000080008081,
-    0x8000000000008080,
-    0x0000000080000001,
-    0x8000000080008008,
-];
-
 /// Whether this table is preprocessed.
 pub const fn is_preprocessed() -> bool {
     true
@@ -80,7 +54,7 @@ pub const fn is_preprocessed() -> bool {
 
 /// Generate one precomputed row: [round, rc_byte0, ..., rc_byte7].
 pub const fn generate_row(round: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
-    let rc_val = if round < 24 { RC[round] } else { 0 };
+    let rc_val = if round < 24 { KECCAK_RC[round] } else { 0 };
     [
         round as u64,
         rc_val & 0xFF,

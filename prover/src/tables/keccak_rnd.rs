@@ -183,7 +183,7 @@ pub mod cols {
     /// Index into chi[x][y][byte]
     #[inline]
     pub const fn chi(x: usize, y: usize, byte: usize) -> usize {
-        CHI + (x * 5 + y) * 8 + byte
+        CHI + (x + 5 * y) * 8 + byte
     }
 
     /// Index into rc[byte]
@@ -438,12 +438,12 @@ pub fn generate_keccak_rnd_trace(
 }
 
 // =========================================================================
-// Bus interactions (1,411 total)
+// Bus interactions (1,371 total)
 // =========================================================================
 
 #[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1380);
+    let mut interactions = Vec::with_capacity(1371);
 
     // --- IO group (3) ---
 

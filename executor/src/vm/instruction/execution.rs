@@ -8,17 +8,19 @@ use crate::vm::{
 const REGULAR_PC_UPDATE: u64 = 4;
 
 pub enum SyscallNumbers {
+    // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
+    KeccakPermute = 0,
     Print = 1,
     Panic = 2,
     Commit = 64,
     Halt = 93,
-    KeccakPermute = 94, // Actual syscall number is KECCAK_SYSCALL_NUMBER (u64::MAX - 1)
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
 ///
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
+const KECCAK_STATE_BYTES: u64 = 25 * 8;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -334,13 +336,26 @@ impl Instruction {
                     SyscallNumbers::KeccakPermute => {
                         // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10
                         let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedKeccakStateAddress(state_addr));
+                        }
+                        state_addr
+                            .checked_add(KECCAK_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+
                         let mut state = [0u64; 25];
                         for (i, lane) in state.iter_mut().enumerate() {
-                            *lane = memory.load_doubleword(state_addr + (i as u64) * 8)?;
+                            let lane_addr = state_addr
+                                .checked_add((i as u64) * 8)
+                                .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+                            *lane = memory.load_doubleword(lane_addr)?;
                         }
                         keccak_f1600(&mut state);
                         for (i, &lane) in state.iter().enumerate() {
-                            memory.store_doubleword(state_addr + (i as u64) * 8, lane)?;
+                            let lane_addr = state_addr
+                                .checked_add((i as u64) * 8)
+                                .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+                            memory.store_doubleword(lane_addr, lane)?;
                         }
                         src2_val = state_addr;
                     }
@@ -516,6 +531,10 @@ pub enum ExecutionError {
     InvalidWSuffixOperation(ArithOp),
     #[error("Invalid commit fd: expected 1 (stdout), got {0}")]
     InvalidCommitFd(u64),
+    #[error("Unaligned Keccak state address: {0:#018x}")]
+    UnalignedKeccakStateAddress(u64),
+    #[error("Keccak state address range overflows: {0:#018x}")]
+    KeccakStateAddressOverflow(u64),
 }
 
 // =============================================================================
@@ -648,5 +667,41 @@ mod tests {
         keccak_f1600(&mut state);
         assert_ne!(state, original);
         assert!(state.iter().any(|&x| x != 0));
+    }
+
+    #[test]
+    fn test_keccak_syscall_rejects_unaligned_state_addr() {
+        let mut pc = 0;
+        let mut registers = Registers::default();
+        let mut memory = Memory::default();
+
+        registers.write(17, KECCAK_SYSCALL_NUMBER).unwrap();
+        registers.write(10, 0x1001).unwrap();
+
+        let err = Instruction::EcallEbreak
+            .run(&mut pc, &mut registers, &mut memory)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::UnalignedKeccakStateAddress(0x1001)
+        ));
+    }
+
+    #[test]
+    fn test_keccak_syscall_rejects_overflowing_state_range() {
+        let mut pc = 0;
+        let mut registers = Registers::default();
+        let mut memory = Memory::default();
+
+        registers.write(17, KECCAK_SYSCALL_NUMBER).unwrap();
+        registers.write(10, u64::MAX - 191).unwrap();
+
+        let err = Instruction::EcallEbreak
+            .run(&mut pc, &mut registers, &mut memory)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::KeccakStateAddressOverflow(addr) if addr == u64::MAX - 191
+        ));
     }
 }
