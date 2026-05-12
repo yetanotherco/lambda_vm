@@ -18,19 +18,14 @@
 use core::arch::asm;
 
 #[cfg(target_arch = "riscv64")]
-use crate::syscalls::SyscallNumbers;
-
-/// Memory-mapped private input region start address.
-/// Must match `executor::vm::memory::PRIVATE_INPUT_START_INDEX`.
-#[cfg(target_arch = "riscv64")]
-const PRIVATE_INPUT_LEN_ADDR: usize = 0xFF000000;
-#[cfg(target_arch = "riscv64")]
-const PRIVATE_INPUT_DATA_ADDR: usize = 0xFF000004;
+use crate::syscalls::{PRIVATE_INPUT_START, SyscallNumbers};
 
 /// EF IO: return a zero-copy pointer and size for the private input.
 ///
 /// Per the spec this function is idempotent, callable multiple times, and
 /// cannot fail. If `buf_size` is 0, the value of `buf_ptr` is unspecified.
+/// Privacy of the input is the guest's responsibility; the VM does not
+/// enforce it.
 ///
 /// # Safety
 ///
@@ -38,10 +33,10 @@ const PRIVATE_INPUT_DATA_ADDR: usize = 0xFF000004;
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_input(buf_ptr: *mut *const u8, buf_size: *mut usize) {
-    let len_ptr = PRIVATE_INPUT_LEN_ADDR as *const u32;
+    let len_ptr = PRIVATE_INPUT_START as *const u32;
     let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
     unsafe {
-        *buf_ptr = PRIVATE_INPUT_DATA_ADDR as *const u8;
+        *buf_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
         *buf_size = len;
     }
 }

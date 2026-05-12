@@ -41,7 +41,7 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// Total cap on public output bytes across all `commit_public_output` calls.
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
-const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
+pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
 /// Maximum size of the private input memory region (in bytes).
 pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Fixed high address where private input is mapped. Guest programs can read
@@ -167,7 +167,7 @@ impl Memory {
         if new_total > MAX_PUBLIC_OUTPUT_TOTAL_SIZE {
             return Err(MemoryError::CommitSizeExceeded);
         }
-        let bytes = self.load_bytes(address, length);
+        let bytes = self.load_bytes(address, length)?;
         self.public_output.extend_from_slice(&bytes);
         Ok(())
     }
@@ -191,11 +191,9 @@ impl Memory {
         Ok(())
     }
 
-    pub fn load_bytes(&self, mut addr: u64, len: u64) -> Vec<u8> {
+    pub fn load_bytes(&self, mut addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         let mut result = Vec::with_capacity(len as usize);
-        let end = addr
-            .checked_add(len)
-            .expect("load_bytes: address range exceeds u64::MAX");
+        let end = addr.checked_add(len).ok_or(MemoryError::AddressOverflow)?;
         while addr < end {
             let aligned = addr - (addr % 4);
             let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
@@ -204,7 +202,7 @@ impl Memory {
             result.extend_from_slice(&bytes[offset..offset + take]);
             addr += take as u64;
         }
-        result
+        Ok(result)
     }
 
     /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
@@ -233,6 +231,8 @@ pub enum MemoryError {
     CommitSizeExceeded,
     #[error("Private input size exceeded")]
     PrivateInputSizeExceeded,
+    #[error("Address range exceeds u64::MAX")]
+    AddressOverflow,
 }
 
 #[cfg(test)]
@@ -279,6 +279,38 @@ mod tests {
                 .expect("public output should be readable"),
             b"abcd".to_vec()
         );
+    }
+
+    #[test]
+    fn test_commit_public_output_empty_is_ok() {
+        let mut memory = Memory::default();
+        memory
+            .commit_public_output(0, 0)
+            .expect("zero-length commit should succeed");
+        assert!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_commit_public_output_address_overflow() {
+        let mut memory = Memory::default();
+        let err = memory
+            .commit_public_output(u64::MAX, 2)
+            .expect_err("address overflow must error, not panic");
+        assert!(matches!(err, super::MemoryError::AddressOverflow));
+    }
+
+    #[test]
+    fn test_load_bytes_overflow_errors() {
+        let memory = Memory::default();
+        let err = memory
+            .load_bytes(u64::MAX, 2)
+            .expect_err("address overflow must error, not panic");
+        assert!(matches!(err, super::MemoryError::AddressOverflow));
     }
 
     #[test]
