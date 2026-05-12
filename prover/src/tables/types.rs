@@ -7,7 +7,7 @@
 //! For the 64-bit VM prover, we use the Goldilocks field:
 //! - Prime: p = 2^64 - 2^32 + 1
 //! - Two-adicity: 32 (supports FFT up to 2^32 rows)
-//! - Extension: Degree 3 (cubic extension with w³ = 2, provides 192-bit security)
+//! - Extension: Degree 3 (cubic extension Fp[w]/(w³ - w - 1), provides 192-bit effective field size)
 //!
 //! ## DecodeEntry
 //!
@@ -23,7 +23,7 @@ use math::field::goldilocks::GoldilocksField as GoldilocksBaseField;
 /// Base field type: Goldilocks prime field (p = 2^64 - 2^32 + 1)
 pub type GoldilocksField = GoldilocksBaseField;
 
-/// Extension field type: Degree 3 extension of Goldilocks (w³ = 2)
+/// Extension field type: Degree 3 extension of Goldilocks, Fp[w]/(w³ - w - 1)
 pub type GoldilocksExtension = Degree3GoldilocksExtensionField;
 
 /// Field element in the base Goldilocks field

@@ -264,10 +264,13 @@ impl Fp2E {
 // =====================================================
 // CUBIC EXTENSION (Fp3)
 // =====================================================
-// The cubic extension is constructed using x^3 - 2,
-// where 2 is a cubic non-residue in the Goldilocks field.
-// This means Fp3 = Fp[x] / (x^3 - 2)
-// Elements are represented as a0 + a1*w + a2*w^2 where w^3 = 2
+// The cubic extension is constructed using the trinomial x^3 - x - 1.
+// This is the same irreducible polynomial used by Plonky3 and pil2-stark
+// (ZisK / Polygon Hermez) on Goldilocks; it has minimum Hamming weight among
+// irreducible cubics over Fp.
+// This means Fp3 = Fp[x] / (x^3 - x - 1)
+// Elements are represented as a0 + a1*w + a2*w^2 where w^3 = w + 1
+// (which also gives w^4 = w^2 + w).
 
 /// Degree 3 extension field of Goldilocks
 #[derive(Copy, Clone, Debug)]
@@ -283,54 +286,53 @@ impl IsField for Degree3GoldilocksExtensionField {
     }
 
     /// Multiplication using schoolbook with fused dot products.
-    /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
+    /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - w - 1)
     ///
-    /// Expanding and applying w^3 = 2:
-    ///   c0 = a0*b0 + 2*(a1*b2 + a2*b1)
-    ///   c1 = a0*b1 + a1*b0 + 2*a2*b2
-    ///   c2 = a0*b2 + a1*b1 + a2*b0
+    /// Expanding and applying w^3 = w + 1 (so w^4 = w^2 + w):
+    ///   c0 = a0*b0 +     a1*b2 +       a2*b1
+    ///   c1 = a0*b1 + a1*(b0 + b2) + a2*(b1 + b2)
+    ///   c2 = a0*b2 +     a1*b1 +    a2*(b0 + b2)
     ///
     /// Each component is computed as a single dot_product_3 (9 raw muls,
-    /// 3 reduce128 calls) instead of Karatsuba (6 muls, 6 reduce128 + many
-    /// add/sub). The reduction savings outweigh the extra multiplications.
+    /// 3 reduce128 calls) — same shape and cost as the binomial variant,
+    /// but with two adds instead of two doubles for the precomputes.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
         let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
 
-        // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
-        let b1_2 = GoldilocksField::double(&b1);
-        let b2_2 = GoldilocksField::double(&b2);
+        // Precompute b0+b2 and b1+b2 for the w^3 = w + 1 reduction
+        let b0_plus_b2 = <GoldilocksField as IsField>::add(&b0, &b2);
+        let b1_plus_b2 = <GoldilocksField as IsField>::add(&b1, &b2);
 
-        // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
-        let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
-        // c1 = a0*b1 + a1*b0 + a2*(2*b2)
-        let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
-        // c2 = a0*b2 + a1*b1 + a2*b0
-        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
+        // c0 = a0*b0 + a1*b2 + a2*b1
+        let c0 = dot_product_3(a0, b0, a1, b2, a2, b1);
+        // c1 = a0*b1 + a1*(b0+b2) + a2*(b1+b2)
+        let c1 = dot_product_3(a0, b1, a1, b0_plus_b2, a2, b1_plus_b2);
+        // c2 = a0*b2 + a1*b1 + a2*(b0+b2)
+        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0_plus_b2);
 
         [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
 
     /// Squaring using fused dot products.
-    /// (a0 + a1*w + a2*w^2)^2 mod (w^3 - 2):
-    ///   c0 = a0^2 + 4*a1*a2
-    ///   c1 = 2*a0*a1 + 2*a2^2
-    ///   c2 = 2*a0*a2 + a1^2
+    /// (a0 + a1*w + a2*w^2)^2 mod (w^3 - w - 1):
+    ///   c0 = a0^2          + 2*a1*a2
+    ///   c1 = 2*a0*a1       + 2*a1*a2 + a2^2
+    ///   c2 = 2*a0*a2 + a1^2          + a2^2
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
         let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
 
-        let a0_2 = GoldilocksField::double(&a0);
-        let a2_4 = GoldilocksField::double(&GoldilocksField::double(&a2));
+        let a0_plus_a2 = <GoldilocksField as IsField>::add(&a0, &a2);
+        let a1_plus_a2 = <GoldilocksField as IsField>::add(&a1, &a2);
 
-        // c0 = a0*a0 + a1*(4*a2) — using dot_product_2
-        let c0 = dot_product_2(a0, a0, a1, a2_4);
-        // c1 = (2*a0)*a1 + (2*a2)*a2 — using dot_product_2
-        let a2_2 = GoldilocksField::double(&a2);
-        let c1 = dot_product_2(a0_2, a1, a2_2, a2);
-        // c2 = a1*a1 + (2*a0)*a2 — using dot_product_2
-        let c2 = dot_product_2(a1, a1, a0_2, a2);
+        // c0 = a0*a0 + a1*a2 + a2*a1 = a0^2 + 2*a1*a2
+        let c0 = dot_product_3(a0, a0, a1, a2, a2, a1);
+        // c1 = a0*a1 + a1*(a0+a2) + a2*(a1+a2) = 2*a0*a1 + 2*a1*a2 + a2^2
+        let c1 = dot_product_3(a0, a1, a1, a0_plus_a2, a2, a1_plus_a2);
+        // c2 = a0*a2 + a1*a1 + a2*(a0+a2) = 2*a0*a2 + a1^2 + a2^2
+        let c2 = dot_product_3(a0, a2, a1, a1, a2, a0_plus_a2);
 
         [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
@@ -347,35 +349,62 @@ impl IsField for Degree3GoldilocksExtensionField {
         [-a[0], -a[1], -a[2]]
     }
 
-    /// Returns the multiplicative inverse of `a`
+    /// Returns the multiplicative inverse of `a` in Fp[w] / (w^3 - w - 1).
+    ///
+    /// Derivation: writing the multiplication map M_a : b -> a*b as a 3x3
+    /// matrix (in the {1, w, w^2} basis) and inverting it gives an adjugate
+    /// formula. The norm N(a) = det(M_a) and the cofactors of the first row
+    /// (transposed) give the inverse coordinates.
+    ///
+    ///   N = a0^3 + 2*a0^2*a2 + a0*a2^2 - a0*a1^2 - 3*a0*a1*a2
+    ///       + a1^3 + a2^3 - a1*a2^2
+    ///
+    ///   inv[0] = (a0^2 + 2*a0*a2 + a2^2 - a1^2 - a1*a2) / N
+    ///   inv[1] = (a2^2 - a0*a1)                          / N
+    ///   inv[2] = (a1^2 - a0*a2 - a2^2)                   / N
+    ///
+    /// Verifiable: inv(w) = w^2 - 1, inv(1 + w) = w^2 - w.
     fn inv(a: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a2_sq = a[2].square();
+        let a0 = a[0];
+        let a1 = a[1];
+        let a2 = a[2];
 
-        // Compute the norm: N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let a0_cubed = a0_sq * a[0];
-        let a1_cubed = a1_sq * a[1];
-        let a2_cubed = a2_sq * a[2];
-        let a0a1a2 = a[0] * a[1] * a[2];
+        let a0_sq = a0.square();
+        let a1_sq = a1.square();
+        let a2_sq = a2.square();
 
-        // N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let norm = a0_cubed + a1_cubed.double() + a2_cubed.double().double()
-            - (a0a1a2.double() + a0a1a2).double();
+        let a0_a1 = a0 * a1;
+        let a0_a2 = a0 * a2;
+        let a1_a2 = a1 * a2;
+        let a0_a1_a2 = a0_a1 * a2;
+
+        let a0_cubed = a0_sq * a0;
+        let a1_cubed = a1_sq * a1;
+        let a2_cubed = a2_sq * a2;
+        let a0sq_a2 = a0_sq * a2;
+        let a0_a2sq = a0 * a2_sq;
+        let a0_a1sq = a0 * a1_sq;
+        let a1_a2sq = a1 * a2_sq;
+
+        // 3 * a0_a1_a2 = a0_a1_a2.double() + a0_a1_a2
+        let three_a0_a1_a2 = a0_a1_a2.double() + a0_a1_a2;
+
+        // N = a0^3 + 2*a0^2*a2 + a0*a2^2 - a0*a1^2 - 3*a0*a1*a2
+        //     + a1^3 + a2^3 - a1*a2^2
+        let norm = a0_cubed + a0sq_a2.double() + a0_a2sq - a0_a1sq - three_a0_a1_a2
+            + a1_cubed
+            + a2_cubed
+            - a1_a2sq;
 
         let norm_inv = norm.inv()?;
 
-        // inv[0] = (a0^2 - 2*a1*a2) / N
-        // inv[1] = (2*a2^2 - a0*a1) / N
-        // inv[2] = (a1^2 - a0*a2) / N
-        let a1a2 = a[1] * a[2];
-        let a0a1 = a[0] * a[1];
-        let a0a2 = a[0] * a[2];
-
+        // inv[0] = (a0^2 + 2*a0*a2 + a2^2 - a1^2 - a1*a2) / N
+        // inv[1] = (a2^2 - a0*a1) / N
+        // inv[2] = (a1^2 - a0*a2 - a2^2) / N
         Ok([
-            (a0_sq - a1a2.double()) * norm_inv,
-            (a2_sq.double() - a0a1) * norm_inv,
-            (a1_sq - a0a2) * norm_inv,
+            (a0_sq + a0_a2.double() + a2_sq - a1_sq - a1_a2) * norm_inv,
+            (a2_sq - a0_a1) * norm_inv,
+            (a1_sq - a0_a2 - a2_sq) * norm_inv,
         ])
     }
 

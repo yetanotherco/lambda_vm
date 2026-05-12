@@ -63,7 +63,7 @@ impl ProofOptions {
 /// Proof options builder for Goldilocks **cubic** extension field (degree 3).
 ///
 /// Goldilocks base field: 64 bits (p = 2^64 - 2^32 + 1)
-/// Cubic extension: degree 3 (w^3 = 2), giving 192-bit effective field size.
+/// Cubic extension: degree 3, Fp[w]/(w^3 - w - 1), giving 192-bit effective field size.
 ///
 /// Computes FRI query count using the Johnson Bound Regime (JBR):
 ///   proximity = 1 - sqrt(1/blowup) - 1/300
