@@ -79,6 +79,50 @@ Then, you can check that the executor works by running:
 make test-executor
 ```
 
+### Using the CLI
+
+The `cli` binary lets you execute, prove, and verify RISC-V ELF programs. Build it once with:
+
+```sh
+cargo build --release -p cli
+```
+
+The binary will be available at `target/release/cli`.
+
+To get a sample program to work with, compile the bundled assembly tests:
+
+```sh
+make compile-programs-asm
+```
+
+This emits ELF files under `executor/program_artifacts/asm/`. With those in place, you can run the three core commands:
+
+#### Execute
+
+Run a program without generating a proof. Useful for sanity checks and debugging:
+
+```sh
+./target/release/cli execute executor/program_artifacts/asm/add.elf
+```
+
+#### Prove
+
+Generate a STARK proof of the execution:
+
+```sh
+./target/release/cli prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
+```
+
+#### Verify
+
+Verify a proof against the ELF it was generated from. The command exits `0` on success and `1` on failure:
+
+```sh
+./target/release/cli verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
+```
+
+For the full CLI reference — including private inputs, blowup factor tuning, timing, and flamegraph profiling — see [`bin/cli/README.md`](./bin/cli/README.md).
+
 ## Design choices
 
 - The Instruction Set Architecture is RISCV64IM
@@ -98,7 +142,18 @@ Following [ethrex](https://github.com/lambdaclass/ethrex):
 
 ## Documentation
 
-Full documentation can be found in [docs](./docs/). It is currently a work in progress, we expect that as more features and components become ready, they will be included in the docs.
+High-level documentation lives in [`docs/`](./docs/):
+
+- [Overview of VM flow](./docs/general_flow.md) — the pipeline from source code to proof
+- [Proof system overview](./docs/cryptography/proof_system.md) — design goals and primitives
+- [Lookup arguments](./docs/cryptography/lookup.md) — how tables are linked
+- [Recommended reading](./docs/other_resources.md) — papers and tutorials
+
+### Specification
+
+A formal specification of the VM is written in [Typst](https://typst.app/) under [`spec/`](./spec/) and rendered as a browsable wiki (HTML) or PDF using [`shiroa`](https://myriad-dreamin.github.io/shiroa/). With both tools installed, run `shiroa serve` from `spec/` to host the wiki locally.
+
+See [`spec/README.md`](./spec/README.md) for full setup instructions.
 
 ## Testing
 
@@ -128,8 +183,8 @@ To run all tests across the project use
 
 ### ASM Tests
 
-In order to add a new asm test you should add the `.s` file under `programs/asm`
-Then add the corresponding test under `tests/asm.rs`
+In order to add a new asm test you should add the `.s` file under `executor/programs/asm`
+Then add the corresponding test under `executor/tests/asm.rs`
 
 To run them you can use
 
@@ -139,9 +194,9 @@ This will compile them and run the tests
 
 ### Rust Tests
 
-In order to add a new rust test you should add the cargo project under `programs/rust` as a new directory.
+In order to add a new rust test you should add the cargo project under `executor/programs/rust` as a new directory.
 The folder should have the same name as the `Cargo.toml` program name.
-Then add the corresponding test under `tests/rust.rs`
+Then add the corresponding test under `executor/tests/rust.rs`
 
 You can run it with
 
