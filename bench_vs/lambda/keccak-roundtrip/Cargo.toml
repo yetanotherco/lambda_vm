@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "keccak-roundtrip-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha3 = { version = "0.10", default-features = false }
+
+# Route Keccak-f[1600] through the lambda-vm precompile syscall on the
+# riscv64 guest. On host this patch is irrelevant — the host build comes
+# from the main workspace which uses the upstream `keccak` crate.
+[patch.crates-io]
+keccak = { path = "../keccak-patched" }

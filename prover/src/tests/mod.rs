@@ -17,6 +17,8 @@ pub mod decode_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod keccak_precompile_test;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;

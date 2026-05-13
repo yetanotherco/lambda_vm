@@ -34,5 +34,6 @@ build_one() {
 build_one empty
 build_one fibonacci
 build_one recursion
+build_one keccak-roundtrip
 
 echo "[recursion-elfs] done"
