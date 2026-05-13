@@ -193,9 +193,10 @@ impl Memory {
 
     pub fn load_bytes(&self, mut addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         let end = addr.checked_add(len).ok_or(MemoryError::AddressOverflow)?;
+        let len_usize = usize::try_from(len).map_err(|_| MemoryError::AllocationFailed)?;
         let mut result = Vec::new();
         result
-            .try_reserve_exact(len as usize)
+            .try_reserve_exact(len_usize)
             .map_err(|_| MemoryError::AllocationFailed)?;
         while addr < end {
             let aligned = addr - (addr % 4);
