@@ -38,19 +38,23 @@ fn read_guest_elf(root: &std::path::Path, name: &str, bin_name: &str) -> Vec<u8>
     std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
-/// Core pipeline: prove an inner program, hand the proof+ELF to the recursion
-/// guest, then prove and verify the outer proof.
-///
-/// Uses `blowup=8` for the inner proof to keep the outer prove memory tractable.
-fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_input: &[u8]) {
+/// Core pipeline: prove an inner program with the given options, hand the
+/// proof+ELF+options to the recursion guest, then prove and verify the outer
+/// proof.
+fn run_recursion_pipeline_with_options(
+    label: &str,
+    inner_elf_bytes: &[u8],
+    inner_private_input: &[u8],
+    inner_proof_options: stark::proof::options::ProofOptions,
+) {
     let root = workspace_root();
     build_elfs(&root);
     let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
 
-    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8)
-        .expect("blowup=8 is always valid");
-
-    eprintln!("[{label}] proving inner (blowup=8) ...");
+    eprintln!(
+        "[{label}] proving inner (blowup={}, fri_queries={}) ...",
+        inner_proof_options.blowup_factor, inner_proof_options.fri_number_of_queries
+    );
     let inner_proof = crate::prove_with_options_and_inputs(
         inner_elf_bytes,
         inner_private_input,
@@ -66,7 +70,7 @@ fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_inp
         "inner proof must verify on host"
     );
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf_bytes))
+    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf_bytes, &inner_proof_options))
         .expect("postcard encode failed");
     eprintln!(
         "[{label}] postcard blob: {} bytes (limit: MAX_PRIVATE_INPUT_SIZE)",
@@ -78,8 +82,8 @@ fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_inp
     );
 
     eprintln!("[{label}] proving outer (recursion guest) ...");
-    let outer_proof = crate::prove_with_inputs(&recursion_elf_bytes, &blob)
-        .expect("outer prove should succeed");
+    let outer_proof =
+        crate::prove_with_inputs(&recursion_elf_bytes, &blob).expect("outer prove should succeed");
     eprintln!("[{label}] outer proof generated");
 
     assert!(
@@ -94,6 +98,19 @@ fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_inp
     );
 }
 
+/// Convenience wrapper using `blowup=8` for the inner proof — the default for
+/// the existing smoke tests, chosen to keep outer-prove memory tractable.
+fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_input: &[u8]) {
+    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8)
+        .expect("blowup=8 is always valid");
+    run_recursion_pipeline_with_options(
+        label,
+        inner_elf_bytes,
+        inner_private_input,
+        inner_proof_options,
+    );
+}
+
 /// Inner program: empty (halt immediately). Useful for measuring the
 /// lambda-vm verifier's intrinsic recursion overhead — i.e. what it costs
 /// to verify the smallest possible lambda-vm proof, with no inner workload.
@@ -104,6 +121,35 @@ fn test_recursion_smoke_empty() {
     build_elfs(&root);
     let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
     run_recursion_pipeline("recursion-empty", &empty_elf_bytes, &[]);
+}
+
+/// Inner program: empty, but with the absolute-minimum FRI parameters
+/// (blowup=2, **fri_number_of_queries=1**). This is a "can the pipeline even
+/// run end-to-end on a 125 GB box" experiment — security is intentionally
+/// terrible. Use only for capacity probing.
+#[test]
+#[ignore = "slow: runs the full STARK verifier inside the VM"]
+fn test_recursion_smoke_1query() {
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+
+    // Construct ProofOptions directly so we can pin fri_number_of_queries = 1.
+    // (GoldilocksCubicProofOptions::with_blowup derives queries from a 128-bit
+    // security target — way more than we want here.)
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    run_recursion_pipeline_with_options(
+        "recursion-1query",
+        &empty_elf_bytes,
+        &[],
+        inner_proof_options,
+    );
 }
 
 /// Inner program: fibonacci(10).

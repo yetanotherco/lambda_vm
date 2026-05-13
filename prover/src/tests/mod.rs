@@ -38,6 +38,7 @@ pub mod ecdas_tests;
 pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
+pub mod keccak_precompile_test;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]

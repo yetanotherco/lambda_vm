@@ -8,7 +8,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 use embedded_alloc::TlsfHeap as Heap;
-use lambda_vm_prover::VmProof;
+use lambda_vm_prover::{ProofOptions, VmProof};
 // Required to pull in the riscv crate's critical-section implementation.
 use riscv as _;
 
@@ -67,21 +67,19 @@ fn halt() -> ! {
 }
 
 /// Private input layout (postcard-encoded):
-///   (VmProof, Vec<u8>)
-/// where the `Vec<u8>` holds the inner program's ELF bytes.
+///   (VmProof, Vec<u8>, ProofOptions)
+/// where the `Vec<u8>` holds the inner program's ELF bytes and the
+/// `ProofOptions` specifies the parameters the inner prover used. Bundling
+/// the options keeps the guest agnostic to whichever blowup/query count the
+/// host picked for a given run.
 #[unsafe(no_mangle)]
 pub fn main() -> ! {
     init_allocator();
 
     let blob = read_private_input();
-    let (vm_proof, inner_elf): (VmProof, Vec<u8>) =
+    let (vm_proof, inner_elf, options): (VmProof, Vec<u8>, ProofOptions) =
         postcard::from_bytes(blob).expect("failed to deserialize recursion input");
 
-    // Must match the inner prover's blowup_factor (see recursion_smoke_test.rs).
-    // The smoke test proves the inner program with blowup=8 to keep the outer
-    // prove tractable; the verifier inside the guest must use the same options.
-    let options =
-        lambda_vm_prover::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is valid");
     let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options)
         .expect("verify errored");
     assert!(ok, "inner proof failed verification");
