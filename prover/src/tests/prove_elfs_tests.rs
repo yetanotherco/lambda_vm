@@ -724,7 +724,7 @@ fn test_prove_elfs_keccak() {
     let (elf, logs, _instructions) = run_asm_elf("test_keccak");
     // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
     // RAM (stack memory), which requires PAGE tables for Memory bus balance.
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
+    let mut traces = traces_from_elf_and_logs_ram(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -760,7 +760,7 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+        traces_from_elf_and_logs_ram(&elf, &result.logs, &Default::default(), &[]).unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -793,7 +793,7 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+        traces_from_elf_and_logs_ram(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
     // value outside [0, 256). The new IS_BYTE bus sender will emit this

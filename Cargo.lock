@@ -1956,6 +1956,7 @@ dependencies = [
  "sysinfo",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
+ "tiny-keccak",
 ]
 
 [[package]]
