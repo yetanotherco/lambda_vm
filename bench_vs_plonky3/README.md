@@ -74,7 +74,7 @@ Stdout (without `--report-dir`):
   log-rows:       19
   num-sequences:  16  (columns = 32)
   runs/size:      3  (median reported)
-  p3 extension:   degree 3 (forked p3-goldilocks, matches Lambda)
+  p3 extension:   degree 3 trinomial x^3-x-1 (upstream Plonky3)
   scalar mode:    on  (arch=x86_64, RUSTFLAGS="-C target-feature=-avx2,-avx512f")
 
 [build] prove_bench
@@ -158,9 +158,11 @@ pollute the historical wall-clock numbers.
 
 ## Notes on fairness
 
-- **Extension field**: Plonky3 runs `BinomialExtensionField<Goldilocks, 3>`
-  with the same `x^3 - 2` irreducible as Lambda's
-  `Degree3GoldilocksExtensionField`. Both sides use the same cubic extension.
+- **Extension field**: Lambda uses `Degree3GoldilocksExtensionField` with
+  irreducible `x^3 - 2` (binomial); Plonky3 upstream uses
+  `CubicTrinomialExtensionField` with `x^3 - x - 1` (trinomial). Same
+  degree, same conjectured soundness; Fp3 multiplication differs by a
+  few extra additions on the trinomial side.
 - **Parallelism**: both provers are multi-threaded by default. Lambda pulls
   rayon via `stark/parallel`; Plonky3 pulls rayon via
   `p3-uni-stark` / `p3-dft` (hardcoded `features = ["parallel"]`, always on).

@@ -1,7 +1,7 @@
 use p3_challenger::{HashChallenger, SerializingChallenger64};
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
+use p3_field::extension::CubicTrinomialExtensionField;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_goldilocks::Goldilocks;
 use p3_keccak::{Keccak256Hash, KeccakF};
@@ -10,11 +10,7 @@ use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, Serializing
 use p3_uni_stark::StarkConfig;
 
 pub type Val = Goldilocks;
-
-/// Cubic extension matching Lambda's `Degree3GoldilocksExtensionField`
-/// (irreducible x^3 - 2). Provided by the forked `p3-goldilocks` via
-/// `BinomiallyExtendable<3>`.
-pub type Challenge = BinomialExtensionField<Val, 3>;
+pub type Challenge = CubicTrinomialExtensionField<Val>;
 
 type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;

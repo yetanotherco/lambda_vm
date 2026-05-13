@@ -155,7 +155,7 @@ echo -e "${BOLD}=== STARK prove benchmark: Lambda vs Plonky3 ===${NC}"
 echo -e "  log-rows:       ${YELLOW}${LOG_ROWS[*]}${NC}"
 echo -e "  num-sequences:  ${YELLOW}${NUM_SEQUENCES}${NC}  (columns = $((2 * NUM_SEQUENCES)))"
 echo -e "  runs/size:      ${YELLOW}${RUNS}${NC}  (median + CV reported)"
-echo -e "  p3 extension:   ${YELLOW}degree 3 (forked p3-goldilocks, matches Lambda)${NC}"
+echo -e "  p3 extension:   ${YELLOW}degree 3 trinomial x^3-x-1 (upstream Plonky3)${NC}"
 echo -e "  proof params:   ${YELLOW}blowup=${BLOWUP}, queries=${FRI_QUERIES}, grinding=${GRINDING}${NC}"
 if $BREAKDOWN; then
     echo -e "  breakdown:      ${YELLOW}on${NC}  (Lambda instruments + P3 tracing spans)"
@@ -588,7 +588,7 @@ if [ -n "$REPORT_DIR" ]; then
         else
             echo "breakdown=off"
         fi
-        echo "p3_extension=degree3_fork"
+        echo "p3_extension=degree3_trinomial_upstream"
         if $SCALAR_ACTIVE; then
             echo "scalar=on"
             echo "rustflags=$SCALAR_RUSTFLAGS"
