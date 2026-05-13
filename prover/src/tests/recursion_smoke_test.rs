@@ -188,20 +188,36 @@ fn test_recursion_cycle_count() {
     )
     .expect("inner prove should succeed");
 
-    let blob =
-        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-            .expect("postcard encode failed");
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
     eprintln!("[cycle-count] postcard blob: {} bytes", blob.len());
 
-    // Execute (NOT prove) the recursion guest. Cheap — finishes in seconds.
-    eprintln!("[cycle-count] executing recursion guest ...");
+    // Execute (NOT prove) the recursion guest. Use `resume()` in a loop and
+    // only count chunk sizes — never accumulate logs in memory. This avoids
+    // the Vec<Log> blow-up that OOMs even a 125 GB server (one Log is 40 B;
+    // a few billion of them is hundreds of GB).
+    eprintln!("[cycle-count] executing recursion guest (streaming counter only) ...");
     let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
-    let executor = Executor::new(&program, blob).expect("Executor::new failed");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
     let start = std::time::Instant::now();
-    let result = executor.run().expect("executor run failed");
+    let mut cycle_count: usize = 0;
+    let mut chunks: usize = 0;
+    loop {
+        match executor.resume().expect("executor resume failed") {
+            Some(logs) => {
+                cycle_count += logs.len();
+                chunks += 1;
+                if chunks.is_multiple_of(50) {
+                    eprintln!(
+                        "[cycle-count]   ... {chunks} chunks, {cycle_count} cycles, {:?} elapsed",
+                        start.elapsed()
+                    );
+                }
+            }
+            None => break,
+        }
+    }
     let exec_time = start.elapsed();
-
-    let cycle_count = result.logs.len();
 
     eprintln!();
     eprintln!("============================================================");
@@ -228,6 +244,113 @@ fn test_recursion_cycle_count() {
         lde_main_bytes as f64 / 1e9
     );
     eprintln!("  (aux trace adds roughly 50% more, so peak peak ≈ 2-3× LDE)");
+    eprintln!("============================================================");
+}
+
+/// Diagnostic: build a PC histogram of the recursion guest's execution.
+///
+/// Streams chunks of logs via `Executor::resume()` so the in-memory state
+/// stays bounded to the histogram itself (~MB for ~hundreds of thousands of
+/// unique PCs). Prints the top 100 PCs by cycle count, plus cumulative %.
+/// Pipe the output through `addr2line` to map PCs to source functions.
+#[test]
+#[ignore = "diagnostic: ~8 minutes; prints PC histogram of the verifier-in-VM"]
+fn test_recursion_pc_histogram() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[pc-hist] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
+    eprintln!("[pc-hist] postcard blob: {} bytes", blob.len());
+
+    eprintln!("[pc-hist] executing recursion guest (building PC histogram) ...");
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+
+    let start = std::time::Instant::now();
+    let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(300_000);
+    let mut total_cycles: u64 = 0;
+    let mut chunks: usize = 0;
+    loop {
+        match executor.resume().expect("executor resume failed") {
+            Some(logs) => {
+                for log in logs {
+                    *pc_hist.entry(log.current_pc).or_insert(0) += 1;
+                }
+                total_cycles += logs.len() as u64;
+                chunks += 1;
+                if chunks.is_multiple_of(500) {
+                    eprintln!(
+                        "[pc-hist]   ... {chunks} chunks, {total_cycles} cycles, {} unique PCs, {:?}",
+                        pc_hist.len(),
+                        start.elapsed()
+                    );
+                }
+            }
+            None => break,
+        }
+    }
+    let exec_time = start.elapsed();
+
+    let mut entries: Vec<(u64, u64)> = pc_hist.into_iter().collect();
+    entries.sort_unstable_by_key(|(_pc, count)| std::cmp::Reverse(*count));
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  RECURSION GUEST PC HISTOGRAM");
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Unique PCs   : {}", entries.len());
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Top 100 PCs by cycle count:");
+    eprintln!(
+        "  {:>4}  {:>18}  {:>14}  {:>7}  {:>7}",
+        "rank", "pc", "cycles", "%", "cum %"
+    );
+    let mut cumulative: u64 = 0;
+    for (rank, (pc, count)) in entries.iter().take(100).enumerate() {
+        cumulative += count;
+        let pct = 100.0 * (*count as f64) / (total_cycles as f64);
+        let cum_pct = 100.0 * (cumulative as f64) / (total_cycles as f64);
+        eprintln!(
+            "  {:>4}  {:#018x}  {:>14}  {:>6.2}%  {:>6.2}%",
+            rank + 1,
+            pc,
+            count,
+            pct,
+            cum_pct
+        );
+    }
+    eprintln!("============================================================");
+    eprintln!();
+    eprintln!("  To map PCs to source functions, on the same machine that has");
+    eprintln!("  the recursion ELF (and ideally a debug build for line info):");
+    eprintln!("    addr2line -e <recursion-bench-elf> -f -i -C 0x<pc>");
+    eprintln!("  Or for symbol-range lookup without DWARF:");
+    eprintln!("    nm --print-size <recursion-bench-elf> | rustfilt | sort");
     eprintln!("============================================================");
 }
 
