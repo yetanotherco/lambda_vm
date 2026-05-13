@@ -1,6 +1,6 @@
 //! Adversarial edge-case parity tests for `ext3::mul` on the GPU.
 //!
-//! The CUDA `dot3` (kernels/ext3.cuh:62-98) manually tracks overflow when
+//! The CUDA `dot3` in kernels/ext3.cuh manually tracks overflow when
 //! summing three u128 products in split u64 hi/lo registers. The CPU
 //! reference (`crypto/math/src/field/goldilocks.rs::dot_product_3` via
 //! `Degree3GoldilocksExtensionField::mul`) uses native u128 and so reaches

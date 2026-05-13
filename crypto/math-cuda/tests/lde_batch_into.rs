@@ -1,4 +1,4 @@
-//! Direct parity test for `coset_lde_batch_base_into` (lde.rs:331), the
+//! Direct parity test for `coset_lde_batch_base_into` (lde.rs), the
 //! caller-allocated-buffer variant of `coset_lde_batch_base`. The two should
 //! produce bit-identical canonical output for the same inputs; the only
 //! difference between them is who owns the output Vec.
@@ -27,7 +27,7 @@ fn coset_weights(n: usize, g: u64) -> Vec<u64> {
 }
 
 fn canon(xs: &[u64]) -> Vec<u64> {
-    xs.iter().map(|x| GoldilocksField::canonical(x)).collect()
+    xs.iter().map(GoldilocksField::canonical).collect()
 }
 
 fn run_pair(log_n: u64, blowup: usize, m: usize, seed: u64) {

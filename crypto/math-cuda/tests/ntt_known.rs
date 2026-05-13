@@ -17,7 +17,7 @@ fn canon(x: u64) -> u64 {
 
 /// p(x) = 1 + x. NTT at size N is the vector [p(omega^0), p(omega^1), ...,
 /// p(omega^(N-1))] for `omega` a primitive N-th root of unity. We compute
-/// the reference by direct exponentiation of `omega` — no FFT involved —
+/// the reference by direct exponentiation of `omega` (no FFT involved)
 /// so a bug in either the CPU or GPU NTT can't hide here.
 #[test]
 fn ntt_known_polynomial_x_plus_one_size_256() {
@@ -25,14 +25,14 @@ fn ntt_known_polynomial_x_plus_one_size_256() {
     let n: usize = 1 << log_n;
 
     // GoldilocksField uses bit-reversed coefficient layout for forward NTT:
-    // input coeffs at index `i` become `p(omega^bitrev(i))` — confirm by
+    // input coeffs at index `i` become `p(omega^bitrev(i))`. Confirm by
     // matching against the existing forward() API which random-input tests
     // already validate against `Polynomial::evaluate_fft`. The known-poly
     // value lets us catch systematic errors in that pipeline that random
     // inputs miss.
 
     // Input coefficients: [1, 1, 0, 0, ..., 0]. (Natural order, lowest
-    // degree first — `Polynomial::new` and `math_cuda::ntt::forward` both
+    // degree first. `Polynomial::new` and `math_cuda::ntt::forward` both
     // expect this convention.)
     let mut input = vec![0u64; n];
     input[0] = 1;
@@ -47,16 +47,16 @@ fn ntt_known_polynomial_x_plus_one_size_256() {
     let one = Fp::from_raw(1);
 
     let mut expected = Vec::with_capacity(n);
-    let mut omega_i = one.clone(); // omega^0
+    let mut omega_i = one; // omega^0
     for _ in 0..n {
         let val = &one + &omega_i;
         expected.push(*val.value());
         omega_i = &omega_i * &omega;
     }
 
-    for i in 0..n {
-        let g = canon(gpu[i]);
-        let e = canon(expected[i]);
+    for (i, (&g_raw, &e_raw)) in gpu.iter().zip(expected.iter()).enumerate() {
+        let g = canon(g_raw);
+        let e = canon(e_raw);
         if g != e {
             panic!(
                 "p(omega^{i}) mismatch: gpu canon {:#018x}, expected canon {:#018x} (omega^{i} computed independently of any FFT)",
@@ -83,11 +83,11 @@ fn ntt_known_polynomial_x_plus_one_size_16() {
 
     let omega = GoldilocksField::get_primitive_root_of_unity(log_n).expect("root");
     let one = Fp::from_raw(1);
-    let mut omega_i = one.clone();
-    for i in 0..n {
+    let mut omega_i = one;
+    for (i, &g) in gpu.iter().enumerate() {
         let exp = &one + &omega_i;
         assert_eq!(
-            canon(gpu[i]),
+            canon(g),
             canon(*exp.value()),
             "p(omega^{i}) mismatch at size 16"
         );
@@ -113,13 +113,13 @@ fn ntt_known_polynomial_x_half_alternating() {
     // Expected: omega^(k*i) for i = 0..N, which is (omega^k)^i = (-1)^i.
     // canonical(+1) = 1; canonical(-1) = p - 1.
     let p_minus_one = 0xFFFF_FFFF_0000_0001u64 - 1;
-    for i in 0..n {
+    for (i, &g) in gpu.iter().enumerate() {
         let exp = if i % 2 == 0 { 1u64 } else { p_minus_one };
         assert_eq!(
-            canon(gpu[i]),
+            canon(g),
             exp,
             "x^(N/2) NTT alternation mismatch at i={i}: got {:#018x}",
-            canon(gpu[i])
+            canon(g)
         );
     }
 }

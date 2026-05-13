@@ -4,7 +4,7 @@
 //! Input  : N evaluations (natural order) of a poly on the standard subgroup,
 //!          plus coset weights (size N). The weights include the `1/N` iFFT
 //!          normalisation, matching the `LdeTwiddles::coset_weights` format at
-//!          `crypto/stark/src/prover.rs:248` — i.e. `weights[i] = g^i / N`.
+//!          `crypto/stark/src/prover.rs` — i.e. `weights[i] = g^i / N`.
 //! Output : N*blowup_factor evaluations (natural order) on the coset.
 //!
 //! On-device steps, picks a stream from the shared pool so rayon-parallel
@@ -13,10 +13,23 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use rayon::prelude::*;
 
 use crate::Result;
 use crate::device::backend;
 use crate::ntt::run_ntt_body;
+
+/// Goldilocks `TWO_ADICITY = 32` puts the theoretical domain ceiling at
+/// `2^32`, where a downstream `as u32` cast would silently truncate to zero
+/// and the corresponding kernel launch would do nothing. Assert at each
+/// public entry point before any cast that depends on it.
+#[inline]
+fn assert_u32_domain(n: usize, what: &str) {
+    assert!(
+        n <= u32::MAX as usize,
+        "{what}: {n} exceeds u32 range — kernel grid would silently truncate",
+    );
+}
 
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
@@ -40,20 +53,23 @@ pub struct GpuLdeExt3 {
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
     let n = evals.len();
+    // Empty input must short-circuit before the power-of-two assert
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     assert!(n.is_power_of_two(), "evals length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match evals");
     assert!(
         blowup_factor.is_power_of_two(),
         "blowup must be power of two"
     );
-    if n == 0 {
-        return Ok(Vec::new());
-    }
     let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_base lde_size");
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     // Device buffer of lde_size, zero-padded tail, first N filled by copy.
@@ -127,6 +143,11 @@ pub fn coset_lde_batch_base(
     }
     let m = columns.len();
     let n = columns[0].len();
+    // Empty columns must short-circuit before the power-of-two assert
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(vec![Vec::new(); m]);
+    }
     assert!(n.is_power_of_two(), "column length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match column length");
     assert!(
@@ -136,32 +157,14 @@ pub fn coset_lde_batch_base(
     for c in columns.iter() {
         assert_eq!(c.len(), n, "all columns must be the same size");
     }
-
-    if n == 0 {
-        return Ok(vec![Vec::new(); m]);
-    }
     let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_batch_base lde_size");
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
-
-    let debug_phases = std::env::var("MATH_CUDA_PHASE_TIMING").is_ok();
-    let t_start = if debug_phases {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let phase = |label: &str, prev: &mut Option<std::time::Instant>| {
-        if let Some(p) = prev.as_ref() {
-            let now = std::time::Instant::now();
-            eprintln!("  [{:>6.2} ms] {}", (now - *p).as_secs_f64() * 1e3, label);
-            *prev = Some(now);
-        }
-    };
-    let mut last = t_start;
 
     // Pinned staging. Lock and grow to max(m*n for upload, m*lde_size for
     // download). Holding the guard across the whole call serialises concurrent
@@ -171,14 +174,10 @@ pub fn coset_lde_batch_base(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     // SAFETY: staging is locked, the slice alias ends before we unlock.
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
-    if debug_phases {
-        phase("staging lock + grow", &mut last);
-    }
 
     // Pack columns into first m*n slots of the pinned buffer. Parallel: pinned
-    // writes are DRAM-bandwidth bound, saturates at ~8 cores on modern
-    // hardware, so rayon shaves 20+ ms at prover scale.
-    use rayon::prelude::*;
+    // writes are DRAM-bandwidth bound, so rayon spreads the cost across CPU
+    // cores.
     let pinned_base_ptr = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         // SAFETY: each task writes to a disjoint `[c*n..c*n+n]` region of
@@ -188,35 +187,20 @@ pub fn coset_lde_batch_base(
             unsafe { std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n) };
         dst.copy_from_slice(col);
     });
-    if debug_phases {
-        phase("host pack (pinned, rayon)", &mut last);
-    }
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
     // tail of each column is already the zero-pad the CPU path does.
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    if debug_phases {
-        stream.synchronize()?;
-        phase("alloc_zeros", &mut last);
-    }
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
-    if debug_phases {
-        stream.synchronize()?;
-        phase("H2D cols (pinned)", &mut last);
-    }
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
-    if debug_phases {
-        stream.synchronize()?;
-        phase("twiddles + weights", &mut last);
-    }
 
     let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
@@ -242,10 +226,6 @@ pub fn coset_lde_batch_base(
         }
     }
 
-    if debug_phases {
-        stream.synchronize()?;
-        phase("bit_reverse N", &mut last);
-    }
     // === 2. iNTT body over all columns ===
     run_batched_ntt_body(
         stream.as_ref(),
@@ -256,10 +236,6 @@ pub fn coset_lde_batch_base(
         col_stride_u64,
         m_u32,
     )?;
-    if debug_phases {
-        stream.synchronize()?;
-        phase("iNTT body", &mut last);
-    }
 
     // === 3. Pointwise multiply by coset weights (includes 1/N) ===
     {
@@ -299,10 +275,6 @@ pub fn coset_lde_batch_base(
         }
     }
 
-    if debug_phases {
-        stream.synchronize()?;
-        phase("pointwise + bit_reverse LDE", &mut last);
-    }
     // === 5. Forward NTT on full LDE of every column ===
     run_batched_ntt_body(
         stream.as_ref(),
@@ -313,29 +285,22 @@ pub fn coset_lde_batch_base(
         col_stride_u64,
         m_u32,
     )?;
-    if debug_phases {
-        stream.synchronize()?;
-        phase("forward NTT body", &mut last);
-    }
 
     // Single big D2H into the reusable pinned staging buffer — pinned, one
     // call to the driver, saturates PCIe.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
-    if debug_phases {
-        phase("D2H (one shot into pinned)", &mut last);
-    }
 
     // Split pinned → per-column Vec<u64>s. The first write to each virgin
-    // Vec page-faults, which can dominate total time (~75 ms for 128 MB).
-    // Parallelise so the fault cost spreads across CPU cores.
+    // Vec page-faults, which can dominate total time. Parallelise so the
+    // fault cost spreads across CPU cores.
     let pinned_ptr = pinned.as_ptr() as usize;
     let out: Vec<Vec<u64>> = (0..m)
         .into_par_iter()
         .map(|c| {
-            // set_len skips the O(N) zero-init that vec![0; n] would do
-            // (saves ~75 ms per 128 MB at prover scale). copy_from_slice
-            // below writes every slot before any reader sees the Vec.
+            // set_len skips the O(N) zero-init that vec![0; n] would do.
+            // copy_from_slice below writes every slot before any reader
+            // sees the Vec.
             #[allow(clippy::uninit_vec)]
             let mut v = {
                 let mut v = Vec::<u64>::with_capacity(lde_size);
@@ -349,18 +314,15 @@ pub fn coset_lde_batch_base(
             v
         })
         .collect();
-    if debug_phases {
-        phase("copy out (rayon pinned → Vecs)", &mut last);
-    }
     drop(staging);
     Ok(out)
 }
 
 /// Like `coset_lde_batch_base` but writes directly into caller-provided
 /// output slices instead of allocating fresh `Vec<u64>`s. Each output slice
-/// must already have length `n * blowup_factor`. Saves ~50–100 ms of pageable
-/// allocator work + page faults at prover scale because the caller's Vecs
-/// have been sized once and are reused across calls.
+/// must already have length `n * blowup_factor`. Avoids pageable allocator
+/// work and page faults at prover scale because the caller's Vecs have been
+/// sized once and are reused across calls.
 pub fn coset_lde_batch_base_into(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -373,6 +335,11 @@ pub fn coset_lde_batch_base_into(
     let m = columns.len();
     assert_eq!(outputs.len(), m, "outputs must match columns count");
     let n = columns[0].len();
+    // Empty columns must short-circuit before the power-of-two assert
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(());
+    }
     assert!(n.is_power_of_two(), "column length must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match column length");
     assert!(
@@ -386,13 +353,11 @@ pub fn coset_lde_batch_base_into(
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size, "each output must be lde_size");
     }
-    if n == 0 {
-        return Ok(());
-    }
+    assert_u32_domain(lde_size, "coset_lde_batch_base_into lde_size");
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -496,7 +461,6 @@ pub fn coset_lde_batch_base_into(
     // Parallel copy pinned → caller outputs. Caller's Vecs may still fault
     // on first write; we spread that cost across rayon cores.
     #[allow(unused_imports)]
-    use rayon::prelude::*;
     let pinned_ptr = pinned.as_ptr() as usize;
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let src = unsafe {
@@ -558,6 +522,11 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     }
     let m = coefs.len();
     assert_eq!(outputs.len(), m);
+    // Empty domain must short-circuit before the power-of-two assert
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(None);
+    }
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
@@ -568,13 +537,11 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
-    if n == 0 {
-        return Ok(None);
-    }
+    assert_u32_domain(lde_size, "evaluate_poly_coset_batch_ext3_into lde_size");
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -582,7 +549,6 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     coefs.par_iter().enumerate().for_each(|(c, col)| {
         let slab_a = unsafe {
@@ -736,6 +702,11 @@ pub fn coset_lde_batch_ext3_into(
     }
     let m = columns.len();
     assert_eq!(outputs.len(), m, "outputs must match columns count");
+    // Empty domain must short-circuit before the power-of-two assert
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(());
+    }
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
     assert!(
@@ -749,16 +720,14 @@ pub fn coset_lde_batch_ext3_into(
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
     }
-    if n == 0 {
-        return Ok(());
-    }
+    assert_u32_domain(lde_size, "coset_lde_batch_ext3_into lde_size");
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
     // 3 base slabs per ext3 column; slab index `c*3 + k` holds component `k`.
     let mb = 3 * m;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -769,7 +738,6 @@ pub fn coset_lde_batch_ext3_into(
     // Pack: for each ext3 column, write 3 base slabs into pinned. The slab
     // for column c, component k lives at `pinned[(c*3 + k)*n .. (c*3+k)*n + n]`.
     // We de-interleave from the interleaved `[a, b, c, a, b, c, ...]` input.
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         // SAFETY: disjoint regions per c; staging lock held.
@@ -925,7 +893,7 @@ fn run_batched_ntt_body(
     col_stride: u64,
     m: u32,
 ) -> Result<()> {
-    let be = backend();
+    let be = backend()?;
     let fused = core::cmp::min(log_n, 8);
     if fused >= 8 {
         let grid_x = (n / 256) as u32;

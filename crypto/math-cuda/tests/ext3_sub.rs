@@ -1,4 +1,4 @@
-//! Parity test for `ext3::sub` (kernels/ext3.cuh:41-45). This device
+//! Parity test for `ext3::sub` in kernels/ext3.cuh. This device
 //! function is part of the public ext3 header but is not invoked by any
 //! kernel in the PR — every other ext3 caller uses `mul`, `add`, or
 //! `mul_base`. The PR's review test infrastructure adds an
@@ -78,7 +78,7 @@ fn ext3_sub_edge_cases() {
         ([0, 0, 0], [P - 1, P - 1, P - 1]),
         ([1, 2, 3], [P - 1, P - 1, P - 1]),
         ([P - 1, P - 1, P - 1], [0, 0, 0]),
-        ([P, P, P], [P, P, P]),            // (0,0,0) - (0,0,0)
+        ([P, P, P], [P, P, P]), // (0,0,0) - (0,0,0)
         ([u64::MAX, u64::MAX, u64::MAX], [0, 0, 0]),
         ([0, 0, 0], [u64::MAX, u64::MAX, u64::MAX]),
     ];

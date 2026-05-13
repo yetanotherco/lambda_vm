@@ -61,13 +61,11 @@ fn ntt_sizes_medium() {
 
 #[test]
 fn ntt_size_2_to_20() {
-    // The hot LDE size. One seed is enough; any mismatch screams loudly.
     assert_ntt_match(20, 0xDEAD);
 }
 
 #[test]
 fn ntt_trivial_sizes() {
-    // Power-of-two below the interesting range — should still pass.
     assert_ntt_match(1, 1);
     assert_ntt_match(2, 2);
     assert_ntt_match(3, 3);

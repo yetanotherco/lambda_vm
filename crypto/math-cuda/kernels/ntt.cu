@@ -218,7 +218,7 @@ extern "C" __global__ void ntt_dit_level(uint64_t *x,
 /// without writing to global memory between them — cuts DRAM traffic by up
 /// to 8× vs the per-level kernel.
 ///
-/// `base_step` selects which 8-level window this launch handles (0, 8, 16…).
+/// `base_step` selects which 8-level window this launch handles (0, 8, 16, ...).
 /// For levels 0–7 the implicit DIT element layout already places all pair
 /// mates inside the same 256-block; for higher base_step we remap the loaded
 /// row so pair mates land in consecutive shared-memory slots.

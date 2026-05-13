@@ -37,7 +37,7 @@ pub fn gl_neg_u64(a: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let a_dev = stream.clone_htod(a)?;
@@ -68,7 +68,7 @@ pub fn ext3_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let a_dev = stream.clone_htod(a)?;
     let b_dev = stream.clone_htod(b)?;
@@ -97,7 +97,7 @@ pub fn ext3_sub_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let a_dev = stream.clone_htod(a)?;
     let b_dev = stream.clone_htod(b)?;
@@ -126,7 +126,7 @@ pub fn ext3_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let a_dev = stream.clone_htod(a)?;
     let b_dev = stream.clone_htod(b)?;
@@ -156,7 +156,7 @@ where
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let a_dev = stream.clone_htod(a)?;
