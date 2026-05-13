@@ -102,7 +102,7 @@ This emits ELF files under `executor/program_artifacts/asm/`. With those in plac
 Run a program without generating a proof. Useful for sanity checks and debugging:
 
 ```sh
-./target/release/cli execute executor/program_artifacts/asm/add.elf
+cargo run -p cli --release -- execute executor/program_artifacts/asm/add.elf
 ```
 
 #### Prove
@@ -110,7 +110,7 @@ Run a program without generating a proof. Useful for sanity checks and debugging
 Generate a STARK proof of the execution:
 
 ```sh
-./target/release/cli prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
+cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
 ```
 
 #### Verify
@@ -118,7 +118,7 @@ Generate a STARK proof of the execution:
 Verify a proof against the ELF it was generated from. The command exits `0` on success and `1` on failure:
 
 ```sh
-./target/release/cli verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
+cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
 ```
 
 For the full CLI reference — including private inputs, blowup factor tuning, timing, and flamegraph profiling — see [`bin/cli/README.md`](./bin/cli/README.md).
