@@ -52,13 +52,28 @@ fn test_recursion_smoke() {
     let mut inner_private_input = Vec::with_capacity(8);
     inner_private_input.extend_from_slice(&n.to_le_bytes());
 
-    eprintln!("[recursion-smoke] proving inner (fibonacci) ...");
-    let inner_proof = crate::prove_with_inputs(&fib_elf_bytes, &inner_private_input)
-        .expect("inner prove should succeed");
+    // Use a larger blowup_factor for the INNER proof to shrink the verifier's
+    // work inside the recursion guest. Default blowup=2 gives 219 FRI queries
+    // and peaks at ~120 GB in the outer prove (OOMs on a 125 GB machine).
+    // blowup=8 gives ~58 FRI queries and brings outer prove memory into a
+    // tractable range. Inner security level drops from 100 → ~64 bits, which
+    // is fine for a smoke test that's about end-to-end wiring, not security.
+    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8)
+        .expect("blowup=8 is always valid");
+
+    eprintln!("[recursion-smoke] proving inner (fibonacci, blowup=8) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &fib_elf_bytes,
+        &inner_private_input,
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
     eprintln!("[recursion-smoke] inner proof generated");
 
     assert!(
-        crate::verify(&inner_proof, &fib_elf_bytes).expect("inner verify errored"),
+        crate::verify_with_options(&inner_proof, &fib_elf_bytes, &inner_proof_options)
+            .expect("inner verify errored"),
         "inner proof must verify on host"
     );
 

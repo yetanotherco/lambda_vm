@@ -77,7 +77,13 @@ pub fn main() -> ! {
     let (vm_proof, inner_elf): (VmProof, Vec<u8>) =
         postcard::from_bytes(blob).expect("failed to deserialize recursion input");
 
-    let ok = lambda_vm_prover::verify(&vm_proof, &inner_elf).expect("verify errored");
+    // Must match the inner prover's blowup_factor (see recursion_smoke_test.rs).
+    // The smoke test proves the inner program with blowup=8 to keep the outer
+    // prove tractable; the verifier inside the guest must use the same options.
+    let options =
+        lambda_vm_prover::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is valid");
+    let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options)
+        .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
     commit(&[1u8]);

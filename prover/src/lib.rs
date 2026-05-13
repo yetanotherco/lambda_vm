@@ -61,7 +61,7 @@ use crate::test_utils::{
     create_register_air, create_shift_air,
 };
 
-use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
