@@ -505,7 +505,7 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -730,7 +730,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -963,7 +963,7 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -1212,7 +1212,7 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -1666,7 +1666,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 

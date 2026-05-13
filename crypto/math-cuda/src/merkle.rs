@@ -33,7 +33,7 @@ pub fn keccak_leaves_base(
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
     assert!(columns.len() >= num_cols * col_stride);
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..num_cols * col_stride])?;
     let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
@@ -60,7 +60,7 @@ pub fn keccak_leaves_ext3(
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
     assert!(columns.len() >= num_cols * 3 * col_stride);
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..num_cols * 3 * col_stride])?;
     let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
@@ -100,7 +100,7 @@ pub(crate) fn launch_keccak_base(
     num_rows: u64,
     out_dev: &mut CudaSlice<u8>,
 ) -> Result<()> {
-    let be = backend();
+    let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let cfg = keccak_launch_cfg(num_rows);
     unsafe {
@@ -139,7 +139,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     );
 
     let total_nodes = 2 * leaves_len - 1;
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     // Allocate the full node buffer without zero-fill — we overwrite the
@@ -210,7 +210,7 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     let num_leaves = lde_size / 2;
     let tight_total_nodes = 2 * num_leaves - 1;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
@@ -332,7 +332,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let evals_dev = stream.clone_htod(evals)?;
@@ -397,7 +397,7 @@ pub(crate) fn launch_keccak_ext3(
     num_rows: u64,
     out_dev: &mut CudaSlice<u8>,
 ) -> Result<()> {
-    let be = backend();
+    let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let cfg = keccak_launch_cfg(num_rows);
     unsafe {
