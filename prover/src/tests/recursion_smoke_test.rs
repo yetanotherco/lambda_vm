@@ -152,6 +152,85 @@ fn test_recursion_smoke_1query() {
     );
 }
 
+/// Diagnostic: build the inner proof + recursion guest input, then **execute
+/// only** the recursion guest (no STARK proving) and report cycle counts +
+/// trace size estimates.
+///
+/// This is the cheap way to find out how many RISC-V instructions the
+/// verifier actually executes inside the guest — a much faster signal than
+/// running the full outer prove (which can OOM on a 125 GB machine).
+#[test]
+#[ignore = "diagnostic: runs the executor only, prints cycle counts"]
+fn test_recursion_cycle_count() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    // Build the inner proof exactly as the smoke test does, with the
+    // absolute-minimum FRI params so the inner is as small as possible.
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[cycle-count] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+            .expect("postcard encode failed");
+    eprintln!("[cycle-count] postcard blob: {} bytes", blob.len());
+
+    // Execute (NOT prove) the recursion guest. Cheap — finishes in seconds.
+    eprintln!("[cycle-count] executing recursion guest ...");
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let executor = Executor::new(&program, blob).expect("Executor::new failed");
+    let start = std::time::Instant::now();
+    let result = executor.run().expect("executor run failed");
+    let exec_time = start.elapsed();
+
+    let cycle_count = result.logs.len();
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  RECURSION GUEST EXECUTION SUMMARY");
+    eprintln!("============================================================");
+    eprintln!("  Cycle count           : {cycle_count}");
+    eprintln!("  Executor wall time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Rough memory estimate for outer prove:");
+    let bytes_per_field = 8usize;
+    let approx_columns = 250usize; // CPU + MEMW + DECODE + bus columns combined
+    let main_trace_bytes = cycle_count * approx_columns * bytes_per_field;
+    let blowup = 2usize;
+    let lde_main_bytes = main_trace_bytes * blowup;
+    eprintln!(
+        "    main trace            : ~{:.2} GB ({} cycles × ~{} cols × 8 B)",
+        main_trace_bytes as f64 / 1e9,
+        cycle_count,
+        approx_columns
+    );
+    eprintln!(
+        "    main LDE (blowup={})   : ~{:.2} GB",
+        blowup,
+        lde_main_bytes as f64 / 1e9
+    );
+    eprintln!("  (aux trace adds roughly 50% more, so peak peak ≈ 2-3× LDE)");
+    eprintln!("============================================================");
+}
+
 /// Inner program: fibonacci(10).
 #[test]
 #[ignore = "slow: runs the full STARK verifier inside the VM"]
