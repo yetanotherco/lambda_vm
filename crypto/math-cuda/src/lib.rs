@@ -38,7 +38,7 @@ pub fn gl_neg_u64(a: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let a_dev = stream.clone_htod(a)?;
@@ -69,7 +69,7 @@ pub fn ext3_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let a_dev = stream.clone_htod(a)?;
     let b_dev = stream.clone_htod(b)?;
@@ -90,6 +90,35 @@ pub fn ext3_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// Element-wise ext3 subtract. Test helper for `ext3::sub` in `ext3.cuh`.
+pub fn ext3_sub_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len() % 3, 0);
+    let n = a.len() / 3;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let be = backend()?;
+    let stream = be.next_stream();
+    let a_dev = stream.clone_htod(a)?;
+    let b_dev = stream.clone_htod(b)?;
+    let mut c_dev = stream.alloc_zeros::<u64>(3 * n)?;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    let n_u64 = n as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.ext3_sub)
+            .arg(&a_dev)
+            .arg(&b_dev)
+            .arg(&mut c_dev)
+            .arg(&n_u64)
+            .launch(cfg)?;
+    }
+    let out = stream.clone_dtoh(&c_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 /// Element-wise ext3 add.
 pub fn ext3_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     assert_eq!(a.len(), b.len());
@@ -98,7 +127,7 @@ pub fn ext3_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
     let a_dev = stream.clone_htod(a)?;
     let b_dev = stream.clone_htod(b)?;
@@ -128,7 +157,7 @@ where
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let a_dev = stream.clone_htod(a)?;

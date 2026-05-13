@@ -9,7 +9,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "driver",
     "nvrtc",
     "std",
-    "cuda-12080",
+    "cuda-version-from-build-system",
+    "fallback-latest",
     "dynamic-loading",
 ] }
 math = { path = "../math" }

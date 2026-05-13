@@ -110,6 +110,10 @@ pub enum BusId {
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit,
+    /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
+    Keccak,
+    /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
+    KeccakRc,
 }
 
 impl BusId {
@@ -138,6 +142,8 @@ impl BusId {
             BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::Keccak => "Keccak",
+            BusId::KeccakRc => "KeccakRc",
         }
     }
 }
@@ -169,6 +175,8 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
+            22 => Ok(BusId::Keccak),
+            23 => Ok(BusId::KeccakRc),
             other => Err(other),
         }
     }
