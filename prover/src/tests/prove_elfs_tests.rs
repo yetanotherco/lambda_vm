@@ -718,6 +718,100 @@ fn test_prove_elfs_all_instructions_64() {
 }
 
 #[test]
+fn test_prove_elfs_keccak() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
+    // RAM (stack memory), which requires PAGE tables for Memory bus balance.
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak prove/verify failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_keccak_multi_call() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest initializes lane[i] = i + 1 and applies keccak-f[1600] three times.
+    // Cross-check the committed output against tiny-keccak's independent
+    // implementation of the permutation.
+    let mut expected_state: [u64; 25] = core::array::from_fn(|i| (i + 1) as u64);
+    for _ in 0..3 {
+        tiny_keccak::keccakf(&mut expected_state);
+    }
+    let mut expected_bytes = Vec::with_capacity(200);
+    for lane in expected_state {
+        expected_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed state must match tiny-keccak after 3 keccak-f[1600] calls"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak multi-call prove/verify failed"
+    );
+}
+
+/// Verifier REJECTS a forged trace where an addr byte cell is set to a
+/// non-byte field element.
+///
+/// Without the IS_BYTE range checks on addr(0..7), an attacker could keep
+/// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
+/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// alignment check) and folding the carry into addr(1) as a non-byte
+/// FE-element. This test asserts that mutating addr(1) to a non-byte value
+/// unbalances the verifier's bus checks and the proof is rejected.
+#[test]
+fn test_prove_elfs_keccak_unaligned_state_addr() {
+    use crate::tables::keccak::cols as keccak_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
+    // value outside [0, 256). The new IS_BYTE bus sender will emit this
+    // value with multiplicity MU=1; the IS_BYTE preprocessed table only
+    // contains 0..256, so the bus cannot balance.
+    traces.keccak.main_table.set(
+        0,
+        keccak_cols::addr(1),
+        FieldElement::<GoldilocksField>::from(257u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a keccak proof whose addr cells are not bytes"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
@@ -1797,7 +1891,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 5);
+    assert_eq!(verifier_air_refs.len(), 8);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 

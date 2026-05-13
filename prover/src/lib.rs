@@ -46,9 +46,10 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air,
+    create_decode_air, create_dvrm_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -206,6 +207,9 @@ pub(crate) struct VmAirs {
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
     pub commit: VmAir,
+    pub keccak: VmAir,
+    pub keccak_rnd: VmAir,
+    pub keccak_rc: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -219,6 +223,9 @@ impl VmAirs {
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
+            (&self.keccak, &mut traces.keccak, &()),
+            (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
+            (&self.keccak_rc, &mut traces.keccak_rc, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -274,6 +281,9 @@ impl VmAirs {
             &self.decode,
             &self.halt,
             &self.commit,
+            &self.keccak,
+            &self.keccak_rnd,
+            &self.keccak_rc,
             &self.register,
         ];
 
@@ -369,6 +379,12 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
+        let keccak = create_keccak_air(proof_options);
+        let keccak_rnd = create_keccak_rnd_air(proof_options);
+        let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
+            tables::keccak_rc::preprocessed_commitment(proof_options),
+            tables::keccak_rc::NUM_PRECOMPUTED_COLS,
+        );
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -412,6 +428,9 @@ impl VmAirs {
             branches,
             halt,
             commit,
+            keccak,
+            keccak_rnd,
+            keccak_rc,
             register,
             pages,
             memw_registers,
@@ -712,11 +731,11 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register) = 8, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 8 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 8 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
