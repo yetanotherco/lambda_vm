@@ -903,6 +903,14 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
+
+        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+        // When `number_of_parts == 1`, the composition polynomial H(x) has degree < N
+        // and we can evaluate it on the N-point trace-offset coset instead of the full
+        // LDE 2N. Downstream we recover the LDE via iFFT N + FFT 2N. For larger d_max
+        // (`number_of_parts >= 2`), evaluate on the full LDE as before.
+        let eval_on_trace_domain = number_of_parts == 1;
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let constraint_evaluations = evaluator.evaluate(
@@ -912,11 +920,10 @@ pub trait IsStarkProver<
             transition_coefficients,
             boundary_coefficients,
             &round_1_result.rap_challenges,
+            eval_on_trace_domain,
         );
         #[cfg(feature = "instruments")]
         let constraints_dur = t_sub.elapsed();
-
-        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -928,8 +935,20 @@ pub trait IsStarkProver<
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
             Self::decompose_and_extend_d2(&constraint_evaluations, domain)
         } else if number_of_parts == 1 {
-            // Degree bound equals trace length: constraint evals are the LDE directly.
-            vec![constraint_evaluations]
+            // d_max == 1: H(x) has degree < N. We evaluated on the N-point trace
+            // coset (eval_on_trace_domain=true above); extend to the LDE 2N via
+            // iFFT (interpolation) + offset FFT.
+            let composition_poly =
+                Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
+                    .unwrap();
+            let lde_evaluations = evaluate_polynomial_on_lde_domain(
+                &composition_poly,
+                domain.blowup_factor,
+                domain.interpolation_domain_size,
+                &domain.coset_offset,
+            )
+            .unwrap();
+            vec![lde_evaluations]
         } else {
             // Fallback for any future AIR with d > 2.
             let composition_poly =
