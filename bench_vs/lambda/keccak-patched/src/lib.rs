@@ -200,13 +200,21 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
 fn keccak_permute_syscall(state: &mut [u64; PLEN]) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a0") state.as_mut_ptr(),
-            in("a7") KECCAK_SYSCALL_NUMBER,
-        )
-    }
+    // EXPERIMENT: stub keccak permutation. The state is NOT permuted; this
+    // function returns immediately. The recursion guest will compute wrong
+    // digests and the inner verify will (probably) fail at the end, but the
+    // executor still runs to completion — which is all we need to measure
+    // cycles attributable to non-keccak work.
+    //
+    // To restore real keccak behavior, revert this commit.
+    let _ = state;
+    // unsafe {
+    //     core::arch::asm!(
+    //         "ecall",
+    //         in("a0") state.as_mut_ptr(),
+    //         in("a7") KECCAK_SYSCALL_NUMBER,
+    //     )
+    // }
 }
 
 // Soft-keccak fallback for `round_count != 24` (unused by sha3::Keccak256
