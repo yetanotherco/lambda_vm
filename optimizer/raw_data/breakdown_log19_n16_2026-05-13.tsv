@@ -1,0 +1,1249 @@
+run	workload	prover	log_rows	rows	phase	ms	table	table_rows	span
+1	fib_pair	lambda	19	524288	prove_total	546.064			
+1	fib_pair	lambda	19	524288	prepass	16.144			
+1	fib_pair	lambda	19	524288	main_commits	147.560			
+1	fib_pair	lambda	19	524288	aux_build	0.001			
+1	fib_pair	lambda	19	524288	aux_commit	0.005			
+1	fib_pair	lambda	19	524288	rounds_2_4	381.736			
+1	fib_pair	lambda	19	524288	r1_main_lde	80.097			
+1	fib_pair	lambda	19	524288	r1_main_merkle	50.619			
+1	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+1	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+1	fib_pair	lambda	19	524288	table_total	378.149	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r2_constraints	168.984	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r2_comp_commit	20.085	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r3_ood	39.032	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r4_deep_comp	41.456	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r4_deep_extend	10.743	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r4_fri_commit	94.935	fib_pair	524288	
+1	fib_pair	lambda	19	524288	r4_queries	1.591	fib_pair	524288	
+2	fib_pair	lambda	19	524288	prove_total	569.945			
+2	fib_pair	lambda	19	524288	prepass	16.307			
+2	fib_pair	lambda	19	524288	main_commits	154.371			
+2	fib_pair	lambda	19	524288	aux_build	0.001			
+2	fib_pair	lambda	19	524288	aux_commit	0.004			
+2	fib_pair	lambda	19	524288	rounds_2_4	398.669			
+2	fib_pair	lambda	19	524288	r1_main_lde	83.265			
+2	fib_pair	lambda	19	524288	r1_main_merkle	53.799			
+2	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+2	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+2	fib_pair	lambda	19	524288	table_total	394.871	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r2_constraints	181.223	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r2_comp_commit	19.456	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r3_ood	38.621	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r4_deep_comp	37.734	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r4_deep_extend	10.199	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r4_fri_commit	104.359	fib_pair	524288	
+2	fib_pair	lambda	19	524288	r4_queries	1.983	fib_pair	524288	
+3	fib_pair	lambda	19	524288	prove_total	565.576			
+3	fib_pair	lambda	19	524288	prepass	16.284			
+3	fib_pair	lambda	19	524288	main_commits	155.861			
+3	fib_pair	lambda	19	524288	aux_build	0.001			
+3	fib_pair	lambda	19	524288	aux_commit	0.019			
+3	fib_pair	lambda	19	524288	rounds_2_4	392.775			
+3	fib_pair	lambda	19	524288	r1_main_lde	85.480			
+3	fib_pair	lambda	19	524288	r1_main_merkle	52.370			
+3	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+3	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+3	fib_pair	lambda	19	524288	table_total	388.514	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r2_constraints	179.512	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r2_comp_commit	20.517	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r3_ood	38.823	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r4_deep_comp	40.438	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r4_deep_extend	10.450	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r4_fri_commit	95.860	fib_pair	524288	
+3	fib_pair	lambda	19	524288	r4_queries	1.764	fib_pair	524288	
+4	fib_pair	lambda	19	524288	prove_total	590.327			
+4	fib_pair	lambda	19	524288	prepass	16.180			
+4	fib_pair	lambda	19	524288	main_commits	152.837			
+4	fib_pair	lambda	19	524288	aux_build	0.001			
+4	fib_pair	lambda	19	524288	aux_commit	0.005			
+4	fib_pair	lambda	19	524288	rounds_2_4	420.690			
+4	fib_pair	lambda	19	524288	r1_main_lde	84.164			
+4	fib_pair	lambda	19	524288	r1_main_merkle	50.888			
+4	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+4	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+4	fib_pair	lambda	19	524288	table_total	417.486	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r2_constraints	181.219	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r2_comp_commit	22.244	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r3_ood	45.841	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r4_deep_comp	42.392	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r4_deep_extend	11.119	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r4_fri_commit	111.424	fib_pair	524288	
+4	fib_pair	lambda	19	524288	r4_queries	1.867	fib_pair	524288	
+5	fib_pair	lambda	19	524288	prove_total	663.386			
+5	fib_pair	lambda	19	524288	prepass	16.144			
+5	fib_pair	lambda	19	524288	main_commits	154.022			
+5	fib_pair	lambda	19	524288	aux_build	0.001			
+5	fib_pair	lambda	19	524288	aux_commit	0.021			
+5	fib_pair	lambda	19	524288	rounds_2_4	492.602			
+5	fib_pair	lambda	19	524288	r1_main_lde	83.033			
+5	fib_pair	lambda	19	524288	r1_main_merkle	52.925			
+5	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+5	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+5	fib_pair	lambda	19	524288	table_total	489.071	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r2_constraints	241.313	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r2_comp_commit	24.160	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r3_ood	55.671	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r4_deep_comp	48.213	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r4_deep_extend	11.023	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r4_fri_commit	105.728	fib_pair	524288	
+5	fib_pair	lambda	19	524288	r4_queries	1.775	fib_pair	524288	
+6	fib_pair	lambda	19	524288	prove_total	723.456			
+6	fib_pair	lambda	19	524288	prepass	16.135			
+6	fib_pair	lambda	19	524288	main_commits	156.248			
+6	fib_pair	lambda	19	524288	aux_build	0.002			
+6	fib_pair	lambda	19	524288	aux_commit	0.005			
+6	fib_pair	lambda	19	524288	rounds_2_4	550.454			
+6	fib_pair	lambda	19	524288	r1_main_lde	86.602			
+6	fib_pair	lambda	19	524288	r1_main_merkle	51.773			
+6	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+6	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+6	fib_pair	lambda	19	524288	table_total	546.419	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r2_constraints	271.251	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r2_comp_commit	31.670	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r3_ood	54.722	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r4_deep_comp	54.569	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r4_deep_extend	11.111	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r4_fri_commit	119.937	fib_pair	524288	
+6	fib_pair	lambda	19	524288	r4_queries	1.810	fib_pair	524288	
+7	fib_pair	lambda	19	524288	prove_total	575.159			
+7	fib_pair	lambda	19	524288	prepass	16.123			
+7	fib_pair	lambda	19	524288	main_commits	172.499			
+7	fib_pair	lambda	19	524288	aux_build	0.001			
+7	fib_pair	lambda	19	524288	aux_commit	0.014			
+7	fib_pair	lambda	19	524288	rounds_2_4	386.236			
+7	fib_pair	lambda	19	524288	r1_main_lde	104.972			
+7	fib_pair	lambda	19	524288	r1_main_merkle	48.751			
+7	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+7	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+7	fib_pair	lambda	19	524288	table_total	382.478	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r2_constraints	163.449	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r2_comp_commit	21.676	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r3_ood	45.855	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r4_deep_comp	40.090	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r4_deep_extend	10.108	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r4_fri_commit	98.213	fib_pair	524288	
+7	fib_pair	lambda	19	524288	r4_queries	1.836	fib_pair	524288	
+8	fib_pair	lambda	19	524288	prove_total	719.061			
+8	fib_pair	lambda	19	524288	prepass	16.239			
+8	fib_pair	lambda	19	524288	main_commits	159.379			
+8	fib_pair	lambda	19	524288	aux_build	0.001			
+8	fib_pair	lambda	19	524288	aux_commit	0.004			
+8	fib_pair	lambda	19	524288	rounds_2_4	542.824			
+8	fib_pair	lambda	19	524288	r1_main_lde	87.396			
+8	fib_pair	lambda	19	524288	r1_main_merkle	53.364			
+8	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+8	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+8	fib_pair	lambda	19	524288	table_total	538.092	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r2_constraints	253.069	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r2_comp_decompose	0.001	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r2_comp_commit	27.476	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r3_ood	69.723	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r4_deep_comp	52.651	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r4_deep_extend	9.269	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r4_fri_commit	122.501	fib_pair	524288	
+8	fib_pair	lambda	19	524288	r4_queries	2.097	fib_pair	524288	
+9	fib_pair	lambda	19	524288	prove_total	565.270			
+9	fib_pair	lambda	19	524288	prepass	16.125			
+9	fib_pair	lambda	19	524288	main_commits	150.404			
+9	fib_pair	lambda	19	524288	aux_build	0.001			
+9	fib_pair	lambda	19	524288	aux_commit	0.005			
+9	fib_pair	lambda	19	524288	rounds_2_4	398.122			
+9	fib_pair	lambda	19	524288	r1_main_lde	78.420			
+9	fib_pair	lambda	19	524288	r1_main_merkle	55.704			
+9	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+9	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+9	fib_pair	lambda	19	524288	table_total	394.403	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r2_constraints	173.829	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r2_comp_commit	18.634	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r3_ood	44.282	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r4_deep_comp	41.038	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r4_deep_extend	9.538	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r4_fri_commit	103.729	fib_pair	524288	
+9	fib_pair	lambda	19	524288	r4_queries	2.060	fib_pair	524288	
+10	fib_pair	lambda	19	524288	prove_total	545.641			
+10	fib_pair	lambda	19	524288	prepass	16.169			
+10	fib_pair	lambda	19	524288	main_commits	151.236			
+10	fib_pair	lambda	19	524288	aux_build	0.001			
+10	fib_pair	lambda	19	524288	aux_commit	0.015			
+10	fib_pair	lambda	19	524288	rounds_2_4	377.599			
+10	fib_pair	lambda	19	524288	r1_main_lde	82.066			
+10	fib_pair	lambda	19	524288	r1_main_merkle	52.081			
+10	fib_pair	lambda	19	524288	r1_aux_lde	0.000			
+10	fib_pair	lambda	19	524288	r1_aux_merkle	0.000			
+10	fib_pair	lambda	19	524288	table_total	374.042	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r2_constraints	169.231	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r2_comp_decompose	0.000	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r2_comp_commit	19.716	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r3_ood	40.466	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r4_deep_comp	38.444	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r4_deep_extend	9.371	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r4_fri_commit	93.601	fib_pair	524288	
+10	fib_pair	lambda	19	524288	r4_queries	1.889	fib_pair	524288	
+1	fib_pair	p3	19	524288	prove_total	343.455			
+1	fib_pair	p3	19	524288	span	343.422			prove
+1	fib_pair	p3	19	524288	span	343.420			prove_with_preprocessed
+1	fib_pair	p3	19	524288	span	135.510			open
+1	fib_pair	p3	19	524288	span	97.472			commit to trace data
+1	fib_pair	p3	19	524288	span	73.180			FRI prover
+1	fib_pair	p3	19	524288	span	69.667			commit phase
+1	fib_pair	p3	19	524288	span	68.655			coset_lde_batch
+1	fib_pair	p3	19	524288	span	56.889			quotient_values
+1	fib_pair	p3	19	524288	span	47.192			commit to quotient poly chunks
+1	fib_pair	p3	19	524288	span	28.808			build merkle tree
+1	fib_pair	p3	19	524288	span	25.745			Compute Selectors
+1	fib_pair	p3	19	524288	span	23.483			compute_inverse_denominators
+1	fib_pair	p3	19	524288	span	23.146			reduce matrix quotient
+1	fib_pair	p3	19	524288	span	22.941			coset_dft_oop
+1	fib_pair	p3	19	524288	span	22.746			coset_lde_batch
+1	fib_pair	p3	19	524288	span	19.884			build merkle tree
+1	fib_pair	p3	19	524288	span	19.598			build merkle tree
+1	fib_pair	p3	19	524288	span	18.268			coset_dft
+1	fib_pair	p3	19	524288	span	14.376			first digest layer
+1	fib_pair	p3	19	524288	span	11.780			coset_dft_oop
+1	fib_pair	p3	19	524288	span	9.995			first digest layer
+1	fib_pair	p3	19	524288	span	8.820			first_half_general_oop
+1	fib_pair	p3	19	524288	span	8.796			build merkle tree
+1	fib_pair	p3	19	524288	span	7.253			coset_dft
+1	fib_pair	p3	19	524288	span	6.796			first digest layer
+1	fib_pair	p3	19	524288	span	6.224			build merkle tree
+1	fib_pair	p3	19	524288	span	5.805			compress mat
+1	fib_pair	p3	19	524288	span	5.466			fold_matrix
+1	fib_pair	p3	19	524288	span	4.973			first_half_general
+1	fib_pair	p3	19	524288	span	4.884			second_half
+1	fib_pair	p3	19	524288	span	4.870			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	4.783			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	4.701			first_half
+1	fib_pair	p3	19	524288	span	4.616			fold_matrix
+1	fib_pair	p3	19	524288	span	4.605			batch_multiplicative_inverse
+1	fib_pair	p3	19	524288	span	4.543			build merkle tree
+1	fib_pair	p3	19	524288	span	4.381			second_half_general
+1	fib_pair	p3	19	524288	span	4.086			first_half_general_oop
+1	fib_pair	p3	19	524288	span	4.023			second_half_general
+1	fib_pair	p3	19	524288	span	3.482			query phase
+1	fib_pair	p3	19	524288	span	3.420			fold_matrix
+1	fib_pair	p3	19	524288	span	3.336			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	3.322			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	2.924			batch_multiplicative_inverse
+1	fib_pair	p3	19	524288	span	2.684			first digest layer
+1	fib_pair	p3	19	524288	span	2.676			evaluate matrix
+1	fib_pair	p3	19	524288	span	2.673			compute opened values with Lagrange interpolation
+1	fib_pair	p3	19	524288	span	2.668			columnwise_dot_product
+1	fib_pair	p3	19	524288	span	2.657			reduce matrix quotient
+1	fib_pair	p3	19	524288	span	2.309			evaluate matrix
+1	fib_pair	p3	19	524288	span	2.301			compute opened values with Lagrange interpolation
+1	fib_pair	p3	19	524288	span	2.296			columnwise_dot_product
+1	fib_pair	p3	19	524288	span	2.273			build merkle tree
+1	fib_pair	p3	19	524288	span	1.969			first digest layer
+1	fib_pair	p3	19	524288	span	1.968			first digest layer
+1	fib_pair	p3	19	524288	span	1.705			batch_multiplicative_inverse
+1	fib_pair	p3	19	524288	span	1.548			build merkle tree
+1	fib_pair	p3	19	524288	span	1.473			compress mat
+1	fib_pair	p3	19	524288	span	1.470			fold_matrix
+1	fib_pair	p3	19	524288	span	1.405			build merkle tree
+1	fib_pair	p3	19	524288	span	1.305			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	1.084			reserve_exact
+1	fib_pair	p3	19	524288	span	1.063			fold_matrix
+1	fib_pair	p3	19	524288	span	0.996			batch_multiplicative_inverse
+1	fib_pair	p3	19	524288	span	0.995			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	0.975			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	0.969			reverse_matrix_index_bits
+1	fib_pair	p3	19	524288	span	0.881			first_half_general
+1	fib_pair	p3	19	524288	span	0.872			fold_matrix
+1	fib_pair	p3	19	524288	span	0.852			build merkle tree
+1	fib_pair	p3	19	524288	span	0.813			evaluate matrix
+1	fib_pair	p3	19	524288	span	0.812			compute opened values with Lagrange interpolation
+1	fib_pair	p3	19	524288	span	0.809			columnwise_dot_product
+1	fib_pair	p3	19	524288	span	0.667			first_half
+1	fib_pair	p3	19	524288	span	0.621			build merkle tree
+1	fib_pair	p3	19	524288	span	0.614			fold_matrix
+1	fib_pair	p3	19	524288	span	0.603			fold_matrix
+1	fib_pair	p3	19	524288	span	0.488			second_half
+1	fib_pair	p3	19	524288	span	0.482			second_half_general
+1	fib_pair	p3	19	524288	span	0.468			first digest layer
+1	fib_pair	p3	19	524288	span	0.465			build merkle tree
+1	fib_pair	p3	19	524288	span	0.458			second_half_general
+1	fib_pair	p3	19	524288	span	0.408			fold_matrix
+1	fib_pair	p3	19	524288	span	0.385			first digest layer
+1	fib_pair	p3	19	524288	span	0.367			fold_matrix
+1	fib_pair	p3	19	524288	span	0.361			build merkle tree
+1	fib_pair	p3	19	524288	span	0.354			first digest layer
+1	fib_pair	p3	19	524288	span	0.352			fold_matrix
+1	fib_pair	p3	19	524288	span	0.349			build merkle tree
+1	fib_pair	p3	19	524288	span	0.339			fold_matrix
+1	fib_pair	p3	19	524288	span	0.337			fold_matrix
+1	fib_pair	p3	19	524288	span	0.328			fold_matrix
+1	fib_pair	p3	19	524288	span	0.294			build merkle tree
+1	fib_pair	p3	19	524288	span	0.288			build merkle tree
+1	fib_pair	p3	19	524288	span	0.271			fold_matrix
+1	fib_pair	p3	19	524288	span	0.267			reserve_exact
+1	fib_pair	p3	19	524288	span	0.266			build merkle tree
+1	fib_pair	p3	19	524288	span	0.233			fold_matrix
+1	fib_pair	p3	19	524288	span	0.197			build merkle tree
+1	fib_pair	p3	19	524288	span	0.184			first digest layer
+1	fib_pair	p3	19	524288	span	0.148			first digest layer
+1	fib_pair	p3	19	524288	span	0.108			build merkle tree
+1	fib_pair	p3	19	524288	span	0.108			fold_matrix
+1	fib_pair	p3	19	524288	span	0.100			first digest layer
+2	fib_pair	p3	19	524288	prove_total	368.497			
+2	fib_pair	p3	19	524288	span	368.465			prove
+2	fib_pair	p3	19	524288	span	368.463			prove_with_preprocessed
+2	fib_pair	p3	19	524288	span	132.903			open
+2	fib_pair	p3	19	524288	span	117.702			commit to trace data
+2	fib_pair	p3	19	524288	span	75.386			coset_lde_batch
+2	fib_pair	p3	19	524288	span	70.337			FRI prover
+2	fib_pair	p3	19	524288	span	66.834			commit phase
+2	fib_pair	p3	19	524288	span	56.000			quotient_values
+2	fib_pair	p3	19	524288	span	55.480			commit to quotient poly chunks
+2	fib_pair	p3	19	524288	span	42.308			build merkle tree
+2	fib_pair	p3	19	524288	span	25.578			build merkle tree
+2	fib_pair	p3	19	524288	span	25.373			coset_dft_oop
+2	fib_pair	p3	19	524288	span	24.986			coset_lde_batch
+2	fib_pair	p3	19	524288	span	23.629			reduce matrix quotient
+2	fib_pair	p3	19	524288	span	23.472			Compute Selectors
+2	fib_pair	p3	19	524288	span	20.238			build merkle tree
+2	fib_pair	p3	19	524288	span	19.733			compute_inverse_denominators
+2	fib_pair	p3	19	524288	span	19.342			coset_dft
+2	fib_pair	p3	19	524288	span	17.688			first digest layer
+2	fib_pair	p3	19	524288	span	12.616			coset_dft_oop
+2	fib_pair	p3	19	524288	span	10.333			first_half_general_oop
+2	fib_pair	p3	19	524288	span	9.834			first digest layer
+2	fib_pair	p3	19	524288	span	9.536			first digest layer
+2	fib_pair	p3	19	524288	span	8.163			build merkle tree
+2	fib_pair	p3	19	524288	span	8.101			coset_dft
+2	fib_pair	p3	19	524288	span	6.783			fold_matrix
+2	fib_pair	p3	19	524288	span	6.586			compress mat
+2	fib_pair	p3	19	524288	span	6.406			build merkle tree
+2	fib_pair	p3	19	524288	span	6.245			second_half
+2	fib_pair	p3	19	524288	span	6.074			first_half
+2	fib_pair	p3	19	524288	span	5.133			first_half_general_oop
+2	fib_pair	p3	19	524288	span	5.041			first_half_general
+2	fib_pair	p3	19	524288	span	4.933			batch_multiplicative_inverse
+2	fib_pair	p3	19	524288	span	4.909			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	4.793			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	4.616			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	4.581			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	4.488			second_half_general
+2	fib_pair	p3	19	524288	span	4.330			second_half_general
+2	fib_pair	p3	19	524288	span	3.708			fold_matrix
+2	fib_pair	p3	19	524288	span	3.473			query phase
+2	fib_pair	p3	19	524288	span	3.279			build merkle tree
+2	fib_pair	p3	19	524288	span	3.064			first digest layer
+2	fib_pair	p3	19	524288	span	3.009			batch_multiplicative_inverse
+2	fib_pair	p3	19	524288	span	3.003			evaluate matrix
+2	fib_pair	p3	19	524288	span	3.000			compute opened values with Lagrange interpolation
+2	fib_pair	p3	19	524288	span	2.995			columnwise_dot_product
+2	fib_pair	p3	19	524288	span	2.537			reduce matrix quotient
+2	fib_pair	p3	19	524288	span	2.395			first digest layer
+2	fib_pair	p3	19	524288	span	2.283			build merkle tree
+2	fib_pair	p3	19	524288	span	2.175			evaluate matrix
+2	fib_pair	p3	19	524288	span	2.168			compute opened values with Lagrange interpolation
+2	fib_pair	p3	19	524288	span	2.165			columnwise_dot_product
+2	fib_pair	p3	19	524288	span	2.037			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	1.980			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	1.680			fold_matrix
+2	fib_pair	p3	19	524288	span	1.460			build merkle tree
+2	fib_pair	p3	19	524288	span	1.459			compress mat
+2	fib_pair	p3	19	524288	span	1.395			build merkle tree
+2	fib_pair	p3	19	524288	span	1.338			batch_multiplicative_inverse
+2	fib_pair	p3	19	524288	span	1.309			fold_matrix
+2	fib_pair	p3	19	524288	span	1.039			fold_matrix
+2	fib_pair	p3	19	524288	span	1.037			reserve_exact
+2	fib_pair	p3	19	524288	span	1.020			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	1.013			build merkle tree
+2	fib_pair	p3	19	524288	span	0.968			fold_matrix
+2	fib_pair	p3	19	524288	span	0.930			evaluate matrix
+2	fib_pair	p3	19	524288	span	0.929			compute opened values with Lagrange interpolation
+2	fib_pair	p3	19	524288	span	0.927			columnwise_dot_product
+2	fib_pair	p3	19	524288	span	0.875			reverse_matrix_index_bits
+2	fib_pair	p3	19	524288	span	0.829			batch_multiplicative_inverse
+2	fib_pair	p3	19	524288	span	0.732			first_half_general
+2	fib_pair	p3	19	524288	span	0.682			build merkle tree
+2	fib_pair	p3	19	524288	span	0.661			first digest layer
+2	fib_pair	p3	19	524288	span	0.655			first_half
+2	fib_pair	p3	19	524288	span	0.629			second_half_general
+2	fib_pair	p3	19	524288	span	0.592			first digest layer
+2	fib_pair	p3	19	524288	span	0.556			fold_matrix
+2	fib_pair	p3	19	524288	span	0.543			build merkle tree
+2	fib_pair	p3	19	524288	span	0.492			fold_matrix
+2	fib_pair	p3	19	524288	span	0.480			fold_matrix
+2	fib_pair	p3	19	524288	span	0.472			second_half_general
+2	fib_pair	p3	19	524288	span	0.465			second_half
+2	fib_pair	p3	19	524288	span	0.461			fold_matrix
+2	fib_pair	p3	19	524288	span	0.412			first digest layer
+2	fib_pair	p3	19	524288	span	0.392			first digest layer
+2	fib_pair	p3	19	524288	span	0.391			fold_matrix
+2	fib_pair	p3	19	524288	span	0.368			build merkle tree
+2	fib_pair	p3	19	524288	span	0.354			fold_matrix
+2	fib_pair	p3	19	524288	span	0.334			build merkle tree
+2	fib_pair	p3	19	524288	span	0.325			first digest layer
+2	fib_pair	p3	19	524288	span	0.294			fold_matrix
+2	fib_pair	p3	19	524288	span	0.288			fold_matrix
+2	fib_pair	p3	19	524288	span	0.281			fold_matrix
+2	fib_pair	p3	19	524288	span	0.260			build merkle tree
+2	fib_pair	p3	19	524288	span	0.246			build merkle tree
+2	fib_pair	p3	19	524288	span	0.227			reserve_exact
+2	fib_pair	p3	19	524288	span	0.199			build merkle tree
+2	fib_pair	p3	19	524288	span	0.189			build merkle tree
+2	fib_pair	p3	19	524288	span	0.173			first digest layer
+2	fib_pair	p3	19	524288	span	0.158			fold_matrix
+2	fib_pair	p3	19	524288	span	0.146			first digest layer
+2	fib_pair	p3	19	524288	span	0.119			build merkle tree
+2	fib_pair	p3	19	524288	span	0.119			first digest layer
+2	fib_pair	p3	19	524288	span	0.105			first digest layer
+3	fib_pair	p3	19	524288	prove_total	340.791			
+3	fib_pair	p3	19	524288	span	340.754			prove
+3	fib_pair	p3	19	524288	span	340.752			prove_with_preprocessed
+3	fib_pair	p3	19	524288	span	134.002			open
+3	fib_pair	p3	19	524288	span	100.766			commit to trace data
+3	fib_pair	p3	19	524288	span	75.090			FRI prover
+3	fib_pair	p3	19	524288	span	71.533			commit phase
+3	fib_pair	p3	19	524288	span	69.812			coset_lde_batch
+3	fib_pair	p3	19	524288	span	50.186			quotient_values
+3	fib_pair	p3	19	524288	span	49.313			commit to quotient poly chunks
+3	fib_pair	p3	19	524288	span	30.945			build merkle tree
+3	fib_pair	p3	19	524288	span	24.410			coset_lde_batch
+3	fib_pair	p3	19	524288	span	23.582			Compute Selectors
+3	fib_pair	p3	19	524288	span	22.028			reduce matrix quotient
+3	fib_pair	p3	19	524288	span	21.732			coset_dft_oop
+3	fib_pair	p3	19	524288	span	20.561			build merkle tree
+3	fib_pair	p3	19	524288	span	20.031			build merkle tree
+3	fib_pair	p3	19	524288	span	19.608			compute_inverse_denominators
+3	fib_pair	p3	19	524288	span	19.109			coset_dft
+3	fib_pair	p3	19	524288	span	15.365			first digest layer
+3	fib_pair	p3	19	524288	span	12.036			coset_dft_oop
+3	fib_pair	p3	19	524288	span	9.741			first digest layer
+3	fib_pair	p3	19	524288	span	8.555			build merkle tree
+3	fib_pair	p3	19	524288	span	8.493			first_half_general_oop
+3	fib_pair	p3	19	524288	span	8.259			coset_dft
+3	fib_pair	p3	19	524288	span	6.478			first digest layer
+3	fib_pair	p3	19	524288	span	6.427			first_half
+3	fib_pair	p3	19	524288	span	5.974			build merkle tree
+3	fib_pair	p3	19	524288	span	5.867			compress mat
+3	fib_pair	p3	19	524288	span	5.727			second_half
+3	fib_pair	p3	19	524288	span	5.429			first_half_general
+3	fib_pair	p3	19	524288	span	5.212			fold_matrix
+3	fib_pair	p3	19	524288	span	4.752			second_half_general
+3	fib_pair	p3	19	524288	span	4.544			build merkle tree
+3	fib_pair	p3	19	524288	span	4.399			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	4.229			first_half_general_oop
+3	fib_pair	p3	19	524288	span	4.151			second_half_general
+3	fib_pair	p3	19	524288	span	4.084			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	3.922			batch_multiplicative_inverse
+3	fib_pair	p3	19	524288	span	3.745			fold_matrix
+3	fib_pair	p3	19	524288	span	3.711			fold_matrix
+3	fib_pair	p3	19	524288	span	3.548			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	3.522			query phase
+3	fib_pair	p3	19	524288	span	3.131			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	2.807			evaluate matrix
+3	fib_pair	p3	19	524288	span	2.804			compute opened values with Lagrange interpolation
+3	fib_pair	p3	19	524288	span	2.799			columnwise_dot_product
+3	fib_pair	p3	19	524288	span	2.678			build merkle tree
+3	fib_pair	p3	19	524288	span	2.479			reduce matrix quotient
+3	fib_pair	p3	19	524288	span	2.244			evaluate matrix
+3	fib_pair	p3	19	524288	span	2.238			compute opened values with Lagrange interpolation
+3	fib_pair	p3	19	524288	span	2.235			columnwise_dot_product
+3	fib_pair	p3	19	524288	span	2.231			batch_multiplicative_inverse
+3	fib_pair	p3	19	524288	span	2.137			first digest layer
+3	fib_pair	p3	19	524288	span	1.881			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	1.769			first digest layer
+3	fib_pair	p3	19	524288	span	1.711			build merkle tree
+3	fib_pair	p3	19	524288	span	1.589			first digest layer
+3	fib_pair	p3	19	524288	span	1.585			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	1.390			fold_matrix
+3	fib_pair	p3	19	524288	span	1.363			compress mat
+3	fib_pair	p3	19	524288	span	1.295			build merkle tree
+3	fib_pair	p3	19	524288	span	1.178			fold_matrix
+3	fib_pair	p3	19	524288	span	1.172			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	1.001			reverse_matrix_index_bits
+3	fib_pair	p3	19	524288	span	0.959			reserve_exact
+3	fib_pair	p3	19	524288	span	0.953			batch_multiplicative_inverse
+3	fib_pair	p3	19	524288	span	0.951			build merkle tree
+3	fib_pair	p3	19	524288	span	0.894			batch_multiplicative_inverse
+3	fib_pair	p3	19	524288	span	0.873			build merkle tree
+3	fib_pair	p3	19	524288	span	0.838			fold_matrix
+3	fib_pair	p3	19	524288	span	0.814			evaluate matrix
+3	fib_pair	p3	19	524288	span	0.813			compute opened values with Lagrange interpolation
+3	fib_pair	p3	19	524288	span	0.811			columnwise_dot_product
+3	fib_pair	p3	19	524288	span	0.797			first_half_general
+3	fib_pair	p3	19	524288	span	0.786			fold_matrix
+3	fib_pair	p3	19	524288	span	0.765			build merkle tree
+3	fib_pair	p3	19	524288	span	0.718			first_half
+3	fib_pair	p3	19	524288	span	0.680			fold_matrix
+3	fib_pair	p3	19	524288	span	0.585			fold_matrix
+3	fib_pair	p3	19	524288	span	0.518			second_half_general
+3	fib_pair	p3	19	524288	span	0.509			first digest layer
+3	fib_pair	p3	19	524288	span	0.491			first digest layer
+3	fib_pair	p3	19	524288	span	0.489			build merkle tree
+3	fib_pair	p3	19	524288	span	0.483			second_half
+3	fib_pair	p3	19	524288	span	0.463			fold_matrix
+3	fib_pair	p3	19	524288	span	0.446			fold_matrix
+3	fib_pair	p3	19	524288	span	0.428			build merkle tree
+3	fib_pair	p3	19	524288	span	0.426			fold_matrix
+3	fib_pair	p3	19	524288	span	0.408			fold_matrix
+3	fib_pair	p3	19	524288	span	0.405			second_half_general
+3	fib_pair	p3	19	524288	span	0.403			build merkle tree
+3	fib_pair	p3	19	524288	span	0.380			fold_matrix
+3	fib_pair	p3	19	524288	span	0.366			build merkle tree
+3	fib_pair	p3	19	524288	span	0.327			first digest layer
+3	fib_pair	p3	19	524288	span	0.324			build merkle tree
+3	fib_pair	p3	19	524288	span	0.316			reserve_exact
+3	fib_pair	p3	19	524288	span	0.302			fold_matrix
+3	fib_pair	p3	19	524288	span	0.280			fold_matrix
+3	fib_pair	p3	19	524288	span	0.222			build merkle tree
+3	fib_pair	p3	19	524288	span	0.217			first digest layer
+3	fib_pair	p3	19	524288	span	0.171			first digest layer
+3	fib_pair	p3	19	524288	span	0.142			first digest layer
+3	fib_pair	p3	19	524288	span	0.124			first digest layer
+3	fib_pair	p3	19	524288	span	0.123			build merkle tree
+3	fib_pair	p3	19	524288	span	0.117			first digest layer
+3	fib_pair	p3	19	524288	span	0.104			first digest layer
+4	fib_pair	p3	19	524288	prove_total	335.121			
+4	fib_pair	p3	19	524288	span	335.082			prove
+4	fib_pair	p3	19	524288	span	335.081			prove_with_preprocessed
+4	fib_pair	p3	19	524288	span	131.639			open
+4	fib_pair	p3	19	524288	span	99.784			commit to trace data
+4	fib_pair	p3	19	524288	span	71.240			coset_lde_batch
+4	fib_pair	p3	19	524288	span	70.928			FRI prover
+4	fib_pair	p3	19	524288	span	67.426			commit phase
+4	fib_pair	p3	19	524288	span	51.321			quotient_values
+4	fib_pair	p3	19	524288	span	45.984			commit to quotient poly chunks
+4	fib_pair	p3	19	524288	span	28.534			build merkle tree
+4	fib_pair	p3	19	524288	span	23.358			Compute Selectors
+4	fib_pair	p3	19	524288	span	22.883			coset_dft_oop
+4	fib_pair	p3	19	524288	span	22.338			reduce matrix quotient
+4	fib_pair	p3	19	524288	span	21.653			compute_inverse_denominators
+4	fib_pair	p3	19	524288	span	21.264			coset_lde_batch
+4	fib_pair	p3	19	524288	span	20.499			build merkle tree
+4	fib_pair	p3	19	524288	span	19.620			build merkle tree
+4	fib_pair	p3	19	524288	span	19.127			coset_dft
+4	fib_pair	p3	19	524288	span	14.309			first digest layer
+4	fib_pair	p3	19	524288	span	11.018			coset_dft_oop
+4	fib_pair	p3	19	524288	span	9.425			first digest layer
+4	fib_pair	p3	19	524288	span	9.401			build merkle tree
+4	fib_pair	p3	19	524288	span	8.944			first_half_general_oop
+4	fib_pair	p3	19	524288	span	7.112			first digest layer
+4	fib_pair	p3	19	524288	span	6.756			coset_dft
+4	fib_pair	p3	19	524288	span	6.673			build merkle tree
+4	fib_pair	p3	19	524288	span	6.459			compress mat
+4	fib_pair	p3	19	524288	span	6.432			fold_matrix
+4	fib_pair	p3	19	524288	span	5.966			first_half
+4	fib_pair	p3	19	524288	span	5.499			second_half
+4	fib_pair	p3	19	524288	span	4.948			first_half_general
+4	fib_pair	p3	19	524288	span	4.619			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	4.520			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	4.381			second_half_general
+4	fib_pair	p3	19	524288	span	4.309			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	4.191			fold_matrix
+4	fib_pair	p3	19	524288	span	4.056			batch_multiplicative_inverse
+4	fib_pair	p3	19	524288	span	4.020			second_half_general
+4	fib_pair	p3	19	524288	span	3.877			first_half_general_oop
+4	fib_pair	p3	19	524288	span	3.509			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	3.471			query phase
+4	fib_pair	p3	19	524288	span	3.391			first digest layer
+4	fib_pair	p3	19	524288	span	3.205			build merkle tree
+4	fib_pair	p3	19	524288	span	3.109			first digest layer
+4	fib_pair	p3	19	524288	span	2.564			evaluate matrix
+4	fib_pair	p3	19	524288	span	2.561			compute opened values with Lagrange interpolation
+4	fib_pair	p3	19	524288	span	2.556			columnwise_dot_product
+4	fib_pair	p3	19	524288	span	2.525			reduce matrix quotient
+4	fib_pair	p3	19	524288	span	2.307			evaluate matrix
+4	fib_pair	p3	19	524288	span	2.292			compute opened values with Lagrange interpolation
+4	fib_pair	p3	19	524288	span	2.287			columnwise_dot_product
+4	fib_pair	p3	19	524288	span	2.176			build merkle tree
+4	fib_pair	p3	19	524288	span	2.037			batch_multiplicative_inverse
+4	fib_pair	p3	19	524288	span	1.684			fold_matrix
+4	fib_pair	p3	19	524288	span	1.679			build merkle tree
+4	fib_pair	p3	19	524288	span	1.375			compress mat
+4	fib_pair	p3	19	524288	span	1.350			fold_matrix
+4	fib_pair	p3	19	524288	span	1.310			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	1.175			reserve_exact
+4	fib_pair	p3	19	524288	span	1.142			batch_multiplicative_inverse
+4	fib_pair	p3	19	524288	span	1.083			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	1.070			build merkle tree
+4	fib_pair	p3	19	524288	span	0.994			build merkle tree
+4	fib_pair	p3	19	524288	span	0.917			fold_matrix
+4	fib_pair	p3	19	524288	span	0.881			fold_matrix
+4	fib_pair	p3	19	524288	span	0.858			batch_multiplicative_inverse
+4	fib_pair	p3	19	524288	span	0.816			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	0.789			evaluate matrix
+4	fib_pair	p3	19	524288	span	0.789			reverse_matrix_index_bits
+4	fib_pair	p3	19	524288	span	0.788			compute opened values with Lagrange interpolation
+4	fib_pair	p3	19	524288	span	0.784			columnwise_dot_product
+4	fib_pair	p3	19	524288	span	0.723			first_half_general
+4	fib_pair	p3	19	524288	span	0.667			fold_matrix
+4	fib_pair	p3	19	524288	span	0.649			first digest layer
+4	fib_pair	p3	19	524288	span	0.602			first_half
+4	fib_pair	p3	19	524288	span	0.565			build merkle tree
+4	fib_pair	p3	19	524288	span	0.526			build merkle tree
+4	fib_pair	p3	19	524288	span	0.493			fold_matrix
+4	fib_pair	p3	19	524288	span	0.483			first digest layer
+4	fib_pair	p3	19	524288	span	0.482			second_half
+4	fib_pair	p3	19	524288	span	0.468			build merkle tree
+4	fib_pair	p3	19	524288	span	0.464			first digest layer
+4	fib_pair	p3	19	524288	span	0.463			build merkle tree
+4	fib_pair	p3	19	524288	span	0.443			second_half_general
+4	fib_pair	p3	19	524288	span	0.432			fold_matrix
+4	fib_pair	p3	19	524288	span	0.420			second_half_general
+4	fib_pair	p3	19	524288	span	0.381			first digest layer
+4	fib_pair	p3	19	524288	span	0.375			fold_matrix
+4	fib_pair	p3	19	524288	span	0.371			fold_matrix
+4	fib_pair	p3	19	524288	span	0.345			build merkle tree
+4	fib_pair	p3	19	524288	span	0.324			fold_matrix
+4	fib_pair	p3	19	524288	span	0.297			reserve_exact
+4	fib_pair	p3	19	524288	span	0.294			fold_matrix
+4	fib_pair	p3	19	524288	span	0.286			fold_matrix
+4	fib_pair	p3	19	524288	span	0.268			fold_matrix
+4	fib_pair	p3	19	524288	span	0.256			first digest layer
+4	fib_pair	p3	19	524288	span	0.227			build merkle tree
+4	fib_pair	p3	19	524288	span	0.205			fold_matrix
+4	fib_pair	p3	19	524288	span	0.195			build merkle tree
+4	fib_pair	p3	19	524288	span	0.159			first digest layer
+4	fib_pair	p3	19	524288	span	0.151			build merkle tree
+4	fib_pair	p3	19	524288	span	0.108			first digest layer
+4	fib_pair	p3	19	524288	span	0.106			build merkle tree
+5	fib_pair	p3	19	524288	prove_total	340.744			
+5	fib_pair	p3	19	524288	span	340.707			prove
+5	fib_pair	p3	19	524288	span	340.705			prove_with_preprocessed
+5	fib_pair	p3	19	524288	span	131.646			open
+5	fib_pair	p3	19	524288	span	107.767			commit to trace data
+5	fib_pair	p3	19	524288	span	72.296			FRI prover
+5	fib_pair	p3	19	524288	span	72.063			coset_lde_batch
+5	fib_pair	p3	19	524288	span	68.751			commit phase
+5	fib_pair	p3	19	524288	span	48.664			quotient_values
+5	fib_pair	p3	19	524288	span	46.126			commit to quotient poly chunks
+5	fib_pair	p3	19	524288	span	35.694			build merkle tree
+5	fib_pair	p3	19	524288	span	24.220			Compute Selectors
+5	fib_pair	p3	19	524288	span	24.057			coset_dft_oop
+5	fib_pair	p3	19	524288	span	22.950			reduce matrix quotient
+5	fib_pair	p3	19	524288	span	21.298			coset_lde_batch
+5	fib_pair	p3	19	524288	span	20.171			compute_inverse_denominators
+5	fib_pair	p3	19	524288	span	20.037			build merkle tree
+5	fib_pair	p3	19	524288	span	19.891			build merkle tree
+5	fib_pair	p3	19	524288	span	19.282			first digest layer
+5	fib_pair	p3	19	524288	span	18.886			coset_dft
+5	fib_pair	p3	19	524288	span	10.052			coset_dft_oop
+5	fib_pair	p3	19	524288	span	9.672			first digest layer
+5	fib_pair	p3	19	524288	span	8.642			first_half_general_oop
+5	fib_pair	p3	19	524288	span	8.174			build merkle tree
+5	fib_pair	p3	19	524288	span	8.049			build merkle tree
+5	fib_pair	p3	19	524288	span	7.700			coset_dft
+5	fib_pair	p3	19	524288	span	6.840			first digest layer
+5	fib_pair	p3	19	524288	span	6.399			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	6.340			compress mat
+5	fib_pair	p3	19	524288	span	6.046			first_half
+5	fib_pair	p3	19	524288	span	5.738			fold_matrix
+5	fib_pair	p3	19	524288	span	5.146			second_half
+5	fib_pair	p3	19	524288	span	5.063			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	4.915			first_half_general
+5	fib_pair	p3	19	524288	span	4.365			second_half_general
+5	fib_pair	p3	19	524288	span	4.165			second_half_general
+5	fib_pair	p3	19	524288	span	4.078			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	3.967			fold_matrix
+5	fib_pair	p3	19	524288	span	3.950			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	3.643			first_half_general_oop
+5	fib_pair	p3	19	524288	span	3.602			first digest layer
+5	fib_pair	p3	19	524288	span	3.511			query phase
+5	fib_pair	p3	19	524288	span	3.150			build merkle tree
+5	fib_pair	p3	19	524288	span	2.781			first digest layer
+5	fib_pair	p3	19	524288	span	2.767			batch_multiplicative_inverse
+5	fib_pair	p3	19	524288	span	2.527			evaluate matrix
+5	fib_pair	p3	19	524288	span	2.525			compute opened values with Lagrange interpolation
+5	fib_pair	p3	19	524288	span	2.518			columnwise_dot_product
+5	fib_pair	p3	19	524288	span	2.490			reduce matrix quotient
+5	fib_pair	p3	19	524288	span	2.299			batch_multiplicative_inverse
+5	fib_pair	p3	19	524288	span	2.286			evaluate matrix
+5	fib_pair	p3	19	524288	span	2.280			compute opened values with Lagrange interpolation
+5	fib_pair	p3	19	524288	span	2.280			build merkle tree
+5	fib_pair	p3	19	524288	span	2.275			columnwise_dot_product
+5	fib_pair	p3	19	524288	span	2.127			batch_multiplicative_inverse
+5	fib_pair	p3	19	524288	span	1.741			fold_matrix
+5	fib_pair	p3	19	524288	span	1.680			build merkle tree
+5	fib_pair	p3	19	524288	span	1.430			compress mat
+5	fib_pair	p3	19	524288	span	1.336			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	1.296			fold_matrix
+5	fib_pair	p3	19	524288	span	1.245			build merkle tree
+5	fib_pair	p3	19	524288	span	1.072			fold_matrix
+5	fib_pair	p3	19	524288	span	1.019			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	0.971			build merkle tree
+5	fib_pair	p3	19	524288	span	0.965			reserve_exact
+5	fib_pair	p3	19	524288	span	0.905			fold_matrix
+5	fib_pair	p3	19	524288	span	0.888			batch_multiplicative_inverse
+5	fib_pair	p3	19	524288	span	0.858			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	0.818			reverse_matrix_index_bits
+5	fib_pair	p3	19	524288	span	0.790			evaluate matrix
+5	fib_pair	p3	19	524288	span	0.790			compute opened values with Lagrange interpolation
+5	fib_pair	p3	19	524288	span	0.787			columnwise_dot_product
+5	fib_pair	p3	19	524288	span	0.767			first_half_general
+5	fib_pair	p3	19	524288	span	0.738			build merkle tree
+5	fib_pair	p3	19	524288	span	0.693			fold_matrix
+5	fib_pair	p3	19	524288	span	0.655			first digest layer
+5	fib_pair	p3	19	524288	span	0.624			build merkle tree
+5	fib_pair	p3	19	524288	span	0.623			first_half
+5	fib_pair	p3	19	524288	span	0.562			fold_matrix
+5	fib_pair	p3	19	524288	span	0.528			build merkle tree
+5	fib_pair	p3	19	524288	span	0.509			first digest layer
+5	fib_pair	p3	19	524288	span	0.506			fold_matrix
+5	fib_pair	p3	19	524288	span	0.491			build merkle tree
+5	fib_pair	p3	19	524288	span	0.456			second_half_general
+5	fib_pair	p3	19	524288	span	0.443			fold_matrix
+5	fib_pair	p3	19	524288	span	0.432			fold_matrix
+5	fib_pair	p3	19	524288	span	0.419			second_half
+5	fib_pair	p3	19	524288	span	0.415			build merkle tree
+5	fib_pair	p3	19	524288	span	0.406			second_half_general
+5	fib_pair	p3	19	524288	span	0.383			fold_matrix
+5	fib_pair	p3	19	524288	span	0.366			fold_matrix
+5	fib_pair	p3	19	524288	span	0.343			first digest layer
+5	fib_pair	p3	19	524288	span	0.321			fold_matrix
+5	fib_pair	p3	19	524288	span	0.320			build merkle tree
+5	fib_pair	p3	19	524288	span	0.306			fold_matrix
+5	fib_pair	p3	19	524288	span	0.294			reserve_exact
+5	fib_pair	p3	19	524288	span	0.284			first digest layer
+5	fib_pair	p3	19	524288	span	0.276			fold_matrix
+5	fib_pair	p3	19	524288	span	0.266			build merkle tree
+5	fib_pair	p3	19	524288	span	0.236			first digest layer
+5	fib_pair	p3	19	524288	span	0.226			first digest layer
+5	fib_pair	p3	19	524288	span	0.210			build merkle tree
+5	fib_pair	p3	19	524288	span	0.148			first digest layer
+5	fib_pair	p3	19	524288	span	0.123			first digest layer
+5	fib_pair	p3	19	524288	span	0.111			build merkle tree
+5	fib_pair	p3	19	524288	span	0.107			first digest layer
+5	fib_pair	p3	19	524288	span	0.100			first digest layer
+6	fib_pair	p3	19	524288	prove_total	339.408			
+6	fib_pair	p3	19	524288	span	339.368			prove
+6	fib_pair	p3	19	524288	span	339.366			prove_with_preprocessed
+6	fib_pair	p3	19	524288	span	131.400			open
+6	fib_pair	p3	19	524288	span	101.302			commit to trace data
+6	fib_pair	p3	19	524288	span	73.376			coset_lde_batch
+6	fib_pair	p3	19	524288	span	70.466			FRI prover
+6	fib_pair	p3	19	524288	span	66.969			commit phase
+6	fib_pair	p3	19	524288	span	52.247			quotient_values
+6	fib_pair	p3	19	524288	span	47.867			commit to quotient poly chunks
+6	fib_pair	p3	19	524288	span	27.914			build merkle tree
+6	fib_pair	p3	19	524288	span	24.981			coset_dft_oop
+6	fib_pair	p3	19	524288	span	22.993			coset_lde_batch
+6	fib_pair	p3	19	524288	span	22.505			reduce matrix quotient
+6	fib_pair	p3	19	524288	span	20.578			Compute Selectors
+6	fib_pair	p3	19	524288	span	20.065			build merkle tree
+6	fib_pair	p3	19	524288	span	19.939			coset_dft
+6	fib_pair	p3	19	524288	span	19.615			compute_inverse_denominators
+6	fib_pair	p3	19	524288	span	19.248			build merkle tree
+6	fib_pair	p3	19	524288	span	15.207			first digest layer
+6	fib_pair	p3	19	524288	span	10.040			coset_dft_oop
+6	fib_pair	p3	19	524288	span	9.833			first_half_general_oop
+6	fib_pair	p3	19	524288	span	9.754			first digest layer
+6	fib_pair	p3	19	524288	span	9.049			coset_dft
+6	fib_pair	p3	19	524288	span	8.713			build merkle tree
+6	fib_pair	p3	19	524288	span	7.366			first digest layer
+6	fib_pair	p3	19	524288	span	6.650			compress mat
+6	fib_pair	p3	19	524288	span	6.479			build merkle tree
+6	fib_pair	p3	19	524288	span	6.050			first_half
+6	fib_pair	p3	19	524288	span	5.976			first_half_general
+6	fib_pair	p3	19	524288	span	5.893			second_half
+6	fib_pair	p3	19	524288	span	5.822			fold_matrix
+6	fib_pair	p3	19	524288	span	4.908			second_half_general
+6	fib_pair	p3	19	524288	span	4.608			second_half_general
+6	fib_pair	p3	19	524288	span	4.356			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	4.053			fold_matrix
+6	fib_pair	p3	19	524288	span	3.926			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	3.710			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	3.548			first_half_general_oop
+6	fib_pair	p3	19	524288	span	3.535			batch_multiplicative_inverse
+6	fib_pair	p3	19	524288	span	3.464			query phase
+6	fib_pair	p3	19	524288	span	3.422			build merkle tree
+6	fib_pair	p3	19	524288	span	3.071			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	2.932			evaluate matrix
+6	fib_pair	p3	19	524288	span	2.929			compute opened values with Lagrange interpolation
+6	fib_pair	p3	19	524288	span	2.924			columnwise_dot_product
+6	fib_pair	p3	19	524288	span	2.777			batch_multiplicative_inverse
+6	fib_pair	p3	19	524288	span	2.572			reduce matrix quotient
+6	fib_pair	p3	19	524288	span	2.360			first digest layer
+6	fib_pair	p3	19	524288	span	2.348			evaluate matrix
+6	fib_pair	p3	19	524288	span	2.344			compute opened values with Lagrange interpolation
+6	fib_pair	p3	19	524288	span	2.338			columnwise_dot_product
+6	fib_pair	p3	19	524288	span	2.248			build merkle tree
+6	fib_pair	p3	19	524288	span	1.632			fold_matrix
+6	fib_pair	p3	19	524288	span	1.575			first digest layer
+6	fib_pair	p3	19	524288	span	1.560			build merkle tree
+6	fib_pair	p3	19	524288	span	1.520			compress mat
+6	fib_pair	p3	19	524288	span	1.493			batch_multiplicative_inverse
+6	fib_pair	p3	19	524288	span	1.490			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	1.433			build merkle tree
+6	fib_pair	p3	19	524288	span	1.263			fold_matrix
+6	fib_pair	p3	19	524288	span	1.126			fold_matrix
+6	fib_pair	p3	19	524288	span	1.092			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	1.062			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	0.976			reserve_exact
+6	fib_pair	p3	19	524288	span	0.967			first_half_general
+6	fib_pair	p3	19	524288	span	0.949			batch_multiplicative_inverse
+6	fib_pair	p3	19	524288	span	0.919			fold_matrix
+6	fib_pair	p3	19	524288	span	0.905			first digest layer
+6	fib_pair	p3	19	524288	span	0.880			build merkle tree
+6	fib_pair	p3	19	524288	span	0.800			evaluate matrix
+6	fib_pair	p3	19	524288	span	0.799			compute opened values with Lagrange interpolation
+6	fib_pair	p3	19	524288	span	0.796			columnwise_dot_product
+6	fib_pair	p3	19	524288	span	0.787			reverse_matrix_index_bits
+6	fib_pair	p3	19	524288	span	0.780			build merkle tree
+6	fib_pair	p3	19	524288	span	0.746			fold_matrix
+6	fib_pair	p3	19	524288	span	0.716			first_half
+6	fib_pair	p3	19	524288	span	0.636			build merkle tree
+6	fib_pair	p3	19	524288	span	0.605			fold_matrix
+6	fib_pair	p3	19	524288	span	0.577			fold_matrix
+6	fib_pair	p3	19	524288	span	0.524			second_half_general
+6	fib_pair	p3	19	524288	span	0.512			second_half
+6	fib_pair	p3	19	524288	span	0.491			second_half_general
+6	fib_pair	p3	19	524288	span	0.476			fold_matrix
+6	fib_pair	p3	19	524288	span	0.454			first digest layer
+6	fib_pair	p3	19	524288	span	0.402			fold_matrix
+6	fib_pair	p3	19	524288	span	0.383			reserve_exact
+6	fib_pair	p3	19	524288	span	0.370			build merkle tree
+6	fib_pair	p3	19	524288	span	0.369			build merkle tree
+6	fib_pair	p3	19	524288	span	0.361			fold_matrix
+6	fib_pair	p3	19	524288	span	0.359			first digest layer
+6	fib_pair	p3	19	524288	span	0.359			first digest layer
+6	fib_pair	p3	19	524288	span	0.356			build merkle tree
+6	fib_pair	p3	19	524288	span	0.317			fold_matrix
+6	fib_pair	p3	19	524288	span	0.287			fold_matrix
+6	fib_pair	p3	19	524288	span	0.280			fold_matrix
+6	fib_pair	p3	19	524288	span	0.280			fold_matrix
+6	fib_pair	p3	19	524288	span	0.276			build merkle tree
+6	fib_pair	p3	19	524288	span	0.272			build merkle tree
+6	fib_pair	p3	19	524288	span	0.220			first digest layer
+6	fib_pair	p3	19	524288	span	0.201			build merkle tree
+6	fib_pair	p3	19	524288	span	0.162			first digest layer
+6	fib_pair	p3	19	524288	span	0.159			first digest layer
+6	fib_pair	p3	19	524288	span	0.139			first digest layer
+6	fib_pair	p3	19	524288	span	0.103			build merkle tree
+6	fib_pair	p3	19	524288	span	0.100			fold_matrix
+6	fib_pair	p3	19	524288	span	0.100			first digest layer
+7	fib_pair	p3	19	524288	prove_total	339.049			
+7	fib_pair	p3	19	524288	span	339.009			prove
+7	fib_pair	p3	19	524288	span	339.007			prove_with_preprocessed
+7	fib_pair	p3	19	524288	span	129.677			open
+7	fib_pair	p3	19	524288	span	108.052			commit to trace data
+7	fib_pair	p3	19	524288	span	73.294			coset_lde_batch
+7	fib_pair	p3	19	524288	span	70.727			FRI prover
+7	fib_pair	p3	19	524288	span	67.158			commit phase
+7	fib_pair	p3	19	524288	span	48.851			quotient_values
+7	fib_pair	p3	19	524288	span	45.903			commit to quotient poly chunks
+7	fib_pair	p3	19	524288	span	34.746			build merkle tree
+7	fib_pair	p3	19	524288	span	25.591			Compute Selectors
+7	fib_pair	p3	19	524288	span	24.555			coset_dft_oop
+7	fib_pair	p3	19	524288	span	22.634			reduce matrix quotient
+7	fib_pair	p3	19	524288	span	20.816			coset_lde_batch
+7	fib_pair	p3	19	524288	span	20.178			build merkle tree
+7	fib_pair	p3	19	524288	span	19.490			compute_inverse_denominators
+7	fib_pair	p3	19	524288	span	19.075			build merkle tree
+7	fib_pair	p3	19	524288	span	18.694			coset_dft
+7	fib_pair	p3	19	524288	span	14.888			first digest layer
+7	fib_pair	p3	19	524288	span	10.375			coset_dft_oop
+7	fib_pair	p3	19	524288	span	9.636			first digest layer
+7	fib_pair	p3	19	524288	span	9.190			first_half_general_oop
+7	fib_pair	p3	19	524288	span	8.662			build merkle tree
+7	fib_pair	p3	19	524288	span	7.001			coset_dft
+7	fib_pair	p3	19	524288	span	6.668			compress mat
+7	fib_pair	p3	19	524288	span	6.494			first digest layer
+7	fib_pair	p3	19	524288	span	6.409			build merkle tree
+7	fib_pair	p3	19	524288	span	6.333			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	5.985			first_half
+7	fib_pair	p3	19	524288	span	5.486			second_half
+7	fib_pair	p3	19	524288	span	5.074			fold_matrix
+7	fib_pair	p3	19	524288	span	4.920			fold_matrix
+7	fib_pair	p3	19	524288	span	4.592			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	4.517			first_half_general
+7	fib_pair	p3	19	524288	span	4.453			first_half_general_oop
+7	fib_pair	p3	19	524288	span	4.203			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	4.095			second_half_general
+7	fib_pair	p3	19	524288	span	4.067			build merkle tree
+7	fib_pair	p3	19	524288	span	3.952			second_half_general
+7	fib_pair	p3	19	524288	span	3.837			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	3.732			batch_multiplicative_inverse
+7	fib_pair	p3	19	524288	span	3.537			query phase
+7	fib_pair	p3	19	524288	span	2.883			evaluate matrix
+7	fib_pair	p3	19	524288	span	2.880			compute opened values with Lagrange interpolation
+7	fib_pair	p3	19	524288	span	2.875			columnwise_dot_product
+7	fib_pair	p3	19	524288	span	2.874			batch_multiplicative_inverse
+7	fib_pair	p3	19	524288	span	2.597			fold_matrix
+7	fib_pair	p3	19	524288	span	2.439			reduce matrix quotient
+7	fib_pair	p3	19	524288	span	2.314			first digest layer
+7	fib_pair	p3	19	524288	span	2.254			evaluate matrix
+7	fib_pair	p3	19	524288	span	2.247			compute opened values with Lagrange interpolation
+7	fib_pair	p3	19	524288	span	2.244			columnwise_dot_product
+7	fib_pair	p3	19	524288	span	2.138			first digest layer
+7	fib_pair	p3	19	524288	span	1.963			build merkle tree
+7	fib_pair	p3	19	524288	span	1.794			batch_multiplicative_inverse
+7	fib_pair	p3	19	524288	span	1.575			build merkle tree
+7	fib_pair	p3	19	524288	span	1.431			first digest layer
+7	fib_pair	p3	19	524288	span	1.409			compress mat
+7	fib_pair	p3	19	524288	span	1.376			build merkle tree
+7	fib_pair	p3	19	524288	span	1.367			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	1.325			fold_matrix
+7	fib_pair	p3	19	524288	span	1.173			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	1.020			fold_matrix
+7	fib_pair	p3	19	524288	span	0.958			reserve_exact
+7	fib_pair	p3	19	524288	span	0.940			build merkle tree
+7	fib_pair	p3	19	524288	span	0.887			fold_matrix
+7	fib_pair	p3	19	524288	span	0.854			evaluate matrix
+7	fib_pair	p3	19	524288	span	0.852			compute opened values with Lagrange interpolation
+7	fib_pair	p3	19	524288	span	0.851			columnwise_dot_product
+7	fib_pair	p3	19	524288	span	0.812			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	0.783			batch_multiplicative_inverse
+7	fib_pair	p3	19	524288	span	0.775			build merkle tree
+7	fib_pair	p3	19	524288	span	0.728			first_half_general
+7	fib_pair	p3	19	524288	span	0.716			fold_matrix
+7	fib_pair	p3	19	524288	span	0.695			reverse_matrix_index_bits
+7	fib_pair	p3	19	524288	span	0.640			fold_matrix
+7	fib_pair	p3	19	524288	span	0.564			first_half
+7	fib_pair	p3	19	524288	span	0.510			build merkle tree
+7	fib_pair	p3	19	524288	span	0.490			first digest layer
+7	fib_pair	p3	19	524288	span	0.431			second_half
+7	fib_pair	p3	19	524288	span	0.427			second_half_general
+7	fib_pair	p3	19	524288	span	0.426			fold_matrix
+7	fib_pair	p3	19	524288	span	0.403			second_half_general
+7	fib_pair	p3	19	524288	span	0.381			fold_matrix
+7	fib_pair	p3	19	524288	span	0.362			fold_matrix
+7	fib_pair	p3	19	524288	span	0.361			first digest layer
+7	fib_pair	p3	19	524288	span	0.357			first digest layer
+7	fib_pair	p3	19	524288	span	0.348			build merkle tree
+7	fib_pair	p3	19	524288	span	0.332			fold_matrix
+7	fib_pair	p3	19	524288	span	0.330			fold_matrix
+7	fib_pair	p3	19	524288	span	0.317			build merkle tree
+7	fib_pair	p3	19	524288	span	0.300			build merkle tree
+7	fib_pair	p3	19	524288	span	0.273			build merkle tree
+7	fib_pair	p3	19	524288	span	0.266			fold_matrix
+7	fib_pair	p3	19	524288	span	0.255			reserve_exact
+7	fib_pair	p3	19	524288	span	0.226			first digest layer
+7	fib_pair	p3	19	524288	span	0.210			fold_matrix
+7	fib_pair	p3	19	524288	span	0.207			build merkle tree
+7	fib_pair	p3	19	524288	span	0.203			fold_matrix
+7	fib_pair	p3	19	524288	span	0.154			build merkle tree
+7	fib_pair	p3	19	524288	span	0.137			first digest layer
+7	fib_pair	p3	19	524288	span	0.128			first digest layer
+7	fib_pair	p3	19	524288	span	0.109			first digest layer
+7	fib_pair	p3	19	524288	span	0.106			fold_matrix
+7	fib_pair	p3	19	524288	span	0.101			build merkle tree
+8	fib_pair	p3	19	524288	prove_total	348.703			
+8	fib_pair	p3	19	524288	span	348.670			prove
+8	fib_pair	p3	19	524288	span	348.668			prove_with_preprocessed
+8	fib_pair	p3	19	524288	span	137.038			open
+8	fib_pair	p3	19	524288	span	100.593			commit to trace data
+8	fib_pair	p3	19	524288	span	75.694			FRI prover
+8	fib_pair	p3	19	524288	span	73.883			coset_lde_batch
+8	fib_pair	p3	19	524288	span	72.191			commit phase
+8	fib_pair	p3	19	524288	span	55.025			quotient_values
+8	fib_pair	p3	19	524288	span	49.685			commit to quotient poly chunks
+8	fib_pair	p3	19	524288	span	26.699			build merkle tree
+8	fib_pair	p3	19	524288	span	25.205			Compute Selectors
+8	fib_pair	p3	19	524288	span	24.397			reduce matrix quotient
+8	fib_pair	p3	19	524288	span	24.187			coset_lde_batch
+8	fib_pair	p3	19	524288	span	23.964			coset_dft_oop
+8	fib_pair	p3	19	524288	span	20.825			compute_inverse_denominators
+8	fib_pair	p3	19	524288	span	20.464			build merkle tree
+8	fib_pair	p3	19	524288	span	20.290			coset_dft
+8	fib_pair	p3	19	524288	span	19.914			build merkle tree
+8	fib_pair	p3	19	524288	span	13.944			first digest layer
+8	fib_pair	p3	19	524288	span	11.736			coset_dft_oop
+8	fib_pair	p3	19	524288	span	9.691			first digest layer
+8	fib_pair	p3	19	524288	span	9.409			build merkle tree
+8	fib_pair	p3	19	524288	span	9.358			first_half_general_oop
+8	fib_pair	p3	19	524288	span	8.545			coset_dft
+8	fib_pair	p3	19	524288	span	8.112			first digest layer
+8	fib_pair	p3	19	524288	span	7.803			compress mat
+8	fib_pair	p3	19	524288	span	6.591			first_half
+8	fib_pair	p3	19	524288	span	5.829			build merkle tree
+8	fib_pair	p3	19	524288	span	5.639			first_half_general
+8	fib_pair	p3	19	524288	span	5.575			second_half
+8	fib_pair	p3	19	524288	span	5.486			fold_matrix
+8	fib_pair	p3	19	524288	span	5.167			second_half_general
+8	fib_pair	p3	19	524288	span	4.777			build merkle tree
+8	fib_pair	p3	19	524288	span	4.657			fold_matrix
+8	fib_pair	p3	19	524288	span	4.644			second_half_general
+8	fib_pair	p3	19	524288	span	4.141			fold_matrix
+8	fib_pair	p3	19	524288	span	3.957			first_half_general_oop
+8	fib_pair	p3	19	524288	span	3.849			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	3.846			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	3.547			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	3.470			query phase
+8	fib_pair	p3	19	524288	span	3.388			first digest layer
+8	fib_pair	p3	19	524288	span	3.118			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	2.789			batch_multiplicative_inverse
+8	fib_pair	p3	19	524288	span	2.615			evaluate matrix
+8	fib_pair	p3	19	524288	span	2.613			compute opened values with Lagrange interpolation
+8	fib_pair	p3	19	524288	span	2.608			columnwise_dot_product
+8	fib_pair	p3	19	524288	span	2.542			reduce matrix quotient
+8	fib_pair	p3	19	524288	span	2.533			batch_multiplicative_inverse
+8	fib_pair	p3	19	524288	span	2.281			evaluate matrix
+8	fib_pair	p3	19	524288	span	2.275			compute opened values with Lagrange interpolation
+8	fib_pair	p3	19	524288	span	2.271			columnwise_dot_product
+8	fib_pair	p3	19	524288	span	2.107			build merkle tree
+8	fib_pair	p3	19	524288	span	1.813			first digest layer
+8	fib_pair	p3	19	524288	span	1.797			build merkle tree
+8	fib_pair	p3	19	524288	span	1.794			first digest layer
+8	fib_pair	p3	19	524288	span	1.507			batch_multiplicative_inverse
+8	fib_pair	p3	19	524288	span	1.477			compress mat
+8	fib_pair	p3	19	524288	span	1.447			batch_multiplicative_inverse
+8	fib_pair	p3	19	524288	span	1.438			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	1.393			fold_matrix
+8	fib_pair	p3	19	524288	span	1.318			build merkle tree
+8	fib_pair	p3	19	524288	span	1.149			fold_matrix
+8	fib_pair	p3	19	524288	span	1.068			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	1.056			reserve_exact
+8	fib_pair	p3	19	524288	span	0.983			fold_matrix
+8	fib_pair	p3	19	524288	span	0.980			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	0.916			reverse_matrix_index_bits
+8	fib_pair	p3	19	524288	span	0.847			evaluate matrix
+8	fib_pair	p3	19	524288	span	0.846			compute opened values with Lagrange interpolation
+8	fib_pair	p3	19	524288	span	0.844			columnwise_dot_product
+8	fib_pair	p3	19	524288	span	0.841			first_half_general
+8	fib_pair	p3	19	524288	span	0.828			build merkle tree
+8	fib_pair	p3	19	524288	span	0.718			fold_matrix
+8	fib_pair	p3	19	524288	span	0.671			first_half
+8	fib_pair	p3	19	524288	span	0.657			build merkle tree
+8	fib_pair	p3	19	524288	span	0.651			build merkle tree
+8	fib_pair	p3	19	524288	span	0.593			fold_matrix
+8	fib_pair	p3	19	524288	span	0.564			fold_matrix
+8	fib_pair	p3	19	524288	span	0.539			fold_matrix
+8	fib_pair	p3	19	524288	span	0.533			second_half
+8	fib_pair	p3	19	524288	span	0.493			build merkle tree
+8	fib_pair	p3	19	524288	span	0.476			second_half_general
+8	fib_pair	p3	19	524288	span	0.471			first digest layer
+8	fib_pair	p3	19	524288	span	0.455			second_half_general
+8	fib_pair	p3	19	524288	span	0.451			first digest layer
+8	fib_pair	p3	19	524288	span	0.425			first digest layer
+8	fib_pair	p3	19	524288	span	0.395			build merkle tree
+8	fib_pair	p3	19	524288	span	0.394			build merkle tree
+8	fib_pair	p3	19	524288	span	0.384			fold_matrix
+8	fib_pair	p3	19	524288	span	0.373			fold_matrix
+8	fib_pair	p3	19	524288	span	0.329			fold_matrix
+8	fib_pair	p3	19	524288	span	0.327			fold_matrix
+8	fib_pair	p3	19	524288	span	0.311			fold_matrix
+8	fib_pair	p3	19	524288	span	0.310			build merkle tree
+8	fib_pair	p3	19	524288	span	0.286			build merkle tree
+8	fib_pair	p3	19	524288	span	0.274			fold_matrix
+8	fib_pair	p3	19	524288	span	0.271			reserve_exact
+8	fib_pair	p3	19	524288	span	0.222			build merkle tree
+8	fib_pair	p3	19	524288	span	0.193			first digest layer
+8	fib_pair	p3	19	524288	span	0.152			first digest layer
+8	fib_pair	p3	19	524288	span	0.111			first digest layer
+8	fib_pair	p3	19	524288	span	0.111			build merkle tree
+8	fib_pair	p3	19	524288	span	0.110			first digest layer
+8	fib_pair	p3	19	524288	span	0.100			fold_matrix
+9	fib_pair	p3	19	524288	prove_total	340.511			
+9	fib_pair	p3	19	524288	span	340.475			prove
+9	fib_pair	p3	19	524288	span	340.473			prove_with_preprocessed
+9	fib_pair	p3	19	524288	span	133.814			open
+9	fib_pair	p3	19	524288	span	102.670			commit to trace data
+9	fib_pair	p3	19	524288	span	74.474			coset_lde_batch
+9	fib_pair	p3	19	524288	span	73.433			FRI prover
+9	fib_pair	p3	19	524288	span	69.928			commit phase
+9	fib_pair	p3	19	524288	span	51.367			quotient_values
+9	fib_pair	p3	19	524288	span	46.097			commit to quotient poly chunks
+9	fib_pair	p3	19	524288	span	28.187			build merkle tree
+9	fib_pair	p3	19	524288	span	22.888			reduce matrix quotient
+9	fib_pair	p3	19	524288	span	22.242			coset_dft_oop
+9	fib_pair	p3	19	524288	span	22.080			Compute Selectors
+9	fib_pair	p3	19	524288	span	21.704			coset_lde_batch
+9	fib_pair	p3	19	524288	span	21.215			compute_inverse_denominators
+9	fib_pair	p3	19	524288	span	19.502			build merkle tree
+9	fib_pair	p3	19	524288	span	19.347			build merkle tree
+9	fib_pair	p3	19	524288	span	19.220			coset_dft
+9	fib_pair	p3	19	524288	span	15.489			first digest layer
+9	fib_pair	p3	19	524288	span	9.942			coset_dft_oop
+9	fib_pair	p3	19	524288	span	9.694			first digest layer
+9	fib_pair	p3	19	524288	span	9.140			build merkle tree
+9	fib_pair	p3	19	524288	span	8.840			first_half_general_oop
+9	fib_pair	p3	19	524288	span	8.006			coset_dft
+9	fib_pair	p3	19	524288	span	6.929			first digest layer
+9	fib_pair	p3	19	524288	span	6.737			build merkle tree
+9	fib_pair	p3	19	524288	span	6.705			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	6.479			first_half
+9	fib_pair	p3	19	524288	span	6.100			compress mat
+9	fib_pair	p3	19	524288	span	6.080			fold_matrix
+9	fib_pair	p3	19	524288	span	6.061			second_half
+9	fib_pair	p3	19	524288	span	5.222			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	5.163			second_half_general
+9	fib_pair	p3	19	524288	span	5.089			first_half_general
+9	fib_pair	p3	19	524288	span	4.240			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	4.092			build merkle tree
+9	fib_pair	p3	19	524288	span	3.954			second_half_general
+9	fib_pair	p3	19	524288	span	3.822			first digest layer
+9	fib_pair	p3	19	524288	span	3.798			fold_matrix
+9	fib_pair	p3	19	524288	span	3.629			first_half_general_oop
+9	fib_pair	p3	19	524288	span	3.472			query phase
+9	fib_pair	p3	19	524288	span	3.324			batch_multiplicative_inverse
+9	fib_pair	p3	19	524288	span	3.082			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	2.913			fold_matrix
+9	fib_pair	p3	19	524288	span	2.887			batch_multiplicative_inverse
+9	fib_pair	p3	19	524288	span	2.562			reduce matrix quotient
+9	fib_pair	p3	19	524288	span	2.502			evaluate matrix
+9	fib_pair	p3	19	524288	span	2.499			compute opened values with Lagrange interpolation
+9	fib_pair	p3	19	524288	span	2.494			columnwise_dot_product
+9	fib_pair	p3	19	524288	span	2.312			build merkle tree
+9	fib_pair	p3	19	524288	span	2.283			first digest layer
+9	fib_pair	p3	19	524288	span	2.210			evaluate matrix
+9	fib_pair	p3	19	524288	span	2.205			compute opened values with Lagrange interpolation
+9	fib_pair	p3	19	524288	span	2.202			columnwise_dot_product
+9	fib_pair	p3	19	524288	span	1.501			fold_matrix
+9	fib_pair	p3	19	524288	span	1.472			compress mat
+9	fib_pair	p3	19	524288	span	1.469			build merkle tree
+9	fib_pair	p3	19	524288	span	1.435			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	1.435			first digest layer
+9	fib_pair	p3	19	524288	span	1.202			build merkle tree
+9	fib_pair	p3	19	524288	span	1.143			fold_matrix
+9	fib_pair	p3	19	524288	span	1.113			batch_multiplicative_inverse
+9	fib_pair	p3	19	524288	span	1.001			build merkle tree
+9	fib_pair	p3	19	524288	span	0.996			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	0.963			reserve_exact
+9	fib_pair	p3	19	524288	span	0.963			batch_multiplicative_inverse
+9	fib_pair	p3	19	524288	span	0.936			fold_matrix
+9	fib_pair	p3	19	524288	span	0.934			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	0.866			second_half_general
+9	fib_pair	p3	19	524288	span	0.863			reverse_matrix_index_bits
+9	fib_pair	p3	19	524288	span	0.806			first_half_general
+9	fib_pair	p3	19	524288	span	0.777			evaluate matrix
+9	fib_pair	p3	19	524288	span	0.776			compute opened values with Lagrange interpolation
+9	fib_pair	p3	19	524288	span	0.774			columnwise_dot_product
+9	fib_pair	p3	19	524288	span	0.741			build merkle tree
+9	fib_pair	p3	19	524288	span	0.679			first_half
+9	fib_pair	p3	19	524288	span	0.637			fold_matrix
+9	fib_pair	p3	19	524288	span	0.590			build merkle tree
+9	fib_pair	p3	19	524288	span	0.579			first digest layer
+9	fib_pair	p3	19	524288	span	0.546			fold_matrix
+9	fib_pair	p3	19	524288	span	0.545			fold_matrix
+9	fib_pair	p3	19	524288	span	0.491			build merkle tree
+9	fib_pair	p3	19	524288	span	0.462			second_half
+9	fib_pair	p3	19	524288	span	0.432			fold_matrix
+9	fib_pair	p3	19	524288	span	0.417			second_half_general
+9	fib_pair	p3	19	524288	span	0.410			build merkle tree
+9	fib_pair	p3	19	524288	span	0.391			fold_matrix
+9	fib_pair	p3	19	524288	span	0.381			fold_matrix
+9	fib_pair	p3	19	524288	span	0.379			build merkle tree
+9	fib_pair	p3	19	524288	span	0.340			fold_matrix
+9	fib_pair	p3	19	524288	span	0.329			first digest layer
+9	fib_pair	p3	19	524288	span	0.320			fold_matrix
+9	fib_pair	p3	19	524288	span	0.308			fold_matrix
+9	fib_pair	p3	19	524288	span	0.305			reserve_exact
+9	fib_pair	p3	19	524288	span	0.304			first digest layer
+9	fib_pair	p3	19	524288	span	0.297			fold_matrix
+9	fib_pair	p3	19	524288	span	0.266			build merkle tree
+9	fib_pair	p3	19	524288	span	0.241			first digest layer
+9	fib_pair	p3	19	524288	span	0.234			build merkle tree
+9	fib_pair	p3	19	524288	span	0.231			build merkle tree
+9	fib_pair	p3	19	524288	span	0.158			first digest layer
+9	fib_pair	p3	19	524288	span	0.125			first digest layer
+9	fib_pair	p3	19	524288	span	0.112			first digest layer
+10	fib_pair	p3	19	524288	prove_total	357.679			
+10	fib_pair	p3	19	524288	span	357.644			prove
+10	fib_pair	p3	19	524288	span	357.642			prove_with_preprocessed
+10	fib_pair	p3	19	524288	span	136.686			open
+10	fib_pair	p3	19	524288	span	107.574			commit to trace data
+10	fib_pair	p3	19	524288	span	73.847			coset_lde_batch
+10	fib_pair	p3	19	524288	span	72.856			FRI prover
+10	fib_pair	p3	19	524288	span	69.362			commit phase
+10	fib_pair	p3	19	524288	span	54.976			quotient_values
+10	fib_pair	p3	19	524288	span	51.929			commit to quotient poly chunks
+10	fib_pair	p3	19	524288	span	33.719			build merkle tree
+10	fib_pair	p3	19	524288	span	26.061			reduce matrix quotient
+10	fib_pair	p3	19	524288	span	25.177			Compute Selectors
+10	fib_pair	p3	19	524288	span	24.924			coset_dft_oop
+10	fib_pair	p3	19	524288	span	23.993			build merkle tree
+10	fib_pair	p3	19	524288	span	23.110			coset_lde_batch
+10	fib_pair	p3	19	524288	span	20.818			coset_dft
+10	fib_pair	p3	19	524288	span	20.235			compute_inverse_denominators
+10	fib_pair	p3	19	524288	span	18.693			build merkle tree
+10	fib_pair	p3	19	524288	span	17.914			first digest layer
+10	fib_pair	p3	19	524288	span	11.439			coset_dft_oop
+10	fib_pair	p3	19	524288	span	10.554			first_half_general_oop
+10	fib_pair	p3	19	524288	span	9.758			first digest layer
+10	fib_pair	p3	19	524288	span	9.742			build merkle tree
+10	fib_pair	p3	19	524288	span	8.415			first digest layer
+10	fib_pair	p3	19	524288	span	8.018			coset_dft
+10	fib_pair	p3	19	524288	span	7.797			build merkle tree
+10	fib_pair	p3	19	524288	span	6.640			compress mat
+10	fib_pair	p3	19	524288	span	6.370			first_half_general
+10	fib_pair	p3	19	524288	span	6.071			first_half
+10	fib_pair	p3	19	524288	span	5.781			second_half
+10	fib_pair	p3	19	524288	span	5.773			fold_matrix
+10	fib_pair	p3	19	524288	span	4.802			second_half_general
+10	fib_pair	p3	19	524288	span	4.606			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	4.370			first digest layer
+10	fib_pair	p3	19	524288	span	4.286			second_half_general
+10	fib_pair	p3	19	524288	span	4.203			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	4.173			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	3.852			first_half_general_oop
+10	fib_pair	p3	19	524288	span	3.810			fold_matrix
+10	fib_pair	p3	19	524288	span	3.673			first digest layer
+10	fib_pair	p3	19	524288	span	3.647			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	3.462			query phase
+10	fib_pair	p3	19	524288	span	3.429			build merkle tree
+10	fib_pair	p3	19	524288	span	3.224			evaluate matrix
+10	fib_pair	p3	19	524288	span	3.221			compute opened values with Lagrange interpolation
+10	fib_pair	p3	19	524288	span	3.216			columnwise_dot_product
+10	fib_pair	p3	19	524288	span	2.895			batch_multiplicative_inverse
+10	fib_pair	p3	19	524288	span	2.684			reduce matrix quotient
+10	fib_pair	p3	19	524288	span	2.429			build merkle tree
+10	fib_pair	p3	19	524288	span	2.353			batch_multiplicative_inverse
+10	fib_pair	p3	19	524288	span	2.167			evaluate matrix
+10	fib_pair	p3	19	524288	span	2.160			compute opened values with Lagrange interpolation
+10	fib_pair	p3	19	524288	span	2.156			columnwise_dot_product
+10	fib_pair	p3	19	524288	span	1.749			batch_multiplicative_inverse
+10	fib_pair	p3	19	524288	span	1.663			fold_matrix
+10	fib_pair	p3	19	524288	span	1.658			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	1.628			compress mat
+10	fib_pair	p3	19	524288	span	1.599			build merkle tree
+10	fib_pair	p3	19	524288	span	1.538			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	1.531			fold_matrix
+10	fib_pair	p3	19	524288	span	1.429			build merkle tree
+10	fib_pair	p3	19	524288	span	1.222			fold_matrix
+10	fib_pair	p3	19	524288	span	1.022			reserve_exact
+10	fib_pair	p3	19	524288	span	0.985			fold_matrix
+10	fib_pair	p3	19	524288	span	0.962			batch_multiplicative_inverse
+10	fib_pair	p3	19	524288	span	0.891			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	0.824			build merkle tree
+10	fib_pair	p3	19	524288	span	0.812			first_half_general
+10	fib_pair	p3	19	524288	span	0.775			reverse_matrix_index_bits
+10	fib_pair	p3	19	524288	span	0.751			build merkle tree
+10	fib_pair	p3	19	524288	span	0.749			fold_matrix
+10	fib_pair	p3	19	524288	span	0.743			evaluate matrix
+10	fib_pair	p3	19	524288	span	0.742			compute opened values with Lagrange interpolation
+10	fib_pair	p3	19	524288	span	0.740			columnwise_dot_product
+10	fib_pair	p3	19	524288	span	0.691			first digest layer
+10	fib_pair	p3	19	524288	span	0.673			build merkle tree
+10	fib_pair	p3	19	524288	span	0.611			first_half
+10	fib_pair	p3	19	524288	span	0.556			build merkle tree
+10	fib_pair	p3	19	524288	span	0.535			fold_matrix
+10	fib_pair	p3	19	524288	span	0.490			first digest layer
+10	fib_pair	p3	19	524288	span	0.489			fold_matrix
+10	fib_pair	p3	19	524288	span	0.484			second_half_general
+10	fib_pair	p3	19	524288	span	0.473			fold_matrix
+10	fib_pair	p3	19	524288	span	0.461			build merkle tree
+10	fib_pair	p3	19	524288	span	0.452			second_half
+10	fib_pair	p3	19	524288	span	0.435			fold_matrix
+10	fib_pair	p3	19	524288	span	0.433			second_half_general
+10	fib_pair	p3	19	524288	span	0.402			first digest layer
+10	fib_pair	p3	19	524288	span	0.399			fold_matrix
+10	fib_pair	p3	19	524288	span	0.388			fold_matrix
+10	fib_pair	p3	19	524288	span	0.382			first digest layer
+10	fib_pair	p3	19	524288	span	0.351			fold_matrix
+10	fib_pair	p3	19	524288	span	0.326			build merkle tree
+10	fib_pair	p3	19	524288	span	0.295			fold_matrix
+10	fib_pair	p3	19	524288	span	0.284			build merkle tree
+10	fib_pair	p3	19	524288	span	0.270			fold_matrix
+10	fib_pair	p3	19	524288	span	0.261			reserve_exact
+10	fib_pair	p3	19	524288	span	0.248			build merkle tree
+10	fib_pair	p3	19	524288	span	0.223			first digest layer
+10	fib_pair	p3	19	524288	span	0.198			build merkle tree
+10	fib_pair	p3	19	524288	span	0.128			first digest layer
+10	fib_pair	p3	19	524288	span	0.123			first digest layer
+10	fib_pair	p3	19	524288	span	0.106			build merkle tree
+10	fib_pair	p3	19	524288	span	0.101			first digest layer
+10	fib_pair	p3	19	524288	span	0.101			first digest layer
