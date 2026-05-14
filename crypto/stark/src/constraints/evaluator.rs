@@ -32,6 +32,143 @@ where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
 {
+    /// Linear combination `sum_i evals[i] * coeffs[i]` for F×E (base eval × ext coeff).
+    ///
+    /// Uses 8 parallel accumulators to allow the compiler to keep multiple
+    /// mul-add chains in flight, hiding multiply-accumulate latency.
+    /// Returns `initial + sum`, so callers can chain (e.g., factor out a shared
+    /// zerofier multiplication at the end).
+    #[inline(always)]
+    fn batched_lin_comb_base(
+        evals: &[FieldElement<Field>],
+        coeffs: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let mut a0 = FieldElement::<FieldExtension>::zero();
+        let mut a1 = FieldElement::<FieldExtension>::zero();
+        let mut a2 = FieldElement::<FieldExtension>::zero();
+        let mut a3 = FieldElement::<FieldExtension>::zero();
+        let mut a4 = FieldElement::<FieldExtension>::zero();
+        let mut a5 = FieldElement::<FieldExtension>::zero();
+        let mut a6 = FieldElement::<FieldExtension>::zero();
+        let mut a7 = FieldElement::<FieldExtension>::zero();
+
+        let n = evals.len().min(coeffs.len());
+        let mut idx = 0;
+        while idx + 8 <= n {
+            a0 = a0 + &evals[idx] * &coeffs[idx];
+            a1 = a1 + &evals[idx + 1] * &coeffs[idx + 1];
+            a2 = a2 + &evals[idx + 2] * &coeffs[idx + 2];
+            a3 = a3 + &evals[idx + 3] * &coeffs[idx + 3];
+            a4 = a4 + &evals[idx + 4] * &coeffs[idx + 4];
+            a5 = a5 + &evals[idx + 5] * &coeffs[idx + 5];
+            a6 = a6 + &evals[idx + 6] * &coeffs[idx + 6];
+            a7 = a7 + &evals[idx + 7] * &coeffs[idx + 7];
+            idx += 8;
+        }
+        // Tail (< 8 elements remaining), keep each one in its own lane so the
+        // dependency chain stays short.
+        if idx < n {
+            a0 = a0 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a1 = a1 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a2 = a2 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a3 = a3 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a4 = a4 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a5 = a5 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a6 = a6 + &evals[idx] * &coeffs[idx];
+        }
+        // Pairwise tree reduction (3 levels, 7 adds; balanced for ILP).
+        let p01 = a0 + a1;
+        let p23 = a2 + a3;
+        let p45 = a4 + a5;
+        let p67 = a6 + a7;
+        let q0 = p01 + p23;
+        let q1 = p45 + p67;
+        q0 + q1
+    }
+
+    /// Linear combination `sum_i evals[i] * coeffs[i]` for E×E (extension × extension).
+    /// Same structure as `batched_lin_comb_base` but with extension-field evals.
+    #[inline(always)]
+    fn batched_lin_comb_ext(
+        evals: &[FieldElement<FieldExtension>],
+        coeffs: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let mut a0 = FieldElement::<FieldExtension>::zero();
+        let mut a1 = FieldElement::<FieldExtension>::zero();
+        let mut a2 = FieldElement::<FieldExtension>::zero();
+        let mut a3 = FieldElement::<FieldExtension>::zero();
+        let mut a4 = FieldElement::<FieldExtension>::zero();
+        let mut a5 = FieldElement::<FieldExtension>::zero();
+        let mut a6 = FieldElement::<FieldExtension>::zero();
+        let mut a7 = FieldElement::<FieldExtension>::zero();
+
+        let n = evals.len().min(coeffs.len());
+        let mut idx = 0;
+        while idx + 8 <= n {
+            a0 = a0 + &evals[idx] * &coeffs[idx];
+            a1 = a1 + &evals[idx + 1] * &coeffs[idx + 1];
+            a2 = a2 + &evals[idx + 2] * &coeffs[idx + 2];
+            a3 = a3 + &evals[idx + 3] * &coeffs[idx + 3];
+            a4 = a4 + &evals[idx + 4] * &coeffs[idx + 4];
+            a5 = a5 + &evals[idx + 5] * &coeffs[idx + 5];
+            a6 = a6 + &evals[idx + 6] * &coeffs[idx + 6];
+            a7 = a7 + &evals[idx + 7] * &coeffs[idx + 7];
+            idx += 8;
+        }
+        if idx < n {
+            a0 = a0 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a1 = a1 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a2 = a2 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a3 = a3 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a4 = a4 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a5 = a5 + &evals[idx] * &coeffs[idx];
+            idx += 1;
+        }
+        if idx < n {
+            a6 = a6 + &evals[idx] * &coeffs[idx];
+        }
+        let p01 = a0 + a1;
+        let p23 = a2 + a3;
+        let p45 = a4 + a5;
+        let p67 = a6 + a7;
+        let q0 = p01 + p23;
+        let q1 = p45 + p67;
+        q0 + q1
+    }
+
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
     /// Uses `map_init` for per-thread buffer reuse (transition evaluations + periodic values)
@@ -116,18 +253,18 @@ where
 
                         let acc_transition = if is_uniform {
                             // All constraints share one zerofier: factor it out of the sum.
+                            // Use 8-way tree-sum accumulators (batched_lin_comb_*) so the
+                            // compiler can keep multiple mul-add chains in flight (ILP).
                             let z = zerofier_data.get_uniform(i);
-                            // F×E inner product for base constraints (3 muls per term)
-                            let mut sum = base_buf
-                                .iter()
-                                .zip(&transition_coefficients[..num_base])
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                            // E×E for extension constraints (9 muls per term)
-                            sum = transition_buf[num_base..]
-                                .iter()
-                                .zip(&transition_coefficients[num_base..])
-                                .fold(sum, |acc, (eval, beta)| acc + eval * beta);
-                            z * &sum
+                            let base_sum = Self::batched_lin_comb_base(
+                                base_buf,
+                                &transition_coefficients[..num_base],
+                            );
+                            let ext_sum = Self::batched_lin_comb_ext(
+                                &transition_buf[num_base..],
+                                &transition_coefficients[num_base..],
+                            );
+                            z * &(base_sum + ext_sum)
                         } else {
                             let mut sum = base_buf
                                 .iter()
@@ -183,17 +320,15 @@ where
 
                     let acc_transition = if is_uniform {
                         let z = zerofier_data.get_uniform(i);
-                        // F×E inner product for base constraints (3 muls per term)
-                        let mut sum = base_buf
-                            .iter()
-                            .zip(&transition_coefficients[..num_base])
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                        // E×E for extension constraints (9 muls per term)
-                        sum = transition_buf[num_base..]
-                            .iter()
-                            .zip(&transition_coefficients[num_base..])
-                            .fold(sum, |acc, (eval, beta)| acc + eval * beta);
-                        z * &sum
+                        let base_sum = Self::batched_lin_comb_base(
+                            &base_buf,
+                            &transition_coefficients[..num_base],
+                        );
+                        let ext_sum = Self::batched_lin_comb_ext(
+                            &transition_buf[num_base..],
+                            &transition_coefficients[num_base..],
+                        );
+                        z * &(base_sum + ext_sum)
                     } else {
                         let mut sum = base_buf
                             .iter()
