@@ -253,65 +253,56 @@ unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
 
 /// Compute a0*b0 + a1*b1 mod p in a single reduction pass.
 ///
-/// Instead of reducing each product separately (2 reduce128 calls),
-/// this sums the u128 products and reduces once. When the sum overflows u128,
-/// we correct by adding 2^128 mod p = EPSILON^2 = (2^32 - 1)^2.
-///
-/// This is the critical building block for extension field multiplication:
-/// each Fp2 mul needs two dot products instead of three separate mul+reduce.
+/// If the two u128 products overflow when summed, the true value exceeds 2^128,
+/// so we subtract OFFSET (a multiple of p larger than any single product sum)
+/// before reducing. Correct because OFFSET ≡ 0 (mod p).
 #[inline(always)]
 pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
+    // OFFSET = p * 2^64 + p * 2^32 - p = p * (2^64 + 2^32 - 1)
+    // It is a multiple of p and larger than the maximum sum of two u64 products.
+    const OFFSET: u128 = ((GOLDILOCKS_PRIME as u128) << 64) - (GOLDILOCKS_PRIME as u128)
+        + ((GOLDILOCKS_PRIME as u128) << 32);
+
     let prod0 = (a0 as u128) * (b0 as u128);
     let prod1 = (a1 as u128) * (b1 as u128);
-    let (sum, overflow) = prod0.overflowing_add(prod1);
-
-    let reduced = reduce128(sum);
-
-    if overflow {
-        // True value is sum + 2^128. Since 2^128 mod p = EPSILON^2,
-        // add EPSILON^2 = (2^32-1)^2 = 2^64 - 2^33 + 1.
-        // Safety: reduced < 2^64 (it's a u64), EPSILON_SQ < p,
-        // so reduced + EPSILON_SQ < 2^64 + p, satisfying add_no_canonicalize's precondition.
-        branch_hint();
-        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
-        unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) }
+    let (sum, over) = prod0.overflowing_add(prod1);
+    // Defining sum_corr unconditionally helps the compiler emit a cmov.
+    let sum_corr = sum.wrapping_sub(OFFSET);
+    if over {
+        reduce128(sum_corr)
     } else {
-        reduced
+        reduce128(sum)
     }
 }
 
 /// Compute a0*b0 + a1*b1 + a2*b2 mod p in a single reduction pass.
 ///
-/// Accumulates three u128 products, tracking overflow count (at most 2).
-/// Each overflow adds 2^128 mod p = EPSILON^2 to the result.
-/// This is the critical building block for Fp3 multiplication (the extension
-/// field used by the VM's STARK prover).
+/// Branchless hi/lo accumulator: accumulate each u128 product into a
+/// (lo: u128, hi: u64) pair, where `hi` collects the upper 32 bits of each
+/// product. Then exploit 2^96 ≡ -1 (mod p): the final value mod p is
+/// `lo - hi`, which we compute as `lo + (p - hi)`.
+///
+/// Assumes inputs are canonical (in [0, p)) so each u64*u64 product fits in u128.
 #[inline(always)]
 pub(crate) fn dot_product_3(a0: u64, b0: u64, a1: u64, b1: u64, a2: u64, b2: u64) -> u64 {
     let prod0 = (a0 as u128) * (b0 as u128);
     let prod1 = (a1 as u128) * (b1 as u128);
     let prod2 = (a2 as u128) * (b2 as u128);
 
-    let (sum01, over1) = prod0.overflowing_add(prod1);
-    let (sum012, over2) = sum01.overflowing_add(prod2);
-    let overflow_count = (over1 as u64) + (over2 as u64);
+    // Accumulate top-32-bit fragments into `hi`, full products into `lo`.
+    // For canonical inputs each prod < p^2 < 2^128, so top 32 bits fit in 32 bits.
+    let hi0 = (prod0 >> 96) as u64;
+    let hi1 = (prod1 >> 96) as u64;
+    let hi2 = (prod2 >> 96) as u64;
+    let hi = hi0 + hi1 + hi2;
 
-    let mut reduced = reduce128(sum012);
+    let lo_plus_hi = prod0.wrapping_add(prod1).wrapping_add(prod2);
+    // Remove the (hi << 96) contribution that was double-counted in lo_plus_hi.
+    let lo = lo_plus_hi.wrapping_sub((hi as u128) << 96);
 
-    if overflow_count > 0 {
-        // Each overflow represents +2^128 to the true sum.
-        // 2^128 mod p = EPSILON^2 = (2^32 - 1)^2 = 2^64 - 2^33 + 1.
-        // Safety: reduced < 2^64, EPSILON_SQ < p, so sum < 2^64 + p.
-        branch_hint();
-        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
-        reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
-        if overflow_count > 1 {
-            branch_hint();
-            reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
-        }
-    }
-
-    reduced
+    // Apply 2^96 ≡ -1 (mod p): true value mod p = lo + (p - hi).
+    let sum = lo.wrapping_add((GOLDILOCKS_PRIME - hi) as u128);
+    reduce128(sum)
 }
 
 /// Multiply a raw u64 field element by 7 (the Fp2 non-residue).

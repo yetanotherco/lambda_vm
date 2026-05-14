@@ -376,31 +376,35 @@ impl IsField for Degree3GoldilocksExtensionField {
         let a0_a1 = a0 * a1;
         let a0_a2 = a0 * a2;
         let a1_a2 = a1 * a2;
+
+        // Group norm terms by squared factor:
+        //   t1 = a0 + 2*a2, t2 = a1 - a0, t3 = a2 + a0 - a1
+        let two_a2 = a2.double();
+        let t1 = a0 + two_a2;
+        let t2 = a1 - a0;
+        let t3 = a2 + a0 - a1;
+
+        // norm_partial = a0^2*t1 + a1^2*t2 + a2^2*t3  (3 muls, 1 reduce128)
+        let norm_partial = FpE::from_raw(dot_product_3(
+            *a0_sq.value(),
+            *t1.value(),
+            *a1_sq.value(),
+            *t2.value(),
+            *a2_sq.value(),
+            *t3.value(),
+        ));
+
+        // 3 * a0*a1*a2 = (a0*a1) * a2, then triple
         let a0_a1_a2 = a0_a1 * a2;
-
-        let a0_cubed = a0_sq * a0;
-        let a1_cubed = a1_sq * a1;
-        let a2_cubed = a2_sq * a2;
-        let a0sq_a2 = a0_sq * a2;
-        let a0_a2sq = a0 * a2_sq;
-        let a0_a1sq = a0 * a1_sq;
-        let a1_a2sq = a1 * a2_sq;
-
-        // 3 * a0_a1_a2 = a0_a1_a2.double() + a0_a1_a2
         let three_a0_a1_a2 = a0_a1_a2.double() + a0_a1_a2;
 
-        // N = a0^3 + 2*a0^2*a2 + a0*a2^2 - a0*a1^2 - 3*a0*a1*a2
-        //     + a1^3 + a2^3 - a1*a2^2
-        let norm = a0_cubed + a0sq_a2.double() + a0_a2sq - a0_a1sq - three_a0_a1_a2
-            + a1_cubed
-            + a2_cubed
-            - a1_a2sq;
+        let norm = norm_partial - three_a0_a1_a2;
 
         let norm_inv = norm.inv()?;
 
         // inv[0] = (a0^2 + 2*a0*a2 + a2^2 - a1^2 - a1*a2) / N
-        // inv[1] = (a2^2 - a0*a1) / N
-        // inv[2] = (a1^2 - a0*a2 - a2^2) / N
+        // inv[1] = (a2^2 - a0*a1)                          / N
+        // inv[2] = (a1^2 - a0*a2 - a2^2)                   / N
         Ok([
             (a0_sq + a0_a2.double() + a2_sq - a1_sq - a1_a2) * norm_inv,
             (a2_sq - a0_a1) * norm_inv,
