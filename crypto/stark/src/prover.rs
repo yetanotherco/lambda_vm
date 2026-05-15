@@ -1655,17 +1655,18 @@ pub trait IsStarkProver<
     /// Phase 4.3b chunks-protocol analogue of
     /// [`IsStarkProver::compute_deep_composition_poly_evaluations`].
     ///
-    /// Sums the chunks contribution (from [`compute_chunks_deep_contribution`])
-    /// and the trace contribution (from [`compute_trace_deep_contribution`])
-    /// element-wise at every LDE row. The result is the DEEP composition
-    /// polynomial that FRI consumes in the chunks protocol — degree `< N`
-    /// just like the single-H version, but parameterized by chunk OOD
-    /// openings `Q_c(z)` at `z` instead of composition-parts evaluations at
-    /// `z^num_parts`.
+    /// Fused implementation: one allocation of denominators, one batched
+    /// inverse, one hot loop summing chunks H-terms + trace terms. Mirrors
+    /// the single-H structure but uses the chunks H-term formula
+    /// `sum_c chunk_gammas[c] * (Q_c(x) - Q_c(z)) / (x - z)` instead of
+    /// `sum_j composition_gammas[j] * (H_j(x) - H_j(z^K)) / (x - z^K)`.
     ///
-    /// Not yet wired into `prove_rounds_2_to_4`; exercised by
-    /// `compute_deep_composition_poly_evaluations_chunks_is_degree_below_n`
-    /// in `prover_tests.rs`.
+    /// Phase 5.1.2 perf note: an earlier unfused variant (separate calls to
+    /// [`compute_chunks_deep_contribution`] + [`compute_trace_deep_contribution`]
+    /// summed element-wise) was responsible for ~7.5% of the chunks-vs-single-H
+    /// prove gap on fib_pair at log_rows=21 (EPYC bench, 2026-05-15). The two
+    /// free helpers remain available — they're useful for the per-piece tests —
+    /// but the prover-flow path now uses this fused version.
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations_chunks(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
@@ -1681,27 +1682,122 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let chunks_part = compute_chunks_deep_contribution(
-            &round_2_chunks.chunk_lde_evaluations,
-            &round_3_chunks.chunk_ood_evaluations,
-            z,
-            chunk_gammas,
-            &domain.lde_roots_of_unity_coset,
-        );
-        let trace_part = compute_trace_deep_contribution(
-            lde_trace,
-            &round_3_chunks.trace_ood_evaluations,
-            z,
-            domain,
-            primitive_root,
-            trace_terms_gammas,
-        );
-        debug_assert_eq!(chunks_part.len(), trace_part.len());
-        chunks_part
-            .into_iter()
-            .zip(trace_part)
-            .map(|(c, t)| c + t)
-            .collect()
+        let num_chunks = round_2_chunks.chunk_lde_evaluations.len();
+
+        // Number of trace eval points per column (e.g., z, z·w for next_row).
+        let num_eval_points = if trace_terms_gammas.is_empty() {
+            0
+        } else {
+            trace_terms_gammas[0].len()
+        };
+
+        // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points.
+        let mut z_shifted = Vec::with_capacity(num_eval_points);
+        let mut current_z = z.clone();
+        for _ in 0..num_eval_points {
+            z_shifted.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
+
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
+
+        // Precompute all inverse denominators at every LDE point in one batched
+        // inverse. The chunks H-term shares the same pole `z` across all chunks
+        // (unlike single-H, which uses `z^num_parts` for H-terms), so we only
+        // need lde_size H-term denoms total — not lde_size * num_chunks.
+        let lde_size = domain.lde_roots_of_unity_coset.len();
+        let num_denoms = lde_size * (1 + num_eval_points);
+        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
+
+        // H-term denominators: x_i - z (all 2N LDE points).
+        for i in 0..lde_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i];
+            denoms.push(x_i - z);
+        }
+        // Trace-term denominators: x_i - z_shifted[k] (all 2N LDE points).
+        for z_k in z_shifted.iter().take(num_eval_points) {
+            for i in 0..lde_size {
+                let x_i = &domain.lde_roots_of_unity_coset[i];
+                denoms.push(x_i - z_k);
+            }
+        }
+        FieldElement::inplace_batch_inverse(&mut denoms)
+            .expect("z must lie outside the LDE coset");
+
+        let inv_h = &denoms[0..lde_size];
+
+        // OOD evaluations.
+        let chunk_ood = &round_3_chunks.chunk_ood_evaluations;
+        let trace_ood_columns = round_3_chunks.trace_ood_evaluations.columns();
+        let num_total_cols = num_main_cols + num_aux_cols;
+
+        // Precompute per-eval-point OOD compressed values:
+        //   ood_compressed[k] = sum_j trace_terms_gammas[j][k] * trace_ood[j][k]
+        let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::zero(); num_eval_points];
+        for j in 0..num_total_cols {
+            let ood_evals_j = &trace_ood_columns[j];
+            let gammas_j = &trace_terms_gammas[j];
+            for k in 0..num_eval_points {
+                ood_compressed[k] += &gammas_j[k] * &ood_evals_j[k];
+            }
+        }
+
+        // Compressed LDE traces, one row vector per eval point:
+        //   compressed[k][i] = sum_j trace_terms_gammas[j][k] * lde_trace[i, j]
+        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|k| {
+                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
+                    .map(|j| &trace_terms_gammas[j][k])
+                    .collect();
+                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
+                    .map(|j| &trace_terms_gammas[num_main_cols + j][k])
+                    .collect();
+
+                #[cfg(feature = "parallel")]
+                let iter = (0..lde_size).into_par_iter();
+                #[cfg(not(feature = "parallel"))]
+                let iter = 0..lde_size;
+
+                iter.map(|i| {
+                    let mut sum = FieldElement::<FieldExtension>::zero();
+                    for (j, gamma) in main_gammas.iter().enumerate() {
+                        sum += lde_trace.get_main(i, j) * *gamma;
+                    }
+                    for (j, gamma) in aux_gammas.iter().enumerate() {
+                        sum += lde_trace.get_aux(i, j) * *gamma;
+                    }
+                    sum
+                })
+                .collect()
+            })
+            .collect();
+
+        // Single fused hot loop at every LDE row:
+        //   result[i] = sum_c chunk_gammas[c] * (Q_c[i] - Q_c(z)) * inv_h[i]
+        //             + sum_k inv_trace[k][i] * (compressed[k][i] - ood_compressed[k])
+        #[cfg(feature = "parallel")]
+        let iter = (0..lde_size).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..lde_size;
+
+        iter.map(|i| {
+            let mut result = FieldElement::<FieldExtension>::zero();
+            // Chunks H-terms (all share the same `inv_h[i] = 1 / (x_i - z)`).
+            for c in 0..num_chunks {
+                let q_c_val = &round_2_chunks.chunk_lde_evaluations[c][i];
+                let q_c_ood = &chunk_ood[c];
+                result += &chunk_gammas[c] * (q_c_val - q_c_ood) * &inv_h[i];
+            }
+            // Trace terms (one denom per eval point).
+            for k in 0..num_eval_points {
+                let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
+                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
+            }
+            result
+        })
+        .collect()
     }
 
     /// Returns the result of the fourth round of the STARK Prove protocol.

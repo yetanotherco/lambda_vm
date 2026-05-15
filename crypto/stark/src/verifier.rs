@@ -1557,20 +1557,31 @@ pub trait IsStarkVerifier<
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
 
-        // Recompose claimed H(z) from chunk OOD evaluations via P3-style
-        // Lagrange-over-cosets identity. d_max is derived from the AIR's
-        // composition_poly_degree_bound; num_chunks must match the proof.
+        // Verify the proof's chunk count matches the AIR's d_max. We compute
+        // expected_num_chunks directly (without building a QuotientDomain)
+        // because the full Domain construction allocates `roots_of_unity_coset`
+        // of size N — wasted work in the num_chunks=1 fast path below, and
+        // measurable on large traces (~5ms at log_rows=21 ≈ 18% of single-H's
+        // verify_s on the EPYC bench server, 2026-05-15).
         let d_max = air.composition_poly_degree_bound(trace_length) / trace_length;
-        let qd = QuotientDomain::<Field>::from_parts(
-            trace_length,
-            domain.coset_offset.clone(),
-            d_max,
-        );
-        if qd.num_chunks != proof.quotient_chunk_ood_evaluations.len() {
+        let expected_num_chunks = d_max.next_power_of_two().max(1);
+        if expected_num_chunks != proof.quotient_chunk_ood_evaluations.len() {
             return false;
         }
-        let composition_poly_claimed_ood_evaluation =
-            qd.recompose_at(&proof.quotient_chunk_ood_evaluations, &challenges.z);
+
+        let composition_poly_claimed_ood_evaluation = if expected_num_chunks == 1 {
+            // For num_chunks=1, recompose_at is the identity: the empty Lagrange
+            // product gives zps[0] = 1, so H(z) = 1 * Q_0(z) = chunk_ood[0].
+            // Skip the QuotientDomain construction entirely.
+            proof.quotient_chunk_ood_evaluations[0].clone()
+        } else {
+            let qd = QuotientDomain::<Field>::from_parts(
+                trace_length,
+                domain.coset_offset.clone(),
+                d_max,
+            );
+            qd.recompose_at(&proof.quotient_chunk_ood_evaluations, &challenges.z)
+        };
 
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
     }
