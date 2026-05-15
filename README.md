@@ -64,14 +64,6 @@ sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
   cp -r /opt/riscv64-newlib/riscv64-unknown-elf/lib /opt/lambda-vm-sysroot/                
 ```
 
-#### Install the dependencies
-
-```sh
-make deps
-```
-
-**Note:** At the moment, `make deps` only works on macOS.
-
 Then, you can check that the executor works by running:
 
 ```sh
@@ -122,6 +114,12 @@ cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/a
 
 For the full CLI reference — including private inputs, blowup factor tuning, timing, and flamegraph profiling — see [`bin/cli/README.md`](./bin/cli/README.md).
 
+### Writing a guest program
+
+Guest programs are written in Rust (or RISC-V assembly) and cross-compiled to the custom RV64IM target. The guest SDK [`lambda-vm-syscalls`](./syscalls/README.md) provides the syscalls a program uses to read private input, commit public output, halt, and call precompiles like Keccak. The [`executor`](./executor/README.md) crate is what loads your compiled ELF and emits the per-instruction logs the prover consumes.
+
+To add a new Rust guest, drop a project under `executor/programs/rust/<name>/` and run `make compile-programs-rust`. See [`executor/programs/rust/`](./executor/programs/rust/) for examples (`fibonacci`, `commit`, `keccak`, `hashmap`, …).
+
 ## Design choices
 
 - The Instruction Set Architecture is RISCV64IM
@@ -145,7 +143,7 @@ High-level documentation lives in [`docs/`](./docs/):
 
 - [Overview of VM flow](./docs/general_flow.md) — the pipeline from source code to proof
 - [Proof system overview](./docs/cryptography/proof_system.md) — design goals and primitives
-- [Lookup arguments](./docs/cryptography/lookup.md) — how tables are linked
+- [Lookup arguments](./docs/cryptography/lookup.md) — how tables are linked via LogUp
 - [Recommended reading](./docs/other_resources.md) — papers and tutorials
 
 ### Specification
@@ -168,6 +166,7 @@ See [`spec/README.md`](./spec/README.md) for full setup instructions.
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
+| `make test-math-cuda` | math-cuda parity tests (requires NVIDIA GPU + nvcc) |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 | `make clippy` | Run clippy on all crates |
@@ -213,6 +212,12 @@ This profiles the synthetic `fibonacci_multi_column` STARK example in `crypto/st
 
 ```sh
 samply record cargo bench --bench profile_vm_prover --features parallel
+```
+
+For a quick GPU microbench (requires an NVIDIA GPU + `nvcc`):
+
+```sh
+make bench-math-cuda
 ```
 
 ## Debug Checks
