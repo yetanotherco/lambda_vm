@@ -97,6 +97,117 @@ impl<F: IsFFTField> Domain<F> {
     }
 }
 
+/// Quotient evaluation domain for the chunks-based prover (Phase 1 of the
+/// migration to a Plonky3-style commitment).
+///
+/// Sized as `num_chunks * trace_length` where `num_chunks = next_pow2(d_max)`.
+/// For `d_max=1` AIRs (like fib_pair) the quotient domain coincides with the
+/// trace coset (size N). For `d_max=3` (e.g., Keccak) it has size 4N.
+///
+/// Each evaluation point at index `i` is `coset_offset * omega^i`, where
+/// `omega` is the primitive root of unity of order `num_chunks * trace_length`.
+///
+/// This struct is added in parallel to `Domain` while the chunks code path
+/// matures. The existing single-H prover does NOT use this struct.
+pub struct QuotientDomain<F: IsFFTField> {
+    /// Number of chunks the quotient is split into = `next_pow2(d_max)`.
+    pub num_chunks: usize,
+    /// Trace domain size N. Each chunk will be size N.
+    pub trace_length: usize,
+    /// Total quotient evaluation domain size = `num_chunks * trace_length`.
+    pub size: usize,
+    /// Coset offset (matches `Domain.coset_offset`, typically the field generator).
+    pub coset_offset: FieldElement<F>,
+    /// Pre-computed coset points: `coset_offset * omega^i` for `i in 0..size`,
+    /// where `omega` has order `size`.
+    pub roots_of_unity_coset: Vec<FieldElement<F>>,
+    /// `log2(size)`, useful for FFT routines.
+    pub log_size: u32,
+}
+
+impl<F: IsFFTField> QuotientDomain<F> {
+    /// Construct a quotient domain for an AIR with the given `d_max` (maximum
+    /// constraint degree). The size is `next_pow2(d_max) * trace_length`.
+    ///
+    /// Assumes `domain.interpolation_domain_size` is a power of two (Lambda's
+    /// existing invariant).
+    pub fn new(domain: &Domain<F>, d_max: usize) -> Self {
+        let num_chunks = d_max.next_power_of_two().max(1);
+        let trace_length = domain.interpolation_domain_size;
+        let size = num_chunks * trace_length;
+        let log_size = size.trailing_zeros();
+        let coset_offset = domain.coset_offset.clone();
+        let roots_of_unity_coset =
+            get_powers_of_primitive_root_coset(log_size as u64, size, &coset_offset).unwrap();
+        Self {
+            num_chunks,
+            trace_length,
+            size,
+            coset_offset,
+            roots_of_unity_coset,
+            log_size,
+        }
+    }
+
+    /// Get the i-th point of the quotient domain (`coset_offset * omega^i`).
+    #[inline]
+    pub fn point_at(&self, index: usize) -> &FieldElement<F> {
+        &self.roots_of_unity_coset[index]
+    }
+
+    /// Split an eval vector of size `self.size` into `self.num_chunks` chunks
+    /// of size `self.trace_length` each, using P3-style **interleaved** split:
+    ///
+    /// - chunk_0 gets indices `0, num_chunks, 2*num_chunks, ...`
+    /// - chunk_1 gets indices `1, num_chunks+1, 2*num_chunks+1, ...`
+    /// - chunk_i gets indices `i, i+num_chunks, i+2*num_chunks, ...`
+    ///
+    /// This matches `commit_quotient` in
+    /// `plonky3/commit/src/domain.rs::split_evals` (interleaved decomposition
+    /// of a coset `gH` into disjoint sub-cosets `g·h^i·K`).
+    ///
+    /// Each resulting chunk represents the evaluations of an implicit
+    /// polynomial `P_i(x)` of degree `< trace_length` on the sub-coset
+    /// `{coset_offset · omega^i · (omega^num_chunks)^j : j=0..trace_length-1}`.
+    pub fn split_evals_interleaved<E: IsField>(
+        &self,
+        evals: &[FieldElement<E>],
+    ) -> Vec<Vec<FieldElement<E>>> {
+        assert_eq!(
+            evals.len(),
+            self.size,
+            "split_evals_interleaved: evals.len() = {} but quotient_domain.size = {}",
+            evals.len(),
+            self.size,
+        );
+        let num_chunks = self.num_chunks;
+        let chunk_size = self.trace_length;
+        let mut chunks: Vec<Vec<FieldElement<E>>> = (0..num_chunks)
+            .map(|_| Vec::with_capacity(chunk_size))
+            .collect();
+        for (idx, val) in evals.iter().enumerate() {
+            chunks[idx % num_chunks].push(val.clone());
+        }
+        chunks
+    }
+
+    /// Return the sub-coset offset and generator for chunk `i`.
+    /// - Sub-coset offset: `coset_offset · omega^i`
+    /// - Sub-coset generator: `omega^num_chunks` (which has order `trace_length`)
+    pub fn chunk_subdomain(&self, chunk_idx: usize) -> (FieldElement<F>, FieldElement<F>) {
+        assert!(chunk_idx < self.num_chunks);
+        let sub_offset = self.roots_of_unity_coset[chunk_idx].clone();
+        let sub_generator = if self.size == self.num_chunks {
+            // chunk_size = 1 — degenerate, sub_generator is irrelevant
+            FieldElement::one()
+        } else {
+            // omega^num_chunks
+            self.roots_of_unity_coset[self.num_chunks].clone() * &self.coset_offset.inv().unwrap()
+        };
+        (sub_offset, sub_generator)
+    }
+}
+
 /// Lightweight domain without pre-computed roots of unity. Used by the verifier
 /// which only needs to compute specific elements on-demand.
 /// This avoids allocating O(n) memory for domains that would be O(millions) of elements.

@@ -1,7 +1,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
 use crate::{
-    domain::{Domain, DomainConstants},
+    domain::{Domain, DomainConstants, QuotientDomain},
     examples::{
         quadratic_air::QuadraticAIR,
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
@@ -516,5 +516,96 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
             "deep evaluation mismatch at LDE index {i}: direct-2N path diverges from \
              iFFT+FFT-extended path"
         );
+    }
+}
+
+/// Phase 1.2 sanity test for the chunks-based commitment migration.
+///
+/// Validates that `QuotientDomain::split_evals_interleaved` produces chunks
+/// that correspond to the evaluations of a polynomial H(x) (of degree < d_max·N)
+/// on the disjoint sub-cosets of the quotient domain.
+///
+/// Concretely: for a random polynomial H of degree < d_max·N, evaluated on a
+/// quotient domain of size d_max·N, the interleaved split should yield
+/// `num_chunks = next_pow2(d_max)` vectors of size N each, where each
+/// `chunks[i][j]` equals `H(coset_offset · omega^(i + j·num_chunks))`.
+///
+/// This validates the split semantics before any prover code changes.
+#[test]
+fn quotient_domain_interleaved_split_matches_subcoset_evals() {
+    // Setup a Domain with trace_length = 8 (so we have a small example).
+    // We don't need a full AIR for this test; build the Domain manually.
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let coset_offset = Felt::from(3u64); // arbitrary non-trivial offset
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    // Try several d_max values to cover all branches:
+    //   d_max=1 → num_chunks=1 (degenerate)
+    //   d_max=2 → num_chunks=2
+    //   d_max=3 → num_chunks=4 (next_power_of_two)
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+        let num_chunks = qd.num_chunks;
+        let size = qd.size;
+        assert_eq!(num_chunks, d_max.next_power_of_two().max(1));
+        assert_eq!(size, num_chunks * trace_length);
+
+        // Build a random-looking polynomial H of degree size-1
+        // (i.e., < num_chunks * trace_length).
+        let h_coeffs: Vec<Felt> = (0..size).map(|i| Felt::from((7 * i + 13) as u64)).collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+
+        // Evaluate H at every point of the quotient domain.
+        let h_evals: Vec<Felt> = (0..size)
+            .map(|i| h_poly.evaluate(qd.point_at(i)))
+            .collect();
+
+        // Split using the interleaved method.
+        let chunks = qd.split_evals_interleaved(&h_evals);
+
+        // Shape checks.
+        assert_eq!(chunks.len(), num_chunks);
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), trace_length);
+        }
+
+        // For each chunk_i, verify chunks[i][j] == H(coset_offset · omega^(i + j*num_chunks))
+        // which is exactly point_at(i + j*num_chunks).
+        for i in 0..num_chunks {
+            for j in 0..trace_length {
+                let global_idx = i + j * num_chunks;
+                let expected = h_poly.evaluate(qd.point_at(global_idx));
+                assert_eq!(
+                    chunks[i][j], expected,
+                    "chunk[{i}][{j}] does not match H evaluated at global index {global_idx} \
+                     (d_max={d_max}, num_chunks={num_chunks})",
+                );
+            }
+        }
     }
 }
