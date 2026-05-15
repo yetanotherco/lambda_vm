@@ -1946,6 +1946,7 @@ dependencies = [
  "rayon",
  "serde",
  "stark",
+ "tiny-keccak",
 ]
 
 [[package]]

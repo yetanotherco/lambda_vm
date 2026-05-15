@@ -18,15 +18,19 @@ The crate also provides a default `_start` that initialises the allocator, calls
 
 ## Example
 
-A minimal guest that reads private input, commits it back, and exits:
+A minimal guest that reads private input and commits a (non-secret) summary of it:
 
 ```rust
-use lambda_vm_syscalls as syscalls;
+use lambda_vm_syscalls::syscalls;
 
 pub fn main() {
-    let input: Vec<u8> = syscalls::syscalls::get_private_input();
-    syscalls::syscalls::print_string(&format!("Received {} bytes\n", input.len()));
-    syscalls::syscalls::commit(&input);
+    let input = syscalls::get_private_input();
+    syscalls::print_string(&format!("Received {} bytes\n", input.len()));
+
+    // Anything passed to `commit` becomes part of the proof's public output.
+    // Don't echo private input here — commit a derived value instead.
+    let len = (input.len() as u32).to_le_bytes();
+    syscalls::commit(&len);
 }
 ```
 

@@ -1,6 +1,6 @@
 # Lambda VM Prover
 
-STARK prover for the Lambda VM. Proves correct execution of RISC-V ELF binaries by generating a multi-table STARK proof (CPU, decoder, bitwise, LT, memory, load, MUL, DVRM, shift, branch, Keccak, …) and provides the matching native verifier.
+STARK prover for the Lambda VM. Proves correct execution of RISC-V ELF binaries by generating a multi-table STARK proof (CPU, decode, bitwise, branch, LT, shift, MUL, DVRM, MEMW, LOAD, page, register, halt, commit, keccak) and provides the matching native verifier.
 
 Published as `lambda-vm-prover`. Consumed by [`bin/cli`](../bin/cli) and by the benchmarks; you can also use it directly from Rust.
 

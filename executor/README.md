@@ -18,7 +18,7 @@ let result = executor.run()?;
 println!("Executed {} instructions", result.logs.len());
 ```
 
-For chunked execution (useful when you don't want to hold all logs in memory), drive the executor via `executor.resume()` in a loop until it returns `None`, then call `executor.finish()`. See [`bin/cli/src/main.rs`](../bin/cli/src/main.rs) for an example.
+For chunked execution (useful when you don't want to hold all logs in memory), drive the executor via `executor.resume()` in a loop until it yields `None`, then call `executor.finish()`. See [`bin/cli/src/main.rs`](../bin/cli/src/main.rs) for an example.
 
 ## Example programs
 

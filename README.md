@@ -26,11 +26,10 @@ Install Rust using [rustup](https://rustup.rs/):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Then install the nightly toolchain with the `rust-src` component (required for building `std` for the custom RISC-V target):
+Add the `rust-src` component to the pinned nightly toolchain used to build guest programs (required for building `std` for the custom RISC-V target — `make compile-programs-rust` will auto-fetch the toolchain itself):
 
 ```sh
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
+rustup component add rust-src --toolchain nightly-2026-02-01
 ```
 
 #### Compile sysroot
@@ -44,7 +43,7 @@ wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 
-##### Compile it directly             
+##### Compile them directly
     
 ```sh                                                
    sudo apt-get install -y autoconf automake autotools-dev curl python3 \                                           
@@ -206,8 +205,14 @@ You can run it with
 
 You can create a flamegraph for proof generation using the following target:
 
+```sh
+make flamegraph-prover
 ```
-  make flamegraph-prover
+
+This profiles the synthetic `fibonacci_multi_column` STARK example in `crypto/stark` (i.e. the STARK engine itself, not a real guest ELF). To profile the VM prover end-to-end on a real ELF, use the dedicated bench in the `prover` crate:
+
+```sh
+samply record cargo bench --bench profile_vm_prover --features parallel
 ```
 
 ## Debug Checks

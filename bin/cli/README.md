@@ -20,6 +20,9 @@ make compile-programs-asm
 
 # Rust guest programs → executor/program_artifacts/rust/*.elf  (needs the sysroot + nightly toolchain)
 make compile-programs-rust
+
+# Benchmark programs → executor/program_artifacts/bench/*.elf  (needs the sysroot + nightly toolchain)
+make compile-bench
 ```
 
 See the root [`README.md`](../../README.md) for the toolchain setup.
