@@ -15,7 +15,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bench_vs_plonky3::{lambda_fibonacci_pair, plonky3_config, plonky3_fibonacci};
+use bench_vs_plonky3::{
+    lambda_fibonacci_pair, lambda_quadratic_pair, plonky3_config, plonky3_fibonacci,
+};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -36,8 +38,20 @@ enum ProverKind {
     P3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Workload {
+    /// Fibonacci-pair (d_max=1) — degenerate chunks case, exercises the
+    /// `num_chunks=1` short-circuit. Both Lambda and P3 implementations exist.
+    FibPair,
+    /// Quadratic-pair (d_max=2, num_chunks=2) — first non-degenerate chunks
+    /// case. Lambda only; no P3 implementation. Used to validate chunks payoff
+    /// vs single-H on a workload where single-H pays `decompose_and_extend_d2`.
+    QuadraticPair,
+}
+
 struct Args {
     prover: ProverKind,
+    workload: Workload,
     log_rows: u32,
     num_sequences: usize,
     blowup: u8,
@@ -57,6 +71,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             prover: ProverKind::Lambda,
+            workload: Workload::FibPair,
             log_rows: 19,
             num_sequences: 16,
             blowup: 2,
@@ -70,6 +85,7 @@ impl Default for Args {
 fn print_usage() {
     eprintln!(
         "usage: prove_bench --prover {{lambda|lambda-chunks|p3}} \
+         [--workload {{fib_pair|quadratic_pair}}] \
          [--log-rows K] [--num-sequences N] \
          [--blowup B] [--queries Q] [--grinding G] [--breakdown]"
     );
@@ -90,6 +106,14 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("unknown prover: {other}")),
                 };
                 prover_set = true;
+            }
+            "--workload" => {
+                let v = iter.next().ok_or("--workload needs a value")?;
+                args.workload = match v.as_str() {
+                    "fib_pair" => Workload::FibPair,
+                    "quadratic_pair" => Workload::QuadraticPair,
+                    other => return Err(format!("unknown workload: {other}")),
+                };
             }
             "--log-rows" => {
                 let v = iter.next().ok_or("--log-rows needs a value")?;
@@ -136,6 +160,11 @@ fn parse_args() -> Result<Args, String> {
     if args.queries == 0 {
         return Err("--queries must be > 0".into());
     }
+    if args.prover == ProverKind::P3 && args.workload != Workload::FibPair {
+        return Err(
+            "--prover p3 only supports --workload fib_pair (no P3 quadratic_pair AIR yet)".into(),
+        );
+    }
     Ok(args)
 }
 
@@ -161,7 +190,7 @@ fn print_breakdown(
     extra: &str,
 ) {
     println!(
-        "BREAKDOWN\tworkload=fib_pair\tprover={prover}\tlog_rows={log_rows}\trows={rows}\tphase={phase}\tms={elapsed_ms:.3}{extra}"
+        "BREAKDOWN\tprover={prover}\tlog_rows={log_rows}\trows={rows}\tphase={phase}\tms={elapsed_ms:.3}{extra}"
     );
 }
 
@@ -424,6 +453,13 @@ fn peak_rss_kb() -> Option<u64> {
 }
 
 fn run_lambda(args: &Args) -> BenchMetrics {
+    match args.workload {
+        Workload::FibPair => run_lambda_fib_pair(args),
+        Workload::QuadraticPair => run_lambda_quadratic_pair(args),
+    }
+}
+
+fn run_lambda_fib_pair(args: &Args) -> BenchMetrics {
     let rows = 1usize << args.log_rows;
     let options = proof_options(args);
 
@@ -469,15 +505,67 @@ fn run_lambda(args: &Args) -> BenchMetrics {
     }
 }
 
+fn run_lambda_quadratic_pair(args: &Args) -> BenchMetrics {
+    let rows = 1usize << args.log_rows;
+    let options = proof_options(args);
+
+    let initial_values: Vec<(FE, FE)> = (0..args.num_sequences)
+        .map(|i| (FE::from((i + 1) as u64), FE::from((i + 3) as u64)))
+        .collect();
+
+    let mut trace = lambda_quadratic_pair::compute_trace::<F, E>(&initial_values, rows);
+    let pub_inputs = lambda_quadratic_pair::create_public_inputs(initial_values);
+    let air = lambda_quadratic_pair::QuadraticPairMultiColAIR::<F, E>::with_num_sequences(
+        &options,
+        args.num_sequences,
+    );
+
+    let start = Instant::now();
+    let proof = Prover::<F, E, _>::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("lambda prove failed (quadratic_pair single-H)");
+    let prove_s = start.elapsed().as_secs_f64();
+    if args.breakdown {
+        emit_lambda_breakdown(args, rows, ms(prove_s));
+    }
+
+    let proof_size_bytes = serde_cbor::to_vec(&proof)
+        .expect("lambda proof serialization failed")
+        .len();
+
+    let start = Instant::now();
+    let verified =
+        Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
+    let verify_s = start.elapsed().as_secs_f64();
+    assert!(verified, "lambda verify failed (quadratic_pair single-H)");
+
+    BenchMetrics {
+        prove_s,
+        verify_s,
+        proof_size_bytes,
+        peak_rss_kb: peak_rss_kb(),
+    }
+}
+
 /// Phase 5.1 chunks-protocol Lambda runner.
 ///
 /// Mirrors [`run_lambda`] but invokes `Prover::prove_chunks` and
-/// `Verifier::verify_chunks`. fib_pair AIR has `composition_poly_degree_bound
-/// = trace_length`, so this exercises the degenerate `num_chunks = 1` chunks
-/// path — useful as a sanity check that the chunks pipeline doesn't crash on
-/// production-sized inputs, but doesn't yet exercise the
-/// multi-chunk recompose. A higher-d_max bench AIR will be added separately.
+/// `Verifier::verify_chunks`. For fib_pair (d_max=1) this exercises the
+/// degenerate `num_chunks=1` short-circuit; for quadratic_pair (d_max=2)
+/// it exercises `num_chunks=2` — the first non-degenerate chunks case
+/// where the multi-chunk recompose actually runs.
 fn run_lambda_chunks(args: &Args) -> BenchMetrics {
+    match args.workload {
+        Workload::FibPair => run_lambda_chunks_fib_pair(args),
+        Workload::QuadraticPair => run_lambda_chunks_quadratic_pair(args),
+    }
+}
+
+fn run_lambda_chunks_fib_pair(args: &Args) -> BenchMetrics {
     let rows = 1usize << args.log_rows;
     let options = proof_options(args);
 
@@ -499,7 +587,7 @@ fn run_lambda_chunks(args: &Args) -> BenchMetrics {
         &pub_inputs,
         &mut DefaultTranscript::<E>::new(&[]),
     )
-    .expect("lambda chunks prove failed");
+    .expect("lambda chunks prove failed (fib_pair)");
     let prove_s = start.elapsed().as_secs_f64();
     if args.breakdown {
         print_breakdown(
@@ -520,7 +608,60 @@ fn run_lambda_chunks(args: &Args) -> BenchMetrics {
     let verified =
         Verifier::<F, E, _>::verify_chunks(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
     let verify_s = start.elapsed().as_secs_f64();
-    assert!(verified, "lambda chunks verify failed");
+    assert!(verified, "lambda chunks verify failed (fib_pair)");
+
+    BenchMetrics {
+        prove_s,
+        verify_s,
+        proof_size_bytes,
+        peak_rss_kb: peak_rss_kb(),
+    }
+}
+
+fn run_lambda_chunks_quadratic_pair(args: &Args) -> BenchMetrics {
+    let rows = 1usize << args.log_rows;
+    let options = proof_options(args);
+
+    let initial_values: Vec<(FE, FE)> = (0..args.num_sequences)
+        .map(|i| (FE::from((i + 1) as u64), FE::from((i + 3) as u64)))
+        .collect();
+
+    let mut trace = lambda_quadratic_pair::compute_trace::<F, E>(&initial_values, rows);
+    let pub_inputs = lambda_quadratic_pair::create_public_inputs(initial_values);
+    let air = lambda_quadratic_pair::QuadraticPairMultiColAIR::<F, E>::with_num_sequences(
+        &options,
+        args.num_sequences,
+    );
+
+    let start = Instant::now();
+    let proof = Prover::<F, E, _>::prove_chunks(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("lambda chunks prove failed (quadratic_pair, num_chunks=2)");
+    let prove_s = start.elapsed().as_secs_f64();
+    if args.breakdown {
+        print_breakdown(
+            "lambda-chunks",
+            args.log_rows,
+            rows,
+            "prove_total",
+            ms(prove_s),
+            "",
+        );
+    }
+
+    let proof_size_bytes = serde_cbor::to_vec(&proof)
+        .expect("lambda chunks proof serialization failed")
+        .len();
+
+    let start = Instant::now();
+    let verified =
+        Verifier::<F, E, _>::verify_chunks(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
+    let verify_s = start.elapsed().as_secs_f64();
+    assert!(verified, "lambda chunks verify failed (quadratic_pair)");
 
     BenchMetrics {
         prove_s,
@@ -604,6 +745,10 @@ fn main() -> ExitCode {
         ProverKind::LambdaChunks => "lambda-chunks",
         ProverKind::P3 => "p3",
     };
+    let workload_name = match args.workload {
+        Workload::FibPair => "fib_pair",
+        Workload::QuadraticPair => "quadratic_pair",
+    };
     let rows = 1usize << args.log_rows;
     let main_cols = 2 * args.num_sequences;
     let aux_cols = 0usize;
@@ -620,7 +765,7 @@ fn main() -> ExitCode {
     println!("Proof size: {} bytes", metrics.proof_size_bytes);
     println!("Peak RSS: {peak_rss_kb} KB");
     println!(
-        "METRICS\tworkload=fib_pair\tprover={prover_name}\tlog_rows={}\trows={rows}\t\
+        "METRICS\tworkload={workload_name}\tprover={prover_name}\tlog_rows={}\trows={rows}\t\
          num_sequences={}\tmain_cols={main_cols}\taux_cols={aux_cols}\ttables=1\t\
          logup=false\tblowup={}\tfri_queries={}\tgrinding={}\tprove_s={:.6}\t\
          verify_s={:.6}\tproof_size_bytes={}\tpeak_rss_kb={peak_rss_kb}\t\

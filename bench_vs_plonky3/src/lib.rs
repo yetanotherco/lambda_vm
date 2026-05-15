@@ -1,4 +1,5 @@
 pub mod lambda_fibonacci_pair;
+pub mod lambda_quadratic_pair;
 pub mod plonky3_config;
 pub mod plonky3_fibonacci;
 
@@ -27,6 +28,67 @@ mod tests {
             coset_offset: 3,
             grinding_factor: 0,
         }
+    }
+
+    /// Sanity test for the QuadraticPair AIR (d_max=2): build the trace, prove
+    /// with both the single-H and chunks paths, verify both. If this passes,
+    /// the AIR is well-formed and chunks gives a valid d_max=2 (num_chunks=2)
+    /// proof. Bench harness wiring depends on this.
+    #[test]
+    fn lambda_quadratic_pair_single_h_and_chunks_prove_verify() {
+        let num_sequences = 2;
+        let trace_length = 128; // 2^7
+        let proof_options = benchmark_proof_options();
+
+        let initial_values: Vec<(FE, FE)> = (0..num_sequences)
+            .map(|i| (FE::from((i + 1) as u64), FE::from((i + 3) as u64)))
+            .collect();
+
+        // Single-H path.
+        let mut trace = lambda_quadratic_pair::compute_trace::<F, E>(&initial_values, trace_length);
+        let pub_inputs = lambda_quadratic_pair::create_public_inputs(initial_values.clone());
+        let air = lambda_quadratic_pair::QuadraticPairMultiColAIR::<F, E>::with_num_sequences(
+            &proof_options,
+            num_sequences,
+        );
+
+        let proof = Prover::<F, E, _>::prove(
+            &air,
+            &mut trace,
+            &pub_inputs,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .expect("single-H prove must succeed on quadratic_pair");
+        assert!(
+            Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[])),
+            "single-H verify must accept quadratic_pair proof",
+        );
+
+        // Chunks path (num_chunks=2 — the non-degenerate case we want to validate).
+        let mut trace_chunks =
+            lambda_quadratic_pair::compute_trace::<F, E>(&initial_values, trace_length);
+        let pub_inputs_chunks =
+            lambda_quadratic_pair::create_public_inputs(initial_values.clone());
+        let proof_chunks = Prover::<F, E, _>::prove_chunks(
+            &air,
+            &mut trace_chunks,
+            &pub_inputs_chunks,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .expect("chunks prove must succeed on quadratic_pair");
+        assert_eq!(
+            proof_chunks.quotient_chunk_roots.len(),
+            2,
+            "quadratic_pair (d_max=2) must produce num_chunks=2",
+        );
+        assert!(
+            Verifier::<F, E, _>::verify_chunks(
+                &proof_chunks,
+                &air,
+                &mut DefaultTranscript::<E>::new(&[])
+            ),
+            "verify_chunks must accept the chunks proof on quadratic_pair (num_chunks=2)",
+        );
     }
 
     #[test]

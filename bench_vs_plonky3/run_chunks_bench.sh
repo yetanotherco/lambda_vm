@@ -32,6 +32,7 @@ GRINDING=0
 REPORT_DIR=""
 SCALAR=false
 RUN_P3=true
+WORKLOAD="fib_pair"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --report-dir)   REPORT_DIR="$2"; shift 2 ;;
         --scalar)       SCALAR=true; shift ;;
         --no-p3)        RUN_P3=false; shift ;;
+        --workload)     WORKLOAD="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,18p' "$0" | sed 's/^# //'
             exit 0
@@ -76,12 +78,14 @@ fi
 
 # --- Provers to run ---
 PROVERS=(lambda lambda-chunks)
-if $RUN_P3; then
+if $RUN_P3 && [ "$WORKLOAD" = "fib_pair" ]; then
+    # P3 only has fib_pair; --workload quadratic_pair forces --no-p3 semantics.
     PROVERS+=(p3)
 fi
 
 # --- Echo config ---
 echo "=== chunks A/B/C bench ==="
+echo "  workload:        $WORKLOAD"
 echo "  log_rows:        ${LOG_ROWS[*]}"
 echo "  runs/size:       $RUNS"
 echo "  num_sequences:   $NUM_SEQUENCES  (cols=$((2 * NUM_SEQUENCES)))"
@@ -117,6 +121,7 @@ GIT_DIRTY=$(git -C "$ROOT_DIR" diff --quiet HEAD -- 2>/dev/null && echo clean ||
     echo "git_sha=$GIT_SHA"
     echo "git_tree=$GIT_DIRTY"
     echo "arch=$(uname -m)"
+    echo "workload=$WORKLOAD"
     echo "log_rows=${LOG_ROWS[*]}"
     echo "runs_per_size=$RUNS"
     echo "num_sequences=$NUM_SEQUENCES"
@@ -136,6 +141,7 @@ for prover in "${PROVERS[@]}"; do
             STDOUT_FILE="$REPORT_DIR/raw_${prover}_log${lr}_run${run}.stdout"
             if ! "$BIN" \
                 --prover "$prover" \
+                --workload "$WORKLOAD" \
                 --log-rows "$lr" \
                 --num-sequences "$NUM_SEQUENCES" \
                 --blowup "$BLOWUP" \
