@@ -10,8 +10,8 @@ use crate::{
     config::BatchedMerkleTreeBackend,
     proof::quotient_chunks::QuotientChunksCommitments,
     prover::{
-        IsStarkProver, Prover, compute_chunks_deep_contribution, domain_cache_stats,
-        evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
+        IsStarkProver, Prover, ProvingError, compute_chunks_deep_contribution,
+        domain_cache_stats, evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
     },
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
@@ -1227,5 +1227,121 @@ fn chunks_protocol_primitives_end_to_end_synthesis() {
                  verifier reconstruction from chunk openings",
             );
         }
+    }
+}
+
+/// Phase 4.1 test for `round_2_chunks_kernel`.
+///
+/// The kernel takes constraint evaluations on the LDE coset (i.e., the
+/// evaluator's output) and produces a `Round2Chunks`. The new logic, on top
+/// of the already-tested `lde_and_commit_quotient_chunks`, is:
+///
+/// - **d_max == 1**: quotient domain has size N (half the LDE). The kernel
+///   should reduce by stride-2 (every other LDE element).
+/// - **d_max == 2**: quotient domain has size 2N (identical to LDE). The
+///   kernel should pass evaluations through unchanged.
+/// - **d_max >= 3**: the standard LDE doesn't have enough samples; the
+///   kernel must return [`ProvingError::WrongParameter`] until the
+///   evaluator is extended in a follow-up commit.
+///
+/// In each supported case the test reconstructs `H(z)` from the resulting
+/// chunks via `QuotientDomain::recompose_at` and asserts equality with
+/// `H(z)` evaluated directly from the known polynomial used to build the
+/// LDE input.
+#[test]
+fn round_2_chunks_kernel_matches_direct_h_eval_and_rejects_d_max_3() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    let z = Felt::from(0xdead_beefu64);
+
+    for &d_max in &[1usize, 2] {
+        let qd_size = d_max.next_power_of_two().max(1) * trace_length;
+        // Known H of degree < d_max·N — well within LDE 2N for d_max in {1, 2}.
+        let h_coeffs: Vec<Felt> = (0..qd_size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        // Evaluate H on the standard LDE coset (this is what the evaluator would emit).
+        let constraint_evals_lde: Vec<Felt> = (0..lde_size)
+            .map(|i| h_poly.evaluate(&domain.lde_roots_of_unity_coset[i]))
+            .collect();
+
+        let r2 = Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+            constraint_evals_lde,
+            &domain,
+            d_max,
+        )
+        .expect("round_2_chunks_kernel should succeed for d_max in {1, 2}");
+
+        let qd = QuotientDomain::new(&domain, d_max);
+        assert_eq!(r2.num_chunks, qd.num_chunks);
+        assert_eq!(r2.chunk_lde_evaluations.len(), qd.num_chunks);
+        assert_eq!(r2.chunk_merkle_trees.len(), qd.num_chunks);
+        assert_eq!(r2.chunk_roots.len(), qd.num_chunks);
+        for chunk_lde in &r2.chunk_lde_evaluations {
+            assert_eq!(chunk_lde.len(), lde_size);
+        }
+
+        // H(z) reconstructed from chunk evals at z (Q_c interpolated from the
+        // chunk LDE) must match direct H(z).
+        let chunk_at_z: Vec<Felt> = r2
+            .chunk_lde_evaluations
+            .iter()
+            .map(|chunk_lde| {
+                Polynomial::interpolate_offset_fft::<GoldilocksField>(
+                    chunk_lde,
+                    &domain.coset_offset,
+                )
+                .unwrap()
+                .evaluate(&z)
+            })
+            .collect();
+        let h_z_recomposed = qd.recompose_at(&chunk_at_z, &z);
+        let h_z_direct = h_poly.evaluate(&z);
+        assert_eq!(
+            h_z_recomposed, h_z_direct,
+            "d_max={d_max}: recompose_at over Round2Chunks should reproduce H(z)",
+        );
+    }
+
+    // d_max=3 must return an error — quotient_domain.size = 4N > lde_size = 2N.
+    let dummy_lde: Vec<Felt> = vec![Felt::zero(); lde_size];
+    let err = Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+        dummy_lde, &domain, 3usize,
+    );
+    match err {
+        Err(ProvingError::WrongParameter(_)) => {}
+        Err(other) => panic!(
+            "d_max=3 should currently return WrongParameter; got Err({other:?})",
+        ),
+        Ok(_) => panic!("d_max=3 should currently return WrongParameter; got Ok(_)"),
     }
 }

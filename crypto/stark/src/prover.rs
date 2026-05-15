@@ -329,6 +329,35 @@ where
     pub(crate) composition_poly_root: Commitment,
 }
 
+/// Phase 4 prover-side container for the chunks-based commitment protocol.
+///
+/// Analogue of [`Round2`]: where the single-H path produces one Merkle
+/// commitment over the (possibly multi-part) composition polynomial, the
+/// chunks path produces `num_chunks = next_pow2(d_max)` independent Merkle
+/// commitments, each over one chunk's LDE.
+///
+/// Not yet wired into `prove_rounds_2_to_4`; constructed by
+/// [`IsStarkProver::round_2_compute_composition_polynomial_chunks`] and its
+/// kernel [`IsStarkProver::round_2_chunks_kernel`].
+#[allow(dead_code)] // wired in Phase 4.2; constructed today by round_2_chunks_kernel
+pub struct Round2Chunks<F>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    /// Per-chunk LDE evaluations on the standard LDE coset, each of length
+    /// `trace_length * blowup_factor`.
+    pub(crate) chunk_lde_evaluations: Vec<Vec<FieldElement<F>>>,
+    /// Per-chunk Merkle trees — one independent tree per chunk.
+    pub(crate) chunk_merkle_trees: Vec<BatchedMerkleTree<F>>,
+    /// Per-chunk Merkle roots, in chunk-index order. The verifier appends
+    /// these to the transcript before sampling `z`.
+    pub(crate) chunk_roots: Vec<Commitment>,
+    /// Number of chunks = `next_pow2(d_max)`; redundant with vector lengths
+    /// but kept for clarity in downstream consumers.
+    pub(crate) num_chunks: usize,
+}
+
 /// A container for the results of the third round of the STARK Prove protocol.
 pub struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main ans auxiliary, at the out-of-domain challenge.
@@ -1169,6 +1198,116 @@ pub trait IsStarkProver<
             composition_poly_merkle_tree,
             composition_poly_root,
         })
+    }
+
+    /// Phase 4.1 kernel: given constraint evaluations on the LDE coset, produce
+    /// the chunks-protocol [`Round2Chunks`] container.
+    ///
+    /// The standard LDE coset has size `trace_length * blowup_factor`. The
+    /// chunks protocol commits over the **quotient domain** of size
+    /// `next_pow2(d_max) * trace_length`:
+    ///
+    /// - `d_max == 1` (e.g., Fibonacci): quotient size = N, half the LDE.
+    ///   Every other LDE element is one quotient-domain evaluation.
+    /// - `d_max == 2` (e.g., Quadratic): quotient size = 2N, identical to LDE.
+    /// - `d_max >= 3`: quotient size > LDE size; this requires the
+    ///   constraint evaluator to produce more samples than the standard LDE.
+    ///   Not yet supported — returns [`ProvingError::WrongParameter`].
+    ///
+    /// After reducing to the quotient domain, the function splits interleaved
+    /// into chunks and delegates per-chunk LDE + Merkle commitment to
+    /// [`IsStarkProver::lde_and_commit_quotient_chunks`].
+    fn round_2_chunks_kernel(
+        constraint_evaluations_lde: Vec<FieldElement<FieldExtension>>,
+        domain: &Domain<Field>,
+        d_max: usize,
+    ) -> Result<Round2Chunks<FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        let lde_size = constraint_evaluations_lde.len();
+        let qd = QuotientDomain::new(domain, d_max);
+
+        let constraint_evals_qd: Vec<FieldElement<FieldExtension>> = match qd.size.cmp(&lde_size) {
+            std::cmp::Ordering::Equal => constraint_evaluations_lde,
+            std::cmp::Ordering::Less => {
+                let stride = lde_size / qd.size;
+                debug_assert_eq!(
+                    lde_size,
+                    stride * qd.size,
+                    "lde_size must be an integer multiple of quotient_domain.size"
+                );
+                constraint_evaluations_lde.into_iter().step_by(stride).collect()
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(ProvingError::WrongParameter(format!(
+                    "round_2_chunks_kernel: quotient_domain.size={} > lde_size={}; \
+                     d_max={d_max} requires the constraint evaluator to produce more samples \
+                     than the standard LDE — not yet supported",
+                    qd.size, lde_size,
+                )));
+            }
+        };
+
+        let chunks = qd.split_evals_interleaved(&constraint_evals_qd);
+        let chunk_results = Self::lde_and_commit_quotient_chunks(&qd, domain, &chunks);
+
+        let mut chunk_lde_evaluations = Vec::with_capacity(chunk_results.len());
+        let mut chunk_merkle_trees = Vec::with_capacity(chunk_results.len());
+        let mut chunk_roots = Vec::with_capacity(chunk_results.len());
+        for (lde, tree, root) in chunk_results {
+            chunk_lde_evaluations.push(lde);
+            chunk_merkle_trees.push(tree);
+            chunk_roots.push(root);
+        }
+        Ok(Round2Chunks {
+            chunk_lde_evaluations,
+            chunk_merkle_trees,
+            chunk_roots,
+            num_chunks: qd.num_chunks,
+        })
+    }
+
+    /// Phase 4.1 chunks-protocol analogue of
+    /// [`IsStarkProver::round_2_compute_composition_polynomial`].
+    ///
+    /// Runs the constraint evaluator over the LDE (identical to the single-H
+    /// path), then delegates the chunks-shape work to
+    /// [`IsStarkProver::round_2_chunks_kernel`]. Not yet wired into
+    /// `prove_rounds_2_to_4`; the toggle that selects this path will be
+    /// added in Phase 4.2.
+    fn round_2_compute_composition_polynomial_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+    ) -> Result<Round2Chunks<FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        let trace_length = domain.interpolation_domain_size;
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            pub_inputs,
+            &round_1_result.rap_challenges,
+            round_1_result.bus_public_inputs.as_ref(),
+            trace_length,
+        );
+        let constraint_evaluations = evaluator.evaluate(
+            air,
+            &round_1_result.lde_trace,
+            domain,
+            transition_coefficients,
+            boundary_coefficients,
+            &round_1_result.rap_challenges,
+        );
+
+        let d_max = air.composition_poly_degree_bound(trace_length) / trace_length;
+        Self::round_2_chunks_kernel(constraint_evaluations, domain, d_max)
     }
 
     /// Returns the result of the third round of the STARK Prove protocol.
