@@ -5,4 +5,5 @@ pub mod fri_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
+pub mod quotient_chunks_proof_tests;
 pub mod small_trace_tests;
