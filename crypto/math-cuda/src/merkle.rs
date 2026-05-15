@@ -32,10 +32,17 @@ pub fn keccak_leaves_base(
     num_rows: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
-    assert!(columns.len() >= num_cols * col_stride);
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(col_stride)
+        .expect("num_cols * col_stride overflows usize");
+    assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..num_cols * col_stride])?;
+    let cols_dev = stream.clone_htod(&columns[..total])?;
     let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
     launch_keccak_base(
         stream.as_ref(),
@@ -59,10 +66,18 @@ pub fn keccak_leaves_ext3(
     num_rows: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
-    assert!(columns.len() >= num_cols * 3 * col_stride);
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(3)
+        .and_then(|v| v.checked_mul(col_stride))
+        .expect("num_cols * 3 * col_stride overflows usize");
+    assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..num_cols * 3 * col_stride])?;
+    let cols_dev = stream.clone_htod(&columns[..total])?;
     let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
     launch_keccak_ext3(
         stream.as_ref(),
@@ -100,6 +115,9 @@ pub(crate) fn launch_keccak_base(
     num_rows: u64,
     out_dev: &mut CudaSlice<u8>,
 ) -> Result<()> {
+    // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
+    // for `log_num_rows == 0` (single-row trees are degenerate anyway).
+    debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");
     let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let cfg = keccak_launch_cfg(num_rows);
@@ -326,11 +344,8 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     );
     let num_evals = evals.len() / 3;
     let num_leaves = num_evals / 2;
-    assert!(num_leaves.is_power_of_two() && num_leaves >= 1);
+    assert!(num_leaves.is_power_of_two() && num_leaves >= 2);
     let tight_total_nodes = 2 * num_leaves - 1;
-    if tight_total_nodes == 0 {
-        return Ok(Vec::new());
-    }
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -397,6 +412,9 @@ pub(crate) fn launch_keccak_ext3(
     num_rows: u64,
     out_dev: &mut CudaSlice<u8>,
 ) -> Result<()> {
+    // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
+    // for `log_num_rows == 0` (single-row trees are degenerate anyway).
+    debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");
     let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let cfg = keccak_launch_cfg(num_rows);

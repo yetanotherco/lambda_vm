@@ -494,10 +494,18 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     let m = columns.len();
     assert_eq!(outputs.len(), m);
     let n = columns[0].len();
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(());
+    }
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
     let lde_size = n * blowup_factor;
+    assert_u32_domain(
+        lde_size,
+        "coset_lde_batch_base_into_with_leaf_hash lde_size",
+    );
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size);
     }
@@ -718,10 +726,18 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let m = columns.len();
     assert_eq!(outputs.len(), m);
     let n = columns[0].len();
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(None);
+    }
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
     let lde_size = n * blowup_factor;
+    assert_u32_domain(
+        lde_size,
+        "coset_lde_batch_base_into_with_merkle_tree lde_size",
+    );
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size);
     }
@@ -943,6 +959,10 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         assert_eq!(outputs.len(), 0);
         return Ok(());
     }
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(());
+    }
     let m = columns.len();
     assert_eq!(outputs.len(), m);
     assert!(n.is_power_of_two());
@@ -952,13 +972,14 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         assert_eq!(c.len(), 3 * n);
     }
     let lde_size = n * blowup_factor;
+    assert_u32_domain(
+        lde_size,
+        "coset_lde_batch_ext3_into_with_leaf_hash lde_size",
+    );
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
     assert_eq!(hashed_leaves_out.len(), lde_size * 32);
-    if n == 0 {
-        return Ok(());
-    }
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
@@ -1191,6 +1212,10 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         assert_eq!(outputs.len(), 0);
         return Ok(None);
     }
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(None);
+    }
     let m = columns.len();
     assert_eq!(outputs.len(), m);
     assert!(n.is_power_of_two());
@@ -1200,14 +1225,15 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         assert_eq!(c.len(), 3 * n);
     }
     let lde_size = n * blowup_factor;
+    assert_u32_domain(
+        lde_size,
+        "coset_lde_batch_ext3_into_with_merkle_tree lde_size",
+    );
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
     let total_nodes = 2 * lde_size - 1;
     assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
-    if n == 0 {
-        return Ok(None);
-    }
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
@@ -1645,6 +1671,10 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     if coefs.is_empty() {
         return Ok(());
     }
+    // (is_power_of_two returns false for 0).
+    if n == 0 {
+        return Ok(());
+    }
     let m = coefs.len();
     assert_eq!(outputs.len(), m);
     assert!(n.is_power_of_two());
@@ -1654,15 +1684,16 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
         assert_eq!(c.len(), 3 * n);
     }
     let lde_size = n * blowup_factor;
+    assert_u32_domain(
+        lde_size,
+        "evaluate_poly_coset_batch_ext3_into_with_merkle_tree lde_size",
+    );
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
     assert!(lde_size >= 2);
     let total_nodes = lde_size - 1;
     assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
-    if n == 0 {
-        return Ok(());
-    }
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
