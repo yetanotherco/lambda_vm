@@ -374,6 +374,80 @@ where
     }
 }
 
+/// Phase 3.1 building block of the chunks-based commitment migration.
+///
+/// Compute the chunks contribution to the DEEP composition polynomial at every
+/// LDE point. For each LDE coset element `x` this returns:
+///
+/// ```text
+///   sum_c gamma_c * (Q_c(x) - Q_c(z)) / (x - z)
+/// ```
+///
+/// where `Q_c` is the c-th chunk polynomial (degree `< N`), `chunk_ldes[c][i]`
+/// is its evaluation at `lde_coset[i]`, and `chunk_ood_evaluations[c]` is
+/// `Q_c(z)` at the out-of-domain point `z`.
+///
+/// Each term `(Q_c(x) - Q_c(z)) / (x - z)` is a polynomial of degree
+/// `< N - 1` (the pole at `z` cancels because the numerator vanishes there),
+/// so the random linear combination has degree `< N` — the same FRI input
+/// shape Lambda already expects from the existing single-H DEEP composition.
+///
+/// This is the chunks-protocol analogue of the "H terms" block in
+/// [`IsStarkProver::compute_deep_composition_poly_evaluations`] (lines
+/// 1366-1370). Not yet wired into the prover; exercised by
+/// `chunks_deep_contribution_is_degree_below_n` in `prover_tests.rs`.
+pub fn compute_chunks_deep_contribution<F, E>(
+    chunk_ldes: &[Vec<FieldElement<E>>],
+    chunk_ood_evaluations: &[FieldElement<E>],
+    z: &FieldElement<E>,
+    gammas: &[FieldElement<E>],
+    lde_coset: &[FieldElement<F>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let num_chunks = chunk_ldes.len();
+    assert_eq!(
+        chunk_ood_evaluations.len(),
+        num_chunks,
+        "compute_chunks_deep_contribution: chunk_ood_evaluations.len() = {} but \
+         chunk_ldes.len() = {num_chunks}",
+        chunk_ood_evaluations.len(),
+    );
+    assert_eq!(
+        gammas.len(),
+        num_chunks,
+        "compute_chunks_deep_contribution: gammas.len() = {} but \
+         chunk_ldes.len() = {num_chunks}",
+        gammas.len(),
+    );
+    let lde_size = lde_coset.len();
+    for (c, lde) in chunk_ldes.iter().enumerate() {
+        assert_eq!(
+            lde.len(),
+            lde_size,
+            "chunk_ldes[{c}].len() = {} but lde_coset.len() = {lde_size}",
+            lde.len(),
+        );
+    }
+
+    // Batch-invert all (x_i - z) denominators in one pass.
+    let mut denom_inv: Vec<FieldElement<E>> = lde_coset.iter().map(|x| x - z).collect();
+    FieldElement::inplace_batch_inverse(&mut denom_inv)
+        .expect("z must lie outside the LDE coset");
+
+    (0..lde_size)
+        .map(|i| {
+            let mut sum = FieldElement::<E>::zero();
+            for c in 0..num_chunks {
+                sum += &gammas[c] * (&chunk_ldes[c][i] - &chunk_ood_evaluations[c]) * &denom_inv[i];
+            }
+            sum
+        })
+        .collect()
+}
+
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover

@@ -7,7 +7,10 @@ use crate::{
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     },
     proof::options::ProofOptions,
-    prover::{IsStarkProver, Prover, domain_cache_stats, evaluate_polynomial_on_lde_domain},
+    prover::{
+        IsStarkProver, Prover, compute_chunks_deep_contribution, domain_cache_stats,
+        evaluate_polynomial_on_lde_domain,
+    },
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
@@ -835,6 +838,128 @@ fn lde_and_commit_quotient_chunks_round_trip() {
                 !all_same,
                 "d_max={d_max}: all {num_chunks} chunk roots collapsed to the same value — \
                  chunks should commit to distinct polynomials",
+            );
+        }
+    }
+}
+
+/// Phase 3.1 test for the chunks DEEP contribution.
+///
+/// For `d_max ∈ {1, 2, 3}` builds the chunk LDEs from a known `H`, runs
+/// `compute_chunks_deep_contribution` over them at every LDE point, and
+/// checks:
+///
+/// 1. **Pointwise correctness**: the result at LDE index `i` equals the naive
+///    `sum_c gamma_c * (chunk_ldes[c][i] - chunk_ood_evals[c]) / (lde[i] - z)`.
+/// 2. **Degree bound**: interpolating the result on the LDE coset yields a
+///    polynomial of degree `< N`. The chunks-protocol DEEP contribution must
+///    feed FRI a low-degree polynomial of the same shape as the single-H
+///    path (`compute_deep_composition_poly_evaluations`).
+#[test]
+fn chunks_deep_contribution_is_degree_below_n() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    // z chosen far enough from any LDE-coset element to avoid accidental coincidences.
+    let z = Felt::from(0xdead_beefu64);
+
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+        let num_chunks = qd.num_chunks;
+
+        let h_coeffs: Vec<Felt> = (0..qd.size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let h_evals: Vec<Felt> = (0..qd.size).map(|i| h_poly.evaluate(qd.point_at(i))).collect();
+        let chunks = qd.split_evals_interleaved(&h_evals);
+
+        let results = Prover::<GoldilocksField, GoldilocksField, ()>::lde_and_commit_quotient_chunks(
+            &qd, &domain, &chunks,
+        );
+        let chunk_ldes: Vec<Vec<Felt>> =
+            results.iter().map(|(lde, _, _)| lde.clone()).collect();
+
+        // Chunk OOD evaluations = Q_c(z).
+        let chunk_ood: Vec<Felt> = chunks
+            .iter()
+            .enumerate()
+            .map(|(c, chunk)| {
+                let (sub_offset, _) = qd.chunk_subdomain(c);
+                let q_c = Polynomial::interpolate_offset_fft::<GoldilocksField>(chunk, &sub_offset)
+                    .unwrap();
+                q_c.evaluate(&z)
+            })
+            .collect();
+
+        // Random-looking gammas, one per chunk.
+        let gammas: Vec<Felt> = (0..num_chunks)
+            .map(|c| Felt::from((c as u64 + 1) * 31 + 7))
+            .collect();
+
+        let deep = compute_chunks_deep_contribution(
+            &chunk_ldes,
+            &chunk_ood,
+            &z,
+            &gammas,
+            &domain.lde_roots_of_unity_coset,
+        );
+        assert_eq!(deep.len(), lde_size);
+
+        // 1. Pointwise equality with naive reference.
+        for i in 0..lde_size {
+            let denom_inv = (&domain.lde_roots_of_unity_coset[i] - &z).inv().unwrap();
+            let mut expected = Felt::zero();
+            for c in 0..num_chunks {
+                expected = expected + &gammas[c] * (&chunk_ldes[c][i] - &chunk_ood[c]) * &denom_inv;
+            }
+            assert_eq!(
+                deep[i], expected,
+                "d_max={d_max}: chunks DEEP contribution disagrees with naive formula at LDE \
+                 index {i}",
+            );
+        }
+
+        // 2. Degree bound: interpolating `deep` on the LDE coset yields a polynomial
+        //    of degree < N. The chunks-protocol DEEP contribution must be of the
+        //    same shape FRI consumes for the single-H path.
+        let deep_poly =
+            Polynomial::interpolate_offset_fft::<GoldilocksField>(&deep, &domain.coset_offset)
+                .unwrap();
+        let coeffs = deep_poly.coefficients();
+        for (i, c) in coeffs.iter().enumerate().skip(trace_length) {
+            assert_eq!(
+                *c,
+                Felt::zero(),
+                "d_max={d_max}: DEEP contribution has non-zero coefficient at degree {i} \
+                 (expected < N = {trace_length})",
             );
         }
     }
