@@ -878,6 +878,19 @@ pub trait IsStarkProver<
     ///
     /// Performs iFFT + coset shift + FFT in place. Coset weights are pre-cached in
     /// `LdeTwiddles` to avoid recomputation across phases.
+    ///
+    /// **Parallelism model**: outer `par_iter_mut()` distributes columns across
+    /// rayon workers; each worker runs a *serial* FFT (via
+    /// `Polynomial::coset_lde_full_expand_seq`). This avoids the nested
+    /// parallelism that the previous implementation introduced (par_iter columns
+    /// × parallel internal FFT), which oversubscribed the rayon thread pool on
+    /// many-core machines and was responsible for ~230 ms of the gap vs P3's
+    /// `coset_lde_batch` on fib_pair at log_rows=21 / 32 cols on the EPYC bench
+    /// server (Camino I plan, 2026-05-15).
+    ///
+    /// When the table has a single column (e.g., tiny tests), the outer
+    /// parallel only spawns one task — the serial inner FFT runs on a single
+    /// thread. That's fine because single-column small workloads are cheap.
     fn expand_columns_to_lde<E>(
         columns: &mut [Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -896,7 +909,7 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter_mut();
         iter.for_each(|buf| {
-            Polynomial::coset_lde_full_expand::<Field>(
+            Polynomial::coset_lde_full_expand_seq::<Field>(
                 buf,
                 domain.blowup_factor,
                 &twiddles.coset_weights,

@@ -284,6 +284,55 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         Ok(())
     }
+
+    /// Sequential variant of [`coset_lde_full_expand`] — same algorithm but never
+    /// dispatches to the parallel `bowers_*_parallel` routines. Intended for callers
+    /// that already parallelize at an outer level (e.g., `par_iter_mut()` across
+    /// columns of a trace matrix), so nesting parallel FFTs inside a parallel column
+    /// iteration would cause Rayon thread oversubscription.
+    ///
+    /// Empirically on EPYC 9454P (48 physical cores, 96 logical, scalar Goldilocks)
+    /// at log_rows=21, 32 columns: nested parallelism path (`par_iter_mut` columns
+    /// × parallel internal FFT) measured ~359 ms; outer-only parallelism with this
+    /// serial variant brings r1_main_lde toward P3's `coset_lde_batch` numbers
+    /// (~129 ms) — same total compute, no thread contention.
+    ///
+    /// The output is bit-for-bit identical to [`coset_lde_full_expand`]; only the
+    /// internal scheduling differs.
+    pub fn coset_lde_full_expand_seq<F: IsFFTField + IsSubFieldOf<E>>(
+        buffer: &mut Vec<FieldElement<E>>,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<(), FFTError> {
+        let n = buffer.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
+
+        buffer.resize(lde_size, FieldElement::zero());
+
+        bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +601,65 @@ mod tests {
             .unwrap();
 
             assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
+    }
+
+    /// `coset_lde_full_expand_seq` must produce byte-identical output to
+    /// `coset_lde_full_expand` — they share the algorithm and only differ in
+    /// whether internal FFT layers dispatch to the parallel routines. This is
+    /// the load-bearing correctness assertion for the Camino I refactor in
+    /// `crypto/stark/src/prover.rs::expand_columns_to_lde`.
+    #[test]
+    fn coset_lde_full_expand_seq_matches_coset_lde_full_expand() {
+        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+
+        let offset = FE::from(3u64);
+        let blowup_factor = 2usize;
+
+        // Cover small and moderate sizes; for large sizes (log_n >= 14) the
+        // parallel path engages — that's exactly the case we want to confirm
+        // produces identical output to the serial path.
+        for order in [1u32, 4, 8, 12, 14, 16] {
+            let n = 1usize << order;
+            let lde_size = n * blowup_factor;
+
+            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let mut weights = Vec::with_capacity(n);
+            let mut offset_power = n_inv;
+            for _ in 0..n {
+                weights.push(offset_power);
+                offset_power = &offset_power * &offset;
+            }
+
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 31 + 7) as u64)).collect();
+
+            let mut buf_parallel = evals.clone();
+            Polynomial::<FE>::coset_lde_full_expand::<F>(
+                &mut buf_parallel,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            let mut buf_seq = evals;
+            Polynomial::<FE>::coset_lde_full_expand_seq::<F>(
+                &mut buf_seq,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            assert_eq!(
+                buf_parallel, buf_seq,
+                "coset_lde_full_expand_seq must produce identical output (order={order})",
+            );
         }
     }
 }
