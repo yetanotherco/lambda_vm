@@ -474,9 +474,9 @@ pub fn coset_lde_batch_base_into(
 }
 
 /// Variant of `coset_lde_batch_base_into` that also emits the Keccak-256
-/// Merkle leaf hashes from the LDE output — all on GPU, no second H2D of
-/// the LDE data. Leaves are computed reading columns at bit-reversed rows
-/// (matching `commit_columns_bit_reversed` on the CPU side).
+/// Merkle leaf hashes from the LDE output. All on GPU, the device LDE buffer
+/// is hashed in place. Leaves are computed reading columns at bit-reversed
+/// rows (matching `commit_columns_bit_reversed` on the CPU side).
 ///
 /// `hashed_leaves_out` must be `lde_size * 32` bytes (one 32-byte digest
 /// per output row, in natural row order).
@@ -521,7 +521,6 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_base_ptr = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         // SAFETY: disjoint regions per c, outer staging lock held.
@@ -614,13 +613,13 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         col_stride_u64,
         m as u64,
         lde_u64,
-        &mut hashes_dev,
+        &mut hashes_dev.as_view_mut(),
     )?;
 
-    // D2H the LDE into the pinned LDE staging and the hashes into a
-    // dedicated pinned hash staging, in parallel on the same stream. Both
-    // at pinned PCIe line-rate — pageable D2H of the 128 MB hash buffer
-    // would otherwise cost ~100 ms per main-trace commit.
+    // D2H the LDE into the pinned LDE staging, then the hashes into a
+    // dedicated pinned hash staging. The two copies run back-to-back on the
+    // same stream; both go at pinned PCIe line-rate — pageable D2H of the
+    // 128 MB hash buffer would otherwise cost ~100 ms per main-trace commit.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     let hashes_u64_len = (lde_size * 32).div_ceil(8);
     let hashes_staging_slot = be.pinned_hashes();
@@ -635,7 +634,9 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     stream.memcpy_dtoh(&hashes_dev, hashes_pinned_bytes)?;
     stream.synchronize()?;
 
-    // Copy pinned → caller outputs in parallel with the hash memcpy.
+    // Copy pinned → caller outputs. Both D2H copies have already drained
+    // (the synchronize above); this is a rayon-parallel host memcpy from
+    // pinned to pageable memory, not concurrent with any GPU transfer.
     let pinned_ptr = pinned.as_ptr() as usize;
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let src = unsafe {
@@ -754,7 +755,6 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_base_ptr = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         let dst =
@@ -851,25 +851,14 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        let log_num_rows_leaves = lde_size.trailing_zeros() as u64;
-        let num_cols_u64 = m as u64;
-        let grid = (lde_size as u32).div_ceil(128);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.keccak256_leaves_base_batched)
-                .arg(&buf)
-                .arg(&col_stride_u64)
-                .arg(&num_cols_u64)
-                .arg(&lde_u64)
-                .arg(&log_num_rows_leaves)
-                .arg(&mut leaves_view)
-                .launch(cfg)?;
-        }
+        launch_keccak_base(
+            stream.as_ref(),
+            &buf,
+            col_stride_u64,
+            m as u64,
+            lde_u64,
+            &mut leaves_view,
+        )?;
     }
 
     // Inner tree levels — mirror the CPU `build(nodes, leaves_len)` scan.
@@ -992,7 +981,6 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         let slab_a = unsafe {
@@ -1092,7 +1080,7 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         col_stride_u64,
         m as u64,
         lde_u64,
-        &mut hashes_dev,
+        &mut hashes_dev.as_view_mut(),
     )?;
 
     // D2H LDE (mb * lde_size u64) and hashes (lde_size * 32 bytes).
@@ -1246,7 +1234,6 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     columns.par_iter().enumerate().for_each(|(c, col)| {
         let slab_a = unsafe {
@@ -1344,25 +1331,14 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        let log_num_rows_leaves = lde_size.trailing_zeros() as u64;
-        let num_cols_u64 = m as u64;
-        let grid = (lde_size as u32).div_ceil(128);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.keccak256_leaves_ext3_batched)
-                .arg(&buf)
-                .arg(&col_stride_u64)
-                .arg(&num_cols_u64)
-                .arg(&lde_u64)
-                .arg(&log_num_rows_leaves)
-                .arg(&mut leaves_view)
-                .launch(cfg)?;
-        }
+        launch_keccak_ext3(
+            stream.as_ref(),
+            &buf,
+            col_stride_u64,
+            m as u64,
+            lde_u64,
+            &mut leaves_view,
+        )?;
     }
 
     // Inner tree levels.
@@ -1705,7 +1681,6 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     coefs.par_iter().enumerate().for_each(|(c, col)| {
         let slab_a = unsafe {

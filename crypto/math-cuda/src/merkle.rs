@@ -15,7 +15,8 @@
 //! — three base slabs per ext3 column — and the kernel reads three u64s per
 //! column in component order 0,1,2 to match `FieldElement::<Ext3>::write_bytes_be`.
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
+use rayon::prelude::*;
 
 use crate::Result;
 use crate::device::backend;
@@ -50,7 +51,7 @@ pub fn keccak_leaves_base(
         col_stride as u64,
         num_cols as u64,
         num_rows as u64,
-        &mut out_dev,
+        &mut out_dev.as_view_mut(),
     )?;
     let out = stream.clone_dtoh(&out_dev)?;
     stream.synchronize()?;
@@ -85,7 +86,7 @@ pub fn keccak_leaves_ext3(
         col_stride as u64,
         num_cols as u64,
         num_rows as u64,
-        &mut out_dev,
+        &mut out_dev.as_view_mut(),
     )?;
     let out = stream.clone_dtoh(&out_dev)?;
     stream.synchronize()?;
@@ -113,7 +114,7 @@ pub(crate) fn launch_keccak_base(
     col_stride: u64,
     num_cols: u64,
     num_rows: u64,
-    out_dev: &mut CudaSlice<u8>,
+    out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
     // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
     // for `log_num_rows == 0` (single-row trees are degenerate anyway).
@@ -238,7 +239,6 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    use rayon::prelude::*;
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
     parts_interleaved
         .par_iter()
@@ -410,7 +410,7 @@ pub(crate) fn launch_keccak_ext3(
     col_stride: u64,
     num_cols: u64,
     num_rows: u64,
-    out_dev: &mut CudaSlice<u8>,
+    out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
     // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
     // for `log_num_rows == 0` (single-row trees are degenerate anyway).

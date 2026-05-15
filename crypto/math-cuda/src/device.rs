@@ -109,9 +109,8 @@ pub struct Backend {
     /// cost for every first use of a new table size).
     pinned_staging: Mutex<PinnedStaging>,
     /// Separate pinned staging for Merkle leaf hashes. Sized `num_rows * 32`
-    /// bytes; lives alongside the LDE staging so the GPU→host D2H for
-    /// hashed leaves runs at full PCIe line-rate instead of the pageable
-    /// ~1.3 GB/s path that would otherwise eat ~100 ms per main-trace commit.
+    /// bytes. It lives alongside the LDE staging so the GPU→host D2H for
+    /// hashed leaves runs at full PCIe line-rate.
     pinned_hashes: Mutex<PinnedStaging>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
@@ -227,7 +226,7 @@ impl Backend {
     }
 
     /// Separate pinned staging for Merkle leaf hash output. Sized in u64
-    /// units; caller should reserve `(num_rows * 32 + 7) / 8` u64s.
+    /// units. Caller should reserve `(num_rows * 32 + 7) / 8` u64s.
     pub fn pinned_hashes(&self) -> &Mutex<PinnedStaging> {
         &self.pinned_hashes
     }

@@ -1,7 +1,7 @@
-// CUDA Keccak-256 (original Keccak, NOT SHA3-256 — uses 0x01 padding delimiter).
+// Original Keccak-256 (0x01 padding)
 //
 // Used by the lambda-vm prover's Merkle commit:
-//   leaf = Keccak-256(concat(col_0[br_idx].to_be_bytes(), col_1[br_idx].to_be_bytes(), …))
+//   leaf = Keccak-256(concat(col_0[br_idx].to_be_bytes(), col_1[br_idx].to_be_bytes(), ...))
 // where `br_idx = bit_reverse(row_idx, log_num_rows)` and each element is
 // written in BIG-ENDIAN canonical form (per `FieldElement::write_bytes_be`).
 //
@@ -96,9 +96,9 @@ __device__ __forceinline__ void keccak_f1600(uint64_t st[25]) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: absorb one 8-byte lane (already in lane form — i.e. LE interpretation
-// of the BE-serialised u64) into the sponge at `rate_pos` (in bytes). Permutes
-// when a full 136-byte block has been absorbed.
+// Helper: absorb one 8-byte lane (already byte-swapped from BE serialisation
+// into Keccak's LE lane form) into the sponge at `rate_pos` (in bytes).
+// Permutes when a full 136-byte block has been absorbed.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void absorb_lane(uint64_t st[25],
                                             uint32_t &rate_pos,
@@ -172,7 +172,7 @@ extern "C" __global__ void keccak256_leaves_base_batched(
         uint64_t v = columns_base_ptr[c * col_stride + br];
         // Canonicalise to match `canonical_u64().to_be_bytes()` on host.
         uint64_t canon = goldilocks::canonical(v);
-        // The on-disk leaf bytes are canon.to_be_bytes(); Keccak reads those
+        // The on-disk leaf bytes are canon.to_be_bytes(). Keccak reads those
         // as a LE lane, which equals bswap64(canon).
         uint64_t lane = bswap64(canon);
         absorb_lane(st, rate_pos, lane);
@@ -275,8 +275,8 @@ extern "C" __global__ void keccak_comp_poly_leaves_ext3(
 //
 // Each leaf hashes 2 consecutive ext3 values: Keccak256 over
 //   evals[2j].to_bytes_be() ++ evals[2j+1].to_bytes_be()
-// = 48 BE bytes = 6 u64 BE lanes. No bit reversal; no column slab layout —
-// the input is a single interleaved ext3 eval vector `[a0,a1,a2,b0,b1,b2,...]`.
+// = 48 BE bytes = 6 u64 BE lanes. No bit reversal, no column slab layout.
+// The input is a single interleaved ext3 eval vector `[a0,a1,a2,b0,b1,b2,...]`.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void keccak_fri_leaves_ext3(
     const uint64_t *evals_interleaved,  // 3 * num_evals u64s (ext3 interleaved)
@@ -311,14 +311,14 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 //
 // `nodes` is the full Merkle node buffer (length `2*leaves_len - 1`, each
 // element 32 bytes). `parent_begin` is the node-index offset of the first
-// parent slot in this level; children live at `parent_begin + n_pairs`.
+// parent slot in this level. Children live at `parent_begin + n_pairs`.
 // The layout mirrors `crypto/crypto/src/merkle_tree/merkle.rs`:
 //
 //     children: nodes[parent_begin + n_pairs .. parent_begin + 3 * n_pairs]
 //     parents:  nodes[parent_begin .. parent_begin + n_pairs]
 //
 // Each thread hashes one child pair → one parent. Keccak-256 of the
-// concatenation of two 32-byte siblings; identical to
+// concatenation of two 32-byte siblings, identical to
 // `FieldElementVectorBackend::hash_new_parent` on host.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void keccak_merkle_level(
