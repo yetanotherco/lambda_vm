@@ -118,7 +118,7 @@ For the full CLI reference — including private inputs, blowup factor tuning, t
 
 Guest programs are written in Rust (or RISC-V assembly) and cross-compiled to the custom RV64IM target. The guest SDK [`lambda-vm-syscalls`](./syscalls/README.md) provides the syscalls a program uses to read private input, commit public output, halt, and call precompiles like Keccak. The [`executor`](./executor/README.md) crate is what loads your compiled ELF and emits the per-instruction logs the prover consumes.
 
-To add a new Rust guest, drop a project under `executor/programs/rust/<name>/` and run `make compile-programs-rust`. See [`executor/programs/rust/`](./executor/programs/rust/) for examples (`fibonacci`, `commit`, `keccak`, `hashmap`, …).
+To add a new Rust guest, drop a project under `executor/programs/rust/<name>/` and run `make compile-programs-rust`. See [`executor/programs/rust/`](./executor/programs/rust/) for examples (`fibonacci`, `keccak`, `hashmap`, …).
 
 ## Design choices
 

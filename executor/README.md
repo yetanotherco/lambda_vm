@@ -25,7 +25,7 @@ For chunked execution (useful when you don't want to hold all logs in memory), d
 The repo ships ready-to-use guest programs in three flavours, all compiled by Makefile targets at the repo root:
 
 - [`programs/asm/`](./programs/asm/) — raw RISC-V assembly. Built with `make compile-programs-asm` into `program_artifacts/asm/`.
-- [`programs/rust/`](./programs/rust/) — Rust guest projects (`fibonacci`, `commit`, `keccak`, `hashmap`, …). Built with `make compile-programs-rust` into `program_artifacts/rust/`. Requires the pinned nightly toolchain and sysroot — see the root [`README.md`](../README.md).
+- [`programs/rust/`](./programs/rust/) — Rust guest projects (`fibonacci`, `keccak`, `hashmap`, …). Built with `make compile-programs-rust` into `program_artifacts/rust/`. Requires the pinned nightly toolchain and sysroot — see the root [`README.md`](../README.md).
 - [`programs/bench/`](./programs/bench/) — benchmark programs. Built with `make compile-bench`.
 
 The custom RISC-V target spec used for Rust guests lives at [`programs/riscv64im-lambda-vm-elf.json`](./programs/riscv64im-lambda-vm-elf.json).

@@ -8,13 +8,14 @@ Published as `lambda-vm-syscalls`. Intended to be used from RISC-V (RV64IM) gues
 
 | Function | Purpose |
 |---|---|
-| `print_string(s: &str)` | Host-side debug print. Not committed to public output. |
 | `commit(bytes: &[u8])` | Append bytes to the **public output** that the verifier checks. |
 | `get_private_input() -> Vec<u8>` | Read the host-supplied private input bytes (memory-mapped at `0xFF000000`). |
 | `sys_halt() -> !` | Terminate execution cleanly. Called automatically after `main` by the default entry point. |
 | `keccak_permute(state: &mut [u64; 25])` | Keccak-f[1600] permutation precompile. |
 
 The crate also provides a default `_start` that initialises the allocator, calls `main`, and halts.
+
+> **Note:** the `print_string` syscall is temporarily unavailable — calling it in a guest will cause proof verification to fail. Tracked as a follow-up.
 
 ## Example
 
@@ -25,7 +26,6 @@ use lambda_vm_syscalls::syscalls;
 
 pub fn main() {
     let input = syscalls::get_private_input();
-    syscalls::print_string(&format!("Received {} bytes\n", input.len()));
 
     // Anything passed to `commit` becomes part of the proof's public output.
     // Don't echo private input here — commit a derived value instead.
@@ -34,7 +34,7 @@ pub fn main() {
 }
 ```
 
-See [`executor/programs/rust/`](../executor/programs/rust/) for more example guests (`fibonacci`, `commit`, `keccak`, `hashmap`, …).
+See [`executor/programs/rust/`](../executor/programs/rust/) for more example guests (`fibonacci`, `keccak`, `hashmap`, …).
 
 ## Building a guest
 
