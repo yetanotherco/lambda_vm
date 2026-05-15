@@ -8,6 +8,7 @@ use crate::{
     },
     proof::options::ProofOptions,
     config::BatchedMerkleTreeBackend,
+    proof::quotient_chunks::QuotientChunksCommitments,
     prover::{
         IsStarkProver, Prover, compute_chunks_deep_contribution, domain_cache_stats,
         evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
@@ -1075,6 +1076,156 @@ fn open_quotient_chunks_at_query_paths_verify() {
                     "d_max={d_max} chunk={c} index={index}: tampered leaf must not verify",
                 );
             }
+        }
+    }
+}
+
+/// Phase 3.3 — end-to-end synthesis test for the chunks primitives.
+///
+/// Wires together every building block we've added so far:
+///   * Phase 1.2 / 1.4: `lde_and_commit_quotient_chunks` produces
+///     per-chunk LDE + Merkle commitments,
+///   * Phase 1.3 / 2: `QuotientChunksCommitments::verify_at_ood` reconstructs
+///     `H(z)` from chunk OOD evaluations and matches the directly-evaluated
+///     `H(z)`,
+///   * Phase 3.1: `compute_chunks_deep_contribution` produces the DEEP
+///     polynomial evaluations on the LDE,
+///   * Phase 3.2: `open_quotient_chunks_at_query` opens each chunk's tree
+///     at FRI query positions.
+///
+/// The load-bearing consistency: at every queried LDE row, the prover-side
+/// chunks-DEEP evaluation must equal what a verifier reconstructs from the
+/// chunk openings alone, i.e.,
+///
+/// ```text
+///   deep[br_x] == sum_c gamma_c * (Q_c(br_x) - Q_c(z)) / (lde[br_x] - z)
+/// ```
+///
+/// for `br_x ∈ {br_0, br_1}` at every query index. This is the cross-check
+/// FRI uses at query time to bind the committed DEEP polynomial to the
+/// per-chunk Merkle commitments.
+#[test]
+fn chunks_protocol_primitives_end_to_end_synthesis() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    // OOD point chosen far from any LDE-coset element.
+    let z = Felt::from(0xdead_beefu64);
+
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+        let num_chunks = qd.num_chunks;
+
+        // Known H of degree < K·N.
+        let h_coeffs: Vec<Felt> = (0..qd.size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let h_evals: Vec<Felt> = (0..qd.size).map(|i| h_poly.evaluate(qd.point_at(i))).collect();
+        let chunks = qd.split_evals_interleaved(&h_evals);
+
+        // Phase 1.4 — per-chunk LDE + Merkle commit.
+        let chunk_results = Prover::<GoldilocksField, GoldilocksField, ()>::lde_and_commit_quotient_chunks(
+            &qd, &domain, &chunks,
+        );
+        let chunk_ldes: Vec<Vec<Felt>> =
+            chunk_results.iter().map(|(lde, _, _)| lde.clone()).collect();
+        let chunk_roots: Vec<_> =
+            chunk_results.iter().map(|(_, _, r)| r.clone()).collect();
+
+        // Phase 1.3 / Phase 2 — chunk OOD evaluations and recompose check.
+        let chunk_ood: Vec<Felt> = chunks
+            .iter()
+            .enumerate()
+            .map(|(c, chunk)| {
+                let (sub_offset, _) = qd.chunk_subdomain(c);
+                let q_c = Polynomial::interpolate_offset_fft::<GoldilocksField>(chunk, &sub_offset)
+                    .unwrap();
+                q_c.evaluate(&z)
+            })
+            .collect();
+        let commitments = QuotientChunksCommitments {
+            chunk_roots: chunk_roots.clone(),
+            chunk_ood_evaluations: chunk_ood.clone(),
+        };
+        let h_at_z = h_poly.evaluate(&z);
+        assert!(
+            commitments.verify_at_ood(&qd, &z, &h_at_z),
+            "d_max={d_max}: chunk OOD evaluations must verify against H(z)",
+        );
+
+        // Phase 3.1 — chunks DEEP contribution on the LDE.
+        let gammas: Vec<Felt> = (0..num_chunks)
+            .map(|c| Felt::from((c as u64 + 1) * 31 + 7))
+            .collect();
+        let deep = compute_chunks_deep_contribution(
+            &chunk_ldes,
+            &chunk_ood,
+            &z,
+            &gammas,
+            &domain.lde_roots_of_unity_coset,
+        );
+
+        // Phase 3.2 + cross-check — at each FRI query position, opening the chunks
+        // and applying the verifier's reconstruction formula must reproduce
+        // `deep[br_x]` exactly.
+        let query_indices = [0usize, 1, 3, lde_size / 2 - 1];
+        for &index in &query_indices {
+            let openings = open_quotient_chunks_at_query(&chunk_results, index);
+            assert_eq!(openings.len(), num_chunks);
+
+            let br_0 = reverse_index(index * 2, lde_size as u64);
+            let br_1 = reverse_index(index * 2 + 1, lde_size as u64);
+            let x_br_0 = &domain.lde_roots_of_unity_coset[br_0];
+            let x_br_1 = &domain.lde_roots_of_unity_coset[br_1];
+            let inv_denom_0 = (x_br_0 - &z).inv().unwrap();
+            let inv_denom_1 = (x_br_1 - &z).inv().unwrap();
+
+            let mut reconstructed_0 = Felt::zero();
+            let mut reconstructed_1 = Felt::zero();
+            for c in 0..num_chunks {
+                reconstructed_0 = reconstructed_0
+                    + &gammas[c] * (&openings[c].evaluations[0] - &chunk_ood[c]) * &inv_denom_0;
+                reconstructed_1 = reconstructed_1
+                    + &gammas[c] * (&openings[c].evaluations_sym[0] - &chunk_ood[c]) * &inv_denom_1;
+            }
+            assert_eq!(
+                deep[br_0], reconstructed_0,
+                "d_max={d_max} index={index}: prover-side DEEP at br_0 disagrees with \
+                 verifier reconstruction from chunk openings",
+            );
+            assert_eq!(
+                deep[br_1], reconstructed_1,
+                "d_max={d_max} index={index}: prover-side DEEP at br_1 disagrees with \
+                 verifier reconstruction from chunk openings",
+            );
         }
     }
 }
