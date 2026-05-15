@@ -206,6 +206,76 @@ impl<F: IsFFTField> QuotientDomain<F> {
         };
         (sub_offset, sub_generator)
     }
+
+    /// Reconstruct `H(z)` from chunk openings `Q_i(z)` using the P3-style
+    /// Lagrange identity over the disjoint sub-cosets:
+    ///
+    /// ```text
+    /// H(z) = sum_{i=0..K-1} zps[i] * Q_i(z)
+    /// zps[i] = product_{j != i} V_j(z) / V_j(first_point_i)
+    /// ```
+    ///
+    /// where `V_j(x) = x^N - first_point_j^N` is the vanishing polynomial of the
+    /// j-th sub-coset, `first_point_j = coset_offset · omega^j = point_at(j)`,
+    /// `K = num_chunks` and `N = trace_length`.
+    ///
+    /// The identity holds because (a) each `zps[i]` is a polynomial of degree
+    /// `<= (K-1)·N` that evaluates to `1` on the i-th sub-coset and to `0` on
+    /// every other sub-coset, and (b) `Q_i` agrees with `H` on the i-th
+    /// sub-coset by construction of the interleaved split. The sum is therefore
+    /// a degree-`< K·N` polynomial that agrees with `H` on `K·N` distinct
+    /// points, i.e., the same polynomial.
+    ///
+    /// Matches `recompose_quotient_from_chunks` in p3-uni-stark 0.5.2
+    /// (`src/verifier.rs`, lines 25–69) — the entry point the verifier uses to
+    /// fold chunk openings back into `H(z)` for the constraint check at `z`.
+    pub fn recompose_at<E>(
+        &self,
+        chunk_evals_at_z: &[FieldElement<E>],
+        z: &FieldElement<E>,
+    ) -> FieldElement<E>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        assert_eq!(
+            chunk_evals_at_z.len(),
+            self.num_chunks,
+            "recompose_at: chunk_evals_at_z.len() = {} but num_chunks = {}",
+            chunk_evals_at_z.len(),
+            self.num_chunks,
+        );
+        let n = self.trace_length;
+
+        // first_pow_n[j] = (coset_offset · omega^j)^N, in the base field F.
+        let first_pow_n: Vec<FieldElement<F>> = (0..self.num_chunks)
+            .map(|j| self.point_at(j).pow(n))
+            .collect();
+        let z_pow_n = z.pow(n);
+
+        // Both V_j(z) and V_j(first_point_i) are written with the F-term on the
+        // left of the subtraction so the mixed F→E coercion goes through
+        // lambdaworks' `IsSubFieldOf::sub` (which only supports F − E). The
+        // overall sign of the ratio is unchanged because both numerator and
+        // denominator are negated.
+        let mut result = FieldElement::<E>::zero();
+        for i in 0..self.num_chunks {
+            let mut zp = FieldElement::<E>::one();
+            for j in 0..self.num_chunks {
+                if j == i {
+                    continue;
+                }
+                let num_e = &first_pow_n[j] - &z_pow_n;
+                let denom_inv = (&first_pow_n[j] - &first_pow_n[i])
+                    .inv()
+                    .expect("disjoint sub-cosets ⇒ shift_i^N != shift_j^N");
+                zp *= &num_e;
+                zp *= &denom_inv;
+            }
+            result = result + &zp * &chunk_evals_at_z[i];
+        }
+        result
+    }
 }
 
 /// Lightweight domain without pre-computed roots of unity. Used by the verifier

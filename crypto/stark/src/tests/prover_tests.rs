@@ -609,3 +609,101 @@ fn quotient_domain_interleaved_split_matches_subcoset_evals() {
         }
     }
 }
+
+/// Phase 1.3 sanity test for the chunks-based commitment migration.
+///
+/// Validates the P3-style algebraic identity that the chunks verifier will use
+/// to recover `H(z)` from the chunk openings `Q_i(z)`:
+///
+/// ```text
+///   H(z) = sum_{i=0..K-1} zps[i] * Q_i(z)
+/// ```
+///
+/// where `Q_i` is the polynomial of degree `< N` interpolating the i-th
+/// interleaved chunk on its sub-coset, and `zps[i]` is the Lagrange-style
+/// coefficient defined in `QuotientDomain::recompose_at`.
+///
+/// For each `d_max in {1, 2, 3}` we build a known `H` of degree `< K·N`,
+/// evaluate it on the quotient domain, run the split + per-chunk
+/// interpolation, then check `recompose_at` matches `H(z)` at several `z`.
+/// `d_max = 1` is trivial (K = 1, zps is the empty product = 1), but is kept
+/// to lock in the degenerate path.
+#[test]
+fn quotient_domain_recompose_at_matches_direct_h_eval() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+        let num_chunks = qd.num_chunks;
+        let size = qd.size;
+
+        // Random-looking polynomial H of degree < K·N.
+        let h_coeffs: Vec<Felt> = (0..size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+
+        // H on the quotient domain.
+        let h_evals: Vec<Felt> = (0..size).map(|i| h_poly.evaluate(qd.point_at(i))).collect();
+
+        // Interleaved split → per-chunk evaluations on sub-cosets.
+        let chunks = qd.split_evals_interleaved(&h_evals);
+
+        // Interpolate each chunk on its sub-coset to recover Q_i.
+        let q_polys: Vec<Polynomial<Felt>> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let (sub_offset, _) = qd.chunk_subdomain(i);
+                Polynomial::interpolate_offset_fft::<GoldilocksField>(chunk, &sub_offset)
+                    .expect("chunk interpolation should succeed on power-of-two-sized sub-coset")
+            })
+            .collect();
+
+        // Probe several z values (different residues mod every sub-coset to avoid
+        // accidental zero denominators inside the verifier identity).
+        let zs = [
+            Felt::from(12345u64),
+            Felt::from(98765u64),
+            Felt::from(42u64),
+            Felt::from(0xdead_beefu64),
+        ];
+        for z in &zs {
+            let q_at_z: Vec<Felt> = q_polys.iter().map(|q| q.evaluate(z)).collect();
+            let h_z_direct = h_poly.evaluate(z);
+            let h_z_recompose = qd.recompose_at(&q_at_z, z);
+            assert_eq!(
+                h_z_direct, h_z_recompose,
+                "d_max={d_max} num_chunks={num_chunks}: recompose_at(chunk_evals, z) \
+                 disagrees with direct H(z) at z={z:?}",
+            );
+        }
+    }
+}
