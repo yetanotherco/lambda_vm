@@ -1296,8 +1296,15 @@ pub trait IsStarkProver<
             chunks.len(),
             quotient_domain.num_chunks,
         );
-        let mut out = Vec::with_capacity(chunks.len());
-        for (i, chunk_vals) in chunks.iter().enumerate() {
+
+        // Per-chunk work: iFFT(N) + scale + FFT(2N) + Merkle commit. All chunks
+        // are independent. Run them in parallel — single-H's analogous
+        // `decompose_and_extend_d2` uses `rayon::join` for the same reason
+        // (extending H_0 and H_1 halves). Without this, on the EPYC bench
+        // server at log_rows=21 / num_chunks=2 / QuadraticPair (2026-05-15),
+        // the sequential loop contributed ~250 ms of unnecessary wall-clock
+        // (about half the chunks-vs-single-H gap at that size).
+        let process_chunk = |i: usize, chunk_vals: &Vec<FieldElement<FieldExtension>>| {
             assert_eq!(
                 chunk_vals.len(),
                 quotient_domain.trace_length,
@@ -1318,9 +1325,25 @@ pub trait IsStarkProver<
             let (tree, root) =
                 Self::commit_composition_polynomial(std::slice::from_ref(&chunk_lde))
                     .expect("commit_composition_polynomial should succeed for nonzero chunk");
-            out.push((chunk_lde, tree, root));
+            (chunk_lde, tree, root)
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            chunks
+                .par_iter()
+                .enumerate()
+                .map(|(i, c)| process_chunk(i, c))
+                .collect()
         }
-        out
+        #[cfg(not(feature = "parallel"))]
+        {
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| process_chunk(i, c))
+                .collect()
+        }
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
