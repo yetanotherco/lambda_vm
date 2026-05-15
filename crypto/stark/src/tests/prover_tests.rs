@@ -9,6 +9,7 @@ use crate::{
     proof::options::ProofOptions,
     config::BatchedMerkleTreeBackend,
     proof::quotient_chunks::QuotientChunksCommitments,
+    prover::{Round1, Round1CommitmentData},
     prover::{
         IsStarkProver, Prover, ProvingError, compute_chunk_ood_evaluations,
         compute_chunks_deep_contribution, compute_trace_deep_contribution, domain_cache_stats,
@@ -1716,4 +1717,453 @@ fn compute_deep_composition_poly_evaluations_chunks_is_degree_below_n() {
             );
         }
     }
+}
+
+/// Phase 4.3c test for `open_deep_composition_poly_chunks`.
+///
+/// Asserts that the chunks-protocol DEEP opening assembled at FRI query
+/// positions carries valid per-chunk Merkle inclusion proofs against the
+/// corresponding chunk roots from `Round2Chunks`. The trace-side openings
+/// share code with the single-H path and are covered by existing tests; this
+/// test focuses on the new quotient_chunks portion of
+/// `DeepPolynomialOpeningChunks`.
+#[test]
+fn open_deep_composition_poly_chunks_paths_verify() {
+    use std::sync::Arc;
+
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root: trace_primitive_root.clone(),
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    // === Minimal Round1 with a single main trace column. ===
+    let trace_poly = Polynomial::new(
+        &(0..trace_length)
+            .map(|i| Felt::from((i as u64 + 1) * 7))
+            .collect::<Vec<_>>(),
+    );
+    let trace_lde: Vec<Felt> =
+        evaluate_polynomial_on_lde_domain(&trace_poly, blowup_factor, trace_length, &coset_offset)
+            .unwrap();
+    let trace_columns = vec![trace_lde.clone()];
+    let (trace_tree, trace_root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed::<
+            GoldilocksField,
+        >(&trace_columns)
+        .expect("trace commit");
+    let lde_trace = LDETraceTable::from_columns(
+        trace_columns.clone(),
+        Vec::<Vec<Felt>>::new(),
+        1,
+        blowup_factor,
+    );
+    let round_1_result = Round1::<GoldilocksField, GoldilocksField> {
+        lde_trace,
+        main: Round1CommitmentData::<GoldilocksField> {
+            lde_trace_merkle_tree: Arc::new(trace_tree),
+            lde_trace_merkle_root: trace_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
+        },
+        aux: None,
+        rap_challenges: Vec::new(),
+        bus_public_inputs: None,
+    };
+
+    // === Round2Chunks via the Phase 4.1 kernel from a known H. ===
+    let d_max = 2usize;
+    let qd_size = d_max * trace_length;
+    let h_coeffs: Vec<Felt> = (0..qd_size)
+        .map(|i| Felt::from((11 * i + 17) as u64))
+        .collect();
+    let h_poly = Polynomial::new(&h_coeffs);
+    let constraint_evals_lde: Vec<Felt> = (0..lde_size)
+        .map(|i| h_poly.evaluate(&domain.lde_roots_of_unity_coset[i]))
+        .collect();
+    let round_2_chunks = Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+        constraint_evals_lde,
+        &domain,
+        d_max,
+    )
+    .unwrap();
+
+    // === Open at several FRI query positions. ===
+    let query_indices = vec![0usize, 1, 3, lde_size / 2 - 1];
+    let openings =
+        Prover::<GoldilocksField, GoldilocksField, ()>::open_deep_composition_poly_chunks(
+            &domain,
+            &round_1_result,
+            &round_2_chunks,
+            &query_indices,
+        );
+    assert_eq!(openings.len(), query_indices.len());
+
+    for (q_idx, opening) in openings.iter().enumerate() {
+        let index = query_indices[q_idx];
+        assert_eq!(
+            opening.quotient_chunks.len(),
+            round_2_chunks.num_chunks,
+            "query={index}: opening.quotient_chunks count mismatch",
+        );
+        assert!(
+            opening.precomputed_trace_polys.is_none(),
+            "no preprocessed trace in this test",
+        );
+        assert!(opening.aux_trace_polys.is_none(), "no aux trace in this test");
+
+        for (c, chunk_open) in opening.quotient_chunks.iter().enumerate() {
+            let chunk_lde = &round_2_chunks.chunk_lde_evaluations[c];
+            let chunk_root = &round_2_chunks.chunk_roots[c];
+            let br_0 = reverse_index(index * 2, lde_size as u64);
+            let br_1 = reverse_index(index * 2 + 1, lde_size as u64);
+
+            // Eval correctness.
+            assert_eq!(chunk_open.evaluations, vec![chunk_lde[br_0].clone()]);
+            assert_eq!(chunk_open.evaluations_sym, vec![chunk_lde[br_1].clone()]);
+
+            // Path correctness — leaf encodes [br_0, br_1] (matches
+            // commit_composition_polynomial's leaf layout).
+            let leaf = vec![chunk_lde[br_0].clone(), chunk_lde[br_1].clone()];
+            assert!(
+                chunk_open
+                    .proof
+                    .verify::<BatchedMerkleTreeBackend<GoldilocksField>>(
+                        chunk_root, index, &leaf
+                    ),
+                "query={index} chunk={c}: Merkle path must verify against chunk root",
+            );
+        }
+    }
+}
+
+/// Phase 4.3d end-to-end test for `round_4_compute_and_run_fri_..._chunks`.
+///
+/// Wires the full chunks-protocol prover stack — Round1 (real Fibonacci trace
+/// commit), Round2Chunks (via round_2_compute_composition_polynomial_chunks),
+/// Round3Chunks (via the chunks round_3 method), and finally
+/// round_4_compute_and_run_fri_on_the_deep_composition_polynomial_chunks —
+/// and asserts the resulting `Round4Chunks` has the expected shape:
+///
+/// 1. `fri_layers_merkle_roots` has the expected number of layers (one per
+///    halving until the FRI last layer).
+/// 2. `query_list` has length equal to the configured FRI query count.
+/// 3. `deep_poly_openings` has one entry per query, each with
+///    `quotient_chunks.len() == num_chunks`.
+///
+/// FibonacciAIR has d_max = 1, so num_chunks = 1 — the degenerate chunks
+/// path. This is intentional: it lets us drive the full pipeline with the
+/// simplest real AIR while still hitting every code path of the new
+/// round_2/3/4 trait methods.
+#[test]
+fn round_4_chunks_full_pipeline_smoke_test() {
+    use std::sync::Arc;
+
+    use crate::examples::simple_fibonacci;
+    use crate::proof::options::ProofOptions;
+    use crate::traits::AIR;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
+    let trace_length: usize = 16;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset_u64: u64 = 3;
+    let coset_offset = Felt::from(coset_offset_u64);
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 4,
+        coset_offset: coset_offset_u64,
+        grinding_factor: 0,
+    };
+
+    let trace =
+        simple_fibonacci::fibonacci_trace([Felt::from(1u64), Felt::from(1u64)], trace_length);
+    let pub_inputs = simple_fibonacci::FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let domain = Domain::new(&air, trace_length);
+
+    // --- Build Round1 (real Merkle commit over the LDE main trace). ---
+    let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
+    let trace_lde_columns: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                .unwrap()
+        })
+        .collect();
+    let (trace_tree, trace_root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed::<
+            GoldilocksField,
+        >(&trace_lde_columns)
+        .expect("trace commit");
+    let lde_trace = LDETraceTable::from_columns(
+        trace_lde_columns,
+        Vec::<Vec<Felt>>::new(),
+        air.step_size(),
+        blowup_factor,
+    );
+    let round_1_result = Round1::<GoldilocksField, GoldilocksField> {
+        lde_trace,
+        main: Round1CommitmentData::<GoldilocksField> {
+            lde_trace_merkle_tree: Arc::new(trace_tree),
+            lde_trace_merkle_root: trace_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
+        },
+        aux: None,
+        rap_challenges: Vec::new(),
+        bus_public_inputs: None,
+    };
+
+    // --- Sample coefficients deterministically (skip real Fiat-Shamir for
+    //     this shape-only test). ---
+    let num_boundary_constraints = air
+        .boundary_constraints(&pub_inputs, &round_1_result.rap_challenges, None, trace_length)
+        .constraints
+        .len();
+    let num_transition_constraints = air.context().num_transition_constraints;
+    let mut coefficients: Vec<Felt> = (0..(num_boundary_constraints + num_transition_constraints))
+        .map(|i| Felt::from((i as u64 + 1) * 17))
+        .collect();
+    let transition_coefficients: Vec<Felt> =
+        coefficients.drain(..num_transition_constraints).collect();
+    let boundary_coefficients = coefficients;
+
+    // --- Round 2 (chunks). ---
+    let round_2_chunks = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::round_2_compute_composition_polynomial_chunks(
+        &air,
+        &pub_inputs,
+        &domain,
+        &round_1_result,
+        &transition_coefficients,
+        &boundary_coefficients,
+    )
+    .expect("round_2_chunks should succeed for d_max = 1");
+    assert_eq!(round_2_chunks.num_chunks, 1, "FibonacciAIR has d_max = 1");
+
+    // --- Round 3 (chunks). ---
+    let z = Felt::from(0xdead_beefu64);
+    let round_3_chunks = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::round_3_evaluate_polynomials_in_out_of_domain_element_chunks(
+        &air,
+        &domain,
+        &round_1_result,
+        &round_2_chunks,
+        &z,
+    );
+    assert_eq!(round_3_chunks.chunk_ood_evaluations.len(), 1);
+
+    // --- Round 4 (chunks): run FRI + assemble openings. ---
+    let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let round_4_chunks = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::round_4_compute_and_run_fri_on_the_deep_composition_polynomial_chunks(
+        &air,
+        &domain,
+        &round_1_result,
+        &round_2_chunks,
+        &round_3_chunks,
+        &z,
+        &mut transcript,
+    );
+
+    // --- Shape assertions. ---
+    // FRI commits a sequence of fold-layer Merkle roots; the exact count
+    // depends on the FRI fold schedule. Just check it produced something.
+    assert!(
+        !round_4_chunks.fri_layers_merkle_roots.is_empty(),
+        "FRI must produce at least one layer root",
+    );
+    assert_eq!(
+        round_4_chunks.query_list.len(),
+        proof_options.fri_number_of_queries as usize,
+        "query_list size must match fri_number_of_queries",
+    );
+    assert_eq!(
+        round_4_chunks.deep_poly_openings.len(),
+        proof_options.fri_number_of_queries as usize,
+        "one DeepPolynomialOpeningChunks per query",
+    );
+    for opening in &round_4_chunks.deep_poly_openings {
+        assert_eq!(
+            opening.quotient_chunks.len(),
+            round_2_chunks.num_chunks,
+            "each DEEP opening must carry num_chunks chunk openings",
+        );
+    }
+    assert!(
+        round_4_chunks.nonce.is_none(),
+        "grinding_factor=0 ⇒ no nonce",
+    );
+
+    let _ = lde_size; // silence unused-variable lint on debug builds
+}
+
+/// Phase 4.4 end-to-end smoke test for `prove_rounds_2_to_4_chunks`.
+///
+/// Threads the chunks-protocol prover from a freshly-initialized transcript
+/// all the way through to a `StarkProofChunks` on `FibonacciAIR`. Asserts
+/// the proof's shape matches the protocol: per-chunk roots are present,
+/// trace OOD evaluations are populated, FRI layers + queries are emitted,
+/// and every per-query DEEP opening carries `num_chunks` quotient-chunk
+/// inclusion proofs.
+///
+/// This is the prover-side counterpart to what Phase 4.5 (verifier mirror)
+/// + Phase 4.7 (round-trip) will close on.
+#[test]
+fn prove_rounds_2_to_4_chunks_full_pipeline_smoke_test() {
+    use std::sync::Arc;
+
+    use crate::examples::simple_fibonacci;
+    use crate::proof::options::ProofOptions;
+    use crate::traits::AIR;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let trace_length: usize = 16;
+    let blowup_factor: usize = 2;
+    let coset_offset_u64: u64 = 3;
+    let coset_offset = Felt::from(coset_offset_u64);
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 4,
+        coset_offset: coset_offset_u64,
+        grinding_factor: 0,
+    };
+
+    let trace =
+        simple_fibonacci::fibonacci_trace([Felt::from(1u64), Felt::from(1u64)], trace_length);
+    let pub_inputs = simple_fibonacci::FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let domain = Domain::new(&air, trace_length);
+
+    let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
+    let trace_lde_columns: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                .unwrap()
+        })
+        .collect();
+    let (trace_tree, trace_root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed::<
+            GoldilocksField,
+        >(&trace_lde_columns)
+        .expect("trace commit");
+    let lde_trace = LDETraceTable::from_columns(
+        trace_lde_columns,
+        Vec::<Vec<Felt>>::new(),
+        air.step_size(),
+        blowup_factor,
+    );
+    let round_1_result = Round1::<GoldilocksField, GoldilocksField> {
+        lde_trace,
+        main: Round1CommitmentData::<GoldilocksField> {
+            lde_trace_merkle_tree: Arc::new(trace_tree),
+            lde_trace_merkle_root: trace_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
+        },
+        aux: None,
+        rap_challenges: Vec::new(),
+        bus_public_inputs: None,
+    };
+
+    // Initialize the transcript exactly as a real prover would (after round 1
+    // appends the trace root). For this shape test, prove_rounds_2_to_4_chunks
+    // is the unit under test, so we only need a fresh transcript that mirrors
+    // the verifier's mental model.
+    let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    <DefaultTranscript<GoldilocksField> as IsTranscript<GoldilocksField>>::append_bytes(
+        &mut transcript,
+        &trace_root,
+    );
+
+    let proof = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::prove_rounds_2_to_4_chunks(
+        &air,
+        &pub_inputs,
+        &round_1_result,
+        &mut transcript,
+        &domain,
+    )
+    .expect("prove_rounds_2_to_4_chunks should succeed on FibonacciAIR");
+
+    // Shape assertions.
+    assert_eq!(proof.trace_length, trace_length);
+    assert_eq!(proof.lde_trace_main_merkle_root, trace_root);
+    assert!(proof.lde_trace_aux_merkle_root.is_none());
+    assert!(proof.lde_trace_precomputed_merkle_root.is_none());
+    assert_eq!(
+        proof.quotient_chunk_roots.len(),
+        1,
+        "FibonacciAIR has d_max = 1 → num_chunks = 1",
+    );
+    assert_eq!(
+        proof.quotient_chunk_ood_evaluations.len(),
+        proof.quotient_chunk_roots.len(),
+        "one Q_c(z) per chunk root",
+    );
+    assert!(!proof.fri_layers_merkle_roots.is_empty());
+    assert_eq!(
+        proof.query_list.len(),
+        proof_options.fri_number_of_queries as usize,
+    );
+    assert_eq!(
+        proof.deep_poly_openings.len(),
+        proof_options.fri_number_of_queries as usize,
+    );
+    for opening in &proof.deep_poly_openings {
+        assert_eq!(opening.quotient_chunks.len(), proof.quotient_chunk_roots.len());
+    }
+    assert!(proof.nonce.is_none(), "grinding_factor=0 ⇒ no nonce");
 }

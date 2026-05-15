@@ -30,6 +30,27 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
+/// Chunks-protocol analogue of [`DeepPolynomialOpening`].
+///
+/// The single-H field `composition_poly: PolynomialOpenings<E>` is replaced
+/// by `quotient_chunks: Vec<PolynomialOpenings<E>>` — one independent
+/// inclusion proof per chunk, each against its own Merkle root. Other fields
+/// (trace openings) are unchanged.
+///
+/// Phase 4.3c: not yet referenced from `StarkProof`; assembled by
+/// `IsStarkProver::open_deep_composition_poly_chunks` and exercised in
+/// isolation by `tests::prover_tests::open_deep_composition_poly_chunks_paths_verify`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct DeepPolynomialOpeningChunks<F: IsSubFieldOf<E>, E: IsField> {
+    pub quotient_chunks: Vec<PolynomialOpenings<E>>,
+    pub main_trace_polys: PolynomialOpenings<F>,
+    pub precomputed_trace_polys: Option<PolynomialOpenings<F>>,
+    pub aux_trace_polys: Option<PolynomialOpenings<E>>,
+}
+
+pub type DeepPolynomialOpeningsChunks<F, E> = Vec<DeepPolynomialOpeningChunks<F, E>>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
@@ -67,6 +88,47 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // 2. Bus balance check: Σ table_contribution across all tables = expected_bus_balance
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
+    pub public_inputs: PI,
+}
+
+/// Phase 4.6 chunks-protocol analogue of [`StarkProof`].
+///
+/// Single-H fields replaced:
+/// - `composition_poly_root: Commitment` → `quotient_chunk_roots: Vec<Commitment>`
+/// - `composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>` →
+///   `quotient_chunk_ood_evaluations: Vec<FieldElement<E>>` (semantics: each
+///   `Q_c(z)` evaluated at `z` directly, not at `z^num_parts`).
+/// - `deep_poly_openings: DeepPolynomialOpenings<F, E>` →
+///   `DeepPolynomialOpeningsChunks<F, E>` (per-chunk Merkle paths in each
+///   query opening).
+///
+/// All other fields (trace commitments, FRI layers, public inputs, etc.) are
+/// shared verbatim with the single-H proof — only the composition-side
+/// fields change semantics.
+///
+/// Not yet referenced from `MultiProof`; this struct is the return type the
+/// chunks-protocol prover assembles in Phase 4.4 and the verifier consumes
+/// in Phase 4.5.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+pub struct StarkProofChunks<F: IsSubFieldOf<E>, E: IsField, PI> {
+    pub trace_length: usize,
+    pub lde_trace_main_merkle_root: Commitment,
+    pub lde_trace_aux_merkle_root: Option<Commitment>,
+    pub lde_trace_precomputed_merkle_root: Option<Commitment>,
+    pub trace_ood_evaluations: Table<E>,
+    /// Per-chunk Merkle roots; appended to the transcript in chunk-index
+    /// order before sampling `z`.
+    pub quotient_chunk_roots: Vec<Commitment>,
+    /// `Q_c(z)` per chunk; verifier passes these to
+    /// [`crate::domain::QuotientDomain::recompose_at`].
+    pub quotient_chunk_ood_evaluations: Vec<FieldElement<E>>,
+    pub fri_layers_merkle_roots: Vec<Commitment>,
+    pub fri_last_value: FieldElement<E>,
+    pub query_list: Vec<FriDecommitment<E>>,
+    pub deep_poly_openings: DeepPolynomialOpeningsChunks<F, E>,
+    pub nonce: Option<u64>,
+    pub bus_public_inputs: Option<BusPublicInputs<E>>,
     pub public_inputs: PI,
 }
 

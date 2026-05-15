@@ -401,6 +401,20 @@ pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     nonce: Option<u64>,
 }
 
+/// Phase 4.3d prover-side container for the chunks-based commitment protocol.
+///
+/// Analogue of [`Round4`]: identical FRI layers + query list shape, but
+/// `deep_poly_openings` carries [`DeepPolynomialOpeningsChunks`] (per-chunk
+/// Merkle inclusion proofs) instead of the single-H `DeepPolynomialOpenings`.
+#[allow(dead_code)] // wired in Phase 4.4
+pub struct Round4Chunks<F: IsSubFieldOf<E>, E: IsField> {
+    pub(crate) fri_last_value: FieldElement<E>,
+    pub(crate) fri_layers_merkle_roots: Vec<Commitment>,
+    pub(crate) deep_poly_openings: crate::proof::stark::DeepPolynomialOpeningsChunks<F, E>,
+    pub(crate) query_list: Vec<FriDecommitment<E>>,
+    pub(crate) nonce: Option<u64>,
+}
+
 /// Returns the evaluations of the polynomial `p` over the lde domain defined by the given
 /// `blowup_factor`, `domain_size` and `offset`. The number of evaluations returned is `domain_size
 /// * blowup_factor`. The domain generator used is the one given by the implementation of `F` as `IsFFTField`.
@@ -2145,6 +2159,218 @@ pub trait IsStarkProver<
         openings
     }
 
+    /// Phase 4.3d chunks-protocol analogue of
+    /// [`IsStarkProver::round_4_compute_and_run_fri_on_the_deep_composition_polynomial`].
+    ///
+    /// Same FRI flow: sample γ, build the DEEP polynomial on the LDE (via
+    /// [`IsStarkProver::compute_deep_composition_poly_evaluations_chunks`]),
+    /// bit-reverse, run `commit_phase_from_evaluations`, optional grinding,
+    /// sample query indices, run `query_phase`, then assemble the openings
+    /// using [`IsStarkProver::open_deep_composition_poly_chunks`]. The only
+    /// shape difference from the single-H path is the opening structure.
+    fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_chunks: &Round2Chunks<FieldExtension>,
+        round_3_chunks: &Round3Chunks<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Round4Chunks<Field, FieldExtension>
+    where
+        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes,
+    {
+        let coset_offset_u64 = air.context().proof_options.coset_offset;
+        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
+
+        let gamma = transcript.sample_field_element();
+
+        let num_chunks = round_2_chunks.num_chunks;
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+
+        // <<<< Receive challenges: 𝛾_c (one per chunk), 𝛾_{j,k} (trace terms)
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(num_chunks + num_terms_trace)
+                .collect();
+
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+            .drain(..num_terms_trace)
+            .collect::<Vec<_>>()
+            .chunks(air.context().transition_offsets.len() * air.step_size())
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        // The remaining coefficients are the chunk gammas.
+        let chunk_gammas = deep_composition_coefficients;
+
+        let deep_evals = Self::compute_deep_composition_poly_evaluations_chunks(
+            &round_1_result.lde_trace,
+            round_2_chunks,
+            round_3_chunks,
+            z,
+            domain,
+            &domain.trace_primitive_root,
+            &chunk_gammas,
+            &trace_term_coeffs,
+        );
+
+        // DEEP evaluations are at all 2N LDE points — bit-reverse for FRI.
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+        let mut lde_evals = deep_evals;
+        in_place_bit_reverse_permute(&mut lde_evals);
+
+        let (fri_last_value, fri_layers) =
+            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+                domain.root_order as usize,
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+            );
+
+        // Optional proof-of-work grinding (same shape as single-H path).
+        let security_bits = air.context().proof_options.grinding_factor;
+        let mut nonce = None;
+        if security_bits > 0 {
+            let nonce_value = grinding::generate_nonce(&transcript.state(), security_bits)
+                .expect("nonce not found");
+            transcript.append_bytes(&nonce_value.to_be_bytes());
+            nonce = Some(nonce_value);
+        }
+
+        let number_of_queries = air.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+
+        let query_list = fri::query_phase(&fri_layers, &iotas);
+
+        let fri_layers_merkle_roots: Vec<_> = fri_layers
+            .iter()
+            .map(|layer| layer.merkle_tree.root)
+            .collect();
+
+        let deep_poly_openings = Self::open_deep_composition_poly_chunks(
+            domain,
+            round_1_result,
+            round_2_chunks,
+            &iotas,
+        );
+
+        Round4Chunks {
+            fri_last_value,
+            fri_layers_merkle_roots,
+            deep_poly_openings,
+            query_list,
+            nonce,
+        }
+    }
+
+    /// Phase 4.3c chunks-protocol analogue of
+    /// [`IsStarkProver::open_deep_composition_poly`].
+    ///
+    /// Mirrors the single-H opener row for row: for each query index, opens
+    /// the main trace, optional precomputed trace, and optional aux trace
+    /// (identical to the single-H path), and replaces the single composition
+    /// opening with one opening per chunk Merkle tree. Each chunk's
+    /// `PolynomialOpenings` carries a single eval pair (`chunk_lde[br_0]`,
+    /// `chunk_lde[br_1]`) plus the Merkle path against that chunk's root.
+    ///
+    /// Not yet wired into `round_4_compute_and_run_fri_..._chunks` (Phase
+    /// 4.3d); exercised in isolation by
+    /// `open_deep_composition_poly_chunks_paths_verify`.
+    fn open_deep_composition_poly_chunks(
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_chunks: &Round2Chunks<FieldExtension>,
+        indexes_to_open: &[usize],
+    ) -> crate::proof::stark::DeepPolynomialOpeningsChunks<Field, FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let mut openings = Vec::with_capacity(indexes_to_open.len());
+
+        let is_preprocessed = round_1_result.main.precomputed_merkle_tree.is_some();
+        let num_precomputed_cols = round_1_result.main.num_precomputed_cols;
+        let total_cols = round_1_result.lde_trace.num_main_cols();
+
+        for index in indexes_to_open.iter() {
+            let main_trace_opening = if is_preprocessed {
+                Self::open_trace_polys_main_range(
+                    domain,
+                    &round_1_result.main.lde_trace_merkle_tree,
+                    &round_1_result.lde_trace,
+                    *index,
+                    num_precomputed_cols,
+                    total_cols,
+                )
+            } else {
+                Self::open_trace_polys_main(
+                    domain,
+                    &round_1_result.main.lde_trace_merkle_tree,
+                    &round_1_result.lde_trace,
+                    *index,
+                )
+            };
+
+            let precomputed_trace_polys =
+                round_1_result.main.precomputed_merkle_tree.as_ref().map(|tree| {
+                    Self::open_trace_polys_main_range(
+                        domain,
+                        tree,
+                        &round_1_result.lde_trace,
+                        *index,
+                        0,
+                        num_precomputed_cols,
+                    )
+                });
+
+            // Per-chunk opens: each chunk has its own Merkle tree. The leaf at
+            // `index` pairs `chunk_lde[br_0]` and `chunk_lde[br_1]`, matching
+            // the leaf layout of `commit_composition_polynomial` for a
+            // single-part input.
+            let quotient_chunks: Vec<PolynomialOpenings<FieldExtension>> = round_2_chunks
+                .chunk_lde_evaluations
+                .iter()
+                .zip(round_2_chunks.chunk_merkle_trees.iter())
+                .map(|(chunk_lde, tree)| {
+                    let n = chunk_lde.len();
+                    let proof = tree
+                        .get_proof_by_pos(*index)
+                        .expect("query index out of range for chunk Merkle tree");
+                    let br_0 = reverse_index(index * 2, n as u64);
+                    let br_1 = reverse_index(index * 2 + 1, n as u64);
+                    PolynomialOpenings {
+                        proof: proof.clone(),
+                        proof_sym: proof,
+                        evaluations: vec![chunk_lde[br_0].clone()],
+                        evaluations_sym: vec![chunk_lde[br_1].clone()],
+                    }
+                })
+                .collect();
+
+            let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
+                Self::open_trace_polys_aux(
+                    domain,
+                    &aux.lde_trace_merkle_tree,
+                    &round_1_result.lde_trace,
+                    *index,
+                )
+            });
+
+            openings.push(crate::proof::stark::DeepPolynomialOpeningChunks {
+                quotient_chunks,
+                main_trace_polys: main_trace_opening,
+                precomputed_trace_polys,
+                aux_trace_polys,
+            });
+        }
+
+        openings
+    }
+
     // TODO: propagate errors instead of unwrap() in commit_columns, reconstruct_round1, and expand_columns_to_lde
     /// Generates STARK proofs for one or more AIRs with a shared transcript.
     ///
@@ -2769,6 +2995,130 @@ pub trait IsStarkProver<
             // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             // Public inputs for boundary constraints
+            public_inputs: pub_inputs.clone(),
+            trace_length: domain.interpolation_domain_size,
+        })
+    }
+
+    /// Phase 4.4 chunks-protocol analogue of `prove_rounds_2_to_4`.
+    ///
+    /// Same Fiat-Shamir flow as the single-H path with these differences:
+    /// 1. Round 2: dispatches to
+    ///    `round_2_compute_composition_polynomial_chunks` and appends every
+    ///    chunk Merkle root (in chunk-index order) to the transcript before
+    ///    sampling `z`.
+    /// 2. Round 3: uses the chunks `round_3` method; appends trace OOD
+    ///    evaluations (same as single-H) and then `Q_c(z)` per chunk (same
+    ///    relative order as single-H's `H_i(z^N)`).
+    /// 3. Round 4: uses the chunks `round_4` method, which builds the DEEP
+    ///    polynomial from the chunks contribution + trace contribution and
+    ///    opens each chunk's tree independently per FRI query.
+    ///
+    /// Returns a [`crate::proof::stark::StarkProofChunks`] instead of
+    /// [`StarkProof`]; the rest of the proof shape (trace commits, FRI
+    /// layers, public inputs) is the same.
+    fn prove_rounds_2_to_4_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &Round1<Field, FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        domain: &Domain<Field>,
+    ) -> Result<crate::proof::stark::StarkProofChunks<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        info!("Started chunks proof generation...");
+
+        // === Round 2: sample 𝛽, run constraint evaluator, build chunks. ===
+        let beta = transcript.sample_field_element();
+        let trace_length = domain.interpolation_domain_size;
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                pub_inputs,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+        let num_transition_constraints = air.context().num_transition_constraints;
+
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                .take(num_boundary_constraints + num_transition_constraints)
+                .collect();
+        let transition_coefficients: Vec<_> =
+            coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coefficients = coefficients;
+
+        let round_2_chunks = Self::round_2_compute_composition_polynomial_chunks(
+            air,
+            pub_inputs,
+            domain,
+            round_1_result,
+            &transition_coefficients,
+            &boundary_coefficients,
+        )?;
+
+        // >>>> Send commitments: each chunk root, in chunk-index order.
+        for root in &round_2_chunks.chunk_roots {
+            transcript.append_bytes(root);
+        }
+
+        // === Round 3: sample z, evaluate OOD values. ===
+        let z = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+        let round_3_chunks = Self::round_3_evaluate_polynomials_in_out_of_domain_element_chunks(
+            air,
+            domain,
+            round_1_result,
+            &round_2_chunks,
+            &z,
+        );
+
+        // >>>> Send values: trace OOD evaluations (same shape as single-H).
+        let trace_ood_evaluations_columns = round_3_chunks.trace_ood_evaluations.columns();
+        for col in trace_ood_evaluations_columns.iter() {
+            for elem in col.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+        // >>>> Send values: Q_c(z) per chunk.
+        for element in round_3_chunks.chunk_ood_evaluations.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // === Round 4: DEEP composition + FRI + chunks opens. ===
+        let round_4_chunks =
+            Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial_chunks(
+                air,
+                domain,
+                round_1_result,
+                &round_2_chunks,
+                &round_3_chunks,
+                &z,
+                transcript,
+            );
+
+        info!("End chunks proof generation");
+
+        Ok(crate::proof::stark::StarkProofChunks {
+            lde_trace_main_merkle_root: round_1_result.main.lde_trace_merkle_root,
+            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.lde_trace_merkle_root),
+            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_merkle_root,
+            trace_ood_evaluations: round_3_chunks.trace_ood_evaluations,
+            quotient_chunk_roots: round_2_chunks.chunk_roots,
+            quotient_chunk_ood_evaluations: round_3_chunks.chunk_ood_evaluations,
+            fri_layers_merkle_roots: round_4_chunks.fri_layers_merkle_roots,
+            fri_last_value: round_4_chunks.fri_last_value,
+            query_list: round_4_chunks.query_list,
+            deep_poly_openings: round_4_chunks.deep_poly_openings,
+            nonce: round_4_chunks.nonce,
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
         })
