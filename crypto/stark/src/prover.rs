@@ -366,6 +366,25 @@ pub struct Round3<F: IsField> {
     composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
 }
 
+/// Phase 4.2 prover-side container for the chunks-based commitment protocol.
+///
+/// Analogue of [`Round3`]: trace OOD evaluations are identical, but the
+/// composition-poly-parts evaluations (at `z^num_parts`) are replaced by
+/// per-chunk evaluations at `z` directly.
+///
+/// Not yet wired into `prove_rounds_2_to_4`; constructed by
+/// [`IsStarkProver::round_3_evaluate_polynomials_in_out_of_domain_element_chunks`].
+#[allow(dead_code)] // wired in Phase 4.4
+pub struct Round3Chunks<F: IsField> {
+    /// Same as [`Round3::trace_ood_evaluations`].
+    pub(crate) trace_ood_evaluations: Table<F>,
+    /// `Q_c(z)` for each chunk `c`. Replaces
+    /// `Round3::composition_poly_parts_ood_evaluation`; the chunks protocol
+    /// opens each chunk at `z` instead of evaluating the composition parts
+    /// at `z^num_parts`.
+    pub(crate) chunk_ood_evaluations: Vec<FieldElement<F>>,
+}
+
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
@@ -401,6 +420,58 @@ where
         1 => Ok(evaluations),
         _ => Ok(evaluations.into_iter().step_by(step).collect()),
     }
+}
+
+/// Phase 4.2 building block of the chunks-based commitment migration.
+///
+/// Given the per-chunk LDE evaluations (rows on the standard LDE coset of size
+/// `trace_length * blowup_factor`) and an out-of-domain point `z`, return
+/// `Q_c(z)` for every chunk `c`. The chunks protocol opens each chunk at `z`
+/// directly — there is no `z^num_parts` exponentiation, in contrast to
+/// [`IsStarkProver::round_3_evaluate_polynomials_in_out_of_domain_element`].
+///
+/// Implementation mirrors the composition-parts barycentric block in
+/// `round_3_evaluate_polynomials_in_out_of_domain_element`: it pulls out
+/// every-`blowup_factor`-th sample from each chunk LDE (= `Q_c` evaluated on
+/// the trace coset, since each chunk polynomial has degree `< N`) and runs
+/// `interpolate_coset_eval_ext_with_g_n_inv` at `z`.
+///
+/// Not yet wired into the prover flow; exercised in isolation by
+/// `chunk_ood_evaluations_recompose_to_h` in `prover_tests.rs`.
+pub fn compute_chunk_ood_evaluations<F, E>(
+    chunk_ldes: &[Vec<FieldElement<E>>],
+    domain: &Domain<F>,
+    z: &FieldElement<E>,
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+{
+    let domain_size = domain.interpolation_domain_size;
+    let blowup_factor = domain.blowup_factor;
+    let dc = DomainConstants::from_domain(domain);
+    let z_pow_n = z.pow(domain_size);
+    let inv_denoms = math::polynomial::barycentric_inv_denoms(z, &dc.points);
+
+    chunk_ldes
+        .iter()
+        .map(|chunk_lde| {
+            let evals: Vec<FieldElement<E>> = (0..domain_size)
+                .map(|i| chunk_lde[i * blowup_factor].clone())
+                .collect();
+            math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                &z_pow_n,
+                &dc.offset_pow_n,
+                &dc.size_inv,
+                &dc.offset_pow_n_inv,
+                &dc.points,
+                &evals,
+                &inv_denoms,
+            )
+        })
+        .collect()
 }
 
 /// Phase 3.2 building block of the chunks-based commitment migration.
@@ -1367,6 +1438,44 @@ pub trait IsStarkProver<
         Round3 {
             trace_ood_evaluations,
             composition_poly_parts_ood_evaluation,
+        }
+    }
+
+    /// Phase 4.2 chunks-protocol analogue of
+    /// [`IsStarkProver::round_3_evaluate_polynomials_in_out_of_domain_element`].
+    ///
+    /// Trace OOD evaluations are computed identically. The composition-poly
+    /// parts OOD evaluation at `z^num_parts` is replaced by per-chunk
+    /// `Q_c(z)` openings via [`compute_chunk_ood_evaluations`]. Not yet
+    /// wired into `prove_rounds_2_to_4`.
+    fn round_3_evaluate_polynomials_in_out_of_domain_element_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_chunks: &Round2Chunks<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+    ) -> Round3Chunks<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let dc = DomainConstants::from_domain(domain);
+
+        let chunk_ood_evaluations =
+            compute_chunk_ood_evaluations(&round_2_chunks.chunk_lde_evaluations, domain, z);
+
+        let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
+            &round_1_result.lde_trace,
+            domain,
+            z,
+            &air.context().transition_offsets,
+            air.step_size(),
+            &dc,
+        );
+
+        Round3Chunks {
+            trace_ood_evaluations,
+            chunk_ood_evaluations,
         }
     }
 

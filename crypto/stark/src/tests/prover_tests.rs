@@ -10,8 +10,9 @@ use crate::{
     config::BatchedMerkleTreeBackend,
     proof::quotient_chunks::QuotientChunksCommitments,
     prover::{
-        IsStarkProver, Prover, ProvingError, compute_chunks_deep_contribution,
-        domain_cache_stats, evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
+        IsStarkProver, Prover, ProvingError, compute_chunk_ood_evaluations,
+        compute_chunks_deep_contribution, domain_cache_stats, evaluate_polynomial_on_lde_domain,
+        open_quotient_chunks_at_query,
     },
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
@@ -1343,5 +1344,82 @@ fn round_2_chunks_kernel_matches_direct_h_eval_and_rejects_d_max_3() {
             "d_max=3 should currently return WrongParameter; got Err({other:?})",
         ),
         Ok(_) => panic!("d_max=3 should currently return WrongParameter; got Ok(_)"),
+    }
+}
+
+/// Phase 4.2 test for `compute_chunk_ood_evaluations`.
+///
+/// The function is the chunks-protocol replacement for the
+/// composition-parts-OOD block of `round_3_evaluate_polynomials_in_out_of_domain_element`:
+/// barycentric-evaluate each chunk polynomial `Q_c` at `z` directly (no
+/// `z^num_parts` power).
+///
+/// The test builds `Round2Chunks` via `round_2_chunks_kernel` from a known
+/// `H`, runs `compute_chunk_ood_evaluations` at a fixed `z`, then folds the
+/// resulting `Q_c(z)` values back to `H(z)` via `QuotientDomain::recompose_at`
+/// and asserts the result equals `H(z)` evaluated directly. This is the
+/// load-bearing identity for the chunks verifier's step-2 check.
+#[test]
+fn chunk_ood_evaluations_recompose_to_h() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    let z = Felt::from(0xdead_beefu64);
+
+    for &d_max in &[1usize, 2] {
+        let qd_size = d_max.next_power_of_two().max(1) * trace_length;
+        let h_coeffs: Vec<Felt> = (0..qd_size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let constraint_evals_lde: Vec<Felt> = (0..lde_size)
+            .map(|i| h_poly.evaluate(&domain.lde_roots_of_unity_coset[i]))
+            .collect();
+
+        let r2 = Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+            constraint_evals_lde,
+            &domain,
+            d_max,
+        )
+        .unwrap();
+
+        let chunk_ood = compute_chunk_ood_evaluations(&r2.chunk_lde_evaluations, &domain, &z);
+        assert_eq!(chunk_ood.len(), r2.num_chunks);
+
+        let qd = QuotientDomain::new(&domain, d_max);
+        let h_z_recomposed = qd.recompose_at(&chunk_ood, &z);
+        let h_z_direct = h_poly.evaluate(&z);
+        assert_eq!(
+            h_z_recomposed, h_z_direct,
+            "d_max={d_max}: recompose_at over compute_chunk_ood_evaluations output must \
+             reproduce H(z)",
+        );
     }
 }
