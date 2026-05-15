@@ -707,3 +707,135 @@ fn quotient_domain_recompose_at_matches_direct_h_eval() {
         }
     }
 }
+
+/// Phase 1.4 round-trip test for the chunks-based commitment migration.
+///
+/// Validates `IsStarkProver::lde_and_commit_quotient_chunks` for `d_max ∈
+/// {1, 2, 3}`. For each chunk index `i`, the kernel does
+/// `iFFT(sub-coset) → Q_i → FFT(LDE)`. The test confirms two things:
+///
+/// 1. **LDE correctness**: the produced `chunk_lde[k]` equals
+///    `Q_i(domain.lde_roots_of_unity_coset[k])`, where `Q_i` is the chunk
+///    polynomial we interpolate independently inside the test.
+/// 2. **End-to-end algebraic consistency**: applying `recompose_at` to the
+///    per-chunk LDE values at every LDE point recovers `H(lde_point)`. This
+///    ties together the Phase 1.2 split semantics, the Phase 1.3 Lagrange
+///    identity, and the Phase 1.4 LDE+commit pipeline.
+///
+/// The kernel also produces a Merkle tree + root per chunk; we check the
+/// returned vector has the expected shape but do not yet verify openings
+/// (that's Phase 2 once we wire chunks through the prover's open path).
+#[test]
+fn lde_and_commit_quotient_chunks_round_trip() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+        let num_chunks = qd.num_chunks;
+        let size = qd.size;
+        let lde_size = trace_length * blowup_factor;
+
+        // Known H of degree < K·N, then evaluate on the quotient domain and split.
+        let h_coeffs: Vec<Felt> = (0..size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let h_evals: Vec<Felt> = (0..size).map(|i| h_poly.evaluate(qd.point_at(i))).collect();
+        let chunks = qd.split_evals_interleaved(&h_evals);
+
+        // Run the kernel under test.
+        let results = Prover::<GoldilocksField, GoldilocksField, ()>::lde_and_commit_quotient_chunks(
+            &qd, &domain, &chunks,
+        );
+
+        assert_eq!(
+            results.len(),
+            num_chunks,
+            "d_max={d_max}: kernel returned {} entries but num_chunks = {num_chunks}",
+            results.len(),
+        );
+
+        // Reference Q_i polynomials (the test interpolates them independently of the kernel).
+        let q_polys: Vec<Polynomial<Felt>> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let (sub_offset, _) = qd.chunk_subdomain(i);
+                Polynomial::interpolate_offset_fft::<GoldilocksField>(chunk, &sub_offset).unwrap()
+            })
+            .collect();
+
+        // 1. LDE correctness per chunk.
+        for (i, (chunk_lde, _tree, _root)) in results.iter().enumerate() {
+            assert_eq!(
+                chunk_lde.len(),
+                lde_size,
+                "d_max={d_max} chunk={i}: lde length {} != expected {lde_size}",
+                chunk_lde.len(),
+            );
+            for k in 0..lde_size {
+                let expected = q_polys[i].evaluate(&domain.lde_roots_of_unity_coset[k]);
+                assert_eq!(
+                    chunk_lde[k], expected,
+                    "d_max={d_max} chunk={i}: chunk_lde[{k}] disagrees with Q_i evaluated \
+                     at lde_roots_of_unity_coset[{k}]",
+                );
+            }
+        }
+
+        // 2. Algebraic consistency: recompose_at over the per-chunk LDE values
+        //    recovers H at every LDE point.
+        let chunk_ldes: Vec<&Vec<Felt>> = results.iter().map(|(lde, _, _)| lde).collect();
+        for k in 0..lde_size {
+            let lde_point = &domain.lde_roots_of_unity_coset[k];
+            let chunk_evals_at_lde_k: Vec<Felt> =
+                (0..num_chunks).map(|i| chunk_ldes[i][k].clone()).collect();
+            let h_recomposed = qd.recompose_at(&chunk_evals_at_lde_k, lde_point);
+            let h_direct = h_poly.evaluate(lde_point);
+            assert_eq!(
+                h_direct, h_recomposed,
+                "d_max={d_max}: recompose_at over chunk_ldes mismatches H at lde index {k}",
+            );
+        }
+
+        // 3. Per-chunk roots are well-formed (different chunks ⇒ generally different
+        //    roots, since they commit to different polynomials). For num_chunks > 1
+        //    assert that not all roots collapse to the same value.
+        if num_chunks > 1 {
+            let roots: Vec<_> = results.iter().map(|(_, _, root)| root.clone()).collect();
+            let all_same = roots.iter().all(|r| *r == roots[0]);
+            assert!(
+                !all_same,
+                "d_max={d_max}: all {num_chunks} chunk roots collapsed to the same value — \
+                 chunks should commit to distinct polynomials",
+            );
+        }
+    }
+}

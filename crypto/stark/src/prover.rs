@@ -33,7 +33,7 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::{Domain, DomainConstants};
+use super::domain::{Domain, DomainConstants, QuotientDomain};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -879,6 +879,74 @@ pub trait IsStarkProver<
             &domain.coset_offset,
         )
         .expect("LDE evaluation should succeed")
+    }
+
+    /// Phase 1.4 kernel of the chunks-based commitment migration.
+    ///
+    /// Given per-chunk evaluations on the disjoint sub-cosets of a
+    /// [`QuotientDomain`] (i.e., the output of
+    /// `QuotientDomain::split_evals_interleaved`), for each chunk:
+    ///   1. iFFT on the sub-coset → chunk polynomial `Q_i` of degree
+    ///      `< trace_length`,
+    ///   2. FFT-extend to LDE evaluations of size
+    ///      `trace_length * blowup_factor` on the standard LDE coset,
+    ///   3. Merkle-commit the LDE evaluations as an independent 1-part tree.
+    ///
+    /// Returns, per chunk, the LDE evaluations together with the corresponding
+    /// Merkle tree and root. Each chunk gets its own tree — Phase 3 will wire
+    /// these independent commitments into a multi-commitment FRI. For now the
+    /// shape mirrors P3's `commit_quotient` output (a `Vec` of per-chunk
+    /// commitments) so subsequent phases can build on it.
+    ///
+    /// Not yet wired into `round_2_compute_composition_polynomial`; the kernel
+    /// is exercised by `lde_and_commit_quotient_chunks_round_trip` to lock in
+    /// the LDE+commit shape before Phase 2 (verifier-side `ProofChunks`
+    /// struct).
+    fn lde_and_commit_quotient_chunks(
+        quotient_domain: &QuotientDomain<Field>,
+        domain: &Domain<Field>,
+        chunks: &[Vec<FieldElement<FieldExtension>>],
+    ) -> Vec<(
+        Vec<FieldElement<FieldExtension>>,
+        BatchedMerkleTree<FieldExtension>,
+        Commitment,
+    )>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        assert_eq!(
+            chunks.len(),
+            quotient_domain.num_chunks,
+            "lde_and_commit_quotient_chunks: got {} chunks but quotient_domain.num_chunks = {}",
+            chunks.len(),
+            quotient_domain.num_chunks,
+        );
+        let mut out = Vec::with_capacity(chunks.len());
+        for (i, chunk_vals) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk_vals.len(),
+                quotient_domain.trace_length,
+                "chunk {i} has length {} but quotient_domain.trace_length = {}",
+                chunk_vals.len(),
+                quotient_domain.trace_length,
+            );
+            let (sub_offset, _sub_gen) = quotient_domain.chunk_subdomain(i);
+            let q_i = Polynomial::interpolate_offset_fft::<Field>(chunk_vals, &sub_offset)
+                .expect("chunk iFFT should succeed on power-of-two-sized sub-coset");
+            let chunk_lde = evaluate_polynomial_on_lde_domain(
+                &q_i,
+                domain.blowup_factor,
+                domain.interpolation_domain_size,
+                &domain.coset_offset,
+            )
+            .expect("chunk LDE extension should succeed");
+            let (tree, root) =
+                Self::commit_composition_polynomial(std::slice::from_ref(&chunk_lde))
+                    .expect("commit_composition_polynomial should succeed for nonzero chunk");
+            out.push((chunk_lde, tree, root));
+        }
+        out
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
