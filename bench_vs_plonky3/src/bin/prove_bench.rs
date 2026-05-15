@@ -32,6 +32,7 @@ type FE = FieldElement<F>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProverKind {
     Lambda,
+    LambdaChunks,
     P3,
 }
 
@@ -68,7 +69,7 @@ impl Default for Args {
 
 fn print_usage() {
     eprintln!(
-        "usage: prove_bench --prover {{lambda|p3}} \
+        "usage: prove_bench --prover {{lambda|lambda-chunks|p3}} \
          [--log-rows K] [--num-sequences N] \
          [--blowup B] [--queries Q] [--grinding G] [--breakdown]"
     );
@@ -84,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
                 let v = iter.next().ok_or("--prover needs a value")?;
                 args.prover = match v.as_str() {
                     "lambda" => ProverKind::Lambda,
+                    "lambda-chunks" => ProverKind::LambdaChunks,
                     "p3" => ProverKind::P3,
                     other => return Err(format!("unknown prover: {other}")),
                 };
@@ -467,6 +469,67 @@ fn run_lambda(args: &Args) -> BenchMetrics {
     }
 }
 
+/// Phase 5.1 chunks-protocol Lambda runner.
+///
+/// Mirrors [`run_lambda`] but invokes `Prover::prove_chunks` and
+/// `Verifier::verify_chunks`. fib_pair AIR has `composition_poly_degree_bound
+/// = trace_length`, so this exercises the degenerate `num_chunks = 1` chunks
+/// path — useful as a sanity check that the chunks pipeline doesn't crash on
+/// production-sized inputs, but doesn't yet exercise the
+/// multi-chunk recompose. A higher-d_max bench AIR will be added separately.
+fn run_lambda_chunks(args: &Args) -> BenchMetrics {
+    let rows = 1usize << args.log_rows;
+    let options = proof_options(args);
+
+    let initial_values: Vec<(FE, FE)> = (0..args.num_sequences)
+        .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
+        .collect();
+
+    let mut trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
+    let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
+    let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
+        &options,
+        args.num_sequences,
+    );
+
+    let start = Instant::now();
+    let proof = Prover::<F, E, _>::prove_chunks(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("lambda chunks prove failed");
+    let prove_s = start.elapsed().as_secs_f64();
+    if args.breakdown {
+        print_breakdown(
+            "lambda-chunks",
+            args.log_rows,
+            rows,
+            "prove_total",
+            ms(prove_s),
+            "",
+        );
+    }
+
+    let proof_size_bytes = serde_cbor::to_vec(&proof)
+        .expect("lambda chunks proof serialization failed")
+        .len();
+
+    let start = Instant::now();
+    let verified =
+        Verifier::<F, E, _>::verify_chunks(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
+    let verify_s = start.elapsed().as_secs_f64();
+    assert!(verified, "lambda chunks verify failed");
+
+    BenchMetrics {
+        prove_s,
+        verify_s,
+        proof_size_bytes,
+        peak_rss_kb: peak_rss_kb(),
+    }
+}
+
 fn run_p3(args: &Args) -> BenchMetrics {
     let rows = 1usize << args.log_rows;
     let config = plonky3_config::params_config(args.blowup, args.queries, args.grinding);
@@ -532,11 +595,13 @@ fn main() -> ExitCode {
 
     let metrics = match args.prover {
         ProverKind::Lambda => run_lambda(&args),
+        ProverKind::LambdaChunks => run_lambda_chunks(&args),
         ProverKind::P3 => run_p3(&args),
     };
 
     let prover_name = match args.prover {
         ProverKind::Lambda => "lambda",
+        ProverKind::LambdaChunks => "lambda-chunks",
         ProverKind::P3 => "p3",
     };
     let rows = 1usize << args.log_rows;

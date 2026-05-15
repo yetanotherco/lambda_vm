@@ -2837,6 +2837,84 @@ pub trait IsStarkProver<
             .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
+    /// Phase 5.1 chunks-protocol single-AIR entry point.
+    ///
+    /// Counterpart to [`Self::prove`] but emits a
+    /// [`crate::proof::stark::StarkProofChunks`] via
+    /// [`Self::prove_rounds_2_to_4_chunks`]. Performs round 1 inline (commit
+    /// main trace, append to transcript) before delegating to the chunks
+    /// rounds 2-4.
+    ///
+    /// Restrictions for this initial entry point — sufficient for the
+    /// `bench_vs_plonky3` fib_pair AIR but rejected with
+    /// [`ProvingError::WrongParameter`] otherwise:
+    ///   * AIR must not be preprocessed (`is_preprocessed() == false`),
+    ///   * AIR must not have an aux trace (`has_aux_trace() == false`),
+    ///   * AIR must not require LogUp/bus public inputs.
+    ///
+    /// These restrictions can be lifted by mirroring `multi_prove`'s phase
+    /// A/B/C plumbing — out of scope for the initial bench.
+    fn prove_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        pub_inputs: &PI,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Result<crate::proof::stark::StarkProofChunks<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        if air.is_preprocessed() {
+            return Err(ProvingError::WrongParameter(
+                "prove_chunks: preprocessed AIRs are not yet supported".to_string(),
+            ));
+        }
+        if air.has_aux_trace() {
+            return Err(ProvingError::WrongParameter(
+                "prove_chunks: AIRs with auxiliary traces (RAP/LogUp) are not yet supported"
+                    .to_string(),
+            ));
+        }
+
+        let trace_length = trace.num_rows();
+        let domain = new_domain(air, trace_length);
+        let twiddles = LdeTwiddles::new(&domain);
+
+        // === Round 1: commit main trace, append root to transcript. ===
+        let (tree, root, _pre_tree, _pre_root, _n_pre, cached_main) =
+            Self::commit_main_trace(trace, &domain, &twiddles)?;
+        transcript.append_bytes(&root);
+
+        let lde_trace = LDETraceTable::from_columns(
+            cached_main,
+            Vec::new(),
+            air.step_size(),
+            domain.blowup_factor,
+        );
+        let round_1_result = Round1::<Field, FieldExtension> {
+            lde_trace,
+            main: Round1CommitmentData::<Field> {
+                lde_trace_merkle_tree: Arc::new(tree),
+                lde_trace_merkle_root: root,
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            },
+            aux: None,
+            rap_challenges: Vec::new(),
+            bus_public_inputs: None,
+        };
+
+        Self::prove_rounds_2_to_4_chunks(
+            air,
+            pub_inputs,
+            &round_1_result,
+            transcript,
+            &domain,
+        )
+    }
+
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
     /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initializated before passing it to this method.

@@ -2469,3 +2469,54 @@ fn chunks_protocol_prove_verify_round_trip_quadratic() {
         "verifier must reject tampered per-chunk Merkle leaf",
     );
 }
+
+/// Phase 5.1 — end-to-end using the new `Prover::prove_chunks` entry point.
+///
+/// Where the FibonacciAIR/QuadraticAIR round-trip tests build Round1
+/// manually, this test exercises the full top-level path `prove_chunks` →
+/// `verify_chunks` to mirror exactly what `bench_vs_plonky3` will invoke.
+/// QuadraticAIR is used because num_chunks=2 is the non-degenerate case.
+#[test]
+fn prove_chunks_then_verify_chunks_end_to_end_quadratic() {
+    use crate::examples::quadratic_air::{self, QuadraticAIR, QuadraticPublicInputs};
+    use crate::proof::options::ProofOptions;
+    use crate::verifier::{IsStarkVerifier, Verifier};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
+    let trace_length: usize = 16;
+    let blowup_factor: usize = 2;
+    let coset_offset_u64: u64 = 3;
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 4,
+        coset_offset: coset_offset_u64,
+        grinding_factor: 0,
+    };
+
+    let a0 = Felt::from(2u64);
+    let mut trace = quadratic_air::quadratic_trace(a0.clone(), trace_length);
+    let pub_inputs = QuadraticPublicInputs { a0: a0.clone() };
+    let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+
+    let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let proof = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        QuadraticPublicInputs<GoldilocksField>,
+    >::prove_chunks(&air, &mut trace, &pub_inputs, &mut prover_transcript)
+    .expect("prove_chunks should succeed on QuadraticAIR");
+    assert_eq!(
+        proof.quotient_chunk_roots.len(),
+        2,
+        "QuadraticAIR (d_max=2) must produce 2 chunks",
+    );
+
+    let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let ok = Verifier::<
+        GoldilocksField,
+        GoldilocksField,
+        QuadraticPublicInputs<GoldilocksField>,
+    >::verify_chunks(&proof, &air, &mut verifier_transcript);
+    assert!(ok, "verify_chunks must accept prove_chunks output");
+}
