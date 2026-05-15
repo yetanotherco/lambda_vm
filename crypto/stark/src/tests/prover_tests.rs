@@ -1565,3 +1565,155 @@ fn trace_deep_contribution_is_degree_below_n() {
         );
     }
 }
+
+/// Phase 4.3b test for `compute_deep_composition_poly_evaluations_chunks`.
+///
+/// The chunks-protocol DEEP composition polynomial = chunks contribution +
+/// trace contribution. Each piece is degree `< N` (validated by the Phase 3.1
+/// and 4.3a tests), so their sum must also be degree `< N` — that is the
+/// FRI input shape.
+///
+/// Builds a synthetic AIR-like scenario: trace polynomials of degree `< N`
+/// and a separate `H` polynomial of degree `< d_max·N` representing the
+/// (otherwise opaque) constraint-evaluation result. Threads everything
+/// through `round_2_chunks_kernel` + `compute_chunk_ood_evaluations` to
+/// produce realistic `Round2Chunks` / `Round3Chunks` inputs, then asserts
+/// the combiner's output has degree `< N` on the LDE coset.
+#[test]
+fn compute_deep_composition_poly_evaluations_chunks_is_degree_below_n() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root: trace_primitive_root.clone(),
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    let z = Felt::from(0xdead_beefu64);
+
+    for &d_max in &[1usize, 2] {
+        // === Trace side ===
+        let num_main_cols = 2usize;
+        let trace_polys: Vec<Polynomial<Felt>> = (0..num_main_cols)
+            .map(|j| {
+                let coeffs: Vec<Felt> = (0..trace_length)
+                    .map(|i| Felt::from(((i + 1) * (j + 2) * 13 + 5) as u64))
+                    .collect();
+                Polynomial::new(&coeffs)
+            })
+            .collect();
+        let lde_columns: Vec<Vec<Felt>> = trace_polys
+            .iter()
+            .map(|poly| {
+                evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                    .unwrap()
+            })
+            .collect();
+        let lde_trace =
+            LDETraceTable::from_columns(lde_columns, Vec::<Vec<Felt>>::new(), 1, blowup_factor);
+
+        let num_eval_points = 2usize;
+        let z_shifted = [z.clone(), &trace_primitive_root * &z];
+        let trace_ood_rows: Vec<Vec<Felt>> = (0..num_eval_points)
+            .map(|k| {
+                (0..num_main_cols)
+                    .map(|j| trace_polys[j].evaluate(&z_shifted[k]))
+                    .collect()
+            })
+            .collect();
+        let trace_ood_evaluations = Table::from_columns(
+            (0..num_main_cols)
+                .map(|j| {
+                    (0..num_eval_points)
+                        .map(|k| trace_ood_rows[k][j].clone())
+                        .collect()
+                })
+                .collect(),
+        );
+
+        // === Chunks side ===
+        let qd_size = d_max.next_power_of_two().max(1) * trace_length;
+        let h_coeffs: Vec<Felt> = (0..qd_size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let constraint_evals_lde: Vec<Felt> = (0..lde_size)
+            .map(|i| h_poly.evaluate(&domain.lde_roots_of_unity_coset[i]))
+            .collect();
+        let round_2_chunks =
+            Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+                constraint_evals_lde,
+                &domain,
+                d_max,
+            )
+            .unwrap();
+        let chunk_ood = compute_chunk_ood_evaluations(
+            &round_2_chunks.chunk_lde_evaluations,
+            &domain,
+            &z,
+        );
+        let round_3_chunks = crate::prover::Round3Chunks {
+            trace_ood_evaluations,
+            chunk_ood_evaluations: chunk_ood,
+        };
+
+        // === Random-looking challenge scalars ===
+        let chunk_gammas: Vec<Felt> = (0..round_2_chunks.num_chunks)
+            .map(|c| Felt::from((c as u64 + 1) * 31 + 7))
+            .collect();
+        let trace_terms_gammas: Vec<Vec<Felt>> = (0..num_main_cols)
+            .map(|j| {
+                (0..num_eval_points)
+                    .map(|k| Felt::from(((j + 1) * (k + 1) * 41 + 11) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let deep = Prover::<GoldilocksField, GoldilocksField, ()>::compute_deep_composition_poly_evaluations_chunks(
+            &lde_trace,
+            &round_2_chunks,
+            &round_3_chunks,
+            &z,
+            &domain,
+            &trace_primitive_root,
+            &chunk_gammas,
+            &trace_terms_gammas,
+        );
+        assert_eq!(deep.len(), lde_size);
+
+        let deep_poly =
+            Polynomial::interpolate_offset_fft::<GoldilocksField>(&deep, &domain.coset_offset)
+                .unwrap();
+        let coeffs = deep_poly.coefficients();
+        for (i, c) in coeffs.iter().enumerate().skip(trace_length) {
+            assert_eq!(
+                *c,
+                Felt::zero(),
+                "d_max={d_max}: chunks DEEP polynomial has non-zero coefficient at degree {i} \
+                 (expected < N = {trace_length})",
+            );
+        }
+    }
+}

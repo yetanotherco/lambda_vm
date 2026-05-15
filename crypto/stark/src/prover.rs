@@ -1608,6 +1608,58 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Phase 4.3b chunks-protocol analogue of
+    /// [`IsStarkProver::compute_deep_composition_poly_evaluations`].
+    ///
+    /// Sums the chunks contribution (from [`compute_chunks_deep_contribution`])
+    /// and the trace contribution (from [`compute_trace_deep_contribution`])
+    /// element-wise at every LDE row. The result is the DEEP composition
+    /// polynomial that FRI consumes in the chunks protocol — degree `< N`
+    /// just like the single-H version, but parameterized by chunk OOD
+    /// openings `Q_c(z)` at `z` instead of composition-parts evaluations at
+    /// `z^num_parts`.
+    ///
+    /// Not yet wired into `prove_rounds_2_to_4`; exercised by
+    /// `compute_deep_composition_poly_evaluations_chunks_is_degree_below_n`
+    /// in `prover_tests.rs`.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_deep_composition_poly_evaluations_chunks(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        round_2_chunks: &Round2Chunks<FieldExtension>,
+        round_3_chunks: &Round3Chunks<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        domain: &Domain<Field>,
+        primitive_root: &FieldElement<Field>,
+        chunk_gammas: &[FieldElement<FieldExtension>],
+        trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let chunks_part = compute_chunks_deep_contribution(
+            &round_2_chunks.chunk_lde_evaluations,
+            &round_3_chunks.chunk_ood_evaluations,
+            z,
+            chunk_gammas,
+            &domain.lde_roots_of_unity_coset,
+        );
+        let trace_part = compute_trace_deep_contribution(
+            lde_trace,
+            &round_3_chunks.trace_ood_evaluations,
+            z,
+            domain,
+            primitive_root,
+            trace_terms_gammas,
+        );
+        debug_assert_eq!(chunks_part.len(), trace_part.len());
+        chunks_part
+            .into_iter()
+            .zip(trace_part)
+            .map(|(c, t)| c + t)
+            .collect()
+    }
+
     /// Returns the result of the fourth round of the STARK Prove protocol.
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
