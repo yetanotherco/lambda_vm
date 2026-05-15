@@ -374,6 +374,63 @@ where
     }
 }
 
+/// Phase 3.2 building block of the chunks-based commitment migration.
+///
+/// Open every per-chunk Merkle tree (produced by
+/// [`IsStarkProver::lde_and_commit_quotient_chunks`]) at FRI query position
+/// `index`. Returns one [`PolynomialOpenings`] per chunk:
+///
+/// - `evaluations` holds `chunk_lde[reverse_index(2 * index, 2N)]` — i.e.
+///   `Q_c(br_0)` — for that chunk,
+/// - `evaluations_sym` holds `chunk_lde[reverse_index(2 * index + 1, 2N)]` —
+///   i.e. `Q_c(br_1)`,
+/// - `proof` and `proof_sym` are both the same Merkle inclusion path: each
+///   chunk's leaf at position `index` pairs `br_0` and `br_1` (matching
+///   `IsStarkProver::commit_composition_polynomial`'s leaf layout for
+///   single-part inputs).
+///
+/// This is the chunks-protocol analogue of
+/// [`IsStarkProver::open_composition_poly`]: where the single-H path emits
+/// one `PolynomialOpenings` with values from all parts, the chunks path
+/// emits `num_chunks` `PolynomialOpenings`, one per chunk's independent tree.
+///
+/// Not yet wired into `open_deep_composition_poly`; exercised in isolation by
+/// `open_quotient_chunks_at_query_paths_verify` in `prover_tests.rs`.
+pub fn open_quotient_chunks_at_query<E>(
+    chunk_results: &[(
+        Vec<FieldElement<E>>,
+        BatchedMerkleTree<E>,
+        Commitment,
+    )],
+    index: usize,
+) -> Vec<PolynomialOpenings<E>>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    chunk_results
+        .iter()
+        .map(|(chunk_lde, tree, _root)| {
+            let n = chunk_lde.len();
+            assert!(
+                n.is_power_of_two(),
+                "chunk LDE length must be a power of two; got {n}"
+            );
+            let proof = tree
+                .get_proof_by_pos(index)
+                .expect("query index out of range for chunk Merkle tree");
+            let br_0 = reverse_index(index * 2, n as u64);
+            let br_1 = reverse_index(index * 2 + 1, n as u64);
+            PolynomialOpenings {
+                proof: proof.clone(),
+                proof_sym: proof,
+                evaluations: vec![chunk_lde[br_0].clone()],
+                evaluations_sym: vec![chunk_lde[br_1].clone()],
+            }
+        })
+        .collect()
+}
+
 /// Phase 3.1 building block of the chunks-based commitment migration.
 ///
 /// Compute the chunks contribution to the DEEP composition polynomial at every

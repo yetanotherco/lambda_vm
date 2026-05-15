@@ -7,15 +7,17 @@ use crate::{
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     },
     proof::options::ProofOptions,
+    config::BatchedMerkleTreeBackend,
     prover::{
         IsStarkProver, Prover, compute_chunks_deep_contribution, domain_cache_stats,
-        evaluate_polynomial_on_lde_domain,
+        evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
     },
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
 };
 use math::{
+    fft::cpu::bit_reversing::reverse_index,
     field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField},
     polynomial::Polynomial,
 };
@@ -961,6 +963,118 @@ fn chunks_deep_contribution_is_degree_below_n() {
                 "d_max={d_max}: DEEP contribution has non-zero coefficient at degree {i} \
                  (expected < N = {trace_length})",
             );
+        }
+    }
+}
+
+/// Phase 3.2 test for `open_quotient_chunks_at_query`.
+///
+/// For `d_max ∈ {1, 2, 3}` and a small set of query indices, this builds the
+/// per-chunk Merkle commitments via `lde_and_commit_quotient_chunks`, opens
+/// each chunk independently at the query position, and verifies:
+///
+/// 1. **Eval correctness**: the opening's `evaluations[0]` equals
+///    `chunk_lde[reverse_index(2*index, 2N)]` and `evaluations_sym[0]` equals
+///    `chunk_lde[reverse_index(2*index + 1, 2N)]`.
+/// 2. **Path correctness**: the Merkle path verifies against the chunk root
+///    using `[br_0, br_1]` as the leaf data (matching the leaf layout used
+///    by `commit_composition_polynomial`).
+/// 3. **Tamper detection**: flipping one of the leaf values makes Merkle
+///    verification fail.
+#[test]
+fn open_quotient_chunks_at_query_paths_verify() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    for &d_max in &[1usize, 2, 3] {
+        let qd = QuotientDomain::new(&domain, d_max);
+
+        let h_coeffs: Vec<Felt> = (0..qd.size)
+            .map(|i| Felt::from((11 * i + 17) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&h_coeffs);
+        let h_evals: Vec<Felt> = (0..qd.size).map(|i| h_poly.evaluate(qd.point_at(i))).collect();
+        let chunks = qd.split_evals_interleaved(&h_evals);
+        let chunk_results = Prover::<GoldilocksField, GoldilocksField, ()>::lde_and_commit_quotient_chunks(
+            &qd, &domain, &chunks,
+        );
+
+        // The Merkle tree has lde_size / 2 leaves (each pairs two LDE rows), so
+        // FRI query positions range over 0..lde_size/2.
+        let query_indices = [0usize, 1, 3, lde_size / 2 - 1];
+        for &index in &query_indices {
+            let openings = open_quotient_chunks_at_query(&chunk_results, index);
+            assert_eq!(openings.len(), qd.num_chunks);
+
+            for (c, opening) in openings.iter().enumerate() {
+                let chunk_lde = &chunk_results[c].0;
+                let root = &chunk_results[c].2;
+                let br_0 = reverse_index(index * 2, lde_size as u64);
+                let br_1 = reverse_index(index * 2 + 1, lde_size as u64);
+
+                // 1. Eval correctness.
+                assert_eq!(opening.evaluations, vec![chunk_lde[br_0].clone()]);
+                assert_eq!(opening.evaluations_sym, vec![chunk_lde[br_1].clone()]);
+
+                // 2. Path correctness — leaf layout is [br_0, br_1].
+                let leaf_data = vec![chunk_lde[br_0].clone(), chunk_lde[br_1].clone()];
+                assert!(
+                    opening
+                        .proof
+                        .verify::<BatchedMerkleTreeBackend<GoldilocksField>>(
+                            root, index, &leaf_data
+                        ),
+                    "d_max={d_max} chunk={c} index={index}: Merkle path must verify against \
+                     the chunk root using [br_0, br_1] leaf data",
+                );
+                assert!(
+                    opening
+                        .proof_sym
+                        .verify::<BatchedMerkleTreeBackend<GoldilocksField>>(
+                            root, index, &leaf_data
+                        ),
+                    "d_max={d_max} chunk={c} index={index}: proof_sym must verify same leaf",
+                );
+
+                // 3. Tamper detection: flipping br_0 breaks the proof.
+                let mut tampered = leaf_data.clone();
+                tampered[0] = &tampered[0] + Felt::one();
+                assert!(
+                    !opening
+                        .proof
+                        .verify::<BatchedMerkleTreeBackend<GoldilocksField>>(
+                            root, index, &tampered
+                        ),
+                    "d_max={d_max} chunk={c} index={index}: tampered leaf must not verify",
+                );
+            }
         }
     }
 }
