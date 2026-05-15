@@ -2520,3 +2520,76 @@ fn prove_chunks_then_verify_chunks_end_to_end_quadratic() {
     >::verify_chunks(&proof, &air, &mut verifier_transcript);
     assert!(ok, "verify_chunks must accept prove_chunks output");
 }
+
+/// Phase 5.1.1 — `round_2_chunks_kernel` short-circuit for `d_max=1`.
+///
+/// For `num_chunks=1` the kernel must reuse the input `constraint_evaluations`
+/// byte-for-byte as the single chunk_lde (skipping the redundant iFFT(N)+FFT(2N)
+/// round-trip that would otherwise produce identical values). This brings the
+/// chunks path to parity with the single-H `number_of_parts == 1` fast path.
+///
+/// Asserts the output `chunk_lde_evaluations[0]` equals the input vector
+/// exactly, plus the Merkle commit produces a non-empty root.
+#[test]
+fn round_2_chunks_kernel_d_max_1_reuses_constraint_evaluations() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root,
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    // Any polynomial H of degree < N produces valid constraint_evaluations_lde
+    // for the d_max=1 case.
+    let h_coeffs: Vec<Felt> = (0..trace_length)
+        .map(|i| Felt::from((11 * i + 17) as u64))
+        .collect();
+    let h_poly = Polynomial::new(&h_coeffs);
+    let constraint_evals_lde: Vec<Felt> = (0..lde_size)
+        .map(|i| h_poly.evaluate(&domain.lde_roots_of_unity_coset[i]))
+        .collect();
+    let expected = constraint_evals_lde.clone();
+
+    let r2 = Prover::<GoldilocksField, GoldilocksField, ()>::round_2_chunks_kernel(
+        constraint_evals_lde,
+        &domain,
+        1, // d_max = 1
+    )
+    .expect("d_max=1 must succeed");
+
+    assert_eq!(r2.num_chunks, 1);
+    assert_eq!(r2.chunk_lde_evaluations.len(), 1);
+    assert_eq!(
+        r2.chunk_lde_evaluations[0], expected,
+        "short-circuit must reuse constraint_evaluations_lde byte-for-byte",
+    );
+    // Root must be non-trivial (the Merkle backend would never produce all-zero
+    // hashes for non-zero leaves, but a sanity check is cheap).
+    assert!(
+        r2.chunk_roots[0].iter().any(|b| *b != 0),
+        "Merkle root must be non-trivial",
+    );
+}

@@ -1443,6 +1443,36 @@ pub trait IsStarkProver<
         let lde_size = constraint_evaluations_lde.len();
         let qd = QuotientDomain::new(domain, d_max);
 
+        // Fast path for `num_chunks == 1` (i.e., `d_max == 1`): the single chunk
+        // polynomial Q_0 has degree `< N` and equals the composition polynomial
+        // H restricted to the trace coset. Evaluating Q_0 on the standard
+        // 2N-point LDE coset produces values bit-for-bit identical to the
+        // input `constraint_evaluations_lde` — the iFFT(N) + FFT(2N) round-trip
+        // is a no-op on the data.
+        //
+        // Reusing `constraint_evaluations_lde` as the single chunk_lde brings
+        // the chunks path to parity with the single-H `number_of_parts == 1`
+        // fast path (which also just wraps the constraint evals in a Vec).
+        // Without this short-circuit the chunks path is ~27% slower than
+        // single-H on fib_pair at log_rows=21 (measured on the EPYC bench
+        // server, 2026-05-15).
+        if qd.num_chunks == 1 {
+            debug_assert!(
+                qd.size <= lde_size,
+                "num_chunks=1 ⇒ qd.size=N ≤ lde_size=2N",
+            );
+            let chunk_lde = constraint_evaluations_lde;
+            let (tree, root) =
+                Self::commit_composition_polynomial(std::slice::from_ref(&chunk_lde))
+                    .ok_or(ProvingError::EmptyCommitment)?;
+            return Ok(Round2Chunks {
+                chunk_lde_evaluations: vec![chunk_lde],
+                chunk_merkle_trees: vec![tree],
+                chunk_roots: vec![root],
+                num_chunks: 1,
+            });
+        }
+
         let constraint_evals_qd: Vec<FieldElement<FieldExtension>> = match qd.size.cmp(&lde_size) {
             std::cmp::Ordering::Equal => constraint_evaluations_lde,
             std::cmp::Ordering::Less => {
