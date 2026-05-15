@@ -809,6 +809,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2001,6 +2010,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2114,6 +2133,18 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "math-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "math",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rayon",
+ "sha3",
 ]
 
 [[package]]
@@ -3204,6 +3235,7 @@ dependencies = [
  "log",
  "math",
  "memmap2",
+ "math-cuda",
  "rayon",
  "serde",
  "serde-wasm-bindgen",

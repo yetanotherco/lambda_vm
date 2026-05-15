@@ -5,6 +5,7 @@ members = [
   "crypto/stark",
   "crypto/crypto",
   "crypto/math",
+  "crypto/math-cuda",
   "bin/cli",
 ]
 
