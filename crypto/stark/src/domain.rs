@@ -132,11 +132,20 @@ impl<F: IsFFTField> QuotientDomain<F> {
     /// Assumes `domain.interpolation_domain_size` is a power of two (Lambda's
     /// existing invariant).
     pub fn new(domain: &Domain<F>, d_max: usize) -> Self {
+        Self::from_parts(
+            domain.interpolation_domain_size,
+            domain.coset_offset.clone(),
+            d_max,
+        )
+    }
+
+    /// Verifier-friendly constructor that only needs `trace_length` and
+    /// `coset_offset` (which the verifier has via `VerifierDomain` or the AIR
+    /// options) rather than a full prover-side [`Domain`].
+    pub fn from_parts(trace_length: usize, coset_offset: FieldElement<F>, d_max: usize) -> Self {
         let num_chunks = d_max.next_power_of_two().max(1);
-        let trace_length = domain.interpolation_domain_size;
         let size = num_chunks * trace_length;
         let log_size = size.trailing_zeros();
-        let coset_offset = domain.coset_offset.clone();
         let roots_of_unity_coset =
             get_powers_of_primitive_root_coset(log_size as u64, size, &coset_offset).unwrap();
         Self {

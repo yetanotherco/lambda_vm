@@ -2167,3 +2167,305 @@ fn prove_rounds_2_to_4_chunks_full_pipeline_smoke_test() {
     }
     assert!(proof.nonce.is_none(), "grinding_factor=0 ⇒ no nonce");
 }
+
+/// Phase 4.7 end-to-end round-trip: prove_chunks → verify_chunks on
+/// FibonacciAIR.
+///
+/// Threads the chunks-protocol prover and verifier through the same Fiat-
+/// Shamir transcript shape and asserts:
+///
+/// 1. The honest proof verifies.
+/// 2. Tampering one `quotient_chunk_ood_evaluations` value flips the
+///    verifier to reject (catches both step_2 recompose mismatch and the
+///    derived FRI inconsistency).
+/// 3. Tampering `fri_last_value` makes the verifier reject (catches FRI
+///    fold).
+///
+/// FibonacciAIR has d_max = 1, so num_chunks = 1 — the degenerate but valid
+/// chunks case. This is the most concrete check that prover and verifier
+/// agree on transcript order and DEEP reconstruction.
+#[test]
+fn chunks_protocol_prove_verify_round_trip_fibonacci() {
+    use std::sync::Arc;
+
+    use crate::examples::simple_fibonacci;
+    use crate::proof::options::ProofOptions;
+    use crate::traits::AIR;
+    use crate::verifier::{IsStarkVerifier, Verifier};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let trace_length: usize = 16;
+    let blowup_factor: usize = 2;
+    let coset_offset_u64: u64 = 3;
+    let coset_offset = Felt::from(coset_offset_u64);
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 4,
+        coset_offset: coset_offset_u64,
+        grinding_factor: 0,
+    };
+
+    let trace =
+        simple_fibonacci::fibonacci_trace([Felt::from(1u64), Felt::from(1u64)], trace_length);
+    let pub_inputs = simple_fibonacci::FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let domain = Domain::new(&air, trace_length);
+
+    // === Build Round1 (real Merkle commit). ===
+    let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
+    let trace_lde_columns: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                .unwrap()
+        })
+        .collect();
+    let (trace_tree, trace_root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed::<
+            GoldilocksField,
+        >(&trace_lde_columns)
+        .unwrap();
+    let lde_trace = LDETraceTable::from_columns(
+        trace_lde_columns,
+        Vec::<Vec<Felt>>::new(),
+        air.step_size(),
+        blowup_factor,
+    );
+    let round_1_result = Round1::<GoldilocksField, GoldilocksField> {
+        lde_trace,
+        main: Round1CommitmentData::<GoldilocksField> {
+            lde_trace_merkle_tree: Arc::new(trace_tree),
+            lde_trace_merkle_root: trace_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
+        },
+        aux: None,
+        rap_challenges: Vec::new(),
+        bus_public_inputs: None,
+    };
+
+    // === Prover: rounds 2-4 chunks. ===
+    // Initialize the transcript and append the trace root just like the
+    // single-H multi_prove path does in Round 1.
+    let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    <DefaultTranscript<GoldilocksField> as IsTranscript<GoldilocksField>>::append_bytes(
+        &mut prover_transcript,
+        &trace_root,
+    );
+
+    let proof = Prover::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::prove_rounds_2_to_4_chunks(
+        &air,
+        &pub_inputs,
+        &round_1_result,
+        &mut prover_transcript,
+        &domain,
+    )
+    .expect("chunks prove must succeed");
+
+    // === Verifier: verify_chunks expects a FRESH transcript; it appends the
+    //     trace_root itself in step_1 (matching the single-H verify entry
+    //     convention). The prover side's prove_rounds_2_to_4 expects the
+    //     caller to have pre-appended the trace_root (matching multi_prove's
+    //     post-round-1 state). ===
+    let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let ok = Verifier::<
+        GoldilocksField,
+        GoldilocksField,
+        simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+    >::verify_chunks(&proof, &air, &mut verifier_transcript);
+    assert!(ok, "honest chunks proof must verify");
+
+    // === Tamper Q_c(z): step_2 recompose must catch. ===
+    let mut tampered_q = proof.clone();
+    tampered_q.quotient_chunk_ood_evaluations[0] =
+        &tampered_q.quotient_chunk_ood_evaluations[0] + Felt::one();
+    let mut t1 = DefaultTranscript::<GoldilocksField>::new(&[]);
+    assert!(
+        !Verifier::<
+            GoldilocksField,
+            GoldilocksField,
+            simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+        >::verify_chunks(&tampered_q, &air, &mut t1),
+        "verifier must reject tampered quotient_chunk_ood_evaluation",
+    );
+
+    // === Tamper fri_last_value: step_3 FRI must catch. ===
+    let mut tampered_fri = proof.clone();
+    tampered_fri.fri_last_value = &tampered_fri.fri_last_value + Felt::one();
+    let mut t2 = DefaultTranscript::<GoldilocksField>::new(&[]);
+    assert!(
+        !Verifier::<
+            GoldilocksField,
+            GoldilocksField,
+            simple_fibonacci::FibonacciPublicInputs<GoldilocksField>,
+        >::verify_chunks(&tampered_fri, &air, &mut t2),
+        "verifier must reject tampered fri_last_value",
+    );
+}
+
+/// Phase 4.7 round-trip on QuadraticAIR — exercises **num_chunks = 2**, the
+/// first non-degenerate chunks case.
+///
+/// QuadraticAIR has `composition_poly_degree_bound = 2 * trace_length`, so
+/// `d_max = 2 → num_chunks = 2`. Unlike FibonacciAIR (num_chunks = 1, where
+/// `recompose_at` returns `chunk_ood[0]` unchanged), this test actually
+/// exercises the P3-style Lagrange-over-cosets identity in `recompose_at`
+/// with a non-trivial `zps[i]` coefficient — the soundness-critical piece.
+///
+/// Plus per-query Merkle path verification against two independent chunk
+/// roots and the chunks DEEP reconstruction at FRI query points across
+/// both chunks.
+#[test]
+fn chunks_protocol_prove_verify_round_trip_quadratic() {
+    use std::sync::Arc;
+
+    use crate::examples::quadratic_air::{self, QuadraticAIR, QuadraticPublicInputs};
+    use crate::proof::options::ProofOptions;
+    use crate::traits::AIR;
+    use crate::verifier::{IsStarkVerifier, Verifier};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let trace_length: usize = 16;
+    let blowup_factor: usize = 2;
+    let coset_offset_u64: u64 = 3;
+    let coset_offset = Felt::from(coset_offset_u64);
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup_factor as u8,
+        fri_number_of_queries: 4,
+        coset_offset: coset_offset_u64,
+        grinding_factor: 0,
+    };
+
+    // Initial value chosen so successive squarings stay in-field for trace_length=16.
+    let a0 = Felt::from(2u64);
+    let trace = quadratic_air::quadratic_trace(a0.clone(), trace_length);
+    let pub_inputs = QuadraticPublicInputs { a0: a0.clone() };
+
+    let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+    let domain = Domain::new(&air, trace_length);
+    // Sanity: d_max really is 2 for QuadraticAIR.
+    assert_eq!(
+        air.composition_poly_degree_bound(trace_length) / trace_length,
+        2,
+        "QuadraticAIR must expose d_max=2 so this test exercises num_chunks=2",
+    );
+
+    // === Round 1: real main-trace Merkle commit. ===
+    let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
+    let trace_lde_columns: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                .unwrap()
+        })
+        .collect();
+    let (trace_tree, trace_root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_columns_bit_reversed::<
+            GoldilocksField,
+        >(&trace_lde_columns)
+        .unwrap();
+    let lde_trace = LDETraceTable::from_columns(
+        trace_lde_columns,
+        Vec::<Vec<Felt>>::new(),
+        air.step_size(),
+        blowup_factor,
+    );
+    let round_1_result = Round1::<GoldilocksField, GoldilocksField> {
+        lde_trace,
+        main: Round1CommitmentData::<GoldilocksField> {
+            lde_trace_merkle_tree: Arc::new(trace_tree),
+            lde_trace_merkle_root: trace_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
+        },
+        aux: None,
+        rap_challenges: Vec::new(),
+        bus_public_inputs: None,
+    };
+
+    // === Prover (chunks). ===
+    let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    <DefaultTranscript<GoldilocksField> as IsTranscript<GoldilocksField>>::append_bytes(
+        &mut prover_transcript,
+        &trace_root,
+    );
+    let proof = Prover::<GoldilocksField, GoldilocksField, QuadraticPublicInputs<GoldilocksField>>::prove_rounds_2_to_4_chunks(
+        &air,
+        &pub_inputs,
+        &round_1_result,
+        &mut prover_transcript,
+        &domain,
+    )
+    .expect("chunks prove on QuadraticAIR must succeed");
+    assert_eq!(
+        proof.quotient_chunk_roots.len(),
+        2,
+        "QuadraticAIR (d_max=2) must produce 2 chunks",
+    );
+
+    // === Verifier (chunks): fresh transcript; verify_chunks appends the trace root itself. ===
+    let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let ok = Verifier::<
+        GoldilocksField,
+        GoldilocksField,
+        QuadraticPublicInputs<GoldilocksField>,
+    >::verify_chunks(&proof, &air, &mut verifier_transcript);
+    assert!(ok, "honest chunks proof on QuadraticAIR (num_chunks=2) must verify");
+
+    // === Tamper Q_0(z) (chunk index 0). ===
+    let mut tampered_q0 = proof.clone();
+    tampered_q0.quotient_chunk_ood_evaluations[0] =
+        &tampered_q0.quotient_chunk_ood_evaluations[0] + Felt::one();
+    let mut t_q0 = DefaultTranscript::<GoldilocksField>::new(&[]);
+    assert!(
+        !Verifier::<
+            GoldilocksField,
+            GoldilocksField,
+            QuadraticPublicInputs<GoldilocksField>,
+        >::verify_chunks(&tampered_q0, &air, &mut t_q0),
+        "verifier must reject tampered Q_0(z)",
+    );
+
+    // === Tamper Q_1(z) (chunk index 1) — different chunk, also exercises the
+    //     non-trivial zps[1] coefficient in recompose_at. ===
+    let mut tampered_q1 = proof.clone();
+    tampered_q1.quotient_chunk_ood_evaluations[1] =
+        &tampered_q1.quotient_chunk_ood_evaluations[1] + Felt::one();
+    let mut t_q1 = DefaultTranscript::<GoldilocksField>::new(&[]);
+    assert!(
+        !Verifier::<
+            GoldilocksField,
+            GoldilocksField,
+            QuadraticPublicInputs<GoldilocksField>,
+        >::verify_chunks(&tampered_q1, &air, &mut t_q1),
+        "verifier must reject tampered Q_1(z)",
+    );
+
+    // === Tamper a chunk Merkle leaf in one query opening. Step 4 must catch. ===
+    let mut tampered_leaf = proof.clone();
+    tampered_leaf.deep_poly_openings[0].quotient_chunks[0].evaluations[0] =
+        &tampered_leaf.deep_poly_openings[0].quotient_chunks[0].evaluations[0] + Felt::one();
+    let mut t_leaf = DefaultTranscript::<GoldilocksField>::new(&[]);
+    assert!(
+        !Verifier::<
+            GoldilocksField,
+            GoldilocksField,
+            QuadraticPublicInputs<GoldilocksField>,
+        >::verify_chunks(&tampered_leaf, &air, &mut t_leaf),
+        "verifier must reject tampered per-chunk Merkle leaf",
+    );
+}

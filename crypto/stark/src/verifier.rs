@@ -8,9 +8,11 @@ use super::{
 };
 use crate::{
     config::Commitment,
-    domain::new_verifier_domain,
+    domain::{QuotientDomain, new_verifier_domain},
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
-    proof::stark::{DeepPolynomialOpening, MultiProof},
+    proof::stark::{
+        DeepPolynomialOpening, DeepPolynomialOpeningChunks, MultiProof, StarkProofChunks,
+    },
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
@@ -1294,6 +1296,671 @@ pub trait IsStarkVerifier<
             );
         }
 
+        true
+    }
+
+    // ====================================================================
+    // ==                Phase 4.5 chunks-protocol verifier              ==
+    // ====================================================================
+    //
+    // Mirrors `step_1`/`step_2`/`step_3`/`step_4` and `verify` but consumes
+    // `StarkProofChunks`. Transcript replay differs in (a) round-2 receives
+    // one append per chunk root (not one composition_poly_root), and (b)
+    // round-3 receives `Q_c(z)` per chunk (not the composition-parts OOD
+    // evaluation at `z^N`). Single-H path is untouched.
+
+    /// Chunks-protocol analogue of
+    /// [`Self::step_1_replay_rounds_and_recover_challenges`].
+    fn step_1_replay_rounds_and_recover_challenges_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Challenges<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // === Round 1 ===
+        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        let rap_challenges = air.build_rap_challenges(transcript);
+        if let Some(root) = proof.lde_trace_aux_merkle_root {
+            transcript.append_bytes(&root);
+        }
+
+        // === Round 2 ===
+        let beta = transcript.sample_field_element();
+        let trace_length = proof.trace_length;
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                proof.bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+        let num_transition_constraints = air.context().num_transition_constraints;
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
+        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coeffs = coefficients;
+
+        // <<<< Per-chunk roots, in chunk-index order (matches prover).
+        for root in &proof.quotient_chunk_roots {
+            transcript.append_bytes(root);
+        }
+
+        // === Round 3 ===
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
+        );
+        let trace_ood_evaluations_columns = proof.trace_ood_evaluations.columns();
+        for col in trace_ood_evaluations_columns.iter() {
+            for elem in col.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+        // <<<< Q_c(z) per chunk (replaces composition_poly_parts_ood_evaluation).
+        for element in proof.quotient_chunk_ood_evaluations.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // === Round 4 ===
+        let num_chunks = proof.quotient_chunk_ood_evaluations.len();
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let gamma = transcript.sample_field_element();
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(num_chunks + num_terms_trace)
+                .collect();
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+            .drain(..num_terms_trace)
+            .collect::<Vec<_>>()
+            .chunks(air.context().transition_offsets.len() * air.step_size())
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let gammas = deep_composition_coefficients;
+
+        // FRI commit phase replay.
+        let merkle_roots = &proof.fri_layers_merkle_roots;
+        let mut zetas = merkle_roots
+            .iter()
+            .map(|root| {
+                let element = transcript.sample_field_element();
+                transcript.append_bytes(root);
+                element
+            })
+            .collect::<Vec<FieldElement<FieldExtension>>>();
+        zetas.push(transcript.sample_field_element());
+        transcript.append_field_element(&proof.fri_last_value);
+
+        // Grinding replay.
+        let security_bits = air.context().proof_options.grinding_factor;
+        let mut grinding_seed = [0u8; 32];
+        if security_bits > 0
+            && let Some(nonce_value) = proof.nonce
+        {
+            grinding_seed = transcript.state();
+            transcript.append_bytes(&nonce_value.to_be_bytes());
+        }
+
+        let number_of_queries = air.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+
+        Challenges {
+            z,
+            boundary_coeffs,
+            transition_coeffs,
+            trace_term_coeffs,
+            gammas,
+            zetas,
+            iotas,
+            rap_challenges,
+            grinding_seed,
+        }
+    }
+
+    /// Chunks-protocol analogue of
+    /// [`Self::step_2_verify_claimed_composition_polynomial`].
+    ///
+    /// Computes the expected `H(z)` from boundary + transition constraint
+    /// folds exactly like the single-H path. The "claimed" `H(z)` is then
+    /// recomposed from `proof.quotient_chunk_ood_evaluations` via
+    /// [`QuotientDomain::recompose_at`] (P3-style Lagrange over disjoint
+    /// sub-cosets) instead of the single-H Horner fold of composition-poly
+    /// parts at `z^num_parts`.
+    fn step_2_verify_claimed_composition_polynomial_chunks(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
+        challenges: &Challenges<FieldExtension>,
+    ) -> bool {
+        let trace_length = proof.trace_length;
+        let boundary_constraints = air.boundary_constraints(
+            &proof.public_inputs,
+            &challenges.rap_challenges,
+            proof.bus_public_inputs.as_ref(),
+            trace_length,
+        );
+        let number_of_b_constraints = boundary_constraints.constraints.len();
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
+
+        #[allow(clippy::type_complexity)]
+        let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
+            Vec<FieldElement<FieldExtension>>,
+            Vec<FieldElement<FieldExtension>>,
+        ) = (0..number_of_b_constraints)
+            .map(|index| {
+                let step = boundary_constraints.constraints[index].step;
+                let is_aux = boundary_constraints.constraints[index].is_aux;
+                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
+                    Some((_, p)) => p.clone(),
+                    None => {
+                        let p = domain.trace_primitive_root.pow(step as u64);
+                        boundary_step_points.push((step, p.clone()));
+                        p
+                    }
+                };
+                let column_idx = boundary_constraints.constraints[index].col;
+                let trace_evaluation = if is_aux {
+                    let column_idx = air.trace_layout().0 + column_idx;
+                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
+                } else {
+                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
+                };
+                let boundary_zerofier_challenges_z_den = -point + &challenges.z;
+                let boundary_quotient_ood_evaluation_num =
+                    -&boundary_constraints.constraints[index].value + trace_evaluation;
+                (
+                    boundary_quotient_ood_evaluation_num,
+                    boundary_zerofier_challenges_z_den,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
+
+        FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).unwrap();
+
+        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
+            boundary_c_i_evaluations_num
+                .iter()
+                .zip(&boundary_c_i_evaluations_den)
+                .zip(&challenges.boundary_coeffs)
+                .map(|((num, den), beta)| num * den * beta)
+                .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
+
+        let periodic_values = air
+            .get_periodic_column_polynomials(trace_length)
+            .iter()
+            .map(|poly| poly.evaluate(&challenges.z))
+            .collect::<Vec<FieldElement<FieldExtension>>>();
+
+        let num_main_trace_columns =
+            proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
+
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(
+                    &challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
+            } else {
+                Vec::new()
+            };
+
+        let logup_table_offset = match &proof.bus_public_inputs {
+            Some(bpi) => {
+                let n = FieldElement::<Field>::from(trace_length as u64);
+                match n.inv() {
+                    Ok(n_inv) => n_inv * &bpi.table_contribution,
+                    Err(_) => return false,
+                }
+            }
+            None => FieldElement::zero(),
+        };
+
+        let ood_frame =
+            (proof.trace_ood_evaluations.clone()).into_frame(num_main_trace_columns, air.step_size());
+        let packing_shifts = PackingShifts::<FieldExtension>::new();
+        let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
+            &ood_frame,
+            &periodic_values,
+            &challenges.rap_challenges,
+            &logup_alpha_powers,
+            &logup_table_offset,
+            &packing_shifts,
+        );
+        let transition_ood_frame_evaluations =
+            air.compute_transition(&transition_evaluation_context);
+
+        let mut denominators =
+            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
+        air.transition_constraints().iter().for_each(|c| {
+            denominators[c.constraint_idx()] =
+                c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
+        });
+
+        let transition_c_i_evaluations_sum = itertools::izip!(
+            transition_ood_frame_evaluations,
+            &challenges.transition_coeffs,
+            denominators
+        )
+        .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
+            acc + beta * eval * &denominator
+        });
+
+        let composition_poly_ood_evaluation =
+            &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
+
+        // Recompose claimed H(z) from chunk OOD evaluations via P3-style
+        // Lagrange-over-cosets identity. d_max is derived from the AIR's
+        // composition_poly_degree_bound; num_chunks must match the proof.
+        let d_max = air.composition_poly_degree_bound(trace_length) / trace_length;
+        let qd = QuotientDomain::<Field>::from_parts(
+            trace_length,
+            domain.coset_offset.clone(),
+            d_max,
+        );
+        if qd.num_chunks != proof.quotient_chunk_ood_evaluations.len() {
+            return false;
+        }
+        let composition_poly_claimed_ood_evaluation =
+            qd.recompose_at(&proof.quotient_chunk_ood_evaluations, &challenges.z);
+
+        composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
+    }
+
+    /// Chunks-protocol analogue of [`Self::verify_trace_openings`].
+    fn verify_trace_openings_chunks(
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        deep_poly_openings: &DeepPolynomialOpeningChunks<Field, FieldExtension>,
+        iota: usize,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let index = iota * 2;
+        let index_sym = iota * 2 + 1;
+        let mut result = true;
+
+        result &= Self::verify_opening::<Field>(
+            &deep_poly_openings.main_trace_polys.proof,
+            &proof.lde_trace_main_merkle_root,
+            index,
+            &deep_poly_openings.main_trace_polys.evaluations,
+        );
+        result &= Self::verify_opening::<Field>(
+            &deep_poly_openings.main_trace_polys.proof_sym,
+            &proof.lde_trace_main_merkle_root,
+            index_sym,
+            &deep_poly_openings.main_trace_polys.evaluations_sym,
+        );
+
+        match (
+            &proof.lde_trace_precomputed_merkle_root,
+            &deep_poly_openings.precomputed_trace_polys,
+        ) {
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(pre_root), Some(pre_open)) => {
+                result &= Self::verify_opening::<Field>(
+                    &pre_open.proof,
+                    pre_root,
+                    index,
+                    &pre_open.evaluations,
+                );
+                result &= Self::verify_opening::<Field>(
+                    &pre_open.proof_sym,
+                    pre_root,
+                    index_sym,
+                    &pre_open.evaluations_sym,
+                );
+            }
+            _ => {}
+        }
+
+        match (
+            proof.lde_trace_aux_merkle_root,
+            &deep_poly_openings.aux_trace_polys,
+        ) {
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(aux_root), Some(aux_open)) => {
+                result &= Self::verify_opening::<FieldExtension>(
+                    &aux_open.proof,
+                    &aux_root,
+                    index,
+                    &aux_open.evaluations,
+                );
+                result &= Self::verify_opening::<FieldExtension>(
+                    &aux_open.proof_sym,
+                    &aux_root,
+                    index_sym,
+                    &aux_open.evaluations_sym,
+                );
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    /// Chunks-protocol analogue of
+    /// [`Self::step_4_verify_trace_and_composition_openings`]: verifies
+    /// trace Merkle paths (identical to single-H) plus per-chunk Merkle paths
+    /// — one inclusion proof per chunk, against its own root in
+    /// `proof.quotient_chunk_roots`.
+    fn step_4_verify_trace_and_composition_openings_chunks(
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        challenges: &Challenges<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        challenges.iotas.iter().zip(&proof.deep_poly_openings).fold(
+            true,
+            |mut result, (iota_n, deep_poly_opening)| {
+                // Verify each chunk's Merkle path independently against its root.
+                if deep_poly_opening.quotient_chunks.len() != proof.quotient_chunk_roots.len() {
+                    return false;
+                }
+                for (chunk_open, chunk_root) in deep_poly_opening
+                    .quotient_chunks
+                    .iter()
+                    .zip(proof.quotient_chunk_roots.iter())
+                {
+                    let mut leaf = chunk_open.evaluations.clone();
+                    leaf.extend_from_slice(&chunk_open.evaluations_sym);
+                    result &=
+                        chunk_open.proof.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                            chunk_root,
+                            *iota_n,
+                            &leaf,
+                        );
+                }
+                result &= Self::verify_trace_openings_chunks(proof, deep_poly_opening, *iota_n);
+                result
+            },
+        )
+    }
+
+    /// Reconstructs the DEEP composition polynomial value at a single
+    /// evaluation point from the chunks-protocol query opening.
+    ///
+    /// Trace contribution is identical to the single-H reconstruction; the
+    /// H contribution is replaced by the chunks formula
+    /// `sum_c gamma_c * (Q_c(x) - Q_c(z)) / (x - z)`.
+    fn reconstruct_deep_composition_poly_evaluation_chunks(
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        evaluation_point: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        challenges: &Challenges<FieldExtension>,
+        lde_trace_evaluations: &[FieldElement<FieldExtension>],
+        chunk_evaluations_at_point: &[FieldElement<FieldExtension>],
+    ) -> FieldElement<FieldExtension> {
+        let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
+        let ood_evaluations_table_width = proof.trace_ood_evaluations.width;
+
+        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_evaluations_table_height {
+            denoms_trace.push(evaluation_point - &current_z);
+            current_z = primitive_root * &current_z;
+        }
+        FieldElement::inplace_batch_inverse(&mut denoms_trace).unwrap();
+
+        let trace_term = (0..ood_evaluations_table_width)
+            .zip(&challenges.trace_term_coeffs)
+            .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
+                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
+                    FieldElement::zero(),
+                    |trace_t, (row_idx, coeff)| {
+                        let poly_evaluation = (lde_trace_evaluations[col_idx].clone()
+                            - proof.trace_ood_evaluations.get_row(row_idx)[col_idx].clone())
+                            * &denoms_trace[row_idx];
+                        trace_t + &poly_evaluation * coeff
+                    },
+                );
+                trace_terms + trace_i
+            });
+
+        // Chunks H contribution: sum_c gamma_c * (Q_c(x) - Q_c(z)) / (x - z).
+        let denom_h = (evaluation_point - &challenges.z).inv().unwrap();
+        let mut h_terms = FieldElement::zero();
+        for (c, q_c_at_x) in chunk_evaluations_at_point.iter().enumerate() {
+            let q_c_at_z = &proof.quotient_chunk_ood_evaluations[c];
+            let term = (q_c_at_x - q_c_at_z) * &challenges.gammas[c];
+            h_terms += term;
+        }
+        h_terms *= denom_h;
+
+        trace_term + h_terms
+    }
+
+    /// Chunks-protocol analogue of
+    /// `reconstruct_deep_composition_poly_evaluations_for_all_queries`.
+    fn reconstruct_deep_composition_poly_evaluations_for_all_queries_chunks(
+        challenges: &Challenges<FieldExtension>,
+        domain: &VerifierDomain<Field>,
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+    ) -> DeepPolynomialEvaluations<FieldExtension> {
+        let num_queries = challenges.iotas.len();
+        let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
+        let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+        for (i, iota) in challenges.iotas.iter().enumerate() {
+            let primitive_root =
+                &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
+
+            // Trace evaluations at v.
+            let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(pre) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations.extend(pre.evaluations.iter().cloned().map(|x| x.to_extension()));
+            }
+            evaluations.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
+            if let Some(aux) = &proof.deep_poly_openings[i].aux_trace_polys {
+                evaluations.extend_from_slice(&aux.evaluations);
+            }
+
+            // Q_c(v) — one per chunk, in chunk-index order.
+            let chunk_evals_at_point: Vec<FieldElement<FieldExtension>> = proof
+                .deep_poly_openings[i]
+                .quotient_chunks
+                .iter()
+                .map(|co| co.evaluations[0].clone())
+                .collect();
+
+            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
+            deep_poly_evaluations.push(
+                Self::reconstruct_deep_composition_poly_evaluation_chunks(
+                    proof,
+                    &evaluation_point,
+                    primitive_root,
+                    challenges,
+                    &evaluations,
+                    &chunk_evals_at_point,
+                ),
+            );
+
+            // Symmetric side.
+            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(pre) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations_sym.extend(pre.evaluations_sym.iter().cloned().map(|x| x.to_extension()));
+            }
+            evaluations_sym.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations_sym
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
+            if let Some(aux) = &proof.deep_poly_openings[i].aux_trace_polys {
+                evaluations_sym.extend_from_slice(&aux.evaluations_sym);
+            }
+            let chunk_evals_at_point_sym: Vec<FieldElement<FieldExtension>> = proof
+                .deep_poly_openings[i]
+                .quotient_chunks
+                .iter()
+                .map(|co| co.evaluations_sym[0].clone())
+                .collect();
+
+            let evaluation_point_sym =
+                Self::query_challenge_to_evaluation_point_sym(*iota, domain);
+            deep_poly_evaluations_sym.push(
+                Self::reconstruct_deep_composition_poly_evaluation_chunks(
+                    proof,
+                    &evaluation_point_sym,
+                    primitive_root,
+                    challenges,
+                    &evaluations_sym,
+                    &chunk_evals_at_point_sym,
+                ),
+            );
+        }
+        (deep_poly_evaluations, deep_poly_evaluations_sym)
+    }
+
+    /// Chunks-protocol analogue of [`Self::step_3_verify_fri`].
+    fn step_3_verify_fri_chunks(
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
+        challenges: &Challenges<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let (deep_poly_evaluations, deep_poly_evaluations_sym) =
+            Self::reconstruct_deep_composition_poly_evaluations_for_all_queries_chunks(
+                challenges, domain, proof,
+            );
+
+        let mut evaluation_point_inverse = challenges
+            .iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
+            .collect::<Vec<FieldElement<Field>>>();
+        FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
+
+        proof
+            .query_list
+            .iter()
+            .zip(&challenges.iotas)
+            .zip(evaluation_point_inverse)
+            .enumerate()
+            .fold(true, |mut result, (i, ((proof_s, iota_s), eval))| {
+                // FRI fold verification at query `iota_s`. Replays the same
+                // logic as `verify_query_and_sym_openings` but in-line here
+                // because that helper is typed against `StarkProof` (single-H).
+                let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
+                let evaluation_point_vec: Vec<FieldElement<Field>> = core::iter::successors(
+                    Some(eval.square()),
+                    |evaluation_point| Some(evaluation_point.square()),
+                )
+                .take(fri_layers_merkle_roots.len())
+                .collect();
+
+                let p0_eval = &deep_poly_evaluations[i];
+                let p0_eval_sym = &deep_poly_evaluations_sym[i];
+                let mut v = (p0_eval + p0_eval_sym)
+                    + eval * &challenges.zetas[0] * (p0_eval - p0_eval_sym);
+                let mut index = *iota_s;
+
+                if fri_layers_merkle_roots.is_empty() {
+                    return result & (v == proof.fri_last_value);
+                }
+
+                let inner = fri_layers_merkle_roots
+                    .iter()
+                    .enumerate()
+                    .zip(&proof_s.layers_auth_paths)
+                    .zip(&proof_s.layers_evaluations_sym)
+                    .zip(evaluation_point_vec)
+                    .fold(
+                        true,
+                        |inner_ok,
+                         ((((j, merkle_root), auth_path_sym), evaluation_sym), evaluation_point_inv)| {
+                            let openings_ok = Self::verify_fri_layer_openings(
+                                merkle_root,
+                                auth_path_sym,
+                                &v,
+                                evaluation_sym,
+                                index,
+                            );
+                            v = (&v + evaluation_sym)
+                                + evaluation_point_inv
+                                    * &challenges.zetas[j + 1]
+                                    * (&v - evaluation_sym);
+                            index >>= 1;
+
+                            if j < proof_s.layers_evaluations_sym.len() - 1 {
+                                inner_ok & openings_ok
+                            } else {
+                                inner_ok & (v == proof.fri_last_value) & openings_ok
+                            }
+                        },
+                    );
+                result &= inner;
+                result
+            })
+    }
+
+    /// Top-level chunks-protocol verifier: replays the transcript, runs
+    /// step_2/3/4 chunks variants, returns whether the proof is accepted.
+    fn verify_chunks(
+        proof: &StarkProofChunks<Field, FieldExtension, PI>,
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let domain = new_verifier_domain(air, proof.trace_length);
+        let challenges = Self::step_1_replay_rounds_and_recover_challenges_chunks(
+            air, proof, &domain, transcript,
+        );
+
+        // Grinding check.
+        if air.context().proof_options.grinding_factor > 0 {
+            let Some(nonce) = proof.nonce else {
+                return false;
+            };
+            if !grinding::is_valid_nonce(
+                &challenges.grinding_seed,
+                nonce,
+                air.context().proof_options.grinding_factor,
+            ) {
+                return false;
+            }
+        }
+
+        if !Self::step_2_verify_claimed_composition_polynomial_chunks(
+            air, proof, &domain, &challenges,
+        ) {
+            return false;
+        }
+        if !Self::step_3_verify_fri_chunks(proof, &domain, &challenges) {
+            return false;
+        }
+        if !Self::step_4_verify_trace_and_composition_openings_chunks(proof, &challenges) {
+            return false;
+        }
         true
     }
 }
