@@ -11,9 +11,10 @@ use crate::{
     proof::quotient_chunks::QuotientChunksCommitments,
     prover::{
         IsStarkProver, Prover, ProvingError, compute_chunk_ood_evaluations,
-        compute_chunks_deep_contribution, domain_cache_stats, evaluate_polynomial_on_lde_domain,
-        open_quotient_chunks_at_query,
+        compute_chunks_deep_contribution, compute_trace_deep_contribution, domain_cache_stats,
+        evaluate_polynomial_on_lde_domain, open_quotient_chunks_at_query,
     },
+    table::Table,
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
@@ -1420,6 +1421,147 @@ fn chunk_ood_evaluations_recompose_to_h() {
             h_z_recomposed, h_z_direct,
             "d_max={d_max}: recompose_at over compute_chunk_ood_evaluations output must \
              reproduce H(z)",
+        );
+    }
+}
+
+/// Phase 4.3a test for `compute_trace_deep_contribution`.
+///
+/// The function returns the trace-only piece of the DEEP composition
+/// polynomial on the LDE. Each per-(column, eval-point) summand is
+/// `(t_j(x) - t_j(z·w^k)) / (x - z·w^k)`, a polynomial of degree `< N - 1`
+/// (the pole at `z·w^k` cancels since the numerator vanishes there). The
+/// random linear combination must therefore have degree `< N`.
+///
+/// The test builds 3 trace polynomials of degree `< N`, evaluates them on
+/// the standard LDE coset to construct an `LDETraceTable`, computes their
+/// OOD values at `z` and `z·w` (one transition offset for `next_row`), runs
+/// the helper, and asserts:
+///
+/// 1. **Pointwise correctness**: result at LDE row `i` equals the naive
+///    `sum_{j,k} gamma_{j,k} * (t_j_lde[i] - t_j(z·w^k)) / (lde[i] - z·w^k)`.
+/// 2. **Degree bound**: interpolating the result on the LDE coset yields a
+///    polynomial of degree `< N` — FRI's expected input shape.
+#[test]
+fn trace_deep_contribution_is_degree_below_n() {
+    let trace_length: usize = 8;
+    let blowup_factor: usize = 2;
+    let lde_size = trace_length * blowup_factor;
+    let coset_offset = Felt::from(3u64);
+    let root_order = trace_length.trailing_zeros();
+    let trace_primitive_root =
+        GoldilocksField::get_primitive_root_of_unity(root_order as u64).unwrap();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
+    let lde_roots_of_unity_coset = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        lde_root_order as u64,
+        trace_length * blowup_factor,
+        &coset_offset,
+    )
+    .unwrap();
+    let trace_roots_of_unity = math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset(
+        root_order as u64,
+        trace_length,
+        &Felt::one(),
+    )
+    .unwrap();
+    let domain = Domain::<GoldilocksField> {
+        root_order,
+        lde_roots_of_unity_coset,
+        trace_primitive_root: trace_primitive_root.clone(),
+        trace_roots_of_unity,
+        coset_offset: coset_offset.clone(),
+        blowup_factor,
+        interpolation_domain_size: trace_length,
+    };
+
+    let num_main_cols = 3usize;
+    let trace_polys: Vec<Polynomial<Felt>> = (0..num_main_cols)
+        .map(|j| {
+            let coeffs: Vec<Felt> = (0..trace_length)
+                .map(|i| Felt::from(((i + 1) * (j + 2) * 13 + 5) as u64))
+                .collect();
+            Polynomial::new(&coeffs)
+        })
+        .collect();
+
+    // LDE each trace poly on the standard LDE coset.
+    let lde_columns: Vec<Vec<Felt>> = trace_polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, trace_length, &coset_offset)
+                .unwrap()
+        })
+        .collect();
+    let lde_trace =
+        LDETraceTable::from_columns(lde_columns.clone(), Vec::<Vec<Felt>>::new(), 1, blowup_factor);
+
+    // Two transition offsets per column: at z (k=0) and z*w (k=1) — covers next_row.
+    let num_eval_points = 2usize;
+    let z = Felt::from(0xdead_beefu64);
+    let z_shifted = [z.clone(), &trace_primitive_root * &z];
+
+    // OOD trace evaluations: trace_ood[k][j] = trace_polys[j].evaluate(z_shifted[k]).
+    let trace_ood_rows: Vec<Vec<Felt>> = (0..num_eval_points)
+        .map(|k| {
+            (0..num_main_cols)
+                .map(|j| trace_polys[j].evaluate(&z_shifted[k]))
+                .collect()
+        })
+        .collect();
+    let trace_ood_evaluations = Table::from_columns(
+        (0..num_main_cols)
+            .map(|j| (0..num_eval_points).map(|k| trace_ood_rows[k][j].clone()).collect())
+            .collect(),
+    );
+
+    // Random-looking gammas: trace_terms_gammas[j][k].
+    let trace_terms_gammas: Vec<Vec<Felt>> = (0..num_main_cols)
+        .map(|j| {
+            (0..num_eval_points)
+                .map(|k| Felt::from(((j + 1) * (k + 1) * 41 + 11) as u64))
+                .collect()
+        })
+        .collect();
+
+    let result = compute_trace_deep_contribution(
+        &lde_trace,
+        &trace_ood_evaluations,
+        &z,
+        &domain,
+        &trace_primitive_root,
+        &trace_terms_gammas,
+    );
+    assert_eq!(result.len(), lde_size);
+
+    // 1. Pointwise naive reference.
+    for i in 0..lde_size {
+        let x_i = &domain.lde_roots_of_unity_coset[i];
+        let mut expected = Felt::zero();
+        for k in 0..num_eval_points {
+            let denom_inv = (x_i - &z_shifted[k]).inv().unwrap();
+            for j in 0..num_main_cols {
+                expected = expected
+                    + &trace_terms_gammas[j][k]
+                        * (&lde_columns[j][i] - &trace_ood_rows[k][j])
+                        * &denom_inv;
+            }
+        }
+        assert_eq!(
+            result[i], expected,
+            "trace DEEP contribution disagrees with naive formula at LDE index {i}",
+        );
+    }
+
+    // 2. Degree bound: result interpolated on the LDE coset has degree < N.
+    let result_poly =
+        Polynomial::interpolate_offset_fft::<GoldilocksField>(&result, &domain.coset_offset)
+            .unwrap();
+    let coeffs = result_poly.coefficients();
+    for (i, c) in coeffs.iter().enumerate().skip(trace_length) {
+        assert_eq!(
+            *c,
+            Felt::zero(),
+            "trace DEEP contribution has non-zero coefficient at degree {i} (expected < N)",
         );
     }
 }

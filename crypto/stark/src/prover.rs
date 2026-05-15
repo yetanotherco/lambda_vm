@@ -422,6 +422,135 @@ where
     }
 }
 
+/// Phase 4.3 building block of the chunks-based commitment migration.
+///
+/// Compute the trace-only contribution to the DEEP composition polynomial at
+/// every LDE point. For each row `i`:
+///
+/// ```text
+///   sum_{j,k} trace_terms_gammas[j][k] *
+///       (lde_trace.get(i, j) - trace_ood_evaluations[k][j]) / (lde[i] - z * w^k)
+/// ```
+///
+/// where `j` ranges over main + aux trace columns and `k` over the AIR's
+/// transition-offset evaluation points (`z`, `z·w`, ..., for next-row
+/// constraints).
+///
+/// Each `(trace_j_lde - trace_j(z·w^k)) / (lde - z·w^k)` term is a polynomial
+/// of degree `< N - 1` (the pole at `z·w^k` cancels because `trace_j` is
+/// degree `< N` and the numerator vanishes there), so the random linear
+/// combination has degree `< N`. The result is FRI-acceptable as-is.
+///
+/// Duplicates the trace-terms block of
+/// [`IsStarkProver::compute_deep_composition_poly_evaluations`] in standalone
+/// form. The single-H path is left untouched (Approach A); a follow-up
+/// Phase 4.3 commit will combine this helper with
+/// [`compute_chunks_deep_contribution`] into the chunks-protocol DEEP.
+///
+/// Exercised in isolation by `trace_deep_contribution_is_degree_below_n` in
+/// `prover_tests.rs`.
+pub fn compute_trace_deep_contribution<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    trace_ood_evaluations: &Table<E>,
+    z: &FieldElement<E>,
+    domain: &Domain<F>,
+    primitive_root: &FieldElement<F>,
+    trace_terms_gammas: &[Vec<FieldElement<E>>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+{
+    let num_eval_points = if trace_terms_gammas.is_empty() {
+        0
+    } else {
+        trace_terms_gammas[0].len()
+    };
+    let lde_size = domain.lde_roots_of_unity_coset.len();
+    let num_main_cols = lde_trace.num_main_cols();
+    let num_aux_cols = lde_trace.num_aux_cols();
+    let num_total_cols = num_main_cols + num_aux_cols;
+
+    // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points.
+    let mut z_shifted = Vec::with_capacity(num_eval_points);
+    let mut current_z = z.clone();
+    for _ in 0..num_eval_points {
+        z_shifted.push(current_z.clone());
+        current_z = primitive_root * &current_z;
+    }
+
+    // Batch-invert all (x_i - z_shifted[k]) denominators in one pass.
+    let mut denoms: Vec<FieldElement<E>> =
+        Vec::with_capacity(lde_size.saturating_mul(num_eval_points));
+    for z_k in z_shifted.iter().take(num_eval_points) {
+        for i in 0..lde_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i];
+            denoms.push(x_i - z_k);
+        }
+    }
+    FieldElement::inplace_batch_inverse(&mut denoms)
+        .expect("z is sampled to avoid the LDE coset, so x_i - z*w^k is never zero");
+
+    let trace_ood_columns = trace_ood_evaluations.columns();
+
+    // Per-eval-point OOD compressed values: ood_compressed[k] = sum_j gamma[j][k] * ood[j][k].
+    let mut ood_compressed: Vec<FieldElement<E>> = vec![FieldElement::zero(); num_eval_points];
+    for j in 0..num_total_cols {
+        let ood_evals_j = &trace_ood_columns[j];
+        let gammas_j = &trace_terms_gammas[j];
+        for k in 0..num_eval_points {
+            ood_compressed[k] += &gammas_j[k] * &ood_evals_j[k];
+        }
+    }
+
+    // Per-eval-point compressed LDE traces: compressed[k][i] = sum_j gamma[j][k] * lde_trace[i, j].
+    let compressed: Vec<Vec<FieldElement<E>>> = (0..num_eval_points)
+        .map(|k| {
+            let main_gammas: Vec<&FieldElement<E>> = (0..num_main_cols)
+                .map(|j| &trace_terms_gammas[j][k])
+                .collect();
+            let aux_gammas: Vec<&FieldElement<E>> = (0..num_aux_cols)
+                .map(|j| &trace_terms_gammas[num_main_cols + j][k])
+                .collect();
+
+            #[cfg(feature = "parallel")]
+            let iter = (0..lde_size).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = 0..lde_size;
+
+            iter.map(|i| {
+                let mut sum = FieldElement::<E>::zero();
+                for (j, gamma) in main_gammas.iter().enumerate() {
+                    sum += lde_trace.get_main(i, j) * *gamma;
+                }
+                for (j, gamma) in aux_gammas.iter().enumerate() {
+                    sum += lde_trace.get_aux(i, j) * *gamma;
+                }
+                sum
+            })
+            .collect()
+        })
+        .collect();
+
+    // Hot loop: sum the trace terms at every LDE row.
+    #[cfg(feature = "parallel")]
+    let iter = (0..lde_size).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..lde_size;
+
+    iter.map(|i| {
+        let mut result = FieldElement::<E>::zero();
+        for k in 0..num_eval_points {
+            let inv_t_k_i = &denoms[k * lde_size + i];
+            result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
+        }
+        result
+    })
+    .collect()
+}
+
 /// Phase 4.2 building block of the chunks-based commitment migration.
 ///
 /// Given the per-chunk LDE evaluations (rows on the standard LDE coset of size
