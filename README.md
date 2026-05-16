@@ -11,6 +11,9 @@ Right now, this is a project under development and experimentation and must not 
 ### Dependencies
 
 - Rust nightly with `rust-src` component
+- Clang with RISC-V target support and LLD linker (used by `make compile-programs-asm`)
+  - **macOS**: `brew install llvm` (the Homebrew LLVM includes `clang` and `lld` with RISC-V support)
+  - **Linux**: `apt install clang lld` (or equivalent for your distribution)
 
 ### Dev dependencies
 

@@ -54,7 +54,7 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 |---|---|
 | `-o, --output <FILE>` | Output path for the serialized proof bundle. Required. |
 | `--private-input <FILE>` | Pass private input bytes to the guest. |
-| `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. Default: 2. |
+| `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. [default: 2] |
 | `--time` | Print total proving time. |
 | `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
 | `--elements` | Build traces and print main-trace and aux-trace field element counts. |
@@ -69,7 +69,7 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 
 | Flag | Description |
 |---|---|
-| `--blowup <N>` | FRI blowup factor used during proving. Must match. |
+| `--blowup <N>` | FRI blowup factor used during proving. Must match. [default: 2] |
 | `--time` | Print verification time. |
 
 Returns exit code `0` on successful verification, `1` on failure.
