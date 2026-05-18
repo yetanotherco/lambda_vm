@@ -3211,6 +3211,29 @@ impl Traces {
     ) -> Result<Self, Error> {
         Self::from_logs_trimmed(logs, instructions, max_rows)
     }
+
+    /// Like [`from_elf_and_logs`] but trims the bitwise table (TEST ONLY).
+    ///
+    /// Produces PAGE and REGISTER tables (requires ELF) while keeping the
+    /// bitwise table small. Same unsoundness caveats as [`from_logs_trimmed`].
+    #[cfg(test)]
+    pub fn from_elf_and_logs_minimal(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+    ) -> Result<Self, Error> {
+        let mut traces = Self::from_elf_and_logs(
+            elf,
+            logs,
+            max_rows,
+            private_input,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )?;
+        traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
+        Ok(traces)
+    }
 }
 
 #[cfg(test)]

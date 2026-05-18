@@ -125,7 +125,7 @@ enum Commands {
         private_input: Option<PathBuf>,
 
         /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
-        #[arg(long)]
+        #[arg(long, default_value = "2")]
         blowup: Option<u8>,
 
         /// Print proving time
@@ -153,10 +153,10 @@ enum Commands {
         elf: PathBuf,
 
         /// Blowup factor used during proving (must match)
-        #[arg(long)]
+        #[arg(long, default_value = "2")]
         blowup: Option<u8>,
 
-        /// Print timing breakdown
+        /// Print verification time
         #[arg(long)]
         time: bool,
     },

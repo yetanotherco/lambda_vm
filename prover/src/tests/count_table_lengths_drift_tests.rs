@@ -1,8 +1,8 @@
 //! Asserts `count_table_lengths` matches `Traces::from_elf_and_logs` row counts.
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::count_table_lengths;
-use crate::test_utils::{run_asm_elf, traces_from_elf_and_logs_ram};
+use crate::tables::trace_builder::{Traces, count_table_lengths};
+use crate::test_utils::run_asm_elf;
 
 #[test]
 fn count_table_lengths_matches_traces() {
@@ -11,8 +11,8 @@ fn count_table_lengths_matches_traces() {
 
     let predicted =
         count_table_lengths(&elf, &logs, &max_rows, &[]).expect("count_table_lengths succeeds");
-    let traces =
-        traces_from_elf_and_logs_ram(&elf, &logs, &max_rows, &[]).expect("trace build succeeds");
+    let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &max_rows, &[])
+        .expect("trace build succeeds");
 
     let sum_heights = |tables: &[stark::trace::TraceTable<_, _>]| -> u64 {
         tables.iter().map(|t| t.main_table.height as u64).sum()

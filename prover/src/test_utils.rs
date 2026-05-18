@@ -29,9 +29,7 @@ use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 
-use crate::Error;
 use crate::constraints::cpu::create_all_cpu_constraints;
-use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
@@ -81,7 +79,6 @@ use crate::tables::register::{
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
 };
-use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
@@ -106,22 +103,6 @@ where
     Prover::<F, E, PI>::multi_prove(
         air_trace_pairs,
         transcript,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
-    )
-}
-
-pub fn traces_from_elf_and_logs_ram(
-    elf: &Elf,
-    logs: &[Log],
-    max_rows: &MaxRowsConfig,
-    private_input: &[u8],
-) -> Result<Traces, Error> {
-    Traces::from_elf_and_logs(
-        elf,
-        logs,
-        max_rows,
-        private_input,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )
