@@ -152,6 +152,49 @@ fn test_recursion_smoke_1query() {
     );
 }
 
+/// Diagnostic: build the inner proof and dump the recursion guest's private-input
+/// blob to `/tmp/recursion_input.bin` so the CLI's `execute --flamegraph` can
+/// consume it.
+///
+/// Usage after running this test:
+/// ```
+/// cargo run -p cli --release -- execute \
+///     bench_vs/lambda/recursion/target/riscv64im-lambda-vm-elf/release/recursion-bench \
+///     --private-input /tmp/recursion_input.bin \
+///     --flamegraph /tmp/recursion_folded.txt
+/// cat /tmp/recursion_folded.txt | inferno-flamegraph > /tmp/recursion_flamegraph.svg
+/// ```
+#[test]
+#[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
+fn test_dump_recursion_input() {
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[dump-input] proving inner ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
+
+    let path = "/tmp/recursion_input.bin";
+    std::fs::write(path, &blob).expect("write blob");
+    eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
+}
+
 /// Diagnostic: build the inner proof + recursion guest input, then **execute
 /// only** the recursion guest (no STARK proving) and report cycle counts +
 /// trace size estimates.
