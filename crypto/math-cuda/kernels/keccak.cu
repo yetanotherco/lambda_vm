@@ -333,6 +333,8 @@ extern "C" __global__ void keccak_merkle_level(
     for (int i = 0; i < 25; ++i) st[i] = 0;
 
     uint32_t rate_pos = 0;
+    // `nodes` comes from cuMemAlloc (256-byte aligned); each 32-byte node
+    // sits at a 32-byte-aligned offset, so the u64 cast is safe.
     const uint64_t *left = reinterpret_cast<const uint64_t *>(
         nodes + (parent_begin + n_pairs + 2 * tid) * 32);
     #pragma unroll

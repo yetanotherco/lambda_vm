@@ -12,11 +12,11 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use rayon::prelude::*;
 
 use crate::Result;
-use crate::device::backend;
+use crate::device::{Backend, backend};
 use crate::merkle::{launch_keccak_base, launch_keccak_ext3};
 use crate::ntt::run_ntt_body;
 
@@ -30,6 +30,129 @@ fn assert_u32_domain(n: usize, what: &str) {
         n <= u32::MAX as usize,
         "{what}: {n} exceeds u32 range — kernel grid would silently truncate",
     );
+}
+
+/// De-interleave `columns` (each `3*n` u64s, ext3-per-element layout
+/// `[a, b, c, a, b, c, ...]`) into `pinned` as `3*m` base-field slabs.
+/// Component `k` of column `c` lands at `pinned[(c*3 + k)*n .. (c*3 + k)*n + n]`.
+///
+/// Caller invariants: `pinned.len() >= 3 * columns.len() * n` and each
+/// `columns[c].len() >= 3 * n`. The caller must hold the pinned-staging lock.
+fn pack_ext3_to_pinned_slabs(columns: &[&[u64]], pinned: &mut [u64], n: usize) {
+    let m = columns.len();
+    debug_assert!(pinned.len() >= 3 * m * n);
+    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
+    columns.par_iter().enumerate().for_each(|(c, col)| {
+        // SAFETY: each task writes to disjoint `[(c*3 + k)*n .. ..+n]` regions
+        // of `pinned`. The outer `&mut [u64]` borrow guarantees no aliasing.
+        let slab_a = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
+        };
+        for i in 0..n {
+            slab_a[i] = col[i * 3];
+            slab_b[i] = col[i * 3 + 1];
+            slab_c[i] = col[i * 3 + 2];
+        }
+    });
+}
+
+/// Re-interleave the `3*m` base-field slabs in `pinned` (layout matches
+/// `pack_ext3_to_pinned_slabs`) into `outputs`, writing each as
+/// `3*lde_size` interleaved u64s.
+fn unpack_pinned_slabs_to_ext3(pinned: &[u64], outputs: &mut [&mut [u64]], lde_size: usize) {
+    let m = outputs.len();
+    debug_assert!(pinned.len() >= 3 * m * lde_size);
+    let pinned_const = pinned.as_ptr() as usize;
+    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+        // SAFETY: each task reads from disjoint `[(c*3 + k)*lde_size .. ..+lde_size]`
+        // regions of `pinned`. Caller borrows `pinned` for the duration of the call.
+        let slab_a = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_b = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
+                lde_size,
+            )
+        };
+        let slab_c = unsafe {
+            std::slice::from_raw_parts(
+                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
+                lde_size,
+            )
+        };
+        for i in 0..lde_size {
+            dst[i * 3] = slab_a[i];
+            dst[i * 3 + 1] = slab_b[i];
+            dst[i * 3 + 2] = slab_c[i];
+        }
+    });
+}
+
+/// Run `bit_reverse_permute_batched` over `m` columns of length `n` each
+/// (column stride `col_stride`). 256 threads per block, grid sized to cover
+/// `n` per column.
+fn launch_bit_reverse_batched(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), m, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute_batched)
+            .arg(buf)
+            .arg(&n)
+            .arg(&log_n)
+            .arg(&col_stride)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Run `pointwise_mul_batched`: `buf[c*col_stride + i] *= weights[i]` for
+/// `m` columns, `n` elements each.
+fn launch_pointwise_mul_batched(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    weights: &CudaSlice<u64>,
+    n: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), m, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.pointwise_mul_batched)
+            .arg(buf)
+            .arg(weights)
+            .arg(&n)
+            .arg(&col_stride)
+            .launch(cfg)?;
+    }
+    Ok(())
 }
 
 /// Handle to a base-field LDE kept live on device after R1 commit.
@@ -209,23 +332,7 @@ pub fn coset_lde_batch_base(
     let m_u32 = m as u32;
 
     // === 1. Bit-reverse first N of every column ===
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&n_u64)
-                .arg(&log_n)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
 
     // === 2. iNTT body over all columns ===
     run_batched_ntt_body(
@@ -239,42 +346,10 @@ pub fn coset_lde_batch_base(
     )?;
 
     // === 3. Pointwise multiply by coset weights (includes 1/N) ===
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.pointwise_mul_batched)
-                .arg(&mut buf)
-                .arg(&weights_dev)
-                .arg(&n_u64)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
 
     // === 4. Bit-reverse full LDE of every column ===
-    {
-        let grid_x = (lde_size as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&lde_u64)
-                .arg(&log_lde)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
 
     // === 5. Forward NTT on full LDE of every column ===
     run_batched_ntt_body(
@@ -386,23 +461,7 @@ pub fn coset_lde_batch_base_into(
     let m_u32 = m as u32;
 
     // iNTT bit-reverse + body, pointwise mul, forward bit-reverse + body.
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&n_u64)
-                .arg(&log_n)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -412,40 +471,8 @@ pub fn coset_lde_batch_base_into(
         col_stride_u64,
         m_u32,
     )?;
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.pointwise_mul_batched)
-                .arg(&mut buf)
-                .arg(&weights_dev)
-                .arg(&n_u64)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
-    {
-        let grid_x = (lde_size as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, m_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&lde_u64)
-                .arg(&log_lde)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -545,19 +572,7 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     let m_u32 = m as u32;
 
     // iNTT
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -568,33 +583,9 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         m_u32,
     )?;
     // pointwise coset scale
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul_batched)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
     // forward NTT on full LDE slab
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((lde_size as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -778,19 +769,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let m_u32 = m as u32;
 
     // iNTT
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -800,33 +779,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         col_stride_u64,
         m_u32,
     )?;
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul_batched)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
     // forward NTT at LDE size
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((lde_size as u32).div_ceil(256), m_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -861,29 +816,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         )?;
     }
 
-    // Inner tree levels — mirror the CPU `build(nodes, leaves_len)` scan.
-    {
-        let mut level_begin: u64 = (lde_size - 1) as u64;
-        while level_begin != 0 {
-            let new_begin = level_begin / 2;
-            let n_pairs = level_begin - new_begin;
-            let grid = (n_pairs as u32).div_ceil(128);
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_merkle_level)
-                    .arg(&mut nodes_dev)
-                    .arg(&new_begin)
-                    .arg(&n_pairs)
-                    .launch(cfg)?;
-            }
-            level_begin = new_begin;
-        }
-    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
 
     // D2H the LDE and the tree nodes via pinned staging.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
@@ -981,23 +914,7 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
-        };
-        for i in 0..n {
-            slab_a[i] = col[i * 3];
-            slab_b[i] = col[i * 3 + 1];
-            slab_c[i] = col[i * 3 + 2];
-        }
-    });
+    pack_ext3_to_pinned_slabs(columns, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     for s in 0..mb {
@@ -1014,19 +931,7 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1036,32 +941,8 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         col_stride_u64,
         mb_u32,
     )?;
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul_batched)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((lde_size as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1097,32 +978,7 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     stream.synchronize()?;
 
     // Re-interleave pinned → caller ext3 outputs, parallel.
-    let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
-                lde_size,
-            )
-        };
-        for i in 0..lde_size {
-            dst[i * 3] = slab_a[i];
-            dst[i * 3 + 1] = slab_b[i];
-            dst[i * 3 + 2] = slab_c[i];
-        }
-    });
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
 
     // Parallel memcpy of pinned hashes → caller.
     const CHUNK: usize = 64 * 1024;
@@ -1234,23 +1090,7 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
-        };
-        for i in 0..n {
-            slab_a[i] = col[i * 3];
-            slab_b[i] = col[i * 3 + 1];
-            slab_c[i] = col[i * 3 + 2];
-        }
-    });
+    pack_ext3_to_pinned_slabs(columns, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     for s in 0..mb {
@@ -1267,19 +1107,7 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1289,32 +1117,8 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         col_stride_u64,
         mb_u32,
     )?;
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul_batched)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((lde_size as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1341,29 +1145,7 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         )?;
     }
 
-    // Inner tree levels.
-    {
-        let mut level_begin: u64 = (lde_size - 1) as u64;
-        while level_begin != 0 {
-            let new_begin = level_begin / 2;
-            let n_pairs = level_begin - new_begin;
-            let grid = (n_pairs as u32).div_ceil(128);
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_merkle_level)
-                    .arg(&mut nodes_dev)
-                    .arg(&new_begin)
-                    .arg(&n_pairs)
-                    .launch(cfg)?;
-            }
-            level_begin = new_begin;
-        }
-    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
 
     // D2H LDE (mb * lde_size u64) and tree nodes.
     stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
@@ -1379,32 +1161,7 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     stream.synchronize()?;
 
     // Re-interleave pinned → caller ext3 outputs.
-    let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
-                lde_size,
-            )
-        };
-        for i in 0..lde_size {
-            dst[i * 3] = slab_a[i];
-            dst[i * 3 + 1] = slab_b[i];
-            dst[i * 3 + 2] = slab_c[i];
-        }
-    });
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
 
     const CHUNK: usize = 64 * 1024;
     let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
@@ -1508,23 +1265,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    coefs.par_iter().enumerate().for_each(|(c, col)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
-        };
-        for i in 0..n {
-            slab_a[i] = col[i * 3];
-            slab_b[i] = col[i * 3 + 1];
-            slab_c[i] = col[i * 3 + 2];
-        }
-    });
+    pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     for s in 0..mb {
@@ -1541,42 +1282,10 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     let mb_u32 = mb as u32;
 
     // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, mb_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.pointwise_mul_batched)
-                .arg(&mut buf)
-                .arg(&weights_dev)
-                .arg(&n_u64)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
 
     // Bit-reverse full lde_size slab, then forward DIT NTT.
-    {
-        let grid_x = (lde_size as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, mb_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&lde_u64)
-                .arg(&log_lde)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1590,32 +1299,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
     stream.synchronize()?;
 
-    let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
-                lde_size,
-            )
-        };
-        for i in 0..lde_size {
-            dst[i * 3] = slab_a[i];
-            dst[i * 3 + 1] = slab_b[i];
-            dst[i * 3 + 2] = slab_c[i];
-        }
-    });
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
     if keep_device_buf {
         Ok(Some(GpuLdeExt3 {
@@ -1681,23 +1365,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    coefs.par_iter().enumerate().for_each(|(c, col)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
-        };
-        for i in 0..n {
-            slab_a[i] = col[i * 3];
-            slab_b[i] = col[i * 3 + 1];
-            slab_c[i] = col[i * 3 + 2];
-        }
-    });
+    pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     for s in 0..mb {
@@ -1713,32 +1381,8 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul_batched)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute_batched)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .arg(&col_stride_u64)
-            .launch(LaunchConfig {
-                grid_dim: ((lde_size as u32).div_ceil(256), mb_u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1780,28 +1424,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
                 .launch(cfg)?;
         }
     }
-    {
-        let mut level_begin: u64 = (num_leaves - 1) as u64;
-        while level_begin != 0 {
-            let new_begin = level_begin / 2;
-            let n_pairs = level_begin - new_begin;
-            let grid = (n_pairs as u32).div_ceil(128);
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_merkle_level)
-                    .arg(&mut nodes_dev)
-                    .arg(&new_begin)
-                    .arg(&n_pairs)
-                    .launch(cfg)?;
-            }
-            level_begin = new_begin;
-        }
-    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     // D2H LDE and tree.
     stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
@@ -1817,32 +1440,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     stream.synchronize()?;
 
     // Re-interleave pinned → caller ext3 outputs.
-    let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
-                lde_size,
-            )
-        };
-        for i in 0..lde_size {
-            dst[i * 3] = slab_a[i];
-            dst[i * 3 + 1] = slab_b[i];
-            dst[i * 3 + 2] = slab_c[i];
-        }
-    });
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
 
     // Copy pinned tree → caller nodes_out.
     debug_assert_eq!(merkle_nodes_out.len(), tight_total_nodes * 32);
@@ -1926,27 +1524,7 @@ pub fn coset_lde_batch_ext3_into(
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    // Pack: for each ext3 column, write 3 base slabs into pinned. The slab
-    // for column c, component k lives at `pinned[(c*3 + k)*n .. (c*3+k)*n + n]`.
-    // We de-interleave from the interleaved `[a, b, c, a, b, c, ...]` input.
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        // SAFETY: disjoint regions per c; staging lock held.
-        let slab_a = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3) * n), n)
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 1) * n), n)
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts_mut((pinned_ptr_u as *mut u64).add((c * 3 + 2) * n), n)
-        };
-        for i in 0..n {
-            slab_a[i] = col[i * 3];
-            slab_b[i] = col[i * 3 + 1];
-            slab_c[i] = col[i * 3 + 2];
-        }
-    });
+    pack_ext3_to_pinned_slabs(columns, pinned, n);
 
     // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
@@ -1967,23 +1545,7 @@ pub fn coset_lde_batch_ext3_into(
 
     // === Butterflies: identical to the base-field batched path, but with
     // grid.y = 3M instead of M. ===
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, mb_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&n_u64)
-                .arg(&log_n)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1993,40 +1555,8 @@ pub fn coset_lde_batch_ext3_into(
         col_stride_u64,
         mb_u32,
     )?;
-    {
-        let grid_x = (n as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, mb_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.pointwise_mul_batched)
-                .arg(&mut buf)
-                .arg(&weights_dev)
-                .arg(&n_u64)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
-    {
-        let grid_x = (lde_size as u32).div_ceil(256);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, mb_u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute_batched)
-                .arg(&mut buf)
-                .arg(&lde_u64)
-                .arg(&log_lde)
-                .arg(&col_stride_u64)
-                .launch(cfg)?;
-        }
-    }
+    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -2042,32 +1572,7 @@ pub fn coset_lde_batch_ext3_into(
 
     // Unpack: for each output column, re-interleave 3 slabs back into the
     // ext3-per-element layout.
-    let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let slab_a = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_b = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 1) * lde_size),
-                lde_size,
-            )
-        };
-        let slab_c = unsafe {
-            std::slice::from_raw_parts(
-                (pinned_const as *const u64).add((c * 3 + 2) * lde_size),
-                lde_size,
-            )
-        };
-        for i in 0..lde_size {
-            dst[i * 3] = slab_a[i];
-            dst[i * 3 + 1] = slab_b[i];
-            dst[i * 3 + 2] = slab_c[i];
-        }
-    });
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
     Ok(())
 }

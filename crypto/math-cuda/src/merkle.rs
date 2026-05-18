@@ -20,7 +20,7 @@ use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKerne
 use rayon::prelude::*;
 
 use crate::Result;
-use crate::device::backend;
+use crate::device::{Backend, backend};
 
 /// Run GPU Keccak-256 leaf hashing on a base-field column buffer.
 ///
@@ -101,12 +101,45 @@ pub fn keccak_leaves_ext3(
 const KECCAK_BLOCK_DIM: u32 = 128;
 
 fn keccak_launch_cfg(num_rows: u64) -> LaunchConfig {
+    debug_assert!(
+        num_rows <= u32::MAX as u64,
+        "keccak_launch_cfg: num_rows ({num_rows}) exceeds u32 grid range",
+    );
     let grid = (num_rows as u32).div_ceil(KECCAK_BLOCK_DIM);
     LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (KECCAK_BLOCK_DIM, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+/// Walk the inner Merkle tree on device. `nodes_dev` already has the
+/// `leaves_len` hashed leaves written into the tail; this loops
+/// `log2(leaves_len)` times invoking `keccak_merkle_level` to fill in the
+/// inner nodes from the bottom up. Mirrors the CPU `build(nodes, leaves_len)`
+/// scan in `crypto/crypto/src/merkle_tree/merkle.rs`.
+pub(crate) fn build_inner_tree_levels(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+) -> Result<()> {
+    let mut level_begin: u64 = (leaves_len - 1) as u64;
+    while level_begin != 0 {
+        let new_begin = level_begin / 2;
+        let n_pairs = level_begin - new_begin;
+        let cfg = keccak_launch_cfg(n_pairs);
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_merkle_level)
+                .arg(&mut *nodes_dev)
+                .arg(&new_begin)
+                .arg(&n_pairs)
+                .launch(cfg)?;
+        }
+        level_begin = new_begin;
+    }
+    Ok(())
 }
 
 pub(crate) fn launch_keccak_base(
@@ -177,30 +210,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
         stream.memcpy_htod(hashed_leaves, &mut slice)?;
     }
 
-    // Build level by level. The CPU `build(nodes, leaves_len)` starts with
-    //   level_begin_index = leaves_len - 1
-    //   level_end_index   = 2 * level_begin_index
-    // and each iteration computes:
-    //   new_level_begin_index = level_begin_index / 2
-    //   new_level_length       = level_begin_index - new_level_begin_index
-    // The parents occupy [new_level_begin_index, level_begin_index), the
-    // children occupy [level_begin_index, level_end_index + 1).
-    let mut level_begin: u64 = (leaves_len - 1) as u64;
-    while level_begin != 0 {
-        let new_begin = level_begin / 2;
-        let n_pairs = level_begin - new_begin;
-
-        let cfg = keccak_launch_cfg(n_pairs);
-        unsafe {
-            stream
-                .launch_builder(&be.keccak_merkle_level)
-                .arg(&mut nodes_dev)
-                .arg(&new_begin)
-                .arg(&n_pairs)
-                .launch(cfg)?;
-        }
-        level_begin = new_begin;
-    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
