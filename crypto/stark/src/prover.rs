@@ -48,34 +48,6 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a PI,
 );
 
-#[cfg(test)]
-pub(crate) mod domain_cache_stats {
-    use std::cell::Cell;
-
-    thread_local! {
-        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    }
-
-    pub(crate) fn reset() {
-        COUNTS.with(|c| c.set((0, 0)));
-    }
-
-    pub(crate) fn get() -> (usize, usize) {
-        COUNTS.with(Cell::get)
-    }
-
-    pub(crate) fn record(was_hit: bool) {
-        COUNTS.with(|c| {
-            let (hits, misses) = c.get();
-            c.set(if was_hit {
-                (hits + 1, misses)
-            } else {
-                (hits, misses + 1)
-            });
-        });
-    }
-}
-
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -1602,7 +1574,7 @@ pub trait IsStarkProver<
                 .clone();
 
             #[cfg(test)]
-            domain_cache_stats::record(was_hit);
+            crate::tests::domain_cache_stats::record(was_hit);
 
             domains.push(domain);
             twiddle_caches.push(twiddles);
