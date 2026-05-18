@@ -106,6 +106,9 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
     /// Fill a pre-allocated frame from LDE data, without allocating.
     ///
     /// The frame must have been created with `preallocate` with matching dimensions.
+    /// Reads one contiguous row slice per (step, sub-row) from the row-major
+    /// LDETraceTable and copies it directly into the frame's per-row buffer —
+    /// the per-column scatter-gather is gone.
     pub fn fill_from_lde(
         &mut self,
         lde_trace: &LDETraceTable<F, E>,
@@ -128,14 +131,13 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
             while step_row < end_step_row {
                 let step_row_idx = step_row % num_rows;
 
-                // Overwrite main row elements
-                for col in 0..num_main_cols {
-                    step.data[sub_row_idx][col] = lde_trace.get_main(step_row_idx, col).clone();
+                if num_main_cols > 0 {
+                    let src = lde_trace.main_row_slice(step_row_idx);
+                    step.data[sub_row_idx].clone_from_slice(src);
                 }
-
-                // Overwrite aux row elements
-                for col in 0..num_aux_cols {
-                    step.aux_data[sub_row_idx][col] = lde_trace.get_aux(step_row_idx, col).clone();
+                if num_aux_cols > 0 {
+                    let src = lde_trace.aux_row_slice(step_row_idx);
+                    step.aux_data[sub_row_idx].clone_from_slice(src);
                 }
 
                 sub_row_idx += 1;
