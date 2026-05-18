@@ -1,4 +1,5 @@
 pub mod lambda_fibonacci_pair;
+pub mod lambda_minimal_fib;
 pub mod plonky3_config;
 pub mod plonky3_fibonacci;
 

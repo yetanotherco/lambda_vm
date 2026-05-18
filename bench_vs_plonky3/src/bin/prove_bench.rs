@@ -15,7 +15,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bench_vs_plonky3::{lambda_fibonacci_pair, plonky3_config, plonky3_fibonacci};
+use bench_vs_plonky3::{
+    lambda_fibonacci_pair, lambda_minimal_fib, plonky3_config, plonky3_fibonacci,
+};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -35,8 +37,33 @@ enum ProverKind {
     P3,
 }
 
+/// Which Lambda AIR variant to drive. `fib_pair` is the default — one
+/// `Box<dyn TransitionConstraintEvaluator>` per (shift, sum) pair per
+/// sequence (= 2 × num_sequences constraints). `minimal_fib` collapses
+/// the same logical work into a single constraint that loops over all
+/// sequences internally — same trace shape, same per-row arithmetic, but
+/// ONE vtable dispatch per LDE row instead of 2 × num_sequences. Use the
+/// delta between the two to isolate per-constraint dispatch overhead.
+///
+/// P3 ignores this flag (only one AIR shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AirKind {
+    FibPair,
+    MinimalFib,
+}
+
+impl AirKind {
+    fn workload_name(&self) -> &'static str {
+        match self {
+            AirKind::FibPair => "fib_pair",
+            AirKind::MinimalFib => "minimal_fib",
+        }
+    }
+}
+
 struct Args {
     prover: ProverKind,
+    air: AirKind,
     log_rows: u32,
     num_sequences: usize,
     blowup: u8,
@@ -56,6 +83,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             prover: ProverKind::Lambda,
+            air: AirKind::FibPair,
             log_rows: 19,
             num_sequences: 16,
             blowup: 2,
@@ -69,6 +97,7 @@ impl Default for Args {
 fn print_usage() {
     eprintln!(
         "usage: prove_bench --prover {{lambda|p3}} \
+         [--air {{fib_pair|minimal_fib}}] \
          [--log-rows K] [--num-sequences N] \
          [--blowup B] [--queries Q] [--grinding G] [--breakdown]"
     );
@@ -88,6 +117,14 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("unknown prover: {other}")),
                 };
                 prover_set = true;
+            }
+            "--air" => {
+                let v = iter.next().ok_or("--air needs a value")?;
+                args.air = match v.as_str() {
+                    "fib_pair" => AirKind::FibPair,
+                    "minimal_fib" => AirKind::MinimalFib,
+                    other => return Err(format!("unknown air: {other}")),
+                };
             }
             "--log-rows" => {
                 let v = iter.next().ok_or("--log-rows needs a value")?;
@@ -151,6 +188,7 @@ fn ms(seconds: f64) -> f64 {
 }
 
 fn print_breakdown(
+    workload: &str,
     prover: &str,
     log_rows: u32,
     rows: usize,
@@ -159,16 +197,17 @@ fn print_breakdown(
     extra: &str,
 ) {
     println!(
-        "BREAKDOWN\tworkload=fib_pair\tprover={prover}\tlog_rows={log_rows}\trows={rows}\tphase={phase}\tms={elapsed_ms:.3}{extra}"
+        "BREAKDOWN\tworkload={workload}\tprover={prover}\tlog_rows={log_rows}\trows={rows}\tphase={phase}\tms={elapsed_ms:.3}{extra}"
     );
 }
 
 #[cfg(feature = "instruments")]
 fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
-    print_breakdown("lambda", args.log_rows, rows, "prove_total", total_ms, "");
+    print_breakdown(args.air.workload_name(), "lambda", args.log_rows, rows, "prove_total", total_ms, "");
 
     if let Some(timing) = stark::instruments::take() {
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -177,6 +216,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -185,6 +225,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -193,6 +234,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -201,6 +243,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -211,6 +254,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
 
         let r1 = timing.round1_sub;
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -219,6 +263,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -227,6 +272,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -235,6 +281,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
             "",
         );
         print_breakdown(
+            args.air.workload_name(),
             "lambda",
             args.log_rows,
             rows,
@@ -246,6 +293,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
         for (name, table_rows, dur, sub) in timing.table_timings {
             let extra = format!("\ttable={name}\ttable_rows={table_rows}");
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -254,6 +302,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -262,6 +311,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -270,6 +320,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -278,6 +329,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -286,6 +338,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -294,6 +347,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -302,6 +356,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -310,6 +365,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
                 &extra,
             );
             print_breakdown(
+                args.air.workload_name(),
                 "lambda",
                 args.log_rows,
                 rows,
@@ -323,7 +379,7 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
 
 #[cfg(not(feature = "instruments"))]
 fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
-    print_breakdown("lambda", args.log_rows, rows, "prove_total", total_ms, "");
+    print_breakdown(args.air.workload_name(), "lambda", args.log_rows, rows, "prove_total", total_ms, "");
     eprintln!("warning: Lambda phase breakdown requires building with --features instruments");
 }
 
@@ -429,35 +485,80 @@ fn run_lambda(args: &Args) -> BenchMetrics {
         .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
         .collect();
 
-    let mut trace = lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
-    let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
-    let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
-        &options,
-        args.num_sequences,
-    );
+    let (prove_s, verify_s, proof_size_bytes) = match args.air {
+        AirKind::FibPair => {
+            let mut trace =
+                lambda_fibonacci_pair::compute_trace::<F, E>(&initial_values, rows);
+            let pub_inputs = lambda_fibonacci_pair::create_public_inputs(initial_values);
+            let air = lambda_fibonacci_pair::FibonacciPairMultiColAIR::<F, E>::with_num_sequences(
+                &options,
+                args.num_sequences,
+            );
 
-    let start = Instant::now();
-    let _proof = Prover::<F, E, _>::prove(
-        &air,
-        &mut trace,
-        &pub_inputs,
-        &mut DefaultTranscript::<E>::new(&[]),
-    )
-    .expect("lambda prove failed");
-    let prove_s = start.elapsed().as_secs_f64();
-    if args.breakdown {
-        emit_lambda_breakdown(args, rows, ms(prove_s));
-    }
+            let start = Instant::now();
+            let proof = Prover::<F, E, _>::prove(
+                &air,
+                &mut trace,
+                &pub_inputs,
+                &mut DefaultTranscript::<E>::new(&[]),
+            )
+            .expect("lambda prove failed");
+            let prove_s = start.elapsed().as_secs_f64();
+            if args.breakdown {
+                emit_lambda_breakdown(args, rows, ms(prove_s));
+            }
 
-    let proof_size_bytes = serde_cbor::to_vec(&_proof)
-        .expect("lambda proof serialization failed")
-        .len();
+            let proof_size_bytes = serde_cbor::to_vec(&proof)
+                .expect("lambda proof serialization failed")
+                .len();
 
-    let start = Instant::now();
-    let verified =
-        Verifier::<F, E, _>::verify(&_proof, &air, &mut DefaultTranscript::<E>::new(&[]));
-    let verify_s = start.elapsed().as_secs_f64();
-    assert!(verified, "lambda verify failed");
+            let start = Instant::now();
+            let verified = Verifier::<F, E, _>::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<E>::new(&[]),
+            );
+            let verify_s = start.elapsed().as_secs_f64();
+            assert!(verified, "lambda verify failed");
+            (prove_s, verify_s, proof_size_bytes)
+        }
+        AirKind::MinimalFib => {
+            let mut trace =
+                lambda_minimal_fib::compute_trace::<F, E>(&initial_values, rows);
+            let pub_inputs = lambda_minimal_fib::create_public_inputs(initial_values);
+            let air = lambda_minimal_fib::MinimalFibMultiColAIR::<F, E>::with_num_sequences(
+                &options,
+                args.num_sequences,
+            );
+
+            let start = Instant::now();
+            let proof = Prover::<F, E, _>::prove(
+                &air,
+                &mut trace,
+                &pub_inputs,
+                &mut DefaultTranscript::<E>::new(&[]),
+            )
+            .expect("lambda prove failed");
+            let prove_s = start.elapsed().as_secs_f64();
+            if args.breakdown {
+                emit_lambda_breakdown(args, rows, ms(prove_s));
+            }
+
+            let proof_size_bytes = serde_cbor::to_vec(&proof)
+                .expect("lambda proof serialization failed")
+                .len();
+
+            let start = Instant::now();
+            let verified = Verifier::<F, E, _>::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<E>::new(&[]),
+            );
+            let verify_s = start.elapsed().as_secs_f64();
+            assert!(verified, "lambda verify failed");
+            (prove_s, verify_s, proof_size_bytes)
+        }
+    };
 
     BenchMetrics {
         prove_s,
@@ -491,14 +592,14 @@ fn run_p3(args: &Args) -> BenchMetrics {
     };
 
     if args.breakdown {
-        print_breakdown("p3", args.log_rows, rows, "prove_total", ms(prove_s), "");
+        print_breakdown(args.air.workload_name(), "p3", args.log_rows, rows, "prove_total", ms(prove_s), "");
         if let Some(results) = span_results {
             let mut span_data = results.lock().unwrap().clone();
             span_data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             for (name, elapsed_ms) in span_data {
                 if elapsed_ms >= 0.1 {
                     let extra = format!("\tspan={name}");
-                    print_breakdown("p3", args.log_rows, rows, "span", elapsed_ms, &extra);
+                    print_breakdown(args.air.workload_name(), "p3", args.log_rows, rows, "span", elapsed_ms, &extra);
                 }
             }
         }
@@ -555,7 +656,7 @@ fn main() -> ExitCode {
     println!("Proof size: {} bytes", metrics.proof_size_bytes);
     println!("Peak RSS: {peak_rss_kb} KB");
     println!(
-        "METRICS\tworkload=fib_pair\tprover={prover_name}\tlog_rows={}\trows={rows}\t\
+        "METRICS\tworkload={workload}\tprover={prover_name}\tlog_rows={}\trows={rows}\t\
          num_sequences={}\tmain_cols={main_cols}\taux_cols={aux_cols}\ttables=1\t\
          logup=false\tblowup={}\tfri_queries={}\tgrinding={}\tprove_s={:.6}\t\
          verify_s={:.6}\tproof_size_bytes={}\tpeak_rss_kb={peak_rss_kb}\t\
@@ -570,6 +671,7 @@ fn main() -> ExitCode {
         metrics.proof_size_bytes,
         rows_per_sec,
         cells_per_sec,
+        workload = args.air.workload_name(),
     );
     ExitCode::SUCCESS
 }

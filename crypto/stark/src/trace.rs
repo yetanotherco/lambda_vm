@@ -8,6 +8,7 @@ use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
+use std::mem::{ManuallyDrop, MaybeUninit};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -235,90 +236,123 @@ where
             0
         };
 
-        // Parallel col-major → row-major transpose. Coarser-grained than
-        // par_chunks_exact_mut(num_main_cols) (which makes ONE task per row
-        // — at log21 that's ~4M tiny tasks on EPYC, rayon overhead dominates).
-        // Instead each task handles ~ROWS_PER_TASK rows (~64 KB) so scheduling
-        // overhead is negligible compared to the memory work. EPYC at log21
-        // n=64 went from ~190 ms transpose to ~15 ms with this change.
+        // Parallel col-major → row-major transpose. Coarse chunks (~ROWS_PER_TASK
+        // rows per rayon task) to avoid 4M tiny tasks on 96-core EPYC. The
+        // destination buffer is allocated UNINITIALIZED via MaybeUninit and
+        // every cell is written exactly once by the transpose — this avoids
+        // an O(num_rows * num_cols) memset that, at log21 n=64, was burning
+        // ~200 ms of memory bandwidth on a 4 GB buffer before we'd overwrite
+        // every byte anyway.
         const ROWS_PER_TASK: usize = 1024;
-        let mut main_data: Vec<FieldElement<F>> =
-            vec![FieldElement::<F>::zero(); num_rows * num_main_cols];
-        if num_main_cols > 0 {
-            let cells_per_task = ROWS_PER_TASK.max(1) * num_main_cols;
-            #[cfg(feature = "parallel")]
-            {
-                main_data
-                    .par_chunks_mut(cells_per_task)
-                    .enumerate()
-                    .for_each(|(chunk_idx, dst_chunk)| {
+        let main_data: Vec<FieldElement<F>> = {
+            let total = num_rows * num_main_cols;
+            let mut buf: Vec<MaybeUninit<FieldElement<F>>> = Vec::with_capacity(total);
+            // SAFETY: we set len to capacity but every cell below is written
+            // via MaybeUninit::write before the buffer is reinterpreted as
+            // initialized.
+            unsafe {
+                buf.set_len(total);
+            }
+            if num_main_cols > 0 && total > 0 {
+                let cells_per_task = ROWS_PER_TASK.max(1) * num_main_cols;
+                #[cfg(feature = "parallel")]
+                {
+                    buf.par_chunks_mut(cells_per_task).enumerate().for_each(
+                        |(chunk_idx, dst_chunk)| {
+                            let row_offset = chunk_idx * ROWS_PER_TASK;
+                            let rows_in_chunk = dst_chunk.len() / num_main_cols;
+                            for r in 0..rows_in_chunk {
+                                let row = row_offset + r;
+                                let dst_row_start = r * num_main_cols;
+                                for (col, src_col) in main_columns.iter().enumerate() {
+                                    dst_chunk[dst_row_start + col].write(src_col[row].clone());
+                                }
+                            }
+                        },
+                    );
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    for (chunk_idx, dst_chunk) in
+                        buf.chunks_mut(cells_per_task).enumerate()
+                    {
                         let row_offset = chunk_idx * ROWS_PER_TASK;
                         let rows_in_chunk = dst_chunk.len() / num_main_cols;
                         for r in 0..rows_in_chunk {
                             let row = row_offset + r;
                             let dst_row_start = r * num_main_cols;
                             for (col, src_col) in main_columns.iter().enumerate() {
-                                dst_chunk[dst_row_start + col] = src_col[row].clone();
+                                dst_chunk[dst_row_start + col].write(src_col[row].clone());
                             }
-                        }
-                    });
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                for (chunk_idx, dst_chunk) in
-                    main_data.chunks_mut(cells_per_task).enumerate()
-                {
-                    let row_offset = chunk_idx * ROWS_PER_TASK;
-                    let rows_in_chunk = dst_chunk.len() / num_main_cols;
-                    for r in 0..rows_in_chunk {
-                        let row = row_offset + r;
-                        let dst_row_start = r * num_main_cols;
-                        for (col, src_col) in main_columns.iter().enumerate() {
-                            dst_chunk[dst_row_start + col] = src_col[row].clone();
                         }
                     }
                 }
             }
-        }
+            // SAFETY: every cell of `buf` has been written above (when total > 0).
+            // Reinterpret the Vec<MaybeUninit<FE>> as Vec<FE>. Same layout, same
+            // allocator, same length and capacity.
+            let mut md = ManuallyDrop::new(buf);
+            unsafe {
+                Vec::from_raw_parts(
+                    md.as_mut_ptr() as *mut FieldElement<F>,
+                    md.len(),
+                    md.capacity(),
+                )
+            }
+        };
 
-        let mut aux_data: Vec<FieldElement<E>> =
-            vec![FieldElement::<E>::zero(); num_rows * num_aux_cols];
-        if num_aux_cols > 0 {
-            let cells_per_task = ROWS_PER_TASK.max(1) * num_aux_cols;
-            #[cfg(feature = "parallel")]
-            {
-                aux_data
-                    .par_chunks_mut(cells_per_task)
-                    .enumerate()
-                    .for_each(|(chunk_idx, dst_chunk)| {
+        let aux_data: Vec<FieldElement<E>> = {
+            let total = num_rows * num_aux_cols;
+            let mut buf: Vec<MaybeUninit<FieldElement<E>>> = Vec::with_capacity(total);
+            // SAFETY: identical pattern to main_data above.
+            unsafe {
+                buf.set_len(total);
+            }
+            if num_aux_cols > 0 && total > 0 {
+                let cells_per_task = ROWS_PER_TASK.max(1) * num_aux_cols;
+                #[cfg(feature = "parallel")]
+                {
+                    buf.par_chunks_mut(cells_per_task).enumerate().for_each(
+                        |(chunk_idx, dst_chunk)| {
+                            let row_offset = chunk_idx * ROWS_PER_TASK;
+                            let rows_in_chunk = dst_chunk.len() / num_aux_cols;
+                            for r in 0..rows_in_chunk {
+                                let row = row_offset + r;
+                                let dst_row_start = r * num_aux_cols;
+                                for (col, src_col) in aux_columns.iter().enumerate() {
+                                    dst_chunk[dst_row_start + col].write(src_col[row].clone());
+                                }
+                            }
+                        },
+                    );
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    for (chunk_idx, dst_chunk) in
+                        buf.chunks_mut(cells_per_task).enumerate()
+                    {
                         let row_offset = chunk_idx * ROWS_PER_TASK;
                         let rows_in_chunk = dst_chunk.len() / num_aux_cols;
                         for r in 0..rows_in_chunk {
                             let row = row_offset + r;
                             let dst_row_start = r * num_aux_cols;
                             for (col, src_col) in aux_columns.iter().enumerate() {
-                                dst_chunk[dst_row_start + col] = src_col[row].clone();
+                                dst_chunk[dst_row_start + col].write(src_col[row].clone());
                             }
-                        }
-                    });
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                for (chunk_idx, dst_chunk) in
-                    aux_data.chunks_mut(cells_per_task).enumerate()
-                {
-                    let row_offset = chunk_idx * ROWS_PER_TASK;
-                    let rows_in_chunk = dst_chunk.len() / num_aux_cols;
-                    for r in 0..rows_in_chunk {
-                        let row = row_offset + r;
-                        let dst_row_start = r * num_aux_cols;
-                        for (col, src_col) in aux_columns.iter().enumerate() {
-                            dst_chunk[dst_row_start + col] = src_col[row].clone();
                         }
                     }
                 }
             }
-        }
+            // SAFETY: every cell of `buf` has been written above (when total > 0).
+            let mut md = ManuallyDrop::new(buf);
+            unsafe {
+                Vec::from_raw_parts(
+                    md.as_mut_ptr() as *mut FieldElement<E>,
+                    md.len(),
+                    md.capacity(),
+                )
+            }
+        };
 
         Self {
             main_data,
