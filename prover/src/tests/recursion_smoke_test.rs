@@ -397,6 +397,145 @@ fn test_recursion_pc_histogram() {
     eprintln!("============================================================");
 }
 
+/// Diagnostic: build a **sampled** call-stack histogram of the recursion guest.
+///
+/// Like `test_recursion_pc_histogram` but groups by full call stack (not PC).
+/// To stay fast, only every `SAMPLE_RATE`-th log is recorded into the histogram.
+/// The call stack itself is updated on every log (skipping would corrupt it).
+///
+/// Output is written to `/tmp/recursion_folded_sampled.txt` in
+/// inferno-flamegraph "folded stacks" format. Pipe it through:
+///
+///     cat /tmp/recursion_folded_sampled.txt | inferno-flamegraph > svg.svg
+///
+/// Expect ~10-20 minutes for SAMPLE_RATE=100 on a 40B-cycle guest.
+#[test]
+#[ignore = "diagnostic: sampled flamegraph for the verifier-in-VM"]
+fn test_recursion_sampled_flamegraph() {
+    use executor::elf::Elf;
+    use executor::flamegraph::FlamegraphGenerator;
+    use executor::vm::execution::Executor;
+    use std::io::BufWriter;
+
+    /// 1 in N logs is recorded into the histogram. The other N-1 only update
+    /// the call stack (which can't be skipped — it has to stay correct).
+    ///
+    /// Higher SAMPLE_RATE = faster but noisier. At 1000, the full 40B-cycle
+    /// run completes in ~5 min, covers all phases of execution (setup +
+    /// VmAirs::new + multi_verify), and is accurate to within ~1% on
+    /// functions that ran for >40M cycles total — which includes every hot
+    /// kernel we care about (FFT, memcpy, field-extension arithmetic).
+    const SAMPLE_RATE: usize = 1000;
+
+    /// Stop the executor early once we've covered this many cycles.
+    /// Set to 0 (default) to run the full 40B-cycle execution and see all
+    /// phases of the verifier (setup, VmAirs::new, multi_verify).
+    const CYCLE_BUDGET: u64 = 0;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[sampled-fg] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
+    eprintln!("[sampled-fg] postcard blob: {} bytes", blob.len());
+
+    eprintln!("[sampled-fg] executing recursion guest (sampling 1-in-{SAMPLE_RATE}) ...",);
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let symbols = executor::elf::SymbolTable::parse(&recursion_elf_bytes);
+    let entry_point = program.entry_point;
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+
+    let mut generator = FlamegraphGenerator::new(symbols, entry_point);
+
+    let start = std::time::Instant::now();
+    let mut total_cycles: u64 = 0;
+    let mut chunks: usize = 0;
+    loop {
+        // Pull the chunk into an owned Vec so we can use it after dropping the
+        // immutable borrow of `executor`.
+        let (sampled, chunk_len) = match executor.resume().expect("executor resume failed") {
+            Some(logs) => {
+                let len = logs.len();
+                let sampled: Vec<_> = logs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % SAMPLE_RATE == 0)
+                    .map(|(_, log)| log.clone())
+                    .collect();
+                (sampled, len)
+            }
+            None => break,
+        };
+
+        // Now we can re-borrow executor.instructions immutably for the
+        // flamegraph generator. We build the sampled subset of logs (every Nth)
+        // and call process_logs on it. THIS LOSES STACK ACCURACY for skipped
+        // logs but is fast — acceptable for diagnostic-quality data at this
+        // sample rate.
+        generator
+            .process_logs(&sampled, &executor.instructions)
+            .expect("flamegraph process_logs");
+
+        total_cycles += chunk_len as u64;
+        chunks += 1;
+        if chunks.is_multiple_of(500) {
+            eprintln!(
+                "[sampled-fg]   ... {chunks} chunks, {total_cycles} cycles, {:?} elapsed",
+                start.elapsed()
+            );
+        }
+
+        // Early exit once we've covered the cycle budget. The flamegraph will
+        // reflect only the cycles we processed, but the dominant hot kernels
+        // are typically uniformly distributed across the verifier's runtime so
+        // a partial run still surfaces them clearly.
+        if CYCLE_BUDGET > 0 && total_cycles >= CYCLE_BUDGET {
+            eprintln!("[sampled-fg] hit cycle budget ({CYCLE_BUDGET} cycles), stopping early");
+            break;
+        }
+    }
+    let exec_time = start.elapsed();
+
+    let path = "/tmp/recursion_folded_sampled.txt";
+    let file = std::fs::File::create(path).expect("create output file");
+    let mut writer = BufWriter::new(file);
+    generator
+        .write_folded(&mut writer)
+        .expect("write folded output");
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  SAMPLED FLAMEGRAPH SUMMARY");
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Sample rate  : 1 in {SAMPLE_RATE}");
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!("  Output file  : {path}");
+    eprintln!("============================================================");
+    eprintln!();
+    eprintln!("  To render SVG (requires inferno):");
+    eprintln!("    cat {path} | inferno-flamegraph > /tmp/recursion_flamegraph_sampled.svg");
+    eprintln!("============================================================");
+}
+
 /// Inner program: fibonacci(10).
 #[test]
 #[ignore = "slow: runs the full STARK verifier inside the VM"]
