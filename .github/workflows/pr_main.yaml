@@ -184,7 +184,7 @@ jobs:
 
       - name: Run prover disk-spill tests
         run: |
-          cargo test --release -p lambda-vm-prover --features disk-spill -- --test-threads=1
+          cargo test --release -p lambda-vm-prover --features disk-spill -- --test-threads=1 disk_spill count_table_lengths
 
   build-prover-tests:
     name: Build prover tests
