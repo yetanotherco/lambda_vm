@@ -559,4 +559,9 @@ impl SymbolTable {
     pub fn len(&self) -> usize {
         self.functions.len()
     }
+
+    /// Borrow the full function list (sorted by address).
+    pub fn functions(&self) -> &[FunctionSymbol] {
+        &self.functions
+    }
 }
