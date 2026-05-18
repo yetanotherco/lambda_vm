@@ -306,6 +306,12 @@ pub struct CpuOperation {
 
     /// For Commit ECALLs: byte count from x12
     pub commit_count: u64,
+
+    /// Whether this ECALL is a KeccakPermute syscall
+    pub ecall_keccak: bool,
+
+    /// For KeccakPermute ECALLs: state address from x10
+    pub keccak_state_addr: u64,
 }
 
 impl CpuOperation {
@@ -641,6 +647,9 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        let ecall_keccak = decode.op_ecall
+            && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
@@ -663,6 +672,8 @@ impl CpuOperation {
             ecall_commit,
             commit_buf_addr,
             commit_count,
+            ecall_keccak,
+            keccak_state_addr,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -2035,12 +2046,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // ECALL interaction (single shared bus for HALT and COMMIT)
+    // ECALL interaction (shared bus for HALT, COMMIT, and KECCAK)
     // -------------------------------------------------------------------------
-    // Sends to both HALT and COMMIT tables. Each receiver pattern-matches on
-    // the syscall number in the payload.
-    // multiplicity = ECALL
-    // rv1 = value of a7 register (syscall number).
+    // multiplicity = ECALL (all ECALLs, each receiver matches on syscall number)
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Column(cols::ECALL),

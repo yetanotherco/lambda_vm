@@ -43,7 +43,22 @@ jobs:
       - name: Run nightly benchmark
         run: |
           bash ./bench_vs/run.sh \
-            --steps 1000000 2000000 4000000 8000000 \
+            --steps 1000000 2000000 4000000 8000000 16000000 \
+            --report-dir bench_vs_artifacts \
+            --no-color
+
+      - name: Restore cached ethrex.elf (TEMPORARY — until /opt/lambda-vm-sysroot is provisioned on the bench runner)
+        continue-on-error: true
+        run: |
+          mkdir -p executor/program_artifacts/rust
+          cp /home/app/cached_artifacts/ethrex.elf executor/program_artifacts/rust/ethrex.elf
+          ls -la executor/program_artifacts/rust/ethrex.elf
+          sha256sum executor/program_artifacts/rust/ethrex.elf
+
+      - name: Run ethrex empty block benchmark
+        continue-on-error: true
+        run: |
+          bash ./bench_vs/run_ethrex.sh \
             --report-dir bench_vs_artifacts \
             --no-color
 

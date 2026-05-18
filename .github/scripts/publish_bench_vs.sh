@@ -157,6 +157,20 @@ if [ -f "$P3_HEADLINE_FILE" ]; then
     P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3 - Headline"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_HEADLINE_MRKDWN"'"}}'
 fi
 
+ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"
+ETHREX_SECTION=""
+if [ -f "$ETHREX_METRICS_FILE" ]; then
+    ETHREX_TIME=$(grep '^ethrex_empty_block_time_s=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+    ETHREX_CYCLES=$(grep '^ethrex_empty_block_cycles=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+    if [ -n "$ETHREX_TIME" ]; then
+        ETHREX_MRKDWN="*Empty block:* ${ETHREX_TIME}s"
+        if [ -n "$ETHREX_CYCLES" ] && [ "$ETHREX_CYCLES" != "n/a" ]; then
+            ETHREX_MRKDWN="${ETHREX_MRKDWN} (${ETHREX_CYCLES} cycles)"
+        fi
+        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex Empty"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
+    fi
+fi
+
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$P3_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* Fibonacci  ·  *Device:* CPU"}]},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION$P3_SECTION"']}'

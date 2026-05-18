@@ -299,6 +299,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.4.0",
  "crypto",
+ "libc",
  "math",
  "p3-air",
  "p3-challenger",
@@ -312,6 +313,8 @@ dependencies = [
  "p3-merkle-tree",
  "p3-symmetric 0.5.1",
  "p3-uni-stark",
+ "serde",
+ "serde_cbor",
  "stark",
  "tracing",
  "tracing-subscriber",
@@ -825,6 +828,15 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -1970,6 +1982,7 @@ dependencies = [
  "rayon",
  "serde",
  "stark",
+ "tiny-keccak",
 ]
 
 [[package]]
@@ -2012,6 +2025,16 @@ name = "libc"
 version = "0.2.178"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -2139,6 +2162,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "math-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "math",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rayon",
+ "sha3",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2257,7 +2292,7 @@ dependencies = [
 [[package]]
 name = "p3-air"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-field 0.5.1",
  "p3-matrix 0.5.1",
@@ -2282,7 +2317,7 @@ dependencies = [
 [[package]]
 name = "p3-challenger"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-field 0.5.1",
  "p3-maybe-rayon 0.5.1",
@@ -2295,13 +2330,14 @@ dependencies = [
 [[package]]
 name = "p3-commit"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-challenger",
  "p3-dft 0.5.1",
  "p3-field 0.5.1",
  "p3-matrix 0.5.1",
+ "p3-multilinear-util",
  "p3-util 0.5.1",
  "serde",
 ]
@@ -2322,14 +2358,14 @@ dependencies = [
 [[package]]
 name = "p3-dft"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
  "p3-matrix 0.5.1",
  "p3-maybe-rayon 0.5.1",
  "p3-util 0.5.1",
- "spin 0.10.0",
+ "spin 0.11.0",
  "tracing",
 ]
 
@@ -2350,7 +2386,7 @@ dependencies = [
 [[package]]
 name = "p3-field"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint 0.4.6",
@@ -2365,7 +2401,7 @@ dependencies = [
 [[package]]
 name = "p3-fri"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-challenger",
@@ -2377,7 +2413,7 @@ dependencies = [
  "p3-util 0.5.1",
  "rand 0.10.1",
  "serde",
- "spin 0.10.0",
+ "spin 0.11.0",
  "thiserror 2.0.17",
  "tracing",
 ]
@@ -2385,7 +2421,7 @@ dependencies = [
 [[package]]
 name = "p3-goldilocks"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "num-bigint 0.4.6",
  "p3-challenger",
@@ -2404,7 +2440,7 @@ dependencies = [
 [[package]]
 name = "p3-keccak"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-symmetric 0.5.1",
  "p3-util 0.5.1",
@@ -2429,7 +2465,7 @@ dependencies = [
 [[package]]
 name = "p3-matrix"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
@@ -2449,7 +2485,7 @@ checksum = "c3968ad1160310296eb04f91a5f4edfa38fe1d6b2b8cd6b5c64e6f9b7370979e"
 [[package]]
 name = "p3-maybe-rayon"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "rayon",
 ]
@@ -2472,7 +2508,7 @@ dependencies = [
 [[package]]
 name = "p3-mds"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-dft 0.5.1",
  "p3-field 0.5.1",
@@ -2484,7 +2520,7 @@ dependencies = [
 [[package]]
 name = "p3-merkle-tree"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-commit",
@@ -2495,6 +2531,7 @@ dependencies = [
  "p3-util 0.5.1",
  "rand 0.10.1",
  "serde",
+ "spin 0.11.0",
  "thiserror 2.0.17",
  "tracing",
 ]
@@ -2502,7 +2539,7 @@ dependencies = [
 [[package]]
 name = "p3-monty-31"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint 0.4.6",
@@ -2518,14 +2555,29 @@ dependencies = [
  "paste",
  "rand 0.10.1",
  "serde",
- "spin 0.10.0",
+ "spin 0.11.0",
+ "tracing",
+]
+
+[[package]]
+name = "p3-multilinear-util"
+version = "0.5.1"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field 0.5.1",
+ "p3-matrix 0.5.1",
+ "p3-maybe-rayon 0.5.1",
+ "p3-util 0.5.1",
+ "rand 0.10.1",
+ "serde",
  "tracing",
 ]
 
 [[package]]
 name = "p3-poseidon1"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-field 0.5.1",
  "p3-symmetric 0.5.1",
@@ -2549,7 +2601,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "p3-field 0.5.1",
  "p3-mds 0.5.1",
@@ -2572,7 +2624,7 @@ dependencies = [
 [[package]]
 name = "p3-symmetric"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
@@ -2583,13 +2635,15 @@ dependencies = [
 [[package]]
 name = "p3-uni-stark"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "itertools 0.14.0",
+ "libm",
  "p3-air",
  "p3-challenger",
  "p3-commit",
  "p3-field 0.5.1",
+ "p3-fri",
  "p3-matrix 0.5.1",
  "p3-maybe-rayon 0.5.1",
  "p3-util 0.5.1",
@@ -2610,7 +2664,7 @@ dependencies = [
 [[package]]
 name = "p3-util"
 version = "0.5.1"
-source = "git+https://github.com/yetanotherco/Plonky3.git?branch=feat%2Fgoldilocks_deg3#2f3f99f1a2765c4945ca7e89ff2231d10b32399a"
+source = "git+https://github.com/Plonky3/Plonky3.git#de83ef4367b66d5908623c6503946ffcfdc3b6ae"
 dependencies = [
  "serde",
  "transpose",
@@ -3452,9 +3506,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "783f3f6f6b01e295a669edfc402133a5f2553d1f0e81284b3ba4594e80bdd4a2"
 dependencies = [
  "lock_api",
 ]
@@ -3485,6 +3539,7 @@ dependencies = [
  "itertools 0.11.0",
  "log",
  "math",
+ "math-cuda",
  "rayon",
  "serde",
  "serde-wasm-bindgen",
