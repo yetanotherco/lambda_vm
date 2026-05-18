@@ -18,9 +18,10 @@ build_one() {
     echo "[recursion-elfs] building $name ..."
     (
         cd "$dir"
-        # Recursion guest pulls in lambda-vm-prover and its serde stack; pin serde
-        # to 1.0.219 (pre-`serde_core` split) so `-Z build-std=core,alloc` works.
-        if [ "$name" = "recursion" ]; then
+        # Recursion/deserialize-only guests pull in lambda-vm-prover and its
+        # serde stack; pin serde to 1.0.219 (pre-`serde_core` split) so
+        # `-Z build-std=core,alloc` works.
+        if [ "$name" = "recursion" ] || [ "$name" = "deserialize-only" ]; then
             cargo "+$TOOLCHAIN" update -p serde --precise 1.0.219 2>/dev/null || true
         fi
         cargo "+$TOOLCHAIN" build --release \
@@ -34,6 +35,7 @@ build_one() {
 build_one empty
 build_one fibonacci
 build_one recursion
+build_one deserialize-only
 build_one keccak-roundtrip
 
 echo "[recursion-elfs] done"

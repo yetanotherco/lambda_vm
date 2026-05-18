@@ -535,6 +535,77 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!("============================================================");
 }
 
+/// Diagnostic: cycle count for the **deserialize-only** counterpart of the
+/// recursion guest. Same input layout (`(VmProof, Vec<u8>, ProofOptions)`)
+/// and same proof, but the guest just postcard-decodes the blob and halts —
+/// it never calls `verify_with_options`.
+///
+/// The cycle delta between this and `test_recursion_cycle_count` is the
+/// actual cost of the STARK verifier inside the VM. The flamegraph
+/// suggested postcard decode was ~93% of the recursion guest's cycles; this
+/// test pins down that number directly.
+#[test]
+#[ignore = "diagnostic: runs the deserialize-only guest, prints cycle count"]
+fn test_deserialize_only_cycle_count() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let deser_elf_bytes = read_guest_elf(&root, "deserialize-only", "deserialize-only-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[deser-only] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
+    eprintln!("[deser-only] postcard blob: {} bytes", blob.len());
+
+    eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
+    let program = Elf::load(&deser_elf_bytes).expect("ELF load failed");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+
+    let start = std::time::Instant::now();
+    let mut cycle_count: usize = 0;
+    let mut chunks: usize = 0;
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        cycle_count += logs.len();
+        chunks += 1;
+        if chunks.is_multiple_of(50) {
+            eprintln!(
+                "[deser-only]   ... {chunks} chunks, {cycle_count} cycles, {:?} elapsed",
+                start.elapsed()
+            );
+        }
+    }
+    let exec_time = start.elapsed();
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  DESERIALIZE-ONLY GUEST EXECUTION SUMMARY");
+    eprintln!("============================================================");
+    eprintln!("  Cycle count           : {cycle_count}");
+    eprintln!("  Executor wall time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Compare against test_recursion_cycle_count (~40.5B cycles");
+    eprintln!("  with the same proof). Delta = verifier-in-VM cost.");
+    eprintln!("============================================================");
+}
+
 /// Diagnostic: bucket the recursion guest's cycles by which verifier step
 /// is currently executing.
 ///
