@@ -174,6 +174,8 @@ fn proof_options(args: &Args) -> ProofOptions {
         fri_number_of_queries: args.queries,
         coset_offset: 3,
         grinding_factor: args.grinding,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     }
 }
 

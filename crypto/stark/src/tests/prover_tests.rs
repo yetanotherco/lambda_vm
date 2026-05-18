@@ -41,6 +41,8 @@ fn test_domain_constructor() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let domain = Domain::new(
@@ -132,6 +134,8 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -203,6 +207,8 @@ fn test_decompose_and_extend_d2_matches_original() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
@@ -263,12 +269,16 @@ fn test_multi_prove_mixed_coset_offsets() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
     let proof_options_7 = ProofOptions {
         blowup_factor: 2,
         fri_number_of_queries: 3,
         coset_offset: 7,
         grinding_factor: 1,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     // Both AIRs have the same trace length and blowup, but different coset offsets.
@@ -333,6 +343,8 @@ fn test_multi_prove_dedups_shared_domain_params() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -423,6 +435,8 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
@@ -1900,6 +1914,8 @@ fn round_4_chunks_full_pipeline_smoke_test() {
         fri_number_of_queries: 4,
         coset_offset: coset_offset_u64,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let trace =
@@ -2070,6 +2086,8 @@ fn prove_rounds_2_to_4_chunks_full_pipeline_smoke_test() {
         fri_number_of_queries: 4,
         coset_offset: coset_offset_u64,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let trace =
@@ -2205,6 +2223,8 @@ fn chunks_protocol_prove_verify_round_trip_fibonacci() {
         fri_number_of_queries: 4,
         coset_offset: coset_offset_u64,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let trace =
@@ -2347,6 +2367,8 @@ fn chunks_protocol_prove_verify_round_trip_quadratic() {
         fri_number_of_queries: 4,
         coset_offset: coset_offset_u64,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     // Initial value chosen so successive squarings stay in-field for trace_length=16.
@@ -2492,6 +2514,8 @@ fn prove_chunks_then_verify_chunks_end_to_end_quadratic() {
         fri_number_of_queries: 4,
         coset_offset: coset_offset_u64,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     };
 
     let a0 = Felt::from(2u64);

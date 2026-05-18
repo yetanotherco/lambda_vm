@@ -36,6 +36,8 @@ fn benchmark_proof_options() -> ProofOptions {
         fri_number_of_queries: 219,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 2,
     }
 }
 
