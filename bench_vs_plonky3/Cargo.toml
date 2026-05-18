@@ -1,0 +1,37 @@
+[package]
+name = "bench-vs-plonky3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+stark = { path = "../crypto/stark", features = ["test-utils"] }
+crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
+math = { path = "../crypto/math", features = ["std", "lambdaworks-serde-binary"] }
+
+p3-air = { path = "/Users/juanpablo/Documents/plonky3/air" }
+p3-challenger = { path = "/Users/juanpablo/Documents/plonky3/challenger" }
+p3-commit = { path = "/Users/juanpablo/Documents/plonky3/commit" }
+p3-dft = { path = "/Users/juanpablo/Documents/plonky3/dft", features = ["parallel"] }
+p3-field = { path = "/Users/juanpablo/Documents/plonky3/field" }
+p3-fri = { path = "/Users/juanpablo/Documents/plonky3/fri" }
+p3-goldilocks = { path = "/Users/juanpablo/Documents/plonky3/goldilocks" }
+p3-keccak = { path = "/Users/juanpablo/Documents/plonky3/keccak" }
+p3-matrix = { path = "/Users/juanpablo/Documents/plonky3/matrix" }
+p3-merkle-tree = { path = "/Users/juanpablo/Documents/plonky3/merkle-tree" }
+p3-symmetric = { path = "/Users/juanpablo/Documents/plonky3/symmetric" }
+p3-uni-stark = { path = "/Users/juanpablo/Documents/plonky3/uni-stark", features = ["parallel"] }
+
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[features]
+default = ["parallel"]
+parallel = ["stark/parallel"]
+instruments = ["stark/instruments"]
+
+[[bin]]
+name = "prove_bench"
+path = "src/bin/prove_bench.rs"
