@@ -25,39 +25,43 @@ impl Drop for ForceDiskGuard {
 }
 
 #[test]
-fn test_disk_spill_prove_and_verify_small() {
-    let _guard = ForceDiskGuard::new();
-    let elf_bytes = asm_elf_bytes("sub");
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
-    let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
-        .expect("prove failed");
-    let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
-    assert!(ok, "verification returned false");
-}
-
-#[test]
-fn test_disk_spill_prove_and_verify_with_chunks() {
-    let _guard = ForceDiskGuard::new();
-    let elf_bytes = asm_elf_bytes("all_instructions_64");
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
-    let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
-        .expect("prove failed");
-    let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
-    assert!(ok, "verification returned false");
-}
-
-#[test]
-fn test_disk_spill_serialization_roundtrip() {
+fn test_disk_spill_prove_verify_and_roundtrip_small() {
     let _guard = ForceDiskGuard::new();
     let elf_bytes = asm_elf_bytes("sub");
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
         .expect("prove failed");
+    assert!(
+        crate::verify_with_options(&proof, &elf_bytes, &opts).expect("verify failed"),
+        "verification returned false"
+    );
 
     let bytes = bincode::serialize(&proof).expect("serialize failed");
     let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
-    let valid = crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed");
-    assert!(valid, "verification failed after serialization roundtrip");
+    assert!(
+        crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed"),
+        "verification failed after serialization roundtrip"
+    );
+}
+
+#[test]
+fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
+    let _guard = ForceDiskGuard::new();
+    let elf_bytes = asm_elf_bytes("all_instructions_64");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
+        .expect("prove failed");
+    assert!(
+        crate::verify_with_options(&proof, &elf_bytes, &opts).expect("verify failed"),
+        "verification returned false"
+    );
+
+    let bytes = bincode::serialize(&proof).expect("serialize failed");
+    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
+    assert!(
+        crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed"),
+        "verification failed after serialization roundtrip (chunked)"
+    );
 }
 
 #[test]
@@ -69,21 +73,4 @@ fn test_disk_spill_prove_and_verify_372k() {
         .expect("prove failed");
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
     assert!(ok, "verification returned false for fib_iterative_372k");
-}
-
-#[test]
-fn test_disk_spill_serialization_roundtrip_chunked() {
-    let _guard = ForceDiskGuard::new();
-    let elf_bytes = asm_elf_bytes("all_instructions_64");
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
-    let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
-        .expect("prove failed");
-
-    let bytes = bincode::serialize(&proof).expect("serialize failed");
-    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
-    let valid = crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed");
-    assert!(
-        valid,
-        "verification failed after serialization roundtrip (chunked)"
-    );
 }
