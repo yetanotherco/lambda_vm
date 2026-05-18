@@ -245,19 +245,14 @@ fn test_recursion_cycle_count() {
     let start = std::time::Instant::now();
     let mut cycle_count: usize = 0;
     let mut chunks: usize = 0;
-    loop {
-        match executor.resume().expect("executor resume failed") {
-            Some(logs) => {
-                cycle_count += logs.len();
-                chunks += 1;
-                if chunks.is_multiple_of(50) {
-                    eprintln!(
-                        "[cycle-count]   ... {chunks} chunks, {cycle_count} cycles, {:?} elapsed",
-                        start.elapsed()
-                    );
-                }
-            }
-            None => break,
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        cycle_count += logs.len();
+        chunks += 1;
+        if chunks.is_multiple_of(50) {
+            eprintln!(
+                "[cycle-count]   ... {chunks} chunks, {cycle_count} cycles, {:?} elapsed",
+                start.elapsed()
+            );
         }
     }
     let exec_time = start.elapsed();
@@ -336,23 +331,18 @@ fn test_recursion_pc_histogram() {
     let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(300_000);
     let mut total_cycles: u64 = 0;
     let mut chunks: usize = 0;
-    loop {
-        match executor.resume().expect("executor resume failed") {
-            Some(logs) => {
-                for log in logs {
-                    *pc_hist.entry(log.current_pc).or_insert(0) += 1;
-                }
-                total_cycles += logs.len() as u64;
-                chunks += 1;
-                if chunks.is_multiple_of(500) {
-                    eprintln!(
-                        "[pc-hist]   ... {chunks} chunks, {total_cycles} cycles, {} unique PCs, {:?}",
-                        pc_hist.len(),
-                        start.elapsed()
-                    );
-                }
-            }
-            None => break,
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        for log in logs {
+            *pc_hist.entry(log.current_pc).or_insert(0) += 1;
+        }
+        total_cycles += logs.len() as u64;
+        chunks += 1;
+        if chunks.is_multiple_of(500) {
+            eprintln!(
+                "[pc-hist]   ... {chunks} chunks, {total_cycles} cycles, {} unique PCs, {:?}",
+                pc_hist.len(),
+                start.elapsed()
+            );
         }
     }
     let exec_time = start.elapsed();
@@ -465,24 +455,25 @@ fn test_recursion_sampled_flamegraph() {
 
     let mut generator = FlamegraphGenerator::new(symbols, entry_point);
 
+    // Path is defined here (not after the loop) so the periodic checkpoint
+    // writes below can target it. The final write at the end still happens.
+    let path = "/tmp/recursion_folded_sampled.txt";
+
     let start = std::time::Instant::now();
     let mut total_cycles: u64 = 0;
     let mut chunks: usize = 0;
-    loop {
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
         // Pull the chunk into an owned Vec so we can use it after dropping the
         // immutable borrow of `executor`.
-        let (sampled, chunk_len) = match executor.resume().expect("executor resume failed") {
-            Some(logs) => {
-                let len = logs.len();
-                let sampled: Vec<_> = logs
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % SAMPLE_RATE == 0)
-                    .map(|(_, log)| log.clone())
-                    .collect();
-                (sampled, len)
-            }
-            None => break,
+        let (sampled, chunk_len) = {
+            let len = logs.len();
+            let sampled: Vec<_> = logs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % SAMPLE_RATE == 0)
+                .map(|(_, log)| log.clone())
+                .collect();
+            (sampled, len)
         };
 
         // Now we can re-borrow executor.instructions immutably for the
@@ -501,12 +492,21 @@ fn test_recursion_sampled_flamegraph() {
                 "[sampled-fg]   ... {chunks} chunks, {total_cycles} cycles, {:?} elapsed",
                 start.elapsed()
             );
+            // Checkpoint: re-write the folded file in place so a killed run
+            // still leaves a usable (if partial) flamegraph on disk.
+            let file = std::fs::File::create(path).expect("create output file");
+            let mut writer = BufWriter::new(file);
+            generator
+                .write_folded(&mut writer)
+                .expect("write folded output");
         }
 
         // Early exit once we've covered the cycle budget. The flamegraph will
         // reflect only the cycles we processed, but the dominant hot kernels
         // are typically uniformly distributed across the verifier's runtime so
-        // a partial run still surfaces them clearly.
+        // a partial run still surfaces them clearly. Wrapped in #[allow] so
+        // CYCLE_BUDGET can be const-0 (full run) without tripping clippy.
+        #[allow(clippy::absurd_extreme_comparisons)]
         if CYCLE_BUDGET > 0 && total_cycles >= CYCLE_BUDGET {
             eprintln!("[sampled-fg] hit cycle budget ({CYCLE_BUDGET} cycles), stopping early");
             break;
@@ -514,7 +514,6 @@ fn test_recursion_sampled_flamegraph() {
     }
     let exec_time = start.elapsed();
 
-    let path = "/tmp/recursion_folded_sampled.txt";
     let file = std::fs::File::create(path).expect("create output file");
     let mut writer = BufWriter::new(file);
     generator
@@ -533,6 +532,168 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!();
     eprintln!("  To render SVG (requires inferno):");
     eprintln!("    cat {path} | inferno-flamegraph > /tmp/recursion_flamegraph_sampled.svg");
+    eprintln!("============================================================");
+}
+
+/// Diagnostic: bucket the recursion guest's cycles by which verifier step
+/// is currently executing.
+///
+/// The verifier's hot path is `verify_rounds_2_to_4`, which calls four
+/// sub-routines in a fixed order:
+///   1. `replay_rounds_after_round_1`               (recover challenges)
+///   2. `step_2_verify_claimed_composition_polynomial`
+///   3. `step_3_verify_fri`
+///   4. `step_4_verify_trace_and_composition_openings`
+///
+/// We resolve each sub-routine's entry PC from the recursion ELF's symbol
+/// table, then run a monotonic state machine over the execution stream:
+/// the active bucket only advances 0 → 1 → 2 → 3 → 4 (never backwards),
+/// so cycles inside a step's callees stay attributed to that step.
+///
+/// Bucket 0 ("setup") captures everything before step 1 is entered — the
+/// allocator init, postcard decode, and `VmAirs::new` (which contains the
+/// expensive preprocessed-commitment FFTs).
+///
+/// Streams chunks via `Executor::resume()` so memory stays bounded.
+#[test]
+#[ignore = "diagnostic: ~13 min; buckets the 40B cycles by verifier step"]
+fn test_recursion_step_breakdown() {
+    use executor::elf::{Elf, SymbolTable};
+    use executor::vm::execution::Executor;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[step-bkd] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
+        .expect("postcard encode failed");
+    eprintln!("[step-bkd] postcard blob: {} bytes", blob.len());
+
+    // Resolve step entry PCs from the recursion ELF. Substring-match the
+    // mangled symbol — Rust name mangling preserves identifier characters,
+    // so the method name is always a contiguous substring of its mangled
+    // symbol. If multiple monomorphizations or clones exist, pick the one
+    // with the largest size (the actual implementation, not a cold thunk).
+    let symbols = SymbolTable::parse(&recursion_elf_bytes);
+    assert!(
+        !symbols.is_empty(),
+        "recursion ELF has no symbol table — was it stripped?"
+    );
+
+    let find = |needle: &str| -> u64 {
+        let mut candidates: Vec<_> = symbols
+            .functions()
+            .iter()
+            .filter(|f| f.name.contains(needle))
+            .collect();
+        assert!(
+            !candidates.is_empty(),
+            "no symbol containing {needle:?} found in recursion ELF"
+        );
+        candidates.sort_by_key(|f| std::cmp::Reverse(f.size));
+        if candidates.len() > 1 {
+            eprintln!(
+                "[step-bkd] note: {} candidates for {:?}, picking the largest (size={})",
+                candidates.len(),
+                needle,
+                candidates[0].size
+            );
+        }
+        candidates[0].address
+    };
+
+    let step1_entry = find("replay_rounds_after_round_1");
+    let step2_entry = find("step_2_verify_claimed_composition_polynomial");
+    let step3_entry = find("step_3_verify_fri");
+    let step4_entry = find("step_4_verify_trace_and_composition_openings");
+
+    eprintln!("[step-bkd] step entry PCs:");
+    eprintln!("  step 1 (replay):           0x{:x}", step1_entry);
+    eprintln!("  step 2 (composition poly): 0x{:x}", step2_entry);
+    eprintln!("  step 3 (fri):              0x{:x}", step3_entry);
+    eprintln!("  step 4 (deep openings):    0x{:x}", step4_entry);
+
+    // Monotonic state machine: 0=setup, 1..=4=inside step N or its callees.
+    // The bucket only advances when the PC lands exactly on a step's entry.
+    let mut bucket: u8 = 0;
+    let mut buckets = [0u64; 5];
+
+    eprintln!("[step-bkd] executing recursion guest (streaming) ...");
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+
+    let start = std::time::Instant::now();
+    let mut total_cycles: u64 = 0;
+    let mut chunks: usize = 0;
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        for log in logs {
+            let pc = log.current_pc;
+            if bucket < 1 && pc == step1_entry {
+                bucket = 1;
+            }
+            if bucket < 2 && pc == step2_entry {
+                bucket = 2;
+            }
+            if bucket < 3 && pc == step3_entry {
+                bucket = 3;
+            }
+            if bucket < 4 && pc == step4_entry {
+                bucket = 4;
+            }
+            buckets[bucket as usize] += 1;
+        }
+        total_cycles += logs.len() as u64;
+        chunks += 1;
+        if chunks.is_multiple_of(500) {
+            eprintln!(
+                "[step-bkd]   ... {chunks} chunks, {total_cycles} cycles, bucket={bucket}, {:?}",
+                start.elapsed()
+            );
+        }
+    }
+    let exec_time = start.elapsed();
+
+    let labels = [
+        "0. setup (alloc + postcard decode + VmAirs::new + pre-step-1)",
+        "1. step 1: replay_rounds_after_round_1",
+        "2. step 2: verify_claimed_composition_polynomial",
+        "3. step 3: verify_fri",
+        "4. step 4: verify_trace_and_composition_openings (+ wrap-up)",
+    ];
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  RECURSION GUEST PER-STEP CYCLE BREAKDOWN");
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  {:<60}  {:>14}  {:>7}", "bucket", "cycles", "%");
+    for (label, cycles) in labels.iter().zip(buckets.iter()) {
+        let pct = if total_cycles > 0 {
+            100.0 * (*cycles as f64) / (total_cycles as f64)
+        } else {
+            0.0
+        };
+        eprintln!("  {:<60}  {:>14}  {:>6.2}%", label, cycles, pct);
+    }
     eprintln!("============================================================");
 }
 

@@ -62,7 +62,7 @@ fn read_guest_elf(root: &Path, name: &str, bin_name: &str) -> Vec<u8> {
 /// * empty input — `c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`
 /// * `"abc"`     — `4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45`
 /// * `"The quick brown fox jumps over the lazy dog"`
-///                — `4d741b6f1eb29cb2a9b9911c82f56fa8d73b04959d3d9d222895df6c0b28aa15`
+///   — `4d741b6f1eb29cb2a9b9911c82f56fa8d73b04959d3d9d222895df6c0b28aa15`
 const TEST_VECTORS: &[(&str, &[u8], [u8; 32])] = &[
     (
         "empty",
@@ -114,10 +114,11 @@ fn count_keccak_syscalls(elf_bytes: &[u8], private_input: &[u8]) -> (usize, usiz
 
     let mut keccak_syscalls = 0usize;
     for log in &result.logs {
-        if let Some(instr) = result.instructions.get(&log.current_pc) {
-            if matches!(instr, Instruction::EcallEbreak) && log.src1_val == KECCAK_SYSCALL_NUMBER {
-                keccak_syscalls += 1;
-            }
+        if let Some(instr) = result.instructions.get(&log.current_pc)
+            && matches!(instr, Instruction::EcallEbreak)
+            && log.src1_val == KECCAK_SYSCALL_NUMBER
+        {
+            keccak_syscalls += 1;
         }
     }
     (result.logs.len(), keccak_syscalls)
@@ -174,12 +175,11 @@ fn test_keccak_precompile_executor_only() {
 
         let mut keccak_syscalls = 0usize;
         for log in &result.logs {
-            if let Some(instr) = result.instructions.get(&log.current_pc) {
-                if matches!(instr, Instruction::EcallEbreak)
-                    && log.src1_val == KECCAK_SYSCALL_NUMBER
-                {
-                    keccak_syscalls += 1;
-                }
+            if let Some(instr) = result.instructions.get(&log.current_pc)
+                && matches!(instr, Instruction::EcallEbreak)
+                && log.src1_val == KECCAK_SYSCALL_NUMBER
+            {
+                keccak_syscalls += 1;
             }
         }
 
