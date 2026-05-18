@@ -100,6 +100,10 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// ProofOptions::validate() rejected the configuration (e.g. a
+    /// non-power-of-2 fri_folding_factor or a malformed
+    /// fri_last_layer_degree_bound).
+    InvalidProofOptions(String),
 }
 
 /// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
@@ -1893,6 +1897,8 @@ pub trait IsStarkProver<
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        let fri_folding_factor = air.options().effective_folding_factor();
+        let fri_last_layer_degree_bound = air.options().fri_last_layer_degree_bound;
         let (fri_last_value, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 domain.root_order as usize,
@@ -1900,6 +1906,8 @@ pub trait IsStarkProver<
                 transcript,
                 &coset_offset,
                 domain_size,
+                fri_folding_factor,
+                fri_last_layer_degree_bound,
             );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
@@ -1919,7 +1927,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, fri_folding_factor);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
@@ -2373,6 +2381,8 @@ pub trait IsStarkProver<
         let mut lde_evals = deep_evals;
         in_place_bit_reverse_permute(&mut lde_evals);
 
+        let fri_folding_factor = air.options().effective_folding_factor();
+        let fri_last_layer_degree_bound = air.options().fri_last_layer_degree_bound;
         let (fri_last_value, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 domain.root_order as usize,
@@ -2380,6 +2390,8 @@ pub trait IsStarkProver<
                 transcript,
                 &coset_offset,
                 domain_size,
+                fri_folding_factor,
+                fri_last_layer_degree_bound,
             );
 
         // Optional proof-of-work grinding (same shape as single-H path).
@@ -2395,7 +2407,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, fri_folding_factor);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
@@ -2552,6 +2564,15 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
+
+        // Validate every AIR's ProofOptions before doing any work. Catches
+        // malformed fri_folding_factor / fri_last_layer_degree_bound values
+        // upfront with a clear error rather than panicking deep inside FRI.
+        for (air, _, _) in air_trace_pairs.iter() {
+            if let Err(e) = air.context().proof_options.validate() {
+                return Err(ProvingError::InvalidProofOptions(e.to_string()));
+            }
+        }
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();

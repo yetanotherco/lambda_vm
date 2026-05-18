@@ -59,6 +59,123 @@ fn test_prove_fib() {
     ));
 }
 
+/// Exercises the FRI early-stop path: with `fri_last_layer_degree_bound = 3`
+/// the prover stops folding when the residual polynomial has degree <= 3 and
+/// ships its 4 coefficients (P3-style); the verifier Horner-evaluates the
+/// polynomial at the layer-K eval point and compares to its running `v`.
+#[test_log::test]
+fn test_prove_fib_fri_early_stop_last_degree_3() {
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 32);
+
+    let proof_options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_last_layer_degree_bound: 3,
+        fri_folding_factor: 2,
+    };
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+    let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    )
+    .unwrap();
+
+    // Early-stop ships `last_layer_degree_bound + 1 = 4` coefficients of the
+    // residual polynomial.
+    assert_eq!(
+        proof.fri_last_value.len(),
+        4,
+        "early-stop should ship `last_layer_degree_bound + 1` coefficients"
+    );
+
+    assert!(
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<F>::new(&[])),
+        "verifier must accept a proof with fri_last_layer_degree_bound > 0"
+    );
+}
+
+/// Tampering any coefficient of the early-stop final polynomial must make
+/// verification fail. Catches "verifier only inspects the constant" bugs.
+#[test_log::test]
+fn test_prove_fib_fri_early_stop_tamper_each_coef_rejected() {
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 32);
+    let proof_options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_last_layer_degree_bound: 3,
+        fri_folding_factor: 2,
+    };
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+    let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    )
+    .unwrap();
+
+    for i in 0..proof.fri_last_value.len() {
+        let mut tampered = proof.clone();
+        tampered.fri_last_value[i] = &tampered.fri_last_value[i] + Felt::one();
+        assert!(
+            !Verifier::verify(&tampered, &air, &mut DefaultTranscript::<F>::new(&[])),
+            "verifier must reject tampered fri_last_value[{i}]"
+        );
+    }
+}
+
+/// Smoke test for the ProofOptions validation path: an invalid
+/// `fri_folding_factor` is rejected by the prover before any heavy work.
+#[test_log::test]
+fn test_prove_rejects_invalid_fri_folding_factor() {
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+
+    // 3 is not a power of two, so ProofOptions::validate() should reject it.
+    let proof_options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_last_layer_degree_bound: 0,
+        fri_folding_factor: 3,
+    };
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+    let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let result = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    );
+
+    assert!(
+        result.is_err(),
+        "prover must reject an invalid fri_folding_factor"
+    );
+}
+
 #[test_log::test]
 fn test_prove_simple_periodic_8() {
     let mut trace = simple_periodic_cols::simple_periodic_trace::<GoldilocksField>(8);

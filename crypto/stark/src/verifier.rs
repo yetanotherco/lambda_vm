@@ -25,6 +25,7 @@ use math::{
         element::FieldElement,
         traits::{IsFFTField, IsField, IsSubFieldOf},
     },
+    polynomial::Polynomial,
     traits::AsBytes,
 };
 use std::marker::PhantomData;
@@ -598,6 +599,42 @@ pub trait IsStarkVerifier<
         )
     }
 
+    /// Check the verifier's running FRI value `v` against the prover's
+    /// `fri_last_value`. With early stopping `fri_last_value` carries the
+    /// coefficients of the residual polynomial; with fold-to-constant it is
+    /// a single field element (length 1, which Horner-evaluates to itself at
+    /// any point).
+    ///
+    /// `k_folds` is the number of binary folds the verifier has performed
+    /// (1 for the empty-FRI-layers branch, `fri_layers_merkle_roots.len() + 1`
+    /// after the full fold loop).
+    fn check_final_fri_value(
+        fri_last_value: &[FieldElement<FieldExtension>],
+        evaluation_point_inv: &FieldElement<Field>,
+        k_folds: usize,
+        v: &FieldElement<FieldExtension>,
+    ) -> bool {
+        if fri_last_value.is_empty() {
+            return false;
+        }
+        // After k folds the evaluation point is `original_eval^(2^k)`. We
+        // have `evaluation_point_inv = 1 / original_eval`, so the layer-k
+        // forward point is `(evaluation_point_inv^(2^k)).inv()`.
+        let mut inv_at_layer_k = evaluation_point_inv.clone();
+        for _ in 0..k_folds {
+            inv_at_layer_k = inv_at_layer_k.square();
+        }
+        let point_at_layer_k = match inv_at_layer_k.inv() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // Lift to the extension field so the polynomial (with extension
+        // coefficients) can be Horner-evaluated at it.
+        let point_ext: FieldElement<FieldExtension> = point_at_layer_k.to_extension();
+        let expected = Polynomial::new(fri_last_value).evaluate(&point_ext);
+        v == &expected
+    }
+
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
     fn verify_fri_layer_openings(
         merkle_root: &Commitment,
@@ -655,6 +692,10 @@ pub trait IsStarkVerifier<
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
+        // Keep the layer-0 eval-point inverse so we can compute the final
+        // point at layer K in `check_final_fri_value`.
+        let initial_eval_inv = evaluation_point_inv.clone();
+
         // Reconstruct p₁(𝜐²)
         let mut v =
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
@@ -664,13 +705,19 @@ pub trait IsStarkVerifier<
         // In this case, the fold loop below doesn't iterate, so we need to verify
         // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            // Binary fold: fri_last_value has length 1 (the constant).
-            return proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
+            // Only the initial fold has been performed (K = 1).
+            return Self::check_final_fri_value(
+                &proof.fri_last_value,
+                &initial_eval_inv,
+                1,
+                &v,
+            );
         }
 
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
         // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
         // Finally, check that the final value coincides with the given by the prover.
+        let total_folds = fri_layers_merkle_roots.len() + 1;
         fri_layers_merkle_roots
             .iter()
             .enumerate()
@@ -708,10 +755,17 @@ pub trait IsStarkVerifier<
                     if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
                         result & openings_ok
                     } else {
-                        // Check that final value is the given by the prover.
-                        // Binary fold: fri_last_value has length 1.
-                        let last_ok =
-                            proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
+                        // After total_folds binary folds, check v against the
+                        // final polynomial shipped by the prover. For fold-to-
+                        // constant, fri_last_value is length 1 and Horner
+                        // collapses to the constant; for early-stop it carries
+                        // the coefficients of the residual polynomial.
+                        let last_ok = Self::check_final_fri_value(
+                            &proof.fri_last_value,
+                            &initial_eval_inv,
+                            total_folds,
+                            &v,
+                        );
                         result & last_ok & openings_ok
                     }
                 },
@@ -1905,17 +1959,25 @@ pub trait IsStarkVerifier<
 
                 let p0_eval = &deep_poly_evaluations[i];
                 let p0_eval_sym = &deep_poly_evaluations_sym[i];
+                // Save before the fold consumes `eval`; we need it again
+                // for `check_final_fri_value`.
+                let initial_eval_inv = eval.clone();
                 let mut v = (p0_eval + p0_eval_sym)
                     + eval * &challenges.zetas[0] * (p0_eval - p0_eval_sym);
                 let mut index = *iota_s;
 
                 if fri_layers_merkle_roots.is_empty() {
-                    // Binary fold: fri_last_value has length 1.
-                    let last_ok =
-                        proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
+                    // Only the initial fold has been performed (K = 1).
+                    let last_ok = Self::check_final_fri_value(
+                        &proof.fri_last_value,
+                        &initial_eval_inv,
+                        1,
+                        &v,
+                    );
                     return result & last_ok;
                 }
 
+                let total_folds = fri_layers_merkle_roots.len() + 1;
                 let inner = fri_layers_merkle_roots
                     .iter()
                     .enumerate()
@@ -1944,9 +2006,12 @@ pub trait IsStarkVerifier<
                             if j < proof_s.layers_evaluations_sym.len() - 1 {
                                 inner_ok & openings_ok
                             } else {
-                                // Binary fold: fri_last_value has length 1.
-                                let last_ok = proof.fri_last_value.len() == 1
-                                    && v == proof.fri_last_value[0];
+                                let last_ok = Self::check_final_fri_value(
+                                    &proof.fri_last_value,
+                                    &initial_eval_inv,
+                                    total_folds,
+                                    &v,
+                                );
                                 inner_ok & last_ok & openings_ok
                             }
                         },
