@@ -49,7 +49,7 @@ __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
 
 __device__ __forceinline__ void keccak_f1600(uint64_t st[25]) {
     uint64_t C[5], D[5], B[25];
-    #pragma unroll
+    // No outer unroll: fully unrolling the 24 rounds slowed the kernel ~7.5% on RTX 5090.
     for (int r = 0; r < 24; ++r) {
         // Theta
         #pragma unroll
