@@ -1274,12 +1274,6 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 /// the LDE output, builds the R2 composition-polynomial Merkle tree on device
 /// (row-pair Keccak leaves at bit-reversed indices + pair-hash inner tree).
 ///
-/// Row-pair commit: each leaf hashes 2 rows, so the tree has `lde_size / 2`
-/// leaves and `merkle_nodes_out` must have byte length `(lde_size - 1) * 32`.
-/// Requires `lde_size >= 2`.
-/// Variant of [`evaluate_poly_coset_batch_ext3_into`] that also builds the
-/// R2 composition-polynomial Merkle tree on device.
-///
 /// Row-pair commit: each leaf hashes 2 bit-reversed rows, so the tree has
 /// `lde_size / 2` leaves and `merkle_nodes_out` must have byte length
 /// `(lde_size - 1) * 32`. Requires `lde_size >= 2`.
