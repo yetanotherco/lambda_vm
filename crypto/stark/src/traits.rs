@@ -268,19 +268,21 @@ pub trait AIR: Send + Sync {
     /// `base_evals` has length `num_base_transition_constraints()`.
     /// `ext_evals` has length `num_transition_constraints()`; only indices
     /// `[num_base..]` are written/read for extension constraints.
+    ///
+    /// **Buffer-zeroing is intentionally skipped.** The trait contract is
+    /// that every `TransitionConstraintEvaluator::evaluate_prover` impl writes
+    /// (not accumulates) to `base_evals[constraint_idx]` or
+    /// `ext_evals[constraint_idx]`. Periodic constraints write a value
+    /// multiplied by the periodic selector (zero on inactive positions, not
+    /// a skip). So overwriting reused per-thread buffers is safe without
+    /// pre-zeroing — saves `num_transition_constraints * num_lde_points`
+    /// dead stores per prove (≈ 20-40 ms in r2_constraints at log21 n=16).
     fn compute_transition_prover(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
         base_evals: &mut [FieldElement<Self::Field>],
         ext_evals: &mut [FieldElement<Self::FieldExtension>],
     ) {
-        for e in base_evals.iter_mut() {
-            *e = FieldElement::zero();
-        }
-        let num_base = base_evals.len();
-        for e in ext_evals[num_base..].iter_mut() {
-            *e = FieldElement::zero();
-        }
         self.transition_constraints()
             .iter()
             .for_each(|c| c.evaluate_prover(evaluation_context, base_evals, ext_evals));
