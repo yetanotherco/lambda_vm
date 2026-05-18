@@ -283,20 +283,6 @@ pub trait AIR: Send + Sync {
         &self.context().proof_options
     }
 
-    fn blowup_factor(&self) -> u8 {
-        self.options().blowup_factor
-    }
-
-    fn coset_offset(&self) -> FieldElement<Self::Field> {
-        FieldElement::from(self.options().coset_offset)
-    }
-
-    fn trace_primitive_root(&self, trace_length: usize) -> FieldElement<Self::Field> {
-        let root_of_unity_order = u64::from(trace_length.trailing_zeros());
-
-        Self::Field::get_primitive_root_of_unity(root_of_unity_order).unwrap()
-    }
-
     fn num_transition_constraints(&self) -> usize {
         self.context().num_transition_constraints
     }
