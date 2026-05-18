@@ -8,18 +8,18 @@ stark = { path = "../crypto/stark", features = ["test-utils"] }
 crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
 math = { path = "../crypto/math", features = ["std", "lambdaworks-serde-binary"] }
 
-p3-air = { path = "../../plonky3/air" }
-p3-challenger = { path = "../../plonky3/challenger" }
-p3-commit = { path = "../../plonky3/commit" }
-p3-dft = { path = "../../plonky3/dft", features = ["parallel"] }
-p3-field = { path = "../../plonky3/field" }
-p3-fri = { path = "../../plonky3/fri" }
-p3-goldilocks = { path = "../../plonky3/goldilocks" }
-p3-keccak = { path = "../../plonky3/keccak" }
-p3-matrix = { path = "../../plonky3/matrix" }
-p3-merkle-tree = { path = "../../plonky3/merkle-tree" }
-p3-symmetric = { path = "../../plonky3/symmetric" }
-p3-uni-stark = { path = "../../plonky3/uni-stark", features = ["parallel"] }
+p3-air = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4", features = ["parallel"] }
+p3-field = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4", features = ["parallel"] }
 
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
