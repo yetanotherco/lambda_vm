@@ -175,6 +175,38 @@ fn test_ef_io_demo_concatenates_writes() {
 }
 
 #[test]
+fn test_ef_io_no_input() {
+    // Guest calls read_input with no private input (buf_size should be 0),
+    // then emits a hardcoded "ok" via write_output.
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ef_io_no_input.elf",
+        b"ok".to_vec(),
+        vec![],
+    );
+}
+
+#[test]
+fn test_ef_io_zero_write() {
+    // Guest calls write_output(ptr, 0) then write_output(ptr, 5).
+    // The zero-length call must be a no-op; output should be "hello".
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ef_io_zero_write.elf",
+        b"hello".to_vec(),
+        vec![],
+    );
+}
+
+#[test]
+fn test_ef_io_multi_write() {
+    // Guest emits "abcdefghij" one byte at a time via 10 write_output calls.
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ef_io_multi_write.elf",
+        b"abcdefghij".to_vec(),
+        vec![],
+    );
+}
+
+#[test]
 fn test_commit_sum() {
     run_program_and_check_public_output(
         "./program_artifacts/rust/commit_sum.elf",

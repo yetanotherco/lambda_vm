@@ -354,4 +354,67 @@ mod tests {
         let err = memory.commit_public_output(0x1_0000, 1).unwrap_err();
         assert!(matches!(err, super::MemoryError::CommitSizeExceeded));
     }
+
+    #[test]
+    fn test_commit_zero_length_after_data() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'x');
+        memory
+            .commit_public_output(0x100, 1)
+            .expect("first commit should succeed");
+        // Zero-length commit must be a no-op.
+        memory
+            .commit_public_output(0x100, 0)
+            .expect("zero-length commit should succeed");
+        assert_eq!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable"),
+            b"x".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_commit_zero_length_at_cap() {
+        let mut memory = Memory::default();
+        let chunk = vec![0xAB; 512 * 1024];
+        memory
+            .set_bytes_aligned(0x1_0000, &chunk)
+            .expect("seed should succeed");
+        // Fill to exactly 1 MB.
+        memory
+            .commit_public_output(0x1_0000, 512 * 1024)
+            .expect("first half should succeed");
+        memory
+            .commit_public_output(0x1_0000, 512 * 1024)
+            .expect("second half should succeed");
+        // Zero-length commit at the cap boundary must still succeed.
+        memory
+            .commit_public_output(0x1_0000, 0)
+            .expect("zero-length commit at cap should succeed");
+    }
+
+    #[test]
+    fn test_commit_cap_exceeded_does_not_modify_output() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'a');
+        memory.store_byte(0x101, b'b');
+        memory
+            .commit_public_output(0x100, 2)
+            .expect("initial commit should succeed");
+
+        let before = memory
+            .read_return_value()
+            .expect("public output should be readable");
+
+        // Attempt a commit that exceeds the cap.
+        let _ = memory.commit_public_output(0x100, super::MAX_PUBLIC_OUTPUT_TOTAL_SIZE);
+
+        let after = memory
+            .read_return_value()
+            .expect("public output should be readable");
+
+        // The failed commit must not have modified the output buffer.
+        assert_eq!(before, after);
+    }
 }

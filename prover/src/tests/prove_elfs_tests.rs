@@ -2197,6 +2197,30 @@ fn test_prove_ef_io_demo_concatenates() {
     );
 }
 
+/// End-to-end: EF IO with no private input — guest emits a hardcoded "ok"
+/// via `write_output`. Proves the output path works when `read_input`
+/// returns `buf_size == 0`.
+#[test]
+fn test_prove_ef_io_no_input() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_no_input.elf"))
+            .expect("ef_io_no_input.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "ef_io_no_input should verify"
+    );
+    assert_eq!(
+        proof.public_output,
+        b"ok".to_vec(),
+        "output should be hardcoded 'ok'"
+    );
+}
+
 /// End-to-end: Rust std program with private input.
 #[test]
 fn test_prove_commit_sum() {
