@@ -1,44 +1,17 @@
 //! Parity: GPU Merkle inner-tree construction must match the CPU
 //! `crypto/crypto/src/merkle_tree/merkle.rs` `build_from_hashed_leaves`
-//! (Keccak-256 pair hash at each level).
+//! (Keccak-256 pair hash at each level). Uses the prover's
+//! `FieldElementVectorBackend<_, Keccak256, 32>` directly so any change to
+//! the CPU tree builder is automatically exercised here.
 
+use crypto::merkle_tree::backends::field_element_vector::FieldElementVectorBackend;
+use crypto::merkle_tree::merkle::MerkleTree;
+use math::field::goldilocks::GoldilocksField;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sha3::{Digest, Keccak256};
+use sha3::Keccak256;
 
-fn cpu_hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut h = Keccak256::new();
-    h.update(left);
-    h.update(right);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
-}
-
-/// CPU reference: same algorithm as `build_from_hashed_leaves`.
-fn cpu_merkle_nodes(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-    let leaves_len = leaves.len();
-    assert!(leaves_len.is_power_of_two() && leaves_len >= 2);
-    let total = 2 * leaves_len - 1;
-
-    let mut nodes: Vec<[u8; 32]> = vec![[0u8; 32]; total];
-    for (i, leaf) in leaves.iter().enumerate() {
-        nodes[leaves_len - 1 + i] = *leaf;
-    }
-
-    let mut level_begin = leaves_len - 1;
-    while level_begin != 0 {
-        let new_begin = level_begin / 2;
-        let n_pairs = level_begin - new_begin;
-        for j in 0..n_pairs {
-            let left = nodes[level_begin + 2 * j];
-            let right = nodes[level_begin + 2 * j + 1];
-            nodes[new_begin + j] = cpu_hash_pair(&left, &right);
-        }
-        level_begin = new_begin;
-    }
-    nodes
-}
+type CpuTree = MerkleTree<FieldElementVectorBackend<GoldilocksField, Keccak256, 32>>;
 
 fn run_parity(log_n: u32, seed: u64) {
     let leaves_len = 1usize << log_n;
@@ -60,11 +33,12 @@ fn run_parity(log_n: u32, seed: u64) {
     let gpu_nodes_bytes = math_cuda::merkle::build_merkle_tree_on_device(&flat).unwrap();
     assert_eq!(gpu_nodes_bytes.len(), (2 * leaves_len - 1) * 32);
 
-    let cpu_nodes = cpu_merkle_nodes(&leaves);
+    // CPU reference: the prover's MerkleTree builder over the same backend.
+    let cpu_tree = CpuTree::build_from_hashed_leaves(leaves).unwrap();
+    let cpu_nodes = cpu_tree.nodes();
 
-    for i in 0..cpu_nodes.len() {
+    for (i, c) in cpu_nodes.iter().enumerate() {
         let g = &gpu_nodes_bytes[i * 32..(i + 1) * 32];
-        let c = &cpu_nodes[i];
         assert_eq!(
             g, c,
             "node {i} mismatch at log_n={log_n} (cpu={c:?}, gpu={g:?})"
