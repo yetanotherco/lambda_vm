@@ -510,12 +510,17 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Compute main LDE, commit, and return the `TableCommit` along with the
-    /// owned LDE columns (consumed later in Phase D).
+    /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
+    /// with the owned LDE columns (consumed later in Phase D).
+    ///
+    /// `precomputed`: if present, the leading `num_cols` columns are committed
+    /// as a separate Merkle tree (the precomputed split for preprocessed
+    /// tables) and the root is checked against the AIR-hardcoded commitment.
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        precomputed: Option<(Commitment, usize)>,
     ) -> Result<(TableCommit<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -523,6 +528,7 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -531,62 +537,40 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (tree, root) =
-            Self::commit_columns_bit_reversed(&columns).ok_or(ProvingError::EmptyCommitment)?;
+
+        let commit = match precomputed {
+            None => {
+                let (tree, root) = Self::commit_columns_bit_reversed(&columns)
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                TableCommit::plain(tree, root)
+            }
+            Some((expected_precomputed_root, num_cols)) => {
+                let (precomputed_tree, precomputed_root) =
+                    Self::commit_columns_bit_reversed(&columns[..num_cols])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                let (mult_tree, mult_root) =
+                    Self::commit_columns_bit_reversed(&columns[num_cols..])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                debug_assert_eq!(
+                    precomputed_root, expected_precomputed_root,
+                    "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+                );
+                TableCommit::preprocessed(
+                    mult_tree,
+                    mult_root,
+                    precomputed_tree,
+                    precomputed_root,
+                    num_cols,
+                )
+            }
+        };
+
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
-        Ok((TableCommit::plain(tree, root), columns))
+        Ok((commit, columns))
     }
 
-    /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
-    fn commit_preprocessed_trace(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        precomputed_commitment: Commitment,
-        num_precomputed_cols: usize,
-        twiddles: &LdeTwiddles<Field>,
-    ) -> Result<(TableCommit<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let mut columns = trace.extract_columns_main(lde_size);
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
-        #[cfg(feature = "instruments")]
-        let main_lde_dur = t_sub.elapsed();
-
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let (precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
-
-        let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
-                .ok_or(ProvingError::EmptyCommitment)?;
-        #[cfg(feature = "instruments")]
-        crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
-
-        debug_assert_eq!(
-            precomputed_root, precomputed_commitment,
-            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
-        );
-
-        Ok((
-            TableCommit::preprocessed(
-                mult_tree,
-                mult_root,
-                precomputed_tree,
-                precomputed_root,
-                num_precomputed_cols,
-            ),
-            columns,
-        ))
-    }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
     ///
@@ -1590,17 +1574,10 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    if air.is_preprocessed() {
-                        Self::commit_preprocessed_trace(
-                            *trace,
-                            domain,
-                            air.precomputed_commitment(),
-                            air.num_precomputed_columns(),
-                            twiddles,
-                        )
-                    } else {
-                        Self::commit_main_trace(*trace, domain, twiddles)
-                    }
+                    let precomputed = air.is_preprocessed().then(|| {
+                        (air.precomputed_commitment(), air.num_precomputed_columns())
+                    });
+                    Self::commit_main_trace(*trace, domain, twiddles, precomputed)
                 })
                 .collect();
 
