@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check clippy fmt lint
+test-fast test-prover test-prover-all test-math-cuda bench-math-cuda build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -184,6 +184,14 @@ test-prover-all:
 # Prover tests with debug-checks (shows bus balance report)
 test-prover-debug:
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
+
+# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+test-math-cuda:
+	cargo test -p math-cuda --release
+
+# math-cuda quick microbench (median of 10 runs)
+bench-math-cuda:
+	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
 
 # Build all
 build:

@@ -1033,7 +1033,7 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 
 /// Total number of CPU constraints.
 ///
-/// - IS_BIT: 32 (all bit flags, including read_register1/2)
+/// - IS_BIT: 34 (all bit flags, including read_register1/2 and inline-PC columns)
 /// - ADD carry: 2 (for ADD + LOAD)
 /// - STORE ADD carry: 2 (for STORE: res = arg1 + imm)
 /// - SUB carry: 2 (for SUB + BEQ)

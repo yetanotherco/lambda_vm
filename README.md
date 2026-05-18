@@ -11,6 +11,9 @@ Right now, this is a project under development and experimentation and must not 
 ### Dependencies
 
 - Rust nightly with `rust-src` component
+- Clang with RISC-V target support and LLD linker (used by `make compile-programs-asm`)
+  - **macOS**: `brew install llvm` (the Homebrew LLVM includes `clang` and `lld` with RISC-V support)
+  - **Linux**: `apt install clang lld` (or equivalent for your distribution)
 
 ### Dev dependencies
 
@@ -26,11 +29,10 @@ Install Rust using [rustup](https://rustup.rs/):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Then install the nightly toolchain with the `rust-src` component (required for building `std` for the custom RISC-V target):
+Add the `rust-src` component to the pinned nightly toolchain used to build guest programs (required for building `std` for the custom RISC-V target — `make compile-programs-rust` will auto-fetch the toolchain itself):
 
 ```sh
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
+rustup component add rust-src --toolchain nightly-2026-02-01
 ```
 
 #### Compile sysroot
@@ -53,7 +55,7 @@ wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 
-##### Compile it directly             
+##### Compile them directly
     
 ```sh                                                
    sudo apt-get install -y autoconf automake autotools-dev curl python3 \                                           
@@ -74,19 +76,61 @@ sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
   cp -r /opt/riscv64-newlib/riscv64-unknown-elf/lib /opt/lambda-vm-sysroot/                
 ```
 
-#### Install the dependencies
-
-```sh
-make deps
-```
-
-**Note:** At the moment, `make deps` only works on macOS.
-
 Then, you can check that the executor works by running:
 
 ```sh
 make test-executor
 ```
+
+### Using the CLI
+
+The `cli` binary lets you execute, prove, and verify RISC-V ELF programs. Build it once with:
+
+```sh
+cargo build --release -p cli
+```
+
+The binary will be available at `target/release/cli`.
+
+To get a sample program to work with, compile the bundled assembly tests:
+
+```sh
+make compile-programs-asm
+```
+
+This emits ELF files under `executor/program_artifacts/asm/`. With those in place, you can run the three core commands:
+
+#### Execute
+
+Run a program without generating a proof. Useful for sanity checks and debugging:
+
+```sh
+cargo run -p cli --release -- execute executor/program_artifacts/asm/add.elf
+```
+
+#### Prove
+
+Generate a STARK proof of the execution:
+
+```sh
+cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
+```
+
+#### Verify
+
+Verify a proof against the ELF it was generated from. The command exits `0` on success and `1` on failure:
+
+```sh
+cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
+```
+
+For the full CLI reference — including private inputs, blowup factor tuning, timing, and flamegraph profiling — see [`bin/cli/README.md`](./bin/cli/README.md).
+
+### Writing a guest program
+
+Guest programs are written in Rust (or RISC-V assembly) and cross-compiled to the custom RV64IM target. The guest SDK [`lambda-vm-syscalls`](./syscalls/README.md) provides the syscalls a program uses to read private input, commit public output, halt, and call precompiles like Keccak. The [`executor`](./executor/README.md) crate is what loads your compiled ELF and emits the per-instruction logs the prover consumes.
+
+To add a new Rust guest, drop a project under `executor/programs/rust/<name>/` and run `make compile-programs-rust`. See [`executor/programs/rust/`](./executor/programs/rust/) for examples (`fibonacci`, `keccak`, `hashmap`, …).
 
 ## Design choices
 
@@ -107,7 +151,18 @@ Following [ethrex](https://github.com/lambdaclass/ethrex):
 
 ## Documentation
 
-Full documentation can be found in [docs](./docs/). It is currently a work in progress, we expect that as more features and components become ready, they will be included in the docs.
+High-level documentation lives in [`docs/`](./docs/):
+
+- [Overview of VM flow](./docs/general_flow.md) — the pipeline from source code to proof
+- [Proof system overview](./docs/cryptography/proof_system.md) — design goals and primitives
+- [Lookup arguments](./docs/cryptography/lookup.md) — how tables are linked via LogUp
+- [Recommended reading](./docs/other_resources.md) — papers and tutorials
+
+### Specification
+
+A formal specification of the VM is written in [Typst](https://typst.app/) under [`spec/`](./spec/) and rendered as a browsable wiki (HTML) or PDF using [`shiroa`](https://myriad-dreamin.github.io/shiroa/). With both tools installed, run `shiroa serve` from `spec/` to host the wiki locally.
+
+See [`spec/README.md`](./spec/README.md) for full setup instructions.
 
 ## Testing
 
@@ -123,6 +178,7 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
+| `make test-math-cuda` | math-cuda parity tests (requires NVIDIA GPU + nvcc) |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 | `make clippy` | Run clippy on all crates |
@@ -137,8 +193,8 @@ To run all tests across the project use
 
 ### ASM Tests
 
-In order to add a new asm test you should add the `.s` file under `programs/asm`
-Then add the corresponding test under `tests/asm.rs`
+In order to add a new asm test you should add the `.s` file under `executor/programs/asm`
+Then add the corresponding test under `executor/tests/asm.rs`
 
 To run them you can use
 
@@ -148,9 +204,9 @@ This will compile them and run the tests
 
 ### Rust Tests
 
-In order to add a new rust test you should add the cargo project under `programs/rust` as a new directory.
+In order to add a new rust test you should add the cargo project under `executor/programs/rust` as a new directory.
 The folder should have the same name as the `Cargo.toml` program name.
-Then add the corresponding test under `tests/rust.rs`
+Then add the corresponding test under `executor/tests/rust.rs`
 
 You can run it with
 
@@ -160,8 +216,20 @@ You can run it with
 
 You can create a flamegraph for proof generation using the following target:
 
+```sh
+make flamegraph-prover
 ```
-  make flamegraph-prover
+
+This profiles the synthetic `fibonacci_multi_column` STARK example in `crypto/stark` (i.e. the STARK engine itself, not a real guest ELF). To profile the VM prover end-to-end on a real ELF, use the dedicated bench in the `prover` crate:
+
+```sh
+samply record cargo bench --bench profile_vm_prover --features parallel
+```
+
+For a quick GPU microbench (requires an NVIDIA GPU + `nvcc`):
+
+```sh
+make bench-math-cuda
 ```
 
 ## Debug Checks
