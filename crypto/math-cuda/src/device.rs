@@ -92,6 +92,7 @@ impl Drop for PinnedStaging {
 
 const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
 const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
+const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -107,6 +108,10 @@ pub struct Backend {
     /// buffers 32×-inflated memory use and multiplied the one-time pinning
     /// cost for every first use of a new table size).
     pinned_staging: Mutex<PinnedStaging>,
+    /// Separate pinned staging for Merkle leaf hashes. Sized `num_rows * 32`
+    /// bytes. It lives alongside the LDE staging so the GPU→host D2H for
+    /// hashed leaves runs at full PCIe line-rate.
+    pinned_hashes: Mutex<PinnedStaging>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
 
@@ -132,6 +137,13 @@ pub struct Backend {
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
 
+    // keccak.ptx
+    pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_ext3_batched: CudaFunction,
+    pub keccak_comp_poly_leaves_ext3: CudaFunction,
+    pub keccak_fri_leaves_ext3: CudaFunction,
+    pub keccak_merkle_level: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -148,12 +160,14 @@ impl Backend {
 
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
+        let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
             streams.push(ctx.new_stream()?);
         }
         let pinned_staging = Mutex::new(PinnedStaging::empty());
+        let pinned_hashes = Mutex::new(PinnedStaging::empty());
         // Separate "utility" stream for twiddle uploads and other bookkeeping;
         // not part of the pool that callers rotate through.
         let util_stream = ctx.new_stream()?;
@@ -182,11 +196,17 @@ impl Backend {
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
+            keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
+            keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
+            keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
+            keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
             streams,
             pinned_staging,
+            pinned_hashes,
             util_stream,
             next: AtomicUsize::new(0),
         })
@@ -203,6 +223,12 @@ impl Backend {
     /// has seen so far. Concurrent callers serialise on the mutex.
     pub fn pinned_staging(&self) -> &Mutex<PinnedStaging> {
         &self.pinned_staging
+    }
+
+    /// Separate pinned staging for Merkle leaf hash output. Sized in u64
+    /// units. Caller should reserve `(num_rows * 32 + 7) / 8` u64s.
+    pub fn pinned_hashes(&self) -> &Mutex<PinnedStaging> {
+        &self.pinned_hashes
     }
 
     pub fn fwd_twiddles_for(&self, log_n: u64) -> Result<Arc<CudaSlice<u64>>> {

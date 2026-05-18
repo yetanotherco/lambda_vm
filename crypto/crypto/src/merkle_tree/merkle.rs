@@ -81,6 +81,13 @@ where
         })
     }
 
+    /// Read-only access to the full node buffer in standard layout:
+    /// `nodes[0..leaves_len - 1]` are inner nodes (root at index 0) and
+    /// `nodes[leaves_len - 1..]` are the leaves.
+    pub fn nodes(&self) -> &[B::Node] {
+        &self.nodes
+    }
+
     /// Returns a Merkle proof for the element/s at position pos
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree

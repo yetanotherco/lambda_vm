@@ -10,7 +10,7 @@ use math::fft::errors::FFTError;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::traits::AsBytes;
+use math::traits::{AsBytes, ByteConversion};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -374,6 +374,102 @@ where
     }
 }
 
+/// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
+/// leaf per row, where each row is read at `reverse_index(row_idx)` and the
+/// columns are concatenated as big-endian bytes before hashing.
+///
+/// Returns `Vec<Commitment>` with the same length as `columns[0]`. Exposed
+/// (instead of being a closure inside `commit_columns_bit_reversed`) so
+/// parity tests in dependent crates can compare against the same code path
+/// the prover uses.
+pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    if columns.is_empty() || columns[0].is_empty() {
+        return Vec::new();
+    }
+
+    let num_rows = columns[0].len();
+    let num_cols = columns.len();
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+
+    debug_assert!(
+        num_rows.is_power_of_two(),
+        "num_rows must be a power of two for reverse_index"
+    );
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_rows).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_rows;
+
+    iter.map(|row_idx| {
+        let br_idx = reverse_index(row_idx, num_rows as u64);
+        let total_bytes = num_cols * byte_len;
+        let mut buf = vec![0u8; total_bytes];
+        for col_idx in 0..num_cols {
+            columns[col_idx][br_idx]
+                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+    })
+    .collect()
+}
+
+/// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
+/// leaf per row-pair, where leaf `i` hashes the BE concatenation of
+/// `parts[..][br_0] ++ parts[..][br_1]` with
+/// `br_k = reverse_index(2*i + k, num_rows)`.
+///
+/// Returns `Vec<Commitment>` of length `parts[0].len() / 2`.
+pub fn keccak_leaves_row_pair_bit_reversed<E>(parts: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    let num_parts = parts.len();
+    if num_parts == 0 {
+        return Vec::new();
+    }
+    let num_rows = parts[0].len();
+    if num_rows == 0 {
+        return Vec::new();
+    }
+
+    let num_leaves = num_rows / 2;
+    debug_assert!(
+        num_rows.is_power_of_two(),
+        "num_rows must be a power of two for reverse_index"
+    );
+
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_leaves).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_leaves;
+
+    iter.map(|leaf_idx| {
+        let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+        let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+        let total_bytes = 2 * num_parts * byte_len;
+        let mut buf = vec![0u8; total_bytes];
+        let mut offset = 0;
+        for part in parts.iter() {
+            part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        for part in parts.iter() {
+            part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+    })
+    .collect()
+}
+
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -400,41 +496,10 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
-        use math::traits::ByteConversion;
-
         if columns.is_empty() || columns[0].is_empty() {
             return None;
         }
-
-        let num_rows = columns[0].len();
-        let num_cols = columns.len();
-        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-
-        debug_assert!(
-            num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index"
-        );
-
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        // One allocation per row (was one per field element): write all columns
-        // into a single buffer, then hash once.
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let total_bytes = num_cols * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                for col_idx in 0..num_cols {
-                    columns[col_idx][br_idx]
-                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-                }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-            })
-            .collect();
-
+        let hashed_leaves = keccak_leaves_bit_reversed(columns);
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
@@ -723,8 +788,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
-        use math::traits::ByteConversion;
-
         let num_parts = lde_composition_poly_parts_evaluations.len();
         if num_parts == 0 {
             return None;
@@ -733,41 +796,8 @@ pub trait IsStarkProver<
         if num_rows == 0 {
             return None;
         }
-
-        let num_leaves = num_rows / 2;
-        debug_assert!(
-            num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index"
-        );
-
-        let byte_len = <FieldElement<FieldExtension> as ByteConversion>::BYTE_LEN;
-
-        // One allocation per leaf (was one per field element): write all parts
-        // into a single buffer. Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_leaves).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_leaves;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|leaf_idx| {
-                let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-                let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                let total_bytes = 2 * num_parts * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                let mut offset = 0;
-                for part in lde_composition_poly_parts_evaluations.iter() {
-                    part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                    offset += byte_len;
-                }
-                for part in lde_composition_poly_parts_evaluations.iter() {
-                    part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                    offset += byte_len;
-                }
-                BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(&buf)
-            })
-            .collect();
-
+        let hashed_leaves =
+            keccak_leaves_row_pair_bit_reversed(lde_composition_poly_parts_evaluations);
         let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
