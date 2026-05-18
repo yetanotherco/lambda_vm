@@ -10,7 +10,7 @@ use math::fft::errors::FFTError;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::traits::AsBytes;
+use math::traits::{AsBytes, ByteConversion};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -385,10 +385,8 @@ where
 pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
 where
     E: IsField,
-    FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    use math::traits::ByteConversion;
-
     if columns.is_empty() || columns[0].is_empty() {
         return Vec::new();
     }
@@ -429,10 +427,8 @@ where
 pub fn keccak_leaves_row_pair_bit_reversed<E>(parts: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
 where
     E: IsField,
-    FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    use math::traits::ByteConversion;
-
     let num_parts = parts.len();
     if num_parts == 0 {
         return Vec::new();

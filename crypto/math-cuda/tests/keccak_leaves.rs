@@ -1,23 +1,21 @@
 //! Parity: GPU Keccak-256 leaf hashes must match the CPU prover's leaf
-//! hashing helpers — `stark::prover::keccak_leaves_bit_reversed` for
+//! hashing helpers. `stark::prover::keccak_leaves_bit_reversed` for
 //! per-row commits, `keccak_leaves_row_pair_bit_reversed` for the R2
-//! composition commit, and `FieldElementPairBackend::hash_data` for the FRI
-//! commit. These are the same helpers the prover itself calls so any
+//! composition commit, and `FriLayerMerkleTreeBackend::hash_data` for the
+//! FRI commit. These are the same helpers the prover itself calls so any
 //! change to the CPU leaf-hash contract surfaces here.
 
-use crypto::merkle_tree::backends::field_element_vector::FieldElementPairBackend;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sha3::Keccak256;
+use stark::config::FriLayerMerkleTreeBackend;
 use stark::prover::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
 type Fp = FieldElement<GoldilocksField>;
 type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
-type FriPairBackend = FieldElementPairBackend<Degree3GoldilocksExtensionField, Keccak256, 32>;
 
 #[test]
 fn keccak_leaves_base_matches_cpu() {
@@ -169,10 +167,14 @@ fn keccak_fri_leaves_matches_cpu() {
             .collect();
 
         // CPU reference: consecutive ext3 pairs hashed via the prover's
-        // `FieldElementPairBackend::hash_data`.
+        // FRI-layer Merkle backend.
         let cpu: Vec<[u8; 32]> = evals
             .chunks_exact(2)
-            .map(|c| FriPairBackend::hash_data(&[c[0], c[1]]))
+            .map(|c| {
+                FriLayerMerkleTreeBackend::<Degree3GoldilocksExtensionField>::hash_data(&[
+                    c[0], c[1],
+                ])
+            })
             .collect();
 
         let mut evals_interleaved = vec![0u64; 3 * lde_size];

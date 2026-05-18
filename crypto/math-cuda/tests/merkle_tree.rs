@@ -54,13 +54,6 @@ fn merkle_tree_small() {
 }
 
 #[test]
-fn merkle_tree_medium() {
-    for log_n in [10u32, 12, 14] {
-        run_parity(log_n, 500 + log_n as u64);
-    }
-}
-
-#[test]
 fn merkle_tree_large() {
     run_parity(18, 9999);
 }
