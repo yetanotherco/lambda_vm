@@ -6,10 +6,10 @@ use core::arch::asm;
 /// The host pre-loads the input; the guest reads directly (no ecall).
 /// Must match `executor::vm::memory::PRIVATE_INPUT_START_INDEX`.
 #[cfg(target_arch = "riscv64")]
-const PRIVATE_INPUT_START: usize = 0xFF000000;
+pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
 #[cfg(target_arch = "riscv64")]
-enum SyscallNumbers {
+pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
     Commit = 64,
