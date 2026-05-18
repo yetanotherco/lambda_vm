@@ -200,33 +200,21 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
 fn keccak_permute_syscall(state: &mut [u64; PLEN]) {
-    // EXPERIMENT (Option 1): replace the real precompile syscall with a
-    // ~3-instruction "fake" permutation that still mutates the state.
+    // EXPERIMENT: stub keccak permutation. The state is NOT permuted; this
+    // function returns immediately. The recursion guest will compute wrong
+    // digests and the inner verify will (probably) fail at the end, but the
+    // executor still runs to completion — which is all we need to measure
+    // cycles attributable to non-keccak work.
     //
-    // Why this and not a true no-op:
-    //   The previous no-op stub broke verifier semantics — every Keccak hash
-    //   returned the same bytes, so `DefaultTranscript::sample_u64`'s
-    //   rejection-sampling `loop { ... }` got stuck because `candidate` was
-    //   always below `threshold` for some upper_bounds. Cycles ballooned
-    //   instead of dropping. By touching state[0] with a deterministic mix,
-    //   subsequent permutations produce different output, the rejection loop
-    //   terminates normally, and the verifier runs to completion.
-    //
-    // Why this is still cheaper than the real precompile:
-    //   The real precompile path costs ~50 RISC-V instructions of plumbing
-    //   plus one `ecall`. This fake costs ~3 instructions (add + store) and
-    //   no syscall. The cycle delta vs baseline tells us how much of the
-    //   40B baseline is attributable to Keccak (precompile syscall + its
-    //   surrounding `sha3` glue).
-    //
-    // Digests will be wrong; the inner verify will return `false`. That's
-    // fine — the cycle-count test only measures executor cycles.
-    //
-    // To restore real Keccak behavior, revert this commit.
-    //
-    // 0x9e3779b97f4a7c15 is the 64-bit golden ratio constant, commonly
-    // used in non-crypto hash mixing (e.g. SplitMix64).
-    state[0] = state[0].wrapping_add(0x9e3779b97f4a7c15);
+    // To restore real keccak behavior, revert this commit.
+    let _ = state;
+    // unsafe {
+    //     core::arch::asm!(
+    //         "ecall",
+    //         in("a0") state.as_mut_ptr(),
+    //         in("a7") KECCAK_SYSCALL_NUMBER,
+    //     )
+    // }
 }
 
 // Soft-keccak fallback for `round_count != 24` (unused by sha3::Keccak256
