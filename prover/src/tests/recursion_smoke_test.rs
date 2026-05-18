@@ -577,6 +577,15 @@ fn test_deserialize_only_cycle_count() {
 
     eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
     let program = Elf::load(&deser_elf_bytes).expect("ELF load failed");
+    eprintln!(
+        "[deser-only] ELF: {} bytes, entry_point=0x{:x}",
+        deser_elf_bytes.len(),
+        program.entry_point,
+    );
+    assert_ne!(
+        program.entry_point, 0,
+        "deserialize-only ELF has entry_point=0 — build artifact is malformed"
+    );
     let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
 
     let start = std::time::Instant::now();
