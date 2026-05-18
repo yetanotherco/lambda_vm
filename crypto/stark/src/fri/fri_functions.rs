@@ -5,6 +5,10 @@ use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Evaluation-form FRI fold: given evaluations in bit-reversed order where
 /// consecutive pairs (2j, 2j+1) are conjugates (p(x_j), p(-x_j)), compute
 /// the folded evaluations: (lo + hi) + inv_twiddle[j] * zeta * (lo - hi)
@@ -18,14 +22,37 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     inv_twiddles: &[FieldElement<F>],
 ) {
     let half = evals.len() / 2;
-    for j in 0..half {
-        let lo = &evals[2 * j];
-        let hi = &evals[2 * j + 1];
-        let sum = lo + hi;
-        let diff = lo - hi;
-        evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+
+    #[cfg(feature = "parallel")]
+    {
+        // Read/write positions overlap (write to evals[j], read from evals[2j], evals[2j+1]),
+        // so we collect into a fresh buffer rather than mutate in place. Mirrors P3's
+        // fold_matrix in p3-fri/src/two_adic_pcs.rs which uses a separate output buffer.
+        let folded: Vec<FieldElement<E>> = evals
+            .par_chunks_exact(2)
+            .zip(inv_twiddles[..half].par_iter())
+            .map(|(pair, inv_tw)| {
+                let lo = &pair[0];
+                let hi = &pair[1];
+                let sum = lo + hi;
+                let diff = lo - hi;
+                &sum + &(inv_tw * &(zeta * &diff))
+            })
+            .collect();
+        *evals = folded;
     }
-    evals.truncate(half);
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        for j in 0..half {
+            let lo = &evals[2 * j];
+            let hi = &evals[2 * j + 1];
+            let sum = lo + hi;
+            let diff = lo - hi;
+            evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+        }
+        evals.truncate(half);
+    }
 }
 
 /// Compute inverse twiddle factors for evaluation-form FRI folding.
