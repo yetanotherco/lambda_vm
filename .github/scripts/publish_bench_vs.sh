@@ -80,9 +80,7 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
 fi
 
 # --- Plonky3 section (optional) --------------------------------------------
-# Built when `bench_vs_artifacts/p3/headline/metrics.txt` exists. The headline
-# row comes from that file; column-scaling rows are read from the per-N
-# subdirs written by the workflow.
+# Built when `bench_vs_artifacts/p3/headline/metrics.txt` exists.
 
 p3_parse() {
     local file=$1
@@ -156,46 +154,7 @@ if [ -f "$P3_HEADLINE_FILE" ]; then
     P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Plonky3:* $(p3_fmt_seconds "$H_P3_PROVE") prove · $(p3_fmt_seconds "$H_P3_VERIFY") verify · $(p3_fmt_mb "$H_P3_PROOF") proof · $(p3_fmt_gb "$H_P3_RSS") RSS"
     P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Ratio L/P3:* ${PROVE_RATIO_FMT} prove · ${PROOF_RATIO} proof · ${RSS_RATIO} RSS"
 
-    # Render a `(label|file)` list into a multi-line mrkdwn block with
-    # `*label* Lambda Xs / P3 Ys — Rx` per row. Used by both sweep sections.
-    p3_render_sweep() {
-        local out=""
-        local entry label file lambda_t p3_t ratio ratio_fmt line
-        for entry in "$@"; do
-            label="${entry%%|*}"
-            file="${entry##*|}"
-            if [ ! -f "$file" ]; then
-                line="*${label}* (no data)"
-            else
-                lambda_t=$(p3_parse "$file" "lambda_prove_medians")
-                p3_t=$(p3_parse "$file" "p3_prove_medians")
-                ratio=$(p3_parse "$file" "ratios_lambda_over_p3")
-                ratio_fmt=$(LC_NUMERIC=C awk -v r="$ratio" 'BEGIN {
-                    if (r == "" || r == "n/a") { print "n/a"; exit }
-                    printf "%.2fx", r
-                }')
-                line="*${label}* Lambda $(p3_fmt_seconds "$lambda_t") / P3 $(p3_fmt_seconds "$p3_t") — ${ratio_fmt}"
-            fi
-            if [ -n "$out" ]; then
-                out="${out}\\n${line}"
-            else
-                out="$line"
-            fi
-        done
-        printf '%s' "$out"
-    }
-
-    P3_SIZE_MRKDWN=$(p3_render_sweep \
-        "log_rows=19|bench_vs_artifacts/p3/size_log19/metrics.txt" \
-        "log_rows=20|bench_vs_artifacts/p3/size_log20/metrics.txt" \
-        "log_rows=21|bench_vs_artifacts/p3/headline/metrics.txt")
-
-    P3_COLS_MRKDWN=$(p3_render_sweep \
-        "8 cols (n=4):|bench_vs_artifacts/p3/cols_n4/metrics.txt" \
-        "32 cols (n=16):|bench_vs_artifacts/p3/headline/metrics.txt" \
-        "128 cols (n=64):|bench_vs_artifacts/p3/cols_n64/metrics.txt")
-
-    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3 - Headline"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_HEADLINE_MRKDWN"'"}},{"type":"header","text":{"type":"plain_text","text":"Size scaling @ 32 cols"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_SIZE_MRKDWN"'"}},{"type":"header","text":{"type":"plain_text","text":"Column scaling @ log_rows='"$H_LOG_ROWS"'"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_COLS_MRKDWN"'"}}'
+    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3 - Headline"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_HEADLINE_MRKDWN"'"}}'
 fi
 
 curl -X POST "$WEBHOOK_URL" \
