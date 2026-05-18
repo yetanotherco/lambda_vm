@@ -88,6 +88,8 @@ prepare-sysroot:
 		fi; \
 		rm "$(SYSROOT_TARBALL)"; \
 	fi
+# Note: the tarball rm above only runs on success — each error handler
+# cleans up the tarball itself before `exit 1`.
 
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)
@@ -98,7 +100,7 @@ compile-programs-asm:
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
-compile-bench: $(BENCH_ARTIFACTS)
+compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
