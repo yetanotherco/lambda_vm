@@ -17,10 +17,10 @@
 //! to match `FieldElement::<Ext3>::write_bytes_be`.
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
-use rayon::prelude::*;
 
 use crate::Result;
 use crate::device::{Backend, backend};
+use crate::lde::pack_ext3_to_pinned_slabs;
 
 /// Run GPU Keccak-256 leaf hashing on a base-field column buffer.
 ///
@@ -98,7 +98,7 @@ pub fn keccak_leaves_ext3(
 /// keeps us inside the budget with some head-room.
 const KECCAK_BLOCK_DIM: u32 = 128;
 
-fn keccak_launch_cfg(num_rows: u64) -> LaunchConfig {
+pub(crate) fn keccak_launch_cfg(num_rows: u64) -> LaunchConfig {
     debug_assert!(
         num_rows <= u32::MAX as u64,
         "keccak_launch_cfg: num_rows ({num_rows}) exceeds u32 grid range",
@@ -247,35 +247,7 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     staging.ensure_capacity(mb * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
 
-    let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    parts_interleaved
-        .par_iter()
-        .enumerate()
-        .for_each(|(c, col)| {
-            let slab_a = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (pinned_ptr_u as *mut u64).add((c * 3) * lde_size),
-                    lde_size,
-                )
-            };
-            let slab_b = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (pinned_ptr_u as *mut u64).add((c * 3 + 1) * lde_size),
-                    lde_size,
-                )
-            };
-            let slab_c = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (pinned_ptr_u as *mut u64).add((c * 3 + 2) * lde_size),
-                    lde_size,
-                )
-            };
-            for i in 0..lde_size {
-                slab_a[i] = col[i * 3];
-                slab_b[i] = col[i * 3 + 1];
-                slab_c[i] = col[i * 3 + 2];
-            }
-        });
+    pack_ext3_to_pinned_slabs(parts_interleaved, pinned, lde_size);
 
     // H2D the de-interleaved parts.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
@@ -291,12 +263,7 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
         let num_parts_u64 = m as u64;
         let num_rows_u64 = lde_size as u64;
         let log_num_rows = lde_size.trailing_zeros() as u64;
-        let grid = (num_leaves as u32).div_ceil(128);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = keccak_launch_cfg(num_leaves as u64);
         unsafe {
             stream
                 .launch_builder(&be.keccak_comp_poly_leaves_ext3)
@@ -344,12 +311,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
         let num_leaves_u64 = num_leaves as u64;
-        let grid = (num_leaves as u32).div_ceil(128);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = keccak_launch_cfg(num_leaves as u64);
         unsafe {
             stream
                 .launch_builder(&be.keccak_fri_leaves_ext3)

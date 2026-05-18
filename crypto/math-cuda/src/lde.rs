@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::Result;
 use crate::device::{Backend, backend};
-use crate::merkle::{launch_keccak_base, launch_keccak_ext3};
+use crate::merkle::{keccak_launch_cfg, launch_keccak_base, launch_keccak_ext3};
 use crate::ntt::run_ntt_body;
 
 /// Goldilocks `TWO_ADICITY = 32` puts the theoretical domain ceiling at
@@ -65,7 +65,7 @@ impl KeccakCommit {
 ///
 /// Caller invariants: `pinned.len() >= 3 * columns.len() * n` and each
 /// `columns[c].len() >= 3 * n`. The caller must hold the pinned-staging lock.
-fn pack_ext3_to_pinned_slabs(columns: &[&[u64]], pinned: &mut [u64], n: usize) {
+pub(crate) fn pack_ext3_to_pinned_slabs(columns: &[&[u64]], pinned: &mut [u64], n: usize) {
     let m = columns.len();
     debug_assert!(pinned.len() >= 3 * m * n);
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
@@ -604,7 +604,6 @@ pub fn coset_lde_batch_base_into(
 
     // Parallel copy pinned → caller outputs. Caller's Vecs may still fault
     // on first write; we spread that cost across rayon cores.
-    #[allow(unused_imports)]
     let pinned_ptr = pinned.as_ptr() as usize;
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let src = unsafe {
@@ -616,17 +615,12 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
-/// Variant of `coset_lde_batch_base_into` that also emits the Keccak-256
-/// Merkle leaf hashes from the LDE output. All on GPU, the device LDE buffer
-/// is hashed in place. Leaves are computed reading columns at bit-reversed
-/// rows (matching `commit_columns_bit_reversed` on the CPU side).
-///
-/// `hashed_leaves_out` must be `lde_size * 32` bytes (one 32-byte digest
-/// per output row, in natural row order).
 /// Fused LDE + Keccak-256 leaf hashing. Caller receives the `lde_size * 32`
-/// bytes of leaf hashes in `hashed_leaves_out`. Thin wrapper over
-/// `coset_lde_batch_base_into_with_merkle_tree_inner` with `LeavesOnly` —
-/// no inner-tree build, no device handle.
+/// bytes of leaf hashes in `hashed_leaves_out` (one 32-byte digest per output
+/// row, in natural row order; leaves are computed reading columns at
+/// bit-reversed rows, matching `commit_columns_bit_reversed` on the CPU
+/// side). Thin wrapper over `coset_lde_batch_base_into_with_merkle_tree_inner`
+/// with `LeavesOnly` — no inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -1102,8 +1096,16 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
-    evaluate_poly_coset_batch_ext3_into_inner(coefs, n, blowup_factor, weights, outputs, false)
-        .map(|_| ())
+    evaluate_poly_coset_batch_ext3_into_inner(
+        coefs,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        None,
+        false,
+    )
+    .map(|_| ())
 }
 
 /// Same as [`evaluate_poly_coset_batch_ext3_into`] but retains the de-
@@ -1116,8 +1118,15 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<GpuLdeExt3> {
-    let opt =
-        evaluate_poly_coset_batch_ext3_into_inner(coefs, n, blowup_factor, weights, outputs, true)?;
+    let opt = evaluate_poly_coset_batch_ext3_into_inner(
+        coefs,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        None,
+        true,
+    )?;
     Ok(opt.expect("keep_device_buf=true must return Some"))
 }
 
@@ -1127,6 +1136,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     blowup_factor: usize,
     weights: &[u64],
     outputs: &mut [&mut [u64]],
+    merkle_nodes_out: Option<&mut [u8]>,
     keep_device_buf: bool,
 ) -> Result<Option<GpuLdeExt3>> {
     if coefs.is_empty() {
@@ -1151,6 +1161,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         assert_eq!(o.len(), 3 * lde_size);
     }
     assert_u32_domain(lde_size, "evaluate_poly_coset_batch_ext3_into lde_size");
+    if merkle_nodes_out.is_some() {
+        assert!(lde_size >= 2);
+    }
     let log_lde = lde_size.trailing_zeros() as u64;
 
     let mb = 3 * m;
@@ -1209,8 +1222,39 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         mb_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    stream.synchronize()?;
+    // Optional R2-style row-pair Merkle tree build on the LDE buffer.
+    if let Some(nodes_out) = merkle_nodes_out {
+        let num_leaves = lde_size / 2;
+        let tight_total_nodes = 2 * num_leaves - 1;
+        assert_eq!(nodes_out.len(), tight_total_nodes * 32);
+        let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+        let leaves_offset_bytes = (num_leaves - 1) * 32;
+        {
+            let mut leaves_view =
+                nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+            let log_num_rows = log_lde;
+            let num_parts_u64 = m as u64;
+            let cfg = keccak_launch_cfg(num_leaves as u64);
+            unsafe {
+                stream
+                    .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                    .arg(&buf)
+                    .arg(&col_stride_u64)
+                    .arg(&num_parts_u64)
+                    .arg(&lde_u64)
+                    .arg(&log_num_rows)
+                    .arg(&mut leaves_view)
+                    .launch(cfg)?;
+            }
+        }
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+
+        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+        d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
+    } else {
+        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+        stream.synchronize()?;
+    }
 
     unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
@@ -1233,6 +1277,12 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 /// Row-pair commit: each leaf hashes 2 rows, so the tree has `lde_size / 2`
 /// leaves and `merkle_nodes_out` must have byte length `(lde_size - 1) * 32`.
 /// Requires `lde_size >= 2`.
+/// Variant of [`evaluate_poly_coset_batch_ext3_into`] that also builds the
+/// R2 composition-polynomial Merkle tree on device.
+///
+/// Row-pair commit: each leaf hashes 2 bit-reversed rows, so the tree has
+/// `lde_size / 2` leaves and `merkle_nodes_out` must have byte length
+/// `(lde_size - 1) * 32`. Requires `lde_size >= 2`.
 pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     coefs: &[&[u64]],
     n: usize,
@@ -1241,128 +1291,16 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<()> {
-    if coefs.is_empty() {
-        return Ok(());
-    }
-    // (is_power_of_two returns false for 0).
-    if n == 0 {
-        return Ok(());
-    }
-    let m = coefs.len();
-    assert_eq!(outputs.len(), m);
-    assert!(n.is_power_of_two());
-    assert_eq!(weights.len(), n);
-    assert!(blowup_factor.is_power_of_two());
-    for c in coefs.iter() {
-        assert_eq!(c.len(), 3 * n);
-    }
-    let lde_size = n * blowup_factor;
-    assert_u32_domain(
-        lde_size,
-        "evaluate_poly_coset_batch_ext3_into_with_merkle_tree lde_size",
-    );
-    for o in outputs.iter() {
-        assert_eq!(o.len(), 3 * lde_size);
-    }
-    assert!(lde_size >= 2);
-    let total_nodes = lde_size - 1;
-    assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
-    let log_lde = lde_size.trailing_zeros() as u64;
-
-    let mb = 3 * m;
-    let be = backend()?;
-    let stream = be.next_stream();
-    let staging_slot = be.pinned_staging();
-
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
-
-    pack_ext3_to_pinned_slabs(coefs, pinned, n);
-
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
-    }
-
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-
-    // Build the row-pair Merkle tree on device.
-    //
-    // Row-pair commit: each leaf hashes 2 rows (bit-reversed indices) →
-    // num_leaves = lde_size / 2. Tree size: 2*num_leaves - 1 = lde_size - 1.
-    let num_leaves = lde_size / 2;
-    let tight_total_nodes = 2 * num_leaves - 1;
-    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
-    let leaves_offset_bytes = (num_leaves - 1) * 32;
-    {
-        let mut leaves_view =
-            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
-        let log_num_rows = log_lde;
-        let num_parts_u64 = m as u64;
-        let grid = (num_leaves as u32).div_ceil(128);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
-                .arg(&buf)
-                .arg(&col_stride_u64)
-                .arg(&num_parts_u64)
-                .arg(&lde_u64)
-                .arg(&log_num_rows)
-                .arg(&mut leaves_view)
-                .launch(cfg)?;
-        }
-    }
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-
-    // D2H LDE and tree.
-    debug_assert_eq!(merkle_nodes_out.len(), tight_total_nodes * 32);
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, merkle_nodes_out)?;
-
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
-    Ok(())
+    evaluate_poly_coset_batch_ext3_into_inner(
+        coefs,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        Some(merkle_nodes_out),
+        false,
+    )
+    .map(|_| ())
 }
 /// Batched coset LDE for Goldilocks **cubic extension** columns.
 ///
