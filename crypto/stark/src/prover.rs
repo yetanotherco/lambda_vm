@@ -24,7 +24,6 @@ use rayon::prelude::{
 
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
-use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
@@ -1439,7 +1438,7 @@ pub trait IsStarkProver<
             let (domain, twiddles) = domain_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    let d = new_domain(*air, trace_length);
+                    let d = Domain::new(*air, trace_length);
                     let t = LdeTwiddles::new(&d);
                     (Arc::new(d), Arc::new(t))
                 })
