@@ -75,13 +75,19 @@ pub fn main() -> ! {
     init_allocator();
 
     let blob = read_private_input();
-    // The decoded tuple is unused by design — we want the deserialization
-    // work to actually happen, then discard the result. `core::hint::black_box`
-    // prevents LLVM from optimizing the call away.
     let decoded: (VmProof, Vec<u8>, ProofOptions) =
         postcard::from_bytes(blob).expect("failed to deserialize");
-    core::hint::black_box(&decoded);
 
-    commit(&[1u8]);
+    // Force the commit byte to depend on the actually-decoded value. Without
+    // this, LLVM at -O3 was eliding the postcard decode entirely — the only
+    // sinks for `decoded` were `black_box(&decoded)` (which only forces the
+    // *reference* to materialize, not the pointee) and `Drop`, neither of
+    // which require the decoded bytes to be real. With the commit byte tied
+    // to a deep field of the decoded value, the decode has to run.
+    let proof_options_byte = decoded.2.blowup_factor;
+    let inner_elf_byte = *decoded.1.first().unwrap_or(&0);
+    let marker = proof_options_byte ^ inner_elf_byte;
+
+    commit(&[marker]);
     halt()
 }
