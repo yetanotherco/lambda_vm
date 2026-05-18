@@ -376,7 +376,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         }
     }
 
-    // Inner tree levels — identical to the R2 version.
+    // Inner tree levels, identical to the R2 version.
     {
         let mut level_begin: u64 = (num_leaves - 1) as u64;
         while level_begin != 0 {
