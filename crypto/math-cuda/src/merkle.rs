@@ -55,7 +55,6 @@ pub fn keccak_leaves_base(
         &mut out_dev.as_view_mut(),
     )?;
     let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
     Ok(out)
 }
 
@@ -90,7 +89,6 @@ pub fn keccak_leaves_ext3(
         &mut out_dev.as_view_mut(),
     )?;
     let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
     Ok(out)
 }
 
@@ -213,7 +211,6 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
     Ok(out)
 }
 
@@ -316,7 +313,6 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
     drop(staging);
     Ok(out)
 }
@@ -367,7 +363,6 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
     Ok(out)
 }
 
