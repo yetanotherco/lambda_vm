@@ -421,7 +421,10 @@ pub trait IsStarkProver<
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
-    /// useful for setting up soundness test scenarios.
+    /// useful for setting up soundness test scenarios. Only available under
+    /// `cfg(test)` (in-crate) or with the `test-utils` Cargo feature
+    /// (cross-crate tests).
+    #[cfg(any(test, feature = "test-utils"))]
     fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
