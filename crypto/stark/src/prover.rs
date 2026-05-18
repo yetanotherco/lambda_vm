@@ -104,7 +104,7 @@ pub enum ProvingError {
 
 /// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
 /// in the first round of the STARK Prove protocol.
-pub struct Round1CommitmentData<F>
+pub(crate) struct Round1CommitmentData<F>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -124,7 +124,7 @@ where
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
-pub struct Round1<Field, FieldExtension>
+pub(crate) struct Round1<Field, FieldExtension>
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
@@ -158,7 +158,7 @@ where
 
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
 /// Borrowed (not consumed) when building `Round1` in Phase D.
-pub struct Round1Commitments<Field, FieldExtension>
+pub(crate) struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
@@ -257,7 +257,7 @@ where
 /// The `coset_weights` vector stores `[n_inv, n_inv*g, n_inv*g², ..., n_inv*g^{n-1}]`
 /// where `g` is the coset offset and `n_inv = 1/n`. These are used in the iFFT+coset-shift
 /// step of `expand_columns_to_lde`.
-pub struct LdeTwiddles<F: IsFFTField> {
+pub(crate) struct LdeTwiddles<F: IsFFTField> {
     inv: LayerTwiddles<F>,
     fwd: LayerTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
@@ -316,7 +316,7 @@ fn table_parallelism() -> usize {
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
-pub struct Round2<F>
+pub(crate) struct Round2<F>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -330,7 +330,7 @@ where
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
-pub struct Round3<F: IsField> {
+pub(crate) struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main ans auxiliary, at the out-of-domain challenge.
     trace_ood_evaluations: Table<F>,
     /// Evaluations of the composition polynomial parts at the out-of-domain challenge.
@@ -338,7 +338,7 @@ pub struct Round3<F: IsField> {
 }
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
-pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
+pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
     fri_last_value: FieldElement<E>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
@@ -378,6 +378,12 @@ where
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
+///
+/// Note: many default-method signatures expose `pub(crate)` round-state types
+/// (`Round1`, `Round2`, `Round3`, `Round4`, `LdeTwiddles`). These are internal
+/// helpers — only `prove`, `multi_prove` are meant for callers. The
+/// `private_interfaces` allow is removed once these helpers move off the trait.
+#[allow(private_interfaces)]
 pub trait IsStarkProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
