@@ -586,52 +586,56 @@ fn test_recursion_step_breakdown() {
         .expect("postcard encode failed");
     eprintln!("[step-bkd] postcard blob: {} bytes", blob.len());
 
-    // Resolve step entry PCs from the recursion ELF. Substring-match the
-    // mangled symbol — Rust name mangling preserves identifier characters,
-    // so the method name is always a contiguous substring of its mangled
-    // symbol. If multiple monomorphizations or clones exist, pick the one
-    // with the largest size (the actual implementation, not a cold thunk).
+    // Build a per-step "advance bucket to N" lookup. The verifier's step
+    // functions get inlined by LLVM in release mode, so we can't rely on
+    // matching their entry PCs directly. Instead we anchor on closures the
+    // compiler emits *inside* each step's body — iterator combinators like
+    // `.fold(|...|)` keep the step's method name as a substring in their
+    // mangled symbol. Any PC that resolves to a symbol containing step N's
+    // keyword advances the bucket to N (monotonically).
+    //
+    // If step N has no matching symbol at all (e.g. step 4 is fully inlined
+    // with no closure children of its own), its cycles get attributed to the
+    // previous bucket. We report that explicitly in the summary.
     let symbols = SymbolTable::parse(&recursion_elf_bytes);
     assert!(
         !symbols.is_empty(),
         "recursion ELF has no symbol table — was it stripped?"
     );
 
-    let find = |needle: &str| -> u64 {
-        let mut candidates: Vec<_> = symbols
+    let step_keywords = [
+        "replay_rounds_after_round_1",
+        "step_2_verify_claimed_composition_polynomial",
+        "step_3_verify_fri",
+        "step_4_verify_trace_and_composition_openings",
+    ];
+    let step_found: [bool; 4] = std::array::from_fn(|i| {
+        symbols
             .functions()
             .iter()
-            .filter(|f| f.name.contains(needle))
-            .collect();
-        assert!(
-            !candidates.is_empty(),
-            "no symbol containing {needle:?} found in recursion ELF"
+            .any(|f| f.name.contains(step_keywords[i]))
+    });
+    for (i, found) in step_found.iter().enumerate() {
+        let n_matches = symbols
+            .functions()
+            .iter()
+            .filter(|f| f.name.contains(step_keywords[i]))
+            .count();
+        eprintln!(
+            "[step-bkd] step {}: keyword={:?} -> {} symbol(s) {}",
+            i + 1,
+            step_keywords[i],
+            n_matches,
+            if *found {
+                ""
+            } else {
+                "(fully inlined; will merge into the previous bucket)"
+            }
         );
-        candidates.sort_by_key(|f| std::cmp::Reverse(f.size));
-        if candidates.len() > 1 {
-            eprintln!(
-                "[step-bkd] note: {} candidates for {:?}, picking the largest (size={})",
-                candidates.len(),
-                needle,
-                candidates[0].size
-            );
-        }
-        candidates[0].address
-    };
+    }
 
-    let step1_entry = find("replay_rounds_after_round_1");
-    let step2_entry = find("step_2_verify_claimed_composition_polynomial");
-    let step3_entry = find("step_3_verify_fri");
-    let step4_entry = find("step_4_verify_trace_and_composition_openings");
-
-    eprintln!("[step-bkd] step entry PCs:");
-    eprintln!("  step 1 (replay):           0x{:x}", step1_entry);
-    eprintln!("  step 2 (composition poly): 0x{:x}", step2_entry);
-    eprintln!("  step 3 (fri):              0x{:x}", step3_entry);
-    eprintln!("  step 4 (deep openings):    0x{:x}", step4_entry);
-
-    // Monotonic state machine: 0=setup, 1..=4=inside step N or its callees.
-    // The bucket only advances when the PC lands exactly on a step's entry.
+    // Monotonic state machine: 0=setup, 1..=4=inside step N (or its callees /
+    // inlined-step-N-cycles attributed here because step N+1 is missing).
     let mut bucket: u8 = 0;
     let mut buckets = [0u64; 5];
 
@@ -639,23 +643,41 @@ fn test_recursion_step_breakdown() {
     let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
     let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
 
+    // Cache the last symbol-table hit so we only do a binary search on
+    // function transitions, not on every cycle. Functions are typically
+    // long-running (>>1 instruction), so this cache hits ~all of the time.
+    let mut last_range: Option<(u64, u64)> = None;
+    let mut last_advance: u8 = 0;
+
     let start = std::time::Instant::now();
     let mut total_cycles: u64 = 0;
     let mut chunks: usize = 0;
     while let Some(logs) = executor.resume().expect("executor resume failed") {
         for log in logs {
             let pc = log.current_pc;
-            if bucket < 1 && pc == step1_entry {
-                bucket = 1;
+            let in_cached = matches!(last_range, Some((s, e)) if pc >= s && pc < e);
+            if !in_cached {
+                // Slow path: refresh the cache from the symbol table.
+                if let Some(sym) = symbols.lookup(pc) {
+                    // SymbolTable accepts size=0 symbols as "any address >="; for
+                    // those we'd need the next symbol's start for a real upper
+                    // bound. Cheapest workaround: set a tiny range so we re-resolve
+                    // soon enough that wrong attribution is bounded.
+                    let end = sym.address + sym.size.max(1);
+                    last_range = Some((sym.address, end));
+                    last_advance = 0;
+                    for (i, kw) in step_keywords.iter().enumerate() {
+                        if sym.name.contains(kw) {
+                            last_advance = (i + 1) as u8;
+                        }
+                    }
+                } else {
+                    last_range = None;
+                    last_advance = 0;
+                }
             }
-            if bucket < 2 && pc == step2_entry {
-                bucket = 2;
-            }
-            if bucket < 3 && pc == step3_entry {
-                bucket = 3;
-            }
-            if bucket < 4 && pc == step4_entry {
-                bucket = 4;
+            if bucket < last_advance {
+                bucket = last_advance;
             }
             buckets[bucket as usize] += 1;
         }
