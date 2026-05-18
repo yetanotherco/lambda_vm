@@ -615,6 +615,10 @@ pub fn prove_with_options_and_inputs(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    debug_assert_eq!(
+        traces.public_output_bytes, result.return_values.memory_values,
+        "public output diverged between executor view and trace reconstruction"
+    );
     drop(result);
 
     #[cfg(feature = "instruments")]
@@ -672,11 +676,6 @@ pub fn prove_with_options_and_inputs(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-
-    debug_assert_eq!(
-        traces.public_output_bytes, result.return_values.memory_values,
-        "public output diverged between executor view and trace reconstruction"
-    );
 
     Ok(VmProof {
         proof,
