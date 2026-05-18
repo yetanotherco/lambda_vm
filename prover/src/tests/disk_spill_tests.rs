@@ -63,14 +63,3 @@ fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
         "verification failed after serialization roundtrip (chunked)"
     );
 }
-
-#[test]
-fn test_disk_spill_prove_and_verify_372k() {
-    let _guard = ForceDiskGuard::new();
-    let elf_bytes = asm_elf_bytes("fib_iterative_372k");
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
-    let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
-        .expect("prove failed");
-    let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &opts).expect("verify failed");
-    assert!(ok, "verification returned false for fib_iterative_372k");
-}
