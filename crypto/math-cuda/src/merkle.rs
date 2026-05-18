@@ -313,29 +313,7 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
         }
     }
 
-    // Inner tree.
-    {
-        let mut level_begin: u64 = (num_leaves - 1) as u64;
-        while level_begin != 0 {
-            let new_begin = level_begin / 2;
-            let n_pairs = level_begin - new_begin;
-            let grid = (n_pairs as u32).div_ceil(128);
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_merkle_level)
-                    .arg(&mut nodes_dev)
-                    .arg(&new_begin)
-                    .arg(&n_pairs)
-                    .launch(cfg)?;
-            }
-            level_begin = new_begin;
-        }
-    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
@@ -386,29 +364,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         }
     }
 
-    // Inner tree levels, identical to the R2 version.
-    {
-        let mut level_begin: u64 = (num_leaves - 1) as u64;
-        while level_begin != 0 {
-            let new_begin = level_begin / 2;
-            let n_pairs = level_begin - new_begin;
-            let grid = (n_pairs as u32).div_ceil(128);
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_merkle_level)
-                    .arg(&mut nodes_dev)
-                    .arg(&new_begin)
-                    .arg(&n_pairs)
-                    .launch(cfg)?;
-            }
-            level_begin = new_begin;
-        }
-    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;

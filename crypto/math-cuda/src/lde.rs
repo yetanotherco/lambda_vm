@@ -32,6 +32,33 @@ fn assert_u32_domain(n: usize, what: &str) {
     );
 }
 
+/// Output shape requested from the fused LDE + Keccak entry points.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum KeccakCommit {
+    /// Only the `lde_size` keccak-256 leaves; no inner-tree build. Caller
+    /// receives `lde_size * 32` bytes.
+    LeavesOnly,
+    /// Full Merkle tree: leaves at the tail + inner nodes built on-device.
+    /// Caller receives `(2*lde_size - 1) * 32` bytes.
+    FullTree,
+}
+
+impl KeccakCommit {
+    fn total_nodes_bytes(self, lde_size: usize) -> usize {
+        match self {
+            KeccakCommit::LeavesOnly => lde_size * 32,
+            KeccakCommit::FullTree => (2 * lde_size - 1) * 32,
+        }
+    }
+
+    fn leaves_offset_bytes(self, lde_size: usize) -> usize {
+        match self {
+            KeccakCommit::LeavesOnly => 0,
+            KeccakCommit::FullTree => (lde_size - 1) * 32,
+        }
+    }
+}
+
 /// De-interleave `columns` (each `3*n` u64s, ext3-per-element layout
 /// `[a, b, c, a, b, c, ...]`) into `pinned` as `3*m` base-field slabs.
 /// Component `k` of column `c` lands at `pinned[(c*3 + k)*n .. (c*3 + k)*n + n]`.
@@ -124,6 +151,47 @@ fn launch_bit_reverse_batched(
             .arg(&col_stride)
             .launch(cfg)?;
     }
+    Ok(())
+}
+
+/// D2H `dst.len()` bytes from `dev_bytes` into the caller's pageable `dst`
+/// via the pinned-hashes staging buffer. Synchronises the stream first (so
+/// any other D2H queued on the same stream also drains), then does a rayon
+/// chunked memcpy pinned → caller to spread page-fault cost across cores.
+fn d2h_bytes_via_pinned_hashes(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    dev_bytes: &CudaSlice<u8>,
+    dst: &mut [u8],
+) -> Result<()> {
+    let n_bytes = dst.len();
+    let u64_len = n_bytes.div_ceil(8);
+    let staging_slot = be.pinned_hashes();
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(u64_len, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(u64_len) };
+    // Reinterpret the u64 pinned buffer as bytes — same allocation, just
+    // typed differently. SAFETY: u64 has stricter alignment than u8 and the
+    // byte length fits in the `u64_len` capacity (rounded up to u64).
+    let pinned_bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(pinned.as_mut_ptr() as *mut u8, n_bytes) };
+    stream.memcpy_dtoh(dev_bytes, pinned_bytes)?;
+    stream.synchronize()?;
+
+    // Single-threaded `copy_from_slice` faults virgin pageable pages one at
+    // a time; the mm_struct rwsem serialises them at prover scale. Chunk so
+    // ~N cores pre-fault+write in parallel.
+    const CHUNK: usize = 64 * 1024;
+    let src_ptr = pinned_bytes.as_ptr() as usize;
+    dst.par_chunks_mut(CHUNK).enumerate().for_each(|(i, d)| {
+        // SAFETY: each task reads `[i*CHUNK .. i*CHUNK + d.len()]` of
+        // `pinned_bytes`, which is disjoint per `i` and lives until `staging`
+        // is dropped below.
+        let src =
+            unsafe { std::slice::from_raw_parts((src_ptr as *const u8).add(i * CHUNK), d.len()) };
+        d.copy_from_slice(src);
+    });
+    drop(staging);
     Ok(())
 }
 
@@ -332,7 +400,15 @@ pub fn coset_lde_batch_base(
     let m_u32 = m as u32;
 
     // === 1. Bit-reverse first N of every column ===
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
 
     // === 2. iNTT body over all columns ===
     run_batched_ntt_body(
@@ -346,10 +422,26 @@ pub fn coset_lde_batch_base(
     )?;
 
     // === 3. Pointwise multiply by coset weights (includes 1/N) ===
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        m_u32,
+    )?;
 
     // === 4. Bit-reverse full LDE of every column ===
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
 
     // === 5. Forward NTT on full LDE of every column ===
     run_batched_ntt_body(
@@ -461,7 +553,15 @@ pub fn coset_lde_batch_base_into(
     let m_u32 = m as u32;
 
     // iNTT bit-reverse + body, pointwise mul, forward bit-reverse + body.
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -471,8 +571,24 @@ pub fn coset_lde_batch_base_into(
         col_stride_u64,
         m_u32,
     )?;
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        m_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -507,6 +623,10 @@ pub fn coset_lde_batch_base_into(
 ///
 /// `hashed_leaves_out` must be `lde_size * 32` bytes (one 32-byte digest
 /// per output row, in natural row order).
+/// Fused LDE + Keccak-256 leaf hashing. Caller receives the `lde_size * 32`
+/// bytes of leaf hashes in `hashed_leaves_out`. Thin wrapper over
+/// `coset_lde_batch_base_into_with_merkle_tree_inner` with `LeavesOnly` —
+/// no inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -514,145 +634,16 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     outputs: &mut [&mut [u64]],
     hashed_leaves_out: &mut [u8],
 ) -> Result<()> {
-    if columns.is_empty() {
-        assert_eq!(outputs.len(), 0);
-        return Ok(());
-    }
-    let m = columns.len();
-    assert_eq!(outputs.len(), m);
-    let n = columns[0].len();
-    // (is_power_of_two returns false for 0).
-    if n == 0 {
-        return Ok(());
-    }
-    assert!(n.is_power_of_two());
-    assert_eq!(weights.len(), n);
-    assert!(blowup_factor.is_power_of_two());
-    let lde_size = n * blowup_factor;
-    assert_u32_domain(
-        lde_size,
-        "coset_lde_batch_base_into_with_leaf_hash lde_size",
-    );
-    for o in outputs.iter() {
-        assert_eq!(o.len(), lde_size);
-    }
-    assert_eq!(hashed_leaves_out.len(), lde_size * 32);
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
-
-    let be = backend()?;
-    let stream = be.next_stream();
-    let staging_slot = be.pinned_staging();
-
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(m * lde_size, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
-
-    let pinned_base_ptr = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        // SAFETY: disjoint regions per c, outer staging lock held.
-        let dst =
-            unsafe { std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n) };
-        dst.copy_from_slice(col);
-    });
-
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    for c in 0..m {
-        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
-    }
-
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // iNTT
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    // pointwise coset scale
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
-    // forward NTT on full LDE slab
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // Keccak-256 leaf hashing directly on the device LDE buffer.
-    let mut hashes_dev = stream.alloc_zeros::<u8>(lde_size * 32)?;
-    launch_keccak_base(
-        stream.as_ref(),
-        &buf,
-        col_stride_u64,
-        m as u64,
-        lde_u64,
-        &mut hashes_dev.as_view_mut(),
-    )?;
-
-    // D2H the LDE into the pinned LDE staging, then the hashes into a
-    // dedicated pinned hash staging. The two copies run back-to-back on the
-    // same stream; both go at pinned PCIe line-rate — pageable D2H of the
-    // 128 MB hash buffer would otherwise cost ~100 ms per main-trace commit.
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
-    let hashes_u64_len = (lde_size * 32).div_ceil(8);
-    let hashes_staging_slot = be.pinned_hashes();
-    let mut hashes_staging = hashes_staging_slot.lock().unwrap();
-    hashes_staging.ensure_capacity(hashes_u64_len, &be.ctx)?;
-    let hashes_pinned = unsafe { hashes_staging.as_mut_slice(hashes_u64_len) };
-    // `memcpy_dtoh` needs a byte slice. Reinterpret the u64 pinned buffer
-    // as bytes — same allocation, just typed differently.
-    let hashes_pinned_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(hashes_pinned.as_mut_ptr() as *mut u8, lde_size * 32)
-    };
-    stream.memcpy_dtoh(&hashes_dev, hashes_pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Copy pinned → caller outputs. Both D2H copies have already drained
-    // (the synchronize above); this is a rayon-parallel host memcpy from
-    // pinned to pageable memory, not concurrent with any GPU transfer.
-    let pinned_ptr = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let src = unsafe {
-            std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
-        };
-        dst.copy_from_slice(src);
-    });
-    // Rayon-parallel memcpy of 128 MB from pinned → caller. Single-threaded
-    // `copy_from_slice` faults virgin pageable pages one at a time; the
-    // mm_struct rwsem serialises them into ~100 ms at 1M-fib scale. Chunk
-    // the slice so ~N cores pre-fault+write in parallel.
-    const CHUNK: usize = 64 * 1024; // 64 KiB ≈ 16 pages per chunk
-    let pinned_hash_ptr = hashes_pinned_bytes.as_ptr() as usize;
-    hashed_leaves_out
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts((pinned_hash_ptr as *const u8).add(i * CHUNK), dst.len())
-            };
-            dst.copy_from_slice(src);
-        });
-    drop(hashes_staging);
-    drop(staging);
-    Ok(())
+    coset_lde_batch_base_into_with_merkle_tree_inner(
+        columns,
+        blowup_factor,
+        weights,
+        outputs,
+        hashed_leaves_out,
+        KeccakCommit::LeavesOnly,
+        false,
+    )
+    .map(|_| ())
 }
 
 /// Like `coset_lde_batch_base_into_with_leaf_hash`, but also builds the full
@@ -676,6 +667,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
         weights,
         outputs,
         merkle_nodes_out,
+        KeccakCommit::FullTree,
         false,
     )
     .map(|_| ())
@@ -697,6 +689,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
         weights,
         outputs,
         merkle_nodes_out,
+        KeccakCommit::FullTree,
         true,
     )?;
     let handle = opt.expect("keep_device_buf=true must return Some");
@@ -708,7 +701,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     blowup_factor: usize,
     weights: &[u64],
     outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
+    nodes_out: &mut [u8],
+    commit: KeccakCommit,
     keep_device_buf: bool,
 ) -> Result<Option<GpuLdeBase>> {
     if columns.is_empty() {
@@ -733,8 +727,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size);
     }
-    let total_nodes = 2 * lde_size - 1;
-    assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
+    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
+    assert_eq!(nodes_out.len(), nodes_dev_bytes);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
@@ -769,7 +763,15 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let m_u32 = m as u32;
 
     // iNTT
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -779,9 +781,25 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         col_stride_u64,
         m_u32,
     )?;
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, m_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        m_u32,
+    )?;
     // forward NTT at LDE size
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, m_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -792,17 +810,14 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         m_u32,
     )?;
 
-    // Allocate the full node buffer; leaves occupy the tail slab, inner
-    // nodes are written by the pair-hash level kernel below. `alloc` (not
-    // `alloc_zeros`) is safe because every byte is written before it is
-    // read: leaf kernel fills the tail, tree kernel fills the head.
-    //
-    // The leaf kernel writes to `nodes_dev` starting at byte offset
-    // `(lde_size - 1) * 32`; we pass the base pointer as-is because the
-    // kernel indexes linearly from `hashed_leaves_out[row_idx * 32]`, so we
-    // build an offset device slice and feed that to the launch.
-    let mut nodes_dev = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
-    let leaves_offset_bytes = (lde_size - 1) * 32;
+    // Allocate the device output buffer. In `LeavesOnly` mode this is just
+    // `lde_size * 32` bytes (the leaves themselves); in `FullTree` mode it's
+    // `(2*lde_size - 1) * 32` bytes (leaves in the tail + inner nodes filled
+    // below). `alloc` (not `alloc_zeros`) is safe because every byte is
+    // written before any reader sees it: the keccak kernel fills the
+    // leaves slab, the inner-tree pass (when present) fills the head.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
+    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
@@ -816,23 +831,15 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         )?;
     }
 
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+    if commit == KeccakCommit::FullTree {
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+    }
 
-    // D2H the LDE and the tree nodes via pinned staging.
+    // D2H the LDE and the tree/leaves nodes via pinned staging.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    let tree_u64_len = (total_nodes * 32).div_ceil(8);
-    let tree_staging_slot = be.pinned_hashes();
-    let mut tree_staging = tree_staging_slot.lock().unwrap();
-    tree_staging.ensure_capacity(tree_u64_len, &be.ctx)?;
-    let tree_pinned = unsafe { tree_staging.as_mut_slice(tree_u64_len) };
-    let tree_pinned_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(tree_pinned.as_mut_ptr() as *mut u8, total_nodes * 32)
-    };
-    stream.memcpy_dtoh(&nodes_dev, tree_pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Parallel memcpy pinned → caller.
+    // Pinned LDE → caller outputs (post-sync host memcpy).
     let pinned_ptr = pinned.as_ptr() as usize;
     outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
         let src = unsafe {
@@ -840,18 +847,6 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         };
         dst.copy_from_slice(src);
     });
-    const CHUNK: usize = 64 * 1024;
-    let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
-    merkle_nodes_out
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts((pinned_tree_ptr as *const u8).add(i * CHUNK), dst.len())
-            };
-            dst.copy_from_slice(src);
-        });
-    drop(tree_staging);
     drop(staging);
 
     if keep_device_buf {
@@ -866,9 +861,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 }
 
-/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: run an LDE
-/// over ext3 columns AND emit Keccak-256 Merkle leaves, all in one on-device
-/// pipeline.
+/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused
+/// LDE + Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
+/// `coset_lde_batch_ext3_into_with_merkle_tree_inner` with `LeavesOnly`.
 pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     columns: &[&[u64]],
     n: usize,
@@ -877,124 +872,17 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     outputs: &mut [&mut [u64]],
     hashed_leaves_out: &mut [u8],
 ) -> Result<()> {
-    if columns.is_empty() {
-        assert_eq!(outputs.len(), 0);
-        return Ok(());
-    }
-    // (is_power_of_two returns false for 0).
-    if n == 0 {
-        return Ok(());
-    }
-    let m = columns.len();
-    assert_eq!(outputs.len(), m);
-    assert!(n.is_power_of_two());
-    assert_eq!(weights.len(), n);
-    assert!(blowup_factor.is_power_of_two());
-    for c in columns.iter() {
-        assert_eq!(c.len(), 3 * n);
-    }
-    let lde_size = n * blowup_factor;
-    assert_u32_domain(
-        lde_size,
-        "coset_lde_batch_ext3_into_with_leaf_hash lde_size",
-    );
-    for o in outputs.iter() {
-        assert_eq!(o.len(), 3 * lde_size);
-    }
-    assert_eq!(hashed_leaves_out.len(), lde_size * 32);
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
-
-    let mb = 3 * m;
-    let be = backend()?;
-    let stream = be.next_stream();
-    let staging_slot = be.pinned_staging();
-
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
-
-    pack_ext3_to_pinned_slabs(columns, pinned, n);
-
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
-    }
-
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-
-    // Keccak-256 on the de-interleaved device buffer (3M base slabs).
-    let mut hashes_dev = stream.alloc_zeros::<u8>(lde_size * 32)?;
-    launch_keccak_ext3(
-        stream.as_ref(),
-        &buf,
-        col_stride_u64,
-        m as u64,
-        lde_u64,
-        &mut hashes_dev.as_view_mut(),
-    )?;
-
-    // D2H LDE (mb * lde_size u64) and hashes (lde_size * 32 bytes).
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    let hashes_u64_len = (lde_size * 32).div_ceil(8);
-    let hashes_staging_slot = be.pinned_hashes();
-    let mut hashes_staging = hashes_staging_slot.lock().unwrap();
-    hashes_staging.ensure_capacity(hashes_u64_len, &be.ctx)?;
-    let hashes_pinned = unsafe { hashes_staging.as_mut_slice(hashes_u64_len) };
-    let hashes_pinned_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(hashes_pinned.as_mut_ptr() as *mut u8, lde_size * 32)
-    };
-    stream.memcpy_dtoh(&hashes_dev, hashes_pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Re-interleave pinned → caller ext3 outputs, parallel.
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-
-    // Parallel memcpy of pinned hashes → caller.
-    const CHUNK: usize = 64 * 1024;
-    let hash_src_ptr = hashes_pinned_bytes.as_ptr() as usize;
-    hashed_leaves_out
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts((hash_src_ptr as *const u8).add(i * CHUNK), dst.len())
-            };
-            dst.copy_from_slice(src);
-        });
-    drop(hashes_staging);
-    drop(staging);
-    Ok(())
+    coset_lde_batch_ext3_into_with_merkle_tree_inner(
+        columns,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        hashed_leaves_out,
+        KeccakCommit::LeavesOnly,
+        false,
+    )
+    .map(|_| ())
 }
 
 /// Ext3 variant of the fused `coset_lde_batch_base_into_with_merkle_tree`.
@@ -1015,6 +903,7 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
         weights,
         outputs,
         merkle_nodes_out,
+        KeccakCommit::FullTree,
         false,
     )
     .map(|_| ())
@@ -1038,18 +927,21 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
         weights,
         outputs,
         merkle_nodes_out,
+        KeccakCommit::FullTree,
         true,
     )?;
     Ok(opt.expect("keep_device_buf=true must return Some"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     n: usize,
     blowup_factor: usize,
     weights: &[u64],
     outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
+    nodes_out: &mut [u8],
+    commit: KeccakCommit,
     keep_device_buf: bool,
 ) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
@@ -1076,8 +968,8 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
-    let total_nodes = 2 * lde_size - 1;
-    assert_eq!(merkle_nodes_out.len(), total_nodes * 32);
+    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
+    assert_eq!(nodes_out.len(), nodes_dev_bytes);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
 
@@ -1107,7 +999,15 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1117,8 +1017,24 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         col_stride_u64,
         mb_u32,
     )?;
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1129,9 +1045,11 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         mb_u32,
     )?;
 
-    // Allocate full tree buffer; leaf kernel writes to the tail slab.
-    let mut nodes_dev = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
-    let leaves_offset_bytes = (lde_size - 1) * 32;
+    // Allocate device output buffer (LeavesOnly → lde_size*32; FullTree →
+    // (2*lde_size - 1)*32). Leaf kernel writes to the leaves slab; the
+    // inner-tree pass (when present) fills the head.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
+    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
@@ -1145,36 +1063,15 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         )?;
     }
 
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+    if commit == KeccakCommit::FullTree {
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+    }
 
-    // D2H LDE (mb * lde_size u64) and tree nodes.
+    // D2H LDE (mb * lde_size u64) and tree/leaves nodes.
     stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    let tree_u64_len = (total_nodes * 32).div_ceil(8);
-    let tree_staging_slot = be.pinned_hashes();
-    let mut tree_staging = tree_staging_slot.lock().unwrap();
-    tree_staging.ensure_capacity(tree_u64_len, &be.ctx)?;
-    let tree_pinned = unsafe { tree_staging.as_mut_slice(tree_u64_len) };
-    let tree_pinned_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(tree_pinned.as_mut_ptr() as *mut u8, total_nodes * 32)
-    };
-    stream.memcpy_dtoh(&nodes_dev, tree_pinned_bytes)?;
-    stream.synchronize()?;
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    // Re-interleave pinned → caller ext3 outputs.
     unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-
-    const CHUNK: usize = 64 * 1024;
-    let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
-    merkle_nodes_out
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts((pinned_tree_ptr as *const u8).add(i * CHUNK), dst.len())
-            };
-            dst.copy_from_slice(src);
-        });
-    drop(tree_staging);
     drop(staging);
 
     if keep_device_buf {
@@ -1282,10 +1179,26 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     let mb_u32 = mb as u32;
 
     // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
 
     // Bit-reverse full lde_size slab, then forward DIT NTT.
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1381,8 +1294,24 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1427,35 +1356,11 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     // D2H LDE and tree.
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    let tree_u64_len = (tight_total_nodes * 32).div_ceil(8);
-    let tree_staging_slot = be.pinned_hashes();
-    let mut tree_staging = tree_staging_slot.lock().unwrap();
-    tree_staging.ensure_capacity(tree_u64_len, &be.ctx)?;
-    let tree_pinned = unsafe { tree_staging.as_mut_slice(tree_u64_len) };
-    let tree_pinned_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(tree_pinned.as_mut_ptr() as *mut u8, tight_total_nodes * 32)
-    };
-    stream.memcpy_dtoh(&nodes_dev, tree_pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Re-interleave pinned → caller ext3 outputs.
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-
-    // Copy pinned tree → caller nodes_out.
     debug_assert_eq!(merkle_nodes_out.len(), tight_total_nodes * 32);
-    const CHUNK: usize = 64 * 1024;
-    let pinned_tree_ptr = tree_pinned_bytes.as_ptr() as usize;
-    merkle_nodes_out
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let src = unsafe {
-                std::slice::from_raw_parts((pinned_tree_ptr as *const u8).add(i * CHUNK), dst.len())
-            };
-            dst.copy_from_slice(src);
-        });
-    drop(tree_staging);
+    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, merkle_nodes_out)?;
+
+    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
     Ok(())
 }
@@ -1545,7 +1450,15 @@ pub fn coset_lde_batch_ext3_into(
 
     // === Butterflies: identical to the base-field batched path, but with
     // grid.y = 3M instead of M. ===
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
@@ -1555,8 +1468,24 @@ pub fn coset_lde_batch_ext3_into(
         col_stride_u64,
         mb_u32,
     )?;
-    launch_pointwise_mul_batched(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, col_stride_u64, mb_u32)?;
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, lde_u64, log_lde, col_stride_u64, mb_u32)?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,
