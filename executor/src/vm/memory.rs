@@ -186,7 +186,9 @@ impl Memory {
         if inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }
-        self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
+        let len_u32 =
+            u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
+        self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
         self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
         Ok(())
     }
