@@ -70,7 +70,7 @@ prepare-test-data:
 	fi
 
 prepare-sysroot:
-	@if [ -d "$(SYSROOT_DIR)" ]; then \
+	@if [ -d "$(SYSROOT_DIR)/include" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	else \
 		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
