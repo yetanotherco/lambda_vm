@@ -387,8 +387,10 @@ pub struct Round3Chunks<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
+    /// Coefficients of the final FRI polynomial. Length 1 (the constant) in
+    /// the binary-fold / no-early-stop path; longer when early stopping ships
+    /// a higher-degree last polynomial.
+    fri_last_value: Vec<FieldElement<E>>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
     fri_layers_merkle_roots: Vec<Commitment>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
@@ -408,7 +410,7 @@ pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
 /// Merkle inclusion proofs) instead of the single-H `DeepPolynomialOpenings`.
 #[allow(dead_code)] // wired in Phase 4.4
 pub struct Round4Chunks<F: IsSubFieldOf<E>, E: IsField> {
-    pub(crate) fri_last_value: FieldElement<E>,
+    pub(crate) fri_last_value: Vec<FieldElement<E>>,
     pub(crate) fri_layers_merkle_roots: Vec<Commitment>,
     pub(crate) deep_poly_openings: crate::proof::stark::DeepPolynomialOpeningsChunks<F, E>,
     pub(crate) query_list: Vec<FriDecommitment<E>>,

@@ -212,7 +212,11 @@ pub trait IsStarkVerifier<
         zetas.push(transcript.sample_field_element());
 
         // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // pₙ: one element in the binary-fold path; the Vec carries the final
+        // polynomial coefficients when early stopping is enabled.
+        for coef in &proof.fri_last_value {
+            transcript.append_field_element(coef);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -660,7 +664,8 @@ pub trait IsStarkVerifier<
         // In this case, the fold loop below doesn't iterate, so we need to verify
         // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+            // Binary fold: fri_last_value has length 1 (the constant).
+            return proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
         }
 
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
@@ -676,9 +681,11 @@ pub trait IsStarkVerifier<
                 true,
                 |result,
                  (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
+                    (((i, merkle_root), auth_path_sym), evaluation_sym_layer),
                     evaluation_point_inv,
                 )| {
+                    // Binary fold: each layer carries exactly one sibling.
+                    let evaluation_sym = &evaluation_sym_layer[0];
                     // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
                     // `v` is pᵢ(𝜐^(2ⁱ)).
                     // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
@@ -701,8 +708,11 @@ pub trait IsStarkVerifier<
                     if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
                         result & openings_ok
                     } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
+                        // Check that final value is the given by the prover.
+                        // Binary fold: fri_last_value has length 1.
+                        let last_ok =
+                            proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
+                        result & last_ok & openings_ok
                     }
                 },
             )
@@ -1161,7 +1171,11 @@ pub trait IsStarkVerifier<
         zetas.push(transcript.sample_field_element());
 
         // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // pₙ: one element in the binary-fold path; the Vec carries the final
+        // polynomial coefficients when early stopping is enabled.
+        for coef in &proof.fri_last_value {
+            transcript.append_field_element(coef);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1396,7 +1410,11 @@ pub trait IsStarkVerifier<
             })
             .collect::<Vec<FieldElement<FieldExtension>>>();
         zetas.push(transcript.sample_field_element());
-        transcript.append_field_element(&proof.fri_last_value);
+        // pₙ: one element in the binary-fold path; the Vec carries the final
+        // polynomial coefficients when early stopping is enabled.
+        for coef in &proof.fri_last_value {
+            transcript.append_field_element(coef);
+        }
 
         // Grinding replay.
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1892,7 +1910,10 @@ pub trait IsStarkVerifier<
                 let mut index = *iota_s;
 
                 if fri_layers_merkle_roots.is_empty() {
-                    return result & (v == proof.fri_last_value);
+                    // Binary fold: fri_last_value has length 1.
+                    let last_ok =
+                        proof.fri_last_value.len() == 1 && v == proof.fri_last_value[0];
+                    return result & last_ok;
                 }
 
                 let inner = fri_layers_merkle_roots
@@ -1904,7 +1925,9 @@ pub trait IsStarkVerifier<
                     .fold(
                         true,
                         |inner_ok,
-                         ((((j, merkle_root), auth_path_sym), evaluation_sym), evaluation_point_inv)| {
+                         ((((j, merkle_root), auth_path_sym), evaluation_sym_layer), evaluation_point_inv)| {
+                            // Binary fold: each layer carries exactly one sibling.
+                            let evaluation_sym = &evaluation_sym_layer[0];
                             let openings_ok = Self::verify_fri_layer_openings(
                                 merkle_root,
                                 auth_path_sym,
@@ -1921,7 +1944,10 @@ pub trait IsStarkVerifier<
                             if j < proof_s.layers_evaluations_sym.len() - 1 {
                                 inner_ok & openings_ok
                             } else {
-                                inner_ok & (v == proof.fri_last_value) & openings_ok
+                                // Binary fold: fri_last_value has length 1.
+                                let last_ok = proof.fri_last_value.len() == 1
+                                    && v == proof.fri_last_value[0];
+                                inner_ok & last_ok & openings_ok
                             }
                         },
                     );

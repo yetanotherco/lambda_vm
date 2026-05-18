@@ -2322,7 +2322,9 @@ fn chunks_protocol_prove_verify_round_trip_fibonacci() {
 
     // === Tamper fri_last_value: step_3 FRI must catch. ===
     let mut tampered_fri = proof.clone();
-    tampered_fri.fri_last_value = &tampered_fri.fri_last_value + Felt::one();
+    // fri_last_value is a Vec; tamper its first coefficient (the constant in
+    // the binary-fold path).
+    tampered_fri.fri_last_value[0] = &tampered_fri.fri_last_value[0] + Felt::one();
     let mut t2 = DefaultTranscript::<GoldilocksField>::new(&[]);
     assert!(
         !Verifier::<

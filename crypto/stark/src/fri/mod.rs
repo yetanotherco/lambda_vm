@@ -26,7 +26,7 @@ pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> (
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
@@ -77,10 +77,15 @@ where
     // Final fold
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
+    // Binary-fold path: the last evaluation IS the constant polynomial pₙ.
+    // Wrapped in a Vec to share shape with the future folding=4 / early-stop
+    // path that returns multiple coefficients of the final polynomial.
+    let last_value = vec![evals.first().unwrap_or(&FieldElement::zero()).clone()];
 
-    // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
+    // >>>> Send value: pₙ (one element in the binary-fold path)
+    for coef in &last_value {
+        transcript.append_field_element(coef);
+    }
 
     (last_value, fri_layer_list)
 }
@@ -97,15 +102,19 @@ where
         iotas
             .iter()
             .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+                let mut layers_evaluations_sym: Vec<Vec<FieldElement<F>>> =
+                    Vec::with_capacity(num_layers);
                 let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
-                    // symmetric element
+                    // Binary fold: one sibling evaluation per layer (the
+                    // symmetric one). Wrapped in a Vec to share shape with
+                    // the future folding=4 path that yields `folding_factor - 1`
+                    // siblings per leaf.
                     let evaluation_sym = layer.evaluation[index ^ 1].clone();
                     let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
+                    layers_evaluations_sym.push(vec![evaluation_sym]);
                     layers_auth_paths_sym.push(auth_path_sym);
 
                     index >>= 1;

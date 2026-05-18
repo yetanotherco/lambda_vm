@@ -73,8 +73,12 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     // [pₖ]
     pub fri_layers_merkle_roots: Vec<Commitment>,
-    // pₙ
-    pub fri_last_value: FieldElement<E>,
+    /// Last FRI polynomial coefficients. When folding to a constant
+    /// (`fri_last_layer_degree_bound = 0`) this Vec has length 1 holding
+    /// `pₙ` as a single field element. With early stopping the Vec has
+    /// `fri_last_layer_degree_bound + 1` coefficients of the final
+    /// polynomial.
+    pub fri_last_value: Vec<FieldElement<E>>,
     // Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
     pub query_list: Vec<FriDecommitment<E>>,
     // Open(H₁(D_LDE, 𝜐ᵢ), Open(H₂(D_LDE, 𝜐ᵢ), Open(tⱼ(D_LDE), 𝜐ᵢ)
@@ -124,7 +128,8 @@ pub struct StarkProofChunks<F: IsSubFieldOf<E>, E: IsField, PI> {
     /// [`crate::domain::QuotientDomain::recompose_at`].
     pub quotient_chunk_ood_evaluations: Vec<FieldElement<E>>,
     pub fri_layers_merkle_roots: Vec<Commitment>,
-    pub fri_last_value: FieldElement<E>,
+    /// See [`StarkProof::fri_last_value`] for the shape.
+    pub fri_last_value: Vec<FieldElement<E>>,
     pub query_list: Vec<FriDecommitment<E>>,
     pub deep_poly_openings: DeepPolynomialOpeningsChunks<F, E>,
     pub nonce: Option<u64>,
