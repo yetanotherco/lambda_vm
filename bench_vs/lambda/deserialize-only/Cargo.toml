@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "deserialize-only-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-prover = { path = "../../../prover", default-features = false }
+embedded-alloc = "0.6"
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+serde = { version = "=1.0.219", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# Match the recursion guest's keccak patching — even though this guest never
+# hashes anything, lambda-vm-prover pulls `keccak` transitively and we want
+# both guests to share the same dependency graph (so build artifacts are
+# directly comparable).
+[patch.crates-io]
+keccak = { path = "../keccak-patched" }
