@@ -1242,28 +1242,23 @@ pub enum Multiplicity {
 }
 
 impl Multiplicity {
-    /// Evaluate the multiplicity for a single row.
+    /// Single canonical evaluator. Callers supply a `get_col` closure that
+    /// returns the field element for the given column index; this lets the
+    /// same arithmetic serve both the column-major build path (`&main_cols[col][row]`)
+    /// and the constraint-eval path (`step.get_main_evaluation_element(0, col)`).
     #[inline]
-    fn evaluate_at_row<F: IsField>(
-        &self,
-        main_segment_cols: &[Vec<FieldElement<F>>],
-        row: usize,
-    ) -> FieldElement<F> {
+    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    where
+        F: IsField,
+        G: Fn(usize) -> FieldElement<F>,
+    {
         match self {
             Multiplicity::One => FieldElement::one(),
-            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
-            Multiplicity::Sum(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
-            Multiplicity::Diff(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] - &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::Sum3(col_a, col_b, col_c) => {
-                &main_segment_cols[*col_a][row]
-                    + &main_segment_cols[*col_b][row]
-                    + &main_segment_cols[*col_c][row]
-            }
+            Multiplicity::Column(col) => get_col(*col),
+            Multiplicity::Sum(a, b) => get_col(*a) + get_col(*b),
+            Multiplicity::Negated(col) => FieldElement::<F>::one() - get_col(*col),
+            Multiplicity::Diff(a, b) => get_col(*a) - get_col(*b),
+            Multiplicity::Sum3(a, b, c) => get_col(*a) + get_col(*b) + get_col(*c),
             Multiplicity::Linear(terms) => {
                 let mut result = FieldElement::<F>::zero();
                 for term in terms {
@@ -1271,25 +1266,27 @@ impl Multiplicity {
                         LinearTerm::Column {
                             coefficient,
                             column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(coefficient);
-                            result += &main_segment_cols[column][row] * coeff;
-                        }
+                        } => result += get_col(column) * FieldElement::<F>::from(coefficient),
                         LinearTerm::ColumnUnsigned {
                             coefficient,
                             column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(coefficient);
-                            result += &main_segment_cols[column][row] * coeff;
-                        }
-                        LinearTerm::Constant(value) => {
-                            result += FieldElement::<F>::from(value);
-                        }
+                        } => result += get_col(column) * FieldElement::<F>::from(coefficient),
+                        LinearTerm::Constant(value) => result += FieldElement::<F>::from(value),
                     }
                 }
                 result
             }
         }
+    }
+
+    /// Evaluate the multiplicity for a single row of column-major main data.
+    #[inline]
+    fn evaluate_at_row<F: IsField>(
+        &self,
+        main_segment_cols: &[Vec<FieldElement<F>>],
+        row: usize,
+    ) -> FieldElement<F> {
+        self.evaluate_with(|col| main_segment_cols[col][row].clone())
     }
 }
 
@@ -1753,51 +1750,7 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     multiplicity: &Multiplicity,
 ) -> FieldElement<A> {
-    match multiplicity {
-        Multiplicity::One => FieldElement::<A>::one(),
-        Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
-        Multiplicity::Sum(col_a, col_b) => {
-            step.get_main_evaluation_element(0, *col_a)
-                + step.get_main_evaluation_element(0, *col_b)
-        }
-        Multiplicity::Negated(col) => {
-            FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
-        }
-        Multiplicity::Diff(col_a, col_b) => {
-            step.get_main_evaluation_element(0, *col_a)
-                - step.get_main_evaluation_element(0, *col_b)
-        }
-        Multiplicity::Sum3(col_a, col_b, col_c) => {
-            step.get_main_evaluation_element(0, *col_a)
-                + step.get_main_evaluation_element(0, *col_b)
-                + step.get_main_evaluation_element(0, *col_c)
-        }
-        Multiplicity::Linear(terms) => {
-            let mut result = FieldElement::<A>::zero();
-            for term in terms {
-                match term {
-                    LinearTerm::Column {
-                        coefficient,
-                        column,
-                    } => {
-                        let coeff = FieldElement::<A>::from(*coefficient);
-                        result += step.get_main_evaluation_element(0, *column) * coeff;
-                    }
-                    LinearTerm::ColumnUnsigned {
-                        coefficient,
-                        column,
-                    } => {
-                        let coeff = FieldElement::<A>::from(*coefficient);
-                        result += step.get_main_evaluation_element(0, *column) * coeff;
-                    }
-                    LinearTerm::Constant(value) => {
-                        result += FieldElement::<A>::from(*value);
-                    }
-                }
-            }
-            result
-        }
-    }
+    multiplicity.evaluate_with(|col| step.get_main_evaluation_element(0, col).clone())
 }
 
 /// Computes the fingerprint for an interaction from a `TableView`.
