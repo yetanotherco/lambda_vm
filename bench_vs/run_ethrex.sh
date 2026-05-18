@@ -54,7 +54,7 @@ if $NO_COLOR; then
 fi
 
 mkdir -p "$TMP_DIR"
-rm -rf "$TMP_DIR"/*
+rm -rf "${TMP_DIR:?}"/*
 
 if [ -n "$REPORT_DIR" ]; then
     mkdir -p "$REPORT_DIR/raw"

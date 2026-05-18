@@ -76,7 +76,7 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
         [ -n "$SP1_R2" ] && line="$line (R2=${SP1_R2})"
         PROJ_MRKDWN="${PROJ_MRKDWN}\\n${line}"
     fi
-    PROJ_SECTION=',{"type":"header","text":{"type":"plain_text","text":"Linear Projection"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$PROJ_MRKDWN"'"}}'
+    PROJ_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Linear Projection"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$PROJ_MRKDWN"'"}}'
 fi
 
 ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"
@@ -89,7 +89,7 @@ if [ -f "$ETHREX_METRICS_FILE" ]; then
         if [ -n "$ETHREX_CYCLES" ] && [ "$ETHREX_CYCLES" != "n/a" ]; then
             ETHREX_MRKDWN="${ETHREX_MRKDWN} (${ETHREX_CYCLES} cycles)"
         fi
-        ETHREX_SECTION=',{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex Empty"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
+        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex Empty"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
     fi
 fi
 
