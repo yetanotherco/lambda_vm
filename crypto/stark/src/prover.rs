@@ -745,50 +745,20 @@ pub trait IsStarkProver<
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
         let two_inv = two_base.inv().expect("2 is non-zero in the field");
-        let (h0_evals, h1_evals) = {
-            #[cfg(feature = "parallel")]
-            {
-                let (h0, h1): (Vec<_>, Vec<_>) = (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
-                        let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                        // F × E → E (base field scalar on left for mixed multiplication)
-                        (&two_inv * &sum, &inv_2x[i] * &diff)
-                    })
-                    .unzip();
-                (h0, h1)
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                let mut h0 = Vec::with_capacity(n);
-                let mut h1 = Vec::with_capacity(n);
-                for i in 0..n {
-                    let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
-                    let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                    h0.push(&two_inv * &sum);
-                    h1.push(&inv_2x[i] * &diff);
-                }
-                (h0, h1)
-            }
-        };
+        let (h0_evals, h1_evals) = crate::par::map_unzip(n, |i| {
+            let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
+            let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
+            // F × E → E (base field scalar on left for mixed multiplication)
+            (&two_inv * &sum, &inv_2x[i] * &diff)
+        });
 
         // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
         // The squared coset offset is g² (= coset_offset²).
         let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
-
-        #[cfg(feature = "parallel")]
-        let (lde_h0, lde_h1) = rayon::join(
+        let (lde_h0, lde_h1) = crate::par::join(
             || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
             || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
         );
-
-        #[cfg(not(feature = "parallel"))]
-        let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
-
         vec![lde_h0, lde_h1]
     }
 
