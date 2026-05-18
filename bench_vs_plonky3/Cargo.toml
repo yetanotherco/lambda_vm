@@ -8,18 +8,18 @@ stark = { path = "../crypto/stark", features = ["test-utils"] }
 crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
 math = { path = "../crypto/math", features = ["std", "lambdaworks-serde-binary"] }
 
-p3-air = { path = "/Users/juanpablo/Documents/plonky3/air" }
-p3-challenger = { path = "/Users/juanpablo/Documents/plonky3/challenger" }
-p3-commit = { path = "/Users/juanpablo/Documents/plonky3/commit" }
-p3-dft = { path = "/Users/juanpablo/Documents/plonky3/dft", features = ["parallel"] }
-p3-field = { path = "/Users/juanpablo/Documents/plonky3/field" }
-p3-fri = { path = "/Users/juanpablo/Documents/plonky3/fri" }
-p3-goldilocks = { path = "/Users/juanpablo/Documents/plonky3/goldilocks" }
-p3-keccak = { path = "/Users/juanpablo/Documents/plonky3/keccak" }
-p3-matrix = { path = "/Users/juanpablo/Documents/plonky3/matrix" }
-p3-merkle-tree = { path = "/Users/juanpablo/Documents/plonky3/merkle-tree" }
-p3-symmetric = { path = "/Users/juanpablo/Documents/plonky3/symmetric" }
-p3-uni-stark = { path = "/Users/juanpablo/Documents/plonky3/uni-stark", features = ["parallel"] }
+p3-air = { path = "../../plonky3/air" }
+p3-challenger = { path = "../../plonky3/challenger" }
+p3-commit = { path = "../../plonky3/commit" }
+p3-dft = { path = "../../plonky3/dft", features = ["parallel"] }
+p3-field = { path = "../../plonky3/field" }
+p3-fri = { path = "../../plonky3/fri" }
+p3-goldilocks = { path = "../../plonky3/goldilocks" }
+p3-keccak = { path = "../../plonky3/keccak" }
+p3-matrix = { path = "../../plonky3/matrix" }
+p3-merkle-tree = { path = "../../plonky3/merkle-tree" }
+p3-symmetric = { path = "../../plonky3/symmetric" }
+p3-uni-stark = { path = "../../plonky3/uni-stark", features = ["parallel"] }
 
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
