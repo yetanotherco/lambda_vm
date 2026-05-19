@@ -137,7 +137,11 @@ pub trait IsStarkVerifier<
             .iter()
             .zip(&boundary_points)
             .map(|(c, point)| {
-                let column_idx = if c.is_aux { main_trace_width + c.col } else { c.col };
+                let column_idx = if c.is_aux {
+                    main_trace_width + c.col
+                } else {
+                    c.col
+                };
                 let trace_evaluation = &ood_row[column_idx];
                 let boundary_zerofier_challenges_z_den = -point + &challenges.z;
                 let boundary_quotient_ood_evaluation_num = -&c.value + trace_evaluation;
