@@ -5,6 +5,14 @@ use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// Minimum number of elements for parallel FRI fold. Below this threshold
+/// the overhead of Rayon dispatch exceeds the benefit.
+#[cfg(feature = "parallel")]
+const FRI_FOLD_PARALLEL_THRESHOLD: usize = 4096;
+
 /// Evaluation-form FRI fold: given evaluations in bit-reversed order where
 /// consecutive pairs (2j, 2j+1) are conjugates (p(x_j), p(-x_j)), compute
 /// the folded evaluations: (lo + hi) + inv_twiddle[j] * zeta * (lo - hi)
@@ -12,12 +20,35 @@ use math::field::{
 ///
 /// After folding, the N/2 results are evaluations on the squared coset
 /// in bit-reversed order, preserving conjugate pairing for the next fold.
-pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
+pub fn fold_evaluations_in_place<F, E>(
     evals: &mut Vec<FieldElement<E>>,
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
-) {
+) where
+    F: IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    FieldElement<E>: Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
     let half = evals.len() / 2;
+
+    #[cfg(feature = "parallel")]
+    if half >= FRI_FOLD_PARALLEL_THRESHOLD {
+        // Parallel: compute folded values into a new buffer to avoid
+        // read/write aliasing on the same slice.
+        let folded: Vec<FieldElement<E>> = evals
+            .par_chunks_exact(2)
+            .zip(inv_twiddles.par_iter())
+            .map(|(pair, tw)| {
+                let sum = &pair[0] + &pair[1];
+                let diff = &pair[0] - &pair[1];
+                &sum + &(tw * &(zeta * &diff))
+            })
+            .collect();
+        *evals = folded;
+        return;
+    }
+
     for j in 0..half {
         let lo = &evals[2 * j];
         let hi = &evals[2 * j + 1];
