@@ -92,7 +92,7 @@ CREATE_JSON=$(scw baremetal server create \
     zone="$SCW_ZONE" \
     type="$OFFER_ID" \
     name="$SERVER_NAME" \
-    user-data="$USER_DATA" \
+    user-data.cloud-init="$USER_DATA" \
     -o json)
 
 SERVER_ID=$(echo "$CREATE_JSON" | jq -r '.id // empty')
