@@ -12,21 +12,18 @@ math = { path = "../crypto/math", features = [
     "lambdaworks-serde-binary",
 ] }
 
-# Pinned to the commit currently resolved in Cargo.lock so the benchmark is
-# reproducible against an exact P3 revision. Bumping is fine; it must be an
-# explicit decision, not the result of an unrelated `cargo update`.
-p3-air = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-field = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-commit = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-fri = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae" }
-p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae", features = ["parallel"] }
-p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", rev = "de83ef4367b66d5908623c6503946ffcfdc3b6ae", features = ["parallel"] }
+p3-air = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
 
 # Tracing for P3 span-based profiling
 tracing = "0.1"
