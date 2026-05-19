@@ -1,0 +1,10 @@
+#cloud-config
+users:
+  - name: app
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ6mrcWIyU+/LrNZLivNIOYr6ld/CXefoq1hyXLsHDfV it
+runcmd:
+  - mkdir -p /repos
+  - chown app:app /repos
