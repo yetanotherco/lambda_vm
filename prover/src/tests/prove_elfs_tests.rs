@@ -18,7 +18,6 @@ use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -32,6 +31,7 @@ use executor::vm::execution::Executor;
 
 // Import shared utilities
 use crate::VmAirs;
+use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
 type F = GoldilocksField;
@@ -63,11 +63,11 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(_) => return false,
-        };
+    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -201,7 +201,7 @@ fn test_cpu_only_no_bus() {
         _,
     )> = vec![(&cpu_air, &mut cpu_trace, &())];
 
-    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Prover failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
@@ -805,7 +805,8 @@ fn test_prove_elfs_keccak() {
     let (elf, logs, _instructions) = run_asm_elf("test_keccak");
     // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
     // RAM (stack memory), which requires PAGE tables for Memory bus balance.
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -841,7 +842,7 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -874,7 +875,7 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs(&elf, &result.logs, &Default::default(), &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
     // value outside [0, 256). The new IS_BYTE bus sender will emit this
@@ -945,7 +946,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1304,7 +1305,15 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
+    let traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        &Default::default(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
@@ -1674,7 +1683,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1729,7 +1738,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1819,7 +1828,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -1991,7 +2000,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         (&airs.decode, &mut decode_trace, &()),
     ];
 
-    let proof = Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Proof generation should succeed");
 
     assert_eq!(proof.proofs.len(), 2);

@@ -10,6 +10,7 @@ use math::fft::errors::FFTError;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
+use math::spill_safe::SpillSafe;
 use math::traits::{AsBytes, ByteConversion};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -28,6 +29,8 @@ use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+#[cfg(feature = "disk-spill")]
+use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
@@ -100,6 +103,10 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
+    /// out of disk space, fd exhaustion, or mmap failure.
+    #[cfg(feature = "disk-spill")]
+    DiskSpill(String),
 }
 
 /// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
@@ -331,7 +338,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
-fn table_parallelism() -> usize {
+pub fn table_parallelism() -> usize {
     #[cfg(feature = "parallel")]
     {
         std::env::var("TABLE_PARALLELISM")
@@ -655,6 +662,7 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainTraceCommitResult<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -693,6 +701,10 @@ pub trait IsStarkProver<
             }
         }
 
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -701,10 +713,17 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (tree, root) =
+        #[allow(unused_mut)]
+        let (mut tree, root) =
             Self::commit_columns_bit_reversed(&columns).ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            tree.spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
+        }
 
         Ok(MainTraceCommitResult {
             tree,
@@ -726,6 +745,7 @@ pub trait IsStarkProver<
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainTraceCommitResult<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -733,6 +753,10 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -741,11 +765,13 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (precomputed_tree, precomputed_root) =
+        #[allow(unused_mut)]
+        let (mut precomputed_tree, precomputed_root) =
             Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
-        let (mult_tree, mult_root) =
+        #[allow(unused_mut)]
+        let (mut mult_tree, mult_root) =
             Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
                 .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
@@ -755,6 +781,16 @@ pub trait IsStarkProver<
             precomputed_root, precomputed_commitment,
             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
         );
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            precomputed_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}")))?;
+            mult_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
+        }
 
         Ok(MainTraceCommitResult {
             tree: mult_tree,
@@ -1654,11 +1690,16 @@ pub trait IsStarkProver<
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
 
@@ -1722,6 +1763,21 @@ pub trait IsStarkProver<
 
         let k = table_parallelism().min(num_airs).max(1);
 
+        // Spill main traces to mmap before Round 1 LDE.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            #[cfg(feature = "parallel")]
+            let spill_iter = air_trace_pairs.par_iter_mut();
+            #[cfg(not(feature = "parallel"))]
+            let mut spill_iter = air_trace_pairs.iter_mut();
+            spill_iter.try_for_each(|(_, trace, _)| {
+                trace
+                    .main_table
+                    .spill_to_disk()
+                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
+            })?;
+        }
+
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
@@ -1766,9 +1822,17 @@ pub trait IsStarkProver<
                             air.precomputed_commitment(),
                             air.num_precomputed_columns(),
                             twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
                         )
                     } else {
-                        Self::commit_main_trace(*trace, domain, twiddles)
+                        Self::commit_main_trace(
+                            *trace,
+                            domain,
+                            twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                        )
                     }
                 })
                 .collect();
@@ -1842,6 +1906,23 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
+
+        // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            #[cfg(feature = "parallel")]
+            let spill_iter = air_trace_pairs.par_iter_mut();
+            #[cfg(not(feature = "parallel"))]
+            let mut spill_iter = air_trace_pairs.iter_mut();
+            spill_iter.try_for_each(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    trace
+                        .spill_aux_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
+                }
+                Ok(())
+            })?;
+        }
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
@@ -1937,6 +2018,10 @@ pub trait IsStarkProver<
                             }
                         }
 
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            trace.aux_table.advise_drop_cache();
+                        }
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_columns_to_lde::<FieldExtension>(
@@ -1948,10 +2033,18 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        let (tree, root) = Self::commit_columns_bit_reversed(&columns)
+                        #[allow(unused_mut)]
+                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            tree.spill_nodes_to_disk().map_err(|e| {
+                                ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
+                            })?;
+                        }
 
                         #[cfg(feature = "cuda")]
                         let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
@@ -2174,10 +2267,19 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(air_trace_pairs, transcript)
-            .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+        .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
