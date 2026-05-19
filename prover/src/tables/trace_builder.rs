@@ -378,15 +378,18 @@ fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-) -> (
-    Vec<MemwOperation>,
-    Vec<LoadOperation>,
-    Vec<LtOperation>,
-    Vec<ShiftOperation>,
-    Vec<BitwiseOperation>,
-    Vec<CommitOperation>,
-    Vec<KeccakOperation>,
-) {
+) -> Result<
+    (
+        Vec<MemwOperation>,
+        Vec<LoadOperation>,
+        Vec<LtOperation>,
+        Vec<ShiftOperation>,
+        Vec<BitwiseOperation>,
+        Vec<CommitOperation>,
+        Vec<KeccakOperation>,
+    ),
+    Error,
+> {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -422,12 +425,13 @@ fn collect_ops_from_cpu(
                 memory_state,
                 current_commit_index as u64,
             ));
-            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
+            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state)?;
             memw_ops.extend(reg_commit_ops);
-            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            let count = u32::try_from(op.commit_count)
+                .map_err(|_| Error::InvalidExecutorLog("commit_count exceeds u32 range"))?;
             current_commit_index = current_commit_index
                 .checked_add(count)
-                .expect("commit index exceeds u32 range");
+                .ok_or(Error::InvalidExecutorLog("commit index exceeds u32 range"))?;
             debug_assert_eq!(
                 current_commit_index,
                 register_state.read_index().0,
@@ -441,14 +445,17 @@ fn collect_ops_from_cpu(
             let state_addr = op.keccak_state_addr;
             let mut input = [0u64; 25];
             for (i, lane) in input.iter_mut().enumerate() {
-                let addr = state_addr
-                    .checked_add(i as u64 * 8)
-                    .expect("keccak state address range must be validated by the executor");
+                let addr =
+                    state_addr
+                        .checked_add(i as u64 * 8)
+                        .ok_or(Error::InvalidExecutorLog(
+                            "keccak state lane address overflows u64",
+                        ))?;
                 let mut val = 0u64;
                 for b in 0..8 {
-                    let byte_addr = addr
-                        .checked_add(b as u64)
-                        .expect("keccak state address range must be validated by the executor");
+                    let byte_addr = addr.checked_add(b as u64).ok_or(Error::InvalidExecutorLog(
+                        "keccak state byte address overflows u64",
+                    ))?;
                     let (byte_val, _ts) = memory_state.read_byte(byte_addr);
                     val |= (byte_val as u64) << (b * 8);
                 }
@@ -458,7 +465,7 @@ fn collect_ops_from_cpu(
             executor::vm::instruction::execution::keccak_f1600(&mut output);
             // collect_keccak_memw_ops handles memory_state + register_state updates
             let keccak_memw_ops =
-                collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
+                collect_keccak_memw_ops(op, &input, &output, memory_state, register_state)?;
             memw_ops.extend(keccak_memw_ops);
             keccak_ops.push(KeccakOperation {
                 timestamp: op.timestamp,
@@ -504,7 +511,7 @@ fn collect_ops_from_cpu(
         "commit_ops count should match accumulated commit index plus end rows"
     );
 
-    (
+    Ok((
         memw_ops,
         load_ops,
         lt_ops,
@@ -512,7 +519,7 @@ fn collect_ops_from_cpu(
         bitwise_ops,
         commit_ops,
         keccak_ops,
-    )
+    ))
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -706,7 +713,7 @@ fn collect_commit_memw_ops(
     op: &CpuOperation,
     register_state: &mut RegisterState,
     memory_state: &mut MemoryState,
-) -> Vec<MemwOperation> {
+) -> Result<Vec<MemwOperation>, Error> {
     let ts = op.timestamp;
     let buf_addr = op.commit_buf_addr;
     let count = op.commit_count;
@@ -760,9 +767,11 @@ fn collect_commit_memw_ops(
     // Read+write x254 (global commit index) at ts
     {
         let (old_index, old_ts) = register_state.read_index();
+        let count_u32 = u32::try_from(count)
+            .map_err(|_| Error::InvalidExecutorLog("commit_count exceeds u32 range"))?;
         let new_index = old_index
-            .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
-            .expect("commit index exceeds u32 range");
+            .checked_add(count_u32)
+            .ok_or(Error::InvalidExecutorLog("commit index exceeds u32 range"))?;
         let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
         let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
@@ -784,7 +793,7 @@ fn collect_commit_memw_ops(
         memory_state.write_byte(addr, byte_val, ts);
     }
 
-    memw_ops
+    Ok(memw_ops)
 }
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
@@ -863,7 +872,7 @@ fn collect_keccak_memw_ops(
     output: &[u64; 25],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-) -> Vec<MemwOperation> {
+) -> Result<Vec<MemwOperation>, Error> {
     let ts = op.timestamp;
     let state_addr = op.keccak_state_addr;
     let mut memw_ops = Vec::with_capacity(26); // 1 register read + 25 lane ops
@@ -884,9 +893,12 @@ fn collect_keccak_memw_ops(
     // input = [0, state_ptr, output_state, timestamp, 0, 0, 1], output = input_state
     // The MEMW table sees: old=input_state, value=output_state, is_read=true.
     for (lane_idx, (&in_lane, &out_lane)) in input.iter().zip(output.iter()).enumerate() {
-        let lane_addr = state_addr
-            .checked_add(lane_idx as u64 * 8)
-            .expect("keccak state address range must be validated by the executor");
+        let lane_addr =
+            state_addr
+                .checked_add(lane_idx as u64 * 8)
+                .ok_or(Error::InvalidExecutorLog(
+                    "keccak state lane address overflows u64",
+                ))?;
 
         let mut old_bytes = [0u64; 8];
         let mut old_timestamps = [0u64; 8];
@@ -894,7 +906,9 @@ fn collect_keccak_memw_ops(
             old_bytes[b] = (in_lane >> (b * 8)) & 0xFF;
             let byte_addr = lane_addr
                 .checked_add(b as u64)
-                .expect("keccak state address range must be validated by the executor");
+                .ok_or(Error::InvalidExecutorLog(
+                    "keccak state byte address overflows u64",
+                ))?;
             let (_old_val, old_ts) = memory_state.read_byte(byte_addr);
             old_timestamps[b] = old_ts;
         }
@@ -912,12 +926,14 @@ fn collect_keccak_memw_ops(
         for (b, &val) in value_bytes.iter().enumerate() {
             let byte_addr = lane_addr
                 .checked_add(b as u64)
-                .expect("keccak state address range must be validated by the executor");
+                .ok_or(Error::InvalidExecutorLog(
+                    "keccak state byte address overflows u64",
+                ))?;
             memory_state.write_byte(byte_addr, val as u8, ts);
         }
     }
 
-    memw_ops
+    Ok(memw_ops)
 }
 
 ///
@@ -1631,7 +1647,9 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 /// interactions; the keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
-fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_keccak(
+    keccak_ops: &[KeccakOperation],
+) -> Result<Vec<BitwiseOperation>, Error> {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
     let mut ops = Vec::new();
@@ -1658,9 +1676,12 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
 
         // IS_HALF for state_ptr halfwords (100 per call)
         for lane_idx in 0..25 {
-            let ptr = state_addr
-                .checked_add(lane_idx as u64 * 8)
-                .expect("keccak state address range must be validated by the executor");
+            let ptr =
+                state_addr
+                    .checked_add(lane_idx as u64 * 8)
+                    .ok_or(Error::InvalidExecutorLog(
+                        "keccak state lane address overflows u64",
+                    ))?;
             push_u64_as_halfwords(&mut ops, BitwiseOperationType::IsHalf, ptr);
         }
 
@@ -1873,7 +1894,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
         }
     }
 
-    ops
+    Ok(ops)
 }
 
 /// every address accessed during execution (ELF init + runtime stores/loads).
@@ -2226,7 +2247,7 @@ fn build_traces(
     // COMMIT table sends IsByte and IsHalfword lookups
     bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
     // KECCAK_RND sends XOR/AND/IS_BYTE/HWSL; KECCAK core sends IS_HALF
-    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
+    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops)?);
 
     // CPU padding rows send IS_BYTE with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
@@ -2592,7 +2613,7 @@ pub fn count_table_lengths(
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
-                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
+                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state)?;
             for memw_op in &reg_commit_ops {
                 partition_memw(
                     memw_op,
@@ -3035,7 +3056,7 @@ impl Traces {
         memory_state.add_private_input(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)?;
 
         let ops = collect_all_ops(
             cpu_ops,
@@ -3084,7 +3105,7 @@ impl Traces {
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)?;
 
         let ops = collect_all_ops(
             cpu_ops,
@@ -3218,7 +3239,7 @@ mod keccak_tests {
     #[test]
     fn test_keccak_bitwise_ops_count() {
         let (kop, _) = make_keccak_ops();
-        let ops = collect_bitwise_from_keccak(&[kop]);
+        let ops = collect_bitwise_from_keccak(&[kop]).expect("keccak bitwise lookup collection");
 
         let xor = ops
             .iter()

@@ -166,6 +166,9 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Executor log violates an invariant the prover relies on
+    /// (e.g. commit-count overflow, keccak state address arithmetic overflow).
+    InvalidExecutorLog(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -179,6 +182,7 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::InvalidExecutorLog(reason) => write!(f, "invalid executor log: {reason}"),
         }
     }
 }
