@@ -4,6 +4,8 @@ use crate::merkle_tree::proof::BatchProof;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
 use alloc::{collections::BTreeSet, vec::Vec};
+#[cfg(feature = "disk-spill")]
+use math::spill_safe::SpillSafe;
 
 #[derive(Debug)]
 pub enum Error {
@@ -22,6 +24,16 @@ impl Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
+/// File-backed mmap storage for Merkle tree nodes.
+///
+/// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
+/// node access goes through this mmap instead.
+#[cfg(feature = "disk-spill")]
+pub(crate) struct MmapNodeBacking {
+    mmap: memmap2::Mmap,
+    node_count: usize,
+}
+
 /// The struct for the Merkle tree, consisting of the root and the nodes.
 /// A typical tree would look like this
 ///                 root
@@ -31,11 +43,68 @@ impl std::error::Error for Error {}
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
-#[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
+#[cfg_attr(
+    all(feature = "serde", not(feature = "disk-spill")),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    all(feature = "serde", feature = "disk-spill"),
+    derive(serde::Deserialize)
+)]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
+    #[cfg(feature = "disk-spill")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    mmap_backing: Option<MmapNodeBacking>,
+}
+
+// `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,
+// so the default derive would emit `{root, nodes: []}` and lose the tree.
+//
+// Output matches the non-disk-spill derive byte-for-byte, so a proof from either
+// storage mode deserializes with the same `Deserialize` impl.
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> serde::Serialize for MerkleTree<B>
+where
+    B::Node: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MerkleTree", 2)?;
+        s.serialize_field("root", &self.root)?;
+        if self.mmap_backing.is_some() {
+            s.serialize_field("nodes", &MmapNodesSeq(self))?;
+        } else {
+            s.serialize_field("nodes", &self.nodes)?;
+        }
+        s.end()
+    }
+}
+
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+struct MmapNodesSeq<'a, B: IsMerkleTreeBackend>(&'a MerkleTree<B>);
+
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> serde::Serialize for MmapNodesSeq<'_, B>
+where
+    B::Node: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let backing = self
+            .0
+            .mmap_backing
+            .as_ref()
+            .expect("MmapNodesSeq is only constructed when mmap_backing is Some");
+        let n = backing.node_count;
+        let mut seq = serializer.serialize_seq(Some(n))?;
+        for i in 0..n {
+            seq.serialize_element(self.0.node_get(i).expect("index in bounds"))?;
+        }
+        seq.end()
+    }
 }
 
 const ROOT: usize = 0;
@@ -78,7 +147,42 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
         })
+    }
+
+    /// Total number of nodes in the tree (inner + leaves).
+    fn node_count(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            return backing.node_count;
+        }
+        self.nodes.len()
+    }
+
+    /// Access a node by index, returning a reference.
+    ///
+    /// Returns `None` if `idx` is out of bounds.
+    fn node_get(&self, idx: usize) -> Option<&B::Node> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            if idx < backing.node_count {
+                // SAFETY: spill_nodes_to_disk is the only function that populates
+                // mmap_backing, and its where-clause requires B::Node: SpillSafe.
+                // Reaching this branch means that bound was checked at construction,
+                // so B::Node carries no padding and every bit pattern is valid.
+                //
+                // Alignment: the mmap base is page-aligned (>= 4096), spill_slice_to_mmap
+                // asserts align_of::<B::Node>() <= 4096, and Rust guarantees
+                // size_of::<B::Node> is a multiple of align_of::<B::Node>, so every
+                // offset idx * node_size lands on an aligned address.
+                let ptr = unsafe { backing.mmap.as_ptr().add(idx * size_of::<B::Node>()) };
+                return Some(unsafe { &*(ptr as *const B::Node) });
+            }
+            return None;
+        }
+        self.nodes.get(idx)
     }
 
     /// Read-only access to the full node buffer in standard layout:
@@ -92,7 +196,7 @@ where
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.nodes.len() / 2;
+        let pos = pos + self.node_count() / 2;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
         };
@@ -108,12 +212,12 @@ where
     /// Returns the Merkle path for the element/s for the leaf at position pos
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
         // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
+        let tree_depth = (self.node_count() + 1).ilog2() as usize;
         let mut merkle_path = Vec::with_capacity(tree_depth);
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.nodes.get(sibling_index(pos)) else {
+            let Some(node) = self.node_get(sibling_index(pos)) else {
                 // out of bounds, exit returning the current merkle_path
                 return Err(Error::OutOfBounds);
             };
@@ -148,7 +252,7 @@ where
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.nodes.len() + 1).div_ceil(2);
+        let num_leaves = (self.node_count() + 1).div_ceil(2);
 
         // Validate all positions are within bounds
         for &pos in pos_list {
@@ -161,7 +265,7 @@ where
         // of the leaves.
         let leaf_positions = pos_list
             .iter()
-            .map(|pos| pos + self.nodes.len() / 2)
+            .map(|pos| pos + self.node_count() / 2)
             .collect::<Vec<usize>>();
         // We get the positions of the nodes for the batch proof.
         let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
@@ -169,7 +273,11 @@ where
         // We get the nodes for the batch proof.
         let batch_auth_path_nodes = batch_auth_path_positions
             .iter()
-            .map(|pos| self.nodes[*pos].clone())
+            .map(|pos| {
+                self.node_get(*pos)
+                    .expect("batch auth path position in bounds")
+                    .clone()
+            })
             .collect();
 
         Ok(BatchProof {
@@ -195,7 +303,7 @@ where
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
         // Number of levels in tree
-        let num_levels = (self.nodes.len() + 1).ilog2();
+        let num_levels = (self.node_count() + 1).ilog2();
 
         // Iter lefevel-by-level from leaves to root.
         for _ in 0..num_levels - 1 {
@@ -223,5 +331,60 @@ where
         // Reverse to get descending order (larger indices first).
         // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
         auth_path_set.into_iter().rev().collect()
+    }
+
+    /// Spill the node vector to a temp-file-backed mmap and free the heap
+    /// allocation. Node access methods read from the mmap after this call.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
+    where
+        B::Node: SpillSafe,
+    {
+        if self.nodes.is_empty() || self.mmap_backing.is_some() {
+            return Ok(());
+        }
+
+        let node_count = self.nodes.len();
+        let mmap = crate::mmap_util::spill_slice_to_mmap(&self.nodes)?;
+        self.nodes = Vec::new();
+        self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
+
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "serde", feature = "disk-spill"))]
+mod disk_spill_serde_tests {
+    use super::*;
+    use crate::merkle_tree::backends::field_element::FieldElementBackend;
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+    use sha3::Keccak256;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+    type Backend = FieldElementBackend<F, Keccak256, 32>;
+
+    /// Serializing a spilled MerkleTree must produce identical bytes to
+    /// serializing the same tree before spilling, and round-trip back to an
+    /// equal tree.
+    #[test]
+    fn test_serialize_spilled_merkle_tree_matches_unspilled() {
+        let values: Vec<FE> = (1..17).map(FE::from).collect();
+        let unspilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
+        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
+
+        let mut spilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
+        spilled.spill_nodes_to_disk().expect("spill_nodes_to_disk");
+        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
+
+        assert_eq!(
+            spilled_bytes, unspilled_bytes,
+            "spilled and unspilled trees must serialize to identical bytes"
+        );
+
+        let restored: MerkleTree<Backend> =
+            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
+        assert!(restored.mmap_backing.is_none());
+        assert_eq!(restored.root, unspilled.root);
     }
 }

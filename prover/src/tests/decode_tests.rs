@@ -9,7 +9,9 @@ use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
     update_multiplicities,
 };
+use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, packed_decode as bits};
+use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
 // =========================================================================
@@ -867,7 +869,6 @@ fn test_instructions_from_elf_includes_all_executable() {
 fn test_decode_soundness_different_elf_rejected() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
     use stark::traits::AIR;
     use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -948,7 +949,7 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
-    let proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Prover failed to generate proof");
 
     // =========================================================================
@@ -999,11 +1000,9 @@ fn test_decode_soundness_different_elf_rejected() {
 fn test_decode_soundness_same_elf_accepted() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
     use stark::verifier::{IsStarkVerifier, Verifier};
 
     use crate::VmAirs;
-    use crate::tables::trace_builder::Traces;
     use crate::tables::types::GoldilocksExtension;
 
     type E = GoldilocksExtension;
@@ -1031,8 +1030,15 @@ fn test_decode_soundness_same_elf_accepted() {
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
-    let mut traces =
-        Traces::from_elf_and_logs(&prover_elf, &result.logs, &Default::default(), &[]).unwrap();
+    let mut traces = Traces::from_elf_and_logs(
+        &prover_elf,
+        &result.logs,
+        &Default::default(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
     let table_counts = traces.table_counts();
     let prover_airs = VmAirs::new(
         &prover_elf,
@@ -1042,7 +1048,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
