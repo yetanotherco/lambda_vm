@@ -109,45 +109,43 @@ pub trait IsStarkVerifier<
             proof.bus_public_inputs.as_ref(),
             trace_length,
         );
-        let number_of_b_constraints = boundary_constraints.constraints.len();
+        // Precompute g^step once per distinct step to avoid the prior O(B^2)
+        // linear scan. A single pass populates a memo and resolves each
+        // constraint's step to its point in O(1) amortized.
+        let mut step_to_point: std::collections::HashMap<usize, FieldElement<Field>> =
+            std::collections::HashMap::new();
+        let boundary_points: Vec<FieldElement<Field>> = boundary_constraints
+            .constraints
+            .iter()
+            .map(|c| {
+                step_to_point
+                    .entry(c.step)
+                    .or_insert_with(|| domain.trace_primitive_root.pow(c.step as u64))
+                    .clone()
+            })
+            .collect();
 
-        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
+        let main_trace_width = air.trace_layout().0;
+        let ood_row = proof.trace_ood_evaluations.get_row(0);
 
         #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
             Vec<FieldElement<FieldExtension>>,
-        ) = (0..number_of_b_constraints)
-            .map(|index| {
-                let step = boundary_constraints.constraints[index].step;
-                let is_aux = boundary_constraints.constraints[index].is_aux;
-                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
-                    Some((_, p)) => p.clone(),
-                    None => {
-                        let p = domain.trace_primitive_root.pow(step as u64);
-                        boundary_step_points.push((step, p.clone()));
-                        p
-                    }
-                };
-                let column_idx = boundary_constraints.constraints[index].col;
-                let trace_evaluation = if is_aux {
-                    let column_idx = air.trace_layout().0 + column_idx;
-                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
-                } else {
-                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
-                };
+        ) = boundary_constraints
+            .constraints
+            .iter()
+            .zip(&boundary_points)
+            .map(|(c, point)| {
+                let column_idx = if c.is_aux { main_trace_width + c.col } else { c.col };
+                let trace_evaluation = &ood_row[column_idx];
                 let boundary_zerofier_challenges_z_den = -point + &challenges.z;
-
-                let boundary_quotient_ood_evaluation_num =
-                    -&boundary_constraints.constraints[index].value + trace_evaluation;
-
+                let boundary_quotient_ood_evaluation_num = -&c.value + trace_evaluation;
                 (
                     boundary_quotient_ood_evaluation_num,
                     boundary_zerofier_challenges_z_den,
                 )
             })
-            .collect::<Vec<_>>()
-            .into_iter()
             .unzip();
 
         // A malformed proof can land `z` on a boundary step, making a denominator zero.
