@@ -273,8 +273,8 @@ pub trait IsStarkVerifier<
             .zip(&challenges.iotas)
             .zip(evaluation_point_inverse)
             .enumerate()
-            .fold(true, |mut result, (i, ((proof_s, iota_s), eval))| {
-                result &= Self::verify_query_and_sym_openings(
+            .all(|(i, ((proof_s, iota_s), eval))| {
+                Self::verify_query_and_sym_openings(
                     proof,
                     &challenges.zetas,
                     *iota_s,
@@ -282,8 +282,7 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
-                );
-                result
+                )
             })
     }
 
@@ -438,19 +437,17 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        challenges.iotas.iter().zip(&proof.deep_poly_openings).fold(
-            true,
-            |mut result, (iota_n, deep_poly_opening)| {
-                result &= Self::verify_composition_poly_opening(
+        challenges
+            .iotas
+            .iter()
+            .zip(&proof.deep_poly_openings)
+            .all(|(iota_n, deep_poly_opening)| {
+                Self::verify_composition_poly_opening(
                     deep_poly_opening,
                     &proof.composition_poly_root,
                     iota_n,
-                );
-
-                result &= Self::verify_trace_openings(proof, deep_poly_opening, *iota_n);
-                result
-            },
-        )
+                ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
+            })
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
