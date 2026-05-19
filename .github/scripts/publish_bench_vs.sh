@@ -118,22 +118,22 @@ p3_fmt_ratio_pair() {
 }
 
 P3_SECTION=""
-P3_HEADLINE_FILE="bench_vs_artifacts/p3/headline/metrics.txt"
-if [ -f "$P3_HEADLINE_FILE" ]; then
-    H_LOG_ROWS=$(p3_parse "$P3_HEADLINE_FILE" "log_rows_series")
-    H_COLS=$(p3_parse "$P3_HEADLINE_FILE" "columns")
-    H_BLOWUP=$(p3_parse "$P3_HEADLINE_FILE" "blowup")
-    H_QUERIES=$(p3_parse "$P3_HEADLINE_FILE" "fri_queries")
-    H_ROWS=$(p3_parse "$P3_HEADLINE_FILE" "rows_series")
-    H_LAMBDA_PROVE=$(p3_parse "$P3_HEADLINE_FILE" "lambda_prove_medians")
-    H_P3_PROVE=$(p3_parse "$P3_HEADLINE_FILE" "p3_prove_medians")
-    H_LAMBDA_VERIFY=$(p3_parse "$P3_HEADLINE_FILE" "lambda_verify_medians")
-    H_P3_VERIFY=$(p3_parse "$P3_HEADLINE_FILE" "p3_verify_medians")
-    H_LAMBDA_PROOF=$(p3_parse "$P3_HEADLINE_FILE" "lambda_proof_size_medians")
-    H_P3_PROOF=$(p3_parse "$P3_HEADLINE_FILE" "p3_proof_size_medians")
-    H_LAMBDA_RSS=$(p3_parse "$P3_HEADLINE_FILE" "lambda_peak_rss_medians")
-    H_P3_RSS=$(p3_parse "$P3_HEADLINE_FILE" "p3_peak_rss_medians")
-    H_RATIO=$(p3_parse "$P3_HEADLINE_FILE" "ratios_lambda_over_p3")
+P3_FILE="bench_vs_artifacts/p3/metrics.txt"
+if [ -f "$P3_FILE" ]; then
+    H_LOG_ROWS=$(p3_parse "$P3_FILE" "log_rows_series")
+    H_COLS=$(p3_parse "$P3_FILE" "columns")
+    H_BLOWUP=$(p3_parse "$P3_FILE" "blowup")
+    H_QUERIES=$(p3_parse "$P3_FILE" "fri_queries")
+    H_ROWS=$(p3_parse "$P3_FILE" "rows_series")
+    H_LAMBDA_PROVE=$(p3_parse "$P3_FILE" "lambda_prove_medians")
+    H_P3_PROVE=$(p3_parse "$P3_FILE" "p3_prove_medians")
+    H_LAMBDA_VERIFY=$(p3_parse "$P3_FILE" "lambda_verify_medians")
+    H_P3_VERIFY=$(p3_parse "$P3_FILE" "p3_verify_medians")
+    H_LAMBDA_PROOF=$(p3_parse "$P3_FILE" "lambda_proof_size_medians")
+    H_P3_PROOF=$(p3_parse "$P3_FILE" "p3_proof_size_medians")
+    H_LAMBDA_RSS=$(p3_parse "$P3_FILE" "lambda_peak_rss_medians")
+    H_P3_RSS=$(p3_parse "$P3_FILE" "p3_peak_rss_medians")
+    H_RATIO=$(p3_parse "$P3_FILE" "ratios_lambda_over_p3")
 
     H_ROWS_FMT=$(LC_NUMERIC=C awk -v r="$H_ROWS" 'BEGIN {
         if (r == "") { print "n/a"; exit }
@@ -149,12 +149,12 @@ if [ -f "$P3_HEADLINE_FILE" ]; then
         printf "%.2fx", r
     }')
 
-    P3_HEADLINE_MRKDWN="*log_rows=${H_LOG_ROWS} (${H_ROWS_FMT} rows · ${H_COLS} cols · blowup=${H_BLOWUP} · ${H_QUERIES} queries)*"
-    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Lambda:* $(p3_fmt_seconds "$H_LAMBDA_PROVE") prove · $(p3_fmt_seconds "$H_LAMBDA_VERIFY") verify · $(p3_fmt_mb "$H_LAMBDA_PROOF") proof · $(p3_fmt_gb "$H_LAMBDA_RSS") RSS"
-    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Plonky3:* $(p3_fmt_seconds "$H_P3_PROVE") prove · $(p3_fmt_seconds "$H_P3_VERIFY") verify · $(p3_fmt_mb "$H_P3_PROOF") proof · $(p3_fmt_gb "$H_P3_RSS") RSS"
-    P3_HEADLINE_MRKDWN="${P3_HEADLINE_MRKDWN}\\n*Ratio L/P3:* ${PROVE_RATIO_FMT} prove · ${PROOF_RATIO} proof · ${RSS_RATIO} RSS"
+    P3_MRKDWN="*log_rows=${H_LOG_ROWS} (${H_ROWS_FMT} rows · ${H_COLS} cols · blowup=${H_BLOWUP} · ${H_QUERIES} queries)*"
+    P3_MRKDWN="${P3_MRKDWN}\\n*Lambda:* $(p3_fmt_seconds "$H_LAMBDA_PROVE") prove · $(p3_fmt_seconds "$H_LAMBDA_VERIFY") verify · $(p3_fmt_mb "$H_LAMBDA_PROOF") proof · $(p3_fmt_gb "$H_LAMBDA_RSS") RSS"
+    P3_MRKDWN="${P3_MRKDWN}\\n*Plonky3:* $(p3_fmt_seconds "$H_P3_PROVE") prove · $(p3_fmt_seconds "$H_P3_VERIFY") verify · $(p3_fmt_mb "$H_P3_PROOF") proof · $(p3_fmt_gb "$H_P3_RSS") RSS"
+    P3_MRKDWN="${P3_MRKDWN}\\n*Ratio L/P3:* ${PROVE_RATIO_FMT} prove · ${PROOF_RATIO} proof · ${RSS_RATIO} RSS"
 
-    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3 - Headline"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_HEADLINE_MRKDWN"'"}}'
+    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_MRKDWN"'"}}'
 fi
 
 ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"

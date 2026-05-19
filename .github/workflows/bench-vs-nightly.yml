@@ -71,7 +71,10 @@ jobs:
             -p p3-uni-stark -p p3-dft
 
       - name: Run Plonky3 nightly benchmark
-        run: bash ./bench_vs_plonky3/run_p3_nightly.sh bench_vs_artifacts/p3
+        run: |
+          bash ./bench_vs_plonky3/run.sh \
+            --log-rows 21 --num-sequences 16 --runs 10 --scalar \
+            --report-dir bench_vs_artifacts/p3 --no-color
 
       - name: Upload nightly benchmark artifact
         uses: actions/upload-artifact@v4
