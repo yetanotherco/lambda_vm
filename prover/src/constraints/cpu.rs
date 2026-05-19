@@ -595,7 +595,7 @@ impl NextPcAddConstraint {
         let carry = match self.carry_idx {
             0 => self.compute_carry_0(step),
             1 => self.compute_carry_1(step),
-            _ => panic!("Invalid carry index"),
+            _ => unreachable!("carry_idx is always 0 or 1; constructed internally"),
         };
 
         // (1 - branch_cond) * carry * (1 - carry)
