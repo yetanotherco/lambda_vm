@@ -407,22 +407,36 @@ where
         "num_rows must be a power of two for reverse_index"
     );
 
+    let total_bytes = num_cols * byte_len;
+
+    let hash_leaf = |buf: &mut [u8], row_idx: usize| -> Commitment {
+        let br_idx = reverse_index(row_idx, num_rows as u64);
+        for col_idx in 0..num_cols {
+            columns[col_idx][br_idx]
+                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+    };
+
     #[cfg(feature = "parallel")]
     let iter = (0..num_rows).into_par_iter();
     #[cfg(not(feature = "parallel"))]
     let iter = 0..num_rows;
 
-    iter.map(|row_idx| {
-        let br_idx = reverse_index(row_idx, num_rows as u64);
-        let total_bytes = num_cols * byte_len;
+    // Per-thread buffer reuse: map_init allocates one buffer per Rayon thread,
+    // eliminating millions of small heap allocations under parallel contention.
+    #[cfg(feature = "parallel")]
+    let result: Vec<Commitment> = iter
+        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf(buf, i))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let result: Vec<Commitment> = {
         let mut buf = vec![0u8; total_bytes];
-        for col_idx in 0..num_cols {
-            columns[col_idx][br_idx]
-                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-        }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-    })
-    .collect()
+        iter.map(|i| hash_leaf(&mut buf, i)).collect()
+    };
+
+    result
 }
 
 /// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
@@ -453,16 +467,11 @@ where
 
     let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
 
-    #[cfg(feature = "parallel")]
-    let iter = (0..num_leaves).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let iter = 0..num_leaves;
+    let total_bytes = 2 * num_parts * byte_len;
 
-    iter.map(|leaf_idx| {
+    let hash_leaf_pair = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
         let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
         let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-        let total_bytes = 2 * num_parts * byte_len;
-        let mut buf = vec![0u8; total_bytes];
         let mut offset = 0;
         for part in parts.iter() {
             part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
@@ -472,9 +481,26 @@ where
             part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
             offset += byte_len;
         }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-    })
-    .collect()
+        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+    };
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_leaves).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_leaves;
+
+    #[cfg(feature = "parallel")]
+    let result: Vec<Commitment> = iter
+        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf_pair(buf, i))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let result: Vec<Commitment> = {
+        let mut buf = vec![0u8; total_bytes];
+        iter.map(|i| hash_leaf_pair(&mut buf, i)).collect()
+    };
+
+    result
 }
 
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
