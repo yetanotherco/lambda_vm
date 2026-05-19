@@ -1,32 +1,25 @@
 //! End-to-end tests forcing `StorageMode::Disk` via the `FORCE_DISK_SPILL` env var.
+//!
+//! Run with `FORCE_DISK_SPILL=1` set in the environment, e.g.
+//! `FORCE_DISK_SPILL=1 cargo test --features disk-spill disk_spill`. Tests
+//! fail fast if the var is unset to avoid silent loss of coverage.
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
-/// RAII guard that sets `FORCE_DISK_SPILL` for the test's scope and clears it
-/// on drop. Tests must run with `--test-threads=1`.
-struct ForceDiskGuard;
-
-impl ForceDiskGuard {
-    fn new() -> Self {
-        // SAFETY: tests run with --test-threads=1, no concurrent env access.
-        unsafe { std::env::set_var("FORCE_DISK_SPILL", "1") };
-        Self
-    }
-}
-
-impl Drop for ForceDiskGuard {
-    fn drop(&mut self) {
-        // SAFETY: same as new().
-        unsafe { std::env::remove_var("FORCE_DISK_SPILL") };
-    }
+fn require_force_disk_spill() {
+    assert_eq!(
+        std::env::var("FORCE_DISK_SPILL").as_deref(),
+        Ok("1"),
+        "set FORCE_DISK_SPILL=1 before running disk-spill tests",
+    );
 }
 
 #[test]
 fn test_disk_spill_prove_verify_and_roundtrip_small() {
-    let _guard = ForceDiskGuard::new();
+    require_force_disk_spill();
     let elf_bytes = asm_elf_bytes("sub");
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
@@ -46,7 +39,7 @@ fn test_disk_spill_prove_verify_and_roundtrip_small() {
 
 #[test]
 fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
-    let _guard = ForceDiskGuard::new();
+    require_force_disk_spill();
     let elf_bytes = asm_elf_bytes("all_instructions_64");
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())

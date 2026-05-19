@@ -183,8 +183,10 @@ jobs:
           cargo test --release -p stark --features disk-spill disk_spill
 
       - name: Run prover disk-spill tests
+        env:
+          FORCE_DISK_SPILL: "1"
         run: |
-          cargo test --release -p lambda-vm-prover --features disk-spill -- --test-threads=1 disk_spill count_table_lengths
+          cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
   build-prover-tests:
     name: Build prover tests
