@@ -25,6 +25,7 @@ use math::{
     },
     traits::AsBytes,
 };
+use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
@@ -112,8 +113,7 @@ pub trait IsStarkVerifier<
         // Precompute g^step once per distinct step to avoid the prior O(B^2)
         // linear scan. A single pass populates a memo and resolves each
         // constraint's step to its point in O(1) amortized.
-        let mut step_to_point: std::collections::HashMap<usize, FieldElement<Field>> =
-            std::collections::HashMap::new();
+        let mut step_to_point: HashMap<usize, FieldElement<Field>> = HashMap::new();
         let boundary_points: Vec<FieldElement<Field>> = boundary_constraints
             .constraints
             .iter()
@@ -128,7 +128,6 @@ pub trait IsStarkVerifier<
         let main_trace_width = air.trace_layout().0;
         let ood_row = proof.trace_ood_evaluations.get_row(0);
 
-        #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
             Vec<FieldElement<FieldExtension>>,
@@ -153,7 +152,6 @@ pub trait IsStarkVerifier<
             .unzip();
 
         // A malformed proof can land `z` on a boundary step, making a denominator zero.
-        // Reject rather than panic.
         if FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).is_err() {
             return false;
         }
@@ -266,7 +264,7 @@ pub trait IsStarkVerifier<
             .iter()
             .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
             .collect::<Vec<FieldElement<Field>>>();
-        // Any zero evaluation point means a malformed query index; reject.
+        // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
         }
@@ -649,14 +647,22 @@ pub trait IsStarkVerifier<
         let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
         let ood_evaluations_table_width = proof.trace_ood_evaluations.width;
         let trace_term_coeffs = &challenges.trace_term_coeffs;
-        debug_assert_eq!(
-            ood_evaluations_table_height * ood_evaluations_table_width,
-            trace_term_coeffs.len() * trace_term_coeffs[0].len()
-        );
-        debug_assert_eq!(
-            lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len(),
-            ood_evaluations_table_width
-        );
+
+        // Runtime guard: a malformed proof may supply opening evaluations whose
+        // column count does not match the OOD table width, or whose composition
+        // poly parts count does not match the proof's `composition_poly_parts_ood_evaluation`.
+        // Without these checks the indexing below would panic in release builds.
+        if lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len()
+            != ood_evaluations_table_width
+        {
+            return None;
+        }
+        if trace_term_coeffs.is_empty()
+            || trace_term_coeffs.len() * trace_term_coeffs[0].len()
+                != ood_evaluations_table_height * ood_evaluations_table_width
+        {
+            return None;
+        }
 
         let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
         let mut current_z = challenges.z.clone();
@@ -664,7 +670,7 @@ pub trait IsStarkVerifier<
             denoms_trace.push(evaluation_point - &current_z);
             current_z = primitive_root * &current_z;
         }
-        // A malformed proof can land an OOD evaluation point on the LDE coset; reject.
+        // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
         FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
 
         let num_base = lde_trace_base_evaluations.len();
@@ -691,12 +697,15 @@ pub trait IsStarkVerifier<
         let number_of_parts = lde_composition_poly_parts_evaluation.len();
         let z_pow = &challenges.z.pow(number_of_parts);
 
-        // Same: reject rather than panic when evaluation_point == z^N.
+        // A malformed proof can make evaluation_point == z^N, reject.
         let denom_composition = (evaluation_point - z_pow).inv().ok()?;
         let mut h_terms = FieldElement::zero();
         for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
-            let h_i_zpower = &proof.composition_poly_parts_ood_evaluation[j];
-            let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
+            // Bounds-check via `.get(j)?`: a malformed opening may have more
+            // parts than the proof header advertises.
+            let h_i_zpower = proof.composition_poly_parts_ood_evaluation.get(j)?;
+            let gamma = challenges.gammas.get(j)?;
+            let h_i_term = (h_i_upsilon - h_i_zpower) * gamma;
             h_terms += h_i_term;
         }
         h_terms *= denom_composition;

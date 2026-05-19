@@ -125,3 +125,89 @@ fn test_verify_fails_with_wrong_inputs() {
         "Verification should fail with tampered public inputs"
     );
 }
+
+// Helper: produce a valid `StarkProof` for a 2-row simple-addition trace, so
+// the rejection tests below can tamper with one field at a time and confirm
+// the verifier returns `false` instead of panicking.
+fn make_valid_simple_proof() -> (
+    SimpleAdditionAIR<GoldilocksField>,
+    crate::proof::stark::StarkProof<
+        GoldilocksField,
+        GoldilocksField,
+        SimpleAdditionPublicInputs<GoldilocksField>,
+    >,
+) {
+    let mut trace = simple_addition_trace::<GoldilocksField>(2);
+    let proof_options = ProofOptions::default_test_options();
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .unwrap();
+    (air, proof)
+}
+
+/// A malformed proof that drops entries from
+/// `composition_poly_parts_ood_evaluation` so the verifier indexes past the
+/// end during deep composition. The `.get(j)?` bounds check must cause the
+/// verifier to return `false` instead of panicking.
+#[test_log::test]
+fn test_verify_rejects_truncated_composition_poly_parts_ood() {
+    let (air, mut proof) = make_valid_simple_proof();
+
+    assert!(
+        !proof.composition_poly_parts_ood_evaluation.is_empty(),
+        "test precondition: a valid proof has at least one composition poly part",
+    );
+    // Drop one entry so the per-query opening has more parts than the header.
+    proof.composition_poly_parts_ood_evaluation.pop();
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject (not panic) when composition_poly_parts_ood_evaluation is truncated"
+    );
+}
+
+/// A malformed proof whose deep-poly opening `evaluations` slice has the
+/// wrong number of columns. The runtime width-mismatch guard added in this
+/// PR must cause the verifier to return `false` instead of indexing past
+/// the end of `lde_trace_aux_evaluations` and panicking in release builds.
+#[test_log::test]
+fn test_verify_rejects_opening_column_count_mismatch() {
+    let (air, mut proof) = make_valid_simple_proof();
+
+    // Append a phantom extra evaluation column to the first query's
+    // main-trace opening so the (base + aux) count exceeds `ood_evaluations_table_width`.
+    if let Some(opening) = proof.deep_poly_openings.first_mut() {
+        let extra = opening
+            .main_trace_polys
+            .evaluations
+            .last()
+            .cloned()
+            .unwrap_or_else(Felt::zero);
+        opening.main_trace_polys.evaluations.push(extra);
+        opening.main_trace_polys.evaluations_sym.push(extra);
+    } else {
+        panic!("test precondition: a valid proof has at least one deep poly opening");
+    }
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject (not panic) when an opening's column count does not match the OOD table width"
+    );
+}
