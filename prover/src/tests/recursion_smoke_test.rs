@@ -407,20 +407,22 @@ fn test_recursion_sampled_flamegraph() {
     use executor::vm::execution::Executor;
     use std::io::BufWriter;
 
-    /// 1 in N logs is recorded into the histogram. The other N-1 only update
-    /// the call stack (which can't be skipped — it has to stay correct).
+    /// 1 in N logs is fed to `process_logs`, which both updates the call
+    /// stack and records a sample. At 1, every cycle goes through — the call
+    /// stack stays exactly in sync with execution so frame widths are
+    /// trustworthy, but the per-cycle cost (~57µs) limits how many cycles
+    /// we can cover within a wall-clock budget.
     ///
-    /// Higher SAMPLE_RATE = faster but noisier. At 1000, the full 40B-cycle
-    /// run completes in ~5 min, covers all phases of execution (setup +
-    /// VmAirs::new + multi_verify), and is accurate to within ~1% on
-    /// functions that ran for >40M cycles total — which includes every hot
-    /// kernel we care about (FFT, memcpy, field-extension arithmetic).
-    const SAMPLE_RATE: usize = 1000;
+    /// At SAMPLE_RATE > 1, every CALL/RETURN that lands on a skipped cycle
+    /// silently desyncs the stack, producing the "stuck-in-visit_seq" effect
+    /// we saw at 1:1000. Use values > 1 only when stack accuracy is
+    /// expendable.
+    const SAMPLE_RATE: usize = 1;
 
     /// Stop the executor early once we've covered this many cycles.
-    /// Set to 0 (default) to run the full 40B-cycle execution and see all
-    /// phases of the verifier (setup, VmAirs::new, multi_verify).
-    const CYCLE_BUDGET: u64 = 0;
+    /// Set to 0 to run to completion (40B+ cycles, hours at SAMPLE_RATE=1).
+    /// At SAMPLE_RATE=1, ~57µs per cycle means 5M cycles ≈ 5 min wall time.
+    const CYCLE_BUDGET: u64 = 5_000_000;
 
     let root = workspace_root();
     build_elfs(&root);
@@ -467,6 +469,11 @@ fn test_recursion_sampled_flamegraph() {
         // immutable borrow of `executor`.
         let (sampled, chunk_len) = {
             let len = logs.len();
+            // When SAMPLE_RATE == 1, this is the identity filter — `_ % 1 == 0`
+            // is trivially true. clippy::modulo_one is fired so we suppress it
+            // here; the generality of the filter is the point (lets us flip
+            // SAMPLE_RATE without touching the loop body).
+            #[allow(clippy::modulo_one)]
             let sampled: Vec<_> = logs
                 .iter()
                 .enumerate()
@@ -533,6 +540,54 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!("  To render SVG (requires inferno):");
     eprintln!("    cat {path} | inferno-flamegraph > /tmp/recursion_flamegraph_sampled.svg");
     eprintln!("============================================================");
+}
+
+/// Diagnostic: host-side per-step timings for the verifier.
+///
+/// Runs an inner prove (empty guest, blowup=2, 1 query) and then verifies it
+/// on the host. When built with `--features stark/instruments`, the verifier
+/// prints `Time spent: ...` for each of the four steps (replay challenges,
+/// composition polynomial, FRI, DEEP openings) plus the step-1-replay it
+/// does before step 2. Lets us see the host-side split in seconds, without
+/// running anything inside the VM.
+///
+/// Usage:
+/// ```
+/// cargo test --release -p lambda-vm-prover --features stark/instruments \
+///   --lib test_host_verify_step_timings -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "diagnostic: prints host-side verifier step timings"]
+fn test_host_verify_step_timings() {
+    let root = workspace_root();
+    let empty_path =
+        root.join("bench_vs/lambda/empty/target/riscv64im-lambda-vm-elf/release/empty-bench");
+    if !empty_path.exists() {
+        build_elfs(&root);
+    }
+    let empty_elf_bytes = std::fs::read(&empty_path).expect("read empty-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[host-verify] proving empty (blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    eprintln!("[host-verify] verifying on host (with instruments) ...");
+    let ok = crate::verify_with_options(&inner_proof, &empty_elf_bytes, &inner_proof_options)
+        .expect("verify errored");
+    assert!(ok, "proof must verify");
+    eprintln!("[host-verify] verified OK");
 }
 
 /// Diagnostic: cycle count for the **deserialize-only** counterpart of the

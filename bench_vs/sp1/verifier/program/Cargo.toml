@@ -1,0 +1,10 @@
+[package]
+name = "verifier-program"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sp1-zkvm = "6.0.1"
+lambda-vm-prover = { path = "../../../../prover", default-features = false }
+serde = { version = "=1.0.219", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
