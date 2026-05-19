@@ -520,6 +520,60 @@ fn run_p3(args: &Args) -> BenchMetrics {
     }
 }
 
+fn print_audit(args: &Args) {
+    let prover_name = match args.prover {
+        ProverKind::Lambda => "lambda",
+        ProverKind::P3 => "p3",
+    };
+    let rows = 1usize << args.log_rows;
+    let main_cols = 2 * args.num_sequences;
+    let trace_cells = rows * main_cols;
+    let public_values = 2 * args.num_sequences;
+    let transition_constraints = 2 * args.num_sequences;
+
+    // Common prefix.
+    let common = format!(
+        "AUDIT\tprover={prover_name}\tworkload=fib_pair\tlog_rows={}\trows={rows}\t\
+         main_cols={main_cols}\taux_cols=0\ttrace_cells={trace_cells}\t\
+         public_values={public_values}",
+        args.log_rows,
+    );
+
+    // Per-prover audit fields.
+    let prover_specific = match args.prover {
+        ProverKind::Lambda => format!(
+            "transition_constraints={transition_constraints}\t\
+             base_transition_constraints={transition_constraints}\t\
+             boundary_constraints={transition_constraints}\t\
+             composition_chunks=1"
+        ),
+        ProverKind::P3 => {
+            // P3 counts 2*num_sequences first-row constraints (boundary equivalent,
+            // encoded inside the AIR via `when_first_row`) + 2*num_sequences
+            // transition constraints, total 4*num_sequences.
+            let air_constraints = 4 * args.num_sequences;
+            let first_row_constraints = 2 * args.num_sequences;
+            format!(
+                "air_constraints={air_constraints}\t\
+                 first_row_constraints={first_row_constraints}\t\
+                 transition_constraints={transition_constraints}\t\
+                 boundary_constraints=0\tquotient_chunks=1\t\
+                 val_packing_width={}\thash_lanes={}",
+                plonky3_config::VAL_PACKING_WIDTH,
+                plonky3_config::HASH_LANES,
+            )
+        }
+    };
+
+    let tail = format!(
+        "blowup={}\tqueries={}\tgrinding={}\t\
+         trace_generation_timed=false\tverify_in_ratio=false",
+        args.blowup, args.queries, args.grinding,
+    );
+
+    println!("{common}\t{prover_specific}\t{tail}");
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -529,6 +583,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    print_audit(&args);
 
     let metrics = match args.prover {
         ProverKind::Lambda => run_lambda(&args),

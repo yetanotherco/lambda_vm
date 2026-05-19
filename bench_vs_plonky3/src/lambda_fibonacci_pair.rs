@@ -104,6 +104,23 @@ where
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        eval_ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        _ext_evals: &mut [FieldElement<E>],
+    ) {
+        let TransitionEvaluationContext::Prover { frame, .. } = eval_ctx else {
+            unreachable!("evaluate_prover called with non-Prover context");
+        };
+        let s0 = frame.get_evaluation_step(0);
+        let s1 = frame.get_evaluation_step(1);
+        let local_left = s0.get_main_evaluation_element(0, 2 * self.seq_idx);
+        let local_right = s0.get_main_evaluation_element(0, 2 * self.seq_idx + 1);
+        let next_left = s1.get_main_evaluation_element(0, 2 * self.seq_idx);
+        base_evals[self.constraint_idx] = next_left - local_left - local_right;
+    }
 }
 
 /// `next.right = local.right + next.left`
@@ -177,6 +194,23 @@ where
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        eval_ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        _ext_evals: &mut [FieldElement<E>],
+    ) {
+        let TransitionEvaluationContext::Prover { frame, .. } = eval_ctx else {
+            unreachable!("evaluate_prover called with non-Prover context");
+        };
+        let s0 = frame.get_evaluation_step(0);
+        let s1 = frame.get_evaluation_step(1);
+        let local_right = s0.get_main_evaluation_element(0, 2 * self.seq_idx + 1);
+        let next_left = s1.get_main_evaluation_element(0, 2 * self.seq_idx);
+        let next_right = s1.get_main_evaluation_element(0, 2 * self.seq_idx + 1);
+        base_evals[self.constraint_idx] = next_right - local_right - next_left;
+    }
 }
 
 /// Public inputs: initial `(a, b) = (left, right)` pair for each sequence.
@@ -224,6 +258,10 @@ where
 
     fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> {
         &self.constraints
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        2 * self.num_sequences
     }
 
     fn boundary_constraints(

@@ -35,7 +35,7 @@ test.
 ## Usage
 
 ```bash
-# Default: log-rows=19, num-sequences=16, runs=3, cubic extension, no scalar
+# Default: log-rows=19, num-sequences=16, runs=10, cubic extension, no scalar
 ./bench_vs_plonky3/run.sh
 
 # Size sweep
@@ -58,10 +58,10 @@ test.
 |---|---|---|
 | `--log-rows K [K ...]` | `19` | One or more power-of-2 row counts. |
 | `--num-sequences N` | `16` | Number of Fibonacci sequences (columns = `2 × N`). |
-| `--runs N` | `3` | Runs per `(size, prover)`; median is reported. |
+| `--runs N` | `10` | Runs per `(size, prover)`; median + CV are reported. |
 | `--lambda-only` / `--p3-only` | both | Restrict to a single prover. |
-| `--report-dir DIR` | — | Write TSV + metrics + raw stdouts. |
-| `--scalar` | off | Pin `RUSTFLAGS="-C target-feature=-avx2,-avx512f"` so Goldilocks (and most of Keccak) run scalar on both sides. x86_64 only; on other archs the flag is ignored with a warning. Residual SSE2 on `p3-keccak` remains (~7% of total prove time). |
+| `--report-dir DIR` | — | Write TSV + metrics + raw stdouts + raw audits. |
+| `--scalar` | off | Pin `RUSTFLAGS="-C target-feature=-avx2,-avx512f"` so Goldilocks field arithmetic runs scalar on both sides. x86_64 only; on other archs the flag is ignored with a warning. The MMCS is already scalar regardless of this flag (see [P3 config: scalar MMCS](#p3-config-scalar-mmcs)). |
 | `--no-color` | off | Disable ANSI colors. |
 | `-h` / `--help` | — | Print usage. |
 
@@ -73,8 +73,10 @@ Stdout (without `--report-dir`):
 === STARK prove benchmark: Lambda vs Plonky3 ===
   log-rows:       19
   num-sequences:  16  (columns = 32)
-  runs/size:      3  (median reported)
-  p3 extension:   degree 3 (forked p3-goldilocks, matches Lambda)
+  runs/size:      10  (median + CV reported)
+  p3 extension:   upstream CubicTrinomialExtensionField (x^3 - x - 1)
+  p3 mmcs:        scalar Keccak256 (val_packing_width=1, hash_lanes=1)
+  proof params:   blowup=2, queries=219, grinding=0
   scalar mode:    on  (arch=x86_64, RUSTFLAGS="-C target-feature=-avx2,-avx512f")
 
 [build] prove_bench
@@ -95,9 +97,16 @@ With `--report-dir DIR` the script writes:
 
 - `results.tsv` — tab-separated raw data (`log_rows, rows, lambda_median_s,
   p3_median_s, ratio_lambda_over_p3, runs`).
+- `raw_metrics.tsv` — one row per `(prover, log_rows, run)` with all
+  `METRICS` fields parsed out.
+- `raw_audits.tsv` — one row per `(prover, log_rows, run)` with the AUDIT
+  line emitted by `prove_bench` before each prove call. Lets you confirm in
+  retrospect that `val_packing_width=1`, `hash_lanes=1`,
+  `base_transition_constraints=2×num_sequences`, etc. Don't trust a number
+  without skimming this file.
 - `metrics.txt` — key=value pairs with the config used (arch, scalar flag,
-  extension degree, blowup, queries, runs, rustflags) and the per-series
-  values slash-joined (so post-processing scripts can split easily).
+  extension, mmcs choice, blowup, queries, runs, rustflags) and the
+  per-series values slash-joined (so post-processing scripts can split easily).
 - `raw/` — per-invocation stdouts (`{prover}_log{K}_run{i}.stdout`).
 
 No markdown file is generated — the TSV is the single source of truth for
@@ -156,18 +165,59 @@ cargo test -p bench-vs-plonky3 --features instruments --release -- \
 The nightly does **not** activate this path — it would add ~1 % overhead and
 pollute the historical wall-clock numbers.
 
+## P3 config: scalar MMCS
+
+`plonky3_config.rs` sets up the P3 stark config with a deliberately
+**non-production** MMCS:
+
+```rust
+type ByteHash = Keccak256Hash;                               // tiny_keccak scalar
+type FieldHash = SerializingHasher<ByteHash>;
+type MyCompress = CompressionFunctionFromHasher<ByteHash, 2, 32>;
+pub type ValMmcs = MerkleTreeMmcs<Val, u8, FieldHash, MyCompress, 2, 32>;
+```
+
+The Plonky3 default for Goldilocks MMCS uses `PaddingFreeSponge<KeccakF, 25,
+17, 4>` with leaves `[Val; VECTOR_LEN]` and digests `[u64; VECTOR_LEN]`,
+where `VECTOR_LEN` is set at compile-time per arch: NEON=2, AVX-512=8,
+AVX2=4, SSE2=2, fallback=1. That gives Plonky3 a free `N×` Keccak speedup
+on every Merkle node — which Lambda's `sha3::Keccak256` cannot exploit
+because the Lambda MMCS hashes a single input at a time.
+
+The scalar config here makes both sides hash one input per Keccak call.
+Both still use the **same Keccak-f[1600] permutation** (capacity 512, rate
+1088, 256-bit output, Keccak-original 0x01 padding); the only thing
+removed is data-parallel lanes on the P3 side. Consequence: the ratio
+published by this bench is **apples-to-apples scalar**, not "Plonky3 as
+shipped in production." If you want the production-realistic P3 number,
+swap the MMCS back to the vector-lane variant from upstream's examples.
+
+On aarch64 with `feature="asm"` enabled in `crypto/crypto`, Lambda's
+`sha3::Keccak256` uses ARMv8 SHA3 intrinsics, which speeds up *one* Keccak
+call (no data parallelism). `tiny_keccak`'s `Keccak256Hash` on P3 is pure
+Rust and gets no such acceleration. On x86_64 server, neither side has
+that path, so the comparison is cleanest there.
+
 ## Notes on fairness
 
-- **Extension field**: Plonky3 runs `BinomialExtensionField<Goldilocks, 3>`
-  with the same `x^3 - 2` irreducible as Lambda's
-  `Degree3GoldilocksExtensionField`. Both sides use the same cubic extension.
+- **Extension field**: Plonky3 runs upstream `CubicTrinomialExtensionField`
+  over Goldilocks (`x^3 - x - 1`); Lambda runs `Degree3GoldilocksExtensionField`
+  (`x^3 - 2`). Both are degree-3 irreducible extensions of `GF(p)` with the
+  same field size and the same soundness. Cell-by-cell trace equivalence is
+  asserted by `lambda_pair_trace_matches_plonky3_trace`.
 - **Parallelism**: both provers are multi-threaded by default. Lambda pulls
-  rayon via `stark/parallel`; Plonky3 pulls rayon via
-  `p3-uni-stark` / `p3-dft` (hardcoded `features = ["parallel"]`, always on).
-- **SIMD**: without `--scalar`, each side uses whatever target-features the
-  compiler decides from the host CPU. `--scalar` (x86_64 only) disables AVX2
-  and AVX-512 so Goldilocks arithmetic is scalar on both sides. `p3-keccak`'s
-  SSE2 path on x86 is not disabled.
+  rayon via `stark/parallel`; Plonky3 pulls rayon via `p3-uni-stark` /
+  `p3-dft` (hardcoded `features = ["parallel"]`, always on).
+- **SIMD**: the MMCS Keccak is scalar on both sides (see above). For
+  Goldilocks field arithmetic, without `--scalar` each side uses whatever
+  target-features the compiler decides from the host CPU. `--scalar`
+  (x86_64 only) disables AVX2 / AVX-512.
+- **AIR base-field path**: the Lambda AIR overrides
+  `num_base_transition_constraints` and implements `evaluate_prover` so its
+  Fibonacci transition constraints are evaluated in the base field (F×E,
+  ≈3 muls/term) instead of the default extension path (E×E, ≈9 muls/term).
+  This matches what the production Lambda STARK does for all
+  domain-constraint AIRs.
 - **Queries / grinding**: same `blowup=2`, `queries=219`, `grinding=0` on both
   sides. Security models differ (Lambda: Johnson-bound, ~108 bits proven;
   P3: conjectured, 219 queries × 1 bit = 219 bits, capped at 192 by the

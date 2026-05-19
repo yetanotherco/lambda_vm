@@ -10,9 +10,10 @@
 # Defaults: --log-rows 19, --num-sequences 16, --runs 10.
 # With multiple --log-rows values, prints one stats row per size.
 #
-# --scalar: on x86_64 drops AVX2 / AVX-512 so Goldilocks (and most of Keccak)
-# run scalar; residual SSE2 in p3-keccak remains. Triggers a rebuild when
-# toggling; subsequent runs with the same RUSTFLAGS are cached.
+# --scalar: on x86_64 drops AVX2 / AVX-512 so Goldilocks runs scalar. The MMCS
+# itself is already scalar (single-input tiny_keccak via Keccak256Hash) regardless
+# of this flag — its SIMD lanes were removed in the config. Triggers a rebuild
+# when toggling; subsequent runs with the same RUSTFLAGS are cached.
 
 set -euo pipefail
 
@@ -123,10 +124,9 @@ if [ -n "$REPORT_DIR" ]; then
 fi
 
 # --- Scalar (no SIMD) toggle ------------------------------------------------
-# When --scalar is on, disable AVX2/AVX-512 so Goldilocks (and most of Keccak)
-# run scalar for an apples-to-apples comparison against Lambda STARK. The
-# residual SSE2 path on p3-keccak is intentionally left enabled — its
-# contribution to total prove time is ~7%.
+# When --scalar is on, disable AVX2/AVX-512 so Goldilocks field arithmetic runs
+# scalar for an apples-to-apples comparison against Lambda STARK. The MMCS Keccak
+# is already scalar regardless of this flag (see plonky3_config.rs).
 # Cargo caches per-RUSTFLAGS, so toggling scalar vs vector triggers a rebuild
 # on first use but is cached afterwards.
 SCALAR_RUSTFLAGS=""
@@ -155,7 +155,8 @@ echo -e "${BOLD}=== STARK prove benchmark: Lambda vs Plonky3 ===${NC}"
 echo -e "  log-rows:       ${YELLOW}${LOG_ROWS[*]}${NC}"
 echo -e "  num-sequences:  ${YELLOW}${NUM_SEQUENCES}${NC}  (columns = $((2 * NUM_SEQUENCES)))"
 echo -e "  runs/size:      ${YELLOW}${RUNS}${NC}  (median + CV reported)"
-echo -e "  p3 extension:   ${YELLOW}degree 3 (forked p3-goldilocks, matches Lambda)${NC}"
+echo -e "  p3 extension:   ${YELLOW}upstream CubicTrinomialExtensionField (x^3 - x - 1)${NC}"
+echo -e "  p3 mmcs:        ${YELLOW}scalar Keccak256 (val_packing_width=1, hash_lanes=1)${NC}"
 echo -e "  proof params:   ${YELLOW}blowup=${BLOWUP}, queries=${FRI_QUERIES}, grinding=${GRINDING}${NC}"
 if $BREAKDOWN; then
     echo -e "  breakdown:      ${YELLOW}on${NC}  (Lambda instruments + P3 tracing spans)"
@@ -201,6 +202,13 @@ extract_proving_time() {
 
 extract_metrics_line() {
     sed -n '/^METRICS	/ {
+        p
+        q
+    }'
+}
+
+extract_audit_line() {
+    sed -n '/^AUDIT	/ {
         p
         q
     }'
@@ -334,8 +342,10 @@ run_prover() {
     local log_rows=$2
     local times=()
     local metrics_file="$TMP_DIR/${prover}_${log_rows}.metrics"
+    local audit_file="$TMP_DIR/${prover}_${log_rows}.audits"
     local breakdown_file="$TMP_DIR/${prover}_${log_rows}.breakdown"
     : > "$metrics_file"
+    : > "$audit_file"
     : > "$breakdown_file"
     for run_i in $(seq 1 "$RUNS"); do
         local out_file="$TMP_DIR/${prover}_${log_rows}_${run_i}.stdout"
@@ -347,6 +357,11 @@ run_prover() {
             echo -e "  ${RED}[${prover}] FAILED on log-rows=${log_rows} run ${run_i}${NC}"
             cat "$out_file"
             exit 1
+        fi
+        local audit_line
+        audit_line=$(extract_audit_line < "$out_file")
+        if [ -n "$audit_line" ]; then
+            printf 'run=%s\t%s\n' "$run_i" "$audit_line" >> "$audit_file"
         fi
         local metrics_line
         metrics_line=$(extract_metrics_line < "$out_file")
@@ -537,6 +552,20 @@ if [ -n "$REPORT_DIR" ]; then
         done
     } > "$REPORT_DIR/raw_metrics.tsv"
 
+    # Raw AUDIT lines per run, one row per prover×log_rows×run. Lets the reader
+    # confirm in retrospect that val_packing_width=1, hash_lanes=1, etc.
+    {
+        printf "run\taudit_line\n"
+        for lr in "${RESULT_LOG_ROWS[@]}"; do
+            for prover in lambda p3; do
+                audit_file="$TMP_DIR/${prover}_${lr}.audits"
+                if [ -f "$audit_file" ]; then
+                    cat "$audit_file"
+                fi
+            done
+        done
+    } > "$REPORT_DIR/raw_audits.tsv"
+
     if $BREAKDOWN; then
         {
             printf "run\tworkload\tprover\tlog_rows\trows\tphase\tms\ttable\ttable_rows\tspan\n"
@@ -588,7 +617,8 @@ if [ -n "$REPORT_DIR" ]; then
         else
             echo "breakdown=off"
         fi
-        echo "p3_extension=degree3_fork"
+        echo "p3_extension=upstream_cubic_trinomial"
+        echo "p3_mmcs=scalar_keccak256"
         if $SCALAR_ACTIVE; then
             echo "scalar=on"
             echo "rustflags=$SCALAR_RUSTFLAGS"
