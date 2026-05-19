@@ -572,32 +572,28 @@ pub trait IsStarkVerifier<
         let num_queries = challenges.iotas.len();
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
-        for (i, iota) in challenges.iotas.iter().enumerate() {
-            let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
-                .expect("verifier domain root_order is a valid power of two");
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
-            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
-                evaluations.extend(
-                    precomputed_polys
-                        .evaluations
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
+        // Build the base-field LDE evaluations as concatenated slice (precomputed + main)
+        // without lifting to the extension field. The helper now subtracts directly via
+        // the F: IsSubFieldOf<E> Sub impl, so we avoid a per-query base->extension lift.
+        let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
+            .expect("verifier domain root_order is a valid power of two");
+
+        for (i, iota) in challenges.iotas.iter().enumerate() {
+            let opening = &proof.deep_poly_openings[i];
+
+            // Base-field portion: precomputed columns FIRST, then main trace columns.
+            let mut lde_base: Vec<FieldElement<Field>> = Vec::new();
+            if let Some(p) = &opening.precomputed_trace_polys {
+                lde_base.extend_from_slice(&p.evaluations);
             }
-            evaluations.extend(
-                proof.deep_poly_openings[i]
-                    .main_trace_polys
-                    .evaluations
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
-            if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
-                evaluations.extend_from_slice(&aux_trace_polys.evaluations);
-            }
+            lde_base.extend_from_slice(&opening.main_trace_polys.evaluations);
+
+            let lde_aux: &[FieldElement<FieldExtension>] = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations.as_slice())
+                .unwrap_or(&[]);
 
             let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
@@ -605,32 +601,23 @@ pub trait IsStarkVerifier<
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &evaluations,
-                &proof.deep_poly_openings[i].composition_poly.evaluations,
+                &lde_base,
+                lde_aux,
+                &opening.composition_poly.evaluations,
             )?);
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
-            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
-                evaluations_sym.extend(
-                    precomputed_polys
-                        .evaluations_sym
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
+            // Mirror for the symmetric query point.
+            let mut lde_base_sym: Vec<FieldElement<Field>> = Vec::new();
+            if let Some(p) = &opening.precomputed_trace_polys {
+                lde_base_sym.extend_from_slice(&p.evaluations_sym);
             }
-            evaluations_sym.extend(
-                proof.deep_poly_openings[i]
-                    .main_trace_polys
-                    .evaluations_sym
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
-            if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
-                evaluations_sym.extend_from_slice(&aux_trace_polys.evaluations_sym);
-            }
+            lde_base_sym.extend_from_slice(&opening.main_trace_polys.evaluations_sym);
+
+            let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_sym.as_slice())
+                .unwrap_or(&[]);
 
             let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
@@ -638,8 +625,9 @@ pub trait IsStarkVerifier<
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &evaluations_sym,
-                &proof.deep_poly_openings[i].composition_poly.evaluations_sym,
+                &lde_base_sym,
+                lde_aux_sym,
+                &opening.composition_poly.evaluations_sym,
             )?);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
@@ -650,7 +638,8 @@ pub trait IsStarkVerifier<
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
-        lde_trace_evaluations: &[FieldElement<FieldExtension>],
+        lde_trace_base_evaluations: &[FieldElement<Field>],
+        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
     ) -> Option<FieldElement<FieldExtension>> {
         let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
@@ -659,6 +648,10 @@ pub trait IsStarkVerifier<
         debug_assert_eq!(
             ood_evaluations_table_height * ood_evaluations_table_width,
             trace_term_coeffs.len() * trace_term_coeffs[0].len()
+        );
+        debug_assert_eq!(
+            lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len(),
+            ood_evaluations_table_width
         );
 
         let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
@@ -670,15 +663,21 @@ pub trait IsStarkVerifier<
         // A malformed proof can land an OOD evaluation point on the LDE coset; reject.
         FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
 
+        let num_base = lde_trace_base_evaluations.len();
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
                 let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
                     FieldElement::zero(),
                     |trace_t, (row_idx, coeff)| {
-                        let poly_evaluation = (lde_trace_evaluations[col_idx].clone()
-                            - proof.trace_ood_evaluations.get_row(row_idx)[col_idx].clone())
-                            * &denoms_trace[row_idx];
+                        let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
+                        // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
+                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
+                            &lde_trace_base_evaluations[col_idx] - ood_val
+                        } else {
+                            &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
+                        };
+                        let poly_evaluation = diff * &denoms_trace[row_idx];
                         trace_t + &poly_evaluation * coeff
                     },
                 );
