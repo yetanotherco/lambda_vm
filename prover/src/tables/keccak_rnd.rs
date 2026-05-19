@@ -30,9 +30,10 @@
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity};
 use stark::trace::TraceTable;
 
+use super::bus_builder::{BusInteractionsBuilder, packed_direct};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -443,57 +444,31 @@ pub fn generate_keccak_rnd_trace(
 
 #[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1371);
+    let mut b = BusInteractionsBuilder::with_capacity(1371);
+    let mu = Multiplicity::Column(cols::MU);
 
-    // --- IO group (3) ---
-
-    // 1. KECCAK bus: receive (timestamp, round, start[200])
-    // Per spec keccak_round.toml: input = ["timestamp", "round", "start"] where
-    // start is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own bus element.
+    // KECCAK bus receiver: (timestamp, round, start[200]).
     {
         let mut values = vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::ROUND,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::TIMESTAMP_0),
+            packed_direct(cols::TIMESTAMP_1),
+            packed_direct(cols::ROUND),
         ];
         for x in 0..5 {
             for y in 0..5 {
-                for b in 0..8 {
-                    values.push(BusValue::Packed {
-                        start_column: cols::start(x, y, b),
-                        packing: Packing::Direct,
-                    });
+                for byte in 0..8 {
+                    values.push(packed_direct(cols::start(x, y, byte)));
                 }
             }
         }
-        interactions.push(BusInteraction::receiver(
-            BusId::Keccak,
-            Multiplicity::Column(cols::MU),
-            values,
-        ));
+        b.recv(BusId::Keccak, mu.clone(), values);
     }
 
-    // 2. KECCAK bus: send (timestamp, round+1, out[200])
-    //    out[0][0] = iota, out[x][y] = chi for (x,y) != (0,0)
+    // KECCAK bus sender: (timestamp, round+1, out[200]).
     {
         let mut values = vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::TIMESTAMP_0),
+            packed_direct(cols::TIMESTAMP_1),
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -504,106 +479,62 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ];
         for x in 0..5 {
             for y in 0..5 {
-                for b in 0..8 {
+                for byte in 0..8 {
                     let col = if x == 0 && y == 0 {
-                        cols::IOTA + b
+                        cols::IOTA + byte
                     } else {
-                        cols::chi(x, y, b)
+                        cols::chi(x, y, byte)
                     };
-                    values.push(BusValue::Packed {
-                        start_column: col,
-                        packing: Packing::Direct,
-                    });
+                    values.push(packed_direct(col));
                 }
             }
         }
-        interactions.push(BusInteraction::sender(
-            BusId::Keccak,
-            Multiplicity::Column(cols::MU),
-            values,
-        ));
+        b.send(BusId::Keccak, mu.clone(), values);
     }
 
-    // 3. KECCAK_RC: lookup (round) → rc[8]
+    // KECCAK_RC lookup: round -> rc[8].
     {
-        let mut values = vec![BusValue::Packed {
-            start_column: cols::ROUND,
-            packing: Packing::Direct,
-        }];
-        for b in 0..8 {
-            values.push(BusValue::Packed {
-                start_column: cols::rc(b),
-                packing: Packing::Direct,
-            });
+        let mut values = vec![packed_direct(cols::ROUND)];
+        for byte in 0..8 {
+            values.push(packed_direct(cols::rc(byte)));
         }
-        interactions.push(BusInteraction::sender(
-            BusId::KeccakRc,
-            Multiplicity::Column(cols::MU),
-            values,
-        ));
+        b.send(BusId::KeccakRc, mu.clone(), values);
     }
 
-    // --- Theta: Cxz chain XOR_BYTE (160) ---
-    // Stage 0: XOR(start[x,0,z], start[x,1,z]) → Cxz[x,0,z]
+    // Theta: Cxz chain XOR_BYTE (5 x 8 = 40 stage-0 + 5 x 3 x 8 = 120 stage 1..3 = 160 total).
+    // Stage 0: XOR(start[x,0,b], start[x,1,b]) -> Cxz[x,0,b].
     for x in 0..5 {
-        for b in 0..8 {
-            interactions.push(BusInteraction::sender(
-                BusId::XorByte,
-                Multiplicity::Column(cols::MU),
-                vec![
-                    BusValue::Packed {
-                        start_column: cols::start(x, 0, b),
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: cols::start(x, 1, b),
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: cols::cxz(x, 0, b),
-                        packing: Packing::Direct,
-                    },
-                ],
-            ));
+        for byte in 0..8 {
+            b.send_xor_byte(
+                cols::start(x, 0, byte),
+                cols::start(x, 1, byte),
+                cols::cxz(x, 0, byte),
+                &mu,
+            );
         }
     }
-    // Stages 1..3: XOR(Cxz[x,stage-1,z], start[x,stage+1,z]) → Cxz[x,stage,z]
+    // Stages 1..3: XOR(Cxz[x, stage-1, b], start[x, stage+1, b]) -> Cxz[x, stage, b].
     for x in 0..5 {
         for stage in 1..4usize {
             let y = stage + 1;
-            for b in 0..8 {
-                interactions.push(BusInteraction::sender(
-                    BusId::XorByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::Packed {
-                            start_column: cols::cxz(x, stage - 1, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::start(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::cxz(x, stage, b),
-                            packing: Packing::Direct,
-                        },
-                    ],
-                ));
+            for byte in 0..8 {
+                b.send_xor_byte(
+                    cols::cxz(x, stage - 1, byte),
+                    cols::start(x, y, byte),
+                    cols::cxz(x, stage, byte),
+                    &mu,
+                );
             }
         }
     }
 
-    // --- Theta: HWSL for rotated C (20) ---
-    // HWSL(C[x] halfword[hw], 1) → (Cxz_left, Cxz_right)
-    // Cxz_right is a single carry bit zero-extended to a halfword (spec d75944ee).
+    // Theta: HWSL for rotated C (20). HWSL(C[x] halfword[hw], 1) -> (rot_left, rot_right_bit).
     for x in 0..5 {
         for hw in 0..4 {
-            interactions.push(BusInteraction::sender(
+            b.send(
                 BusId::Hwsl,
-                Multiplicity::Column(cols::MU),
+                mu.clone(),
                 vec![
-                    // Input halfword: Cxz[x][3][hw*2] + 256 * Cxz[x][3][hw*2+1]
                     BusValue::linear(vec![
                         LinearTerm::Column {
                             coefficient: 1,
@@ -614,9 +545,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             column: cols::cxz(x, 3, hw * 2 + 1),
                         },
                     ]),
-                    // Shift amount = 1
                     BusValue::constant(1),
-                    // Output: shifted
                     BusValue::linear(vec![
                         LinearTerm::Column {
                             coefficient: 1,
@@ -627,102 +556,67 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             column: cols::cxz_left(x, hw * 2 + 1),
                         },
                     ]),
-                    // Output: carry (single bit cast to Half — high byte = 0).
-                    BusValue::Packed {
-                        start_column: cols::cxz_right_bit(x, hw),
-                        packing: Packing::Direct,
-                    },
+                    packed_direct(cols::cxz_right_bit(x, hw)),
                 ],
-            ));
+            );
         }
     }
 
-    // --- Theta: IS_BYTE range checks on Cxz_left (40) ---
-    // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
+    // Theta: IS_BYTE range checks on Cxz_left (40).
     for x in 0..5 {
-        for b in 0..8 {
-            interactions.push(BusInteraction::sender(
-                BusId::IsByte,
-                Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
-                    start_column: cols::cxz_left(x, b),
-                    packing: Packing::Direct,
-                }],
-            ));
+        for byte in 0..8 {
+            b.send_is_byte(cols::cxz_left(x, byte), &mu);
         }
     }
 
-    // --- Theta: Dxz XOR_BYTE (40) ---
-    // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
-    // rotated_C[x'][b] = Cxz_left[x'][b] + (1 - b%2) * Cxz_right[x'][(b/2 - 1)%4]
-    // (spec d75944ee/9143370f). For odd b only Cxz_left contributes.
+    // Theta: Dxz XOR_BYTE (40). D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b].
     for x in 0..5 {
-        for b in 0..8 {
+        for byte in 0..8 {
             let mut rotated_c_terms = vec![LinearTerm::Column {
                 coefficient: 1,
-                column: cols::cxz_left((x + 1) % 5, b),
+                column: cols::cxz_left((x + 1) % 5, byte),
             }];
-            if let Some(hw) = cols::cxz_right_bit_for_byte(b) {
+            if let Some(hw) = cols::cxz_right_bit_for_byte(byte) {
                 rotated_c_terms.push(LinearTerm::Column {
                     coefficient: 1,
                     column: cols::cxz_right_bit((x + 1) % 5, hw),
                 });
             }
-            interactions.push(BusInteraction::sender(
+            b.send(
                 BusId::XorByte,
-                Multiplicity::Column(cols::MU),
+                mu.clone(),
                 vec![
-                    BusValue::Packed {
-                        start_column: cols::cxz((x + 4) % 5, 3, b),
-                        packing: Packing::Direct,
-                    },
+                    packed_direct(cols::cxz((x + 4) % 5, 3, byte)),
                     BusValue::linear(rotated_c_terms),
-                    BusValue::Packed {
-                        start_column: cols::dxz(x, b),
-                        packing: Packing::Direct,
-                    },
+                    packed_direct(cols::dxz(x, byte)),
                 ],
-            ));
+            );
         }
     }
 
-    // --- Theta final: XOR_BYTE (200) ---
-    // theta[x][y][b] = start[x][y][b] XOR D[x][b]
+    // Theta final: XOR_BYTE (200). theta[x][y][b] = start[x][y][b] XOR D[x][b].
     for x in 0..5 {
         for y in 0..5 {
-            for b in 0..8 {
-                interactions.push(BusInteraction::sender(
-                    BusId::XorByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::Packed {
-                            start_column: cols::start(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::dxz(x, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::theta(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                    ],
-                ));
+            for byte in 0..8 {
+                b.send_xor_byte(
+                    cols::start(x, y, byte),
+                    cols::dxz(x, byte),
+                    cols::theta(x, y, byte),
+                    &mu,
+                );
             }
         }
     }
 
-    // --- Rho: HWSL (100) ---
-    // HWSL(theta[x][y] halfword[hw], rnc[x][y]) → (rot_left, rot_right)
-    // rnc is inlined as a constant: KECCAK_RHO[x][y] % 16.
+    // Rho: HWSL (100). HWSL(theta[x][y] halfword[hw], rnc[x][y]) -> (rot_left, rot_right).
+    // rnc inlined as KECCAK_RHO[x][y] % 16.
     for x in 0..5 {
         for y in 0..5 {
             let rnc_val = (KECCAK_RHO[x][y] % 16) as u64;
             for hw in 0..4 {
-                interactions.push(BusInteraction::sender(
+                b.send(
                     BusId::Hwsl,
-                    Multiplicity::Column(cols::MU),
+                    mu.clone(),
                     vec![
                         BusValue::linear(vec![
                             LinearTerm::Column {
@@ -756,47 +650,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                             },
                         ]),
                     ],
-                ));
+                );
             }
         }
     }
 
-    // --- Rho: IS_BYTE range checks on rot_left + rot_right (400) ---
+    // Rho: IS_BYTE range checks on rot_left + rot_right (400).
     for x in 0..5 {
         for y in 0..5 {
-            for b in 0..8 {
-                interactions.push(BusInteraction::sender(
-                    BusId::IsByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_left(x, y, b),
-                        packing: Packing::Direct,
-                    }],
-                ));
-                interactions.push(BusInteraction::sender(
-                    BusId::IsByte,
-                    Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_right(x, y, b),
-                        packing: Packing::Direct,
-                    }],
-                ));
+            for byte in 0..8 {
+                b.send_is_byte(cols::rot_left(x, y, byte), &mu);
+                b.send_is_byte(cols::rot_right(x, y, byte), &mu);
             }
         }
     }
 
-    // --- Chi: AND_BYTE (200) ---
-    // chi_ands[x][y][b] = (255 - pi[(x+1)%5][y][b]) AND pi[(x+2)%5][y][b]
-    // pi is virtual: pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
-    // with src lane (sx,sy) = ((x+3y)%5, x) and byte offsets from KECCAK_RHO.
+    // Chi: AND_BYTE (200). chi_ands[x][y][b] = (255 - pi[(x+1)%5][y][b]) AND pi[(x+2)%5][y][b].
     for x in 0..5 {
         for y in 0..5 {
-            for b in 0..8 {
-                let (p1_l, p1_r) = cols::pi_src_cols((x + 1) % 5, y, b);
-                let (p2_l, p2_r) = cols::pi_src_cols((x + 2) % 5, y, b);
-                interactions.push(BusInteraction::sender(
+            for byte in 0..8 {
+                let (p1_l, p1_r) = cols::pi_src_cols((x + 1) % 5, y, byte);
+                let (p2_l, p2_r) = cols::pi_src_cols((x + 2) % 5, y, byte);
+                b.send(
                     BusId::AndByte,
-                    Multiplicity::Column(cols::MU),
+                    mu.clone(),
                     vec![
                         BusValue::linear(vec![
                             LinearTerm::Constant(255),
@@ -819,25 +696,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                                 column: p2_r,
                             },
                         ]),
-                        BusValue::Packed {
-                            start_column: cols::chi_ands(x, y, b),
-                            packing: Packing::Direct,
-                        },
+                        packed_direct(cols::chi_ands(x, y, byte)),
                     ],
-                ));
+                );
             }
         }
     }
 
-    // --- Chi: XOR_BYTE (200) ---
-    // chi[x][y][b] = pi[x][y][b] XOR chi_ands[x][y][b] (pi virtual).
+    // Chi: XOR_BYTE (200). chi[x][y][b] = pi[x][y][b] XOR chi_ands[x][y][b] (pi virtual).
     for x in 0..5 {
         for y in 0..5 {
-            for b in 0..8 {
-                let (p_l, p_r) = cols::pi_src_cols(x, y, b);
-                interactions.push(BusInteraction::sender(
+            for byte in 0..8 {
+                let (p_l, p_r) = cols::pi_src_cols(x, y, byte);
+                b.send(
                     BusId::XorByte,
-                    Multiplicity::Column(cols::MU),
+                    mu.clone(),
                     vec![
                         BusValue::linear(vec![
                             LinearTerm::Column {
@@ -849,44 +722,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                                 column: p_r,
                             },
                         ]),
-                        BusValue::Packed {
-                            start_column: cols::chi_ands(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::chi(x, y, b),
-                            packing: Packing::Direct,
-                        },
+                        packed_direct(cols::chi_ands(x, y, byte)),
+                        packed_direct(cols::chi(x, y, byte)),
                     ],
-                ));
+                );
             }
         }
     }
 
-    // --- Iota: XOR_BYTE (8) ---
-    // iota[b] = chi[0][0][b] XOR rc[b]
-    for b in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::chi(0, 0, b),
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::rc(b),
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::iota(b),
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
+    // Iota: XOR_BYTE (8). iota[b] = chi[0][0][b] XOR rc[b].
+    for byte in 0..8 {
+        b.send_xor_byte(cols::chi(0, 0, byte), cols::rc(byte), cols::iota(byte), &mu);
     }
 
-    interactions
+    b.into_vec()
 }
 
 // =========================================================================
