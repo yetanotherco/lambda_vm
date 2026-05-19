@@ -174,6 +174,7 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {

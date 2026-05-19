@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::instruction::decoding::Instruction;
@@ -21,7 +22,12 @@ use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
+use stark::proof::stark::MultiProof;
+use stark::prover::{IsStarkProver, Prover, ProvingError};
+#[cfg(feature = "disk-spill")]
+use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
+use stark::traits::AIR;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
 use crate::tables::bitwise::{
@@ -80,6 +86,27 @@ pub type E = GoldilocksExtension;
 pub type FE = FieldElement<F>;
 
 pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
+
+type GoldilocksPair<'a, PI> = (
+    &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+    &'a mut TraceTable<F, E>,
+    &'a PI,
+);
+
+pub fn multi_prove_ram<PI>(
+    air_trace_pairs: Vec<GoldilocksPair<'_, PI>>,
+    transcript: &mut (impl IsStarkTranscript<E, F> + Clone + Send),
+) -> Result<MultiProof<F, E, PI>, ProvingError>
+where
+    PI: Send + Sync + Clone,
+{
+    Prover::<F, E, PI>::multi_prove(
+        air_trace_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )
+}
 
 // =============================================================================
 // ELF Execution Helpers
