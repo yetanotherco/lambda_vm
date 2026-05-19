@@ -1321,37 +1321,27 @@ pub trait IsStarkProver<
             }
         }
 
-        // Compressed traces at ALL 2N LDE points (Plonky3-style).
-        // Eliminates the iFFT(N)+FFT(2N) extension by computing directly at LDE size.
-        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+        // Fused single-pass: compute column compression AND DEEP polynomial inline.
+        // Eliminates the intermediate `compressed` allocation (~400 MB for CPU table)
+        // and reduces to a single rayon dispatch instead of num_eval_points + 1.
+        // Column data is read once per LDE point and reused across eval points (L1 hit).
+
+        // Pre-gather gamma references per eval point for cache-friendly access.
+        let main_gammas_by_k: Vec<Vec<&FieldElement<FieldExtension>>> = (0..num_eval_points)
             .map(|k| {
-                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
+                (0..num_main_cols)
                     .map(|j| &trace_terms_gammas[j][k])
-                    .collect();
-                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
+                    .collect()
+            })
+            .collect();
+        let aux_gammas_by_k: Vec<Vec<&FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|k| {
+                (0..num_aux_cols)
                     .map(|j| &trace_terms_gammas[num_main_cols + j][k])
-                    .collect();
-
-                #[cfg(feature = "parallel")]
-                let iter = (0..lde_size).into_par_iter();
-                #[cfg(not(feature = "parallel"))]
-                let iter = 0..lde_size;
-
-                iter.map(|i| {
-                    let mut sum = FieldElement::<FieldExtension>::zero();
-                    for (j, gamma) in main_gammas.iter().enumerate() {
-                        sum += lde_trace.get_main(i, j) * *gamma;
-                    }
-                    for (j, gamma) in aux_gammas.iter().enumerate() {
-                        sum += lde_trace.get_aux(i, j) * *gamma;
-                    }
-                    sum
-                })
-                .collect()
+                    .collect()
             })
             .collect();
 
-        // Hot loop at all 2N LDE points — no FFT extension needed.
         #[cfg(feature = "parallel")]
         let iter = (0..lde_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -1367,10 +1357,18 @@ pub trait IsStarkProver<
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
 
-            // Trace terms (compressed)
+            // Trace terms: for each eval point k, compute the column sum inline
+            // and multiply by the denominator inverse in one pass.
             for k in 0..num_eval_points {
                 let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
-                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
+                let mut col_sum = FieldElement::<FieldExtension>::zero();
+                for (j, gamma) in main_gammas_by_k[k].iter().enumerate() {
+                    col_sum += lde_trace.get_main(i, j) * *gamma;
+                }
+                for (j, gamma) in aux_gammas_by_k[k].iter().enumerate() {
+                    col_sum += lde_trace.get_aux(i, j) * *gamma;
+                }
+                result += inv_t_k_i * (col_sum - &ood_compressed[k]);
             }
 
             result
