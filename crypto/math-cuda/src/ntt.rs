@@ -14,10 +14,13 @@ use math::field::traits::{IsFFTField, IsField};
 use crate::Result;
 use crate::device::backend;
 
-/// Host-side twiddle table: `[ω^0, ω^1, …, ω^{n/2-1}]` where ω is the
+/// Host-side twiddle table: `[ω^0, ω^1, ..., ω^{n/2-1}]` where ω is the
 /// primitive n-th root of unity. Exposed for `device::Backend::cached_twiddles`
 /// and for direct use in tests / benches.
 pub fn twiddles_forward(log_n: u64) -> Vec<u64> {
+    // Smallest meaningful NTT is size 2 (log_n = 1); size-1 has nothing to
+    // twiddle. The shift `1 << (log_n - 1)` underflows for log_n = 0.
+    assert!(log_n >= 1, "twiddles_forward: log_n must be >= 1");
     let omega = *GoldilocksField::get_primitive_root_of_unity(log_n)
         .expect("primitive root")
         .value();
@@ -26,6 +29,7 @@ pub fn twiddles_forward(log_n: u64) -> Vec<u64> {
 
 /// Inverse twiddle table: `[ω^{-i}]` for i in [0, n/2).
 pub fn twiddles_inverse(log_n: u64) -> Vec<u64> {
+    assert!(log_n >= 1, "twiddles_inverse: log_n must be >= 1");
     let omega = GoldilocksField::get_primitive_root_of_unity(log_n).expect("primitive root");
     let omega_inv = FieldElement::<GoldilocksField>::inv(&omega).expect("inverse");
     powers_of(*omega_inv.value(), 1usize << (log_n - 1))
@@ -56,13 +60,20 @@ pub fn inverse(evals: &[u64]) -> Result<Vec<u64>> {
 
 fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
     let n = input.len();
-    assert!(n.is_power_of_two(), "ntt length must be a power of two");
+    // Empty / size-1 has no work to do. `is_power_of_two()` returns false for
+    // 0, so this branch must come before the assert to avoid panicking on
+    // empty input.
     if n <= 1 {
         return Ok(input.to_vec());
     }
+    assert!(n.is_power_of_two(), "ntt length must be a power of two");
+    assert!(
+        n <= u32::MAX as usize,
+        "ntt length {n} exceeds u32 range — kernel grid would silently truncate",
+    );
     let log_n = n.trailing_zeros() as u64;
 
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let mut x_dev = stream.clone_htod(input)?;
@@ -117,7 +128,7 @@ pub(crate) fn run_ntt_body(
     n: u64,
     log_n: u64,
 ) -> Result<()> {
-    let be = backend();
+    let be = backend()?;
     // Levels 0..min(log_n, 8): one shmem-fused launch. Loads are fully
     // coalesced (base_step=0 → `row = tid`) and 8 butterfly rounds stay on
     // chip. This is the big DRAM-bandwidth win.
@@ -183,7 +194,7 @@ pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let be = backend();
+    let be = backend()?;
     let stream = be.next_stream();
 
     let mut x_dev = stream.clone_htod(x)?;

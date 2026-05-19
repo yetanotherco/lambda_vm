@@ -15,8 +15,9 @@ use math::field::traits::IsFFTField;
 use crate::Result;
 use crate::ntt::{twiddles_forward, twiddles_inverse};
 
-/// Reusable pinned host staging buffer. One per stream; the stream's LDE call
-/// holds its buffer's lock across the D2H + memcpy-to-user-Vecs window.
+/// Reusable pinned host staging buffer. Shared across all streams via a
+/// `Mutex` (see `Backend::pinned_staging`); the LDE call holds the lock
+/// across the D2H + memcpy-to-user-Vecs window.
 ///
 /// Allocated with `cuMemHostAlloc(flags=0)` — portable, non-write-combined,
 /// so both DMA writes from device and CPU reads into user Vecs run at full
@@ -108,9 +109,8 @@ pub struct Backend {
     /// cost for every first use of a new table size).
     pinned_staging: Mutex<PinnedStaging>,
     /// Separate pinned staging for Merkle leaf hashes. Sized `num_rows * 32`
-    /// bytes; lives alongside the LDE staging so the GPU→host D2H for
-    /// hashed leaves runs at full PCIe line-rate instead of the pageable
-    /// ~1.3 GB/s path that would otherwise eat ~100 ms per main-trace commit.
+    /// bytes. It lives alongside the LDE staging so the GPU→host D2H for
+    /// hashed leaves runs at full PCIe line-rate.
     pinned_hashes: Mutex<PinnedStaging>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
@@ -123,6 +123,7 @@ pub struct Backend {
     pub gl_neg: CudaFunction,
     pub ext3_mul: CudaFunction,
     pub ext3_add: CudaFunction,
+    pub ext3_sub: CudaFunction,
 
     // ntt.ptx
     pub bit_reverse_permute: CudaFunction,
@@ -171,8 +172,9 @@ impl Backend {
         // not part of the pool that callers rotate through.
         let util_stream = ctx.new_stream()?;
 
-        // Goldilocks TWO_ADICITY is 32, so log_n ≤ 32 covers every LDE size
-        // the prover can produce. Overshoot by one for safety.
+        // Cache is indexed by log_n. Valid range is [0, TWO_ADICITY] since
+        // Goldilocks has roots of unity for orders 2^0..=2^TWO_ADICITY only.
+        // Length = TWO_ADICITY + 1 to allow indexing at log_n = TWO_ADICITY.
         let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
 
         Ok(Self {
@@ -183,6 +185,7 @@ impl Backend {
             gl_neg: arith.load_function("gl_neg_kernel")?,
             ext3_mul: arith.load_function("ext3_mul_kernel")?,
             ext3_add: arith.load_function("ext3_add_kernel")?,
+            ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
@@ -223,7 +226,7 @@ impl Backend {
     }
 
     /// Separate pinned staging for Merkle leaf hash output. Sized in u64
-    /// units; caller should reserve `(num_rows * 32 + 7) / 8` u64s.
+    /// units. Caller should reserve `(num_rows * 32 + 7) / 8` u64s.
     pub fn pinned_hashes(&self) -> &Mutex<PinnedStaging> {
         &self.pinned_hashes
     }
@@ -243,6 +246,14 @@ impl Backend {
         } else {
             &self.inv_twiddles
         };
+        // Cache is sized TWO_ADICITY + 1 in `Backend::init`. Callers derive
+        // log_n from `trailing_zeros` of valid Goldilocks domain sizes so it
+        // must stay in range; assert in debug to catch regressions.
+        debug_assert!(
+            log_n <= GoldilocksField::TWO_ADICITY,
+            "log_n {log_n} exceeds Goldilocks TWO_ADICITY ({})",
+            GoldilocksField::TWO_ADICITY,
+        );
         {
             let guard = cache.lock().unwrap();
             if let Some(t) = &guard[idx] {
@@ -268,7 +279,19 @@ impl Backend {
     }
 }
 
-pub fn backend() -> &'static Backend {
+/// Returns the process-wide CUDA backend, initialising it on first call.
+///
+/// Returns `Err` when CUDA initialisation fails (no driver, no GPU, PTX load
+/// failure). Initialisation is retried on the next call until one succeeds —
+/// only a successful `Backend` is cached. The race window where two threads
+/// init concurrently is harmless: at most one extra `Backend::init()` runs
+/// and the loser is dropped.
+pub fn backend() -> Result<&'static Backend> {
     static BACKEND: OnceLock<Backend> = OnceLock::new();
-    BACKEND.get_or_init(|| Backend::init().expect("failed to initialise CUDA backend"))
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let b = Backend::init()?;
+    let _ = BACKEND.set(b);
+    Ok(BACKEND.get().expect("backend just initialised"))
 }

@@ -1,4 +1,4 @@
-//! Phase-5 parity: GPU `coset_lde_base` must match the CPU
+//! Parity: GPU `coset_lde_base` must match the CPU
 //! `Polynomial::coset_lde_full_expand` for a sweep of realistic sizes and
 //! blowup factors.
 
@@ -12,8 +12,8 @@ use rand_chacha::ChaCha8Rng;
 
 type Fp = FieldElement<GoldilocksField>;
 
-/// Build the coset weights `[1/N, g/N, g²/N, …, g^{n-1}/N]` — this is the
-/// layout `crypto/stark/src/prover.rs:248` uses, with `1/N` pre-folded into the
+/// Build the coset weights `[1/N, g/N, g²/N, ..., g^{n-1}/N]` — this is the
+/// layout `crypto/stark/src/prover.rs` uses, with `1/N` pre-folded into the
 /// first coefficient so the iFFT step does not need a separate scaling pass.
 fn coset_weights(n: usize, coset_offset: u64) -> Vec<u64> {
     let inv_n_fe = FieldElement::<GoldilocksField>::from(n as u64)
