@@ -33,13 +33,12 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
+
+use super::preprocessed::commit_preprocessed_columns;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -264,34 +263,8 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
         };
     }
 
-    let columns = [offset_col, init_col];
-
-    let polys: Vec<Polynomial<FE>> = columns
-        .iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for page column")
-        })
-        .collect();
-
-    let blowup_factor = options.blowup_factor as usize;
-    let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
-                .expect("LDE evaluation failed for page polynomial")
-        })
-        .collect();
-
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    let lde_rows = columns2rows(lde_columns);
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
-        .expect("Failed to build Merkle tree for page LDE");
-    tree.root
+    let columns = vec![offset_col, init_col];
+    commit_preprocessed_columns(columns, options, "page")
 }
 
 /// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.

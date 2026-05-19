@@ -38,6 +38,7 @@ pub mod memw_aligned;
 pub mod memw_register;
 pub mod mul;
 pub mod page;
+pub mod preprocessed;
 pub mod register;
 pub mod shift;
 pub mod trace_builder;

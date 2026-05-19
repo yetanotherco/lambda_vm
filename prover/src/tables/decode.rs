@@ -38,14 +38,12 @@
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
+use super::preprocessed::commit_preprocessed_columns;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // Re-export DecodeEntry from types for backwards compatibility
@@ -251,11 +249,10 @@ pub fn compute_precomputed_commitment(
     instructions: &U64HashMap<Instruction>,
     options: &ProofOptions,
 ) -> Commitment {
-    // Step 1: Generate trace (MU=0, we only need precomputed columns)
+    // Generate the trace (MU=0; only the precomputed columns are committed).
     let (trace, _pc_to_row) = generate_decode_trace(instructions);
     let num_rows = trace.num_rows();
 
-    // Step 2: Extract precomputed columns (0..NUM_PRECOMPUTED_COLS)
     let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
         .map(|col_idx| {
             (0..num_rows)
@@ -263,40 +260,7 @@ pub fn compute_precomputed_commitment(
                 .collect()
         })
         .collect();
-
-    // Step 3: Interpolate each column to a polynomial
-    let polys: Vec<Polynomial<FE>> = columns
-        .iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for decode column")
-        })
-        .collect();
-
-    // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
-    let blowup_factor = options.blowup_factor as usize;
-    let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
-                .expect("LDE evaluation failed for decode polynomial")
-        })
-        .collect();
-
-    // Step 5: Bit-reverse permute (same as prover)
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    // Step 6: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
-
-    // Step 7: Build Merkle tree over LDE (N * blowup leaves)
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
-        .expect("Failed to build Merkle tree for decode LDE");
-
-    tree.root
+    commit_preprocessed_columns(columns, options, "decode")
 }
 
 // =========================================================================

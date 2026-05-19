@@ -9,14 +9,13 @@
 
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
-use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
+
+use super::preprocessed::commit_preprocessed_columns;
 
 use executor::vm::instruction::execution::KECCAK_RC;
 
@@ -75,7 +74,6 @@ pub const fn generate_row(round: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
 static KECCAK_RC_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    // Generate precomputed columns
     let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
         .map(|_| Vec::with_capacity(NUM_ROWS))
         .collect();
@@ -85,38 +83,7 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
             columns[col_idx].push(FE::from(value));
         }
     }
-
-    // Interpolate each column to a polynomial
-    let polys: Vec<Polynomial<FE>> = columns
-        .iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for keccak_rc column")
-        })
-        .collect();
-
-    // Evaluate on LDE domain
-    let blowup_factor = options.blowup_factor as usize;
-    let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, NUM_ROWS, &coset_offset)
-                .expect("LDE evaluation failed for keccak_rc polynomial")
-        })
-        .collect();
-
-    // Bit-reverse permute
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    // Build Merkle tree
-    let lde_rows = columns2rows(lde_columns);
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
-        .expect("Failed to build Merkle tree for keccak_rc LDE");
-
-    tree.root
+    commit_preprocessed_columns(columns, options, "keccak_rc")
 }
 
 #[inline]
