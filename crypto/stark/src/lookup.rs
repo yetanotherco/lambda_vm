@@ -1061,7 +1061,10 @@ where
 
         #[cfg(feature = "parallel")]
         let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE {
-            (0..num_committed_pairs).into_par_iter().map(build_pair).collect()
+            (0..num_committed_pairs)
+                .into_par_iter()
+                .map(build_pair)
+                .collect()
         } else {
             (0..num_committed_pairs).map(build_pair).collect()
         };
@@ -1538,7 +1541,7 @@ where
                     .multiplicity
                     .evaluate_at_row(main_segment_cols, row);
                 let term = &m * &fingerprints[k * chunk_len + i];
-                acc = acc + if interaction.is_sender { term } else { -term };
+                acc += if interaction.is_sender { term } else { -term };
             }
             *result_elem = acc;
         }

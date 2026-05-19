@@ -531,6 +531,7 @@ pub trait IsStarkProver<
     /// `precomputed`: if present, the leading `num_cols` columns are committed
     /// as a separate Merkle tree (the precomputed split for preprocessed
     /// tables) and the root is checked against the AIR-hardcoded commitment.
+    #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -585,7 +586,6 @@ pub trait IsStarkProver<
 
         Ok((commit, columns))
     }
-
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
     ///
@@ -1352,7 +1352,9 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| lde_trace.gather_aux_row(row))
+                Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                    lde_trace.gather_aux_row(row)
+                })
             });
 
             openings.push(DeepPolynomialOpening {
@@ -1491,9 +1493,9 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    let precomputed = air.is_preprocessed().then(|| {
-                        (air.precomputed_commitment(), air.num_precomputed_columns())
-                    });
+                    let precomputed = air
+                        .is_preprocessed()
+                        .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
                     Self::commit_main_trace(*trace, domain, twiddles, precomputed)
                 })
                 .collect();
@@ -1586,6 +1588,7 @@ pub trait IsStarkProver<
         // Parallel aux commit in chunks of K. Each entry holds the optional aux
         // `TableCommit` (`None` when the AIR has no aux trace) and the cached
         // aux LDE columns consumed in Phase D.
+        #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<(
             Option<TableCommit<FieldExtension>>,
             Vec<Vec<FieldElement<FieldExtension>>>,
