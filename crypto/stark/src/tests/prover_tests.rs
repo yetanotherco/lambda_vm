@@ -8,6 +8,7 @@ use crate::{
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover, domain_cache_stats, evaluate_polynomial_on_lde_domain},
+    test_utils::multi_prove_ram,
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
@@ -287,7 +288,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         (&air_2, &mut trace_2, &pub_inputs),
     ];
 
-    let multi_proof = Prover::multi_prove(
+    let multi_proof = multi_prove_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
@@ -353,7 +354,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         (&air_3, &mut trace_3, &pub_inputs),
     ];
 
-    let multi_proof = Prover::multi_prove(
+    let multi_proof = multi_prove_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )

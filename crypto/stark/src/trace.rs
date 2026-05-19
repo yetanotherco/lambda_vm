@@ -4,6 +4,8 @@ use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::polynomial::barycentric_inv_denoms;
+#[cfg(feature = "disk-spill")]
+use math::spill_safe::SpillSafe;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -147,6 +149,26 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
+    /// Write main trace data to a temp file and free the in-memory vector.
+    /// Accessors read from the mmap after this call.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
+    where
+        F: Copy + 'static,
+        F::BaseType: SpillSafe,
+    {
+        self.main_table.spill_to_disk()
+    }
+
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
+    where
+        E: Copy + 'static,
+        E::BaseType: SpillSafe,
+    {
+        self.aux_table.spill_to_disk()
+    }
+
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
@@ -255,9 +277,8 @@ where
     /// Gather a full main-trace row into an owned Vec.
     /// Used by `open_trace_polys` (called ~30 times per table, allocation is negligible).
     pub fn gather_main_row(&self, row_idx: usize) -> Vec<FieldElement<F>> {
-        self.main_columns
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (0..self.num_main_cols())
+            .map(|col| self.get_main(row_idx, col).clone())
             .collect()
     }
 
@@ -269,17 +290,15 @@ where
         col_start: usize,
         col_end: usize,
     ) -> Vec<FieldElement<F>> {
-        self.main_columns[col_start..col_end]
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (col_start..col_end)
+            .map(|col| self.get_main(row_idx, col).clone())
             .collect()
     }
 
     /// Gather a full aux-trace row into an owned Vec.
     pub fn gather_aux_row(&self, row_idx: usize) -> Vec<FieldElement<E>> {
-        self.aux_columns
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (0..self.num_aux_cols())
+            .map(|col| self.get_aux(row_idx, col).clone())
             .collect()
     }
 
