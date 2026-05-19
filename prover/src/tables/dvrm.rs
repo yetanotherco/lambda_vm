@@ -38,6 +38,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::bus_builder::{BusInteractionsBuilder, packed_direct};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16,
@@ -382,137 +383,52 @@ pub fn generate_dvrm_trace(
 /// - **Sends** ZERO lookups for div_by_zero, overflow, NEG carries (×5)
 /// - **Receives** DVRM lookups from CPU table (×2: quotient and remainder)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
+    let mut b = BusInteractionsBuilder::with_capacity(20);
+    let mu_sum = Multiplicity::Sum(cols::MU_Q, cols::MU_R);
+    let signed = Multiplicity::Column(cols::SIGNED);
 
-    // DVRM-A1.i (IS_HALF[n[i]]) and DVRM-A2.i (IS_HALF[d[i]]) are assumptions:
-    // the CPU (sender) is responsible for range-checking n and d before sending
-    // to DVRM. The DVRM table does NOT send these IS_HALF lookups.
+    // DVRM-A1.i/A2.i (IS_HALF[n[i]] / IS_HALF[d[i]]) are sent by the CPU
+    // (sender side); the DVRM table does NOT replay them.
 
-    // -------------------------------------------------------------------------
-    // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
+    // DVRM-C13.i: IS_HALF[r[i]] x4.
     for col in [cols::R_0, cols::R_1, cols::R_2, cols::R_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
+        b.send_halfword(col, &mu_sum);
     }
-
-    // -------------------------------------------------------------------------
-    // DVRM-C14.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
+    // DVRM-C14.i: IS_HALF[n_sub_r[i]] x4.
     for col in [
         cols::N_SUB_R_0,
         cols::N_SUB_R_1,
         cols::N_SUB_R_2,
         cols::N_SUB_R_3,
     ] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
+        b.send_halfword(col, &mu_sum);
     }
-
-    // -------------------------------------------------------------------------
-    // DVRM-C11.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
+    // DVRM-C11.i: IS_HALF[q[i]] x4.
     for col in [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
+        b.send_halfword(col, &mu_sum);
     }
 
-    // -------------------------------------------------------------------------
-    // DVRM-C18 (SIGN): MSB16[sign_n; n[3]] when signed=1
-    // Multiplicity: Column(SIGNED) = 0 or 1 per unique row.
-    // The trace builder deduplicates MSB16 lookups per unique op.
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::N_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_N,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+    // DVRM-C18/C19/C20 (SIGN): MSB16[n[3]] -> sign_n, MSB16[r[3]] -> sign_r,
+    // MSB16[d[3]] -> sign_d when signed=1. Trace builder deduplicates per
+    // unique op, so multiplicity is Column(SIGNED) (0 or 1).
+    b.send_msb16(cols::N_3, cols::SIGN_N, &signed);
+    b.send_msb16(cols::R_3, cols::SIGN_R, &signed);
+    b.send_msb16(cols::D_3, cols::SIGN_D, &signed);
 
-    // -------------------------------------------------------------------------
-    // DVRM-C19 (SIGN): MSB16[sign_r; r[3]] when signed=1
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::R_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_R,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C20 (SIGN): MSB16[sign_d; d[3]] when signed=1
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::D_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_D,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C2: LT[1-div_by_zero; abs_r, abs_d, 0]
-    // Verify |r| < |d| when d != 0
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
+    // DVRM-C2: LT[abs_r < abs_d when d != 0]; multiplicity mu_q + mu_r.
+    b.send(
         BusId::Lt,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        mu_sum.clone(),
         vec![
-            // abs_r as DWordWL (2 words → 2 elements)
             BusValue::Packed {
                 start_column: cols::ABS_R_0,
                 packing: Packing::DWordWL,
             },
-            // abs_d as DWordWL (2 words → 2 elements)
             BusValue::Packed {
                 start_column: cols::ABS_D_0,
                 packing: Packing::DWordWL,
             },
-            // signed = 0 (unsigned comparison of absolute values)
             BusValue::constant(0),
-            // lt_result = 1 - div_by_zero
             BusValue::linear(vec![
                 LinearTerm::Constant(1),
                 LinearTerm::Column {
@@ -521,109 +437,65 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C9: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
-    // Verify n - r = d * q (lower 64 bits)
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
+    // DVRM-C9: MUL[d, signed, q, sign_q] -> n_sub_r (lo); selector = 0.
+    b.send(
         BusId::Mul,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        mu_sum.clone(),
         vec![
-            // d as DWordHL (lhs)
             BusValue::Packed {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed = signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // q as DWordHL (rhs)
+            packed_direct(cols::SIGNED),
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed = sign_q
-            BusValue::Packed {
-                start_column: cols::SIGN_Q,
-                packing: Packing::Direct,
-            },
-            // result: n_sub_r as DWordHL (lower 64 bits of d*q)
+            packed_direct(cols::SIGN_Q),
             BusValue::Packed {
                 start_column: cols::N_SUB_R_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 0 (lo)
             BusValue::constant(0),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C10: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
-    // Verify upper 64 bits of d * q = sign extension of n_sub_r
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
+    // DVRM-C10: MUL[d, signed, q, sign_q] -> extension of n_sub_r (hi); selector = 1.
+    // Each result halfword equals sign_n_sub_r * 65535, packed as DWordWL [lo32, hi32].
+    let ext_coeff = (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64;
+    b.send(
         BusId::Mul,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        mu_sum.clone(),
         vec![
-            // d as DWordHL (lhs)
             BusValue::Packed {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed = signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // q as DWordHL (rhs)
+            packed_direct(cols::SIGNED),
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed = sign_q
-            BusValue::Packed {
-                start_column: cols::SIGN_Q,
-                packing: Packing::Direct,
-            },
-            // result: sign extension of n_sub_r as DWordHL
-            // Each halfword = sign_n_sub_r * 65535
-            // lo32 = sign_n_sub_r * (65535 + 65535 * 2^16) = sign_n_sub_r * 0xFFFFFFFF
-            // hi32 = same
+            packed_direct(cols::SIGN_Q),
             BusValue::linear(vec![LinearTerm::Column {
-                coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
+                coefficient: ext_coeff,
                 column: cols::SIGN_N_SUB_R,
             }]),
             BusValue::linear(vec![LinearTerm::Column {
-                coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
+                coefficient: ext_coeff,
                 column: cols::SIGN_N_SUB_R,
             }]),
-            // muldiv_selector = 1 (hi)
             BusValue::constant(1),
         ],
-    ));
+    );
 
-    // =========================================================================
-    // ZERO interactions (C3, C5, C8, C20)
-    // =========================================================================
-
-    // -------------------------------------------------------------------------
-    // DVRM-C3: sign_r ⇒ NEG<abs_r; r>
-    // carry[0] = 2^-32 * ((r::DWordWL)[0] + abs_r[0])
-    // carry[1] = 2^-32 * ((r::DWordWL)[1] + abs_r[1] + carry[0])
-    // ZERO[1-carry[0]; r[0]+r[1]] with multiplicity sign_r
-    // ZERO[1-carry[1]; r[0]+r[1]+r[2]+r[3]] with multiplicity sign_r
-    // -------------------------------------------------------------------------
-
-    // C3a: 1 - carry[0] = 1 - 2^-32*r[0] - 2^-16*r[1] - 2^-32*abs_r[0]
-    interactions.push(BusInteraction::sender(
+    // DVRM-C3 (NEG<abs_r; r>): two ZERO checks gated by sign_r.
+    let sign_r = Multiplicity::Column(cols::SIGN_R);
+    b.send(
         BusId::Zero,
-        Multiplicity::Column(cols::SIGN_R),
+        sign_r.clone(),
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -651,13 +523,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
-
-    // C3b: 1 - carry[1] = 1 - 2^-32*r[2] - 2^-16*r[3] - 2^-32*abs_r[1]
-    //                        - 2^-64*r[0] - 2^-48*r[1] - 2^-64*abs_r[0]
-    interactions.push(BusInteraction::sender(
+    );
+    b.send(
         BusId::Zero,
-        Multiplicity::Column(cols::SIGN_R),
+        sign_r,
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -679,7 +548,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ]),
             BusValue::linear(vec![
                 LinearTerm::Constant(1),
-                // Current-level terms (carry[1] direct)
                 LinearTerm::ColumnUnsigned {
                     coefficient: NEG_INV_2_32,
                     column: cols::ABS_R_1,
@@ -692,7 +560,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     coefficient: NEG_INV_2_16,
                     column: cols::R_3,
                 },
-                // carry[0]-dependent terms (shifted by additional 2^-32)
                 LinearTerm::ColumnUnsigned {
                     coefficient: NEG_INV_2_64,
                     column: cols::ABS_R_0,
@@ -707,18 +574,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C5: sign_d ⇒ NEG<abs_d; d>
-    // carry[0] = 2^-32 * ((d::DWordWL)[0] + abs_d[0])
-    // carry[1] = 2^-32 * ((d::DWordWL)[1] + abs_d[1] + carry[0])
-    // -------------------------------------------------------------------------
-
-    // C5a: 1 - carry[0] = 1 - 2^-32*d[0] - 2^-16*d[1] - 2^-32*abs_d[0]
-    interactions.push(BusInteraction::sender(
+    // DVRM-C5 (NEG<abs_d; d>): two ZERO checks gated by sign_d.
+    let sign_d = Multiplicity::Column(cols::SIGN_D);
+    b.send(
         BusId::Zero,
-        Multiplicity::Column(cols::SIGN_D),
+        sign_d.clone(),
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -746,13 +608,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
-
-    // C5b: 1 - carry[1] = 1 - 2^-32*d[2] - 2^-16*d[3] - 2^-32*abs_d[1]
-    //                        - 2^-64*d[0] - 2^-48*d[1] - 2^-64*abs_d[0]
-    interactions.push(BusInteraction::sender(
+    );
+    b.send(
         BusId::Zero,
-        Multiplicity::Column(cols::SIGN_D),
+        sign_d,
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -774,7 +633,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ]),
             BusValue::linear(vec![
                 LinearTerm::Constant(1),
-                // Current-level terms (carry[1] direct)
                 LinearTerm::ColumnUnsigned {
                     coefficient: NEG_INV_2_32,
                     column: cols::ABS_D_1,
@@ -787,7 +645,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     coefficient: NEG_INV_2_16,
                     column: cols::D_3,
                 },
-                // carry[0]-dependent terms (shifted by additional 2^-32)
                 LinearTerm::ColumnUnsigned {
                     coefficient: NEG_INV_2_64,
                     column: cols::ABS_D_0,
@@ -802,16 +659,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C8: ZERO[overflow; overflow_sum] multiplicity: μ_q + μ_r
-    // overflow_sum = n[0]+n[1]+n[2]+(n[3]-2^15*sign_n)+(1-sign_n)+(65535-d[0])+...+(65535-d[3])
-    // Each term ≥ 0, total ≤ 2^19. Sum is 0 iff overflow condition holds.
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
+    // DVRM-C8: ZERO[overflow; overflow_sum]. overflow_sum is the long linear
+    // combination of n[*], sign_n, and d[*] derived in the spec; vanishes iff
+    // overflow condition holds.
+    b.send(
         BusId::Zero,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        mu_sum.clone(),
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -831,10 +686,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::N_3,
                 },
                 LinearTerm::Column {
-                    coefficient: -32769, // -(2^15 + 1) * sign_n
+                    coefficient: -32769,
                     column: cols::SIGN_N,
                 },
-                LinearTerm::Constant(1 + 4 * 65535), // 262141
+                LinearTerm::Constant(1 + 4 * 65535),
                 LinearTerm::Column {
                     coefficient: -1,
                     column: cols::D_0,
@@ -852,20 +707,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::D_3,
                 },
             ]),
-            BusValue::Packed {
-                start_column: cols::OVERFLOW,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::OVERFLOW),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C17: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
+    // DVRM-C17: ZERO[div_by_zero; sum(d[*])].
+    b.send(
         BusId::Zero,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        mu_sum,
         vec![
             BusValue::linear(vec![
                 LinearTerm::Column {
@@ -885,80 +734,36 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::D_3,
                 },
             ]),
-            BusValue::Packed {
-                start_column: cols::DIV_BY_ZERO,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::DIV_BY_ZERO),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // DVRM-C21: Receiver for quotient result
-    // DVRM[q::DWordWL; n, d, signed, 0] with multiplicity -μ_q
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
-        Multiplicity::Column(cols::MU_Q),
-        vec![
-            // n as DWordHL (4 halfwords → 2 words)
-            BusValue::Packed {
-                start_column: cols::N_0,
-                packing: Packing::DWordHL,
-            },
-            // d as DWordHL
-            BusValue::Packed {
-                start_column: cols::D_0,
-                packing: Packing::DWordHL,
-            },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // q as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::Q_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 0 (quotient)
-            BusValue::constant(0),
-        ],
-    ));
+    // DVRM-C21/C22: receivers for quotient (selector = 0) and remainder (selector = 1).
+    for (result_col, mult_col, selector) in [(cols::Q_0, cols::MU_Q, 0), (cols::R_0, cols::MU_R, 1)]
+    {
+        b.recv(
+            BusId::Dvrm,
+            Multiplicity::Column(mult_col),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::N_0,
+                    packing: Packing::DWordHL,
+                },
+                BusValue::Packed {
+                    start_column: cols::D_0,
+                    packing: Packing::DWordHL,
+                },
+                packed_direct(cols::SIGNED),
+                BusValue::Packed {
+                    start_column: result_col,
+                    packing: Packing::DWordHL,
+                },
+                BusValue::constant(selector),
+            ],
+        );
+    }
 
-    // -------------------------------------------------------------------------
-    // DVRM-C22: Receiver for remainder result
-    // DVRM[r::DWordWL; n, d, signed, 1] with multiplicity -μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
-        Multiplicity::Column(cols::MU_R),
-        vec![
-            // n as DWordHL
-            BusValue::Packed {
-                start_column: cols::N_0,
-                packing: Packing::DWordHL,
-            },
-            // d as DWordHL
-            BusValue::Packed {
-                start_column: cols::D_0,
-                packing: Packing::DWordHL,
-            },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // r as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::R_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 1 (remainder)
-            BusValue::constant(1),
-        ],
-    ));
-
-    interactions
+    b.into_vec()
 }
 
 // =========================================================================

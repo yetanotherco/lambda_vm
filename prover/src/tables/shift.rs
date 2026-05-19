@@ -24,6 +24,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::bus_builder::{BusInteractionsBuilder, packed_direct};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
@@ -377,48 +378,33 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(11);
+    let mut b = BusInteractionsBuilder::with_capacity(11);
+    let mu = Multiplicity::Column(cols::MU);
+    let one_minus_zbs = Multiplicity::Negated(cols::ZBS);
 
-    // SHIFT-C14: MSB16[in[3]] → is_negative | signed
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            // in[3] as halfword: x + 256*y (in[3] is stored as single Half column)
-            BusValue::Packed {
-                start_column: cols::IN_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::IS_NEGATIVE,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+    // SHIFT-C14: MSB16[in[3]] -> is_negative | signed.
+    b.send_msb16(
+        cols::IN_3,
+        cols::IS_NEGATIVE,
+        &Multiplicity::Column(cols::SIGNED),
+    );
 
-    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
-    interactions.push(BusInteraction::sender(
+    // SHIFT-C1: AND_BYTE[shift, 15] -> bit_shift | mu - direction.
+    b.send(
         BusId::AndByte,
         Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
-            BusValue::Packed {
-                start_column: cols::SHIFT_AMOUNT,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::SHIFT_AMOUNT),
             BusValue::constant(15),
-            BusValue::Packed {
-                start_column: cols::BIT_SHIFT,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::BIT_SHIFT),
         ],
-    ));
+    );
 
-    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
-    // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
-    // [0,255].
-    // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
-    // 256 - 16 - shift ∈ [0,255].
-    interactions.push(BusInteraction::sender(
+    // SHIFT-C2: AND_BYTE[256 - zbs*16 - shift, 15] -> bit_shift | direction.
+    // 256 - shift would overflow a byte when shift = 0. Subtracting zbs*16
+    // keeps it in [0, 255]: when zbs = 1, shift is a multiple of 16 (in
+    // [0, 240]), so 256 - 16 - shift in [0, 255].
+    b.send(
         BusId::AndByte,
         Multiplicity::Column(cols::DIRECTION),
         vec![
@@ -434,78 +420,45 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
             BusValue::constant(15),
-            BusValue::Packed {
-                start_column: cols::BIT_SHIFT,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::BIT_SHIFT),
         ],
-    ));
+    );
 
-    // SHIFT-C3: ZERO[bit_shift] → zbs | μ
-    // ZERO receiver expects [x + 256*y + 65536*z, zero_flag]
-    // bit_shift is a byte (0-15), so y=0, z=0: just send bit_shift directly
-    interactions.push(BusInteraction::sender(
+    // SHIFT-C3: ZERO[bit_shift] -> zbs | mu.
+    // ZERO receiver expects [x + 256*y + 65536*z, zero_flag]; bit_shift is a
+    // byte (0-15), so y=0, z=0 means just sending bit_shift directly.
+    b.send(
         BusId::Zero,
-        Multiplicity::Column(cols::MU),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BIT_SHIFT,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::ZBS,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+        mu.clone(),
+        vec![packed_direct(cols::BIT_SHIFT), packed_direct(cols::ZBS)],
+    );
 
-    // SHIFT-C4.i: HWSL[in[i], bit_shift] → [X[i], Y[i]] for i∈[0,3] | 1 - zbs
-    // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL, SLLC]
-    let one_minus_zbs = Multiplicity::Negated(cols::ZBS);
+    // SHIFT-C4.i: HWSL[in[i], bit_shift] -> [X[i], Y[i]] for i in 0..4 | 1 - zbs.
     for i in 0..4 {
-        interactions.push(BusInteraction::sender(
+        b.send(
             BusId::Hwsl,
             one_minus_zbs.clone(),
             vec![
-                BusValue::Packed {
-                    start_column: cols::IN[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::BIT_SHIFT,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::X[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y[i],
-                    packing: Packing::Direct,
-                },
+                packed_direct(cols::IN[i]),
+                packed_direct(cols::BIT_SHIFT),
+                packed_direct(cols::X[i]),
+                packed_direct(cols::Y[i]),
             ],
-        ));
+        );
     }
 
-    // SHIFT-C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]] | 1 - zbs
-    // extension = 65535 * is_negative (virtual)
-    // second output = extension - X[4] (the carry, expressed as a linear combination)
-    interactions.push(BusInteraction::sender(
+    // SHIFT-C7: HWSL[extension, bit_shift] -> [X[4], extension - X[4]] | 1 - zbs.
+    // extension = 65535 * is_negative (virtual).
+    b.send(
         BusId::Hwsl,
-        one_minus_zbs.clone(),
+        one_minus_zbs,
         vec![
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: 65535,
                 column: cols::IS_NEGATIVE,
             }]),
-            BusValue::Packed {
-                start_column: cols::BIT_SHIFT,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::X_4,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::BIT_SHIFT),
+            packed_direct(cols::X_4),
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 65535,
@@ -517,21 +470,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
+    );
 
-    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
-    // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
-    // mask = 48 - 32 * word_instr
-    interactions.push(BusInteraction::sender(
+    // SHIFT-C11: AND_BYTE[shift, mask] -> encoded_limb | mu.
+    // mask = 48 - 32 * word_instr; encoded = 48 - 48*ls_raw[0] - 32*ls_raw[1] - 16*ls_raw[2].
+    b.send(
         BusId::AndByte,
-        Multiplicity::Column(cols::MU),
+        mu.clone(),
         vec![
-            // first input: shift
-            BusValue::Packed {
-                start_column: cols::SHIFT_AMOUNT,
-                packing: Packing::Direct,
-            },
-            // second input: mask = 48 - 32 * word_instr
+            packed_direct(cols::SHIFT_AMOUNT),
             BusValue::linear(vec![
                 LinearTerm::Constant(48),
                 LinearTerm::Column {
@@ -539,10 +486,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::WORD_INSTR,
                 },
             ]),
-            // result: encoded limb_shift
-            // = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
-            // substituting ls[3] = 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]:
-            // = 48 - 48*ls_raw[0] - 32*ls_raw[1] - 16*ls_raw[2]
             BusValue::linear(vec![
                 LinearTerm::Constant(48),
                 LinearTerm::Column {
@@ -559,47 +502,29 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
         ],
-    ));
+    );
 
-    // SHIFT-C15: SHIFT[out; in, shift, direction, signed, word_instr] | -μ (receiver)
-    interactions.push(BusInteraction::receiver(
+    // SHIFT-C15: SHIFT[out; in, shift, direction, signed, word_instr] | mu (receiver).
+    b.recv(
         BusId::Shift,
-        Multiplicity::Column(cols::MU),
+        mu,
         vec![
-            // out as DWordWL (2 elements)
             BusValue::Packed {
                 start_column: cols::OUT_0,
                 packing: Packing::DWordWL,
             },
-            // in as DWordHL (4 halfwords → 2 elements)
             BusValue::Packed {
                 start_column: cols::IN_0,
                 packing: Packing::DWordHL,
             },
-            // shift
-            BusValue::Packed {
-                start_column: cols::SHIFT_AMOUNT,
-                packing: Packing::Direct,
-            },
-            // direction
-            BusValue::Packed {
-                start_column: cols::DIRECTION,
-                packing: Packing::Direct,
-            },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // word_instr
-            BusValue::Packed {
-                start_column: cols::WORD_INSTR,
-                packing: Packing::Direct,
-            },
+            packed_direct(cols::SHIFT_AMOUNT),
+            packed_direct(cols::DIRECTION),
+            packed_direct(cols::SIGNED),
+            packed_direct(cols::WORD_INSTR),
         ],
-    ));
+    );
 
-    interactions
+    b.into_vec()
 }
 
 // =========================================================================

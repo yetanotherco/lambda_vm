@@ -38,6 +38,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::bus_builder::{BusInteractionsBuilder, packed_direct};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
@@ -362,84 +363,36 @@ pub fn generate_mul_trace(
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
+    let mut b = BusInteractionsBuilder::with_capacity(11);
+    let mu_sum = Multiplicity::Sum(cols::MU_LO, cols::MU_HI);
 
-    // -------------------------------------------------------------------------
-    // MSB16 lookups for sign bit extraction
-    // -------------------------------------------------------------------------
-    // MSB16[lhs[3]] -> lhs_is_negative (when lhs_signed=1)
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::LHS_SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::LHS_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::LHS_IS_NEGATIVE,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+    // MSB16 sign extraction for lhs[3] and rhs[3].
+    b.send_msb16(
+        cols::LHS_3,
+        cols::LHS_IS_NEGATIVE,
+        &Multiplicity::Column(cols::LHS_SIGNED),
+    );
+    b.send_msb16(
+        cols::RHS_3,
+        cols::RHS_IS_NEGATIVE,
+        &Multiplicity::Column(cols::RHS_SIGNED),
+    );
 
-    // MSB16[rhs[3]] -> rhs_is_negative (when rhs_signed=1)
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::RHS_SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::RHS_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RHS_IS_NEGATIVE,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // IS_HALF lookups for lo range checks (multiplicity: mu_lo + mu_hi)
-    // -------------------------------------------------------------------------
+    // IS_HALF range checks on lo[0..4] and hi[0..4] (mult = mu_lo + mu_hi).
     for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
+        b.send_halfword(col, &mu_sum);
     }
-
-    // -------------------------------------------------------------------------
-    // IS_HALF lookups for hi range checks (multiplicity: mu_lo + mu_hi)
-    // -------------------------------------------------------------------------
     for col in [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
+        b.send_halfword(col, &mu_sum);
     }
 
-    // -------------------------------------------------------------------------
-    // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)
-    // Carries are virtual columns computed as linear combinations:
-    //   carry[0] = 2^-32 * (raw_product[0] - res[0])
-    //   carry[i] = 2^-32 * (raw_product[i] + carry[i-1] - res[i])
-    // where res = [lo_word0, lo_word1, hi_word0, hi_word1]
-    // -------------------------------------------------------------------------
-
-    // carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
-    interactions.push(BusInteraction::sender(
-        BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-        vec![BusValue::linear(vec![
+    // IS_B20 range checks on the four virtual carries. Each carry is a linear
+    // combination of raw_product[*] and lo[*]/hi[*] limbs (see compute_carries):
+    //   carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
+    //   carry[i] = 2^-32 * raw_product[i] + (next-shifted predecessors) - (lo/hi limbs)
+    b.send_b20_linear(
+        &mu_sum,
+        vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
                 column: cols::RAW_PRODUCT_0,
@@ -452,15 +405,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: NEG_INV_2_16,
                 column: cols::LO_1,
             },
-        ])],
-    ));
-
-    // carry[1] = 2^-32 * raw_product[1] + 2^-64 * raw_product[0]
-    //          - 2^-64 * lo[0] - 2^-48 * lo[1] - 2^-32 * lo[2] - 2^-16 * lo[3]
-    interactions.push(BusInteraction::sender(
-        BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-        vec![BusValue::linear(vec![
+        ],
+    );
+    b.send_b20_linear(
+        &mu_sum,
+        vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
                 column: cols::RAW_PRODUCT_1,
@@ -485,16 +434,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: NEG_INV_2_16,
                 column: cols::LO_3,
             },
-        ])],
-    ));
-
-    // carry[2] = 2^-32 * raw_product[2] + 2^-64 * raw_product[1] + 2^-96 * raw_product[0]
-    //          - 2^-96 * lo[0] - 2^-80 * lo[1] - 2^-64 * lo[2] - 2^-48 * lo[3]
-    //          - 2^-32 * hi[0] - 2^-16 * hi[1]
-    interactions.push(BusInteraction::sender(
-        BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-        vec![BusValue::linear(vec![
+        ],
+    );
+    b.send_b20_linear(
+        &mu_sum,
+        vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
                 column: cols::RAW_PRODUCT_2,
@@ -531,16 +475,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: NEG_INV_2_16,
                 column: cols::HI_1,
             },
-        ])],
-    ));
-
-    // carry[3] = 2^-32 * raw_product[3] + 2^-64 * raw_product[2] + 2^-96 * raw_product[1] + 2^-128 * raw_product[0]
-    //          - 2^-128 * lo[0] - 2^-112 * lo[1] - 2^-96 * lo[2] - 2^-80 * lo[3]
-    //          - 2^-64 * hi[0] - 2^-48 * hi[1] - 2^-32 * hi[2] - 2^-16 * hi[3]
-    interactions.push(BusInteraction::sender(
-        BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-        vec![BusValue::linear(vec![
+        ],
+    );
+    b.send_b20_linear(
+        &mu_sum,
+        vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
                 column: cols::RAW_PRODUCT_3,
@@ -589,86 +528,37 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: NEG_INV_2_16,
                 column: cols::HI_3,
             },
-        ])],
-    ));
-
-    // -------------------------------------------------------------------------
-    // MUL receiver for lo result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, lo, 0] per spec MUL-C7
-    interactions.push(BusInteraction::receiver(
-        BusId::Mul,
-        Multiplicity::Column(cols::MU_LO),
-        vec![
-            // lhs as DWordHL (4 halfwords -> 2 words)
-            BusValue::Packed {
-                start_column: cols::LHS_0,
-                packing: Packing::DWordHL,
-            },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::RHS_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // lo as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::LO_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 0 (lo)
-            BusValue::constant(0),
         ],
-    ));
+    );
 
-    // -------------------------------------------------------------------------
-    // MUL receiver for hi result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, hi, 1] per spec MUL-C8
-    interactions.push(BusInteraction::receiver(
-        BusId::Mul,
-        Multiplicity::Column(cols::MU_HI),
-        vec![
-            // lhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::LHS_0,
-                packing: Packing::DWordHL,
-            },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::RHS_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // hi as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::HI_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 1 (hi)
-            BusValue::constant(1),
-        ],
-    ));
+    // MUL receivers: lo result (selector = 0, MUL-C7) and hi result (selector = 1, MUL-C8).
+    for (result_col, mult_col, selector) in
+        [(cols::LO_0, cols::MU_LO, 0), (cols::HI_0, cols::MU_HI, 1)]
+    {
+        b.recv(
+            BusId::Mul,
+            Multiplicity::Column(mult_col),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::LHS_0,
+                    packing: Packing::DWordHL,
+                },
+                packed_direct(cols::LHS_SIGNED),
+                BusValue::Packed {
+                    start_column: cols::RHS_0,
+                    packing: Packing::DWordHL,
+                },
+                packed_direct(cols::RHS_SIGNED),
+                BusValue::Packed {
+                    start_column: result_col,
+                    packing: Packing::DWordHL,
+                },
+                BusValue::constant(selector),
+            ],
+        );
+    }
 
-    interactions
+    b.into_vec()
 }
 
 // =========================================================================
