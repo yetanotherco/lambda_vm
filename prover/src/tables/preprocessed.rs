@@ -10,7 +10,7 @@ use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 use stark::prover::commit_lde_columns;
 
-use super::types::{FE, GoldilocksField};
+use super::types::FE;
 
 /// Commit the precomputed `columns` of a preprocessed table and return the
 /// Merkle root.
@@ -26,6 +26,8 @@ pub fn commit_preprocessed_columns(
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
 
-    commit_lde_columns::<GoldilocksField>(&columns, blowup_factor, &coset_offset)
+    // `F` is inferred as GoldilocksField from `columns` / `coset_offset` — the
+    // prover crate is monomorphic over Goldilocks; the genericity lives in `stark`.
+    commit_lde_columns(&columns, blowup_factor, &coset_offset)
         .unwrap_or_else(|| panic!("failed to commit preprocessed columns for {table_label}"))
 }

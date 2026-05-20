@@ -11,8 +11,8 @@
 //! The builder reduces each interaction to a single intent-named call that
 //! reads as a spec line ("send `col` to IS_HALFWORD with multiplicity mu").
 //!
-//! No macros: plain Rust methods, discoverable via `rust-analyzer`. Use the
-//! `raw(...)` escape hatch for one-off interactions that do not fit a helper.
+//! No macros: plain Rust methods, discoverable via `rust-analyzer`. Heterogeneous
+//! interactions that do not match a named helper use the generic `send` / `recv`.
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 
@@ -24,10 +24,8 @@ pub struct BusInteractionsBuilder {
 }
 
 impl BusInteractionsBuilder {
-    pub fn new() -> Self {
-        Self { inner: Vec::new() }
-    }
-
+    /// Create a builder, pre-sizing for `n` interactions. Every `bus_interactions()`
+    /// knows its interaction count up front, so there is no zero-arg constructor.
     pub fn with_capacity(n: usize) -> Self {
         Self {
             inner: Vec::with_capacity(n),
@@ -84,17 +82,6 @@ impl BusInteractionsBuilder {
         self
     }
 
-    /// Send a direct-packed column to a B20 range check.
-    /// IS_B20[col]
-    pub fn send_b20(&mut self, col: usize, mult: &Multiplicity) -> &mut Self {
-        self.inner.push(BusInteraction::sender(
-            BusId::IsB20,
-            mult.clone(),
-            vec![packed_direct(col)],
-        ));
-        self
-    }
-
     /// Generic sender with caller-provided values. Takes ownership of `mult`;
     /// use when sending exactly one interaction with this multiplicity.
     pub fn send(&mut self, bus_id: BusId, mult: Multiplicity, values: Vec<BusValue>) -> &mut Self {
@@ -143,24 +130,6 @@ impl BusInteractionsBuilder {
         self.inner
             .push(BusInteraction::receiver(bus_id, mult, values));
         self
-    }
-
-    // -------------------------------------------------------------------------
-    // Escape hatch
-    // -------------------------------------------------------------------------
-
-    /// Push a fully-constructed `BusInteraction` (sender or receiver) without
-    /// going through a helper. Use when the interaction does not match any
-    /// named idiom on this builder.
-    pub fn raw(&mut self, interaction: BusInteraction) -> &mut Self {
-        self.inner.push(interaction);
-        self
-    }
-}
-
-impl Default for BusInteractionsBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
