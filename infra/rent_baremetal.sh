@@ -25,6 +25,7 @@ NC='\033[0m'
 
 SCW_ZONE="${SCW_ZONE:-fr-par-2}"
 SCW_TYPE="${SCW_TYPE:-EM-I320E-NVME}"
+SCW_OS_ID="${SCW_OS_ID:-83640d93-a0b8-45ad-9c9f-30cae48380a4}"  # Debian
 USER_DATA_FILE="${USER_DATA_FILE:-$SCRIPT_DIR/user_data.yaml}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
 
@@ -85,14 +86,28 @@ if [ -z "$OFFER_ID" ]; then
 fi
 ok "Resolved hourly offer ID: $OFFER_ID"
 
-USER_DATA=$(cat "$USER_DATA_FILE")
+info "Enumerating SSH keys from scw iam ssh-key list..."
+SSH_KEYS_JSON=$(scw iam ssh-key list -o json)
+mapfile -t SSH_KEY_IDS < <(echo "$SSH_KEYS_JSON" | jq -r '.[].id')
+if [ ${#SSH_KEY_IDS[@]} -eq 0 ]; then
+    err "no SSH keys found in scw iam ssh-key list — register one first ('scw iam ssh-key create')"
+    exit 1
+fi
+ok "Found ${#SSH_KEY_IDS[@]} SSH key(s) to install"
 
-info "Creating server name=$SERVER_NAME..."
+SSH_KEY_ARGS=()
+for i in "${!SSH_KEY_IDS[@]}"; do
+    SSH_KEY_ARGS+=("install.ssh-key-ids.${i}=${SSH_KEY_IDS[$i]}")
+done
+
+info "Creating server name=$SERVER_NAME (user-data skipped for now)..."
 CREATE_JSON=$(scw baremetal server create \
     zone="$SCW_ZONE" \
     type="$OFFER_ID" \
     name="$SERVER_NAME" \
-    user-data.cloud-init="$USER_DATA" \
+    install.os-id="$SCW_OS_ID" \
+    install.hostname="$SERVER_NAME" \
+    "${SSH_KEY_ARGS[@]}" \
     -o json)
 
 SERVER_ID=$(echo "$CREATE_JSON" | jq -r '.id // empty')
