@@ -52,7 +52,7 @@ mod fft_polynomial_tests {
     use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
-    use crate::fft::polynomial::compose_fft;
+    use crate::polynomial::compose_fft;
     use crate::field::element::FieldElement;
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
