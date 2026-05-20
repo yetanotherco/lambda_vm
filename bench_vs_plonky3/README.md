@@ -81,22 +81,25 @@ Stdout (without `--report-dir`):
 
 [build] prove_bench
 --- log-rows=19  (rows = 524288) ---
-  [lambda] median 2.444s from 3 runs: 2.444,2.279,2.830
-  [p3]     median 0.988s from 3 runs: 0.981,0.993,0.988
+  [lambda] prove median 0.574s (CV 3.07%), verify 0.024s, proof 4116000 B, rss 805000 KB
+  [p3]     prove median 0.324s (CV 2.85%), verify 0.019s, proof 1987000 B, rss 627000 KB
 
 === Summary ===
-  log-rows   rows              Lambda (s)          P3 (s)        L/P3
-  --------   ----              ----------          ------        ----
-  19         524288                2.444s          0.988s      2.474x  (P3 faster)
+  log-rows   rows              Lambda (s)      L CV%          P3 (s)     P3 CV%        L/P3
+  --------   ----              ----------      -----          ------     ------        ----
+  19         524288              0.574s         3.07%        0.324s       2.85%      1.770x  (P3 faster)
 
-Timing window: single-shot end-to-end prove.
-Ratio = Lambda / P3. ratio > 1 → P3 faster (Lambda took ratio× longer); ratio < 1 → Lambda faster.
+Timing window: prove only for the ratio. Verify, proof size, RSS and throughput are reported separately.
 ```
 
 With `--report-dir DIR` the script writes:
 
-- `results.tsv` — tab-separated raw data (`log_rows, rows, lambda_median_s,
-  p3_median_s, ratio_lambda_over_p3, runs`).
+- `results.tsv` — tab-separated, one row per `log_rows` size with 14 columns:
+  `log_rows, rows, lambda_prove_median_s, lambda_prove_cv_pct,
+  lambda_verify_median_s, lambda_proof_size_bytes_median,
+  lambda_peak_rss_kb_median, p3_prove_median_s, p3_prove_cv_pct,
+  p3_verify_median_s, p3_proof_size_bytes_median, p3_peak_rss_kb_median,
+  ratio_lambda_over_p3, runs`.
 - `raw_metrics.tsv` — one row per `(prover, log_rows, run)` with all
   `METRICS` fields parsed out.
 - `raw_audits.tsv` — one row per `(prover, log_rows, run)` with the AUDIT
@@ -114,22 +117,27 @@ downstream tooling.
 
 ## Nightly
 
-A GitHub Actions workflow (`.github/workflows/bench-vs-p3-nightly.yml`) runs
-daily at 07:30 UTC (04:30 Buenos Aires, after the SP1 nightly completes) on
-the self-hosted `bench` runner. It executes:
+The Lambda-vs-Plonky3 bench is part of the shared
+`.github/workflows/bench-vs-nightly.yml` workflow, which runs daily at
+06:00 UTC (03:00 Buenos Aires) on the self-hosted `bench` runner. The P3
+step executes after the Lambda-vs-SP1 and ethrex empty-block steps:
 
 ```bash
 bash ./bench_vs_plonky3/run.sh \
-  --log-rows 19 \
+  --log-rows 21 \
   --num-sequences 16 \
-  --runs 3 \
+  --runs 10 \
   --scalar \
-  --report-dir bench_vs_p3_artifacts \
+  --report-dir bench_vs_artifacts/p3 \
   --no-color
 ```
 
-The `bench_vs_p3_artifacts/` directory is uploaded as an artifact named
-`bench-vs-p3-nightly-<run_number>-<sha>` with 90-day retention.
+A `cargo update -p p3-*` runs before this step so the bench tracks the
+latest upstream Plonky3 `main`. The full `bench_vs_artifacts/` directory
+(SP1 + ethrex + P3 outputs) is uploaded as one artifact named
+`bench-vs-nightly-<run_number>-<sha>` with 90-day retention. A "Lambda
+VM vs Plonky3" section is appended to the same Slack post that publishes
+the SP1 and ethrex results.
 
 ## Breakdown (per-phase timing) for manual analysis
 

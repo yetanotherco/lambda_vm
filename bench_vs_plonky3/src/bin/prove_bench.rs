@@ -12,9 +12,9 @@
 //!   log-rows=19, num-sequences=16, blowup=2, queries=219, grinding=0.
 
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use bench_vs_plonky3::span_timing::{P3TimingLayer, SpanResults as P3SpanResults};
 use bench_vs_plonky3::{lambda_fibonacci_pair, plonky3_config, plonky3_fibonacci};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -327,74 +327,8 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
     eprintln!("warning: Lambda phase breakdown requires building with --features instruments");
 }
 
-struct SpanState {
-    name: String,
-    active_since: Option<Instant>,
-    accumulated: std::time::Duration,
-}
-
-struct P3TimingLayer {
-    spans: Mutex<std::collections::HashMap<u64, SpanState>>,
-    results: Arc<Mutex<Vec<(String, f64)>>>,
-}
-
-impl<S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>>
-    tracing_subscriber::Layer<S> for P3TimingLayer
-{
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.spans.lock().unwrap().insert(
-            id.into_u64(),
-            SpanState {
-                name: attrs.metadata().name().to_string(),
-                active_since: None,
-                accumulated: std::time::Duration::ZERO,
-            },
-        );
-    }
-
-    fn on_enter(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-            && entry.active_since.is_none()
-        {
-            entry.active_since = Some(Instant::now());
-        }
-    }
-
-    fn on_exit(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-            && let Some(start) = entry.active_since.take()
-        {
-            entry.accumulated += start.elapsed();
-        }
-    }
-
-    fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(entry) = self.spans.lock().unwrap().remove(&id.into_u64()) {
-            let mut total = entry.accumulated;
-            if let Some(start) = entry.active_since {
-                total += start.elapsed();
-            }
-            self.results
-                .lock()
-                .unwrap()
-                .push((entry.name, ms(total.as_secs_f64())));
-        }
-    }
-}
-
-type P3SpanResults = Arc<Mutex<Vec<(String, f64)>>>;
-
 fn p3_span_subscriber() -> (impl tracing::Subscriber + Send + Sync, P3SpanResults) {
-    let results = Arc::new(Mutex::new(Vec::new()));
-    let layer = P3TimingLayer {
-        spans: Mutex::new(std::collections::HashMap::new()),
-        results: Arc::clone(&results),
-    };
+    let (layer, results) = P3TimingLayer::new();
     let filter = tracing_subscriber::filter::LevelFilter::DEBUG;
     (
         tracing_subscriber::registry().with(filter).with(layer),
@@ -411,13 +345,17 @@ fn peak_rss_kb() -> Option<u64> {
     }
 
     let maxrss = unsafe { usage.assume_init().ru_maxrss };
+    if maxrss < 0 {
+        return None;
+    }
+    let maxrss = maxrss as u64;
     #[cfg(target_os = "macos")]
     {
-        Some((maxrss as u64).div_ceil(1024))
+        Some(maxrss.div_ceil(1024))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Some(maxrss as u64)
+        Some(maxrss)
     }
 }
 

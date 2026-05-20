@@ -242,10 +242,6 @@ ratio_fmt() {
     }'
 }
 
-mean_file() {
-    LC_NUMERIC=C awk '{ s += $1; n++ } END { if (n == 0) print "n/a"; else printf "%.6f\n", s / n }' "$1"
-}
-
 median_file() {
     LC_ALL=C sort -g "$1" | LC_NUMERIC=C awk '
         { a[NR] = $0 + 0 }
@@ -254,18 +250,6 @@ median_file() {
             if (NR % 2 == 1) printf "%.6f\n", a[(NR + 1) / 2]
             else printf "%.6f\n", (a[NR / 2] + a[NR / 2 + 1]) / 2
         }'
-}
-
-stddev_file() {
-    LC_NUMERIC=C awk '
-        { s += $1; ss += $1 * $1; n++ }
-        END {
-            if (n == 0) { print "n/a"; exit }
-            m = s / n
-            v = (ss / n) - (m * m)
-            if (v < 0) v = 0
-            printf "%.6f\n", sqrt(v)
-        }' "$1"
 }
 
 cv_pct_file() {
@@ -280,14 +264,6 @@ cv_pct_file() {
             if (m == 0) print "n/a"
             else printf "%.2f\n", sd * 100 / m
         }' "$1"
-}
-
-min_file() {
-    LC_ALL=C sort -g "$1" | LC_NUMERIC=C awk 'NR == 1 { printf "%.6f\n", $1; exit }'
-}
-
-max_file() {
-    LC_ALL=C sort -g "$1" | LC_NUMERIC=C awk '{ x = $1 } END { if (NR == 0) print "n/a"; else printf "%.6f\n", x }'
 }
 
 fmt0() {
@@ -354,8 +330,8 @@ run_prover() {
             run_args+=(--breakdown)
         fi
         if ! "$BIN" "${run_args[@]}" > "$out_file" 2>&1; then
-            echo -e "  ${RED}[${prover}] FAILED on log-rows=${log_rows} run ${run_i}${NC}"
-            cat "$out_file"
+            echo -e "  ${RED}[${prover}] FAILED on log-rows=${log_rows} run ${run_i}${NC}" >&2
+            cat "$out_file" >&2
             exit 1
         fi
         local audit_line
@@ -366,8 +342,8 @@ run_prover() {
         local metrics_line
         metrics_line=$(extract_metrics_line < "$out_file")
         if [ -z "$metrics_line" ]; then
-            echo -e "  ${RED}[${prover}] could not parse metrics (log-rows=${log_rows}, run ${run_i})${NC}"
-            cat "$out_file"
+            echo -e "  ${RED}[${prover}] could not parse metrics (log-rows=${log_rows}, run ${run_i})${NC}" >&2
+            cat "$out_file" >&2
             exit 1
         fi
         printf '%s\n' "$metrics_line" >> "$metrics_file"

@@ -271,6 +271,13 @@ where
         _bus_public_inputs: Option<&stark::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
+        assert_eq!(
+            pub_inputs.initial_values.len(),
+            self.num_sequences,
+            "AIR built for {} sequences, public inputs carry {}",
+            self.num_sequences,
+            pub_inputs.initial_values.len(),
+        );
         let mut constraints = Vec::with_capacity(2 * pub_inputs.initial_values.len());
         for (seq_idx, (a, b)) in pub_inputs.initial_values.iter().enumerate() {
             constraints.push(BoundaryConstraint::new_main(

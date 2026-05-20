@@ -1,6 +1,7 @@
 pub mod lambda_fibonacci_pair;
 pub mod plonky3_config;
 pub mod plonky3_fibonacci;
+pub mod span_timing;
 
 #[cfg(test)]
 mod tests {
@@ -206,93 +207,9 @@ mod tests {
         println!("\n============================================================");
         println!("Plonky3 STARK Span Breakdown");
 
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
         use tracing_subscriber::layer::SubscriberExt;
 
-        type SpanResults = Arc<Mutex<Vec<(String, f64)>>>;
-
-        struct SpanState {
-            name: String,
-            active_since: Option<std::time::Instant>,
-            accumulated: std::time::Duration,
-        }
-
-        struct P3TimingLayer {
-            spans: Mutex<HashMap<u64, SpanState>>,
-            results: SpanResults,
-        }
-
-        impl<
-            S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-        > tracing_subscriber::Layer<S> for P3TimingLayer
-        {
-            fn on_new_span(
-                &self,
-                attrs: &tracing::span::Attributes<'_>,
-                id: &tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let name = attrs.metadata().name().to_string();
-                self.spans.lock().unwrap().insert(
-                    id.into_u64(),
-                    SpanState {
-                        name,
-                        active_since: None,
-                        accumulated: std::time::Duration::ZERO,
-                    },
-                );
-            }
-
-            // Rayon can re-enter a span across threads, so only start timing on
-            // the first enter after each exit; accumulate every interval.
-            fn on_enter(
-                &self,
-                id: &tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-                    && entry.active_since.is_none()
-                {
-                    entry.active_since = Some(std::time::Instant::now());
-                }
-            }
-
-            fn on_exit(
-                &self,
-                id: &tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-                    && let Some(start) = entry.active_since.take()
-                {
-                    entry.accumulated += start.elapsed();
-                }
-            }
-
-            fn on_close(
-                &self,
-                id: tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if let Some(entry) = self.spans.lock().unwrap().remove(&id.into_u64()) {
-                    // If we never saw on_exit (span closed while active), include
-                    // the dangling interval.
-                    let mut total = entry.accumulated;
-                    if let Some(start) = entry.active_since {
-                        total += start.elapsed();
-                    }
-                    let ms = total.as_secs_f64() * 1000.0;
-                    self.results.lock().unwrap().push((entry.name, ms));
-                }
-            }
-        }
-
-        let results: SpanResults = Arc::new(Mutex::new(Vec::new()));
-        let layer = P3TimingLayer {
-            spans: Mutex::new(HashMap::new()),
-            results: Arc::clone(&results),
-        };
+        let (layer, results) = crate::span_timing::P3TimingLayer::new();
         let filter = tracing_subscriber::filter::LevelFilter::DEBUG;
         let subscriber = tracing_subscriber::registry().with(filter).with(layer);
 

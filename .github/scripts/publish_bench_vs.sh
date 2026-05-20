@@ -13,7 +13,7 @@ METRICS_FILE="bench_vs_artifacts/metrics.txt"
 if [ ! -f "$METRICS_FILE" ]; then
     curl -X POST "$WEBHOOK_URL" \
         -H 'Content-Type: application/json; charset=utf-8' \
-        --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"section","text":{"type":"mrkdwn","text":":x: Benchmark failed - no metrics found. Check the workflow logs."}}]}'
+        --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM Nightly Benchmark"}},{"type":"section","text":{"type":"mrkdwn","text":":x: Benchmark failed - no metrics found. Check the workflow logs."}}]}'
     exit 0
 fi
 
@@ -173,4 +173,4 @@ fi
 
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* Fibonacci  ·  *Device:* CPU"}]},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION$P3_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM Nightly Benchmark"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* Fibonacci  ·  *Device:* CPU"}]},{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION$P3_SECTION"']}'
