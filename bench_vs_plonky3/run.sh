@@ -174,7 +174,7 @@ run_one() {
         --blowup "$BLOWUP" \
         --queries "$FRI_QUERIES" \
         --grinding "$GRINDING" \
-        "${extra_args[@]}" > "$out_file" 2>&1
+        ${extra_args[@]+"${extra_args[@]}"} > "$out_file" 2>&1
 }
 
 run_prover() {

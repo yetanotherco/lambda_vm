@@ -19,7 +19,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -685,13 +685,34 @@ pub trait IsStarkProver<
 
         // Upfront transpose on the small trace (trace_len rows × num_cols).
         // Allocate the LDE-sized buffer up front so the in-place expansion
-        // never needs to grow.
-        let mut row_major: Vec<FieldElement<E>> = Vec::with_capacity(lde_size * num_cols);
-        for row in 0..trace_len {
-            for col in &columns {
-                row_major.push(col[row].clone());
+        // never needs to grow. Use the larger LDE capacity but only fill the
+        // trace prefix; `coset_lde_full_expand_row_major` resizes to lde_n.
+        let prefix_len = trace_len * num_cols;
+        let mut row_major: Vec<FieldElement<E>> = vec![FieldElement::<E>::zero(); prefix_len];
+
+        #[cfg(feature = "parallel")]
+        {
+            row_major
+                .par_chunks_exact_mut(num_cols)
+                .enumerate()
+                .for_each(|(row, dst)| {
+                    for (col_idx, src_col) in columns.iter().enumerate() {
+                        dst[col_idx] = src_col[row].clone();
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (row, dst) in row_major.chunks_exact_mut(num_cols).enumerate() {
+                for (col_idx, src_col) in columns.iter().enumerate() {
+                    dst[col_idx] = src_col[row].clone();
+                }
             }
         }
+
+        // Reserve LDE-sized capacity so the in-place resize inside the
+        // batched expand never reallocates.
+        row_major.reserve_exact(lde_size * num_cols - prefix_len);
 
         Polynomial::coset_lde_full_expand_row_major::<Field>(
             &mut row_major,

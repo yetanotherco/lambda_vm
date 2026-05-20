@@ -31,14 +31,150 @@ use crate::fft::cpu::bit_reversing::reverse_index;
 #[cfg(feature = "alloc")]
 use crate::fft::cpu::bowers_fft::LayerTwiddles;
 
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+use rayon::prelude::*;
+
+/// Threshold for engaging intra-block parallelism inside the butterfly loop.
+/// Below this, even Rayon-aware blocks fall back to sequential per-row work.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+const INTRA_BLOCK_PAR_THRESHOLD: usize = 64;
+
+/// Process one DIF block in row-major layout (M-wide rows).
+///
+/// When the parallel feature is enabled and `half_block_rows >= threshold`,
+/// the butterflies inside this block run in parallel via Rayon — important
+/// for the early FFT layers (large blocks, few blocks) where across-block
+/// parallelism is not available.
+#[cfg(feature = "alloc")]
+#[inline]
+fn dif_block_row_major<F, E>(
+    block: &mut [FieldElement<E>],
+    num_cols: usize,
+    twiddles: &[FieldElement<F>],
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let m = num_cols;
+    let block_size_rows = block.len() / m;
+    let half_block_rows = block_size_rows >> 1;
+    let half_off = half_block_rows * m;
+    let (lo_part, hi_part) = block.split_at_mut(half_off);
+
+    #[cfg(feature = "parallel")]
+    {
+        if half_block_rows >= INTRA_BLOCK_PAR_THRESHOLD {
+            lo_part
+                .par_chunks_exact_mut(m)
+                .zip(hi_part.par_chunks_exact_mut(m))
+                .zip(twiddles[..half_block_rows].par_iter())
+                .for_each(|((lo_row, hi_row), w)| {
+                    for k in 0..m {
+                        let sum = &lo_row[k] + &hi_row[k];
+                        let diff = &lo_row[k] - &hi_row[k];
+                        let diff_w = w * &diff;
+                        lo_row[k] = sum;
+                        hi_row[k] = diff_w;
+                    }
+                });
+            return;
+        }
+    }
+
+    for j in 0..half_block_rows {
+        let w = &twiddles[j];
+        let lo_row = &mut lo_part[j * m..j * m + m];
+        let hi_row = &mut hi_part[j * m..j * m + m];
+        for k in 0..m {
+            let sum = &lo_row[k] + &hi_row[k];
+            let diff = &lo_row[k] - &hi_row[k];
+            let diff_w = w * &diff;
+            lo_row[k] = sum;
+            hi_row[k] = diff_w;
+        }
+    }
+}
+
+/// Process one DIT (inverse) block in row-major layout.
+#[cfg(feature = "alloc")]
+#[inline]
+fn dit_block_row_major<F, E>(
+    block: &mut [FieldElement<E>],
+    num_cols: usize,
+    twiddles: &[FieldElement<F>],
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let m = num_cols;
+    let block_size_rows = block.len() / m;
+    let half_block_rows = block_size_rows >> 1;
+    let half_off = half_block_rows * m;
+    let (lo_part, hi_part) = block.split_at_mut(half_off);
+
+    #[cfg(feature = "parallel")]
+    {
+        if half_block_rows >= INTRA_BLOCK_PAR_THRESHOLD {
+            lo_part
+                .par_chunks_exact_mut(m)
+                .zip(hi_part.par_chunks_exact_mut(m))
+                .zip(twiddles[..half_block_rows].par_iter())
+                .for_each(|((lo_row, hi_row), w)| {
+                    for k in 0..m {
+                        let bw = w * &hi_row[k];
+                        let sum = &lo_row[k] + &bw;
+                        let diff = &lo_row[k] - &bw;
+                        lo_row[k] = sum;
+                        hi_row[k] = diff;
+                    }
+                });
+            return;
+        }
+    }
+
+    for j in 0..half_block_rows {
+        let w = &twiddles[j];
+        let lo_row = &mut lo_part[j * m..j * m + m];
+        let hi_row = &mut hi_part[j * m..j * m + m];
+        for k in 0..m {
+            let bw = w * &hi_row[k];
+            let sum = &lo_row[k] + &bw;
+            let diff = &lo_row[k] - &bw;
+            lo_row[k] = sum;
+            hi_row[k] = diff;
+        }
+    }
+}
+
+/// Adaptive parallelism threshold: at least this many independent FFT blocks
+/// before we engage Rayon (matches the single-column path).
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn adaptive_parallel_threshold() -> usize {
+    const BLOCKS_PER_THREAD: usize = 4;
+    const MIN_BLOCKS: usize = 16;
+    rayon::current_num_threads()
+        .saturating_mul(BLOCKS_PER_THREAD)
+        .max(MIN_BLOCKS)
+}
+
 /// In-place bit-reverse permutation over rows of a row-major buffer.
 ///
 /// `buf.len()` must equal `n * num_cols` for some power-of-two `n`. Each row
 /// is M = `num_cols` consecutive elements. Row `i` is swapped with row
 /// `reverse_index(i, n)` when that index is greater (so each pair is swapped
 /// exactly once).
+///
+/// Parallel path: gather all `(i, br(i))` pairs with `br(i) > i` (which are
+/// pairwise disjoint by construction) and dispatch each swap to a worker
+/// via raw-pointer indexing. Safe because each pair touches two distinct
+/// non-overlapping row slices and the pairs themselves don't share rows.
 #[cfg(feature = "alloc")]
-pub fn in_place_bit_reverse_permute_row_major<E>(buf: &mut [E], num_cols: usize) {
+pub fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(buf: &mut [E], num_cols: usize) {
     if num_cols == 0 || buf.is_empty() {
         return;
     }
@@ -49,16 +185,44 @@ pub fn in_place_bit_reverse_permute_row_major<E>(buf: &mut [E], num_cols: usize)
     }
     debug_assert!(n.is_power_of_two(), "row count must be a power of two");
 
+    #[cfg(feature = "parallel")]
+    {
+        // Collect the swap pairs first (each i with br(i) > i appears exactly
+        // once). The set of indices touched across all pairs is a disjoint
+        // union, so swaps don't race.
+        let pairs: alloc::vec::Vec<(usize, usize)> = (0..n)
+            .filter_map(|i| {
+                let j = reverse_index(i, n as u64);
+                (j > i).then_some((i * num_cols, j * num_cols))
+            })
+            .collect();
+
+        if pairs.len() >= 1024 {
+            use core::sync::atomic::{AtomicPtr, Ordering};
+            // SAFETY: each (lo, hi) pair is disjoint from every other pair
+            // (bit-reverse is a permutation, so distinct sources map to
+            // distinct destinations), and lo..lo+M / hi..hi+M never overlap
+            // since lo != hi. We share a raw pointer across threads but
+            // each thread writes to a unique pair of M-wide row ranges.
+            let raw = AtomicPtr::new(buf.as_mut_ptr());
+            pairs.par_iter().for_each(|&(lo, hi)| {
+                let ptr = raw.load(Ordering::Relaxed);
+                unsafe {
+                    let lo_row = core::slice::from_raw_parts_mut(ptr.add(lo), num_cols);
+                    let hi_row = core::slice::from_raw_parts_mut(ptr.add(hi), num_cols);
+                    lo_row.swap_with_slice(hi_row);
+                }
+            });
+            return;
+        }
+    }
+
     for i in 0..n {
         let j = reverse_index(i, n as u64);
         if j > i {
-            // Swap the two M-element rows. Disjoint mutable borrows via
-            // split_at_mut at boundary j*num_cols.
             let lo = i * num_cols;
             let hi = j * num_cols;
             let (left, right) = buf.split_at_mut(hi);
-            // left covers [..hi], so row i (at lo..lo+num_cols) lives inside left.
-            // right covers [hi..], so row j sits at right[..num_cols].
             left[lo..lo + num_cols].swap_with_slice(&mut right[..num_cols]);
         }
     }
@@ -82,6 +246,8 @@ pub fn bowers_fft_batch_row_major<F, E>(
 where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
 {
     if num_cols == 0 || buf.is_empty() {
         return Ok(());
@@ -103,39 +269,31 @@ where
         return Err(FFTError::InputError(n));
     }
 
+    #[cfg(feature = "parallel")]
+    let parallel_threshold = adaptive_parallel_threshold();
     let m = num_cols;
 
-    // DIF: layer goes 0..log_n. At layer L, block_size = n >> L rows.
-    // Each block contains 2 half_block-sized subblocks: indices [bs, bs+half)
-    // and [bs+half, bs+block). For each j in 0..half_block:
-    //   row_lo = bs + j, row_hi = row_lo + half_block, twiddle = tw[j]
-    //   butterfly on M consecutive elements:
-    //     (a, b) -> (a + b, w * (a - b))
+    // DIF: layer goes 0..log_n. At layer L there are `n >> L` rows per
+    // block and `n / block_size_rows` independent blocks. We chunk the
+    // row-major buffer into `block_size_rows * m`-wide slices and run the
+    // butterfly per block (parallel when enough blocks).
     for layer in 0..log_n {
         let block_size_rows = n >> layer;
-        let half_block_rows = block_size_rows >> 1;
+        let chunk_bytes = block_size_rows * m;
         let twiddles = layer_twiddles.get_layer(layer);
+        let num_blocks = n / block_size_rows;
 
-        for block_start_rows in (0..n).step_by(block_size_rows) {
-            for j in 0..half_block_rows {
-                let row_lo = block_start_rows + j;
-                let row_hi = row_lo + half_block_rows;
-                let w = &twiddles[j];
-
-                let lo_off = row_lo * m;
-                let hi_off = row_hi * m;
-                let (lo_part, hi_part) = buf.split_at_mut(hi_off);
-                let lo_row = &mut lo_part[lo_off..lo_off + m];
-                let hi_row = &mut hi_part[..m];
-
-                for k in 0..m {
-                    let sum = &lo_row[k] + &hi_row[k];
-                    let diff = &lo_row[k] - &hi_row[k];
-                    let diff_w = w * &diff;
-                    lo_row[k] = sum;
-                    hi_row[k] = diff_w;
-                }
+        #[cfg(feature = "parallel")]
+        {
+            if num_blocks >= parallel_threshold {
+                buf.par_chunks_mut(chunk_bytes).for_each(|block| {
+                    dif_block_row_major::<F, E>(block, m, twiddles);
+                });
+                continue;
             }
+        }
+        for block in buf.chunks_mut(chunk_bytes) {
+            dif_block_row_major::<F, E>(block, m, twiddles);
         }
     }
 
@@ -160,6 +318,8 @@ pub fn bowers_ifft_batch_row_major<F, E>(
 where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
 {
     if num_cols == 0 || buf.is_empty() {
         return Ok(());
@@ -181,38 +341,28 @@ where
         return Err(FFTError::InputError(n));
     }
 
+    #[cfg(feature = "parallel")]
+    let parallel_threshold = adaptive_parallel_threshold();
     let m = num_cols;
 
-    // DIT: layer goes log_n..0 (we iterate the "remaining_layer" index).
-    // Single-layer fallback structure from bowers_ifft_opt_parallel's tail:
-    //   for j in 0..half_block:
-    //     bw = w * input[i1]
-    //     input[i0], input[i1] = input[i0] + bw, input[i0] - bw
+    // DIT: layer iterates log_n..0 (the "remaining_layer" index).
     for remaining_layer in (0..log_n).rev() {
         let block_size_rows = n >> remaining_layer;
-        let half_block_rows = block_size_rows >> 1;
+        let chunk_bytes = block_size_rows * m;
         let twiddles = layer_twiddles.get_layer(remaining_layer);
+        let num_blocks = n / block_size_rows;
 
-        for block_start_rows in (0..n).step_by(block_size_rows) {
-            for j in 0..half_block_rows {
-                let row_lo = block_start_rows + j;
-                let row_hi = row_lo + half_block_rows;
-                let w = &twiddles[j];
-
-                let lo_off = row_lo * m;
-                let hi_off = row_hi * m;
-                let (lo_part, hi_part) = buf.split_at_mut(hi_off);
-                let lo_row = &mut lo_part[lo_off..lo_off + m];
-                let hi_row = &mut hi_part[..m];
-
-                for k in 0..m {
-                    let bw = w * &hi_row[k];
-                    let sum = &lo_row[k] + &bw;
-                    let diff = &lo_row[k] - &bw;
-                    lo_row[k] = sum;
-                    hi_row[k] = diff;
-                }
+        #[cfg(feature = "parallel")]
+        {
+            if num_blocks >= parallel_threshold {
+                buf.par_chunks_mut(chunk_bytes).for_each(|block| {
+                    dit_block_row_major::<F, E>(block, m, twiddles);
+                });
+                continue;
             }
+        }
+        for block in buf.chunks_mut(chunk_bytes) {
+            dit_block_row_major::<F, E>(block, m, twiddles);
         }
     }
 

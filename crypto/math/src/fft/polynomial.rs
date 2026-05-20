@@ -345,12 +345,28 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         bowers_ifft_batch_row_major::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
 
         // 2. Scale by coset weights — one weight per row, multiply M elements
-        //    of that row by it.
-        for r in 0..n {
-            let w = &weights[r];
-            let row = &mut buffer[r * num_cols..(r + 1) * num_cols];
-            for x in row.iter_mut() {
-                *x = w * &*x;
+        //    of that row by it. Each row is independent → parallelizable.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            buffer[..prefix_len]
+                .par_chunks_exact_mut(num_cols)
+                .enumerate()
+                .for_each(|(r, row)| {
+                    let w = &weights[r];
+                    for x in row.iter_mut() {
+                        *x = w * &*x;
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for r in 0..n {
+                let w = &weights[r];
+                let row = &mut buffer[r * num_cols..(r + 1) * num_cols];
+                for x in row.iter_mut() {
+                    *x = w * &*x;
+                }
             }
         }
 
