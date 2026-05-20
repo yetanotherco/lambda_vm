@@ -1491,33 +1491,78 @@ pub trait IsStarkProver<
 
         // Compressed traces at ALL 2N LDE points (Plonky3-style).
         // Eliminates the iFFT(N)+FFT(2N) extension by computing directly at LDE size.
-        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
-            .map(|k| {
-                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
-                    .map(|j| &trace_terms_gammas[j][k])
-                    .collect();
-                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
-                    .map(|j| &trace_terms_gammas[num_main_cols + j][k])
-                    .collect();
+        //
+        // Layout: `compressed_flat[i * num_eval_points + k]` = sum over j of
+        // `lde_trace.get_main/aux(i, j) * trace_terms_gammas[j][k]`.
+        //
+        // The loop is inverted vs the natural `[k][i]` shape: one par_iter over
+        // `i in 0..lde_size`, computing all `num_eval_points` sums per row.
+        // This collapses what used to be `num_eval_points` separate `par_iter`
+        // barriers into one, and scans the LDE buffer exactly once instead of
+        // `num_eval_points` times (better cache reuse on the trace data).
+        //
+        // The downstream hot loop reads `compressed_flat[i * num_eval_points + k]`
+        // for fixed i, varying k, which is contiguous in memory.
+        //
+        // Pre-flatten gammas to `gammas_per_col[j * num_eval_points + k]` so
+        // the inner `for j: for k:` loop reads `gammas_per_col[j*ne..]` as a
+        // contiguous slice instead of chasing two levels of `Vec<Vec<_>>`
+        // indirection per iteration.
+        let total_cols = num_main_cols + num_aux_cols;
+        let mut gammas_per_col: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(total_cols * num_eval_points);
+        for j in 0..total_cols {
+            for k in 0..num_eval_points {
+                gammas_per_col.push(trace_terms_gammas[j][k].clone());
+            }
+        }
 
-                #[cfg(feature = "parallel")]
-                let iter = (0..lde_size).into_par_iter();
-                #[cfg(not(feature = "parallel"))]
-                let iter = 0..lde_size;
+        let mut compressed_flat: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::<FieldExtension>::zero(); lde_size * num_eval_points];
 
-                iter.map(|i| {
-                    let mut sum = FieldElement::<FieldExtension>::zero();
-                    for (j, gamma) in main_gammas.iter().enumerate() {
-                        sum += lde_trace.get_main(i, j) * *gamma;
+        #[cfg(feature = "parallel")]
+        {
+            compressed_flat
+                .par_chunks_exact_mut(num_eval_points)
+                .enumerate()
+                .for_each(|(i, sums)| {
+                    for j in 0..num_main_cols {
+                        let val = lde_trace.get_main(i, j);
+                        let gbase = &gammas_per_col[j * num_eval_points..(j + 1) * num_eval_points];
+                        for k in 0..num_eval_points {
+                            sums[k] += val * &gbase[k];
+                        }
                     }
-                    for (j, gamma) in aux_gammas.iter().enumerate() {
-                        sum += lde_trace.get_aux(i, j) * *gamma;
+                    for j in 0..num_aux_cols {
+                        let val = lde_trace.get_aux(i, j);
+                        let gbase = &gammas_per_col[(num_main_cols + j) * num_eval_points
+                            ..(num_main_cols + j + 1) * num_eval_points];
+                        for k in 0..num_eval_points {
+                            sums[k] += val * &gbase[k];
+                        }
                     }
-                    sum
-                })
-                .collect()
-            })
-            .collect();
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (i, sums) in compressed_flat.chunks_exact_mut(num_eval_points).enumerate() {
+                for j in 0..num_main_cols {
+                    let val = lde_trace.get_main(i, j);
+                    let gbase = &gammas_per_col[j * num_eval_points..(j + 1) * num_eval_points];
+                    for k in 0..num_eval_points {
+                        sums[k] += val * &gbase[k];
+                    }
+                }
+                for j in 0..num_aux_cols {
+                    let val = lde_trace.get_aux(i, j);
+                    let gbase = &gammas_per_col[(num_main_cols + j) * num_eval_points
+                        ..(num_main_cols + j + 1) * num_eval_points];
+                    for k in 0..num_eval_points {
+                        sums[k] += val * &gbase[k];
+                    }
+                }
+            }
+        }
 
         // Hot loop at all 2N LDE points — no FFT extension needed.
         #[cfg(feature = "parallel")]
@@ -1535,10 +1580,12 @@ pub trait IsStarkProver<
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
 
-            // Trace terms (compressed)
+            // Trace terms (compressed). `compressed_flat[i * num_eval_points + k]`
+            // — contiguous in k for fixed i, so the inner loop reads a small slice.
+            let row_base = i * num_eval_points;
             for k in 0..num_eval_points {
                 let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
-                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
+                result += inv_t_k_i * (&compressed_flat[row_base + k] - &ood_compressed[k]);
             }
 
             result
