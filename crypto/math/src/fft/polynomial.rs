@@ -84,6 +84,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// skipping the final natural-order permutation. Use when the consumer expects
     /// bit-reversed input (e.g. FRI commit phase, which pairs consecutive values as
     /// {f(x), f(-x)}).
+    ///
+    /// Currently exercised only by the FFT property tests; gated to keep it out
+    /// of the production surface until a non-test caller needs it.
+    #[cfg(test)]
     pub fn evaluate_fft_bit_reversed<F: IsFFTField + IsSubFieldOf<E>>(
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
