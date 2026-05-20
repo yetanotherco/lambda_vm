@@ -28,7 +28,7 @@
 
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};

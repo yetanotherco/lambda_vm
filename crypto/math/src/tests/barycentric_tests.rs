@@ -1,4 +1,4 @@
-use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
+use crate::fft::roots_of_unity::get_powers_of_primitive_root_coset;
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
 use crate::polynomial::{

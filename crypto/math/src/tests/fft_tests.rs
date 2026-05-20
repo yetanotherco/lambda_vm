@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod fft_helpers_test {
-    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
     use crate::fft::test_helpers::naive_matrix_dft_test;
     use crate::field::element::FieldElement;
     use crate::field::test_fields::u64_test_field::U64TestField;
@@ -48,8 +48,8 @@ mod fft_helpers_test {
 mod fft_polynomial_tests {
     use crate::field::traits::IsField;
 
-    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::{
+    use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+    use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
     use crate::fft::polynomial::compose_fft;
@@ -306,8 +306,8 @@ mod fft_polynomial_tests {
 
 #[cfg(test)]
 mod roots_of_unity_tests {
-    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
     use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::field::traits::RootsConfig;
     use proptest::prelude::*;

@@ -6,13 +6,13 @@ use crate::{
 };
 use alloc::{vec, vec::Vec};
 
-use super::cpu::{
+use super::{
     bit_reversing::in_place_bit_reverse_permute,
     bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
 };
 
 #[cfg(feature = "parallel")]
-use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+use super::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn coset_lde_full_into_matches_coset_lde_full() {
-        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+        use crate::fft::bowers_fft::LayerTwiddles;
 
         let offset = FE::from(3u64);
         let blowup_factor = 2;
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn coset_lde_full_into_reuses_buffer() {
-        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+        use crate::fft::bowers_fft::LayerTwiddles;
 
         let offset = FE::from(5u64);
         let blowup_factor = 2usize;

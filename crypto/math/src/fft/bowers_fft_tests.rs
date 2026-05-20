@@ -3,9 +3,9 @@
 //! Separated from the main implementation to keep the library code concise.
 
 use super::bowers_fft::*;
-use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use crate::fft::cpu::fft::in_place_nr_2radix_fft;
-use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+use crate::fft::fft::in_place_nr_2radix_fft;
+use crate::fft::roots_of_unity::get_powers_of_primitive_root;
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
 use crate::field::traits::{IsFFTField, RootsConfig};
@@ -675,7 +675,7 @@ mod parallel_tests {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_adaptive_threshold_scales_with_threads() {
-    use crate::fft::cpu::bowers_fft::bowers_fft_opt_fused_parallel;
+    use crate::fft::bowers_fft::bowers_fft_opt_fused_parallel;
     use rayon::ThreadPoolBuilder;
 
     // Test with different thread counts

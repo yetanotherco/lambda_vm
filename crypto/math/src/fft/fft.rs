@@ -95,8 +95,8 @@ where
 
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
-    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
     use crate::fft::test_helpers::naive_matrix_dft_test;
     use crate::field::{test_fields::u64_test_field::U64TestField, traits::RootsConfig};
     use proptest::{collection, prelude::*};

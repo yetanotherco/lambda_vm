@@ -272,7 +272,7 @@ fn test_from_i64_max_value() {
 #[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
-    use crate::fft::cpu::roots_of_unity::{
+    use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
     use crate::field::traits::{IsFFTField, RootsConfig};
