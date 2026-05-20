@@ -52,11 +52,11 @@ mod fft_polynomial_tests {
     use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
-    use crate::polynomial::compose_fft;
     use crate::field::element::FieldElement;
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
+    use crate::polynomial::compose_fft;
     use proptest::{collection, prelude::*};
 
     /// Evaluates a polynomial at a slice of points
@@ -330,5 +330,110 @@ mod roots_of_unity_tests {
         // U64TestField has TWO_ADICITY = 32, so order 33 should fail
         let result = get_powers_of_primitive_root::<F>(33, 1, RootsConfig::Natural);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod coset_lde_tests {
+    use crate::fft::bowers_fft::LayerTwiddles;
+    use crate::field::element::FieldElement;
+    use crate::field::goldilocks::GoldilocksField;
+    use crate::polynomial::Polynomial;
+    use alloc::vec::Vec;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    #[test]
+    fn coset_lde_full_into_matches_coset_lde_full() {
+        let offset = FE::from(3u64);
+        let blowup_factor = 2;
+
+        for order in 1..=10 {
+            let n = 1usize << order;
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+            let lde_size = n * blowup_factor;
+            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let mut weights = Vec::with_capacity(n);
+            let mut offset_power = n_inv;
+            for _ in 0..n {
+                weights.push(offset_power);
+                offset_power = &offset_power * &offset;
+            }
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            // Test with pre-allocated buffer
+            let mut buffer = Vec::with_capacity(lde_size);
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch at order {}", order);
+        }
+    }
+
+    #[test]
+    fn coset_lde_full_into_reuses_buffer() {
+        let offset = FE::from(5u64);
+        let blowup_factor = 2usize;
+        let n = 16usize;
+        let lde_size = n * blowup_factor;
+
+        let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut offset_power = n_inv;
+        for _ in 0..n {
+            weights.push(offset_power);
+            offset_power = &offset_power * &offset;
+        }
+
+        // Pre-allocate buffer once, reuse for two different inputs
+        let mut buffer = Vec::with_capacity(lde_size);
+
+        for seed in [13u64, 42u64] {
+            let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
     }
 }
