@@ -4,12 +4,17 @@
 # Usage: infra/rent_baremetal.sh <server-name>
 #
 # Env var overrides (all optional):
-#   SCW_ZONE          default: fr-par-2
-#   SCW_TYPE          default: EM-I320E-NVME
-#   PROVISION_FILE    default: <repo>/infra/provision.sh
-#   READY_TIMEOUT     default: 1800 (seconds)
+#   SCW_ZONE              default: fr-par-2
+#   SCW_TYPE              default: EM-I320E-NVME
+#   PROVISION_FILE        default: <repo>/infra/provision.sh
+#   READY_TIMEOUT         default: 1800 (seconds)
+#   GITHUB_SSH_KEY_FILE   default: $HOME/.ssh/lambda_vm_read_only
+#                         Local path to a GitHub deploy key for
+#                         yetanotherco/lambda_vm. If the file exists,
+#                         provision_server.sh scp's it to the server before
+#                         provision.sh runs. If missing, the clone is skipped.
 #
-# Requires: scw, jq, ssh.
+# Requires: scw, jq, ssh, scp.
 # To stop hourly charges when done: scw baremetal server delete <id> zone=<zone>
 
 set -euo pipefail
@@ -168,33 +173,21 @@ fi
 
 PUBLIC_IP=$(echo "$GET_JSON" | jq -r '.ips[] | select(.version == "IPv4") | .address' | head -n1)
 
-info "Waiting for sshd on $PUBLIC_IP..."
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if ssh "${SSH_OPTS[@]}" "root@$PUBLIC_IP" true 2>/dev/null; then
-        ok "ssh root@$PUBLIC_IP ready (attempt $attempt)"
-        break
-    fi
-    if [ "$attempt" -eq 10 ]; then
-        err "ssh root@$PUBLIC_IP did not accept connections after 10 attempts"
-        exit 1
-    fi
-    sleep 10
-done
-
-info "Running $PROVISION_FILE on the server (this also disables root ssh at the end)..."
-ssh "${SSH_OPTS[@]}" "root@$PUBLIC_IP" 'bash -s' < "$PROVISION_FILE"
-
 echo
-ok "Server ready and provisioned."
+ok "Server ready."
 echo "  id:     $SERVER_ID"
 echo "  name:   $SERVER_NAME"
 echo "  zone:   $SCW_ZONE"
 echo "  type:   $SCW_TYPE (hourly offer $OFFER_ID)"
 echo "  ip:     $PUBLIC_IP"
 echo
-echo "  ssh admin@$PUBLIC_IP    # sudo"
-echo "  ssh app@$PUBLIC_IP      # no sudo"
+
+info "Handing off to provision_server.sh (Ctrl+C to skip and provision later)..."
+PROVISION_FILE="$PROVISION_FILE" SSH_USER=root "$SCRIPT_DIR/provision_server.sh" "$PUBLIC_IP"
+
 echo
 echo "To stop hourly charges:"
 echo "  scw baremetal server delete $SERVER_ID zone=$SCW_ZONE"
+echo
+echo "To re-provision this server later (sshd is hardened, so admin + sudo):"
+echo "  SSH_USER=admin infra/provision_server.sh $PUBLIC_IP"
