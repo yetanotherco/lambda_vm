@@ -90,6 +90,7 @@ where
         }
     }
 
+    #[inline]
     fn evaluate_prover(
         &self,
         eval_ctx: &TransitionEvaluationContext<F, E>,
@@ -175,6 +176,7 @@ where
         }
     }
 
+    #[inline]
     fn evaluate_prover(
         &self,
         eval_ctx: &TransitionEvaluationContext<F, E>,
@@ -206,6 +208,15 @@ where
 {
     context: AirContext,
     constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
+    /// Concrete copies of the shift constraints, used by the monomorphic
+    /// `compute_transition_prover` override below. Mirrors the boxed entries
+    /// stored in `constraints` (which the framework still needs for
+    /// `transition_constraints()`), but lets the compiler inline
+    /// `evaluate_prover` directly in the hot loop. Pattern lifted from
+    /// PR #593 (`crypto/stark/src/lookup.rs`'s LogUp dispatch), applied here
+    /// to base (domain) constraints.
+    shift_constraints_direct: Vec<FibPairShiftConstraint<F, E>>,
+    sum_constraints_direct: Vec<FibPairSumConstraint<F, E>>,
     num_sequences: usize,
 }
 
@@ -240,6 +251,29 @@ where
 
     fn num_base_transition_constraints(&self) -> usize {
         2 * self.num_sequences
+    }
+
+    /// Monomorphic prover dispatch: bypass the `Box<dyn TransitionConstraintEvaluator>`
+    /// vtable for the hot path. Lambda's default `compute_transition_prover`
+    /// iterates `self.transition_constraints()` (the boxed slice) and calls
+    /// `evaluate_prover` through an indirect call per constraint per LDE
+    /// point. For log21 n=64 that's ~512M indirect calls. Storing concrete
+    /// constraint copies and dispatching directly lets LLVM inline the body,
+    /// which on `fib_iterative_4M` was worth -11.4% in r2_evaluate per
+    /// PR #593's measurement (LogUp constraints). Same technique, applied
+    /// here to the base (domain) constraints of the bench AIR.
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for c in &self.shift_constraints_direct {
+            c.evaluate_prover(evaluation_context, base_evals, ext_evals);
+        }
+        for c in &self.sum_constraints_direct {
+            c.evaluate_prover(evaluation_context, base_evals, ext_evals);
+        }
     }
 
     fn boundary_constraints(
@@ -282,9 +316,15 @@ where
     pub fn with_num_sequences(proof_options: &ProofOptions, num_sequences: usize) -> Self {
         let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
             Vec::with_capacity(2 * num_sequences);
+        let mut shift_constraints_direct = Vec::with_capacity(num_sequences);
+        let mut sum_constraints_direct = Vec::with_capacity(num_sequences);
         for seq in 0..num_sequences {
-            constraints.push(Box::new(FibPairShiftConstraint::new(seq, 2 * seq)));
-            constraints.push(Box::new(FibPairSumConstraint::new(seq, 2 * seq + 1)));
+            let shift = FibPairShiftConstraint::new(seq, 2 * seq);
+            let sum = FibPairSumConstraint::new(seq, 2 * seq + 1);
+            shift_constraints_direct.push(shift.clone());
+            sum_constraints_direct.push(sum.clone());
+            constraints.push(Box::new(shift));
+            constraints.push(Box::new(sum));
         }
 
         let context = AirContext {
@@ -297,6 +337,8 @@ where
         Self {
             context,
             constraints,
+            shift_constraints_direct,
+            sum_constraints_direct,
             num_sequences,
         }
     }
