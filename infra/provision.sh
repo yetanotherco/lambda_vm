@@ -19,7 +19,7 @@ log() { printf '\n=== %s ===\n' "$*"; }
 log "apt update + upgrade"
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-#apt-get update -y
+apt-get update -y
 #apt-get upgrade "${APT_OPTS[@]}"
 
 # --- 2. apt packages ---------------------------------------------------------
