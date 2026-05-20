@@ -273,19 +273,31 @@ pub struct LdeTwiddles<F: IsFFTField> {
 impl<F: IsFFTField> LdeTwiddles<F> {
     /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
     fn new(domain: &Domain<F>) -> Self {
-        let domain_size = domain.interpolation_domain_size;
-        let lde_size = domain_size * domain.blowup_factor;
+        Self::from_params(
+            domain.interpolation_domain_size,
+            domain.blowup_factor,
+            &domain.coset_offset,
+        )
+    }
+
+    /// Construct twiddles and coset weights directly from the domain parameters,
+    /// without building a full [`Domain`] (which also allocates the LDE coset).
+    pub fn from_params(
+        domain_size: usize,
+        blowup_factor: usize,
+        coset_offset: &FieldElement<F>,
+    ) -> Self {
+        let lde_size = domain_size * blowup_factor;
 
         let domain_size_inv = FieldElement::<F>::from(domain_size as u64)
             .inv()
             .expect("domain_size is power of two");
-        let offset = &domain.coset_offset;
         let coset_weights = {
             let mut w = Vec::with_capacity(domain_size);
             let mut offset_power = domain_size_inv;
             for _ in 0..domain_size {
                 w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
+                offset_power = coset_offset * &offset_power;
             }
             w
         };
@@ -423,6 +435,58 @@ where
         BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
     })
     .collect()
+}
+
+/// Commit a set of equal-length columns through the prover's own column
+/// pipeline and return the Merkle root.
+///
+/// Each column is taken from evaluation form straight to its LDE in a single
+/// **fused** coset-LDE pass (`Polynomial::coset_lde_full`) — there is no
+/// separate "interpolate to coefficients, then evaluate again" round trip.
+/// The inverse/forward twiddle tables and coset weights are built once and
+/// shared across every column.
+///
+/// This is exactly how `commit_main_trace` / `commit_preprocessed_trace`
+/// commit trace columns, so a preprocessed table that derives its hardcoded
+/// commitment through this function is guaranteed to match the root the
+/// prover produces (and the verifier checks).
+pub fn commit_lde_columns<F>(
+    columns: &[Vec<FieldElement<F>>],
+    blowup_factor: usize,
+    coset_offset: &FieldElement<F>,
+) -> Option<Commitment>
+where
+    F: IsFFTField + Send + Sync,
+    FieldElement<F>: AsBytes + Sync + Send + ByteConversion,
+{
+    if columns.is_empty() || columns[0].is_empty() {
+        return None;
+    }
+    let n = columns[0].len();
+    // Twiddles + coset weights: built once, reused for every column.
+    let twiddles = LdeTwiddles::<F>::from_params(n, blowup_factor, coset_offset);
+
+    #[cfg(feature = "parallel")]
+    let columns_iter = columns.par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let columns_iter = columns.iter();
+
+    let lde: Vec<Vec<FieldElement<F>>> = columns_iter
+        .map(|col| {
+            Polynomial::coset_lde_full::<F>(
+                col,
+                blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+        })
+        .collect::<Result<_, FFTError>>()
+        .ok()?;
+
+    let hashed_leaves = keccak_leaves_bit_reversed(&lde);
+    let tree = BatchedMerkleTree::<F>::build_from_hashed_leaves(hashed_leaves)?;
+    Some(tree.root)
 }
 
 /// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one

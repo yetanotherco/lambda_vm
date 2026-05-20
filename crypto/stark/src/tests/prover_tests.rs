@@ -519,3 +519,58 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         );
     }
 }
+
+/// Pins the invariant that `commit_lde_columns` (single fused coset-LDE pass
+/// per column) produces the exact same Merkle root as the older two-step
+/// "interpolate to coefficients, then evaluate on the LDE domain" pipeline.
+///
+/// Preprocessed tables derive their hardcoded commitments through
+/// `commit_lde_columns`; this guards against the fused path ever drifting
+/// from what the verifier recomputes.
+#[test]
+fn commit_lde_columns_matches_interpolate_then_evaluate() {
+    use crate::config::BatchedMerkleTree;
+    use crate::prover::commit_lde_columns;
+    use crate::trace::columns2rows;
+    use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+
+    let blowup_factor = 4usize;
+    let coset_offset = Felt::from(3u64);
+
+    for order in 2..=8u32 {
+        let n = 1usize << order;
+        // A couple of deterministic columns of length n.
+        let columns: Vec<Vec<Felt>> = (0..3)
+            .map(|c| {
+                (0..n)
+                    .map(|i| Felt::from((i * 31 + c * 7 + 1) as u64))
+                    .collect()
+            })
+            .collect();
+
+        // Fused path under test.
+        let fused = commit_lde_columns::<GoldilocksField>(&columns, blowup_factor, &coset_offset)
+            .expect("fused commit");
+
+        // Old two-step path: interpolate -> evaluate on LDE -> bit-reverse -> Merkle.
+        let mut lde: Vec<Vec<Felt>> = columns
+            .iter()
+            .map(|col| {
+                let poly = Polynomial::interpolate_fft::<GoldilocksField>(col).unwrap();
+                evaluate_polynomial_on_lde_domain(&poly, blowup_factor, n, &coset_offset).unwrap()
+            })
+            .collect();
+        for col in lde.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+        let rows = columns2rows(lde);
+        let two_step = BatchedMerkleTree::<GoldilocksField>::build(&rows)
+            .expect("two-step commit")
+            .root;
+
+        assert_eq!(
+            fused, two_step,
+            "fused coset-LDE commit diverged from interpolate-then-evaluate at n=2^{order}"
+        );
+    }
+}
