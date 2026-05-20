@@ -102,7 +102,9 @@ for i in "${!SSH_KEY_IDS[@]}"; do
     SSH_KEY_ARGS+=("common-configuration.install.ssh-key-ids.${i}=${SSH_KEY_IDS[$i]}")
 done
 
-info "Creating server name=$SERVER_NAME via batch-create (user-data skipped for now)..."
+USER_DATA=$(cat "$USER_DATA_FILE")
+
+info "Creating server name=$SERVER_NAME via batch-create..."
 CREATE_JSON=$(scw baremetal server batch-create \
     zone="$SCW_ZONE" \
     common-configuration.offer-id="$OFFER_ID" \
@@ -110,6 +112,7 @@ CREATE_JSON=$(scw baremetal server batch-create \
     common-configuration.name="$SERVER_NAME" \
     common-configuration.install.os-id="$SCW_OS_ID" \
     common-configuration.install.hostname="$SERVER_NAME" \
+    common-configuration.user-data="$USER_DATA" \
     "${SSH_KEY_ARGS[@]}" \
     servers.0.hostname="$SERVER_NAME" \
     -o json)
