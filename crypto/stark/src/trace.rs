@@ -299,6 +299,52 @@ where
         }
     }
 
+    /// Build an LDETraceTable directly from row-major flat buffers. Skips the
+    /// O(N·M) col→row transpose that `from_columns` pays — the caller is
+    /// responsible for producing the buffers in row-major layout already
+    /// (e.g. via `coset_lde_full_expand_row_major`).
+    pub fn from_row_major(
+        main_data: Vec<FieldElement<F>>,
+        num_main_cols: usize,
+        aux_data: Vec<FieldElement<E>>,
+        num_aux_cols: usize,
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> Self {
+        let lde_step_size = trace_step_size * blowup_factor;
+        let num_rows = if num_main_cols > 0 {
+            debug_assert_eq!(main_data.len() % num_main_cols, 0);
+            main_data.len() / num_main_cols
+        } else if num_aux_cols > 0 {
+            debug_assert_eq!(aux_data.len() % num_aux_cols, 0);
+            aux_data.len() / num_aux_cols
+        } else {
+            0
+        };
+
+        Self {
+            main_data,
+            aux_data,
+            num_main_cols,
+            num_aux_cols,
+            num_rows,
+            lde_step_size,
+            blowup_factor,
+        }
+    }
+
+    /// Borrow the row-major main buffer with its column count. Used by callers
+    /// that want to push the buffer through APIs expecting row-major flat
+    /// access (e.g. `commit_rows_bit_reversed`).
+    pub fn main_row_major(&self) -> (&[FieldElement<F>], usize) {
+        (&self.main_data, self.num_main_cols)
+    }
+
+    /// Borrow the row-major aux buffer with its column count.
+    pub fn aux_row_major(&self) -> (&[FieldElement<E>], usize) {
+        (&self.aux_data, self.num_aux_cols)
+    }
+
     /// Consume self and re-materialize the column vectors. Inverse of
     /// `from_columns` — pays the same O(N · M) transpose cost.
     #[allow(clippy::type_complexity)]
