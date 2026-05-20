@@ -6,7 +6,7 @@
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
 
-use core::any::type_name;
+use std::any::TypeId;
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -47,10 +47,233 @@ pub fn reset_gpu_lde_calls() {
     GPU_LDE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Reset all GPU call counters at once. Useful between bench warm-up and
+/// profiled passes so the numbers reported aren't doubled by the warm-up.
+pub fn reset_all_gpu_call_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    GPU_LDE_CALLS.store(0, Relaxed);
+    GPU_EXTEND_HALVES_CALLS.store(0, Relaxed);
+    GPU_LEAF_HASH_CALLS.store(0, Relaxed);
+    GPU_MERKLE_TREE_CALLS.store(0, Relaxed);
+}
+
 pub(crate) static GPU_EXTEND_HALVES_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ============================================================================
+// Shared dispatch helpers
+// ============================================================================
+//
+// Every `try_expand_*` variant runs the same prologue: empty-check, threshold
+// check, two TypeId checks, equal-length check, and a column-to-u64 cast under
+// the type-confirmed precondition. Centralising that here keeps each variant
+// short and means a future change to (say) the threshold logic is one edit.
+
+/// Outcome of validating an incoming `columns` slice against the GPU dispatch
+/// preconditions.
+enum LayoutDispatch {
+    /// `columns` is empty — caller returns its own "trivially done" value
+    /// (`true` for `bool` callers, `Some(Vec::new())` for `Option` callers).
+    Empty,
+    /// GPU path doesn't apply (below threshold, wrong types, ragged columns).
+    /// Caller returns its own "fall through to CPU" value (`false`/`None`).
+    Skip,
+    /// GPU path applies. `n` is the per-column input length; `lde_size = n *
+    /// blowup_factor` (saturating).
+    Run { n: usize, lde_size: usize },
+}
+
+/// Validate preconditions for the base-field batched GPU path: every column
+/// must be Goldilocks base-field of equal length, the LDE size must clear the
+/// threshold.
+fn check_base_layout<F, E>(columns: &[Vec<FieldElement<E>>], blowup_factor: usize) -> LayoutDispatch
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if columns.is_empty() {
+        return LayoutDispatch::Empty;
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return LayoutDispatch::Skip;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return LayoutDispatch::Skip;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return LayoutDispatch::Skip;
+    }
+    if columns.iter().any(|c| c.len() != n) {
+        return LayoutDispatch::Skip;
+    }
+    LayoutDispatch::Run { n, lde_size }
+}
+
+/// Validate preconditions for the ext3 batched GPU path: every column must be
+/// `Degree3GoldilocksExtensionField` of equal length, weights must be over
+/// `GoldilocksField`, LDE size must clear the threshold.
+fn check_ext3_layout<F, E>(columns: &[Vec<FieldElement<E>>], blowup_factor: usize) -> LayoutDispatch
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if columns.is_empty() {
+        return LayoutDispatch::Empty;
+    }
+    let n = columns[0].len();
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return LayoutDispatch::Skip;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return LayoutDispatch::Skip;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return LayoutDispatch::Skip;
+    }
+    if columns.iter().any(|c| c.len() != n) {
+        return LayoutDispatch::Skip;
+    }
+    LayoutDispatch::Run { n, lde_size }
+}
+
+/// Materialise base-field columns as owned `Vec<Vec<u64>>` for the GPU input
+/// slice list.
+///
+/// SAFETY: caller must have established `E == GoldilocksField` (e.g. via
+/// [`check_base_layout`]). Each `FieldElement<E>` is then a `#[repr(transparent)]`
+/// wrapper over `u64`.
+unsafe fn columns_to_u64_base<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> Vec<Vec<u64>> {
+    columns
+        .iter()
+        .map(|col| {
+            col.iter()
+                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+                .collect()
+        })
+        .collect()
+}
+
+/// Materialise ext3 columns as owned `Vec<Vec<u64>>` (de-interleaved into raw
+/// `[u64; 3]` lanes per element) for the GPU input slice list.
+///
+/// SAFETY: caller must have established `E == Degree3GoldilocksExtensionField`
+/// (e.g. via [`check_ext3_layout`]). Each `FieldElement<E>` is then a
+/// `#[repr(transparent)]` wrapper over `[u64; 3]`.
+unsafe fn columns_to_u64_ext3<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> Vec<Vec<u64>> {
+    columns
+        .iter()
+        .map(|col| {
+            let len = col.len() * 3;
+            let ptr = col.as_ptr() as *const u64;
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+        })
+        .collect()
+}
+
+/// Materialise weights as a raw `Vec<u64>`.
+///
+/// SAFETY: caller must have established `F == GoldilocksField`.
+unsafe fn weights_to_u64<F: IsField>(weights: &[FieldElement<F>]) -> Vec<u64> {
+    weights
+        .iter()
+        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
+        .collect()
+}
+
+/// Pre-size each column to `lde_size` and view it as a `&mut [u64]` of length
+/// `lde_size` (base-field, single-u64 layout). Asserts capacity hard so a
+/// caller regression can't quietly UB in release builds.
+///
+/// SAFETY: caller must have established `E == GoldilocksField`.
+unsafe fn presize_and_view_base<E: IsField>(
+    columns: &mut [Vec<FieldElement<E>>],
+    lde_size: usize,
+) -> Vec<&mut [u64]> {
+    for col in columns.iter_mut() {
+        assert!(
+            col.capacity() >= lde_size,
+            "col capacity {} < lde_size {}",
+            col.capacity(),
+            lde_size
+        );
+        // SAFETY: assert above guarantees capacity; the GPU path overwrites
+        // every slot before any reader sees the new length.
+        unsafe { col.set_len(lde_size) };
+    }
+    columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len();
+            // SAFETY: single-u64 layout, caller still owns the backing alloc.
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect()
+}
+
+/// Same as [`presize_and_view_base`] but for ext3 columns: each view is
+/// `3 * lde_size` u64s (de-interleaved lanes).
+///
+/// SAFETY: caller must have established `E == Degree3GoldilocksExtensionField`.
+unsafe fn presize_and_view_ext3<E: IsField>(
+    columns: &mut [Vec<FieldElement<E>>],
+    lde_size: usize,
+) -> Vec<&mut [u64]> {
+    for col in columns.iter_mut() {
+        assert!(
+            col.capacity() >= lde_size,
+            "col capacity {} < lde_size {}",
+            col.capacity(),
+            lde_size
+        );
+        // SAFETY: assert above + GPU path overwrites every slot.
+        unsafe { col.set_len(lde_size) };
+    }
+    columns
+        .iter_mut()
+        .map(|col| {
+            let ptr = col.as_mut_ptr() as *mut u64;
+            let len = col.len() * 3;
+            // SAFETY: ext3 `[u64; 3]` layout, caller still owns the backing.
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        })
+        .collect()
+}
+
+/// Truncate each column back to `n` (trace size) after a GPU error so the
+/// CPU fallback (which reads `buffer.len()` as the trace size) runs cleanly.
+/// Safe because `math_cuda` writes outputs only at the final host copy, post-
+/// synchronize; any `Err` returns before that copy, leaving `columns[0..n]`
+/// untouched.
+fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: usize) {
+    for col in columns.iter_mut() {
+        col.truncate(n);
+    }
+}
+
+/// Allocate the `[u8; 32]` Merkle node buffer for a tree of `lde_size` leaves
+/// and return both the node `Vec` (length-initialised, contents undefined) and
+/// a `&mut [u8]` byte view of total length `total_nodes * 32`. Returns `None`
+/// if the layout would be invalid (`lde_size < 2` or the byte length
+/// overflows). The caller must overwrite every byte via the GPU D2H below.
+fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
+    if lde_size < 2 {
+        return None;
+    }
+    let total_nodes = 2usize.saturating_mul(lde_size).checked_sub(1)?;
+    let _byte_len = total_nodes.checked_mul(32)?;
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
+    // SAFETY: every byte will be overwritten via the GPU D2H before the
+    // contents are read; the caller computes the byte-length view from the
+    // returned `nodes` Vec using `total_nodes.checked_mul(32)`.
+    unsafe { nodes.set_len(total_nodes) };
+    Some((nodes, total_nodes))
 }
 
 /// Try to GPU-batch all columns in one pass.
@@ -70,86 +293,45 @@ pub(crate) fn try_expand_columns_batched<F, E>(
     weights: &[FieldElement<F>],
 ) -> bool
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
 {
-    if columns.is_empty() {
-        return true; // nothing to do — same as CPU path
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return false;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return false;
-    }
-    // All columns within one call must be the same size (invariant of the
-    // caller), but double-check before unsafe extraction.
-    if columns.iter().any(|c| c.len() != n) {
-        return false;
-    }
-
     // Ext3 fast path: decompose each ext3 column into its 3 base components
     // and dispatch to the base-field batched NTT with 3×M logical columns.
     // Butterflies with a base-field twiddle act componentwise on ext3, so
     // this is exactly equivalent to running the NTT in the extension field.
-    if type_name::<E>() == type_name::<Degree3GoldilocksExtensionField>() {
+    if TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
         return try_expand_columns_batched_ext3::<F, E>(columns, blowup_factor, weights);
     }
 
-    if type_name::<E>() != type_name::<GoldilocksField>() {
+    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty => return true, // nothing to do — same as CPU path
+        LayoutDispatch::Skip => return false,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
+
+    // SAFETY: layout-checked above (`E == GoldilocksField`, `F == GoldilocksField`).
+    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+    GPU_LDE_CALLS.fetch_add(num_columns as u64, std::sync::atomic::Ordering::Relaxed);
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
+        math_cuda::lde::coset_lde_batch_base_into(
+            &slices,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+        )
+    };
+    if gpu_result.is_err() {
+        // Restore columns to trace length for the CPU fallback. `math_cuda`
+        // only writes outputs at the very end (post-synchronize host copy);
+        // on any Err the caller's `columns[0..n]` is untouched trace data.
+        restore_columns_on_err(columns, n);
         return false;
     }
-
-    // Extract raw u64 slices. SAFETY: type_name above confirms
-    // `E == GoldilocksField`, so `FieldElement<E>` wraps u64 one-to-one.
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            col.iter()
-                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                .collect()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    // Pre-size caller Vecs to lde_size so the GPU path can write directly
-    // into the same backing allocation the caller already holds. This skips
-    // the intermediate `Vec<Vec<u64>>` allocation (which would page-fault
-    // per column) and is the main reason `coset_lde_batch_base_into` exists.
-    for col in columns.iter_mut() {
-        // SAFETY: set_len is valid here because capacity is already >=
-        // lde_size (the caller sized columns via `extract_columns_main(lde_size)`)
-        // and we're about to overwrite every slot via the GPU copy below.
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-
-    // Borrow each caller Vec as a raw `&mut [u64]` slice; safe because each
-    // FieldElement<E> aliases a single u64 when E == GoldilocksField.
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len();
-            // SAFETY: see above — single-u64 layout, caller still owns.
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
-    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
-    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    math_cuda::lde::coset_lde_batch_base_into(
-        &slices,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-    )
-    .expect("GPU batched coset LDE failed");
     true
 }
 
@@ -170,12 +352,11 @@ where
 pub(crate) fn try_extend_two_halves_gpu<F, E>(
     h0: &[FieldElement<E>],
     h1: &[FieldElement<E>],
-    squared_offset: &FieldElement<F>,
     domain: &Domain<F>,
 ) -> Option<(Vec<FieldElement<E>>, Vec<FieldElement<E>>)>
 where
-    F: math::field::traits::IsFFTField + IsField,
-    E: IsField,
+    F: math::field::traits::IsFFTField + IsField + 'static,
+    E: IsField + 'static,
     F: IsSubFieldOf<E>,
 {
     if h0.len() != h1.len() {
@@ -187,16 +368,16 @@ where
     if lde_size < gpu_lde_threshold() {
         return None;
     }
-    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // squared_offset should be `g²`. We recover `g` as `domain.coset_offset`
-    // and use it to build the `g^(-k) / N` weights.
-    let _ = squared_offset; // unused (we derive weights from domain)
+    // Weights are built from `g = domain.coset_offset` directly: the
+    // CPU caller previously passed `g²` redundantly. See the
+    // `g^(-k) / N` weight loop below.
 
     // Flatten ext3 slices to raw 3*n u64 buffers.
     let to_u64 = |col: &[FieldElement<E>]| -> Vec<u64> {
@@ -214,7 +395,7 @@ where
     let mut weights_u64 = Vec::with_capacity(n);
     let mut w = inv_n.clone();
     for _ in 0..n {
-        // F == GoldilocksField by type_name check above, so value is u64.
+        // F == GoldilocksField by TypeId check above, so value is u64.
         let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
         weights_u64.push(v);
         w = w * &g_inv;
@@ -232,11 +413,17 @@ where
         let out1_ptr = lde_h1.as_mut_ptr() as *mut u64;
         // SAFETY: ext3 FieldElement is [u64; 3] in memory, and the Vec has len
         // = lde_size so the backing is 3*lde_size u64s.
-        let out0_slice = unsafe { core::slice::from_raw_parts_mut(out0_ptr, 3 * lde_size) };
-        let out1_slice = unsafe { core::slice::from_raw_parts_mut(out1_ptr, 3 * lde_size) };
+        let ext3_len = lde_size
+            .checked_mul(3)
+            .expect("ext3 output length overflow");
+        let out0_slice = unsafe { core::slice::from_raw_parts_mut(out0_ptr, ext3_len) };
+        let out1_slice = unsafe { core::slice::from_raw_parts_mut(out1_ptr, ext3_len) };
         let mut outputs: [&mut [u64]; 2] = [out0_slice, out1_slice];
-        math_cuda::lde::coset_lde_batch_ext3_into(&inputs, n, blowup, &weights_u64, &mut outputs)
-            .expect("GPU extend_half_to_lde failed");
+        if math_cuda::lde::coset_lde_batch_ext3_into(&inputs, n, blowup, &weights_u64, &mut outputs)
+            .is_err()
+        {
+            return None;
+        }
     }
 
     Some((lde_h0, lde_h1))
@@ -259,75 +446,47 @@ pub(crate) fn try_expand_and_leaf_hash_batched<F, E>(
     weights: &[FieldElement<F>],
 ) -> Option<Vec<[u8; 32]>>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
 {
-    if columns.is_empty() {
-        return Some(Vec::new());
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if columns.iter().any(|c| c.len() != n) {
-        return None;
-    }
+    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty => return Some(Vec::new()),
+        LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
 
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            col.iter()
-                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                .collect()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len();
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    // Allocate as Vec<[u8; 32]> directly so we both skip the zero-fill pass
-    // AND avoid re-chunking afterwards. Fresh pages still fault on first
-    // write (inside the GPU-side memcpy), but only once each.
+    // Allocate the leaf-hash buffer directly as `Vec<[u8; 32]>` to skip a
+    // re-chunk pass; fresh pages fault on first write but only once each.
     let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(lde_size);
-    // SAFETY: we fill every byte via memcpy_dtoh below.
+    // SAFETY: every byte will be overwritten by the GPU D2H below.
     unsafe { leaves.set_len(lde_size) };
-    let hashed_bytes_ptr = leaves.as_mut_ptr() as *mut u8;
-    let hashed_bytes: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(hashed_bytes_ptr, lde_size * 32) };
+    let leaf_byte_len = lde_size.checked_mul(32).expect("leaf byte length overflow");
 
-    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add(num_columns as u64, std::sync::atomic::Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    math_cuda::lde::coset_lde_batch_base_into_with_leaf_hash(
-        &slices,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        hashed_bytes,
-    )
-    .expect("GPU LDE+leaf-hash failed");
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
+        let hashed_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(leaves.as_mut_ptr() as *mut u8, leaf_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_base_into_with_leaf_hash(
+            &slices,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            hashed_bytes,
+        )
+    };
+    if gpu_result.is_err() {
+        restore_columns_on_err(columns, n);
+        return None;
+    }
 
     Some(leaves)
 }
@@ -349,80 +508,46 @@ pub(crate) fn try_expand_leaf_and_tree_batched<F, E, B>(
     weights: &[FieldElement<F>],
 ) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
     B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    if columns.is_empty() {
-        return None;
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if columns.iter().any(|c| c.len() != n) {
-        return None;
-    }
-    // Tree layout needs `2*lde_size - 1` nodes; must be a power-of-two leaf
-    // count. LDE size is always pow2 here (checked above).
-    if lde_size < 2 {
-        return None;
-    }
+    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
 
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            col.iter()
-                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                .collect()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len();
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    let total_nodes = 2 * lde_size - 1;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    // SAFETY: every byte is written by the D2H below.
-    unsafe { nodes.set_len(total_nodes) };
-    let nodes_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32) };
-
-    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add(num_columns as u64, std::sync::atomic::Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree(
-        &slices,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        nodes_bytes,
-    )
-    .expect("GPU LDE+leaf-hash+tree failed");
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
+        let nodes_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree(
+            &slices,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            nodes_bytes,
+        )
+    };
+    if gpu_result.is_err() {
+        restore_columns_on_err(columns, n);
+        return None;
+    }
 
     crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
 }
@@ -440,77 +565,49 @@ pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
     math_cuda::lde::GpuLdeBase,
 )>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
     B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    if columns.is_empty() {
-        return None;
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if columns.iter().any(|c| c.len() != n) {
-        return None;
-    }
-    if lde_size < 2 {
-        return None;
-    }
+    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
 
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            col.iter()
-                .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                .collect()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len();
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    let total_nodes = 2 * lde_size - 1;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    unsafe { nodes.set_len(total_nodes) };
-    let nodes_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32) };
-
-    GPU_LDE_CALLS.fetch_add(columns.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add(num_columns as u64, std::sync::atomic::Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let handle = math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
-        &slices,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        nodes_bytes,
-    )
-    .expect("GPU LDE+leaf-hash+tree+keep failed");
+    let handle_result = {
+        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
+        let nodes_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
+            &slices,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            nodes_bytes,
+        )
+    };
+    let handle = match handle_result {
+        Ok(h) => h,
+        Err(_) => {
+            restore_columns_on_err(columns, n);
+            return None;
+        }
+    };
 
     let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((tree, handle))
@@ -527,80 +624,50 @@ pub(crate) fn try_expand_leaf_and_tree_batched_ext3<F, E, B>(
     weights: &[FieldElement<F>],
 ) -> Option<crypto::merkle_tree::merkle::MerkleTree<B>>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
     B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    if columns.is_empty() {
-        return None;
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if lde_size < 2 {
-        return None;
-    }
+    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
 
-    // SAFETY: `E == Degree3Goldilocks`; each `FieldElement<E>` is
-    // memory-equivalent to `[u64; 3]`. Copy out a Vec<u64> view per column.
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            let len = col.len() * 3;
-            let ptr = col.as_ptr() as *const u64;
-            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len() * 3;
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    let total_nodes = 2 * lde_size - 1;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    unsafe { nodes.set_len(total_nodes) };
-    let nodes_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32) };
-
     GPU_LDE_CALLS.fetch_add(
-        (columns.len() * 3) as u64,
+        (num_columns * 3) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree(
-        &slices,
-        n,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        nodes_bytes,
-    )
-    .expect("GPU ext3 LDE+leaf-hash+tree failed");
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
+        let nodes_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree(
+            &slices,
+            n,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            nodes_bytes,
+        )
+    };
+    if gpu_result.is_err() {
+        restore_columns_on_err(columns, n);
+        return None;
+    }
 
     crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
 }
@@ -617,78 +684,53 @@ pub(crate) fn try_expand_leaf_and_tree_batched_ext3_keep<F, E, B>(
     math_cuda::lde::GpuLdeExt3,
 )>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
     B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    if columns.is_empty() {
-        return None;
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if lde_size < 2 {
-        return None;
-    }
+    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
 
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            let len = col.len() * 3;
-            let ptr = col.as_ptr() as *const u64;
-            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len() * 3;
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    let total_nodes = 2 * lde_size - 1;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    unsafe { nodes.set_len(total_nodes) };
-    let nodes_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, total_nodes * 32) };
-
     GPU_LDE_CALLS.fetch_add(
-        (columns.len() * 3) as u64,
+        (num_columns * 3) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let handle = math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
-        &slices,
-        n,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        nodes_bytes,
-    )
-    .expect("GPU ext3 LDE+leaf-hash+tree+keep failed");
+    let handle_result = {
+        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
+        let nodes_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
+            &slices,
+            n,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            nodes_bytes,
+        )
+    };
+    let handle = match handle_result {
+        Ok(h) => h,
+        Err(_) => {
+            restore_columns_on_err(columns, n);
+            return None;
+        }
+    };
 
     let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((tree, handle))
@@ -705,175 +747,98 @@ pub(crate) fn try_expand_and_leaf_hash_batched_ext3<F, E>(
     weights: &[FieldElement<F>],
 ) -> Option<Vec<[u8; 32]>>
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
 {
-    if columns.is_empty() {
-        return Some(Vec::new());
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if type_name::<F>() != type_name::<GoldilocksField>() {
-        return None;
-    }
-    if type_name::<E>() != type_name::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if columns.iter().any(|c| c.len() != n) {
-        return None;
-    }
+    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty => return Some(Vec::new()),
+        LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
 
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            let len = col.len() * 3;
-            let ptr = col.as_ptr() as *const u64;
-            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
-        })
-        .collect();
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        unsafe { col.set_len(lde_size) };
-    }
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len() * 3;
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
     let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(lde_size);
+    // SAFETY: every byte will be overwritten by the GPU D2H below.
     unsafe { leaves.set_len(lde_size) };
-    let hashed_bytes: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(leaves.as_mut_ptr() as *mut u8, lde_size * 32) };
+    let leaf_byte_len = lde_size.checked_mul(32).expect("leaf byte length overflow");
 
     GPU_LDE_CALLS.fetch_add(
-        (columns.len() * 3) as u64,
+        (num_columns * 3) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
     GPU_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    math_cuda::lde::coset_lde_batch_ext3_into_with_leaf_hash(
-        &slices,
-        n,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-        hashed_bytes,
-    )
-    .expect("GPU ext3 LDE+leaf-hash failed");
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
+        let hashed_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(leaves.as_mut_ptr() as *mut u8, leaf_byte_len)
+        };
+        math_cuda::lde::coset_lde_batch_ext3_into_with_leaf_hash(
+            &slices,
+            n,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            hashed_bytes,
+        )
+    };
+    if gpu_result.is_err() {
+        restore_columns_on_err(columns, n);
+        return None;
+    }
 
     Some(leaves)
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
-/// `Degree3GoldilocksExtensionField` by type_name match at the caller.
+/// `Degree3GoldilocksExtensionField` by TypeId match at the caller.
 fn try_expand_columns_batched_ext3<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
     weights: &[FieldElement<F>],
 ) -> bool
 where
-    F: IsField,
-    E: IsField,
+    F: IsField + 'static,
+    E: IsField + 'static,
 {
-    if columns.is_empty() {
-        return true;
-    }
-    let n = columns[0].len();
-    let lde_size = n.saturating_mul(blowup_factor);
+    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
+        LayoutDispatch::Empty => return true,
+        LayoutDispatch::Skip => return false,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
+    };
+    let num_columns = columns.len();
 
-    // SAFETY: caller confirmed `E == Degree3GoldilocksExtensionField` via
-    // type_name. That means `FieldElement<E>` wraps `[FieldElement<Gl>; 3]`,
-    // which is memory-equivalent to `[u64; 3]`. A `&[FieldElement<E>]` of
-    // length `n` is therefore a contiguous `3 * n * 8` byte buffer.
-    let raw_columns: Vec<Vec<u64>> = columns
-        .iter()
-        .map(|col| {
-            let len = col.len() * 3;
-            let ptr = col.as_ptr() as *const u64;
-            // Copy rather than borrow: the caller still owns `col` and will
-            // reuse its backing storage after we resize + rewrite below.
-            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
-        })
-        .collect();
-    // F is `type_name::<F>() == GoldilocksField` by caller precondition;
-    // `F::BaseType == u64`, so we can read each `w.value()` as a `*const u64`.
-    let weights_u64: Vec<u64> = weights
-        .iter()
-        .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
-        .collect();
-
-    // Pre-size each ext3 column to lde_size so its backing Vec has the right
-    // length for the output re-interleave. Capacity must already be >=
-    // lde_size (caller's `extract_columns_main(lde_size)` ensures this).
-    for col in columns.iter_mut() {
-        debug_assert!(col.capacity() >= lde_size);
-        // SAFETY: overwritten fully by the GPU path below.
-        unsafe { col.set_len(lde_size) };
-    }
-
-    // View each column's backing memory as a `&mut [u64]` of length
-    // `3*lde_size`. Safe because ext3 elements are `[u64; 3]` layouts.
-    let mut raw_outputs: Vec<&mut [u64]> = columns
-        .iter_mut()
-        .map(|col| {
-            let ptr = col.as_mut_ptr() as *mut u64;
-            let len = col.len() * 3;
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-        })
-        .collect();
-
+    // SAFETY: layout-checked above.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+
     // Account each ext3 column as 3 logical GPU LDE "calls" (base-field
     // components) so the counter matches the base-field batched path.
     GPU_LDE_CALLS.fetch_add(
-        (columns.len() * 3) as u64,
+        (num_columns * 3) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    math_cuda::lde::coset_lde_batch_ext3_into(
-        &slices,
-        n,
-        blowup_factor,
-        &weights_u64,
-        &mut raw_outputs,
-    )
-    .expect("GPU batched ext3 coset LDE failed");
+    let gpu_result = {
+        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
+        math_cuda::lde::coset_lde_batch_ext3_into(
+            &slices,
+            n,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+        )
+    };
+    if gpu_result.is_err() {
+        restore_columns_on_err(columns, n);
+        return false;
+    }
     true
 }
-
-// ============================================================================
-// GPU barycentric OOD evaluation
-// ============================================================================
-//
-// Infrastructure for future use: these wrappers drive
-// `math_cuda::barycentric::barycentric_{base,ext3}` and apply the trailing ext3
-// scalar on host. See the CPU reference in
-// `crypto/math/src/polynomial/mod.rs::interpolate_coset_eval_*_with_g_n_inv`.
-//
-// NOT currently wired into the prover — a benchmark on fib_iterative_{1M, 4M}
-// showed the CPU path (rayon over ~50 columns) already finishes in <1 ms wall
-// because the GPU is busy with LDE and Merkle on parallel streams, so moving
-// R3 OOD to the GPU just serialises work without freeing CPU wall time.
-// Kept here and covered by parity tests in `crypto/math-cuda/tests/barycentric.rs`
-// because it remains a net win for single-table or very-large-trace workloads.
-//
-// The GPU kernel returns the unscaled sum
-//     S = Σ_i point_i · eval_i · inv_denom_i
-// per column; the final barycentric value is
-//     f(z) = scalar · (z^N − g^N) · S
-// with `scalar = n_inv · g_n_inv` kept in the base field.
 
 // ============================================================================
 // GPU Merkle inner-tree construction
@@ -917,22 +882,35 @@ where
     if leaves_len < gpu_merkle_tree_threshold() || !leaves_len.is_power_of_two() || leaves_len < 2 {
         return None;
     }
+    let leaves_byte_len = leaves_len
+        .checked_mul(32)
+        .expect("leaf byte length overflow");
+    let total_nodes = 2usize
+        .checked_mul(leaves_len)
+        .and_then(|v| v.checked_sub(1))
+        .expect("merkle node count overflow");
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
+
     GPU_MERKLE_TREE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Flatten host-side leaves into a contiguous byte buffer for the GPU
     // kernel. SAFETY: `[u8; 32]` is POD and the slice is contiguous.
     let leaves_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(hashed_leaves.as_ptr() as *const u8, leaves_len * 32)
+        core::slice::from_raw_parts(hashed_leaves.as_ptr() as *const u8, leaves_byte_len)
     };
-    let nodes_bytes = math_cuda::merkle::build_merkle_tree_on_device(leaves_bytes)
-        .expect("GPU merkle tree build failed");
+    let nodes_bytes = match math_cuda::merkle::build_merkle_tree_on_device(leaves_bytes) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
 
-    let total_nodes = 2 * leaves_len - 1;
-    debug_assert_eq!(nodes_bytes.len(), total_nodes * 32);
+    debug_assert_eq!(nodes_bytes.len(), node_byte_len);
 
-    // Re-chunk into `Vec<[u8; 32]>` without re-allocating. We'd need an
-    // explicit copy because Vec<u8> and Vec<[u8; 32]> have different
-    // layouts in the allocator metadata (align differs on some platforms).
+    // Re-chunk the flat byte buffer into `Vec<[u8; 32]>`. Alignment is
+    // identical (`[u8; 32]` has align 1), but `Vec<u8>` and `Vec<[u8; 32]>`
+    // track different element counts, so a fresh allocation + per-row copy
+    // is the simplest correct conversion.
     let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
     for i in 0..total_nodes {
         let mut n = [0u8; 32];

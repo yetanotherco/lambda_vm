@@ -123,16 +123,14 @@ where
         Self::build_from_hashed_leaves(hashed_leaves)
     }
 
-    /// Build a `MerkleTree` from an already-filled node vector whose layout
-    /// matches [`build_from_hashed_leaves`] output:
+    /// Useful for handing a GPU-built tree to the stark prover.
+    /// Performs no hashing, the caller is responsible for the layout's
+    /// cryptographic correctness.
     ///
+    /// Expected layout (matches [`build_from_hashed_leaves`]):
     ///   - `nodes.len() == 2 * leaves_len - 1` where `leaves_len` is a power of two
     ///   - `nodes[0]` is the root
     ///   - `nodes[leaves_len - 1 .. 2*leaves_len - 1]` are the leaves
-    ///
-    /// Useful when the tree was constructed elsewhere (e.g. on a GPU) and
-    /// the caller just wants to hand the finished layout to the stark prover.
-    /// Performs no hashing.
     pub fn from_precomputed_nodes(nodes: Vec<B::Node>) -> Option<Self> {
         if nodes.is_empty() {
             return None;
@@ -143,8 +141,24 @@ where
         if !(total + 1).is_power_of_two() {
             return None;
         }
+        // Debug-only integrity spot-check: the root must equal hash(left, right).
+        // Catches GPU correctness regressions in CI without paying for a full
+        // tree walk on every call.
+        #[cfg(debug_assertions)]
+        if total >= 3 {
+            let expected_root = B::hash_new_parent(&nodes[1], &nodes[2]);
+            debug_assert!(
+                nodes[ROOT] == expected_root,
+                "from_precomputed_nodes: root does not hash from children",
+            );
+        }
         let root = nodes[ROOT].clone();
-        Some(MerkleTree { root, nodes })
+        Some(MerkleTree {
+            root,
+            nodes,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        })
     }
 
     /// Create a Merkle tree from pre-hashed leaf nodes.

@@ -89,8 +89,8 @@ pub struct Prover<
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
 where
@@ -212,18 +212,22 @@ struct Lde<Field: IsFFTField, FieldExtension: IsField> {
 /// Result of `commit_main_trace` / `commit_preprocessed_trace`. Wraps the
 /// commitment Merkle data plus the owned LDE columns, and — when the R1
 /// fused GPU pipeline ran — the retained device LDE handle.
+///
+/// Fields are `pub(crate)` because constructing one is the prover module's
+/// job; external implementers of `IsStarkProver` consume it via the trait's
+/// default impls and don't need to construct it themselves.
 pub struct MainTraceCommitResult<Field: IsFFTField>
 where
     FieldElement<Field>: AsBytes,
 {
-    tree: BatchedMerkleTree<Field>,
-    root: Commitment,
-    precomputed_tree: Option<BatchedMerkleTree<Field>>,
-    precomputed_root: Option<Commitment>,
-    num_precomputed_cols: usize,
-    columns: Vec<Vec<FieldElement<Field>>>,
+    pub(crate) tree: BatchedMerkleTree<Field>,
+    pub(crate) root: Commitment,
+    pub(crate) precomputed_tree: Option<BatchedMerkleTree<Field>>,
+    pub(crate) precomputed_root: Option<Commitment>,
+    pub(crate) num_precomputed_cols: usize,
+    pub(crate) columns: Vec<Vec<FieldElement<Field>>>,
     #[cfg(feature = "cuda")]
-    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
 }
 
 impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
@@ -517,8 +521,8 @@ where
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
 pub trait IsStarkProver<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > where
     FieldElement<Field>: math::traits::ByteConversion,
@@ -617,7 +621,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) where
         Field: IsSubFieldOf<E>,
-        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync + 'static,
         FieldElement<E>: Send + Sync,
     {
         if columns.is_empty() {
@@ -833,7 +837,14 @@ pub trait IsStarkProver<
         };
 
         Ok(commitment.build_round1(
-            Lde { main, aux },
+            Lde {
+                main,
+                aux,
+                #[cfg(feature = "cuda")]
+                gpu_main: None,
+                #[cfg(feature = "cuda")]
+                gpu_aux: None,
+            },
             air.step_size(),
             domain.blowup_factor,
             air.has_aux_trace(),
@@ -982,12 +993,9 @@ pub trait IsStarkProver<
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
         // `cuda` feature and a qualifying size; falls through to CPU when not.
         #[cfg(feature = "cuda")]
-        if let Some((lde_h0, lde_h1)) = crate::gpu_lde::try_extend_two_halves_gpu(
-            &h0_evals,
-            &h1_evals,
-            &coset_offset_squared,
-            domain,
-        ) {
+        if let Some((lde_h0, lde_h1)) =
+            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
+        {
             return vec![lde_h0, lde_h1];
         }
 
@@ -1947,24 +1955,20 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K. Fourth field is an optional
-        // GPU ext3 LDE handle retained when the R1 fused pipeline fires.
-        #[cfg(feature = "cuda")]
+        // Parallel aux commit in chunks of K. The optional ext3 GPU LDE handle
+        // (retained when the R1 fused pipeline fires) is carried in a side
+        // vector under `cfg(cuda)` so AuxResult stays a clean 3-tuple in both
+        // cfg variants.
         type AuxResult<FE> = (
             Option<Arc<BatchedMerkleTree<FE>>>,
             Option<Commitment>,
             Vec<Vec<FieldElement<FE>>>,
-            Option<math_cuda::lde::GpuLdeExt3>,
-        );
-        #[cfg(not(feature = "cuda"))]
-        type AuxResult<FE> = (
-            Option<Arc<BatchedMerkleTree<FE>>>,
-            Option<Commitment>,
-            Vec<Vec<FieldElement<FE>>>,
-            (),
         );
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
+        #[cfg(feature = "cuda")]
+        let mut aux_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeExt3>> =
+            Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1975,6 +1979,10 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "parallel"))]
             let iter = chunk_range;
 
+            // Per-iter the closure produces `(AuxResult, Option<GpuLdeExt3>)`
+            // under cuda, or `AuxResult` alone under non-cuda. Splitting them
+            // at the sequential collection step keeps the two-vec layout.
+            #[allow(clippy::type_complexity)]
             let chunk_aux: Vec<Result<_, ProvingError>> = iter
                 .map(|idx| {
                     let (air, trace, _) = &air_trace_pairs[idx];
@@ -2010,9 +2018,7 @@ pub trait IsStarkProver<
                                 #[cfg(feature = "instruments")]
                                 crate::instruments::accum_r1_aux(aux_lde_dur, zero);
                                 return Ok((
-                                    Some(Arc::new(tree)),
-                                    Some(root),
-                                    columns,
+                                    (Some(Arc::new(tree)), Some(root), columns),
                                     Some(handle),
                                 ));
                             }
@@ -2047,27 +2053,35 @@ pub trait IsStarkProver<
                         }
 
                         #[cfg(feature = "cuda")]
-                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
+                        return Ok((
+                            (Some(Arc::new(tree)), Some(root), columns),
+                            None::<math_cuda::lde::GpuLdeExt3>,
+                        ));
                         #[cfg(not(feature = "cuda"))]
-                        let aux_gpu: () = ();
-                        Ok((Some(Arc::new(tree)), Some(root), columns, aux_gpu))
+                        Ok((Some(Arc::new(tree)), Some(root), columns))
                     } else {
                         #[cfg(feature = "cuda")]
-                        let aux_gpu: Option<math_cuda::lde::GpuLdeExt3> = None;
+                        return Ok(((None, None, Vec::new()), None::<math_cuda::lde::GpuLdeExt3>));
                         #[cfg(not(feature = "cuda"))]
-                        let aux_gpu: () = ();
-                        Ok((None, None, Vec::new(), aux_gpu))
+                        Ok((None, None, Vec::new()))
                     }
                 })
                 .collect();
 
-            // Sequential: append aux roots to forked transcripts
+            // Sequential: append aux roots to forked transcripts and split
+            // the optional GPU handle into its own side vector under cuda.
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_tree, aux_root, cached_aux, aux_gpu) = result?;
+                #[cfg(feature = "cuda")]
+                let (aux_triple, aux_gpu_h) = result?;
+                #[cfg(not(feature = "cuda"))]
+                let aux_triple = result?;
+                let (aux_tree, aux_root, cached_aux) = aux_triple;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-                aux_results.push((aux_tree, aux_root, cached_aux, aux_gpu));
+                aux_results.push((aux_tree, aux_root, cached_aux));
+                #[cfg(feature = "cuda")]
+                aux_gpu_handles.push(aux_gpu_h);
             }
         }
 
@@ -2076,25 +2090,18 @@ pub trait IsStarkProver<
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        // Zip in the optional GPU handles so the Lde constructor always
-        // has a value for its gpu_main/gpu_aux. Under `cfg(not(cuda))` the
-        // handles are `()` (see AuxResult type alias) — we just discard them.
-        #[cfg(feature = "cuda")]
-        let main_gpu_iter: Box<dyn Iterator<Item = Option<math_cuda::lde::GpuLdeBase>>> =
-            Box::new(main_gpu_handles.into_iter());
-        #[cfg(not(feature = "cuda"))]
-        let main_gpu_iter: Box<dyn Iterator<Item = ()>> =
-            Box::new(std::iter::repeat_with(|| ()).take(num_airs));
 
-        for (
-            (((main_commit, main_lde), main_gpu_h), (aux_tree, aux_root, cached_aux, aux_gpu_h)),
-            bus_public_inputs,
-        ) in main_commits
-            .into_iter()
-            .zip(main_ldes)
-            .zip(main_gpu_iter)
-            .zip(aux_results)
-            .zip(bus_inputs_vec)
+        #[cfg(feature = "cuda")]
+        let mut main_gpu_iter = main_gpu_handles.into_iter();
+        #[cfg(feature = "cuda")]
+        let mut aux_gpu_iter = aux_gpu_handles.into_iter();
+
+        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
+            main_commits
+                .into_iter()
+                .zip(main_ldes)
+                .zip(aux_results)
+                .zip(bus_inputs_vec)
         {
             commitments.push(Round1Commitments {
                 main_merkle_tree: main_commit.main_tree,
@@ -2111,18 +2118,18 @@ pub trait IsStarkProver<
             cached_ldes.push(Lde {
                 main: main_lde,
                 aux: cached_aux,
-                gpu_main: main_gpu_h,
-                gpu_aux: aux_gpu_h,
+                gpu_main: main_gpu_iter
+                    .next()
+                    .expect("main_gpu_handles length mismatch"),
+                gpu_aux: aux_gpu_iter
+                    .next()
+                    .expect("aux_gpu_handles length mismatch"),
             });
             #[cfg(not(feature = "cuda"))]
-            {
-                #[allow(clippy::let_unit_value)]
-                let _ = (main_gpu_h, aux_gpu_h);
-                cached_ldes.push(Lde {
-                    main: main_lde,
-                    aux: cached_aux,
-                });
-            }
+            cached_ldes.push(Lde {
+                main: main_lde,
+                aux: cached_aux,
+            });
         }
 
         #[cfg(feature = "instruments")]

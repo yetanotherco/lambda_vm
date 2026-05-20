@@ -107,7 +107,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         &table_counts,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
