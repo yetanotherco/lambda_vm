@@ -3,12 +3,6 @@
 # Invoked remotely from infra/provision_server.sh as:
 #   ssh root@<ip> bash -s < infra/provision.sh
 #
-# Optional input (placed by provision_server.sh before SSH'ing in):
-#   /tmp/lambda_vm_read_only_key   GitHub deploy key. If present it is installed
-#                               to /home/app/.ssh/lambda_vm_read_only and used to
-#                               clone yetanotherco/lambda_vm. If absent the
-#                               clone is skipped.
-#
 # Idempotent — safe to re-run.
 
 set -euo pipefail
@@ -73,7 +67,7 @@ for u in admin app; do
     chown "$u:$u" "$AUTH_FILE"
 done
 
-# --- 6. GitHub CLI (gh) -----------------------------------------------------
+# --- 5. GitHub CLI (gh) -----------------------------------------------------
 if ! command -v gh >/dev/null 2>&1; then
     log "installing gh (GitHub CLI)"
     mkdir -p -m 755 /etc/apt/keyrings
@@ -88,7 +82,7 @@ if ! command -v gh >/dev/null 2>&1; then
     apt-get install "${APT_OPTS[@]}" gh
 fi
 
-# --- 7. Rust toolchain for app (1.94.0 default + nightly-2026-02-01 + src) ---
+# --- 6. Rust toolchain for app (1.94.0 default + nightly-2026-02-01 + src) ---
 log "Rust 1.94.0 + nightly-2026-02-01 (rust-src) for app"
 sudo -u app -H bash -se <<'APP_RUST'
 set -euo pipefail
@@ -103,7 +97,7 @@ rustup toolchain install nightly-2026-02-01 --profile minimal --component rust-s
 rustup component add rust-analyzer
 APP_RUST
 
-# --- 8. Claude Code for app -------------------------------------------------
+# --- 7. Claude Code for app -------------------------------------------------
 log "Claude Code for app"
 sudo -u app -H bash -se <<'APP_CLAUDE'
 set -euo pipefail
@@ -116,7 +110,7 @@ grep -qxF "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null \
     || printf '%s\n' "$PATH_LINE" >> "$HOME/.bashrc"
 APP_CLAUDE
 
-# --- 9. lambda-vm sysroot (rv64im) ------------------------------------------
+# --- 8. lambda-vm sysroot (rv64im) ------------------------------------------
 SYSROOT_DIR=/opt/lambda-vm-sysroot
 SYSROOT_URL=https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 if [ ! -d "$SYSROOT_DIR" ]; then
@@ -127,15 +121,17 @@ if [ ! -d "$SYSROOT_DIR" ]; then
     rm /tmp/sysroot.tar.gz
 fi
 
-# --- 10. GitHub deploy key for app (from /tmp/lambda_vm_read_only_key) ---------
+# --- 9. GitHub deploy key for app (from /tmp/keydir/lambda_vm_read_only_key) -
 GH_SSH_KEY=/home/app/.ssh/lambda_vm_read_only
-STAGED_KEY=/tmp/lambda_vm_read_only_key
+STAGED_DIR=/tmp/keydir
+STAGED_KEY=$STAGED_DIR/lambda_vm_read_only_key
 if [ ! -f "$GH_SSH_KEY" ] && [ -s "$STAGED_KEY" ]; then
     log "installing $STAGED_KEY -> $GH_SSH_KEY"
     install -d -m 0700 -o app -g app /home/app/.ssh
     install -m 0600 -o app -g app "$STAGED_KEY" "$GH_SSH_KEY"
-    rm -f "$STAGED_KEY"
 fi
+# Always clean up the staging area, even if the key was already installed.
+rm -rf "$STAGED_DIR"
 
 if [ -f "$GH_SSH_KEY" ]; then
     SSH_CONFIG=/home/app/.ssh/config
@@ -161,7 +157,7 @@ EOF
     fi
 fi
 
-# --- 11. Clone lambda_vm (as app) -------------------------------------------
+# --- 10. Clone lambda_vm (as app) -------------------------------------------
 REPO_DIR=/home/app/lambda_vm
 REPO_URL=git@github.com:yetanotherco/lambda_vm.git
 if [ ! -d "$REPO_DIR/.git" ] && [ -f "$GH_SSH_KEY" ]; then
@@ -169,7 +165,7 @@ if [ ! -d "$REPO_DIR/.git" ] && [ -f "$GH_SSH_KEY" ]; then
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 12. ethrex test fixture ------------------------------------------------
+# --- 11. ethrex test fixture ------------------------------------------------
 ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
 ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
 if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
@@ -177,7 +173,7 @@ if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
     sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
 fi
 
-# --- 13. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 12. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -185,7 +181,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 14. /etc/environment + locale ------------------------------------------
+# --- 13. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -196,7 +192,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 15. sshd hardening (last; reload won't drop existing session) ----------
+# --- 14. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no

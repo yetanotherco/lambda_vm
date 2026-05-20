@@ -33,7 +33,8 @@ NC='\033[0m'
 SSH_USER="${SSH_USER:-root}"
 PROVISION_FILE="${PROVISION_FILE:-$SCRIPT_DIR/provision.sh}"
 GITHUB_SSH_KEY_FILE="${GITHUB_SSH_KEY_FILE:-$HOME/.ssh/lambda_vm_read_only}"
-REMOTE_KEY_PATH=/tmp/lambda_vm_read_only_key
+REMOTE_KEY_DIR=/tmp/keydir
+REMOTE_KEY_PATH=$REMOTE_KEY_DIR/lambda_vm_read_only_key
 
 err() { echo -e "${RED}error:${NC} $*" >&2; }
 info() { echo -e "${BOLD}$*${NC}"; }
@@ -73,9 +74,10 @@ done
 ok "sshd reachable on $SSH_USER@$IP (attempt $attempt)"
 
 if [ -r "$GITHUB_SSH_KEY_FILE" ]; then
-    info "Copying $GITHUB_SSH_KEY_FILE to $SSH_USER@$IP:$REMOTE_KEY_PATH..."
-    scp "${SSH_OPTS[@]}" "$GITHUB_SSH_KEY_FILE" "$SSH_USER@$IP:$REMOTE_KEY_PATH"
-    ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" "chmod 600 $REMOTE_KEY_PATH"
+    info "Staging $GITHUB_SSH_KEY_FILE -> $SSH_USER@$IP:$REMOTE_KEY_PATH (mode 0600 atomically)..."
+    ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" \
+        "install -d -m 0700 $REMOTE_KEY_DIR && install -m 0600 /dev/stdin $REMOTE_KEY_PATH" \
+        < "$GITHUB_SSH_KEY_FILE"
 fi
 
 if [ "$SSH_USER" = "root" ]; then
