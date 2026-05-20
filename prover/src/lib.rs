@@ -31,6 +31,9 @@ pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
+pub mod vkey;
+
+pub use vkey::VmVerifyingKey;
 
 use alloc::format;
 use alloc::string::String;
@@ -435,16 +438,40 @@ impl VmAirs {
         decode_commitment: Option<Commitment>,
         page_commitments: Option<&[(u64, Commitment)]>,
     ) -> Self {
+        Self::new_with_vkey(
+            elf,
+            proof_options,
+            minimal_bitwise,
+            page_configs,
+            table_counts,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new`] but accepts a precomputed [`VmVerifyingKey`].
+    /// When `vkey` is `Some`, the bitwise preprocessed commitment is taken
+    /// from it instead of being recomputed from `proof_options` — that
+    /// recomputation is ~87% of verifier cycles inside the recursion guest.
+    pub fn new_with_vkey(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
+        vkey: Option<&VmVerifyingKey>,
+    ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
             .collect();
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
-            create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-            )
+            let commitment = match vkey {
+                Some(vk) => vk.bitwise,
+                None => bitwise::preprocessed_commitment(proof_options),
+            };
+            create_bitwise_air(proof_options)
+                .with_preprocessed(commitment, bitwise::NUM_PRECOMPUTED_COLS)
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
@@ -905,6 +932,21 @@ pub fn verify_with_options(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
+    verify_with_options_with_vkey(vm_proof, elf_bytes, proof_options, None)
+}
+
+/// Same as [`verify_with_options`] but accepts a precomputed
+/// [`VmVerifyingKey`]. When `vkey` is `Some`, the bitwise preprocessed
+/// commitment is taken from it instead of being recomputed inside
+/// `VmAirs::new`. A tampered vkey is caught by Fiat-Shamir: the verifier
+/// feeds the supplied commitment into the transcript, derives different
+/// challenges from what the prover used, and the openings stop matching.
+pub fn verify_with_options_with_vkey(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    vkey: Option<&VmVerifyingKey>,
+) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
@@ -944,7 +986,7 @@ pub fn verify_with_options(
         )));
     }
 
-    let airs = VmAirs::new(
+    let airs = VmAirs::new_with_vkey(
         &program,
         proof_options,
         false,
