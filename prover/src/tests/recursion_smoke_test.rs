@@ -71,7 +71,16 @@ fn run_recursion_pipeline_with_options(
     );
 
     let elf_for_vkey = executor::elf::Elf::load(inner_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &inner_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -191,7 +200,16 @@ fn test_dump_recursion_input() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -238,7 +256,16 @@ fn test_recursion_cycle_count() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -329,7 +356,16 @@ fn test_recursion_pc_histogram() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -458,7 +494,16 @@ fn test_recursion_sampled_flamegraph() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -642,7 +687,16 @@ fn test_deserialize_only_cycle_count() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
@@ -736,7 +790,16 @@ fn test_recursion_step_breakdown() {
     .expect("inner prove should succeed");
 
     let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
-    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
     let blob =
         postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
             .expect("postcard encode failed");
