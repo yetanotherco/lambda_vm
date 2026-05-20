@@ -71,21 +71,19 @@ if [ "$ACTIVE_PROFILE" != "$EXPECTED_PROFILE" ]; then
 fi
 ok "Using scw profile: $EXPECTED_PROFILE"
 
-info "Resolving hourly offer for type=$SCW_TYPE zone=$SCW_ZONE..."
+info "Resolving hourly offer ID for type=$SCW_TYPE zone=$SCW_ZONE..."
 OFFER_JSON=$(scw baremetal offer list \
     zone="$SCW_ZONE" \
     name="$SCW_TYPE" \
     subscription-period=hourly \
     -o json)
-OFFER_ID=$(echo "$OFFER_JSON" | jq -r '.[0].id // empty')
-
+OFFER_ID=$(echo "$OFFER_JSON" | jq -r --arg n "$SCW_TYPE" '[.[] | select(.name == $n)] | .[0].id // empty')
 if [ -z "$OFFER_ID" ]; then
-    err "no hourly offer for $SCW_TYPE in $SCW_ZONE — refusing to create a monthly server"
-    echo "Offers returned:" >&2
+    err "no hourly offer named '$SCW_TYPE' in $SCW_ZONE — refusing to create a non-hourly server"
     echo "$OFFER_JSON" >&2
     exit 1
 fi
-ok "Resolved hourly offer ID: $OFFER_ID"
+ok "Hourly offer ID: $OFFER_ID"
 
 info "Enumerating SSH keys in project $SCW_PROJECT_ID..."
 SSH_KEYS_JSON=$(scw iam ssh-key list project-id="$SCW_PROJECT_ID" -o json)
@@ -101,20 +99,22 @@ ok "Found ${#SSH_KEY_IDS[@]} SSH key(s) to install"
 
 SSH_KEY_ARGS=()
 for i in "${!SSH_KEY_IDS[@]}"; do
-    SSH_KEY_ARGS+=("install.ssh-key-ids.${i}=${SSH_KEY_IDS[$i]}")
+    SSH_KEY_ARGS+=("common-configuration.install.ssh-key-ids.${i}=${SSH_KEY_IDS[$i]}")
 done
 
-info "Creating server name=$SERVER_NAME (user-data skipped for now)..."
-CREATE_JSON=$(scw baremetal server create \
+info "Creating server name=$SERVER_NAME via batch-create (user-data skipped for now)..."
+CREATE_JSON=$(scw baremetal server batch-create \
     zone="$SCW_ZONE" \
-    type="$OFFER_ID" \
-    name="$SERVER_NAME" \
-    install.os-id="$SCW_OS_ID" \
-    install.hostname="$SERVER_NAME" \
+    common-configuration.offer-id="$OFFER_ID" \
+    common-configuration.project-id="$SCW_PROJECT_ID" \
+    common-configuration.name="$SERVER_NAME" \
+    common-configuration.install.os-id="$SCW_OS_ID" \
+    common-configuration.install.hostname="$SERVER_NAME" \
     "${SSH_KEY_ARGS[@]}" \
+    servers.0.hostname="$SERVER_NAME" \
     -o json)
 
-SERVER_ID=$(echo "$CREATE_JSON" | jq -r '.id // empty')
+SERVER_ID=$(echo "$CREATE_JSON" | jq -r '.servers[0].id // empty')
 if [ -z "$SERVER_ID" ]; then
     err "server create did not return an id. Raw response:"
     echo "$CREATE_JSON" >&2
