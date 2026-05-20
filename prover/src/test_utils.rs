@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::instruction::decoding::Instruction;
@@ -21,7 +22,12 @@ use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
+use stark::proof::stark::MultiProof;
+use stark::prover::{IsStarkProver, Prover, ProvingError};
+#[cfg(feature = "disk-spill")]
+use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
+use stark::traits::AIR;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
 use crate::tables::bitwise::{
@@ -43,6 +49,13 @@ use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
+use crate::tables::keccak_rc::{
+    bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
+};
+use crate::tables::keccak_rnd::{
+    bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
+};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -73,6 +86,27 @@ pub type E = GoldilocksExtension;
 pub type FE = FieldElement<F>;
 
 pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
+
+type GoldilocksPair<'a, PI> = (
+    &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+    &'a mut TraceTable<F, E>,
+    &'a PI,
+);
+
+pub fn multi_prove_ram<PI>(
+    air_trace_pairs: Vec<GoldilocksPair<'_, PI>>,
+    transcript: &mut (impl IsStarkTranscript<E, F> + Clone + Send),
+) -> Result<MultiProof<F, E, PI>, ProvingError>
+where
+    PI: Send + Sync + Clone,
+{
+    Prover::<F, E, PI>::multi_prove(
+        air_trace_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )
+}
 
 // =============================================================================
 // ELF Execution Helpers
@@ -790,4 +824,60 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
+}
+
+/// Create KECCAK core AIR with ADD constraints and bus interactions.
+pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = crate::tables::keccak::create_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = constraints;
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: keccak_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        keccak_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("KECCAK")
+}
+
+/// Create KECCAK_RND AIR with pi constraints and bus interactions.
+pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = crate::tables::keccak_rnd::create_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = constraints;
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: keccak_rnd_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        keccak_rnd_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("KECCAK_RND")
+}
+
+/// Create KECCAK_RC AIR with bus interactions (preprocessed table).
+pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: keccak_rc_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        keccak_rc_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("KECCAK_RC")
 }

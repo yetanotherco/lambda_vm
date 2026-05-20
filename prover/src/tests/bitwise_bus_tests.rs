@@ -15,12 +15,12 @@ use stark::lookup::{
     NullBoundaryConstraintBuilder, Packing,
 };
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::test_utils::multi_prove_ram;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -197,7 +197,7 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
@@ -307,7 +307,7 @@ fn prove_and_verify_custom(
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];

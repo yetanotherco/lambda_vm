@@ -10,6 +10,8 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+#[cfg(feature = "disk-spill")]
+pub mod auto_storage;
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
@@ -28,6 +30,8 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
+#[cfg(feature = "disk-spill")]
+use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -37,12 +41,15 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+#[cfg(feature = "disk-spill")]
+use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air,
+    create_decode_air, create_dvrm_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -200,6 +207,9 @@ pub(crate) struct VmAirs {
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
     pub commit: VmAir,
+    pub keccak: VmAir,
+    pub keccak_rnd: VmAir,
+    pub keccak_rc: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -213,6 +223,9 @@ impl VmAirs {
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
+            (&self.keccak, &mut traces.keccak, &()),
+            (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
+            (&self.keccak_rc, &mut traces.keccak_rc, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -268,6 +281,9 @@ impl VmAirs {
             &self.decode,
             &self.halt,
             &self.commit,
+            &self.keccak,
+            &self.keccak_rnd,
+            &self.keccak_rc,
             &self.register,
         ];
 
@@ -363,6 +379,12 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
+        let keccak = create_keccak_air(proof_options);
+        let keccak_rnd = create_keccak_rnd_air(proof_options);
+        let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
+            tables::keccak_rc::preprocessed_commitment(proof_options),
+            tables::keccak_rc::NUM_PRECOMPUTED_COLS,
+        );
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -406,6 +428,9 @@ impl VmAirs {
             branches,
             halt,
             commit,
+            keccak,
+            keccak_rnd,
+            keccak_rc,
             register,
             pages,
             memw_registers,
@@ -525,6 +550,8 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
     )?;
     Ok((
         traces.total_field_elements(),
@@ -574,9 +601,25 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    // Generate all traces from ELF and execution logs.
-    // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    debug_assert_eq!(
+        traces.public_output_bytes, result.return_values.memory_values,
+        "public output diverged between executor view and trace reconstruction"
+    );
+    drop(result);
 
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
@@ -607,6 +650,8 @@ pub fn prove_with_options_and_inputs(
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -690,11 +735,11 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register) = 8, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 8 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 8 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

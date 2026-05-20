@@ -16,11 +16,9 @@ use crate::lookup::{
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
+use crate::test_utils::multi_prove_ram;
 use crate::traits::AIR;
-use crate::{
-    prover::{IsStarkProver, Prover},
-    verifier::{IsStarkVerifier, Verifier},
-};
+use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -137,7 +135,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace, &()),
         ];
 
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================
