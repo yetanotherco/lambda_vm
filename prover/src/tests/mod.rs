@@ -30,3 +30,5 @@ pub mod mul_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+#[cfg(test)]
+pub mod vkey_tests;
