@@ -4,26 +4,48 @@ use executor::elf::Elf;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::VmVerifyingKey;
+use crate::tables::page::PageConfig;
+use crate::tables::trace_builder::Traces;
 use crate::test_utils::asm_elf_bytes;
 use crate::vkey::VKEY_VERSION;
+use crate::{VmProof, prove};
 
 fn default_options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid")
 }
 
+/// Derive the same `page_configs` slice the verifier would reconstruct from
+/// `vm_proof`. This is exactly what `verify_with_options_with_vkey` does
+/// internally, lifted into the test so the test-side and verifier-side
+/// `vkey.pages` indexing line up.
+fn page_configs_from_proof(elf: &Elf, vm_proof: &VmProof) -> Vec<PageConfig> {
+    Traces::page_configs_from_elf_and_runtime(
+        elf,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+    )
+}
+
 #[test]
 fn test_vkey_roundtrip() {
     let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
     let elf = Elf::load(&elf_bytes).expect("ELF load failed");
     let options = default_options();
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
 
-    let vkey = VmVerifyingKey::from_elf_and_options(&elf, &options);
+    let vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
     assert_eq!(vkey.version, VKEY_VERSION, "version field must be set");
+    assert_eq!(
+        vkey.pages.len(),
+        page_configs.len(),
+        "vkey.pages must have one entry per page config",
+    );
     let digest_before = vkey.compute_digest();
 
     // Two host derivations on the same inputs must produce the same vkey;
-    // the BITWISE_COMMITMENT cache should not change between calls.
-    let vkey_again = VmVerifyingKey::from_elf_and_options(&elf, &options);
+    // the per-table commitment caches should not change between calls.
+    let vkey_again = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
     assert_eq!(vkey, vkey_again, "vkey derivation must be deterministic");
 
     // postcard round-trip preserves every field.
@@ -45,10 +67,11 @@ fn test_vkey_verify_equivalence() {
     // guarantee — the vkey shortcut produces identical results to the
     // recompute-from-scratch path.
     let elf_bytes = asm_elf_bytes("sub");
-    let vm_proof = crate::prove(&elf_bytes).expect("inner prove should succeed");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
     let elf = Elf::load(&elf_bytes).expect("ELF load failed");
     let options = default_options();
-    let vkey = VmVerifyingKey::from_elf_and_options(&elf, &options);
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
 
     let baseline = crate::verify_with_options(&vm_proof, &elf_bytes, &options)
         .expect("baseline verify errored");
@@ -68,14 +91,39 @@ fn test_vkey_mismatch_rejects() {
     // derives different challenges from what the prover used, and the
     // proof's openings stop matching.
     let elf_bytes = asm_elf_bytes("sub");
-    let vm_proof = crate::prove(&elf_bytes).expect("inner prove should succeed");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
     let elf = Elf::load(&elf_bytes).expect("ELF load failed");
     let options = default_options();
-    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options);
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
 
     vkey.bitwise[0] ^= 0xFF;
 
     let result = crate::verify_with_options_with_vkey(&vm_proof, &elf_bytes, &options, Some(&vkey))
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(!result, "tampered bitwise commitment must cause rejection");
+}
+
+#[test]
+fn test_vkey_page_mismatch_rejects() {
+    // Same shape as `test_vkey_mismatch_rejects`, but tampers with the page
+    // table that gets it first non-private-input slot. Fiat-Shamir rejects
+    // the same way: the page commitment is in the verifier's transcript
+    // exactly like the bitwise one.
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load failed");
+    let options = default_options();
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
+
+    let target = page_configs
+        .iter()
+        .position(|c| !c.is_private_input)
+        .expect("test ELF must produce at least one non-private-input page");
+    vkey.pages[target][0] ^= 0xFF;
+
+    let result = crate::verify_with_options_with_vkey(&vm_proof, &elf_bytes, &options, Some(&vkey))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(!result, "tampered page commitment must cause rejection");
 }

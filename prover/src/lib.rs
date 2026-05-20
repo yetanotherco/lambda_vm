@@ -428,7 +428,8 @@ impl VmAirs {
         );
         let pages: Vec<_> = page_configs
             .iter()
-            .map(|config| {
+            .enumerate()
+            .map(|(i, config)| {
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
@@ -436,11 +437,19 @@ impl VmAirs {
                     create_page_air(proof_options, config.page_base)
                 } else {
                     // ELF and zero-init pages: OFFSET + INIT are preprocessed.
-                    // The verifier independently recomputes the commitment from public data.
-                    create_page_air(proof_options, config.page_base).with_preprocessed(
-                        page::precomputed_commitment_cached(config, proof_options),
-                        page::NUM_PREPROCESSED_COLS,
-                    )
+                    // Prefer the vkey-supplied commitment when present (cached on host,
+                    // saves the FFT + Merkle pipeline inside the verifier). If the vkey
+                    // is absent or shorter than expected, fall back to recomputing — the
+                    // length mismatch path is defensive only; Fiat-Shamir would catch a
+                    // genuine mismatch downstream anyway.
+                    let commitment =
+                        vkey.and_then(|vk| vk.pages.get(i))
+                            .copied()
+                            .unwrap_or_else(|| {
+                                page::precomputed_commitment_cached(config, proof_options)
+                            });
+                    create_page_air(proof_options, config.page_base)
+                        .with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }
             })
             .collect();
