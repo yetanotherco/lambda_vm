@@ -127,3 +127,54 @@ fn test_vkey_page_mismatch_rejects() {
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(!result, "tampered page commitment must cause rejection");
 }
+
+#[test]
+fn test_vkey_decode_mismatch_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load failed");
+    let options = default_options();
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
+
+    vkey.decode[0] ^= 0xFF;
+
+    let result = crate::verify_with_options_with_vkey(&vm_proof, &elf_bytes, &options, Some(&vkey))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(!result, "tampered decode commitment must cause rejection");
+}
+
+#[test]
+fn test_vkey_register_mismatch_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load failed");
+    let options = default_options();
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
+
+    vkey.register[0] ^= 0xFF;
+
+    let result = crate::verify_with_options_with_vkey(&vm_proof, &elf_bytes, &options, Some(&vkey))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(!result, "tampered register commitment must cause rejection");
+}
+
+#[test]
+fn test_vkey_keccak_rc_mismatch_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("inner prove should succeed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load failed");
+    let options = default_options();
+    let page_configs = page_configs_from_proof(&elf, &vm_proof);
+    let mut vkey = VmVerifyingKey::from_elf_and_options(&elf, &options, &page_configs);
+
+    vkey.keccak_rc[0] ^= 0xFF;
+
+    let result = crate::verify_with_options_with_vkey(&vm_proof, &elf_bytes, &options, Some(&vkey))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "tampered keccak_rc commitment must cause rejection"
+    );
+}

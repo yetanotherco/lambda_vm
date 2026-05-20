@@ -507,8 +507,11 @@ impl VmAirs {
         let commit = create_commit_air(proof_options);
         let keccak = create_keccak_air(proof_options);
         let keccak_rnd = create_keccak_rnd_air(proof_options);
+        let keccak_rc_commitment = vkey
+            .map(|vk| vk.keccak_rc)
+            .unwrap_or_else(|| tables::keccak_rc::preprocessed_commitment(proof_options));
         let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
+            keccak_rc_commitment,
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
         let ecsm = create_ecsm_air(proof_options);
