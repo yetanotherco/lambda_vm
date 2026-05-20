@@ -1,5 +1,3 @@
-use crate::errors::DeserializationError;
-
 use crate::errors::ByteConversionError;
 /// A trait for converting an element to and from its byte representation and
 /// for getting an element from its byte representation in big-endian or
@@ -97,11 +95,4 @@ impl ByteConversion for u64 {
                 .map_err(|_| ByteConversionError::FromLEBytesError)?,
         ))
     }
-}
-
-/// Deserialize function without args
-pub trait Deserializable {
-    fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>
-    where
-        Self: Sized;
 }
