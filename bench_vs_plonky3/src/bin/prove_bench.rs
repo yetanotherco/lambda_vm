@@ -28,6 +28,7 @@ struct Args {
     queries: usize,
     grinding: u8,
     audit_only: bool,
+    breakdown: bool,
 }
 
 struct BenchMetrics {
@@ -48,6 +49,7 @@ impl Default for Args {
             queries: 219,
             grinding: 0,
             audit_only: false,
+            breakdown: false,
         }
     }
 }
@@ -55,7 +57,7 @@ impl Default for Args {
 fn print_usage() {
     eprintln!(
         "usage: prove_bench --prover {{lambda|p3}} [--log-rows K] [--num-sequences N] \
-         [--blowup B] [--queries Q] [--grinding G] [--audit-only]"
+         [--blowup B] [--queries Q] [--grinding G] [--audit-only] [--breakdown]"
     );
 }
 
@@ -97,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
                 args.grinding = value.parse().map_err(|_| "--grinding: invalid u8")?;
             }
             "--audit-only" => args.audit_only = true,
+            "--breakdown" => args.breakdown = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -266,6 +269,60 @@ fn run_p3(args: &Args) -> BenchMetrics {
     }
 }
 
+fn ms(seconds: f64) -> f64 {
+    seconds * 1000.0
+}
+
+fn print_breakdown(
+    prover: &str,
+    log_rows: u32,
+    rows: usize,
+    phase: &str,
+    elapsed_ms: f64,
+    extra: &str,
+) {
+    println!(
+        "BREAKDOWN\tworkload=fib_pair\tprover={prover}\tlog_rows={log_rows}\trows={rows}\tphase={phase}\tms={elapsed_ms:.3}{extra}"
+    );
+}
+
+#[cfg(feature = "instruments")]
+fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
+    print_breakdown("lambda", args.log_rows, rows, "prove_total", total_ms, "");
+    let Some(timing) = stark::instruments::take() else {
+        eprintln!("warning: stark::instruments::take() returned None");
+        return;
+    };
+    print_breakdown("lambda", args.log_rows, rows, "prepass", ms(timing.prepass.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "main_commits", ms(timing.main_commits.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "aux_build", ms(timing.aux_build.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "aux_commit", ms(timing.aux_commit.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "rounds_2_4", ms(timing.rounds_2_4.as_secs_f64()), "");
+    let r1 = timing.round1_sub;
+    print_breakdown("lambda", args.log_rows, rows, "r1_main_lde", ms(r1.main_lde.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "r1_main_merkle", ms(r1.main_merkle.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "r1_aux_lde", ms(r1.aux_lde.as_secs_f64()), "");
+    print_breakdown("lambda", args.log_rows, rows, "r1_aux_merkle", ms(r1.aux_merkle.as_secs_f64()), "");
+    for (name, table_rows, dur, sub) in timing.table_timings {
+        let extra = format!("\ttable={name}\ttable_rows={table_rows}");
+        print_breakdown("lambda", args.log_rows, rows, "table_total", ms(dur.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r2_constraints", ms(sub.constraints.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r2_comp_decompose", ms(sub.comp_decompose.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r2_comp_commit", ms(sub.comp_commit.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r3_ood", ms(sub.ood.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r4_deep_comp", ms(sub.deep_comp.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r4_deep_extend", ms(sub.deep_extend.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r4_fri_commit", ms(sub.fri_commit.as_secs_f64()), &extra);
+        print_breakdown("lambda", args.log_rows, rows, "r4_queries", ms(sub.queries.as_secs_f64()), &extra);
+    }
+}
+
+#[cfg(not(feature = "instruments"))]
+fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
+    print_breakdown("lambda", args.log_rows, rows, "prove_total", total_ms, "");
+    eprintln!("warning: Lambda phase breakdown requires building with --features instruments");
+}
+
 fn print_metrics(args: &Args, metrics: &BenchMetrics) {
     let prover = match args.prover {
         ProverKind::Lambda => "lambda",
@@ -311,6 +368,9 @@ fn real_main() -> Result<(), String> {
         metrics.prove_s, metrics.verify_s, metrics.setup_s
     );
     print_metrics(&args, &metrics);
+    if args.breakdown && args.prover == ProverKind::Lambda {
+        emit_lambda_breakdown(&args, rows(&args), ms(metrics.prove_s));
+    }
     Ok(())
 }
 

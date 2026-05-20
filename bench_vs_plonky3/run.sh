@@ -16,6 +16,7 @@ RUN_LAMBDA=true
 RUN_P3=true
 REPORT_DIR=""
 NO_SIMD=true
+BREAKDOWN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             NO_SIMD=true
             shift
             ;;
+        --breakdown)
+            BREAKDOWN=true
+            shift
+            ;;
         -h|--help)
             sed -n '1,80p' "$0" | sed -n 's/^# //p'
             exit 0
@@ -114,7 +119,12 @@ else
 fi
 echo
 
-cargo build --release -p bench-vs-plonky3 --bin prove_bench --manifest-path "$ROOT_DIR/Cargo.toml"
+CARGO_FEATURES=""
+if $BREAKDOWN; then
+    CARGO_FEATURES="--features instruments"
+fi
+# shellcheck disable=SC2086
+cargo build --release -p bench-vs-plonky3 --bin prove_bench --manifest-path "$ROOT_DIR/Cargo.toml" $CARGO_FEATURES
 
 TARGET_DIR="$(cargo metadata --manifest-path "$ROOT_DIR/Cargo.toml" --format-version 1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
@@ -153,13 +163,18 @@ run_one() {
     local prover="$1"
     local log_rows="$2"
     local out_file="$3"
+    local extra_args=()
+    if $BREAKDOWN && [ "$prover" = "lambda" ]; then
+        extra_args+=(--breakdown)
+    fi
     "$BIN" \
         --prover "$prover" \
         --log-rows "$log_rows" \
         --num-sequences "$NUM_SEQUENCES" \
         --blowup "$BLOWUP" \
         --queries "$FRI_QUERIES" \
-        --grinding "$GRINDING" > "$out_file" 2>&1
+        --grinding "$GRINDING" \
+        "${extra_args[@]}" > "$out_file" 2>&1
 }
 
 run_prover() {
@@ -192,6 +207,24 @@ run_prover() {
 
         if [ -n "$REPORT_DIR" ]; then
             cp "$out_file" "$REPORT_DIR/raw/${prover}_log${log_rows}_run${run_i}.stdout"
+            if $BREAKDOWN && [ "$prover" = "lambda" ]; then
+                # BREAKDOWN lines look like:
+                #   BREAKDOWN<TAB>workload=fib_pair<TAB>prover=lambda<TAB>log_rows=21<TAB>rows=2097152<TAB>phase=r2_constraints<TAB>ms=478.123[<TAB>table=...<TAB>table_rows=...]
+                # Re-emit as a clean TSV row: run, workload, prover, log_rows, rows, phase, ms, table, table_rows
+                grep '^BREAKDOWN	' "$out_file" | while IFS= read -r line; do
+                    workload=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="workload"{print $2}')
+                    prv=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="prover"{print $2}')
+                    lr=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="log_rows"{print $2}')
+                    rws=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="rows"{print $2}')
+                    phase=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="phase"{print $2}')
+                    msval=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="ms"{print $2}')
+                    table=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="table"{print $2}')
+                    table_rows=$(printf '%s' "$line" | tr '\t' '\n' | awk -F= '$1=="table_rows"{print $2}')
+                    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+                        "$run_i" "$workload" "$prv" "$lr" "$rws" "$phase" "$msval" "$table" "$table_rows" \
+                        >> "$REPORT_DIR/breakdown.tsv"
+                done
+            fi
         fi
     done
 
@@ -204,6 +237,9 @@ ratio() {
 
 if [ -n "$REPORT_DIR" ]; then
     printf "log_rows\trows\tlambda_median_s\tlambda_cv_pct\tp3_median_s\tp3_cv_pct\tratio_lambda_over_p3\truns\n" > "$REPORT_DIR/results.tsv"
+    if $BREAKDOWN; then
+        printf "run\tworkload\tprover\tlog_rows\trows\tphase\tms\ttable\ttable_rows\n" > "$REPORT_DIR/breakdown.tsv"
+    fi
 fi
 
 for lr in "${LOG_ROWS[@]}"; do
