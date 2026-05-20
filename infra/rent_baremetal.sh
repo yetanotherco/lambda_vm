@@ -123,20 +123,22 @@ if [ -z "$SERVER_ID" ]; then
     echo "$CREATE_JSON" >&2
     exit 1
 fi
-ok "Created server id=$SERVER_ID. Waiting up to ${READY_TIMEOUT}s for status=ready..."
+ok "Created server id=$SERVER_ID. Waiting up to ${READY_TIMEOUT}s for status=ready AND install.status=completed..."
 
 DEADLINE=$(( $(date +%s) + READY_TIMEOUT ))
-LAST_STATUS=""
+LAST_STATE=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     GET_JSON=$(scw baremetal server get "$SERVER_ID" zone="$SCW_ZONE" -o json)
     STATUS=$(echo "$GET_JSON" | jq -r '.status // empty')
-    if [ "$STATUS" != "$LAST_STATUS" ]; then
-        echo -e "  status: ${YELLOW}$STATUS${NC}"
-        LAST_STATUS="$STATUS"
+    INSTALL_STATUS=$(echo "$GET_JSON" | jq -r '.install.status // "pending"')
+    STATE="$STATUS / install=$INSTALL_STATUS"
+    if [ "$STATE" != "$LAST_STATE" ]; then
+        echo -e "  ${YELLOW}$STATE${NC}"
+        LAST_STATE="$STATE"
     else
         echo -n "."
     fi
-    if [ "$STATUS" = "ready" ]; then
+    if [ "$STATUS" = "ready" ] && [ "$INSTALL_STATUS" = "completed" ]; then
         echo
         break
     fi
@@ -146,13 +148,20 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         echo "$GET_JSON" >&2
         exit 1
     fi
+    if [ "$INSTALL_STATUS" = "error" ]; then
+        echo
+        err "install entered terminal status: $INSTALL_STATUS"
+        echo "$GET_JSON" >&2
+        exit 1
+    fi
     sleep 15
 done
 
 GET_JSON=$(scw baremetal server get "$SERVER_ID" zone="$SCW_ZONE" -o json)
 FINAL_STATUS=$(echo "$GET_JSON" | jq -r '.status // empty')
-if [ "$FINAL_STATUS" != "ready" ]; then
-    err "timed out after ${READY_TIMEOUT}s — last status=$FINAL_STATUS"
+FINAL_INSTALL=$(echo "$GET_JSON" | jq -r '.install.status // "pending"')
+if [ "$FINAL_STATUS" != "ready" ] || [ "$FINAL_INSTALL" != "completed" ]; then
+    err "timed out after ${READY_TIMEOUT}s — last status=$FINAL_STATUS install=$FINAL_INSTALL"
     exit 1
 fi
 
