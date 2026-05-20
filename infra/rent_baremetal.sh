@@ -6,10 +6,10 @@
 # Env var overrides (all optional):
 #   SCW_ZONE          default: fr-par-2
 #   SCW_TYPE          default: EM-I320E-NVME
-#   USER_DATA_FILE    default: <repo>/infra/user_data.yaml
+#   PROVISION_FILE    default: <repo>/infra/provision.sh
 #   READY_TIMEOUT     default: 1800 (seconds)
 #
-# Requires: scw, jq.
+# Requires: scw, jq, ssh.
 # To stop hourly charges when done: scw baremetal server delete <id> zone=<zone>
 
 set -euo pipefail
@@ -27,7 +27,7 @@ SCW_ZONE="${SCW_ZONE:-fr-par-2}"
 SCW_TYPE="${SCW_TYPE:-EM-I320E-NVME}"
 SCW_OS_ID="${SCW_OS_ID:-83640d93-a0b8-45ad-9c9f-30cae48380a4}"  # Debian
 SCW_PROJECT_ID="${SCW_PROJECT_ID:-946cfb34-d351-48c4-8566-127e7727e15f}"
-USER_DATA_FILE="${USER_DATA_FILE:-$SCRIPT_DIR/user_data.yaml}"
+PROVISION_FILE="${PROVISION_FILE:-$SCRIPT_DIR/provision.sh}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
 
 err() { echo -e "${RED}error:${NC} $*" >&2; }
@@ -49,8 +49,12 @@ if ! command -v jq >/dev/null 2>&1; then
     err "jq not found on PATH."
     exit 1
 fi
-if [ ! -r "$USER_DATA_FILE" ]; then
-    err "user-data file not found or unreadable: $USER_DATA_FILE"
+if [ ! -r "$PROVISION_FILE" ]; then
+    err "provision script not found or unreadable: $PROVISION_FILE"
+    exit 1
+fi
+if ! command -v ssh >/dev/null 2>&1; then
+    err "ssh not found on PATH."
     exit 1
 fi
 
@@ -102,8 +106,6 @@ for i in "${!SSH_KEY_IDS[@]}"; do
     SSH_KEY_ARGS+=("common-configuration.install.ssh-key-ids.${i}=${SSH_KEY_IDS[$i]}")
 done
 
-USER_DATA=$(cat "$USER_DATA_FILE")
-
 info "Creating server name=$SERVER_NAME via batch-create..."
 CREATE_JSON=$(scw baremetal server batch-create \
     zone="$SCW_ZONE" \
@@ -112,7 +114,6 @@ CREATE_JSON=$(scw baremetal server batch-create \
     common-configuration.name="$SERVER_NAME" \
     common-configuration.install.os-id="$SCW_OS_ID" \
     common-configuration.install.hostname="$SERVER_NAME" \
-    common-configuration.user-data="$USER_DATA" \
     "${SSH_KEY_ARGS[@]}" \
     servers.0.hostname="$SERVER_NAME" \
     -o json)
@@ -167,15 +168,33 @@ fi
 
 PUBLIC_IP=$(echo "$GET_JSON" | jq -r '.ips[] | select(.version == "IPv4") | .address' | head -n1)
 
+info "Waiting for sshd on $PUBLIC_IP..."
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ssh "${SSH_OPTS[@]}" "root@$PUBLIC_IP" true 2>/dev/null; then
+        ok "ssh root@$PUBLIC_IP ready (attempt $attempt)"
+        break
+    fi
+    if [ "$attempt" -eq 10 ]; then
+        err "ssh root@$PUBLIC_IP did not accept connections after 10 attempts"
+        exit 1
+    fi
+    sleep 10
+done
+
+info "Running $PROVISION_FILE on the server (this also disables root ssh at the end)..."
+ssh "${SSH_OPTS[@]}" "root@$PUBLIC_IP" 'bash -s' < "$PROVISION_FILE"
+
 echo
-ok "Server ready."
+ok "Server ready and provisioned."
 echo "  id:     $SERVER_ID"
 echo "  name:   $SERVER_NAME"
 echo "  zone:   $SCW_ZONE"
 echo "  type:   $SCW_TYPE (hourly offer $OFFER_ID)"
 echo "  ip:     $PUBLIC_IP"
 echo
-echo "  ssh app@$PUBLIC_IP"
+echo "  ssh admin@$PUBLIC_IP    # sudo"
+echo "  ssh app@$PUBLIC_IP      # no sudo"
 echo
 echo "To stop hourly charges:"
 echo "  scw baremetal server delete $SERVER_ID zone=$SCW_ZONE"
