@@ -66,11 +66,6 @@ for u in admin app; do
     chown "$u:$u" "$AUTH_FILE"
 done
 
-# --- 5. /workspace owned by app ---------------------------------------------
-log "/workspace owned by app"
-mkdir -p /workspace
-chown app:app /workspace
-
 # --- 6. GitHub CLI (gh) -----------------------------------------------------
 if ! command -v gh >/dev/null 2>&1; then
     log "installing gh (GitHub CLI)"
@@ -160,7 +155,7 @@ EOF
 fi
 
 # --- 11. Clone lambda_vm (as app) -------------------------------------------
-REPO_DIR=/workspace/lambda_vm
+REPO_DIR=/home/app/lambda_vm
 REPO_URL=git@github.com:yetanotherco/lambda_vm.git
 if [ ! -d "$REPO_DIR/.git" ] && [ -f "$GH_SSH_KEY" ]; then
     log "cloning lambda_vm to $REPO_DIR (as app)"
@@ -168,9 +163,9 @@ if [ ! -d "$REPO_DIR/.git" ] && [ -f "$GH_SSH_KEY" ]; then
 fi
 
 # --- 12. ethrex test fixture ------------------------------------------------
-ETHREX_FILE=/workspace/lambda_vm/executor/tests/ethrex_hoodi.bin
+ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
 ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
-if [ -d /workspace/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
+if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
     log "downloading ethrex_hoodi.bin"
     sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
 fi

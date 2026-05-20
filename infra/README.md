@@ -49,7 +49,7 @@ After it finishes, log in as:
 
 ```bash
 ssh admin@<ip>    # passwordless sudo
-ssh app@<ip>      # workload user, no sudo, has /workspace/lambda_vm cloned
+ssh app@<ip>      # workload user, no sudo, has ~/lambda_vm cloned
 ```
 
 Root SSH is disabled at the end of provisioning.
