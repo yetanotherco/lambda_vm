@@ -400,11 +400,12 @@ impl VmAirs {
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
-        let decode = create_decode_air(proof_options).with_preprocessed(
+        let decode_commitment = vkey.map(|vk| vk.decode).unwrap_or_else(|| {
             decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment"),
-            decode::NUM_PRECOMPUTED_COLS,
-        );
+                .expect("Failed to compute decode commitment")
+        });
+        let decode = create_decode_air(proof_options)
+            .with_preprocessed(decode_commitment, decode::NUM_PRECOMPUTED_COLS);
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
             .collect();
@@ -418,14 +419,18 @@ impl VmAirs {
         let commit = create_commit_air(proof_options);
         let keccak = create_keccak_air(proof_options);
         let keccak_rnd = create_keccak_rnd_air(proof_options);
+        let keccak_rc_commitment = vkey
+            .map(|vk| vk.keccak_rc)
+            .unwrap_or_else(|| tables::keccak_rc::preprocessed_commitment(proof_options));
         let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
+            keccak_rc_commitment,
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register_commitment = vkey
+            .map(|vk| vk.register)
+            .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
+        let register = create_register_air(proof_options)
+            .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS);
         let pages: Vec<_> = page_configs
             .iter()
             .enumerate()

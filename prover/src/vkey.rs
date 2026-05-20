@@ -9,11 +9,11 @@
 //!
 //! ## Current scope
 //!
-//! BITWISE and PAGE preprocessed commitments are cached here. The remaining
-//! three preprocessed tables (DECODE, KECCAK_RC, REGISTER) are still
-//! recomputed inside `VmAirs::new`; follow-up PRs will move them into this
-//! struct one at a time. The `version` field exists so a vkey serialized
-//! against an older layout produces a different `compute_digest()` and stops
+//! All five preprocessed tables — BITWISE, DECODE, REGISTER, KECCAK_RC, and
+//! every non-private-input PAGE — are cached here. `VmAirs::new_with_vkey`
+//! prefers the vkey-supplied commitment over recomputing when a vkey is
+//! provided. The `version` field exists so a vkey serialized against an
+//! older layout produces a different `compute_digest()` and stops
 //! validating.
 //!
 //! ## Security
@@ -34,12 +34,15 @@ use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 
 use crate::tables::bitwise;
+use crate::tables::decode;
+use crate::tables::keccak_rc;
 use crate::tables::page::{self, PageConfig};
+use crate::tables::register;
 
 /// Current `VmVerifyingKey` layout version. Bump whenever fields are added,
 /// removed, or reordered so that vkeys serialized against an older layout
 /// produce a different `compute_digest()` and stop validating.
-pub const VKEY_VERSION: u32 = 2;
+pub const VKEY_VERSION: u32 = 3;
 
 /// Placeholder commitment stored in [`VmVerifyingKey::pages`] for
 /// private-input page slots, where there is no preprocessed commitment to
@@ -56,6 +59,15 @@ pub struct VmVerifyingKey {
     /// Merkle root over the LDE of the bitwise preprocessed columns.
     /// Program-independent; depends only on `ProofOptions`.
     pub bitwise: Commitment,
+    /// Merkle root over the LDE of the decode preprocessed columns.
+    /// Program-dependent: derived from the inner ELF's instruction stream.
+    pub decode: Commitment,
+    /// Merkle root over the LDE of the register preprocessed columns.
+    /// Program-dependent via the ELF's entry point.
+    pub register: Commitment,
+    /// Merkle root over the LDE of the keccak round-constants preprocessed
+    /// columns. Program-independent; depends only on `ProofOptions`.
+    pub keccak_rc: Commitment,
     /// Per-page preprocessed Merkle roots, indexed parallel to the
     /// `page_configs` slice the verifier reconstructs from the proof via
     /// [`crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime`].
@@ -68,17 +80,16 @@ pub struct VmVerifyingKey {
 impl VmVerifyingKey {
     /// Derive the verifying key on the host.
     ///
+    /// `elf` is read to derive the program-dependent commitments (DECODE
+    /// from the instruction stream, REGISTER from `elf.entry_point`).
+    ///
     /// `page_configs` must match exactly what the verifier will reconstruct
     /// from the proof — i.e. the output of
     /// `Traces::page_configs_from_elf_and_runtime(elf, runtime_page_ranges,
     /// num_private_input_pages)`. The host can call that helper with the
     /// values it already has after producing the inner proof.
-    ///
-    /// `elf` is unused at the moment but kept in the signature so callers
-    /// stay stable when follow-up PRs fold in DECODE, REGISTER, and the
-    /// other ELF-dependent preprocessed tables.
     pub fn from_elf_and_options(
-        _elf: &Elf,
+        elf: &Elf,
         options: &ProofOptions,
         page_configs: &[PageConfig],
     ) -> Self {
@@ -95,6 +106,10 @@ impl VmVerifyingKey {
         Self {
             version: VKEY_VERSION,
             bitwise: bitwise::preprocessed_commitment(options),
+            decode: decode::commitment_from_elf(elf, options)
+                .expect("decode commitment must compute"),
+            register: register::preprocessed_commitment(options, elf.entry_point),
+            keccak_rc: keccak_rc::preprocessed_commitment(options),
             pages,
         }
     }
