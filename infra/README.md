@@ -3,30 +3,28 @@
 Scripts for renting and provisioning a Scaleway Elastic Metal server for
 benchmark / feature-testing work.
 
-| Script | Runs on | Purpose |
-|---|---|---|
-| `rent_baremetal.sh <name>` | local | Creates the server (hourly billing, Debian, fr-par-2) and hands off to `provision_server.sh`. |
-| `provision_server.sh <ip>` | local | Waits for sshd, `scp`s the GitHub deploy key, runs `provision.sh` on the server over SSH. Re-runnable. |
-| `provision.sh` | remote | Installs toolchain, creates `admin`/`app` users, clones `lambda_vm`, hardens sshd. |
+| Script                     | Runs on | Purpose                                                                                                |
+|----------------------------|---------|--------------------------------------------------------------------------------------------------------|
+| `rent_baremetal.sh <name>` | local   | Creates the server (hourly billing, Debian, fr-par-2) and hands off to `provision_server.sh`.          |
+| `provision_server.sh <ip>` | local   | Waits for sshd, `scp`s the GitHub deploy key, runs `provision.sh` on the server over SSH. Re-runnable. |
+| `provision.sh`             | remote  | Installs toolchain, creates `admin`/`app` users, clones `lambda_vm`, hardens sshd.                     |
 
 ## Prerequisites
 
-- `scw` CLI configured with the **`vm`** profile active (the script refuses
-  to run on any other profile). Check with `scw config get active-profile`
-  or set with `export SCW_PROFILE=vm`.
-- `jq`, `ssh`, `scp` on `$PATH`.
-- Your SSH key registered in the Scaleway project so it gets installed on
-  the server: `scw iam ssh-key list project-id=<project-id>`.
-- A GitHub deploy key with read access to `yetanotherco/lambda_vm` at
-  `~/.ssh/lambda_vm_read_only`. Create one with:
+1. Install `scw` and `jq`:
+   ```bash
+   brew install scw jq     # macOS
+   ```
 
-  ```bash
-  ssh-keygen -t ed25519 -f ~/.ssh/lambda_vm_read_only \
-      -C "lambda_vm read-only deploy key" -N ""
-  ```
+2. Create the `vm` scw profile (script refuses any other profile name):
+   ```bash
+   scw init --profile vm
+   ```
 
-  Then paste `~/.ssh/lambda_vm_read_only.pub` into **GitHub → repo Settings
-  → Deploy keys → Add deploy key** (leave "Allow write access" unchecked).
+3. Create the GitHub deploy key and add the `.pub` to **GitHub repo → Settings → Deploy keys** (read-only):
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/lambda_vm_read_only -N ""
+   ```
 
 ## Rent + provision a new server
 
@@ -42,7 +40,7 @@ lambda-vm sysroot, repo clone, ssh hardening).
 Use a unique name (Scaleway rejects duplicates):
 
 ```bash
-infra/rent_baremetal.sh bench-$(date +%s)
+infra/rent_baremetal.sh <server_name>
 ```
 
 After it finishes, log in as:
@@ -56,7 +54,7 @@ Root SSH is disabled at the end of provisioning.
 
 ## Re-provision an existing server
 
-If `provision.sh` failed partway or you want to re-apply changes, point
+If `provision.sh` failed partway, or you want to re-apply changes, point
 `provision_server.sh` at the IP directly. It's idempotent.
 
 ```bash
@@ -69,31 +67,6 @@ SSH_USER=admin infra/provision_server.sh <ip>
 
 The wrapper switches to `sudo bash -s` automatically when `SSH_USER` isn't
 root.
-
-### Stuck on "Waiting for sshd"?
-
-Scaleway recycles IPs across rentals. If you've SSH'd to that IP before,
-your `~/.ssh/known_hosts` has the previous server's host key, the new
-server returns a different one, and `ssh -o StrictHostKeyChecking=accept-new`
-refuses the connection — so the retry loop runs forever. `rent_baremetal.sh`
-handles this automatically; for a standalone `provision_server.sh` run,
-clear the stale entry first:
-
-```bash
-ssh-keygen -R <ip>
-infra/provision_server.sh <ip>
-```
-
-## Tear down
-
-Hourly billing keeps ticking until you delete the server:
-
-```bash
-scw baremetal server delete <server-id> zone=fr-par-2
-```
-
-`rent_baremetal.sh` prints this line with the right ID at the end of a
-successful run.
 
 ## Configuration
 
