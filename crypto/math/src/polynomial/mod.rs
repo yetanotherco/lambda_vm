@@ -191,6 +191,8 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         }
     }
 
+    /// Only used by the test-only `fast_division` / `invert_polynomial_mod`.
+    #[cfg(test)]
     pub fn truncate(&self, k: usize) -> Self {
         if k == 0 {
             Self::zero()
@@ -198,6 +200,9 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             Self::new(&self.coefficients[0..k.min(self.coefficients.len())])
         }
     }
+
+    /// Only used by the test-only `fast_division`.
+    #[cfg(test)]
     pub fn reverse(&self, d: usize) -> Self {
         let mut coeffs = self.coefficients.clone();
         coeffs.resize(d + 1, FieldElement::zero());
