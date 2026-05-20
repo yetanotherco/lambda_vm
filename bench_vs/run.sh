@@ -287,8 +287,8 @@ TARGET_SPEC="$ROOT_DIR/executor/programs/riscv64im-lambda-vm-elf.json"
 LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
 if $RUN_LAMBDA; then
-    echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
-    cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
+    echo -e "${GREEN}[Lambda VM] Building CLI (with disk-spill)...${NC}"
+    cargo build --release -p cli --features disk-spill --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 fi
 
 if $RUN_LAMBDA; then
