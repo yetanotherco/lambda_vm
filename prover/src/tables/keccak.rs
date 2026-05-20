@@ -18,13 +18,17 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+
 use executor::constants::KECCAK_SYSCALL_NUMBER;
+use math::field::element::FieldElement;
+use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::constraints::templates::{AddConstraint, AddOperand};
+use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
 // =========================================================================
 // Column indices
@@ -139,7 +143,10 @@ pub fn generate_keccak_trace(
 
         // State pointers: state_ptr[lane] = addr + 8 * lane_idx
         for lane_idx in 0..25 {
-            let ptr = op.state_addr.wrapping_add(lane_idx as u64 * 8);
+            let ptr = op
+                .state_addr
+                .checked_add(lane_idx as u64 * 8)
+                .expect("keccak state address range must be validated by the executor");
             data[base + cols::state_ptr(lane_idx, 0)] = FE::from(ptr & 0xFFFF);
             data[base + cols::state_ptr(lane_idx, 1)] = FE::from((ptr >> 16) & 0xFFFF);
             data[base + cols::state_ptr(lane_idx, 2)] = FE::from((ptr >> 32) & 0xFFFF);
@@ -349,7 +356,39 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // 5. MEMW interactions: 25 combined read+write per lane (per spec)
+    // 5. Alignment: addr[0] & 7 = 0, which enforces addr % 8 == 0.
+    interactions.push(BusInteraction::sender(
+        BusId::AndByte,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::addr(0),
+                packing: Packing::Direct,
+            },
+            BusValue::constant(7),
+            BusValue::constant(0),
+        ],
+    ));
+
+    // 6. Range-check every addr byte. The addr columns are reconstructed as a
+    // linear combination (addr_lo = b0 + 256*b1 + 65536*b2 + 2^24*b3, etc.)
+    // for the MEMW lookup and the no-overflow / alignment constraints. Without
+    // an explicit byte range check on each cell, an attacker can keep the
+    // field-element value of that linear combination correct while encoding
+    // arbitrary non-byte values in the individual cells (e.g. addr[0]=0,
+    // addr[1]=V_lo * 256^{-1} mod p), bypassing the alignment check.
+    for b in 0..8 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::addr(b),
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // 7. MEMW interactions: 25 combined read+write per lane (per spec)
     // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
     // old = input_state (read), value = output_state (write)
     for lane_idx in 0..25 {
@@ -426,12 +465,76 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Constraints
 // =========================================================================
 
+struct KeccakAddressNoOverflowConstraint {
+    constraint_idx: usize,
+}
+
+impl KeccakAddressNoOverflowConstraint {
+    fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let addr_lo = step.get_main_evaluation_element(0, cols::addr(0)).clone()
+            + step.get_main_evaluation_element(0, cols::addr(1)) * FieldElement::<F>::from(256)
+            + step.get_main_evaluation_element(0, cols::addr(2)) * FieldElement::<F>::from(65536)
+            + step.get_main_evaluation_element(0, cols::addr(3))
+                * FieldElement::<F>::from(16777216);
+        let addr_hi = step.get_main_evaluation_element(0, cols::addr(4)).clone()
+            + step.get_main_evaluation_element(0, cols::addr(5)) * FieldElement::<F>::from(256)
+            + step.get_main_evaluation_element(0, cols::addr(6)) * FieldElement::<F>::from(65536)
+            + step.get_main_evaluation_element(0, cols::addr(7))
+                * FieldElement::<F>::from(16777216);
+
+        let ptr_lo = step
+            .get_main_evaluation_element(0, cols::state_ptr(24, 0))
+            .clone()
+            + step.get_main_evaluation_element(0, cols::state_ptr(24, 1))
+                * FieldElement::<F>::from(65536);
+        let ptr_hi = step
+            .get_main_evaluation_element(0, cols::state_ptr(24, 2))
+            .clone()
+            + step.get_main_evaluation_element(0, cols::state_ptr(24, 3))
+                * FieldElement::<F>::from(65536);
+
+        let inv_2_32 = FieldElement::<F>::from(INV_SHIFT_32);
+        let carry_0 = (addr_lo + FieldElement::<F>::from(192) - ptr_lo) * inv_2_32.clone();
+        let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
+        step.get_main_evaluation_element(0, cols::MU).clone() * carry_1
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
+    for KeccakAddressNoOverflowConstraint
+{
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
+    }
+}
+
 /// Create constraints for the KECCAK core chip.
 ///
 /// Per spec (keccak:c:state_ptr): ADD template for each lane:
 ///   state_ptr[lane] = addr + 8 * lane_idx
 ///
-/// 25 lane pointers × 2 constraints per ADD = 50 constraints total.
+/// 25 lane pointers × 2 constraints per ADD + 1 top-lane no-overflow
+/// constraint = 51 constraints total.
 /// Conditional on mu (only real rows).
 pub fn create_constraints(
     constraint_idx_start: usize,
@@ -441,7 +544,7 @@ pub fn create_constraints(
 ) {
     let mut constraints: Vec<
         Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(50);
+    > = Vec::with_capacity(51);
     let mut idx = constraint_idx_start;
 
     // state_ptr[lane] = addr + 8*lane_idx
@@ -460,6 +563,9 @@ pub fn create_constraints(
         constraints.push(c1.boxed());
         idx += 2;
     }
+
+    constraints.push(KeccakAddressNoOverflowConstraint::new(idx).boxed());
+    idx += 1;
 
     (constraints, idx)
 }

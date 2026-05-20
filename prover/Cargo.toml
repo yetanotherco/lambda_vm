@@ -10,6 +10,9 @@ prove = []
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon", "std"]
 debug-checks = ["stark/debug-checks", "std"]
 instruments = ["stark/instruments", "std"]
+# disk-spill uses sysinfo (no no_std support) and mmap-backed storage, so it
+# requires std. The no_std guest never proves, so it never needs this feature.
+disk-spill = ["stark/disk-spill", "std", "dep:sysinfo", "dep:log"]
 
 [dependencies]
 stark = { path = "../crypto/stark", default-features = false }
@@ -21,10 +24,16 @@ hashbrown = { version = "0.14", default-features = false, features = ["inline-mo
 rayon = { version = "1.8.0", optional = true }
 sha3 = { version = "0.10.8", default-features = false }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+sysinfo = { version = "0.31", default-features = false, features = ["system"], optional = true }
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 env_logger = "*"
 criterion = { version = "0.5", default-features = false }
+bincode = "1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
 
 [[bench]]
 name = "vm_prover_benchmark"

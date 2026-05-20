@@ -31,6 +31,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+
 use executor::constants::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -44,6 +45,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 pub mod cols {
     use executor::constants::KECCAK_RHO;
+
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
     pub const ROUND: usize = 2;
@@ -186,7 +188,7 @@ pub mod cols {
     /// Index into chi[x][y][byte]
     #[inline]
     pub const fn chi(x: usize, y: usize, byte: usize) -> usize {
-        CHI + (x * 5 + y) * 8 + byte
+        CHI + (x + 5 * y) * 8 + byte
     }
 
     /// Index into rc[byte]
@@ -442,7 +444,7 @@ pub fn generate_keccak_rnd_trace(
 }
 
 // =========================================================================
-// Bus interactions (1,411 total)
+// Bus interactions (approx 1,371 total)
 // =========================================================================
 
 #[allow(clippy::needless_range_loop)]
