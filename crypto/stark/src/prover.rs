@@ -576,10 +576,11 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
-    /// Compute the LDE commitment for a subset of columns from a trace (for testing).
+    /// Compute the LDE commitment for a subset of trace columns (test helper).
     ///
-    /// This helper computes the same commitment the prover generates internally,
-    /// useful for setting up soundness test scenarios.
+    /// Delegates to [`commit_lde_columns`] — the same fused coset-LDE + Merkle
+    /// pipeline the prover uses internally — so soundness tests pin against the
+    /// real commitment instead of a parallel re-implementation.
     fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -587,53 +588,14 @@ pub trait IsStarkProver<
     ) -> Option<Commitment>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = Domain::new(air, trace.num_rows());
         let columns = trace.columns_main();
         let precomputed: Vec<_> = columns.into_iter().take(num_precomputed_cols).collect();
-        let twiddles = LdeTwiddles::new(&domain);
-        let evals =
-            Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) = Self::commit_columns_bit_reversed(&evals)?;
-        Some(commitment)
-    }
-
-    /// Compute LDE evaluations with pre-computed twiddle factors and coset weights.
-    ///
-    /// Accepts shared [`LdeTwiddles`] to avoid redundant twiddle generation and weight
-    /// computation across phases (A, C, Rounds 2-4).
-    fn compute_lde_from_columns_cached<E>(
-        columns: &[Vec<FieldElement<E>>],
-        domain: &Domain<Field>,
-        twiddles: &LdeTwiddles<Field>,
-    ) -> Vec<Vec<FieldElement<E>>>
-    where
-        E: IsSubFieldOf<FieldExtension> + Send + Sync,
-        Field: IsSubFieldOf<E>,
-        FieldElement<E>: Send + Sync,
-    {
-        if columns.is_empty() {
-            return Vec::new();
-        }
-
-        #[cfg(not(feature = "parallel"))]
-        let columns_iter = columns.iter();
-        #[cfg(feature = "parallel")]
-        let columns_iter = columns.par_iter();
-
-        columns_iter
-            .map(|col| {
-                Polynomial::coset_lde_full::<Field>(
-                    col,
-                    domain.blowup_factor,
-                    &twiddles.coset_weights,
-                    &twiddles.inv,
-                    &twiddles.fwd,
-                )
-            })
-            .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
-            .expect("coset LDE computation")
+        commit_lde_columns(
+            &precomputed,
+            air.options().blowup_factor as usize,
+            &FieldElement::from(air.options().coset_offset),
+        )
     }
 
     /// Expand each column in-place from N evaluations to N×blowup LDE evaluations.

@@ -15,9 +15,9 @@ use super::types::FE;
 /// Commit the precomputed `columns` of a preprocessed table and return the
 /// Merkle root.
 ///
-/// All columns must share the same power-of-two length. `table_label` is only
-/// used for the panic message if the commit fails — a commit failure here is a
-/// code bug on the table's own data, never adversarial input.
+/// All columns must share the same power-of-two length and be non-empty.
+/// `table_label` names the table in the invariant-failure message: an empty
+/// column set is a table-definition bug, never adversarial input.
 pub fn commit_preprocessed_columns(
     columns: Vec<Vec<FE>>,
     options: &ProofOptions,
@@ -26,8 +26,17 @@ pub fn commit_preprocessed_columns(
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
 
+    // `commit_lde_columns` only returns `None` for empty input. A preprocessed
+    // table always has a fixed, non-empty column set, so empty `columns` here is
+    // a table-definition bug — assert it explicitly (naming the table) rather
+    // than letting it surface as an opaque commit failure downstream.
+    assert!(
+        !columns.is_empty() && !columns[0].is_empty(),
+        "{table_label}: preprocessed table has no columns to commit (table-definition bug)",
+    );
+
     // `F` is inferred as GoldilocksField from `columns` / `coset_offset` — the
     // prover crate is monomorphic over Goldilocks; the genericity lives in `stark`.
     commit_lde_columns(&columns, blowup_factor, &coset_offset)
-        .unwrap_or_else(|| panic!("failed to commit preprocessed columns for {table_label}"))
+        .expect("commit_lde_columns is infallible for the non-empty columns asserted above")
 }
