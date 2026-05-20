@@ -26,6 +26,8 @@
 //! additionally embed `vkey.compute_digest()` in `VmProof` so vkey
 //! substitution surfaces as an explicit error before any STARK work runs.
 
+use alloc::vec::Vec;
+
 use executor::elf::Elf;
 use sha3::{Digest, Keccak256};
 use stark::config::Commitment;
