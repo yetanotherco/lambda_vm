@@ -19,8 +19,15 @@ log() { printf '\n=== %s ===\n' "$*"; }
 log "apt update + upgrade"
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+# Scaleway baremetal Debian ships grub-cloud-amd64; its postinst (fired as a
+# trigger by initramfs-tools / shim-signed / kernel upgrades) runs grub-install
+# against an ext2 root and fails ("will not proceed with blocklists"). The
+# package isn't load-bearing on UEFI baremetal — purge it before any upgrade.
+apt-get purge -y grub-cloud-amd64 2>/dev/null || true
+
 apt-get update -y
-#apt-get upgrade "${APT_OPTS[@]}"
+apt-get upgrade "${APT_OPTS[@]}"
 
 # --- 2. apt packages ---------------------------------------------------------
 log "apt install base packages + clang/lld/llvm + xz-utils"
