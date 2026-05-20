@@ -26,6 +26,7 @@ NC='\033[0m'
 SCW_ZONE="${SCW_ZONE:-fr-par-2}"
 SCW_TYPE="${SCW_TYPE:-EM-I320E-NVME}"
 SCW_OS_ID="${SCW_OS_ID:-83640d93-a0b8-45ad-9c9f-30cae48380a4}"  # Debian
+SCW_PROJECT_ID="${SCW_PROJECT_ID:-946cfb34-d351-48c4-8566-127e7727e15f}"
 USER_DATA_FILE="${USER_DATA_FILE:-$SCRIPT_DIR/user_data.yaml}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
 
@@ -86,22 +87,14 @@ if [ -z "$OFFER_ID" ]; then
 fi
 ok "Resolved hourly offer ID: $OFFER_ID"
 
-info "Resolving active project ID..."
-PROJECT_ID=$(scw config get default_project_id 2>/dev/null | tr -d '[:space:]')
-if [ -z "$PROJECT_ID" ]; then
-    err "could not resolve default_project_id from scw config (profile $EXPECTED_PROFILE)"
-    exit 1
-fi
-ok "Project ID: $PROJECT_ID"
-
-info "Enumerating SSH keys in project $PROJECT_ID..."
-SSH_KEYS_JSON=$(scw iam ssh-key list project-id="$PROJECT_ID" -o json)
+info "Enumerating SSH keys in project $SCW_PROJECT_ID..."
+SSH_KEYS_JSON=$(scw iam ssh-key list project-id="$SCW_PROJECT_ID" -o json)
 SSH_KEY_IDS=()
 while IFS= read -r line; do
     [ -n "$line" ] && SSH_KEY_IDS+=("$line")
 done < <(echo "$SSH_KEYS_JSON" | jq -r '.[].id')
 if [ ${#SSH_KEY_IDS[@]} -eq 0 ]; then
-    err "no SSH keys found in project $PROJECT_ID — register one first ('scw iam ssh-key create')"
+    err "no SSH keys found in project $SCW_PROJECT_ID — register one first ('scw iam ssh-key create')"
     exit 1
 fi
 ok "Found ${#SSH_KEY_IDS[@]} SSH key(s) to install"
