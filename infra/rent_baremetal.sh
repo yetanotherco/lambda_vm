@@ -88,7 +88,10 @@ ok "Resolved hourly offer ID: $OFFER_ID"
 
 info "Enumerating SSH keys from scw iam ssh-key list..."
 SSH_KEYS_JSON=$(scw iam ssh-key list -o json)
-mapfile -t SSH_KEY_IDS < <(echo "$SSH_KEYS_JSON" | jq -r '.[].id')
+SSH_KEY_IDS=()
+while IFS= read -r line; do
+    [ -n "$line" ] && SSH_KEY_IDS+=("$line")
+done < <(echo "$SSH_KEYS_JSON" | jq -r '.[].id')
 if [ ${#SSH_KEY_IDS[@]} -eq 0 ]; then
     err "no SSH keys found in scw iam ssh-key list — register one first ('scw iam ssh-key create')"
     exit 1
