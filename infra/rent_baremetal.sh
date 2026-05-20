@@ -182,6 +182,9 @@ echo "  type:   $SCW_TYPE (hourly offer $OFFER_ID)"
 echo "  ip:     $PUBLIC_IP"
 echo
 
+info "Wiping any stale known_hosts entry for $PUBLIC_IP (Scaleway recycles IPs)..."
+ssh-keygen -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+
 info "Handing off to provision_server.sh (Ctrl+C to skip and provision later)..."
 PROVISION_FILE="$PROVISION_FILE" SSH_USER=root "$SCRIPT_DIR/provision_server.sh" "$PUBLIC_IP"
 
