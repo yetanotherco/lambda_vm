@@ -537,30 +537,30 @@ pub fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(buf: &mut [E], num
 
     #[cfg(feature = "parallel")]
     {
-        // Collect the swap pairs first (each i with br(i) > i appears exactly
-        // once). The set of indices touched across all pairs is a disjoint
-        // union, so swaps don't race.
-        let pairs: alloc::vec::Vec<(usize, usize)> = (0..n)
-            .filter_map(|i| {
-                let j = reverse_index(i, n as u64);
-                (j > i).then_some((i * num_cols, j * num_cols))
-            })
-            .collect();
-
-        if pairs.len() >= 1024 {
+        // For each i in 0..n we check if its bit-reversed partner j has
+        // `j > i`; if so we swap rows i and j directly. Bit-reverse is a
+        // permutation, so distinct i values map to distinct j values, and
+        // (i, j) pairs are pairwise disjoint — safe to dispatch via raw
+        // pointer indexing in parallel. No upfront Vec<(usize, usize)>
+        // collection (saves ~16 MB at log21 n=64).
+        if n >= 2048 {
             use core::sync::atomic::{AtomicPtr, Ordering};
-            // SAFETY: each (lo, hi) pair is disjoint from every other pair
-            // (bit-reverse is a permutation, so distinct sources map to
-            // distinct destinations), and lo..lo+M / hi..hi+M never overlap
-            // since lo != hi. We share a raw pointer across threads but
-            // each thread writes to a unique pair of M-wide row ranges.
             let raw = AtomicPtr::new(buf.as_mut_ptr());
-            pairs.par_iter().for_each(|&(lo, hi)| {
-                let ptr = raw.load(Ordering::Relaxed);
-                unsafe {
-                    let lo_row = core::slice::from_raw_parts_mut(ptr.add(lo), num_cols);
-                    let hi_row = core::slice::from_raw_parts_mut(ptr.add(hi), num_cols);
-                    lo_row.swap_with_slice(hi_row);
+            (0..n).into_par_iter().for_each(|i| {
+                let j = reverse_index(i, n as u64);
+                if j > i {
+                    let ptr = raw.load(Ordering::Relaxed);
+                    let lo = i * num_cols;
+                    let hi = j * num_cols;
+                    // SAFETY: (lo..lo+M) and (hi..hi+M) point into the same
+                    // Vec but are disjoint (lo != hi); the par_iter visits
+                    // each unordered pair exactly once (we filter on j > i),
+                    // so no two threads touch overlapping ranges.
+                    unsafe {
+                        let lo_row = core::slice::from_raw_parts_mut(ptr.add(lo), num_cols);
+                        let hi_row = core::slice::from_raw_parts_mut(ptr.add(hi), num_cols);
+                        lo_row.swap_with_slice(hi_row);
+                    }
                 }
             });
             return;

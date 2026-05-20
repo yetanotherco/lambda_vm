@@ -456,7 +456,8 @@ pub trait IsStarkProver<
     /// `data` is laid out `[row_0 col_0..col_{M-1}, row_1 col_0..col_{M-1}, ...]`
     /// with length `num_rows * num_cols`. Each Merkle leaf hashes a single
     /// bit-reversed row read directly as a contiguous slice — no per-column
-    /// scatter-gather.
+    /// scatter-gather. Per-worker scratch buffer is reused via `map_init`,
+    /// so we allocate `num_threads` byte buffers instead of `num_rows`.
     fn commit_rows_bit_reversed<E>(
         data: &[FieldElement<E>],
         num_cols: usize,
@@ -476,6 +477,7 @@ pub trait IsStarkProver<
             return None;
         }
         let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+        let row_bytes = num_cols * byte_len;
 
         debug_assert!(
             num_rows.is_power_of_two(),
@@ -483,24 +485,40 @@ pub trait IsStarkProver<
         );
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row_start = br_idx * num_cols;
-                let row = &data[row_start..row_start + num_cols];
-                let mut buf = vec![0u8; num_cols * byte_len];
-                for (col_idx, elem) in row.iter().enumerate() {
-                    elem.write_bytes_be(
-                        &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
-                    );
-                }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-            })
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0u8; row_bytes],
+                |buf, row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start..row_start + num_cols];
+                    for (col_idx, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(
+                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
+                        );
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+                },
+            )
             .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut buf = vec![0u8; row_bytes];
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start..row_start + num_cols];
+                    for (col_idx, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(
+                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
+                        );
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+                })
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -534,6 +552,7 @@ pub trait IsStarkProver<
         }
         let subset_cols = col_end - col_start;
         let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+        let row_bytes = subset_cols * byte_len;
 
         debug_assert!(
             num_rows.is_power_of_two(),
@@ -541,22 +560,36 @@ pub trait IsStarkProver<
         );
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row_start = br_idx * num_cols;
-                let row = &data[row_start + col_start..row_start + col_end];
-                let mut buf = vec![0u8; subset_cols * byte_len];
-                for (i, elem) in row.iter().enumerate() {
-                    elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
-                }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-            })
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0u8; row_bytes],
+                |buf, row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start + col_start..row_start + col_end];
+                    for (i, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+                },
+            )
             .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut buf = vec![0u8; row_bytes];
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start + col_start..row_start + col_end];
+                    for (i, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+                })
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -656,63 +689,36 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Build a row-major LDE flat buffer directly from column-major trace
-    /// columns. Returns `(data, num_cols)` where `data.len() == lde_size * num_cols`.
+    /// Build a row-major LDE flat buffer directly from the trace's row-major
+    /// storage. Returns a Vec of length `lde_size * num_cols`.
     ///
-    /// The transpose happens upfront on the small trace (length N rows × M
-    /// cols), not on the LDE-sized buffer afterwards. The expansion to LDE
-    /// runs the batched row-major FFT pipeline, which shares twiddle loads
-    /// across M columns per butterfly.
+    /// Because `Table::data` is **already row-major**, the trace prefix is
+    /// loaded into the LDE buffer with one `extend_from_slice` (memcpy), no
+    /// transpose at all. `coset_lde_full_expand_row_major` then expands in
+    /// place, running the batched FFT with one twiddle load per butterfly
+    /// applied to M consecutive elements.
     fn expand_to_lde_row_major<E>(
-        columns: Vec<Vec<FieldElement<E>>>,
+        trace_row_major: &[FieldElement<E>],
+        num_cols: usize,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-    ) -> (Vec<FieldElement<E>>, usize)
+    ) -> Vec<FieldElement<E>>
     where
         Field: IsSubFieldOf<E>,
         E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
         FieldElement<E>: Send + Sync,
     {
-        let num_cols = columns.len();
-        if num_cols == 0 {
-            return (Vec::new(), 0);
+        if num_cols == 0 || trace_row_major.is_empty() {
+            return Vec::new();
         }
-        let trace_len = columns[0].len();
-        if trace_len == 0 {
-            return (Vec::new(), num_cols);
-        }
+        debug_assert_eq!(trace_row_major.len() % num_cols, 0);
+        let trace_len = trace_row_major.len() / num_cols;
         let lde_size = trace_len * domain.blowup_factor;
 
-        // Upfront transpose on the small trace (trace_len rows × num_cols).
-        // Allocate the LDE-sized buffer up front so the in-place expansion
-        // never needs to grow. Use the larger LDE capacity but only fill the
-        // trace prefix; `coset_lde_full_expand_row_major` resizes to lde_n.
-        let prefix_len = trace_len * num_cols;
-        let mut row_major: Vec<FieldElement<E>> = vec![FieldElement::<E>::zero(); prefix_len];
-
-        #[cfg(feature = "parallel")]
-        {
-            row_major
-                .par_chunks_exact_mut(num_cols)
-                .enumerate()
-                .for_each(|(row, dst)| {
-                    for (col_idx, src_col) in columns.iter().enumerate() {
-                        dst[col_idx] = src_col[row].clone();
-                    }
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for (row, dst) in row_major.chunks_exact_mut(num_cols).enumerate() {
-                for (col_idx, src_col) in columns.iter().enumerate() {
-                    dst[col_idx] = src_col[row].clone();
-                }
-            }
-        }
-
-        // Reserve LDE-sized capacity so the in-place resize inside the
-        // batched expand never reallocates.
-        row_major.reserve_exact(lde_size * num_cols - prefix_len);
+        // Allocate LDE-sized capacity once; memcpy the row-major trace into
+        // the first `trace_len * num_cols` positions. No transpose anywhere.
+        let mut row_major: Vec<FieldElement<E>> = Vec::with_capacity(lde_size * num_cols);
+        row_major.extend_from_slice(trace_row_major);
 
         Polynomial::coset_lde_full_expand_row_major::<Field>(
             &mut row_major,
@@ -725,7 +731,7 @@ pub trait IsStarkProver<
         .expect("row-major coset LDE expansion");
 
         debug_assert_eq!(row_major.len(), lde_size * num_cols);
-        (row_major, num_cols)
+        row_major
     }
 
     /// Compute main LDE, commit, and return the Merkle tree/root along with the
@@ -751,10 +757,15 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let columns = trace.columns_main();
+        let num_cols = trace.num_main_columns;
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (lde_data, num_cols) = Self::expand_to_lde_row_major::<Field>(columns, domain, twiddles);
+        let lde_data = Self::expand_to_lde_row_major::<Field>(
+            trace.main_data_row_major(),
+            num_cols,
+            domain,
+            twiddles,
+        );
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
 
@@ -792,10 +803,15 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let columns = trace.columns_main();
+        let num_cols = trace.num_main_columns;
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (lde_data, num_cols) = Self::expand_to_lde_row_major::<Field>(columns, domain, twiddles);
+        let lde_data = Self::expand_to_lde_row_major::<Field>(
+            trace.main_data_row_major(),
+            num_cols,
+            domain,
+            twiddles,
+        );
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
 
@@ -851,13 +867,23 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let main_columns = trace.columns_main();
-        let (main_data, num_main_cols) =
-            Self::expand_to_lde_row_major::<Field>(main_columns, domain, twiddles);
+        let num_main_cols = trace.num_main_columns;
+        let main_data = Self::expand_to_lde_row_major::<Field>(
+            trace.main_data_row_major(),
+            num_main_cols,
+            domain,
+            twiddles,
+        );
 
         let (aux_data, num_aux_cols) = if air.has_aux_trace() {
-            let aux_columns = trace.columns_aux();
-            Self::expand_to_lde_row_major::<FieldExtension>(aux_columns, domain, twiddles)
+            let num_aux_cols = trace.num_aux_columns;
+            let data = Self::expand_to_lde_row_major::<FieldExtension>(
+                trace.aux_data_row_major(),
+                num_aux_cols,
+                domain,
+                twiddles,
+            );
+            (data, num_aux_cols)
         } else {
             (Vec::new(), 0)
         };
@@ -1980,13 +2006,15 @@ pub trait IsStarkProver<
                     let twiddles = &twiddle_caches[idx];
 
                     if air.has_aux_trace() {
-                        let columns = trace.columns_aux();
+                        let num_aux_cols = trace.num_aux_columns;
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        let (aux_data, num_aux_cols) =
-                            Self::expand_to_lde_row_major::<FieldExtension>(
-                                columns, domain, twiddles,
-                            );
+                        let aux_data = Self::expand_to_lde_row_major::<FieldExtension>(
+                            trace.aux_data_row_major(),
+                            num_aux_cols,
+                            domain,
+                            twiddles,
+                        );
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]

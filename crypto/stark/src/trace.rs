@@ -120,6 +120,21 @@ where
         self.aux_table.columns()
     }
 
+    /// Borrow the underlying row-major main-trace buffer (data laid out
+    /// `[row_0 col_0..col_{M-1}, row_1 col_0..col_{M-1}, ...]`). Cheaper than
+    /// `columns_main()`, which materializes a column-major transpose, when
+    /// the consumer wants row-major bytes (e.g. for the row-major LDE pipeline).
+    #[inline]
+    pub fn main_data_row_major(&self) -> &[FieldElement<F>] {
+        &self.main_table.data
+    }
+
+    /// Borrow the underlying row-major aux-trace buffer.
+    #[inline]
+    pub fn aux_data_row_major(&self) -> &[FieldElement<E>] {
+        &self.aux_table.data
+    }
+
     /// Given a row and a column index, gives stored value in that position
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
         self.main_table.get(row, col)
