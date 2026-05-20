@@ -19,8 +19,8 @@ executor = { path = "../executor", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
 rayon = { version = "1.8.0", optional = true }
-sha3 = "0.10.8"
-postcard = { version = "1.0", features = ["alloc"] }
+sha3 = { version = "0.10.8", default-features = false }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 env_logger = "*"

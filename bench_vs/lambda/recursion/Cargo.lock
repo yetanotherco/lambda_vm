@@ -245,7 +245,9 @@ dependencies = [
  "executor",
  "hashbrown",
  "math",
+ "postcard",
  "serde",
+ "sha3",
  "stark",
 ]
 

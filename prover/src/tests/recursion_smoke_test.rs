@@ -70,8 +70,11 @@ fn run_recursion_pipeline_with_options(
         "inner proof must verify on host"
     );
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(inner_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &inner_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!(
         "[{label}] postcard blob: {} bytes (limit: MAX_PRIVATE_INPUT_SIZE)",
         blob.len()
@@ -187,8 +190,11 @@ fn test_dump_recursion_input() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
 
     let path = "/tmp/recursion_input.bin";
     std::fs::write(path, &blob).expect("write blob");
@@ -231,8 +237,11 @@ fn test_recursion_cycle_count() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!("[cycle-count] postcard blob: {} bytes", blob.len());
 
     // Execute (NOT prove) the recursion guest. Use `resume()` in a loop and
@@ -319,8 +328,11 @@ fn test_recursion_pc_histogram() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!("[pc-hist] postcard blob: {} bytes", blob.len());
 
     eprintln!("[pc-hist] executing recursion guest (building PC histogram) ...");
@@ -445,8 +457,11 @@ fn test_recursion_sampled_flamegraph() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!("[sampled-fg] postcard blob: {} bytes", blob.len());
 
     eprintln!("[sampled-fg] executing recursion guest (sampling 1-in-{SAMPLE_RATE}) ...",);
@@ -626,8 +641,11 @@ fn test_deserialize_only_cycle_count() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!("[deser-only] postcard blob: {} bytes", blob.len());
 
     eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
@@ -717,8 +735,11 @@ fn test_recursion_step_breakdown() {
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options))
-        .expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, &inner_proof_options);
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
     eprintln!("[step-bkd] postcard blob: {} bytes", blob.len());
 
     // Build a per-step "advance bucket to N" lookup. The verifier's step
