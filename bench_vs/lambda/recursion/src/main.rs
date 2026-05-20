@@ -8,7 +8,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 use embedded_alloc::TlsfHeap as Heap;
-use lambda_vm_prover::{ProofOptions, VmProof};
+use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
 // Required to pull in the riscv crate's critical-section implementation.
 use riscv as _;
 
@@ -67,21 +67,23 @@ fn halt() -> ! {
 }
 
 /// Private input layout (postcard-encoded):
-///   (VmProof, Vec<u8>, ProofOptions)
-/// where the `Vec<u8>` holds the inner program's ELF bytes and the
-/// `ProofOptions` specifies the parameters the inner prover used. Bundling
-/// the options keeps the guest agnostic to whichever blowup/query count the
-/// host picked for a given run.
+///   (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)
+/// where the `Vec<u8>` holds the inner program's ELF bytes, the
+/// `ProofOptions` specifies the parameters the inner prover used, and the
+/// `VmVerifyingKey` carries the host-derived bitwise preprocessed commitment
+/// so the guest can skip the ~87% of verifier cycles that would otherwise be
+/// spent recomputing it from scratch.
 #[unsafe(no_mangle)]
 pub fn main() -> ! {
     init_allocator();
 
     let blob = read_private_input();
-    let (vm_proof, inner_elf, options): (VmProof, Vec<u8>, ProofOptions) =
+    let (vm_proof, inner_elf, options, vkey): (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey) =
         postcard::from_bytes(blob).expect("failed to deserialize recursion input");
 
-    let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options)
-        .expect("verify errored");
+    let ok =
+        lambda_vm_prover::verify_with_options_with_vkey(&vm_proof, &inner_elf, &options, Some(&vkey))
+            .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
     commit(&[1u8]);
