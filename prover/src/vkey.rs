@@ -45,7 +45,13 @@ pub const VKEY_VERSION: u32 = 3;
 /// Placeholder commitment stored in [`VmVerifyingKey::pages`] for
 /// private-input page slots, where there is no preprocessed commitment to
 /// cache. The verifier never reads these slots (private-input pages have no
-/// `with_preprocessed(...)` call in `VmAirs::new`).
+/// `with_preprocessed(...)` call in `VmAirs::new_with_vkey`).
+///
+/// NOTE: once the deferred `vk_digest` PR lands and `compute_digest()`
+/// becomes verifier-checked, these slots will need to be canonicalized
+/// (e.g. by hashing only non-private-input slots, or by asserting these
+/// slots equal `[0u8; 32]` before hashing) so a malicious supplier cannot
+/// produce two functionally-equivalent vkeys with different digests.
 const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
 
 /// Cached preprocessed-table commitments the verifier would otherwise

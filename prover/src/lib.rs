@@ -351,9 +351,12 @@ impl VmAirs {
     }
 
     /// Same as [`Self::new`] but accepts a precomputed [`VmVerifyingKey`].
-    /// When `vkey` is `Some`, the bitwise preprocessed commitment is taken
-    /// from it instead of being recomputed from `proof_options` — that
-    /// recomputation is ~87% of verifier cycles inside the recursion guest.
+    /// When `vkey` is `Some`, every preprocessed-table commitment (bitwise,
+    /// decode, register, keccak_rc, and the per-page commitments) is taken
+    /// from it instead of being recomputed inside `VmAirs::new`. In the
+    /// recursion guest this skips the FFT + Merkle pipeline for all 5
+    /// preprocessed tables, dropping the in-VM verifier from ~40.5 B cycles
+    /// to ~67 M (609×).
     pub fn new_with_vkey(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -368,10 +371,9 @@ impl VmAirs {
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
-            let commitment = match vkey {
-                Some(vk) => vk.bitwise,
-                None => bitwise::preprocessed_commitment(proof_options),
-            };
+            let commitment = vkey
+                .map(|vk| vk.bitwise)
+                .unwrap_or_else(|| bitwise::preprocessed_commitment(proof_options));
             create_bitwise_air(proof_options)
                 .with_preprocessed(commitment, bitwise::NUM_PRECOMPUTED_COLS)
         };
@@ -754,7 +756,7 @@ pub fn verify_with_options(
 }
 
 /// Same as [`verify_with_options`] but accepts a precomputed
-/// [`VmVerifyingKey`]. When `vkey` is `Some`, the bitwise preprocessed
+/// [`VmVerifyingKey`]. When `vkey` is `Some`, every preprocessed-table
 /// commitment is taken from it instead of being recomputed inside
 /// `VmAirs::new`. A tampered vkey is caught by Fiat-Shamir: the verifier
 /// feeds the supplied commitment into the transcript, derives different
