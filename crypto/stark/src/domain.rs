@@ -59,9 +59,11 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
-    /// Construct a full prover domain. Accepts both concrete AIR types
-    /// (`A: AIR<Field = F>`) and trait objects (`&dyn AIR<Field = F, ...>`)
-    /// via the `?Sized` bound — `multi_prove` passes a `&dyn AIR` here.
+    /// Builds the interpolation and LDE domains used by the prover.
+    ///
+    /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).
+    /// - LDE domain: a coset of size `trace_length * blowup_factor`, shifted by
+    ///   `air.options().coset_offset`.
     pub fn new<A>(air: &A, trace_length: usize) -> Self
     where
         A: AIR<Field = F> + ?Sized,

@@ -81,14 +81,10 @@ pub enum ProvingError {
 }
 
 /// Commitment artifacts for one trace table (main or auxiliary). Used for both
-/// plain and preprocessed tables — preprocessed tables additionally carry a
+/// plain and preprocessed tables. Preprocessed tables additionally carry a
 /// separate Merkle tree over their precomputed columns, hence the optional
 /// `precomputed_tree`/`precomputed_root` pair and the `num_precomputed_cols`
 /// index used when opening positions.
-///
-/// `Arc<BatchedMerkleTree<F>>` so the same tree (~64 MB per large table) can be
-/// shared between Phase A/C bookkeeping and the `Round1` value handed to
-/// rounds 2–4 without deep-cloning.
 pub(crate) struct TableCommit<F: IsField>
 where
     FieldElement<F>: AsBytes,
@@ -137,7 +133,7 @@ where
         }
     }
 
-    /// Cheap clone — only bumps Arc refcounts; no tree data is copied.
+    /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
     fn share(&self) -> Self {
         Self {
             tree: Arc::clone(&self.tree),

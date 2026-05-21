@@ -1,7 +1,5 @@
-//! Tiny helpers that abstract over `cfg(feature = "parallel")` for the
-//! handful of patterns that recur the most across the prover. The goal is
-//! to delete duplicate algorithm bodies — not to wrap every parallel
-//! iterator pattern.
+//! Helpers that abstract over `cfg(feature = "parallel")` for patterns
+//! that recur across the prover.
 
 /// Run `f(i)` for `i in 0..n` and return the unzipped pair of result vecs.
 /// Parallel when `feature = "parallel"`, sequential otherwise.
