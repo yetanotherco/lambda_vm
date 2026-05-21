@@ -375,7 +375,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // addr[1]=V_lo * 256^{-1} mod p), bypassing the alignment check.
     for b in 0..8 {
         interactions.push(BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::addr(b),
