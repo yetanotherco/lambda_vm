@@ -637,17 +637,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Theta: ARE_BYTES range checks on Cxz_left (40) ---
+    // --- Theta: ARE_BYTES range checks on Cxz_left (20 pairs) ---
+    // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
+    // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
+    // implementation guidance in spec/is_byte.typ.
     // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
     for x in 0..5 {
-        for b in 0..8 {
+        for i in 0..4 {
             interactions.push(BusInteraction::sender(
                 BusId::AreBytes,
                 Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
-                    start_column: cols::cxz_left(x, b),
-                    packing: Packing::Direct,
-                }],
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::cxz_left(x, 2 * i),
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::cxz_left(x, 2 * i + 1),
+                        packing: Packing::Direct,
+                    },
+                ],
             ));
         }
     }
@@ -761,25 +770,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Rho: ARE_BYTES range checks on rot_left + rot_right (400) ---
+    // --- Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs) ---
+    // Spec emits 400 IS_BYTE templates (200 per side); we merge each
+    // (rot_left[x][y][b], rot_right[x][y][b]) into one ARE_BYTES interaction.
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
                     BusId::AreBytes,
                     Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_left(x, y, b),
-                        packing: Packing::Direct,
-                    }],
-                ));
-                interactions.push(BusInteraction::sender(
-                    BusId::AreBytes,
-                    Multiplicity::Column(cols::MU),
-                    vec![BusValue::Packed {
-                        start_column: cols::rot_right(x, y, b),
-                        packing: Packing::Direct,
-                    }],
+                    vec![
+                        BusValue::Packed {
+                            start_column: cols::rot_left(x, y, b),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::rot_right(x, y, b),
+                            packing: Packing::Direct,
+                        },
+                    ],
                 ));
             }
         }

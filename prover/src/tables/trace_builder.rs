@@ -1688,11 +1688,14 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
         // Range-check addr bytes (paired with the ARE_BYTES sends in
         // keccak::bus_interactions): without this the field-element value of
         // the addr_lo / addr_hi linear combinations is unconstrained per byte.
-        for b in 0..8 {
-            let byte = ((state_addr >> (b * 8)) & 0xFF) as u8;
-            ops.push(BitwiseOperation::single_byte(
+        // 4 paired ops matching the (addr[2i], addr[2i+1]) sender pairing.
+        for i in 0..4 {
+            let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
+            let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
-                byte,
+                lo,
+                hi,
             ));
         }
 
@@ -1757,13 +1760,11 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                         ((halfword >> 8) & 0xFF) as u8,
                         1,
                     ));
-                    // ARE_BYTES for cxz_left bytes
-                    ops.push(BitwiseOperation::single_byte(
+                    // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
+                    // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
+                    ops.push(BitwiseOperation::byte_op(
                         BitwiseOperationType::AreBytes,
                         (shifted & 0xFF) as u8,
-                    ));
-                    ops.push(BitwiseOperation::single_byte(
-                        BitwiseOperationType::AreBytes,
                         ((shifted >> 8) & 0xFF) as u8,
                     ));
                 }
@@ -1842,22 +1843,17 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                             ((halfword >> 8) & 0xFF) as u8,
                             rnc_val,
                         ));
-                        // ARE_BYTES for rot_left
-                        ops.push(BitwiseOperation::single_byte(
+                        // ARE_BYTES paired as (rot_left[b], rot_right[b]) for
+                        // each byte of the halfword, matching the sender pairing
+                        // in keccak_rnd::bus_interactions.
+                        ops.push(BitwiseOperation::byte_op(
                             BitwiseOperationType::AreBytes,
                             (shifted & 0xFF) as u8,
-                        ));
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::AreBytes,
-                            ((shifted >> 8) & 0xFF) as u8,
-                        ));
-                        // ARE_BYTES for rot_right
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::AreBytes,
                             (carry & 0xFF) as u8,
                         ));
-                        ops.push(BitwiseOperation::single_byte(
+                        ops.push(BitwiseOperation::byte_op(
                             BitwiseOperationType::AreBytes,
+                            ((shifted >> 8) & 0xFF) as u8,
                             ((carry >> 8) & 0xFF) as u8,
                         ));
                     }
@@ -3291,11 +3287,12 @@ mod keccak_tests {
         assert_eq!(xor, 24 * 608, "XorByte count");
         assert_eq!(and, 24 * 200 + 1, "AndByte count");
         // Cxz_right Byte→Bit (spec d75944ee): drops 40 ARE_BYTES per round.
-        // +8 per call to range-check the addr bytes used in alignment / no-overflow.
-        assert_eq!(are_bytes, 24 * 440 + 8, "AreBytes count");
+        // Spec emits one IS_BYTE template per byte; ops pair adjacent bytes
+        // into ARE_BYTES (20 cxz_left + 200 rho per round, 4 addr per call).
+        assert_eq!(are_bytes, 24 * 220 + 4, "AreBytes count");
         assert_eq!(hwsl, 24 * 120, "Hwsl count");
         assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 109 + 24 * 1368, "Total bitwise ops");
+        assert_eq!(ops.len(), 105 + 24 * 1148, "Total bitwise ops");
     }
 
     #[test]
@@ -3395,14 +3392,15 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            138,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 8 ARE_BYTES addr + 1 Keccak send + 1 Keccak recv"
+            134,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
-            1371,
-            "KECCAK_RND: 3 IO + 460 theta + 500 rho + 400 chi + 8 iota \
-             (Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee)"
+            1151,
+            "KECCAK_RND: 3 IO + 440 theta + 300 rho + 400 chi + 8 iota \
+             (Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
+             ARE_BYTES sends are paired per spec ARE_BYTES interaction signature)"
         );
         assert_eq!(
             keccak_rc::bus_interactions().len(),
