@@ -1,5 +1,4 @@
-//! GPU dispatch layer for the per-column coset LDE. Lives in the stark crate
-//! (not `math`) to avoid a dependency cycle between `math` and `math-cuda`.
+//! GPU dispatch layer for the per-column coset LDE.
 //!
 //! Handles only Goldilocks base-field columns above a size threshold; falls
 //! back to CPU for extension-field columns and small columns where kernel
