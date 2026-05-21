@@ -1,7 +1,4 @@
 use alloc::{collections::BTreeMap, vec::Vec};
-#[cfg(feature = "alloc")]
-use math::traits::Serializable;
-use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::{
     traits::IsMerkleTreeBackend,
@@ -38,36 +35,6 @@ impl<T: PartialEq + Eq> Proof<T> {
         }
 
         root_hash == &hashed_value
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<T> Serializable for Proof<T>
-where
-    T: Serializable + PartialEq + Eq,
-{
-    fn serialize(&self) -> Vec<u8> {
-        self.merkle_path
-            .iter()
-            .flat_map(|node| node.serialize())
-            .collect()
-    }
-}
-
-impl<T> Deserializable for Proof<T>
-where
-    T: Deserializable + PartialEq + Eq,
-{
-    fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>
-    where
-        Self: Sized,
-    {
-        let mut merkle_path = Vec::new();
-        for elem in bytes[0..].chunks(8) {
-            let node = T::deserialize(elem)?;
-            merkle_path.push(node);
-        }
-        Ok(Self { merkle_path })
     }
 }
 

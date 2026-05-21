@@ -127,21 +127,23 @@ where
     ///
     /// This skips the `hash_leaves` step, useful when leaves have already been
     /// hashed externally (e.g., to avoid materializing large intermediate data).
+    ///
+    /// Returns `None` unless the leaf count is a non-zero power of two. The tree
+    /// is intentionally not padded: padding by repeating the last leaf would
+    /// make the root of `[.., x]` collide with the root of `[.., x, x]`, so the
+    /// root would no longer bind the leaf count. Every prover commitment is
+    /// already over a power-of-two domain, so this is a caller-side invariant.
     pub fn build_from_hashed_leaves(hashed_leaves: Vec<B::Node>) -> Option<Self> {
-        if hashed_leaves.is_empty() {
+        if hashed_leaves.is_empty() || !hashed_leaves.len().is_power_of_two() {
             return None;
         }
-
-        //The leaf must be a power of 2 set
-        let hashed_leaves = complete_until_power_of_two(hashed_leaves);
         let leaves_len = hashed_leaves.len();
 
-        //The length of leaves minus one inner node in the merkle tree
-        //The first elements are overwritten by build function, it doesn't matter what it's there
+        // `nodes` holds (leaves_len - 1) inner nodes followed by the leaves.
+        // The inner-node entries are placeholders, overwritten by `build`.
         let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
         nodes.extend(hashed_leaves);
 
-        //Build the inner nodes of the tree
         build::<B>(&mut nodes, leaves_len);
 
         Some(MerkleTree {
@@ -192,24 +194,14 @@ where
         &self.nodes
     }
 
-    /// Returns a Merkle proof for the element/s at position pos
-    /// For example, give me an inclusion proof for the 3rd element in the
-    /// Merkle tree
+    /// Returns a Merkle inclusion proof for the leaf at position `pos`.
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
         let pos = pos + self.node_count() / 2;
-        let Ok(merkle_path) = self.build_merkle_path(pos) else {
-            return None;
-        };
-
-        self.create_proof(merkle_path)
-    }
-
-    /// Creates a proof from a Merkle pasth
-    fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
+        let merkle_path = self.build_merkle_path(pos).ok()?;
         Some(Proof { merkle_path })
     }
 
-    /// Returns the Merkle path for the element/s for the leaf at position pos
+    /// Returns the Merkle path (sibling hashes, leaf to root) for the node at `pos`.
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
         // Pre-allocate based on tree depth (log2 of tree size)
         let tree_depth = (self.node_count() + 1).ilog2() as usize;
@@ -217,13 +209,15 @@ where
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.node_get(sibling_index(pos)) else {
+            // `pos != ROOT` guarantees a sibling exists.
+            let sibling = get_sibling_pos(pos).expect("non-root node has a sibling");
+            let Some(node) = self.node_get(sibling) else {
                 // out of bounds, exit returning the current merkle_path
                 return Err(Error::OutOfBounds);
             };
             merkle_path.push(node.clone());
 
-            pos = parent_index(pos);
+            pos = get_parent_pos(pos);
         }
 
         Ok(merkle_path)
@@ -305,7 +299,7 @@ where
         // Number of levels in tree
         let num_levels = (self.node_count() + 1).ilog2();
 
-        // Iter lefevel-by-level from leaves to root.
+        // Iterate level-by-level from leaves to root.
         for _ in 0..num_levels - 1 {
             let mut next_obtainable = BTreeSet::new();
 
@@ -329,7 +323,7 @@ where
         }
 
         // Reverse to get descending order (larger indices first).
-        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
+        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes closer to root).
         auth_path_set.into_iter().rev().collect()
     }
 

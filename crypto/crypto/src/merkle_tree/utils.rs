@@ -1,27 +1,8 @@
-use alloc::vec::Vec;
-
 use super::traits::IsMerkleTreeBackend;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-pub fn sibling_index(node_index: usize) -> usize {
-    if node_index.is_multiple_of(2) {
-        node_index - 1
-    } else {
-        node_index + 1
-    }
-}
-
-pub fn parent_index(node_index: usize) -> usize {
-    if node_index.is_multiple_of(2) {
-        (node_index - 1) / 2
-    } else {
-        node_index / 2
-    }
-}
-
-/// Returns the sibling position for a given node index.
-/// Returns `None` for the root node (index 0) since it has no sibling.
+/// Sibling of `node_index` in the flat node array, or `None` for the root (0).
 pub fn get_sibling_pos(node_index: usize) -> Option<usize> {
     if node_index == 0 {
         return None;
@@ -33,8 +14,8 @@ pub fn get_sibling_pos(node_index: usize) -> Option<usize> {
     }
 }
 
+/// Parent of `node_index`. The root (0) has no parent and maps to itself.
 pub fn get_parent_pos(node_index: usize) -> usize {
-    // Root node (index 0) has no parent, return itself to avoid underflow
     if node_index == 0 {
         return node_index;
     }
@@ -45,26 +26,11 @@ pub fn get_parent_pos(node_index: usize) -> usize {
     }
 }
 
-// The list of values is completed repeating the last value to a power of two length
-pub fn complete_until_power_of_two<T: Clone>(mut values: Vec<T>) -> Vec<T> {
-    while !is_power_of_two(values.len()) {
-        values.push(values[values.len() - 1].clone());
-    }
-    values
-}
-
-// ! NOTE !
-// In this function we say 2^0 = 1 is a power of two.
-// In turn, this makes the smallest tree of one leaf, possible.
-// The function is private and is only used to ensure the tree
-// has a power of 2 number of leaves.
-fn is_power_of_two(x: usize) -> bool {
-    (x & (x - 1)) == 0
-}
-
-// ! CAUTION !
-// Make sure n=nodes.len()+1 is a power of two, and the last n/2 elements (leaves) are populated with hashes.
-// This function takes no precautions for other cases.
+/// Fills the inner nodes of a Merkle tree bottom-up.
+///
+/// Precondition (caller-enforced, not checked): `nodes.len() + 1` is a power of
+/// two and the last `leaves_len` entries of `nodes` already hold the leaf
+/// hashes. Behaviour is unspecified for any other input.
 pub fn build<B: IsMerkleTreeBackend>(nodes: &mut [B::Node], leaves_len: usize)
 where
     B::Node: Clone,

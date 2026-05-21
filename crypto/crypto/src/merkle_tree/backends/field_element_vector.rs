@@ -41,18 +41,14 @@ where
         let mut hasher = D::new();
         hasher.update(input[0].as_bytes());
         hasher.update(input[1].as_bytes());
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hasher.finalize().into()
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         hasher.update(left);
         hasher.update(right);
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hasher.finalize().into()
     }
 }
 
@@ -82,9 +78,7 @@ where
     pub fn hash_bytes(data: &[u8]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         hasher.update(data);
-        let mut result = [0u8; NUM_BYTES];
-        result.copy_from_slice(&hasher.finalize());
-        result
+        hasher.finalize().into()
     }
 }
 
@@ -104,18 +98,14 @@ where
         for element in input.iter() {
             hasher.update(element.as_bytes());
         }
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hasher.finalize().into()
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         hasher.update(left);
         hasher.update(right);
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hasher.finalize().into()
     }
 }
 

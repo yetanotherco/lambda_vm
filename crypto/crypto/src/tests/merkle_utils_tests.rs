@@ -1,10 +1,7 @@
 use alloc::vec::Vec;
 use math::field::{element::FieldElement, test_fields::u64_test_field::U64Field};
 
-use crate::merkle_tree::{
-    traits::IsMerkleTreeBackend,
-    utils::{build, complete_until_power_of_two},
-};
+use crate::merkle_tree::{traits::IsMerkleTreeBackend, utils::build};
 use crate::tests::merkle_tests::TestBackend;
 
 const MODULUS: u64 = 13;
@@ -27,32 +24,6 @@ fn hash_leaves_from_a_list_of_field_elemnts() {
     for (leaf, expected_leaf) in hashed_leaves.iter().zip(list_of_nodes) {
         assert_eq!(leaf, expected_leaf);
     }
-}
-
-#[test]
-// expected |1|2|3|4|5|5|5|5|
-fn complete_the_length_of_a_list_of_fields_elements_to_be_a_power_of_two() {
-    let values: Vec<FE> = (1..6).map(FE::new).collect();
-    let hashed_leaves = complete_until_power_of_two(values);
-
-    let mut expected_leaves = (1..6).map(FE::new).collect::<Vec<FE>>();
-    expected_leaves.extend([FE::new(5); 3]);
-
-    for (leaf, expected_leaves) in hashed_leaves.iter().zip(expected_leaves) {
-        assert_eq!(*leaf, expected_leaves);
-    }
-}
-
-#[test]
-// expected |2|2|
-fn complete_the_length_of_one_field_element_to_be_a_power_of_two() {
-    let values: Vec<FE> = vec![FE::new(2)];
-    let hashed_leaves = complete_until_power_of_two(values);
-
-    let mut expected_leaves = vec![FE::new(2)];
-    expected_leaves.extend([FE::new(2)]);
-    assert_eq!(hashed_leaves.len(), 1);
-    assert_eq!(hashed_leaves[0], expected_leaves[0]);
 }
 
 const ROOT: usize = 0;
