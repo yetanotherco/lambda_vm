@@ -1,6 +1,6 @@
 //! GPU dispatch layer for the per-column coset LDE.
 //!
-//! Handles only Goldilocks base-field columns above a size threshold; falls
+//! Handles only Goldilocks base-field columns above a size threshold. Falls
 //! back to CPU for extension-field columns and small columns where kernel
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
