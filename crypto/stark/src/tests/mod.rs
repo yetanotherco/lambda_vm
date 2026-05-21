@@ -1,5 +1,4 @@
 pub mod air_tests;
-pub mod boundary_tests;
 pub mod bus_tests;
 pub mod fri_tests;
 pub mod proof_options_tests;
