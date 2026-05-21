@@ -1,7 +1,7 @@
 //! Thread-local hit/miss counter for the `multi_prove` domain dedup cache.
 //!
-//! Used only by tests that exercise the dedup behavior — see
-//! `tests::prover_tests::test_multi_prove_dedups_shared_domain_params`.
+//! Used only by tests that exercise the dedup behavior (See
+//! `tests::prover_tests::test_multi_prove_dedups_shared_domain_params`).
 //! Recorded from inside `multi_prove` under `#[cfg(test)]` and read back
 //! by the test after proving completes.
 

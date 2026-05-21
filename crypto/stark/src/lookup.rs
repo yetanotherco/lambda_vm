@@ -1229,10 +1229,8 @@ pub enum Multiplicity {
 }
 
 impl Multiplicity {
-    /// Single canonical evaluator. Callers supply a `get_col` closure that
-    /// returns the field element for the given column index; this lets the
-    /// same arithmetic serve both the column-major build path (`&main_cols[col][row]`)
-    /// and the constraint-eval path (`step.get_main_evaluation_element(0, col)`).
+    /// Evaluate the multiplicity expression to a field element. `get_col(i)`
+    /// must return the value of main column `i` at the row being evaluated.
     #[inline]
     fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
@@ -1479,8 +1477,8 @@ where
     let process_chunk = |chunk_start: usize, result_chunk: &mut [FieldElement<E>]| {
         let chunk_len = result_chunk.len();
 
-        // Phase 1: fingerprints for every (interaction, row) — layout
-        // [int_0 rows…, int_1 rows…], so fp[k*chunk_len + i] is interaction k row chunk_start+i.
+        // Phase 1 — fingerprints, laid out as [int_0 rows…, int_1 rows…].
+        // fp[k*chunk_len + i] = interaction k at row chunk_start+i.
         let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(n * chunk_len);
         for (k, interaction) in interactions.iter().enumerate() {
             for row in chunk_start..chunk_start + chunk_len {
@@ -1500,8 +1498,6 @@ where
             }
         }
 
-        // Debug-checks log: only for single-interaction calls (preserves the
-        // pre-merge behavior — batched-pair callers never logged).
         #[cfg(feature = "debug-checks")]
         if n == 1 {
             let interaction = interactions[0];
@@ -1532,7 +1528,7 @@ where
         FieldElement::inplace_batch_inverse(&mut fingerprints)
             .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-        // Phase 3: sum sign·m/fp across interactions per row
+        // Phase 3: Compute terms
         for (i, result_elem) in result_chunk.iter_mut().enumerate() {
             let row = chunk_start + i;
             let mut acc = FieldElement::<E>::zero();
