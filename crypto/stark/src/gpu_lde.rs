@@ -21,7 +21,7 @@ use crate::domain::Domain;
 ///
 /// 2^19 is a conservative default calibrated against a 46-core machine where
 /// rayon-parallel CPU LDE is already fast. Override via env var for tuning
-/// on smaller machines; see `/workspace/lambda_vm/crypto/math-cuda/tests/bench_quick.rs`.
+/// on smaller machines, see `crypto/math-cuda/tests/bench_quick.rs`.
 const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
 
 fn gpu_lde_threshold() -> usize {
