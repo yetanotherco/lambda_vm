@@ -1522,23 +1522,38 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "parallel")]
         {
+            // Coarse-grained chunking: process ROWS_PER_TASK rows per Rayon
+            // task to amortize fork/join overhead. Without this, num_eval_points=2
+            // → 4M tiny tasks at log21 n=64 (each ~100 ns scheduling overhead
+            // dominates over the per-row compute). ROWS_PER_TASK=1024 → ~4K tasks
+            // for log21 n=64, plenty for 48 cores while keeping overhead negligible.
+            const ROWS_PER_TASK: usize = 1024;
+            let task_chunk = ROWS_PER_TASK * num_eval_points;
             compressed_flat
-                .par_chunks_exact_mut(num_eval_points)
+                .par_chunks_mut(task_chunk)
                 .enumerate()
-                .for_each(|(i, sums)| {
-                    for j in 0..num_main_cols {
-                        let val = lde_trace.get_main(i, j);
-                        let gbase = &gammas_per_col[j * num_eval_points..(j + 1) * num_eval_points];
-                        for k in 0..num_eval_points {
-                            sums[k] += val * &gbase[k];
+                .for_each(|(chunk_idx, chunk)| {
+                    let row_base = chunk_idx * ROWS_PER_TASK;
+                    let rows_this = chunk.len() / num_eval_points;
+                    for row_local in 0..rows_this {
+                        let i = row_base + row_local;
+                        let sums = &mut chunk
+                            [row_local * num_eval_points..(row_local + 1) * num_eval_points];
+                        for j in 0..num_main_cols {
+                            let val = lde_trace.get_main(i, j);
+                            let gbase = &gammas_per_col
+                                [j * num_eval_points..(j + 1) * num_eval_points];
+                            for k in 0..num_eval_points {
+                                sums[k] += val * &gbase[k];
+                            }
                         }
-                    }
-                    for j in 0..num_aux_cols {
-                        let val = lde_trace.get_aux(i, j);
-                        let gbase = &gammas_per_col[(num_main_cols + j) * num_eval_points
-                            ..(num_main_cols + j + 1) * num_eval_points];
-                        for k in 0..num_eval_points {
-                            sums[k] += val * &gbase[k];
+                        for j in 0..num_aux_cols {
+                            let val = lde_trace.get_aux(i, j);
+                            let gbase = &gammas_per_col[(num_main_cols + j) * num_eval_points
+                                ..(num_main_cols + j + 1) * num_eval_points];
+                            for k in 0..num_eval_points {
+                                sums[k] += val * &gbase[k];
+                            }
                         }
                     }
                 });
