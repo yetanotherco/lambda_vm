@@ -1303,14 +1303,11 @@ pub trait IsStarkProver<
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
         let num_total_cols = num_main_cols + num_aux_cols;
 
-        // === Phase 1: Column compression (Plonky3-style) ===
-        // Instead of iterating all ~95 columns per row in the hot loop, we precompute:
-        //   compressed_k[i] = Σ_j gamma[j][k] * lde_trace.get_main(i, j)   for i in 0..lde_size
-        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k]
-        // This moves the column sum outside the hot loop. Since the new path evaluates
-        // DEEP directly at all 2N LDE points, no stride is needed — every row is used.
-
-        // Precompute OOD compressed values (one per eval point)
+        // OOD column compression (Plonky3-style): precompute one value per eval point,
+        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
+        // The per-LDE-point trace column sums are NOT precomputed — they are fused
+        // directly into the hot loop below. DEEP is evaluated at all 2N LDE points
+        // (no stride), so every row is used.
         let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
             vec![FieldElement::zero(); num_eval_points];
         for j in 0..num_total_cols {
@@ -1324,7 +1321,8 @@ pub trait IsStarkProver<
         // Fused single-pass: compute column compression AND DEEP polynomial inline.
         // Eliminates the intermediate `compressed` allocation (~400 MB for CPU table)
         // and reduces to a single rayon dispatch instead of num_eval_points + 1.
-        // Column data is read once per LDE point and reused across eval points (L1 hit).
+        // Each row i's column data is reused across all eval points k within a rayon
+        // task, so the k=1 read hits L1 cache after k=0 just loaded it.
 
         // Pre-gather gamma references per eval point for cache-friendly access.
         let main_gammas_by_k: Vec<Vec<&FieldElement<FieldExtension>>> = (0..num_eval_points)
