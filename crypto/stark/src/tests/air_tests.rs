@@ -31,6 +31,7 @@ type Felt = FieldElement<GoldilocksField>;
 use crate::examples::read_only_memory_logup::{
     LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
 };
+use crate::test_utils::multi_prove_ram;
 
 #[test_log::test]
 fn test_prove_fib() {
@@ -400,7 +401,7 @@ fn test_multi_prove_fib_3_tables() {
         (&air_3, &mut trace_3, &pub_inputs_3),
     ];
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     let airs: Vec<
         &dyn AIR<
@@ -500,7 +501,7 @@ fn test_multi_prove_2_tables_small_field() {
         (&air_2, &mut trace_2, &pub_inputs_2),
     ];
 
-    let multi_proof = Prover::multi_prove(
+    let multi_proof = multi_prove_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[]),
     )
@@ -538,7 +539,7 @@ fn test_multi_prove_different_airs() {
     )> = vec![(&air_1, &mut trace_1, &()), (&air_2, &mut trace_2, &())];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     let airs: Vec<
         &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksField, PublicInputs = ()>,

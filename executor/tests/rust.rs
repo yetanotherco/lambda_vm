@@ -161,6 +161,20 @@ fn test_commit() {
 }
 
 #[test]
+fn test_ef_io_demo_concatenates_writes() {
+    // Demo guest reads its private input via EF `read_input`, then emits it
+    // back as the public output via TWO `write_output` calls (split in halves).
+    // The COMMIT AIR concatenates the two calls; the executor's
+    // `commit_public_output` appends in the same order.
+    let input: Vec<u8> = b"hello world!".to_vec();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ef_io_demo.elf",
+        input.clone(),
+        input,
+    );
+}
+
+#[test]
 fn test_commit_sum() {
     run_program_and_check_public_output(
         "./program_artifacts/rust/commit_sum.elf",

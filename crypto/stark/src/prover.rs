@@ -10,7 +10,8 @@ use math::fft::errors::FFTError;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::traits::AsBytes;
+use math::spill_safe::SpillSafe;
+use math::traits::{AsBytes, ByteConversion};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -28,12 +29,14 @@ use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{CompositionPolyOpenings, DeepPolynomialOpenings, PolynomialOpenings};
+#[cfg(feature = "disk-spill")]
+use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::Domain;
+use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -100,6 +103,10 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
+    /// out of disk space, fd exhaustion, or mmap failure.
+    #[cfg(feature = "disk-spill")]
+    DiskSpill(String),
 }
 
 /// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
@@ -296,7 +303,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
-fn table_parallelism() -> usize {
+pub fn table_parallelism() -> usize {
     #[cfg(feature = "parallel")]
     {
         std::env::var("TABLE_PARALLELISM")
@@ -374,6 +381,102 @@ where
     }
 }
 
+/// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
+/// leaf per row, where each row is read at `reverse_index(row_idx)` and the
+/// columns are concatenated as big-endian bytes before hashing.
+///
+/// Returns `Vec<Commitment>` with the same length as `columns[0]`. Exposed
+/// (instead of being a closure inside `commit_columns_bit_reversed`) so
+/// parity tests in dependent crates can compare against the same code path
+/// the prover uses.
+pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    if columns.is_empty() || columns[0].is_empty() {
+        return Vec::new();
+    }
+
+    let num_rows = columns[0].len();
+    let num_cols = columns.len();
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+
+    debug_assert!(
+        num_rows.is_power_of_two(),
+        "num_rows must be a power of two for reverse_index"
+    );
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_rows).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_rows;
+
+    iter.map(|row_idx| {
+        let br_idx = reverse_index(row_idx, num_rows as u64);
+        let total_bytes = num_cols * byte_len;
+        let mut buf = vec![0u8; total_bytes];
+        for col_idx in 0..num_cols {
+            columns[col_idx][br_idx]
+                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+    })
+    .collect()
+}
+
+/// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
+/// leaf per row-pair, where leaf `i` hashes the BE concatenation of
+/// `parts[..][br_0] ++ parts[..][br_1]` with
+/// `br_k = reverse_index(2*i + k, num_rows)`.
+///
+/// Returns `Vec<Commitment>` of length `parts[0].len() / 2`.
+pub fn keccak_leaves_row_pair_bit_reversed<E>(parts: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    let num_parts = parts.len();
+    if num_parts == 0 {
+        return Vec::new();
+    }
+    let num_rows = parts[0].len();
+    if num_rows == 0 {
+        return Vec::new();
+    }
+
+    let num_leaves = num_rows / 2;
+    debug_assert!(
+        num_rows.is_power_of_two(),
+        "num_rows must be a power of two for reverse_index"
+    );
+
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_leaves).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_leaves;
+
+    iter.map(|leaf_idx| {
+        let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+        let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+        let total_bytes = 2 * num_parts * byte_len;
+        let mut buf = vec![0u8; total_bytes];
+        let mut offset = 0;
+        for part in parts.iter() {
+            part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        for part in parts.iter() {
+            part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+    })
+    .collect()
+}
+
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -400,41 +503,10 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
-        use math::traits::ByteConversion;
-
         if columns.is_empty() || columns[0].is_empty() {
             return None;
         }
-
-        let num_rows = columns[0].len();
-        let num_cols = columns.len();
-        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-
-        debug_assert!(
-            num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index"
-        );
-
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        // One allocation per row (was one per field element): write all columns
-        // into a single buffer, then hash once.
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let total_bytes = num_cols * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                for col_idx in 0..num_cols {
-                    columns[col_idx][br_idx]
-                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-                }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-            })
-            .collect();
-
+        let hashed_leaves = keccak_leaves_bit_reversed(columns);
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
@@ -540,6 +612,7 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -557,6 +630,10 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -565,10 +642,17 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (tree, root) =
+        #[allow(unused_mut)]
+        let (mut tree, root) =
             Self::commit_columns_bit_reversed(&columns).ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            tree.spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
+        }
 
         Ok((tree, root, None, None, 0, columns))
     }
@@ -581,6 +665,7 @@ pub trait IsStarkProver<
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<
         (
             BatchedMerkleTree<Field>,
@@ -598,6 +683,10 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
@@ -606,11 +695,13 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (precomputed_tree, precomputed_root) =
+        #[allow(unused_mut)]
+        let (mut precomputed_tree, precomputed_root) =
             Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
-        let (mult_tree, mult_root) =
+        #[allow(unused_mut)]
+        let (mut mult_tree, mult_root) =
             Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
                 .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
@@ -620,6 +711,16 @@ pub trait IsStarkProver<
             precomputed_root, precomputed_commitment,
             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
         );
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            precomputed_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}")))?;
+            mult_tree
+                .spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
+        }
 
         Ok((
             mult_tree,
@@ -723,8 +824,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
-        use math::traits::ByteConversion;
-
         let num_parts = lde_composition_poly_parts_evaluations.len();
         if num_parts == 0 {
             return None;
@@ -733,41 +832,8 @@ pub trait IsStarkProver<
         if num_rows == 0 {
             return None;
         }
-
-        let num_leaves = num_rows / 2;
-        debug_assert!(
-            num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index"
-        );
-
-        let byte_len = <FieldElement<FieldExtension> as ByteConversion>::BYTE_LEN;
-
-        // One allocation per leaf (was one per field element): write all parts
-        // into a single buffer. Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_leaves).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_leaves;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|leaf_idx| {
-                let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-                let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-                let total_bytes = 2 * num_parts * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                let mut offset = 0;
-                for part in lde_composition_poly_parts_evaluations.iter() {
-                    part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                    offset += byte_len;
-                }
-                for part in lde_composition_poly_parts_evaluations.iter() {
-                    part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
-                    offset += byte_len;
-                }
-                BatchedMerkleTreeBackend::<FieldExtension>::hash_bytes(&buf)
-            })
-            .collect();
-
+        let hashed_leaves =
+            keccak_leaves_row_pair_bit_reversed(lde_composition_poly_parts_evaluations);
         let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
@@ -989,25 +1055,12 @@ pub trait IsStarkProver<
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
-        // === Composition poly parts: barycentric evaluation at z^num_parts ===
-        // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
-        // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
-        let coset_points: Vec<FieldElement<Field>> = (0..domain_size)
-            .map(|i| domain.lde_roots_of_unity_coset[i * blowup_factor].clone())
-            .collect();
-        // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
-        // functions use F×E→E mixed arithmetic, avoiding field conversions.
-        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(domain_size);
-        let domain_size_inv: FieldElement<Field> = FieldElement::<Field>::from(domain_size as u64)
-            .inv()
-            .expect("domain_size is a power of two, hence non-zero in the field");
-        let g_n_inv: FieldElement<Field> = coset_offset_pow_n
-            .inv()
-            .expect("coset_offset_pow_n is non-zero");
+        // === Shared domain constants for barycentric evaluation ===
+        let dc = DomainConstants::from_domain(domain);
 
-        // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
+        // === Composition poly parts: barycentric evaluation at z^num_parts ===
         let comp_z_pow_n = z_power.pow(domain_size);
-        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
+        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
             .lde_composition_poly_evaluations
@@ -1019,10 +1072,10 @@ pub trait IsStarkProver<
                     .collect();
                 math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
-                    &coset_offset_pow_n,
-                    &domain_size_inv,
-                    &g_n_inv,
-                    &coset_points,
+                    &dc.offset_pow_n,
+                    &dc.size_inv,
+                    &dc.offset_pow_n_inv,
+                    &dc.points,
                     &evals,
                     &comp_inv_denoms,
                 )
@@ -1030,14 +1083,13 @@ pub trait IsStarkProver<
             .collect();
 
         // === Trace polynomials: barycentric evaluation via LDE ===
-        // Uses get_trace_evaluations_from_lde which performs barycentric interpolation
-        // on the LDE trace data, avoiding the need for coefficient-form trace_polys.
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
             &round_1_result.lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
             air.step_size(),
+            &dc,
         );
 
         Round3 {
@@ -1101,21 +1153,17 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
-        // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
-        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
+        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
+        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
+        let mut lde_evals = deep_evals;
         in_place_bit_reverse_permute(&mut lde_evals);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
-        // FRI commit phase from pre-computed evaluations (no initial FFT)
+        // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let (fri_last_value, fri_layers) =
@@ -1185,10 +1233,11 @@ pub trait IsStarkProver<
             .collect::<Vec<usize>>()
     }
 
-    /// Computes the DEEP composition polynomial as evaluations on the trace-size coset.
+    /// Computes the DEEP composition polynomial at all 2N LDE points (Plonky3-style).
     ///
-    /// Evaluates `deep(x_i)` at N points (every bf-th point of the LDE coset).
-    /// The caller extends to the full 2N-point LDE domain before feeding to FRI.
+    /// Evaluates directly on the full LDE domain, eliminating the iFFT(N)+FFT(2N)
+    /// extension that was needed when computing at only N trace-coset points.
+    /// The result is ready for FRI after bit-reversal — no FFT needed.
     ///
     /// The DEEP polynomial is:
     ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
@@ -1208,8 +1257,6 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let domain_size = domain.interpolation_domain_size;
-        let blowup_factor = domain.blowup_factor;
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
@@ -1232,20 +1279,21 @@ pub trait IsStarkProver<
         let num_main_cols = lde_trace.num_main_cols();
         let num_aux_cols = lde_trace.num_aux_cols();
 
-        // Precompute all inverse denominators via batch inversion.
-        let num_denoms = domain_size * (1 + num_eval_points);
+        // Precompute all inverse denominators at ALL LDE points via batch inversion.
+        let lde_size = domain.lde_roots_of_unity_coset.len();
+        let num_denoms = lde_size * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
-        // H-term denominators: x_i - z^K
-        for i in 0..domain_size {
-            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+        // H-term denominators: x_i - z^K (all 2N LDE points)
+        for i in 0..lde_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i];
             denoms.push(x_i - &z_power);
         }
 
-        // Trace-term denominators: x_i - z_shifted[k]
+        // Trace-term denominators: x_i - z_shifted[k] (all 2N LDE points)
         for z_k in z_shifted.iter().take(num_eval_points) {
-            for i in 0..domain_size {
-                let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
+            for i in 0..lde_size {
+                let x_i = &domain.lde_roots_of_unity_coset[i];
                 denoms.push(x_i - z_k);
             }
         }
@@ -1253,47 +1301,81 @@ pub trait IsStarkProver<
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
-        let inv_h = &denoms[0..domain_size];
+        let inv_h = &denoms[0..lde_size];
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+        let num_total_cols = num_main_cols + num_aux_cols;
 
-        // Compute deep(x_i) for each trace-size coset point
+        // === Phase 1: Column compression (Plonky3-style) ===
+        // Instead of iterating all ~95 columns per row in the hot loop, we precompute:
+        //   compressed_k[i] = Σ_j gamma[j][k] * lde_trace.get_main(i, j)   for i in 0..lde_size
+        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k]
+        // This moves the column sum outside the hot loop. Since the new path evaluates
+        // DEEP directly at all 2N LDE points, no stride is needed — every row is used.
+
+        // Precompute OOD compressed values (one per eval point)
+        let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::zero(); num_eval_points];
+        for j in 0..num_total_cols {
+            let ood_evals_j = &trace_ood_columns[j];
+            let gammas_j = &trace_terms_gammas[j];
+            for k in 0..num_eval_points {
+                ood_compressed[k] += &gammas_j[k] * &ood_evals_j[k];
+            }
+        }
+
+        // Compressed traces at ALL 2N LDE points (Plonky3-style).
+        // Eliminates the iFFT(N)+FFT(2N) extension by computing directly at LDE size.
+        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|k| {
+                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
+                    .map(|j| &trace_terms_gammas[j][k])
+                    .collect();
+                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
+                    .map(|j| &trace_terms_gammas[num_main_cols + j][k])
+                    .collect();
+
+                #[cfg(feature = "parallel")]
+                let iter = (0..lde_size).into_par_iter();
+                #[cfg(not(feature = "parallel"))]
+                let iter = 0..lde_size;
+
+                iter.map(|i| {
+                    let mut sum = FieldElement::<FieldExtension>::zero();
+                    for (j, gamma) in main_gammas.iter().enumerate() {
+                        sum += lde_trace.get_main(i, j) * *gamma;
+                    }
+                    for (j, gamma) in aux_gammas.iter().enumerate() {
+                        sum += lde_trace.get_aux(i, j) * *gamma;
+                    }
+                    sum
+                })
+                .collect()
+            })
+            .collect();
+
+        // Hot loop at all 2N LDE points — no FFT extension needed.
         #[cfg(feature = "parallel")]
-        let iter = (0..domain_size).into_par_iter();
+        let iter = (0..lde_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let iter = 0..domain_size;
+        let iter = 0..lde_size;
 
         iter.map(|i| {
-            let row_idx = i * blowup_factor; // LDE row index
-
-            // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
+
+            // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
                 let h_j_ood = &h_ood[j];
-                let numerator = h_j_val - h_j_ood;
-                result += &composition_poly_gammas[j] * numerator * &inv_h[i];
+                result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
-            let num_total_cols = num_main_cols + num_aux_cols;
-            for j in 0..num_total_cols {
-                let gammas_j = &trace_terms_gammas[j];
-                let ood_evals_j = &trace_ood_columns[j];
-
-                for k in 0..num_eval_points {
-                    let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-
-                    let t_j_ood = &ood_evals_j[k];
-                    let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j) - t_j_ood
-                    } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
-                    };
-                    result += &gammas_j[k] * numerator * inv_t_k_i;
-                }
+            // Trace terms (compressed)
+            for k in 0..num_eval_points {
+                let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
+                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
             }
 
             result
@@ -1548,11 +1630,16 @@ pub trait IsStarkProver<
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
 
@@ -1616,6 +1703,21 @@ pub trait IsStarkProver<
 
         let k = table_parallelism().min(num_airs).max(1);
 
+        // Spill main traces to mmap before Round 1 LDE.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            #[cfg(feature = "parallel")]
+            let spill_iter = air_trace_pairs.par_iter_mut();
+            #[cfg(not(feature = "parallel"))]
+            let mut spill_iter = air_trace_pairs.iter_mut();
+            spill_iter.try_for_each(|(_, trace, _)| {
+                trace
+                    .main_table
+                    .spill_to_disk()
+                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
+            })?;
+        }
+
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
@@ -1657,9 +1759,17 @@ pub trait IsStarkProver<
                             air.precomputed_commitment(),
                             air.num_precomputed_columns(),
                             twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
                         )
                     } else {
-                        Self::commit_main_trace(*trace, domain, twiddles)
+                        Self::commit_main_trace(
+                            *trace,
+                            domain,
+                            twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                        )
                     }
                 })
                 .collect();
@@ -1732,6 +1842,23 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            #[cfg(feature = "parallel")]
+            let spill_iter = air_trace_pairs.par_iter_mut();
+            #[cfg(not(feature = "parallel"))]
+            let mut spill_iter = air_trace_pairs.iter_mut();
+            spill_iter.try_for_each(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    trace
+                        .spill_aux_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
+                }
+                Ok(())
+            })?;
+        }
+
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
@@ -1781,6 +1908,10 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
                         let mut columns = trace.extract_columns_aux(lde_size);
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            trace.aux_table.advise_drop_cache();
+                        }
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         Self::expand_columns_to_lde::<FieldExtension>(
@@ -1792,10 +1923,18 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        let (tree, root) = Self::commit_columns_bit_reversed(&columns)
+                        #[allow(unused_mut)]
+                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            tree.spill_nodes_to_disk().map_err(|e| {
+                                ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
+                            })?;
+                        }
 
                         Ok((Some(Arc::new(tree)), Some(root), columns))
                     } else {
@@ -1985,10 +2124,19 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(air_trace_pairs, transcript)
-            .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
+        .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
