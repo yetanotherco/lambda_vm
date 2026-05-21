@@ -71,17 +71,15 @@ pub fn gpu_extend_halves_calls() -> u64 {
 // the type-confirmed precondition. Centralising that here keeps each variant
 // short and means a future change to (say) the threshold logic is one edit.
 
-/// Outcome of validating an incoming `columns` slice against the GPU dispatch
-/// preconditions.
+/// Outcome of validating an input slice against the GPU dispatch preconditions.
 enum LayoutDispatch {
-    /// `columns` is empty — caller returns its own "trivially done" value
-    /// (`true` for `bool` callers, `Some(Vec::new())` for `Option` callers).
+    /// Input slice is empty, no work to do.
     Empty,
-    /// GPU path doesn't apply (below threshold, wrong types, ragged columns).
-    /// Caller returns its own "fall through to CPU" value (`false`/`None`).
+    /// Preconditions not met: below threshold, wrong element types, or
+    /// columns of unequal length.
     Skip,
-    /// GPU path applies. `n` is the per-column input length; `lde_size = n *
-    /// blowup_factor` (saturating).
+    /// Preconditions met. `n` is the per-column input length:
+    /// `lde_size = n * blowup_factor` (saturating).
     Run { n: usize, lde_size: usize },
 }
 
