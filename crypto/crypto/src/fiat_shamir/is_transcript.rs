@@ -29,20 +29,22 @@ pub trait IsStarkTranscript<F: IsField, S: IsField + IsSubFieldOf<F>>: IsTranscr
         lde_length: usize,
         coset_offset: &FieldElement<S>,
     ) -> FieldElement<F> {
-        // Pre-compute coset_offset^lde_length once (for coset membership check)
-        let coset_offset_pow_lde: FieldElement<F> =
-            coset_offset.clone().to_extension().pow(lde_length);
+        // Coset membership reference value, precomputed once. The power map runs
+        // in the base field S (cheap) and the scalar result is lifted to F — we
+        // never lift `coset_offset` into F before exponentiating.
+        let coset_offset_pow_lde: FieldElement<F> = coset_offset.pow(lde_length).to_extension();
+        // lde_length = trace_length * blowup_factor, so z^lde = (z^trace)^blowup.
+        let blowup_factor = lde_length / trace_length;
 
         loop {
             let z: FieldElement<F> = self.sample_field_element();
 
-            // Check z NOT in trace domain: z^trace_length != 1
-            // (trace domain is the group of trace_length-th roots of unity)
-            let in_trace_domain = z.pow(trace_length) == FieldElement::one();
+            // z is in the trace domain (trace_length-th roots of unity) iff z^trace_length == 1.
+            let z_pow_trace = z.pow(trace_length);
+            let in_trace_domain = z_pow_trace == FieldElement::one();
 
-            // Check z NOT in LDE coset: z^lde_length != coset_offset^lde_length
-            // (LDE coset is coset_offset * <lde_primitive_root>)
-            let in_lde_coset = z.pow(lde_length) == coset_offset_pow_lde;
+            // z is in the LDE coset (coset_offset * <lde root>) iff z^lde == coset_offset^lde.
+            let in_lde_coset = z_pow_trace.pow(blowup_factor) == coset_offset_pow_lde;
 
             if !in_trace_domain && !in_lde_coset {
                 return z;
