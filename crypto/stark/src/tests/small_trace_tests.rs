@@ -175,7 +175,7 @@ fn test_verify_rejects_truncated_composition_poly_parts_ood() {
             &air,
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
-        "Verifier must reject (not panic) when composition_poly_parts_ood_evaluation is truncated"
+        "Verifier must reject when composition_poly_parts_ood_evaluation is truncated"
     );
 }
 
@@ -208,6 +208,6 @@ fn test_verify_rejects_opening_column_count_mismatch() {
             &air,
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
-        "Verifier must reject (not panic) when an opening's column count does not match the OOD table width"
+        "Verifier must reject when an opening's column count does not match the OOD table width"
     );
 }
