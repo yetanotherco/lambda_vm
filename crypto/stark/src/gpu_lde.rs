@@ -6,6 +6,9 @@
 //! LDE evaluations as the CPU path.
 
 use std::any::TypeId;
+use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -25,7 +28,7 @@ use crate::domain::Domain;
 const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
 
 fn gpu_lde_threshold() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("LAMBDA_VM_GPU_LDE_THRESHOLD")
             .ok()
@@ -36,40 +39,36 @@ fn gpu_lde_threshold() -> usize {
 
 /// Atomically counted by `try_expand_column` every time it actually routes a
 /// column to the GPU. Used by benchmarks to confirm the GPU path fired.
-static GPU_LDE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_LDE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn gpu_lde_calls() -> u64 {
-    GPU_LDE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    GPU_LDE_CALLS.load(Ordering::Relaxed)
 }
 
 pub fn reset_gpu_lde_calls() {
-    GPU_LDE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    GPU_LDE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// Reset all GPU call counters at once. Useful between bench warm-up and
 /// profiled passes so the numbers reported aren't doubled by the warm-up.
 pub fn reset_all_gpu_call_counters() {
-    use std::sync::atomic::Ordering::Relaxed;
-    GPU_LDE_CALLS.store(0, Relaxed);
-    GPU_EXTEND_HALVES_CALLS.store(0, Relaxed);
-    GPU_LEAF_HASH_CALLS.store(0, Relaxed);
-    GPU_MERKLE_TREE_CALLS.store(0, Relaxed);
+    GPU_LDE_CALLS.store(0, Ordering::Relaxed);
+    GPU_EXTEND_HALVES_CALLS.store(0, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.store(0, Ordering::Relaxed);
 }
 
-pub(crate) static GPU_EXTEND_HALVES_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
-    GPU_EXTEND_HALVES_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
 }
 
 // ============================================================================
 // Shared dispatch helpers
 // ============================================================================
 //
-// Every `try_expand_*` variant runs the same prologue: empty-check, threshold
-// check, two TypeId checks, equal-length check, and a column-to-u64 cast under
-// the type-confirmed precondition. Centralising that here keeps each variant
-// short and means a future change to (say) the threshold logic is one edit.
+// Common prologue for the try_expand_* variants: empty-check, threshold,
+// TypeId checks, equal-length check, column-to-u64 cast.
 
 /// Outcome of validating an input slice against the GPU dispatch preconditions.
 enum LayoutDispatch {
@@ -139,8 +138,7 @@ where
     LayoutDispatch::Run { n, lde_size }
 }
 
-/// Materialise base-field columns as owned `Vec<Vec<u64>>` for the GPU input
-/// slice list.
+/// Convert base-field columns to `Vec<Vec<u64>>` for the GPU input slice list.
 ///
 /// SAFETY: caller must have established `E == GoldilocksField` (e.g. via
 /// [`check_base_layout`]). Each `FieldElement<E>` is then a `#[repr(transparent)]`
@@ -156,8 +154,8 @@ unsafe fn columns_to_u64_base<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> V
         .collect()
 }
 
-/// Materialise ext3 columns as owned `Vec<Vec<u64>>` (de-interleaved into raw
-/// `[u64; 3]` lanes per element) for the GPU input slice list.
+/// Convert ext3 columns to `Vec<Vec<u64>>` (de-interleaved into raw `[u64; 3]`
+/// lanes per element) for the GPU input slice list.
 ///
 /// SAFETY: caller must have established `E == Degree3GoldilocksExtensionField`
 /// (e.g. via [`check_ext3_layout`]). Each `FieldElement<E>` is then a
@@ -168,12 +166,12 @@ unsafe fn columns_to_u64_ext3<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> V
         .map(|col| {
             let len = col.len() * 3;
             let ptr = col.as_ptr() as *const u64;
-            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+            unsafe { from_raw_parts(ptr, len) }.to_vec()
         })
         .collect()
 }
 
-/// Materialise weights as a raw `Vec<u64>`.
+/// Convert weights to raw `Vec<u64>`.
 ///
 /// SAFETY: caller must have established `F == GoldilocksField`.
 unsafe fn weights_to_u64<F: IsField>(weights: &[FieldElement<F>]) -> Vec<u64> {
@@ -184,8 +182,7 @@ unsafe fn weights_to_u64<F: IsField>(weights: &[FieldElement<F>]) -> Vec<u64> {
 }
 
 /// Pre-size each column to `lde_size` and view it as a `&mut [u64]` of length
-/// `lde_size` (base-field, single-u64 layout). Asserts capacity hard so a
-/// caller regression can't quietly UB in release builds.
+/// `lde_size` (base-field, single-u64 layout).
 ///
 /// SAFETY: caller must have established `E == GoldilocksField`.
 unsafe fn presize_and_view_base<E: IsField>(
@@ -199,7 +196,7 @@ unsafe fn presize_and_view_base<E: IsField>(
             col.capacity(),
             lde_size
         );
-        // SAFETY: assert above guarantees capacity; the GPU path overwrites
+        // SAFETY: assert above guarantees capacity, the GPU path overwrites
         // every slot before any reader sees the new length.
         unsafe { col.set_len(lde_size) };
     }
@@ -209,7 +206,7 @@ unsafe fn presize_and_view_base<E: IsField>(
             let ptr = col.as_mut_ptr() as *mut u64;
             let len = col.len();
             // SAFETY: single-u64 layout, caller still owns the backing alloc.
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+            unsafe { from_raw_parts_mut(ptr, len) }
         })
         .collect()
 }
@@ -238,7 +235,7 @@ unsafe fn presize_and_view_ext3<E: IsField>(
             let ptr = col.as_mut_ptr() as *mut u64;
             let len = col.len() * 3;
             // SAFETY: ext3 `[u64; 3]` layout, caller still owns the backing.
-            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+            unsafe { from_raw_parts_mut(ptr, len) }
         })
         .collect()
 }
