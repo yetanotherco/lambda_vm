@@ -15,7 +15,7 @@ use math::field::traits::{IsField, IsSubFieldOf};
 use crate::domain::Domain;
 
 /// Break-even LDE size. Below this, the CPU `coset_lde_full_expand` completes
-/// in a few hundred microseconds and the GPU's ~37 kernel launches plus
+/// in a few hundred microseconds and the GPU's tens of kernel launches plus
 /// H2D/D2H round-trip is a net loss. The check is on **lde size**, not trace
 /// length, because that's what determines the FFT workload.
 ///
