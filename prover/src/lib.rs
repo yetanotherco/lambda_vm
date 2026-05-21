@@ -423,6 +423,16 @@ impl VmAirs {
             .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
         let register = create_register_air(proof_options)
             .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS);
+        if let Some(vk) = vkey
+            && vk.pages.len() != page_configs.len()
+        {
+            log::warn!(
+                "vkey.pages length ({}) does not match page_configs length ({}); \
+                 recomputing the missing/extra slots — likely a caller bug",
+                vk.pages.len(),
+                page_configs.len()
+            );
+        }
         let pages: Vec<_> = page_configs
             .iter()
             .enumerate()
@@ -761,6 +771,16 @@ pub fn verify_with_options(
 /// `VmAirs::new`. A tampered vkey is caught by Fiat-Shamir: the verifier
 /// feeds the supplied commitment into the transcript, derives different
 /// challenges from what the prover used, and the openings stop matching.
+///
+/// IMPORTANT: when `vkey` is `Some(...)`, the `elf_bytes` argument no longer
+/// authenticates the proof against the program. The `decode`, `register`,
+/// and page commitments come from the vkey, not from `elf_bytes`, so a
+/// caller who passes a vkey derived from program A together with
+/// `elf_bytes` of program B will get `Ok(true)` for any proof of program A.
+/// The caller is responsible for ensuring the vkey was derived from the
+/// same `elf_bytes` they intend to verify against. A future PR will bind
+/// `vkey.compute_digest()` into [`VmProof`] so this trust assumption is
+/// enforced cryptographically.
 pub fn verify_with_options_with_vkey(
     vm_proof: &VmProof,
     elf_bytes: &[u8],

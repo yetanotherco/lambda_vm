@@ -39,7 +39,10 @@ use crate::tables::register;
 
 /// Current `VmVerifyingKey` layout version. Bump whenever fields are added,
 /// removed, or reordered so that vkeys serialized against an older layout
-/// produce a different `compute_digest()` and stop validating.
+/// produce a different `compute_digest()`. Today the verifier does not read
+/// `version` directly; the deferred `vk_digest` PR will bind
+/// `compute_digest()` into the proof, at which point a stale `version` will
+/// cause verification to fail as a side effect of the digest mismatch.
 pub const VKEY_VERSION: u32 = 3;
 
 /// Placeholder commitment stored in [`VmVerifyingKey::pages`] for
