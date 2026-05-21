@@ -1453,7 +1453,7 @@ where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    debug_assert!(
+    assert!(
         matches!(interactions.len(), 1 | 2),
         "compute_logup_term_column expects 1 or 2 interactions, got {}",
         interactions.len()
