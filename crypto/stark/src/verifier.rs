@@ -72,8 +72,6 @@ where
     pub grinding_seed: [u8; 32],
 }
 
-pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
-
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 pub trait IsStarkVerifier<
@@ -519,7 +517,7 @@ pub trait IsStarkVerifier<
         // Verify main trace (multiplicities for preprocessed, full trace for normal)
         let main_values = [
             deep_poly_openings.main_trace_polys.evaluations.clone(),
-            deep_poly_openings.main_trace_polys.evaluations_sym.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_1.clone(),
             deep_poly_openings.main_trace_polys.evaluations_2.clone(),
             deep_poly_openings.main_trace_polys.evaluations_3.clone(),
         ];
@@ -545,7 +543,7 @@ pub trait IsStarkVerifier<
             (Some(precomputed_root), Some(precomputed_opening)) => {
                 let precomputed_values = [
                     precomputed_opening.evaluations.clone(),
-                    precomputed_opening.evaluations_sym.clone(),
+                    precomputed_opening.evaluations_1.clone(),
                     precomputed_opening.evaluations_2.clone(),
                     precomputed_opening.evaluations_3.clone(),
                 ];
@@ -571,7 +569,7 @@ pub trait IsStarkVerifier<
             (Some(aux_root), Some(aux_trace_polys_opening)) => {
                 let aux_values = [
                     aux_trace_polys_opening.evaluations.clone(),
-                    aux_trace_polys_opening.evaluations_sym.clone(),
+                    aux_trace_polys_opening.evaluations_1.clone(),
                     aux_trace_polys_opening.evaluations_2.clone(),
                     aux_trace_polys_opening.evaluations_3.clone(),
                 ];
@@ -601,11 +599,11 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Arity-4: composition poly tree has pair leaves (PairKeccak256Backend).
-        // The 4-element orbit {4*iota, 4*iota+1, 4*iota+2, 4*iota+3} spans leaves
-        // {2*iota, 2*iota+1}. Verify both leaves independently.
+        // Arity-4: the composition-poly tree (a BatchedMerkleTree) commits one
+        // row-pair per leaf, so the 4-element orbit {4*iota .. 4*iota+3} spans
+        // two leaves, {2*iota, 2*iota+1}. Verify both leaves independently.
         let mut value_01 = deep_poly_openings.composition_poly.evaluations.clone();
-        value_01.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+        value_01.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_1);
 
         let mut value_23 = deep_poly_openings.composition_poly.evaluations_2.clone();
         value_23.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_3);
@@ -887,7 +885,7 @@ pub trait IsStarkVerifier<
             let precomp_1 = opening
                 .precomputed_trace_polys
                 .as_ref()
-                .map(|p| p.evaluations_sym.as_slice());
+                .map(|p| p.evaluations_1.as_slice());
             let precomp_2 = opening
                 .precomputed_trace_polys
                 .as_ref()
@@ -904,7 +902,7 @@ pub trait IsStarkVerifier<
             let aux_1 = opening
                 .aux_trace_polys
                 .as_ref()
-                .map(|a| a.evaluations_sym.as_slice());
+                .map(|a| a.evaluations_1.as_slice());
             let aux_2 = opening
                 .aux_trace_polys
                 .as_ref()
@@ -915,8 +913,7 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations_3.as_slice());
 
             let te0 = gather_trace_evals(&opening.main_trace_polys.evaluations, precomp_0, aux_0);
-            let te1 =
-                gather_trace_evals(&opening.main_trace_polys.evaluations_sym, precomp_1, aux_1);
+            let te1 = gather_trace_evals(&opening.main_trace_polys.evaluations_1, precomp_1, aux_1);
             let te2 = gather_trace_evals(&opening.main_trace_polys.evaluations_2, precomp_2, aux_2);
             let te3 = gather_trace_evals(&opening.main_trace_polys.evaluations_3, precomp_3, aux_3);
 
@@ -945,7 +942,7 @@ pub trait IsStarkVerifier<
                 primitive_root,
                 challenges,
                 &te1,
-                &opening.composition_poly.evaluations_sym,
+                &opening.composition_poly.evaluations_1,
             ));
             evals_2.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,

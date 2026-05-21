@@ -16,7 +16,7 @@ pub struct PolynomialOpenings<F: IsField> {
     /// auth-path prefix — smaller than 4 independent proofs.
     pub batch_proof: BatchProof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
-    pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_1: Vec<FieldElement<F>>,
     pub evaluations_2: Vec<FieldElement<F>>,
     pub evaluations_3: Vec<FieldElement<F>>,
 }
@@ -32,7 +32,7 @@ pub struct CompositionPolyOpenings<F: IsField> {
     /// Merkle proof for leaf containing positions {4i+2, 4i+3}.
     pub proof_2: Proof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
-    pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_1: Vec<FieldElement<F>>,
     pub evaluations_2: Vec<FieldElement<F>>,
     pub evaluations_3: Vec<FieldElement<F>>,
 }

@@ -1421,7 +1421,7 @@ pub trait IsStarkProver<
             proof: proof_01,
             proof_2: proof_23,
             evaluations: eval_at(index * 4),
-            evaluations_sym: eval_at(index * 4 + 1),
+            evaluations_1: eval_at(index * 4 + 1),
             evaluations_2: eval_at(index * 4 + 2),
             evaluations_3: eval_at(index * 4 + 3),
         }
@@ -1450,7 +1450,7 @@ pub trait IsStarkProver<
         PolynomialOpenings {
             batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_main_row(reverse_index(i0, domain_size as u64)),
-            evaluations_sym: lde_trace.gather_main_row(reverse_index(i1, domain_size as u64)),
+            evaluations_1: lde_trace.gather_main_row(reverse_index(i1, domain_size as u64)),
             evaluations_2: lde_trace.gather_main_row(reverse_index(i2, domain_size as u64)),
             evaluations_3: lde_trace.gather_main_row(reverse_index(i3, domain_size as u64)),
         }
@@ -1482,7 +1482,7 @@ pub trait IsStarkProver<
                 col_start,
                 col_end,
             ),
-            evaluations_sym: lde_trace.gather_main_row_range(
+            evaluations_1: lde_trace.gather_main_row_range(
                 reverse_index(i1, domain_size as u64),
                 col_start,
                 col_end,
@@ -1520,7 +1520,7 @@ pub trait IsStarkProver<
         PolynomialOpenings {
             batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_aux_row(reverse_index(i0, domain_size as u64)),
-            evaluations_sym: lde_trace.gather_aux_row(reverse_index(i1, domain_size as u64)),
+            evaluations_1: lde_trace.gather_aux_row(reverse_index(i1, domain_size as u64)),
             evaluations_2: lde_trace.gather_aux_row(reverse_index(i2, domain_size as u64)),
             evaluations_3: lde_trace.gather_aux_row(reverse_index(i3, domain_size as u64)),
         }
