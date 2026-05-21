@@ -4,7 +4,7 @@ A verifiable virtual machine developed in collaboration with [Lambdaclass](https
 
 This open-source zkVM lets users prove the correct execution of a program over a given input stream. The current implementation generates base proofs using STARKs over the Goldilocks field, with 128 bits of security and LogUp as the lookup argument linking tables.
 
-Proof accelerators and proof compression are under development.
+Proof accelerators, GPU support, and proof compression are under development.
 
 > ⚠️ **This project is under active development and experimentation — do not use in production.**
 
