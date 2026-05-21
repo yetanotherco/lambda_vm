@@ -59,10 +59,7 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
-    pub fn new<A>(air: &A, trace_length: usize) -> Self
-    where
-        A: AIR<Field = F>,
-    {
+    pub fn new<A: ?Sized + AIR<Field = F>>(air: &A, trace_length: usize) -> Self {
         // Initial definitions
         let blowup_factor = air.options().blowup_factor as usize;
         let coset_offset = FieldElement::from(air.options().coset_offset);
@@ -126,37 +123,7 @@ where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
 {
-    // Initial definitions
-    let blowup_factor = air.options().blowup_factor as usize;
-    let coset_offset = FieldElement::from(air.options().coset_offset);
-    let interpolation_domain_size = trace_length;
-    let root_order = trace_length.trailing_zeros();
-    // * Generate Coset
-    let trace_primitive_root = Field::get_primitive_root_of_unity(root_order as u64).unwrap();
-    let trace_roots_of_unity = get_powers_of_primitive_root_coset(
-        root_order as u64,
-        interpolation_domain_size,
-        &FieldElement::one(),
-    )
-    .unwrap();
-
-    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
-    let lde_roots_of_unity_coset = get_powers_of_primitive_root_coset(
-        lde_root_order as u64,
-        trace_length * blowup_factor,
-        &coset_offset,
-    )
-    .unwrap();
-
-    Domain {
-        root_order,
-        lde_roots_of_unity_coset,
-        trace_primitive_root,
-        trace_roots_of_unity,
-        blowup_factor,
-        coset_offset,
-        interpolation_domain_size,
-    }
+    Domain::new(air, trace_length)
 }
 
 /// Creates a lightweight verifier domain without pre-computing roots of unity.

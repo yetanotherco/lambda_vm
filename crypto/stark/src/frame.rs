@@ -10,11 +10,7 @@ use math::field::traits::{IsField, IsSubFieldOf};
 /// Owns its row data so it can be built from either row-major Tables
 /// (verifier) or column-major LDE data (prover) without lifetime issues.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Frame<F: IsSubFieldOf<E>, E: IsField>
-where
-    E: IsField,
-    F: IsSubFieldOf<E>,
-{
+pub struct Frame<F: IsSubFieldOf<E>, E: IsField> {
     steps: Vec<TableView<F, E>>,
 }
 
