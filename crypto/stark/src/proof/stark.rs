@@ -1,4 +1,4 @@
-use crypto::merkle_tree::proof::Proof;
+use crypto::merkle_tree::proof::{BatchProof, Proof};
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
@@ -11,16 +11,36 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct PolynomialOpenings<F: IsField> {
-    pub proof: Proof<Commitment>,
-    pub proof_sym: Proof<Commitment>,
+    /// Openings at the 4 positions of the arity-4 orbit: index, index^1, index^2, index^3.
+    /// A single batch Merkle proof authenticates all 4 leaves, sharing the common
+    /// auth-path prefix — smaller than 4 independent proofs.
+    pub batch_proof: BatchProof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_2: Vec<FieldElement<F>>,
+    pub evaluations_3: Vec<FieldElement<F>>,
+}
+
+/// Openings for the composition polynomial tree (pair-leaf: leaf j covers positions {2j, 2j+1}).
+/// Arity-4 opens 4 positions {4i, 4i+1, 4i+2, 4i+3} spanning 2 leaves, so only 2 Merkle proofs
+/// are needed — unlike the trace-tree openings where 4 distinct paths are required.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct CompositionPolyOpenings<F: IsField> {
+    /// Merkle proof for leaf containing positions {4i, 4i+1}.
+    pub proof: Proof<Commitment>,
+    /// Merkle proof for leaf containing positions {4i+2, 4i+3}.
+    pub proof_2: Proof<Commitment>,
+    pub evaluations: Vec<FieldElement<F>>,
+    pub evaluations_sym: Vec<FieldElement<F>>,
+    pub evaluations_2: Vec<FieldElement<F>>,
+    pub evaluations_3: Vec<FieldElement<F>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
-    pub composition_poly: PolynomialOpenings<E>,
+    pub composition_poly: CompositionPolyOpenings<E>,
     pub main_trace_polys: PolynomialOpenings<F>,
     /// For preprocessed tables: openings for precomputed columns.
     /// These are verified against the hardcoded precomputed commitment.

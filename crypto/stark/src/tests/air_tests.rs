@@ -598,6 +598,36 @@ fn test_multi_column_fibonacci_2_cols() {
     ));
 }
 
+#[test_log::test]
+fn test_prove_fib_64_rows() {
+    // 64-row trace → LDE 128 → number_layers=7 → num_double_rounds=3.
+    // Exercises the fold_is_double branch in the verifier query loop,
+    // which requires num_double_rounds >= 2 and is not hit by smaller traces.
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 64);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    )
+    .unwrap();
+    assert!(Verifier::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<F>::new(&[]),
+    ));
+}
+
 #[test]
 fn test_multi_column_fibonacci_4_cols() {
     let proof_options = ProofOptions::default_test_options();

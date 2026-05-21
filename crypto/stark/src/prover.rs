@@ -28,7 +28,7 @@ use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
-use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+use crate::proof::stark::{CompositionPolyOpenings, DeepPolynomialOpenings, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
@@ -1192,7 +1192,8 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let num_double_rounds = (domain.root_order as usize).saturating_sub(1) / 2;
+        let query_list = fri::query_phase(&fri_layers, &iotas, num_double_rounds);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
@@ -1223,8 +1224,12 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let query_domain_size = domain_size >> 2;
+        if query_domain_size == 0 {
+            return vec![];
+        }
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| (transcript.sample_u64(query_domain_size)) as usize)
             .collect::<Vec<usize>>()
     }
 
@@ -1385,38 +1390,40 @@ pub trait IsStarkProver<
         composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
-    ) -> PolynomialOpenings<FieldExtension>
+    ) -> CompositionPolyOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let proof = composition_poly_merkle_tree
-            .get_proof_by_pos(index)
+        // Arity-4: iota indexes into LDE/4. Composition poly tree has LDE/2 leaves,
+        // each leaf j covers positions {2j, 2j+1}. We need two leaves: 2*index and 2*index+1,
+        // covering all 4 positions {4*index, 4*index+1, 4*index+2, 4*index+3}.
+        let proof_01 = composition_poly_merkle_tree
+            .get_proof_by_pos(index * 2)
+            .unwrap();
+        let proof_23 = composition_poly_merkle_tree
+            .get_proof_by_pos(index * 2 + 1)
             .unwrap();
 
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
-            .iter()
-            .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
-            })
-            .collect();
+        let num_parts = lde_composition_poly_evaluations.len();
+        let part_len = lde_composition_poly_evaluations[0].len();
 
-        PolynomialOpenings {
-            proof: proof.clone(),
-            proof_sym: proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
-                .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
-                .collect(),
+        let eval_at = |raw_idx: usize| -> Vec<FieldElement<FieldExtension>> {
+            (0..num_parts)
+                .map(|p| {
+                    lde_composition_poly_evaluations[p][reverse_index(raw_idx, part_len as u64)]
+                        .clone()
+                })
+                .collect()
+        };
+
+        CompositionPolyOpenings {
+            proof: proof_01,
+            proof_2: proof_23,
+            evaluations: eval_at(index * 4),
+            evaluations_sym: eval_at(index * 4 + 1),
+            evaluations_2: eval_at(index * 4 + 2),
+            evaluations_3: eval_at(index * 4 + 3),
         }
     }
 
@@ -1435,14 +1442,17 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
+        // Arity-4: challenge indexes into LDE/4; open all 4 positions in the orbit.
+        let i0 = challenge * 4;
+        let i1 = challenge * 4 + 1;
+        let i2 = challenge * 4 + 2;
+        let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.gather_main_row(reverse_index(index, domain_size as u64)),
-            evaluations_sym: lde_trace
-                .gather_main_row(reverse_index(index_sym, domain_size as u64)),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
+            evaluations: lde_trace.gather_main_row(reverse_index(i0, domain_size as u64)),
+            evaluations_sym: lde_trace.gather_main_row(reverse_index(i1, domain_size as u64)),
+            evaluations_2: lde_trace.gather_main_row(reverse_index(i2, domain_size as u64)),
+            evaluations_3: lde_trace.gather_main_row(reverse_index(i3, domain_size as u64)),
         }
     }
 
@@ -1461,18 +1471,29 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
+        let i0 = challenge * 4;
+        let i1 = challenge * 4 + 1;
+        let i2 = challenge * 4 + 2;
+        let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
             evaluations: lde_trace.gather_main_row_range(
-                reverse_index(index, domain_size as u64),
+                reverse_index(i0, domain_size as u64),
                 col_start,
                 col_end,
             ),
             evaluations_sym: lde_trace.gather_main_row_range(
-                reverse_index(index_sym, domain_size as u64),
+                reverse_index(i1, domain_size as u64),
+                col_start,
+                col_end,
+            ),
+            evaluations_2: lde_trace.gather_main_row_range(
+                reverse_index(i2, domain_size as u64),
+                col_start,
+                col_end,
+            ),
+            evaluations_3: lde_trace.gather_main_row_range(
+                reverse_index(i3, domain_size as u64),
                 col_start,
                 col_end,
             ),
@@ -1492,13 +1513,16 @@ pub trait IsStarkProver<
     {
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
+        let i0 = challenge * 4;
+        let i1 = challenge * 4 + 1;
+        let i2 = challenge * 4 + 2;
+        let i3 = challenge * 4 + 3;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.gather_aux_row(reverse_index(index, domain_size as u64)),
-            evaluations_sym: lde_trace.gather_aux_row(reverse_index(index_sym, domain_size as u64)),
+            batch_proof: tree.get_batch_proof(&[i0, i1, i2, i3]).unwrap(),
+            evaluations: lde_trace.gather_aux_row(reverse_index(i0, domain_size as u64)),
+            evaluations_sym: lde_trace.gather_aux_row(reverse_index(i1, domain_size as u64)),
+            evaluations_2: lde_trace.gather_aux_row(reverse_index(i2, domain_size as u64)),
+            evaluations_3: lde_trace.gather_aux_row(reverse_index(i3, domain_size as u64)),
         }
     }
 

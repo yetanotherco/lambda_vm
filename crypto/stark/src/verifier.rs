@@ -1,5 +1,5 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
+    config::{BatchedMerkleTreeBackend, FriLayerQuadMerkleTreeBackend},
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -82,14 +82,42 @@ pub trait IsStarkVerifier<
     PI,
 >
 {
+    fn reconstruct_fri_zetas(
+        number_layers: usize,
+        merkle_roots: &[Commitment],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let num_double_rounds = number_layers.saturating_sub(1) / 2;
+        let mut zetas = Vec::with_capacity(number_layers);
+        for (i, root) in merkle_roots.iter().enumerate() {
+            let z1 = transcript.sample_field_element();
+            zetas.push(z1);
+            if i < num_double_rounds {
+                let z2 = transcript.sample_field_element();
+                zetas.push(z2);
+            }
+            transcript.append_bytes(root);
+        }
+        zetas.push(transcript.sample_field_element());
+        zetas
+    }
+
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_length as u64;
+        let query_domain_size = domain_size >> 2;
+        if query_domain_size == 0 {
+            return vec![];
+        }
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| (transcript.sample_u64(query_domain_size)) as usize)
             .collect::<Vec<usize>>()
     }
 
@@ -193,21 +221,11 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
+        // FRI commit phase — arity-4: 2 zetas per double-fold layer, 1 for odd-extra layer.
+        // number_layers = domain.root_order (log2 of the LDE domain size).
+        let number_layers = domain.root_order as usize;
+        let zetas =
+            Self::reconstruct_fri_zetas(number_layers, &proof.fri_layers_merkle_roots, transcript);
 
         // <<<< Receive value: pₙ
         transcript.append_field_element(&proof.fri_last_value);
@@ -393,54 +411,76 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let (deep_poly_evaluations, deep_poly_evaluations_sym) =
+        let (evals_0, evals_1, evals_2, evals_3) =
             Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges, domain, proof,
             );
 
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
+        // Arity-4: each query needs eval_inv at position 4*iota (eval_inv_a)
+        // and at position 4*iota+2 (eval_inv_b) for the 2-step fold bootstrap.
+        // eval_inv_b is only used when num_double_rounds >= 1.
+        let num_double_rounds = (challenges.zetas.len() - 1) / 2;
+        let mut eval_inv_a_vec: Vec<FieldElement<Field>> = challenges
             .iotas
             .iter()
             .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
-            .collect::<Vec<FieldElement<Field>>>();
-        FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut eval_inv_a_vec).unwrap();
+        let eval_inv_b_vec: Vec<FieldElement<Field>> = if num_double_rounds > 0 {
+            let mut v: Vec<FieldElement<Field>> = challenges
+                .iotas
+                .iter()
+                .map(|iota| Self::query_challenge_to_evaluation_point_2(*iota, domain))
+                .collect();
+            FieldElement::inplace_batch_inverse(&mut v).unwrap();
+            v
+        } else {
+            vec![FieldElement::zero(); challenges.iotas.len()]
+        };
 
         proof
             .query_list
             .iter()
             .zip(&challenges.iotas)
-            .zip(evaluation_point_inverse)
+            .zip(eval_inv_a_vec)
+            .zip(eval_inv_b_vec)
             .enumerate()
-            .fold(true, |mut result, (i, ((proof_s, iota_s), eval))| {
-                result &= Self::verify_query_and_sym_openings(
-                    proof,
-                    &challenges.zetas,
-                    *iota_s,
-                    proof_s,
-                    eval,
-                    &deep_poly_evaluations[i],
-                    &deep_poly_evaluations_sym[i],
-                );
-                result
-            })
+            .fold(
+                true,
+                |mut result, (i, (((proof_s, iota_s), eval_inv_a), eval_inv_b))| {
+                    result &= Self::verify_query_and_sym_openings(
+                        proof,
+                        domain,
+                        &challenges.zetas,
+                        *iota_s,
+                        proof_s,
+                        eval_inv_a,
+                        eval_inv_b,
+                        &evals_0[i],
+                        &evals_1[i],
+                        &evals_2[i],
+                        &evals_3[i],
+                    );
+                    result
+                },
+            )
     }
 
-    /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
+    /// Returns the coset element at bit-reversed position `4*iota` (orbit base for arity-4 FRI).
     fn query_challenge_to_evaluation_point(
         iota: usize,
         domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        let index = reverse_index(iota * 2, domain.lde_length as u64);
+        let index = reverse_index(iota * 4, domain.lde_length as u64);
         domain.lde_coset_element(index)
     }
 
-    /// Returns the symmetric field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
-    fn query_challenge_to_evaluation_point_sym(
+    /// Returns the coset element at bit-reversed position `4*iota+2` (second fold partner in arity-4 FRI).
+    fn query_challenge_to_evaluation_point_2(
         iota: usize,
         domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        let index = reverse_index(iota * 2 + 1, domain.lde_length as u64);
+        let index = reverse_index(iota * 4 + 2, domain.lde_length as u64);
         domain.lde_coset_element(index)
     }
 
@@ -466,28 +506,32 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
+        num_leaves: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let index = iota * 2;
-        let index_sym = iota * 2 + 1;
+        // Arity-4: 4 positions per query orbit.
+        let positions = [iota * 4, iota * 4 + 1, iota * 4 + 2, iota * 4 + 3];
         let mut result = true;
 
         // Verify main trace (multiplicities for preprocessed, full trace for normal)
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof,
-            &proof.lde_trace_main_merkle_root,
-            index,
-            &deep_poly_openings.main_trace_polys.evaluations,
-        );
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof_sym,
-            &proof.lde_trace_main_merkle_root,
-            index_sym,
-            &deep_poly_openings.main_trace_polys.evaluations_sym,
-        );
+        let main_values = [
+            deep_poly_openings.main_trace_polys.evaluations.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_sym.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_2.clone(),
+            deep_poly_openings.main_trace_polys.evaluations_3.clone(),
+        ];
+        result &= deep_poly_openings
+            .main_trace_polys
+            .batch_proof
+            .verify::<BatchedMerkleTreeBackend<Field>>(
+                &proof.lde_trace_main_merkle_root,
+                &positions,
+                &main_values,
+                num_leaves,
+            );
 
         // Verify precomputed trace (for preprocessed tables only)
         match (
@@ -499,18 +543,20 @@ pub trait IsStarkVerifier<
             (None, Some(_)) => result = false,
             (Some(_), None) => result = false,
             (Some(precomputed_root), Some(precomputed_opening)) => {
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof,
-                    precomputed_root,
-                    index,
-                    &precomputed_opening.evaluations,
-                );
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof_sym,
-                    precomputed_root,
-                    index_sym,
-                    &precomputed_opening.evaluations_sym,
-                );
+                let precomputed_values = [
+                    precomputed_opening.evaluations.clone(),
+                    precomputed_opening.evaluations_sym.clone(),
+                    precomputed_opening.evaluations_2.clone(),
+                    precomputed_opening.evaluations_3.clone(),
+                ];
+                result &= precomputed_opening
+                    .batch_proof
+                    .verify::<BatchedMerkleTreeBackend<Field>>(
+                        precomputed_root,
+                        &positions,
+                        &precomputed_values,
+                        num_leaves,
+                    );
             }
             _ => {}
         }
@@ -523,18 +569,20 @@ pub trait IsStarkVerifier<
             (None, Some(_)) => result = false,
             (Some(_), None) => result = false,
             (Some(aux_root), Some(aux_trace_polys_opening)) => {
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof,
-                    &aux_root,
-                    index,
-                    &aux_trace_polys_opening.evaluations,
-                );
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof_sym,
-                    &aux_root,
-                    index_sym,
-                    &aux_trace_polys_opening.evaluations_sym,
-                );
+                let aux_values = [
+                    aux_trace_polys_opening.evaluations.clone(),
+                    aux_trace_polys_opening.evaluations_sym.clone(),
+                    aux_trace_polys_opening.evaluations_2.clone(),
+                    aux_trace_polys_opening.evaluations_3.clone(),
+                ];
+                result &= aux_trace_polys_opening
+                    .batch_proof
+                    .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                        &aux_root,
+                        &positions,
+                        &aux_values,
+                        num_leaves,
+                    );
             }
             _ => {}
         }
@@ -553,17 +601,31 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let mut value = deep_poly_openings.composition_poly.evaluations.clone();
-        value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+        // Arity-4: composition poly tree has pair leaves (PairKeccak256Backend).
+        // The 4-element orbit {4*iota, 4*iota+1, 4*iota+2, 4*iota+3} spans leaves
+        // {2*iota, 2*iota+1}. Verify both leaves independently.
+        let mut value_01 = deep_poly_openings.composition_poly.evaluations.clone();
+        value_01.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+
+        let mut value_23 = deep_poly_openings.composition_poly.evaluations_2.clone();
+        value_23.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_3);
 
         deep_poly_openings
             .composition_poly
             .proof
             .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
                 composition_poly_merkle_root,
-                *iota,
-                &value,
+                iota * 2,
+                &value_01,
             )
+            & deep_poly_openings
+                .composition_poly
+                .proof_2
+                .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                    composition_poly_merkle_root,
+                    iota * 2 + 1,
+                    &value_23,
+                )
     }
 
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
@@ -572,6 +634,7 @@ pub trait IsStarkVerifier<
     fn step_4_verify_trace_and_composition_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
+        num_leaves: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -586,205 +649,322 @@ pub trait IsStarkVerifier<
                     iota_n,
                 );
 
-                result &= Self::verify_trace_openings(proof, deep_poly_opening, *iota_n);
+                result &=
+                    Self::verify_trace_openings(proof, deep_poly_opening, *iota_n, num_leaves);
                 result
             },
         )
     }
 
-    /// Verifies the openings of a fold polynomial of an inner layer of FRI.
-    fn verify_fri_layer_openings(
+    /// Verifies a single FRI layer opening for arity-4 (quad Merkle tree, 4-element leaves).
+    ///
+    /// `v` is the computed fold value at position `index` within the committed layer.
+    /// `siblings` are the prover's claimed values at `index^1`, `index^2`, `index^3`.
+    /// `auth_path` proves the 4-element leaf at `index >> 2`.
+    fn verify_fri_layer_openings_quad(
         merkle_root: &Commitment,
-        auth_path_sym: &Proof<Commitment>,
-        evaluation: &FieldElement<FieldExtension>,
-        evaluation_sym: &FieldElement<FieldExtension>,
-        iota: usize,
+        auth_path: &Proof<Commitment>,
+        v: &FieldElement<FieldExtension>,
+        siblings: &[FieldElement<FieldExtension>; 3],
+        index: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
-        } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
-        };
+        // Reconstruct the 4-element leaf from v (at position k = index & 3) and siblings.
+        let k = index & 3;
+        let mut leaf: [FieldElement<FieldExtension>; 4] = [
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+        ];
+        leaf[k] = v.clone();
+        leaf[k ^ 1] = siblings[0].clone();
+        leaf[k ^ 2] = siblings[1].clone();
+        leaf[k ^ 3] = siblings[2].clone();
 
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+        auth_path.verify::<FriLayerQuadMerkleTreeBackend<FieldExtension>>(
             merkle_root,
-            iota >> 1,
-            &evaluations,
+            index >> 2,
+            &leaf,
         )
     }
 
-    /// Verify a single FRI query
-    /// `zetas`: the vector of all challenges sent by the verifier to the prover at the commit
-    /// phase to fold polynomials.
-    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements 𝜐 and -𝜐
-    /// of the evaluation domain of FRI layer 0.
-    /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
-    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
-    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
+    /// Verify a single arity-4 FRI query.
+    ///
+    /// - `domain`: the verifier domain, needed to recompute twiddles at each fold level.
+    /// - `zetas`: all FRI folding challenges. Layout: [z0, z1] per double-fold layer,
+    ///   [z_k] for the odd-extra layer (if any), [z_last] for the final fold.
+    /// - `iota`: FRI query index in [0, LDE/4).
+    /// - `eval_inv_a`: inverse of the coset element at bit-reversed position `4*iota`.
+    /// - `eval_inv_b`: inverse of the coset element at bit-reversed position `4*iota+2`.
+    /// - `deep_eval_{0..3}`: DEEP composition poly evaluations at the 4 orbit positions.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
         fri_decommitment: &FriDecommitment<FieldExtension>,
-        evaluation_point_inv: FieldElement<Field>,
-        deep_composition_evaluation: &FieldElement<FieldExtension>,
-        deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+        eval_inv_a: FieldElement<Field>,
+        eval_inv_b: FieldElement<Field>,
+        deep_eval_0: &FieldElement<FieldExtension>,
+        deep_eval_1: &FieldElement<FieldExtension>,
+        deep_eval_2: &FieldElement<FieldExtension>,
+        deep_eval_3: &FieldElement<FieldExtension>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
 
-        let p0_eval = deep_composition_evaluation;
-        let p0_eval_sym = deep_composition_evaluation_sym;
+        // Derive bootstrap type from zeta count.
+        // zetas.len() = number_layers = 2*num_double_rounds + has_odd_extra + 1
+        let num_double_rounds = (zetas.len() - 1) / 2;
 
-        // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
-        let mut index = iota;
+        // Bootstrap: reconstruct layer[0] value from DEEP poly evaluations.
+        // Double bootstrap (num_double_rounds >= 1): two binary folds using zetas[0,1].
+        //   val_a = (A+B) + inv_a  * z0 * (A-B)   [fold pair {pos0,pos1}]
+        //   val_b = (C+D) + inv_b  * z0 * (C-D)   [fold pair {pos2,pos3}]
+        //   v     = (val_a+val_b) + inv_a² * z1 * (val_a-val_b)
+        // Single bootstrap (num_double_rounds == 0): one binary fold using zetas[0].
+        //   v = (A+B) + inv_a * z0 * (A-B)
+        //
+        // `folds_done` counts binary folds completed so far; used to recompute twiddles.
+        let (mut v, mut zeta_idx, mut index, mut layer_eval_inv_a, mut folds_done) =
+            if num_double_rounds >= 1 {
+                let eval_inv_a_sq = eval_inv_a.square();
+                let val_a = (deep_eval_0 + deep_eval_1)
+                    + &eval_inv_a * &zetas[0] * (deep_eval_0 - deep_eval_1);
+                let val_b = (deep_eval_2 + deep_eval_3)
+                    + &eval_inv_b * &zetas[0] * (deep_eval_2 - deep_eval_3);
+                let v = (&val_a + &val_b) + &eval_inv_a_sq * &zetas[1] * (&val_a - &val_b);
+                (
+                    v,
+                    2usize,
+                    iota,
+                    eval_inv_a_sq.square(), // eval_inv_a^4: twiddle for layer[0]→[1] fold
+                    2usize,                 // 2 binary folds done in bootstrap
+                )
+            } else {
+                let v = (deep_eval_0 + deep_eval_1)
+                    + &eval_inv_a * &zetas[0] * (deep_eval_0 - deep_eval_1);
+                (
+                    v,
+                    1usize,
+                    iota * 2,
+                    eval_inv_a.square(), // eval_inv_a^2: twiddle for layer[0] fold
+                    1usize,              // 1 binary fold done in bootstrap
+                )
+            };
 
-        // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
             return v == proof.fri_last_value;
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+        let num_layers = fri_layers_merkle_roots.len();
+        let mut result = true;
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..num_layers {
+            let siblings = &fri_decommitment.layers_evaluations_siblings[i];
+            let auth_path = &fri_decommitment.layers_auth_paths[i];
+            let merkle_root = &fri_layers_merkle_roots[i];
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
+            result &=
+                Self::verify_fri_layer_openings_quad(merkle_root, auth_path, &v, siblings, index);
 
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
-                    }
-                },
-            )
+            let is_last = i == num_layers - 1;
+
+            // Round (i+1) is a double fold iff it is one of the prover's committed
+            // double-fold rounds, i.e. (i+1) < num_double_rounds.
+            let fold_is_double = (i + 1) < num_double_rounds;
+
+            if fold_is_double {
+                let z_a = &zetas[zeta_idx];
+                let z_b = &zetas[zeta_idx + 1];
+                zeta_idx += 2;
+
+                let sib_a = &siblings[0]; // index^1
+                let sib_b = &siblings[1]; // index^2
+                let sib_c = &siblings[2]; // index^3
+
+                let inner_val_a = (&v + sib_a) + &layer_eval_inv_a * z_a * (&v - sib_a);
+
+                // Compute the "b" pair twiddle fresh at this fold level.
+                // The "b" pair is {index^2, index^3}; its twiddle position is j_b = (index>>1)^1.
+                // twiddle_d[j] = lde_coset_element(reverse_index(2^{d+1}·j, N))^{-2^d}
+                // Sign: index^2 is lo (even) when index is even, hi (odd) when index is odd.
+                let j_b = (index >> 1) ^ 1;
+                let lde_idx_b =
+                    reverse_index((1usize << (folds_done + 1)) * j_b, domain.lde_length as u64);
+                let base_b = domain.lde_coset_element(lde_idx_b);
+                let twiddle_b_unsigned = base_b.pow(1u64 << folds_done).inv().unwrap();
+                let layer_eval_inv_b = if index & 1 == 0 {
+                    twiddle_b_unsigned
+                } else {
+                    -twiddle_b_unsigned
+                };
+
+                let inner_val_b = (sib_b + sib_c) + layer_eval_inv_b * z_a * (sib_b - sib_c);
+
+                let layer_inv_a_sq = layer_eval_inv_a.square();
+                v = (&inner_val_a + &inner_val_b)
+                    + &layer_inv_a_sq * z_b * (&inner_val_a - &inner_val_b);
+
+                layer_eval_inv_a = layer_inv_a_sq.square();
+                index >>= 2;
+                folds_done += 2;
+            } else {
+                let z = &zetas[zeta_idx];
+                zeta_idx += 1;
+
+                let sib_a = &siblings[0];
+                v = (&v + sib_a) + &layer_eval_inv_a * z * (&v - sib_a);
+
+                layer_eval_inv_a = layer_eval_inv_a.square();
+                index >>= 1;
+                folds_done += 1;
+            }
+
+            if is_last {
+                result &= v == proof.fri_last_value;
+            }
+        }
+
+        result
     }
 
+    /// Returns 4-tuple of DEEP composition polynomial evaluations for all queries.
+    /// Each query's 4-element orbit gives evaluations at positions
+    /// {4*iota, 4*iota+1, 4*iota+2, 4*iota+3} in the LDE domain.
+    #[allow(clippy::type_complexity)]
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-    ) -> DeepPolynomialEvaluations<FieldExtension> {
+    ) -> (
+        Vec<FieldElement<FieldExtension>>,
+        Vec<FieldElement<FieldExtension>>,
+        Vec<FieldElement<FieldExtension>>,
+        Vec<FieldElement<FieldExtension>>,
+    ) {
         let num_queries = challenges.iotas.len();
-        let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
-        let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+        let mut evals_0 = Vec::with_capacity(num_queries);
+        let mut evals_1 = Vec::with_capacity(num_queries);
+        let mut evals_2 = Vec::with_capacity(num_queries);
+        let mut evals_3 = Vec::with_capacity(num_queries);
+
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let primitive_root =
                 &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
+            let opening = &proof.deep_poly_openings[i];
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
-            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
-                evaluations.extend(
-                    precomputed_polys
-                        .evaluations
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
-            }
-            evaluations.extend(
-                proof.deep_poly_openings[i]
-                    .main_trace_polys
-                    .evaluations
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
-            if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
-                evaluations.extend_from_slice(&aux_trace_polys.evaluations);
-            }
+            // Helper to gather trace evaluations for one orbit position.
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities.
+            let gather_trace_evals = |main_evals: &[FieldElement<Field>],
+                                      precomp_evals: Option<&[FieldElement<Field>]>,
+                                      aux_evals: Option<&[FieldElement<FieldExtension>]>|
+             -> Vec<FieldElement<FieldExtension>> {
+                let mut evals: Vec<FieldElement<FieldExtension>> = Vec::new();
+                if let Some(pe) = precomp_evals {
+                    evals.extend(pe.iter().cloned().map(|x| x.to_extension()));
+                }
+                evals.extend(main_evals.iter().cloned().map(|x| x.to_extension()));
+                if let Some(ae) = aux_evals {
+                    evals.extend_from_slice(ae);
+                }
+                evals
+            };
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
-            deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
+            let precomp_0 = opening
+                .precomputed_trace_polys
+                .as_ref()
+                .map(|p| p.evaluations.as_slice());
+            let precomp_1 = opening
+                .precomputed_trace_polys
+                .as_ref()
+                .map(|p| p.evaluations_sym.as_slice());
+            let precomp_2 = opening
+                .precomputed_trace_polys
+                .as_ref()
+                .map(|p| p.evaluations_2.as_slice());
+            let precomp_3 = opening
+                .precomputed_trace_polys
+                .as_ref()
+                .map(|p| p.evaluations_3.as_slice());
+
+            let aux_0 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations.as_slice());
+            let aux_1 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_sym.as_slice());
+            let aux_2 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_2.as_slice());
+            let aux_3 = opening
+                .aux_trace_polys
+                .as_ref()
+                .map(|a| a.evaluations_3.as_slice());
+
+            let te0 = gather_trace_evals(&opening.main_trace_polys.evaluations, precomp_0, aux_0);
+            let te1 =
+                gather_trace_evals(&opening.main_trace_polys.evaluations_sym, precomp_1, aux_1);
+            let te2 = gather_trace_evals(&opening.main_trace_polys.evaluations_2, precomp_2, aux_2);
+            let te3 = gather_trace_evals(&opening.main_trace_polys.evaluations_3, precomp_3, aux_3);
+
+            let ep0 = Self::query_challenge_to_evaluation_point(*iota, domain);
+            let ep1 = {
+                let idx = reverse_index(iota * 4 + 1, domain.lde_length as u64);
+                domain.lde_coset_element(idx)
+            };
+            let ep2 = Self::query_challenge_to_evaluation_point_2(*iota, domain);
+            let ep3 = {
+                let idx = reverse_index(iota * 4 + 3, domain.lde_length as u64);
+                domain.lde_coset_element(idx)
+            };
+
+            evals_0.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
+                &ep0,
                 primitive_root,
                 challenges,
-                &evaluations,
-                &proof.deep_poly_openings[i].composition_poly.evaluations,
+                &te0,
+                &opening.composition_poly.evaluations,
             ));
-
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
-            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
-                evaluations_sym.extend(
-                    precomputed_polys
-                        .evaluations_sym
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
-            }
-            evaluations_sym.extend(
-                proof.deep_poly_openings[i]
-                    .main_trace_polys
-                    .evaluations_sym
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
-            if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
-                evaluations_sym.extend_from_slice(&aux_trace_polys.evaluations_sym);
-            }
-
-            let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
-            deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
+            evals_1.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
+                &ep1,
                 primitive_root,
                 challenges,
-                &evaluations_sym,
-                &proof.deep_poly_openings[i].composition_poly.evaluations_sym,
+                &te1,
+                &opening.composition_poly.evaluations_sym,
+            ));
+            evals_2.push(Self::reconstruct_deep_composition_poly_evaluation(
+                proof,
+                &ep2,
+                primitive_root,
+                challenges,
+                &te2,
+                &opening.composition_poly.evaluations_2,
+            ));
+            evals_3.push(Self::reconstruct_deep_composition_poly_evaluation(
+                proof,
+                &ep3,
+                primitive_root,
+                challenges,
+                &te3,
+                &opening.composition_poly.evaluations_3,
             ));
         }
-        (deep_poly_evaluations, deep_poly_evaluations_sym)
+        (evals_0, evals_1, evals_2, evals_3)
     }
 
     fn reconstruct_deep_composition_poly_evaluation(
@@ -1142,21 +1322,10 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
+        // FRI commit phase — arity-4: 2 zetas per double-fold layer, 1 for odd-extra layer.
+        let number_layers = domain.root_order as usize;
+        let zetas =
+            Self::reconstruct_fri_zetas(number_layers, &proof.fri_layers_merkle_roots, transcript);
 
         // <<<< Receive value: pₙ
         transcript.append_field_element(&proof.fri_last_value);
@@ -1202,8 +1371,15 @@ pub trait IsStarkVerifier<
     {
         let domain = new_verifier_domain(air, proof.trace_length);
 
-        // Verify there are enough queries
-        if proof.query_list.len() < air.options().fri_number_of_queries {
+        // Verify there are enough queries. When LDE <= 4 the query domain is empty
+        // and 0 queries is correct; otherwise require the full configured count.
+        let query_domain_size = (domain.lde_length as u64) >> 2;
+        let expected_queries = if query_domain_size == 0 {
+            0
+        } else {
+            air.options().fri_number_of_queries
+        };
+        if proof.query_list.len() < expected_queries {
             return false;
         }
 
@@ -1271,7 +1447,11 @@ pub trait IsStarkVerifier<
         let timer4 = Instant::now();
 
         #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
+        if !Self::step_4_verify_trace_and_composition_openings(
+            proof,
+            &challenges,
+            domain.lde_length,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
             return false;
