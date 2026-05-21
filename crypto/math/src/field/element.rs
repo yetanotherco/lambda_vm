@@ -212,7 +212,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn add(self, rhs: &FieldElement<L>) -> Self::Output {
         Self::Output {
             value: <F as IsSubFieldOf<L>>::add(&self.value, &rhs.value),
@@ -227,7 +227,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn add(self, rhs: FieldElement<L>) -> Self::Output {
         &self + &rhs
     }
@@ -240,7 +240,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn add(self, rhs: &FieldElement<L>) -> Self::Output {
         &self + rhs
     }
@@ -253,7 +253,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn add(self, rhs: FieldElement<L>) -> Self::Output {
         self + &rhs
     }
@@ -265,7 +265,7 @@ where
     F: IsSubFieldOf<L>,
     L: IsField,
 {
-    #[inline]
+    #[inline(always)]
     fn add_assign(&mut self, rhs: FieldElement<F>) {
         self.value = <F as IsSubFieldOf<L>>::add(&rhs.value, &self.value);
     }
@@ -276,7 +276,7 @@ impl<F> Sum<FieldElement<F>> for FieldElement<F>
 where
     F: IsField,
 {
-    #[inline]
+    #[inline(always)]
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Self::zero(), |augend, addend| augend + addend)
     }
@@ -290,7 +290,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn sub(self, rhs: &FieldElement<L>) -> Self::Output {
         Self::Output {
             value: <F as IsSubFieldOf<L>>::sub(&self.value, &rhs.value),
@@ -305,7 +305,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn sub(self, rhs: FieldElement<L>) -> Self::Output {
         &self - &rhs
     }
@@ -318,7 +318,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn sub(self, rhs: &FieldElement<L>) -> Self::Output {
         &self - rhs
     }
@@ -331,7 +331,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn sub(self, rhs: FieldElement<L>) -> Self::Output {
         self - &rhs
     }
@@ -345,7 +345,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: &FieldElement<L>) -> Self::Output {
         Self::Output {
             value: <F as IsSubFieldOf<L>>::mul(&self.value, &rhs.value),
@@ -360,7 +360,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: FieldElement<L>) -> Self::Output {
         &self * &rhs
     }
@@ -373,7 +373,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: &FieldElement<L>) -> Self::Output {
         &self * rhs
     }
@@ -386,7 +386,7 @@ where
 {
     type Output = FieldElement<L>;
 
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: FieldElement<L>) -> Self::Output {
         self * &rhs
     }
@@ -398,7 +398,7 @@ where
     F: IsSubFieldOf<L>,
     L: IsField,
 {
-    #[inline]
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: FieldElement<F>) {
         self.value = <F as IsSubFieldOf<L>>::mul(&rhs.value, &self.value);
     }
@@ -410,7 +410,7 @@ where
     F: IsSubFieldOf<L>,
     L: IsField,
 {
-    #[inline]
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: &FieldElement<F>) {
         self.value = <F as IsSubFieldOf<L>>::mul(&rhs.value, &self.value);
     }
@@ -473,7 +473,7 @@ where
 {
     type Output = FieldElement<F>;
 
-    #[inline]
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         Self::Output {
             value: F::neg(&self.value),
@@ -487,7 +487,7 @@ where
 {
     type Output = FieldElement<F>;
 
-    #[inline]
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         -&self
     }
