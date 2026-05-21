@@ -1745,7 +1745,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // theta: HWSL for rotated C (20) + ARE_BYTES on Cxz_left (40).
+            // theta: HWSL for rotated C (20) + ARE_BYTES on Cxz_left (20 pairs).
             // Cxz_right is range-checked via IS_BIT polynomial constraints
             // on the keccak_rnd chip, not via lookups (spec d75944ee).
             let mut rotated_c = [[0u8; 8]; 5];
@@ -1824,7 +1824,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // rho: HWSL (100) + ARE_BYTES (400)
+            // rho: HWSL (100) + ARE_BYTES (200 pairs)
             for x in 0..5 {
                 for y in 0..5 {
                     let rho_offset = KECCAK_RHO[x][y] as usize;
