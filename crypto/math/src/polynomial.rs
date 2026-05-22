@@ -195,25 +195,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
                 .collect(),
         }
     }
-
-    /// Only used by the test-only `fast_division` / `invert_polynomial_mod`.
-    #[cfg(test)]
-    pub fn truncate(&self, k: usize) -> Self {
-        if k == 0 {
-            Self::zero()
-        } else {
-            Self::new(&self.coefficients[0..k.min(self.coefficients.len())])
-        }
-    }
-
-    /// Only used by the test-only `fast_division`.
-    #[cfg(test)]
-    pub fn reverse(&self, d: usize) -> Self {
-        let mut coeffs = self.coefficients.clone();
-        coeffs.resize(d + 1, FieldElement::zero());
-        coeffs.reverse();
-        Self::new(&coeffs)
-    }
 }
 
 /// Pads a polynomial with zeros until the desired length
@@ -960,37 +941,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         evaluate_fft_cpu_raw::<F, E>(&coeffs, true)
     }
 
-    /// Same as `evaluate_fft` but returns the evaluations in bit-reversed order,
-    /// skipping the final natural-order permutation. Use when the consumer expects
-    /// bit-reversed input (e.g. FRI commit phase, which pairs consecutive values as
-    /// {f(x), f(-x)}).
-    ///
-    /// Currently exercised only by the FFT property tests; gated to keep it out
-    /// of the production surface until a non-test caller needs it.
-    #[cfg(test)]
-    pub fn evaluate_fft_bit_reversed<F: IsFFTField + IsSubFieldOf<E>>(
-        poly: &Polynomial<FieldElement<E>>,
-        blowup_factor: usize,
-        domain_size: Option<usize>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let domain_size = domain_size.unwrap_or(0);
-        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
-        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
-            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
-        }
-        if poly.coefficients().is_empty() {
-            return Ok(vec![FieldElement::zero(); len]);
-        }
-
-        let mut coeffs = poly.coefficients().to_vec();
-        coeffs.resize(len, FieldElement::zero());
-
-        evaluate_fft_cpu_raw::<F, E>(&coeffs, false)
-    }
-
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
     /// (so the results are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
@@ -1046,7 +996,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         E: Send + Sync,
     {
         let scaled = Polynomial::interpolate_fft::<F>(fft_evals)?;
-        Ok(scaled.scale(&offset.inv().unwrap()))
+        // A zero coset offset has no inverse; report it instead of panicking.
+        let offset_inv = offset.inv().map_err(|_| FFTError::InvalidCosetOffset)?;
+        Ok(scaled.scale(&offset_inv))
     }
 
     /// Compute the coset LDE with pre-computed twiddle factors and pre-computed weights.
@@ -1226,92 +1178,4 @@ where
         in_place_bit_reverse_permute(&mut result);
     }
     Ok(result)
-}
-
-#[cfg(test)]
-impl<E: IsField> Polynomial<FieldElement<E>> {
-    /// Multiplies two polynomials using FFT.
-    pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
-        &self,
-        other: &Self,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let domain_size = self.degree() + other.degree() + 1;
-        let p = Polynomial::evaluate_fft::<F>(self, 1, Some(domain_size))?;
-        let q = Polynomial::evaluate_fft::<F>(other, 1, Some(domain_size))?;
-        let r = p.into_iter().zip(q).map(|(a, b)| a * b).collect::<Vec<_>>();
-
-        Polynomial::interpolate_fft::<F>(&r)
-    }
-
-    /// Divides two polynomials with remainder using FFT.
-    pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        divisor: &Self,
-    ) -> Result<(Self, Self), FFTError>
-    where
-        E: Send + Sync,
-    {
-        use crate::field::errors::FieldError;
-
-        let n = self.degree();
-        let m = divisor.degree();
-        if divisor.coefficients.is_empty()
-            || divisor
-                .coefficients
-                .iter()
-                .all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        if n < m {
-            return Ok((Self::zero(), self.clone()));
-        }
-        let d = n - m;
-        let a_rev = self.reverse(n);
-        let b_rev = divisor.reverse(m);
-        let inv_b_rev = b_rev.invert_polynomial_mod::<F>(d + 1)?;
-        let q = a_rev
-            .fast_fft_multiplication::<F>(&inv_b_rev)?
-            .truncate(d + 1)
-            .reverse(d);
-
-        let r = self - q.fast_fft_multiplication::<F>(divisor)?;
-        Ok((q, r))
-    }
-
-    /// Computes the inverse of polynomial P modulo x^k using Newton iteration.
-    pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        k: usize,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        use crate::field::errors::FieldError;
-
-        if self.coefficients.is_empty()
-            || self.coefficients.iter().all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        let mut q = Self::new(&[self.coefficients[0].inv()?]);
-        let mut current_precision = 1;
-
-        let two = Self::new(&[FieldElement::<F>::one() + FieldElement::one()]);
-        while current_precision < k {
-            current_precision *= 2;
-            let temp = self
-                .fast_fft_multiplication::<F>(&q)?
-                .truncate(current_precision);
-            let correction = &two - temp;
-            q = q
-                .fast_fft_multiplication::<F>(&correction)?
-                .truncate(current_precision);
-        }
-
-        Ok(q.truncate(k))
-    }
 }
