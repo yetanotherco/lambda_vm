@@ -3,6 +3,7 @@ name = "math-cuda"
 description = "CUDA-accelerated FFT/NTT for Goldilocks (base field) used by the lambda-vm STARK prover"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 cudarc = { version = "0.19", default-features = false, features = [
