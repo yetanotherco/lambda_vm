@@ -6,7 +6,7 @@ benchmark / feature-testing work.
 | Script                     | Runs on | Purpose                                                                                                |
 |----------------------------|---------|--------------------------------------------------------------------------------------------------------|
 | `rent_baremetal.sh <name>` | local   | Creates the server (hourly billing, Debian, fr-par-2) and hands off to `provision_server.sh`.          |
-| `provision_server.sh <ip>` | local   | Waits for sshd, `scp`s the GitHub deploy key, runs `provision.sh` on the server over SSH. Re-runnable. |
+| `provision_server.sh <ip>` | local   | Waits for sshd, runs `provision.sh` on the server over SSH. Re-runnable.                               |
 | `provision.sh`             | remote  | Installs toolchain, creates `admin`/`app` users, clones `lambda_vm`, hardens sshd.                     |
 
 ## Prerequisites
@@ -19,11 +19,6 @@ benchmark / feature-testing work.
 2. Create the `vm` scw profile (script refuses any other profile name):
    ```bash
    scw init --profile vm
-   ```
-
-3. Create the GitHub deploy key and add the `.pub` to **GitHub repo → Settings → Deploy keys** (read-only):
-   ```bash
-   ssh-keygen -t ed25519 -f ~/.ssh/lambda_vm_read_only -N ""
    ```
 
 ## Rent + provision a new server
@@ -80,5 +75,4 @@ Everything has a working default; override via env var only when needed.
 | `SCW_PROJECT_ID` | team project UUID | `rent_baremetal.sh` |
 | `READY_TIMEOUT` | `1800` (s) | `rent_baremetal.sh` |
 | `PROVISION_FILE` | `infra/provision.sh` | both wrappers |
-| `GITHUB_SSH_KEY_FILE` | `~/.ssh/lambda_vm_read_only` | `provision_server.sh` |
 | `SSH_USER` | `root` | `provision_server.sh` |

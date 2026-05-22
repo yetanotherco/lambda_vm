@@ -10,13 +10,6 @@
 #                        First-run servers accept root SSH; once provision.sh
 #                        has hardened sshd, re-run as: SSH_USER=admin ...
 #   PROVISION_FILE       default: <script-dir>/provision.sh
-#   GITHUB_SSH_KEY_FILE  default: $HOME/.ssh/lambda_vm_read_only
-#                        Local path to a GitHub deploy key for
-#                        yetanotherco/lambda_vm. If the file exists it is
-#                        scp'd to /tmp/lambda_vm_read_only_key on the server
-#                        before provision.sh runs; provision.sh then moves
-#                        it to /home/app/.ssh/lambda_vm_read_only. If the local
-#                        file is missing, the lambda_vm clone is skipped.
 #
 # SSH wait is indefinite — Ctrl+C to abort.
 
@@ -32,9 +25,6 @@ NC='\033[0m'
 
 SSH_USER="${SSH_USER:-root}"
 PROVISION_FILE="${PROVISION_FILE:-$SCRIPT_DIR/provision.sh}"
-GITHUB_SSH_KEY_FILE="${GITHUB_SSH_KEY_FILE:-$HOME/.ssh/lambda_vm_read_only}"
-REMOTE_KEY_DIR=/tmp/keydir
-REMOTE_KEY_PATH=$REMOTE_KEY_DIR/lambda_vm_read_only_key
 
 err() { echo -e "${RED}error:${NC} $*" >&2; }
 info() { echo -e "${BOLD}$*${NC}"; }
@@ -56,10 +46,6 @@ if ! command -v ssh >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -r "$GITHUB_SSH_KEY_FILE" ]; then
-    info "GITHUB_SSH_KEY_FILE not found at $GITHUB_SSH_KEY_FILE — provision.sh will skip the lambda_vm clone."
-fi
-
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
 
 info "Waiting for sshd on $SSH_USER@$IP (indefinite — Ctrl+C to abort)..."
@@ -72,13 +58,6 @@ while ! ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" true 2>/dev/null; do
     sleep 10
 done
 ok "sshd reachable on $SSH_USER@$IP (attempt $attempt)"
-
-if [ -r "$GITHUB_SSH_KEY_FILE" ]; then
-    info "Staging $GITHUB_SSH_KEY_FILE -> $SSH_USER@$IP:$REMOTE_KEY_PATH (mode 0600 atomically)..."
-    ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" \
-        "install -d -m 0700 $REMOTE_KEY_DIR && install -m 0600 /dev/stdin $REMOTE_KEY_PATH" \
-        < "$GITHUB_SSH_KEY_FILE"
-fi
 
 if [ "$SSH_USER" = "root" ]; then
     REMOTE_CMD="bash -s"

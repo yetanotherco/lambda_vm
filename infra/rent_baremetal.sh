@@ -8,13 +8,8 @@
 #   SCW_TYPE              default: EM-I320E-NVME
 #   PROVISION_FILE        default: <repo>/infra/provision.sh
 #   READY_TIMEOUT         default: 1800 (seconds)
-#   GITHUB_SSH_KEY_FILE   default: $HOME/.ssh/lambda_vm_read_only
-#                         Local path to a GitHub deploy key for
-#                         yetanotherco/lambda_vm. If the file exists,
-#                         provision_server.sh scp's it to the server before
-#                         provision.sh runs. If missing, the clone is skipped.
 #
-# Requires: scw, jq, ssh, scp.
+# Requires: scw, jq, ssh.
 # To stop hourly charges when done: scw baremetal server delete <id> zone=<zone>
 
 set -euo pipefail

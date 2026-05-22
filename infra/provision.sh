@@ -121,51 +121,15 @@ if [ ! -d "$SYSROOT_DIR" ]; then
     rm /tmp/sysroot.tar.gz
 fi
 
-# --- 9. GitHub deploy key for app (from /tmp/keydir/lambda_vm_read_only_key) -
-GH_SSH_KEY=/home/app/.ssh/lambda_vm_read_only
-STAGED_DIR=/tmp/keydir
-STAGED_KEY=$STAGED_DIR/lambda_vm_read_only_key
-if [ ! -f "$GH_SSH_KEY" ] && [ -s "$STAGED_KEY" ]; then
-    log "installing $STAGED_KEY -> $GH_SSH_KEY"
-    install -d -m 0700 -o app -g app /home/app/.ssh
-    install -m 0600 -o app -g app "$STAGED_KEY" "$GH_SSH_KEY"
-fi
-# Always clean up the staging area, even if the key was already installed.
-rm -rf "$STAGED_DIR"
-
-if [ -f "$GH_SSH_KEY" ]; then
-    SSH_CONFIG=/home/app/.ssh/config
-    if ! grep -q '^Host github.com' "$SSH_CONFIG" 2>/dev/null; then
-        cat >> "$SSH_CONFIG" <<EOF
-Host github.com
-  HostName github.com
-  User git
-  IdentityFile $GH_SSH_KEY
-  IdentitiesOnly yes
-EOF
-        chmod 600 "$SSH_CONFIG"
-        chown app:app "$SSH_CONFIG"
-        log "added github.com block to $SSH_CONFIG"
-    fi
-    KNOWN_HOSTS=/home/app/.ssh/known_hosts
-    touch "$KNOWN_HOSTS"
-    chown app:app "$KNOWN_HOSTS"
-    chmod 600 "$KNOWN_HOSTS"
-    if ! ssh-keygen -F github.com -f "$KNOWN_HOSTS" >/dev/null 2>&1; then
-        ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> "$KNOWN_HOSTS" 2>/dev/null || true
-        log "added github.com to known_hosts"
-    fi
-fi
-
-# --- 10. Clone lambda_vm (as app) -------------------------------------------
+# --- 9. Clone lambda_vm (as app, public repo over HTTPS) ---------------------
 REPO_DIR=/home/app/lambda_vm
-REPO_URL=git@github.com:yetanotherco/lambda_vm.git
-if [ ! -d "$REPO_DIR/.git" ] && [ -f "$GH_SSH_KEY" ]; then
+REPO_URL=https://github.com/yetanotherco/lambda_vm.git
+if [ ! -d "$REPO_DIR/.git" ]; then
     log "cloning lambda_vm to $REPO_DIR (as app)"
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 11. ethrex test fixture ------------------------------------------------
+# --- 10. ethrex test fixture ------------------------------------------------
 ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
 ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
 if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
@@ -173,7 +137,7 @@ if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
     sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
 fi
 
-# --- 12. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 11. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -181,7 +145,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 13. /etc/environment + locale ------------------------------------------
+# --- 12. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -192,7 +156,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 14. sshd hardening (last; reload won't drop existing session) ----------
+# --- 13. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no
