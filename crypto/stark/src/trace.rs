@@ -2,17 +2,20 @@ use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 #[cfg(test)]
 use itertools::Itertools;
+#[cfg(test)]
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
+use math::field::{element::FieldElement, traits::IsFFTField};
+#[cfg(test)]
+use math::polynomial::Polynomial;
 use math::polynomial::barycentric_inv_denoms;
 #[cfg(feature = "disk-spill")]
 use math::spill_safe::SpillSafe;
-use math::{
-    field::{element::FieldElement, traits::IsFFTField},
-    polynomial::Polynomial,
-};
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+// `par_iter()` is only used by the test-only `compute_trace_polys_main`.
+#[cfg(all(test, feature = "parallel"))]
+use rayon::prelude::IntoParallelRefIterator;
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -170,6 +173,7 @@ where
         self.aux_table.spill_to_disk()
     }
 
+    #[cfg(test)]
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
