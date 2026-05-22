@@ -1,16 +1,12 @@
 use std::collections::HashMap;
 
 use super::boundary::BoundaryConstraints;
-#[cfg(all(debug_assertions, not(feature = "parallel")))]
-use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-#[cfg(not(feature = "parallel"))]
-use math::polynomial::Polynomial;
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
 use rayon::{
@@ -307,9 +303,6 @@ where
             constraint_zerofier_idx.push(idx);
         }
 
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
-
         let trace_length = domain.interpolation_domain_size;
         let lde_periodic_columns = air
             .get_periodic_column_polynomials(trace_length)
@@ -354,15 +347,6 @@ where
                     )
             })
             .collect();
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let boundary_zerofiers = Vec::new();
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        check_boundary_polys_divisibility(boundary_polys, boundary_zerofiers);
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let _transition_evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
 
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
 
