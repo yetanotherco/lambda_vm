@@ -36,7 +36,7 @@
 //!
 //! ### Senders (CPU sends to other tables)
 //! - DECODE: instruction fetch
-//! - IS_BYTE: range checks for rs1, rs2, rd, and arg1/arg2/res byte pairs
+//! - ARE_BYTES: range checks for rs1, rs2, rd, and arg1/arg2/res byte pairs
 //! - IS_BIT: range checks for flags (via templates)
 //! - ADD: for ADD, LOAD, JALR operations
 //! - STORE ADD: for STORE (res = arg1 + imm, separate from main ADD)
@@ -501,9 +501,9 @@ impl CpuOperation {
     /// Collects CPU range-check lookups for register indices and byte pairs.
     ///
     /// The CPU sends:
-    /// - 1 IS_BYTE lookup for (RS1, RS2) batched as a pair
-    /// - 1 IS_BYTE lookup for RD encoded as (RD, 0)
-    /// - 12 IS_BYTE lookups for adjacent byte pairs in ARG1, ARG2, and RES
+    /// - 1 ARE_BYTES lookup for (RS1, RS2) batched as a pair
+    /// - 1 ARE_BYTES lookup for RD encoded as (RD, 0)
+    /// - 12 ARE_BYTES lookups for adjacent byte pairs in ARG1, ARG2, and RES
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
@@ -515,16 +515,16 @@ impl CpuOperation {
 
         // Batch RS1+RS2 as a pair; RD stays single with Y=0.
         ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::IsByte,
+            BitwiseOperationType::AreBytes,
             self.decode.rs1,
             self.decode.rs2,
         ));
         ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::IsByte,
+            BitwiseOperationType::AreBytes,
             self.decode.rd,
         ));
 
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs
+        // 12 ARE_BYTES lookups for ARG1/ARG2/RES byte pairs
         // Each pair sends [lo, hi] as two separate bus values, so the LogUp
         // fingerprint forces each byte to match individually against BITWISE X, Y.
         for value in [arg1, arg2, res] {
@@ -532,7 +532,7 @@ impl CpuOperation {
                 let lo = ((value >> (i * 16)) & 0xFF) as u8;
                 let hi = ((value >> (i * 16 + 8)) & 0xFF) as u8;
                 ops.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::IsByte,
+                    BitwiseOperationType::AreBytes,
                     lo,
                     hi,
                 ));
@@ -547,7 +547,7 @@ impl CpuOperation {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let mut lookups = Vec::new();
 
-        // Range checks: 14 IS_BYTE ops (RS1+RS2 paired, RD single with Y=0,
+        // Range checks: 14 ARE_BYTES ops (RS1+RS2 paired, RD single with Y=0,
         // plus 12 ARG1/ARG2/RES byte pairs).
         lookups.extend(self.collect_byte_check_ops());
 
@@ -1991,19 +1991,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // Range checks (14 total):
-    // CPU-CR29: IS_BYTE[rs1, rs2], CPU-CR30: IS_BYTE[rd, 0]
-    // CPU-CR31.i: IS_BYTE[arg1[2i], arg1[2i+1]] (i=0..3)
-    // CPU-CR32.i: IS_BYTE[arg2[2i], arg2[2i+1]] (i=0..3)
-    // CPU-CR33.i: IS_BYTE[res[2i], res[2i+1]] (i=0..3)
+    // CPU-CR29: ARE_BYTES[rs1, rs2], CPU-CR30: ARE_BYTES[rd, 0]
+    // CPU-CR31.i: ARE_BYTES[arg1[2i], arg1[2i+1]] (i=0..3)
+    // CPU-CR32.i: ARE_BYTES[arg2[2i], arg2[2i+1]] (i=0..3)
+    // CPU-CR33.i: ARE_BYTES[res[2i], res[2i+1]] (i=0..3)
     // -------------------------------------------------------------------------
-    // RS1 and RS2 share one IS_BYTE check; RD uses 0 as the second argument.
+    // RS1 and RS2 share one ARE_BYTES check; RD uses 0 as the second argument.
     // ARG1/ARG2/RES are 8-byte little-endian values — adjacent byte pairs are
-    // batched into IS_BYTE checks. Each pair sends two separate bus values
+    // batched into ARE_BYTES checks. Each pair sends two separate bus values
     // [lo, hi], so the LogUp fingerprint forces each byte to match individually
     // against the BITWISE table's X in [0,255] and Y in [0,255].
     // Every CPU row (including padding) sends with Multiplicity::One.
     interactions.push(BusInteraction::sender(
-        BusId::IsByte,
+        BusId::AreBytes,
         Multiplicity::One,
         vec![
             BusValue::Packed {
@@ -2017,7 +2017,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
     interactions.push(BusInteraction::sender(
-        BusId::IsByte,
+        BusId::AreBytes,
         Multiplicity::One,
         vec![
             BusValue::Packed {
@@ -2030,7 +2030,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for arr in [&cols::ARG1, &cols::ARG2, &cols::RES] {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
-                BusId::IsByte,
+                BusId::AreBytes,
                 Multiplicity::One,
                 vec![
                     BusValue::Packed {

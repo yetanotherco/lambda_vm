@@ -21,7 +21,7 @@
 //! - `carry[0]`, `carry[1]`: Carries from 64-bit addition
 //!
 //! ## Bus Interactions
-//! - Sender: IS_BYTE (×1 for next_pc_low[1])
+//! - Sender: ARE_BYTES (×1 for `[next_pc_low[1], 0]`, spec template `IS_BYTE<next_pc_low[1]>`)
 //! - Sender: AND_BYTE (×1 for masking LSB)
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
@@ -229,15 +229,15 @@ pub fn generate_branch_trace(
 /// Creates all bus interactions for the BRANCH table.
 ///
 /// The BRANCH table:
-/// - **Sends** IS_BYTE lookup for next_pc_low[1] range check
+/// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
 /// - **Sends** AND_BYTE lookup for LSB masking (next_pc_low[0] = unmasked_low_byte & 254)
 /// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
+        // ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
         BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
