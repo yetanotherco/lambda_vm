@@ -136,3 +136,35 @@ fn batch_proof_len_is_expected_for_long_pos_list() {
     let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     assert_eq!(batch_proof.path.len(), 2);
 }
+
+#[test]
+fn quad_leaf_backend_builds_and_verifies() {
+    use crate::merkle_tree::backends::types::QuadKeccak256Backend;
+    use math::field::goldilocks::GoldilocksField;
+
+    type QF = GoldilocksField;
+    type Qfe = FieldElement<QF>;
+    type QuadBackend = QuadKeccak256Backend<QF>;
+
+    // Eight 4-element fold orbits.
+    let leaves: [[Qfe; 4]; 8] = core::array::from_fn(|g| {
+        let g = g as u64;
+        [
+            Qfe::from(4 * g),
+            Qfe::from(4 * g + 1),
+            Qfe::from(4 * g + 2),
+            Qfe::from(4 * g + 3),
+        ]
+    });
+    let tree = MerkleTree::<QuadBackend>::build(&leaves).unwrap();
+
+    for (pos, leaf) in leaves.iter().enumerate() {
+        let proof = tree.get_proof_by_pos(pos).unwrap();
+        assert!(proof.verify::<QuadBackend>(&tree.root, pos, leaf));
+    }
+
+    // A wrong orbit must not verify.
+    let proof = tree.get_proof_by_pos(2).unwrap();
+    let wrong = [Qfe::from(0u64); 4];
+    assert!(!proof.verify::<QuadBackend>(&tree.root, 2, &wrong));
+}
