@@ -57,7 +57,7 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     nodes: Vec<B::Node>,
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
-    mmap_backing: Option<MmapNodeBacking>,
+    pub(crate) mmap_backing: Option<MmapNodeBacking>,
 }
 
 // `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,
@@ -350,41 +350,5 @@ where
         self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
 
         Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "serde", feature = "disk-spill"))]
-mod disk_spill_serde_tests {
-    use super::*;
-    use crate::merkle_tree::backends::field_element::FieldElementBackend;
-    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
-    use sha3::Keccak256;
-
-    type F = GoldilocksField;
-    type FE = FieldElement<F>;
-    type Backend = FieldElementBackend<F, Keccak256, 32>;
-
-    /// Serializing a spilled MerkleTree must produce identical bytes to
-    /// serializing the same tree before spilling, and round-trip back to an
-    /// equal tree.
-    #[test]
-    fn test_serialize_spilled_merkle_tree_matches_unspilled() {
-        let values: Vec<FE> = (1..17).map(FE::from).collect();
-        let unspilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
-
-        let mut spilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        spilled.spill_nodes_to_disk().expect("spill_nodes_to_disk");
-        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
-
-        assert_eq!(
-            spilled_bytes, unspilled_bytes,
-            "spilled and unspilled trees must serialize to identical bytes"
-        );
-
-        let restored: MerkleTree<Backend> =
-            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(restored.mmap_backing.is_none());
-        assert_eq!(restored.root, unspilled.root);
     }
 }
