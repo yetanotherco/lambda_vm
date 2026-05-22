@@ -152,22 +152,6 @@ pub fn validate_trace<
     ret
 }
 
-pub fn check_boundary_polys_divisibility<F: IsFFTField>(
-    boundary_polys: Vec<Polynomial<FieldElement<F>>>,
-    boundary_zerofiers: Vec<Polynomial<FieldElement<F>>>,
-) {
-    for (i, (poly, z)) in boundary_polys
-        .iter()
-        .zip(boundary_zerofiers.iter())
-        .enumerate()
-    {
-        let (_, b) = poly.clone().long_division_with_remainder(z);
-        if b != Polynomial::zero() {
-            error!("Boundary poly {i} is not divisible by its zerofier");
-        }
-    }
-}
-
 /// Validates that the one-dimensional array `data` can be interpreted as two-dimensional
 /// array, returning a true when valid and false when not.
 pub fn validate_2d_structure<F>(data: &[FieldElement<F>], width: usize) -> bool

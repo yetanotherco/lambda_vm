@@ -59,17 +59,22 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
-    pub fn new<A: ?Sized + AIR<Field = F>>(air: &A, trace_length: usize) -> Self {
-        // Initial definitions
+    /// Builds the interpolation and LDE domains used by the prover.
+    ///
+    /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).
+    /// - LDE domain: a coset of size `trace_length * blowup_factor`, shifted by
+    ///   `air.options().coset_offset`.
+    pub fn new<A>(air: &A, trace_length: usize) -> Self
+    where
+        A: AIR<Field = F> + ?Sized,
+    {
         let blowup_factor = air.options().blowup_factor as usize;
         let coset_offset = FieldElement::from(air.options().coset_offset);
-        let interpolation_domain_size = trace_length;
         let root_order = trace_length.trailing_zeros();
-        // * Generate Coset
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(
             root_order as u64,
-            interpolation_domain_size,
+            trace_length,
             &FieldElement::one(),
         )
         .unwrap();
@@ -89,7 +94,7 @@ impl<F: IsFFTField> Domain<F> {
             trace_roots_of_unity,
             blowup_factor,
             coset_offset,
-            interpolation_domain_size,
+            interpolation_domain_size: trace_length,
         }
     }
 }
@@ -113,17 +118,6 @@ impl<F: IsFFTField> VerifierDomain<F> {
     pub fn lde_coset_element(&self, index: usize) -> FieldElement<F> {
         &self.coset_offset * self.lde_primitive_root.pow(index)
     }
-}
-
-pub fn new_domain<Field, FieldExtension, PI>(
-    air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-    trace_length: usize,
-) -> Domain<Field>
-where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
-{
-    Domain::new(air, trace_length)
 }
 
 /// Creates a lightweight verifier domain without pre-computing roots of unity.
