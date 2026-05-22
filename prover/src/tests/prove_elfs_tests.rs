@@ -71,6 +71,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
+        &[],
     )
     .expect("fingerprint collision in test");
 
@@ -885,6 +886,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &[],
     )
     .expect("fingerprint collision in test");
 
@@ -1621,6 +1623,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &[],
     )
     .expect("fingerprint collision in test");
 
@@ -1676,6 +1679,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &[],
     )
     .expect("fingerprint collision in test");
 
@@ -1766,6 +1770,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &[],
     )
     .expect("fingerprint collision in test");
 
