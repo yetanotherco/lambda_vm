@@ -21,7 +21,18 @@ pub struct Proof<T: PartialEq + Eq> {
 
 impl<T: PartialEq + Eq> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
-    pub fn verify<B>(&self, root_hash: &B::Node, mut index: usize, value: &B::Data) -> bool
+    pub fn verify<B>(&self, root_hash: &B::Node, index: usize, value: &B::Data) -> bool
+    where
+        B: IsMerkleTreeBackend<Node = T>,
+    {
+        self.verify_capped::<B>(core::slice::from_ref(root_hash), index, value)
+    }
+
+    /// Verifies a Merkle inclusion proof against a Merkle cap (`2^cap_height`
+    /// nodes). The path is folded up to the cap level and the result is checked
+    /// for membership in the cap. A single-node cap is equivalent to
+    /// [`verify`](Self::verify).
+    pub fn verify_capped<B>(&self, cap: &[B::Node], mut index: usize, value: &B::Data) -> bool
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
@@ -37,7 +48,9 @@ impl<T: PartialEq + Eq> Proof<T> {
             index >>= 1;
         }
 
-        root_hash == &hashed_value
+        // After folding `merkle_path.len()` levels, `index` is the position of
+        // the reconstructed node within the cap.
+        cap.get(index) == Some(&hashed_value)
     }
 }
 
@@ -105,7 +118,30 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
+        self.verify_capped::<B>(
+            core::slice::from_ref(root_hash),
+            pos_list,
+            values,
+            num_leaves,
+        )
+    }
+
+    /// Batch verification against a Merkle cap (`2^cap_height` nodes). A
+    /// single-node cap is equivalent to [`verify`](Self::verify).
+    pub fn verify_capped<B>(
+        &self,
+        cap: &[B::Node],
+        pos_list: &[usize],
+        values: &[B::Data],
+        num_leaves: usize,
+    ) -> bool
+    where
+        B: IsMerkleTreeBackend<Node = T>,
+    {
         if pos_list.len() != values.len() || pos_list.is_empty() {
+            return false;
+        }
+        if !cap.len().is_power_of_two() {
             return false;
         }
 
@@ -136,9 +172,11 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
 
         let mut proof_path_iter = self.path.iter();
 
-        let num_levels = (2 * num_leaves).ilog2();
-        // Process level by level, from bottom to top, same as `get_batch_auth_path_positions`.
-        for _ in 0..num_levels - 1 {
+        let depth = num_leaves.trailing_zeros() as usize;
+        let cap_height = cap.len().trailing_zeros() as usize;
+        // Process level by level, from the leaves up to the cap level, same as
+        // `get_batch_auth_path_positions`.
+        for _ in 0..depth - cap_height {
             let mut next_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
 
             // Process each known node from right to left to match the order of the proof.
@@ -178,9 +216,16 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             current_level_known_nodes = next_level_known_nodes;
         }
 
-        // Verify: root computed correctly and all proof nodes consumed.
+        // Verify: every reconstructed cap-level node is in the cap, and all
+        // proof nodes were consumed.
+        let cap_start = cap.len() - 1;
         proof_path_iter.next().is_none()
-            && current_level_known_nodes.len() == 1
-            && (current_level_known_nodes.get(&0) == Some(root_hash))
+            && !current_level_known_nodes.is_empty()
+            && current_level_known_nodes.iter().all(|(tree_index, node)| {
+                tree_index
+                    .checked_sub(cap_start)
+                    .and_then(|cap_index| cap.get(cap_index))
+                    == Some(node)
+            })
     }
 }

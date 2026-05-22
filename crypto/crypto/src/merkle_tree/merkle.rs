@@ -192,31 +192,53 @@ where
         &self.nodes
     }
 
-    /// Returns a Merkle proof for the element/s at position pos
-    /// For example, give me an inclusion proof for the 3rd element in the
-    /// Merkle tree
-    pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.node_count() / 2;
-        let Ok(merkle_path) = self.build_merkle_path(pos) else {
-            return None;
-        };
-
-        self.create_proof(merkle_path)
+    /// Total tree depth (root-to-leaf): `log2(number of leaves)`.
+    fn depth(&self) -> usize {
+        let leaves_len = self.node_count().div_ceil(2);
+        leaves_len.trailing_zeros() as usize
     }
 
-    /// Creates a proof from a Merkle pasth
-    fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
+    /// Returns the Merkle cap at `cap_height`: the `2^cap_height` nodes at tree
+    /// depth `cap_height`, ordered left to right. `cap_height` is clamped to the
+    /// tree depth; `cap_height == 0` yields a single-node cap equal to the root.
+    pub fn cap(&self, cap_height: usize) -> Vec<B::Node> {
+        let c = cap_height.min(self.depth());
+        let start = (1usize << c) - 1;
+        let end = (1usize << (c + 1)) - 1;
+        (start..end)
+            .map(|i| self.node_get(i).expect("cap node index in bounds").clone())
+            .collect()
+    }
+
+    /// Returns a Merkle proof for the element at position `pos` (full path to
+    /// the root).
+    pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
+        self.get_proof_by_pos_capped(pos, 0)
+    }
+
+    /// Returns a Merkle proof for the element at position `pos` whose
+    /// authentication path stops at the cap level (`cap_height` levels below
+    /// the root). `cap_height == 0` is equivalent to [`get_proof_by_pos`].
+    pub fn get_proof_by_pos_capped(&self, pos: usize, cap_height: usize) -> Option<Proof<B::Node>> {
+        let pos = pos + self.node_count() / 2;
+        let merkle_path = self.build_merkle_path_capped(pos, cap_height).ok()?;
         Some(Proof { merkle_path })
     }
 
-    /// Returns the Merkle path for the element/s for the leaf at position pos
-    fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.node_count() + 1).ilog2() as usize;
-        let mut merkle_path = Vec::with_capacity(tree_depth);
+    /// Returns the authentication path from leaf node `pos` up to — but not
+    /// including — the cap level.
+    fn build_merkle_path_capped(
+        &self,
+        pos: usize,
+        cap_height: usize,
+    ) -> Result<Vec<B::Node>, Error> {
+        let c = cap_height.min(self.depth());
+        let cap_start = (1usize << c) - 1;
+        let cap_end = (1usize << (c + 1)) - 1;
+        let mut merkle_path = Vec::with_capacity(self.depth() - c);
         let mut pos = pos;
 
-        while pos != ROOT {
+        while !(cap_start..cap_end).contains(&pos) {
             let Some(node) = self.node_get(sibling_index(pos)) else {
                 // out of bounds, exit returning the current merkle_path
                 return Err(Error::OutOfBounds);
@@ -248,6 +270,16 @@ where
     /// - `Error::EmptyPositionList` if `pos_list` is empty
     /// - `Error::OutOfBounds` if any position in `pos_list` is >= number of leaves
     pub fn get_batch_proof(&self, pos_list: &[usize]) -> Result<BatchProof<B::Node>, Error> {
+        self.get_batch_proof_capped(pos_list, 0)
+    }
+
+    /// Batch proof variant whose authentication paths stop at the cap level.
+    /// `cap_height == 0` is equivalent to [`get_batch_proof`].
+    pub fn get_batch_proof_capped(
+        &self,
+        pos_list: &[usize],
+        cap_height: usize,
+    ) -> Result<BatchProof<B::Node>, Error> {
         if pos_list.is_empty() {
             return Err(Error::EmptyPositionList);
         }
@@ -268,7 +300,8 @@ where
             .map(|pos| pos + self.node_count() / 2)
             .collect::<Vec<usize>>();
         // We get the positions of the nodes for the batch proof.
-        let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
+        let batch_auth_path_positions =
+            self.get_batch_auth_path_positions(&leaf_positions, cap_height);
 
         // We get the nodes for the batch proof.
         let batch_auth_path_nodes = batch_auth_path_positions
@@ -297,16 +330,20 @@ where
     ///
     /// This ordering is critical because the verifier consumes proof nodes level-by-level
     /// starting from leaves, so it needs leaf-level siblings first.
-    fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
+    fn get_batch_auth_path_positions(
+        &self,
+        leaf_positions: &[usize],
+        cap_height: usize,
+    ) -> Vec<usize> {
         // BTreeSet always maintains elements in ascending order (smaller indices first), regardless of insertion order.
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
-        // Number of levels in tree
-        let num_levels = (self.node_count() + 1).ilog2();
-
-        // Iter lefevel-by-level from leaves to root.
-        for _ in 0..num_levels - 1 {
+        // Climb level-by-level from the leaves up to the cap level. A full
+        // tree has `depth` levels above the leaves; a cap of height `c` stops
+        // `c` levels early.
+        let levels_to_climb = self.depth() - cap_height.min(self.depth());
+        for _ in 0..levels_to_climb {
             let mut next_obtainable = BTreeSet::new();
 
             for &pos in &obtainable {
