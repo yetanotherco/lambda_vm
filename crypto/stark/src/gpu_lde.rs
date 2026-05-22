@@ -239,8 +239,7 @@ unsafe fn presize_and_view_ext3<E: IsField>(
 /// Truncate each column back to `n` (trace size) after a GPU error so the
 /// CPU fallback (which reads `buffer.len()` as the trace size) runs cleanly.
 /// Safe because `math_cuda` writes outputs only at the final host copy, post-
-/// synchronize; any `Err` returns before that copy, leaving `columns[0..n]`
-/// untouched.
+/// synchronize; any `Err` returns before that copy, leaving `columns[0..n]` untouched.
 fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: usize) {
     for col in columns.iter_mut() {
         col.truncate(n);
@@ -260,7 +259,7 @@ fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
     let _byte_len = total_nodes.checked_mul(32)?;
     let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
     // SAFETY: every byte will be overwritten via the GPU D2H before the
-    // contents are read; the caller computes the byte-length view from the
+    // contents are read. The caller computes the byte-length view from the
     // returned `nodes` Vec using `total_nodes.checked_mul(32)`.
     unsafe { nodes.set_len(total_nodes) };
     Some((nodes, total_nodes))
@@ -270,13 +269,12 @@ fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
 ///
 /// Only engaged for Goldilocks-base tables whose LDE size is above the
 /// threshold. The prover's `expand_columns_to_lde` hands us every column of
-/// one table at once; those columns all share twiddles and coset weights so
+/// one table at once. Those columns all share twiddles and coset weights so
 /// they can be processed in a single batched pipeline on one stream.
 ///
 /// Returns `Some(())` if the batch was handled on GPU (and `columns` now
 /// contains the LDE evaluations). Returns `None` to let the caller run the
 /// per-column CPU fallback.
-#[inline]
 pub(crate) fn try_expand_columns_batched<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -286,8 +284,8 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    // Ext3 fast path: decompose each ext3 column into its 3 base components
-    // and dispatch to the base-field batched NTT with 3×M logical columns.
+    // Ext3 path: decompose each ext3 column into its 3 base components and
+    // dispatch to the base-field batched NTT with 3×M logical columns.
     // Butterflies with a base-field twiddle act componentwise on ext3, so
     // this is exactly equivalent to running the NTT in the extension field.
     if TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
@@ -301,7 +299,8 @@ where
     };
     let num_columns = columns.len();
 
-    // SAFETY: layout-checked above (`E == GoldilocksField`, `F == GoldilocksField`).
+    // SAFETY: the `Run` arm of `check_base_layout::<F, E>` (matched above)
+    // guarantees `E == GoldilocksField` and `F == GoldilocksField`.
     let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
