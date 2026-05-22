@@ -373,7 +373,7 @@ impl<F: IsField> Table<F> {
 pub struct TableView<F, E>
 where
     E: IsField,
-    F: IsSubFieldOf<F>,
+    F: IsSubFieldOf<E>,
 {
     pub data: Vec<Vec<FieldElement<F>>>,
     pub aux_data: Vec<Vec<FieldElement<E>>>,
@@ -382,7 +382,7 @@ where
 impl<F, E> TableView<F, E>
 where
     E: IsField,
-    F: IsSubFieldOf<F>,
+    F: IsSubFieldOf<E>,
 {
     pub fn new(data: Vec<Vec<FieldElement<F>>>, aux_data: Vec<Vec<FieldElement<E>>>) -> Self {
         Self { data, aux_data }

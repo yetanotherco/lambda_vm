@@ -90,17 +90,6 @@ impl BusInteractionsBuilder {
         self
     }
 
-    /// Send an IS_BYTE range check on a single direct-packed column.
-    /// IS_BYTE[col]
-    pub fn send_is_byte(&mut self, col: usize, mult: &Multiplicity) -> &mut Self {
-        self.inner.push(BusInteraction::sender(
-            BusId::IsByte,
-            mult.clone(),
-            vec![packed_direct(col)],
-        ));
-        self
-    }
-
     /// Send an XOR_BYTE lookup over three direct-packed columns (x, y, x ^ y).
     pub fn send_xor_byte(
         &mut self,

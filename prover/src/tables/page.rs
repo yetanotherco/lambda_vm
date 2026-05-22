@@ -26,7 +26,7 @@
 //!
 //! | Tag | Bus | Signature | Multiplicity |
 //! |-----|-----|-----------|--------------|
-//! | PAGE-C1+C2 | IS_BYTE | `[init, fini]` | 1 (sender) |
+//! | PAGE-C1+C2 | ARE_BYTES | `[init, fini]` | 1 (sender) |
 //! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
@@ -290,7 +290,7 @@ pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions
 ///
 /// ## Bus Interactions
 ///
-/// - PAGE-C1+C2: IS_BYTE[init, fini] - sender, multiplicity 1 (batched range check)
+/// - PAGE-C1+C2: ARE_BYTES[init, fini] - sender, multiplicity 1 (batched range check)
 /// - PAGE-C3: memory[0, address, 0, init] - receiver, multiplicity -1
 /// - PAGE-C4: memory[0, address, timestamp, fini] - sender, multiplicity 1
 ///
@@ -314,9 +314,9 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // PAGE-C1+C2: IS_BYTE[init, fini] - range check both byte values in one interaction
+        // PAGE-C1+C2: ARE_BYTES[init, fini] - range check both byte values in one interaction
         BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::One,
             vec![
                 BusValue::Packed {
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn test_bus_interactions() {
         let interactions = bus_interactions(0x1000); // page_base
-        assert_eq!(interactions.len(), 3); // C1+C2 (batched IS_BYTE), C3, C4
+        assert_eq!(interactions.len(), 3); // C1+C2 (batched ARE_BYTES), C3, C4
     }
 
     #[test]

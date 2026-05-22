@@ -1,7 +1,7 @@
 //! KECCAK_RND: Round chip for Keccak-f[1600] permutation.
 //!
 //! One row per round (24 rows per keccak call). All bitwise operations are
-//! delegated to BITWISE lookup tables (XOR_BYTE, AND_BYTE, HWSL, IS_BYTE).
+//! delegated to BITWISE lookup tables (XOR_BYTE, AND_BYTE, HWSL, ARE_BYTES).
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -562,10 +562,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // Theta: IS_BYTE range checks on Cxz_left (40).
+    // Theta: ARE_BYTES range checks on Cxz_left (20 pairs).
+    // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
+    // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
+    // implementation guidance in spec/is_byte.typ.
+    // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
     for x in 0..5 {
-        for byte in 0..8 {
-            b.send_is_byte(cols::cxz_left(x, byte), &mu);
+        for i in 0..4 {
+            b.send(
+                BusId::AreBytes,
+                mu.clone(),
+                vec![
+                    packed_direct(cols::cxz_left(x, 2 * i)),
+                    packed_direct(cols::cxz_left(x, 2 * i + 1)),
+                ],
+            );
         }
     }
 
@@ -655,12 +666,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // Rho: IS_BYTE range checks on rot_left + rot_right (400).
+    // Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs).
+    // Spec emits 400 IS_BYTE templates (200 per side); we merge each
+    // (rot_left[x][y][b], rot_right[x][y][b]) into one ARE_BYTES interaction.
     for x in 0..5 {
         for y in 0..5 {
             for byte in 0..8 {
-                b.send_is_byte(cols::rot_left(x, y, byte), &mu);
-                b.send_is_byte(cols::rot_right(x, y, byte), &mu);
+                b.send(
+                    BusId::AreBytes,
+                    mu.clone(),
+                    vec![
+                        packed_direct(cols::rot_left(x, y, byte)),
+                        packed_direct(cols::rot_right(x, y, byte)),
+                    ],
+                );
             }
         }
     }
@@ -751,7 +770,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
 /// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
 ///
-/// All other checks (XOR, AND, HWSL, IS_BYTE, IS_HALF, KECCAK, KECCAK_RC) are
+/// All other checks (XOR, AND, HWSL, ARE_BYTES, IS_HALF, KECCAK, KECCAK_RC) are
 /// enforced via bus interactions against the BITWISE/KECCAK_RC chips.
 pub fn create_constraints(
     constraint_idx_start: usize,

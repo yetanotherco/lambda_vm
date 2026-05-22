@@ -3,7 +3,8 @@
 //! This table provides 10 different lookup types used by other tables:
 //!
 //! ## Range Checks
-//! - `IS_BYTE[X, Y]` - X and Y are valid bytes [0, 256)
+//! - `ARE_BYTES[X, Y]` - X and Y are valid bytes [0, 256). Spec template
+//!   `IS_BYTE<X>` is implemented by sending `ARE_BYTES[X, 0]`.
 //! - `IS_HALF[X]` - X is a valid halfword [0, 2^16)
 //! - `IS_B20[X]` - X is a valid 20-bit value [0, 2^20)
 //!
@@ -82,9 +83,9 @@ pub mod cols {
     pub const MU_MSB16: usize = 15;
     /// Multiplicity for ZERO lookups
     pub const MU_ZERO: usize = 16;
-    /// Multiplicity for IS_BYTE lookups. Each lookup checks X and Y; pass Y=0
-    /// for a single-byte range check.
-    pub const MU_IS_BYTE: usize = 17;
+    /// Multiplicity for ARE_BYTES lookups. Each lookup checks X and Y; pass Y=0
+    /// for a single-byte range check (spec template `IS_BYTE<X>`).
+    pub const MU_ARE_BYTES: usize = 17;
     /// Multiplicity for IS_HALF lookups
     pub const MU_IS_HALF: usize = 18;
     /// Multiplicity for IS_B20 lookups
@@ -310,7 +311,7 @@ pub fn update_multiplicities(
             BitwiseOperationType::Msb8 => cols::MU_MSB8,
             BitwiseOperationType::Msb16 => cols::MU_MSB16,
             BitwiseOperationType::Zero => cols::MU_ZERO,
-            BitwiseOperationType::IsByte => cols::MU_IS_BYTE,
+            BitwiseOperationType::AreBytes => cols::MU_ARE_BYTES,
             BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
@@ -387,7 +388,7 @@ pub enum BitwiseOperationType {
     Msb8,
     Msb16,
     Zero,
-    IsByte,
+    AreBytes,
     IsHalf,
     IsB20,
     Hwsl,
@@ -408,7 +409,7 @@ pub enum BitwiseOperationType {
 /// - AND/OR/XOR: `x OP y`
 /// - MSB8: MSB of `x`
 /// - MSB16: MSB of halfword `x + y * 256`
-/// - IS_BYTE: Range check both `x` and `y`; use `y = 0` for a single byte
+/// - ARE_BYTES: Range check both `x` and `y`; use `y = 0` for a single byte
 /// - IS_HALF: Range check on `x + y * 256`
 /// - HWSL: Shift `x + y * 256` by `z` bits, returning [SLL, SLLC] as a pair
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -436,7 +437,7 @@ impl BitwiseOperation {
         Self::new(lookup_type, x, y, 0)
     }
 
-    /// Create an operation for single-byte ops (MSB8, IS_BYTE).
+    /// Create an operation for single-byte ops (MSB8, ARE_BYTES with y=0).
     pub fn single_byte(lookup_type: BitwiseOperationType, x: u8) -> Self {
         Self::new(lookup_type, x, 0, 0)
     }
@@ -600,11 +601,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // IS_BYTE[X, Y] - range check two byte values, no output.
-        // Single-byte checks send the second argument as 0.
+        // ARE_BYTES[X, Y] - range check two byte values, no output.
+        // Single-byte checks (spec template `IS_BYTE<X>`) send Y=0.
         BusInteraction::receiver(
-            BusId::IsByte,
-            Multiplicity::Column(cols::MU_IS_BYTE),
+            BusId::AreBytes,
+            Multiplicity::Column(cols::MU_ARE_BYTES),
             vec![
                 BusValue::Packed {
                     start_column: cols::X,
