@@ -957,7 +957,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         coeffs.resize(len, FieldElement::zero());
         // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        evaluate_fft_cpu::<F, E>(&coeffs)
+        evaluate_fft_cpu_raw::<F, E>(&coeffs, true)
     }
 
     /// Same as `evaluate_fft` but returns the evaluations in bit-reversed order,
@@ -1017,7 +1017,22 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     where
         E: Send + Sync,
     {
-        interpolate_fft_cpu::<F, E>(fft_evals)
+        let n = fft_evals.len();
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let order = n.trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order)
+            .ok_or(FFTError::DomainSizeError(order as usize))?;
+
+        let mut coeffs = fft_evals.to_vec();
+        // Bowers iFFT: bit-reverse first (natural -> bit-reversed), then DIT inverse butterflies
+        in_place_bit_reverse_permute(&mut coeffs);
+        dispatch_ifft(&mut coeffs, &inv_twiddles)?;
+
+        // Scale by 1/n
+        let scale_factor = FieldElement::from(n as u64).inv().unwrap();
+        Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -1073,7 +1088,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
     /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+    pub(crate) fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
@@ -1124,7 +1139,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// 3. Zero-pad to N * blowup_factor
     /// 4. Forward FFT on the full buffer
     ///
-    /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
+    /// Unlike `coset_lde_full_into`, this skips the `clear + extend_from_slice` step
     /// since data is already in the buffer. Used for transpose elimination: columns are
     /// extracted directly into owned buffers, then expanded in-place.
     pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
@@ -1189,14 +1204,6 @@ where
     Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
-pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    evaluate_fft_cpu_raw::<F, E>(coeffs, true)
-}
-
 fn evaluate_fft_cpu_raw<F, E>(
     coeffs: &[FieldElement<E>],
     permute_to_natural: bool,
@@ -1219,31 +1226,6 @@ where
         in_place_bit_reverse_permute(&mut result);
     }
     Ok(result)
-}
-
-pub fn interpolate_fft_cpu<F, E>(
-    fft_evals: &[FieldElement<E>],
-) -> Result<Polynomial<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let n = fft_evals.len();
-    if !n.is_power_of_two() {
-        return Err(FFTError::InputError(n));
-    }
-    let order = n.trailing_zeros() as u64;
-    let inv_twiddles =
-        LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
-
-    let mut coeffs = fft_evals.to_vec();
-    // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
-    in_place_bit_reverse_permute(&mut coeffs);
-    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
-
-    // Scale by 1/n
-    let scale_factor = FieldElement::from(n as u64).inv().unwrap();
-    Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
 
 #[cfg(test)]
