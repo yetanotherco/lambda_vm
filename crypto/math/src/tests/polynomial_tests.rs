@@ -2,7 +2,7 @@
 mod tests {
     use crate::field::element::FieldElement;
     use crate::field::goldilocks::GoldilocksField;
-    use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
+    use crate::field::traits::{IsField, IsPrimeField};
     use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};
     use alloc::{format, vec, vec::Vec};
@@ -33,72 +33,6 @@ mod tests {
             derivative.push(FieldElement::<F>::from(i as u64) * coeff);
         }
         Polynomial::new(&derivative)
-    }
-
-    /// Computes the quotient of the division of P(x) with x - b using Ruffini's rule
-    fn ruffini_division<F, L>(
-        poly: &Polynomial<FieldElement<F>>,
-        b: &FieldElement<L>,
-    ) -> Polynomial<FieldElement<L>>
-    where
-        L: IsField,
-        F: IsSubFieldOf<L>,
-    {
-        if let Some(c) = poly.coefficients().last() {
-            let mut c = c.clone().to_extension();
-            let mut coefficients = Vec::with_capacity(poly.degree());
-            for coeff in poly.coefficients().iter().rev().skip(1) {
-                coefficients.push(c.clone());
-                c = coeff + c * b;
-            }
-            coefficients = coefficients.into_iter().rev().collect();
-            Polynomial::new(&coefficients)
-        } else {
-            Polynomial::zero()
-        }
-    }
-
-    /// Computes quotient only (discards remainder)
-    fn div_with_ref<F: IsField>(
-        poly: Polynomial<FieldElement<F>>,
-        dividend: &Polynomial<FieldElement<F>>,
-    ) -> Polynomial<FieldElement<F>> {
-        let (quotient, _remainder) = poly.long_division_with_remainder(dividend);
-        quotient
-    }
-
-    /// Extended Euclidean Algorithm for polynomials
-    #[allow(clippy::type_complexity)]
-    fn xgcd<F: IsField>(
-        poly: &Polynomial<FieldElement<F>>,
-        y: &Polynomial<FieldElement<F>>,
-    ) -> (
-        Polynomial<FieldElement<F>>,
-        Polynomial<FieldElement<F>>,
-        Polynomial<FieldElement<F>>,
-    ) {
-        let one = Polynomial::new(&[FieldElement::one()]);
-        let zero = Polynomial::zero();
-        let (mut old_r, mut r) = (poly.clone(), y.clone());
-        let (mut old_s, mut s) = (one.clone(), zero.clone());
-        let (mut old_t, mut t) = (zero.clone(), one.clone());
-
-        while r != Polynomial::zero() {
-            let quotient = div_with_ref(old_r.clone(), &r);
-            old_r = old_r - &quotient * &r;
-            core::mem::swap(&mut old_r, &mut r);
-            old_s = old_s - &quotient * &s;
-            core::mem::swap(&mut old_s, &mut s);
-            old_t = old_t - &quotient * &t;
-            core::mem::swap(&mut old_t, &mut t);
-        }
-
-        let lcinv = old_r.leading_coefficient().inv().unwrap();
-        (
-            old_s.scale_coeffs(&lcinv),
-            old_t.scale_coeffs(&lcinv),
-            old_r.scale_coeffs(&lcinv),
-        )
     }
 
     /// Print the polynomial as a string ready to be used in SageMath
@@ -298,23 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn division_works() {
-        let p1 = Polynomial::new(&[FE::new(1), FE::new(3)]);
-        let p2 = Polynomial::new(&[FE::new(1), FE::new(3)]);
-        let p3 = p1.mul_with_ref(&p2);
-        assert_eq!(div_with_ref(p3, &p2), p1);
-    }
-
-    #[test]
-    fn division_by_zero_degree_polynomial_works() {
-        let four = FE::new(4);
-        let two = FE::new(2);
-        let p1 = Polynomial::new(&[four, four]);
-        let p2 = Polynomial::new(&[two]);
-        assert_eq!(Polynomial::new(&[two, two]), div_with_ref(p1, &p2));
-    }
-
-    #[test]
     fn evaluate_constant_polynomial_returns_constant() {
         let three = FE::new(3);
         let p = Polynomial::new(&[three]);
@@ -444,57 +361,6 @@ mod tests {
         let p1 = &parts[1];
         assert_eq!(p0, &p0_expected);
         assert_eq!(p1, &p1_expected);
-    }
-
-    use proptest::prelude::*;
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_division(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-
-            let p_ref = p.clone();
-            let m = Polynomial::new_monomial(FE::one(), 1) - b;
-
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(p, div_with_ref(p_ref, &m));
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_ruffini(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-            let q = ruffini_division(&p, &b);
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(q, p);
-        }
-    }
-    #[test]
-    fn test_xgcd() {
-        // Case 1: Simple polynomials
-        let p1 = Polynomial::new(&[FE::new(1), FE::new(0), FE::new(1)]); // x^2 + 1
-        let p2 = Polynomial::new(&[FE::new(1), FE::new(1)]); // x + 1
-        let (a, b, g) = xgcd(&p1, &p2);
-        // Check that a * p1 + b * p2 = g
-        let lhs = a.mul_with_ref(&p1) + b.mul_with_ref(&p2);
-        assert_eq!(lhs, g);
-        assert_eq!(g, Polynomial::new(&[FE::new(1)]));
-
-        // x^2-1 :
-        let p3 = Polynomial::new(&[-FE::new(1), FE::new(0), FE::new(1)]);
-        // x^3-x = x(x^2-1)
-        let p4 = Polynomial::new(&[FE::new(0), -FE::new(1), FE::new(0), FE::new(1)]);
-        let (a, b, g) = xgcd(&p3, &p4);
-
-        let lhs = a.mul_with_ref(&p3) + b.mul_with_ref(&p4);
-        assert_eq!(a, Polynomial::new(&[FE::new(1)]));
-        assert_eq!(b, Polynomial::zero());
-        assert_eq!(lhs, g);
-        assert_eq!(g, p3);
     }
 
     #[test]

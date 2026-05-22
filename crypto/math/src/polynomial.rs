@@ -67,15 +67,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         }
     }
 
-    /// Returns the coefficient accompanying x^degree
-    pub fn leading_coefficient(&self) -> FieldElement<F> {
-        if let Some(coefficient) = self.coefficients.last() {
-            coefficient.clone()
-        } else {
-            FieldElement::zero()
-        }
-    }
-
     /// Returns coefficients of the polynomial as an array
     /// \[c_0, c_1, c_2, ..., c_n\]
     /// that represents the polynomial
@@ -87,29 +78,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Returns the length of the vector of coefficients
     pub fn coeff_len(&self) -> usize {
         self.coefficients().len()
-    }
-
-    /// Computes quotient and remainder of polynomial division.
-    ///
-    /// Output: (quotient, remainder)
-    pub fn long_division_with_remainder(self, dividend: &Self) -> (Self, Self) {
-        if dividend.degree() > self.degree() {
-            (Polynomial::zero(), self)
-        } else {
-            let mut n = self;
-            let mut q: Vec<FieldElement<F>> = vec![FieldElement::zero(); n.degree() + 1];
-            let denominator = dividend.leading_coefficient().inv().unwrap();
-            while n != Polynomial::zero() && n.degree() >= dividend.degree() {
-                let new_coefficient = n.leading_coefficient() * &denominator;
-                q[n.degree() - dividend.degree()] = new_coefficient.clone();
-                let d = dividend.mul_with_ref(&Polynomial::new_monomial(
-                    new_coefficient,
-                    n.degree() - dividend.degree(),
-                ));
-                n = n - d;
-            }
-            (Polynomial::new(&q), n)
-        }
     }
 
     pub fn mul_with_ref(&self, factor: &Self) -> Self {
@@ -178,22 +146,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             parts.push(Polynomial::new(&coeffs));
         }
         parts
-    }
-
-    /// Embeds the coefficients of a polynomial into an extension field
-    /// For example, given a polynomial with coefficients in F_p, returns the same
-    /// polynomial with its coefficients as elements in F_{p^2}
-    pub fn to_extension<L: IsField>(self) -> Polynomial<FieldElement<L>>
-    where
-        F: IsSubFieldOf<L>,
-    {
-        Polynomial {
-            coefficients: self
-                .coefficients
-                .into_iter()
-                .map(|x| x.to_extension::<L>())
-                .collect(),
-        }
     }
 }
 
@@ -726,47 +678,6 @@ where
     denoms
 }
 
-/// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
-///
-/// Use this when evaluating multiple columns at the same coset — the inverse is
-/// constant across all columns and should be computed once.
-///
-/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F. The function
-/// uses F×E→E mixed arithmetic for the final multiplication, avoiding any field
-/// embedding/conversion overhead.
-pub fn interpolate_coset_eval_with_g_n_inv<F, E>(
-    z_pow_n: &FieldElement<E>,
-    coset_offset_pow_n: &FieldElement<F>,
-    n_inv: &FieldElement<F>,
-    g_n_inv: &FieldElement<F>,
-    coset_points: &[FieldElement<F>],
-    evaluations: &[FieldElement<F>],
-    inv_denoms: &[FieldElement<E>],
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    debug_assert_eq!(coset_points.len(), evaluations.len());
-    debug_assert_eq!(coset_points.len(), inv_denoms.len());
-
-    // sum = sum_{i} (g*w^i) * f(g*w^i) / (z - g*w^i)
-    // point * eval is in base field F; multiply by inv_d lifts to E
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            acc + (point * eval) * inv_d
-        });
-
-    // f(z) = (z^N - g^N) / (N * g^N) * sum
-    // All scalar factors in base field F; vanishing via sub_subfield.
-    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
-    let scalar = n_inv * g_n_inv; // F * F → F
-    &scalar * &(vanishing * &sum) // F × E → E
-}
-
 /// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///
 /// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F.
@@ -858,16 +769,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             result = result + y_term;
         }
         Ok(result)
-    }
-
-    /// Computes quotient with `x - b` in place.
-    pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
-        let mut c = FieldElement::zero();
-        for coeff in self.coefficients.iter_mut().rev() {
-            *coeff = &*coeff + b * &c;
-            core::mem::swap(coeff, &mut c);
-        }
-        self.coefficients.pop();
     }
 }
 
