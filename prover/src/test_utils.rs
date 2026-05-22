@@ -419,7 +419,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
             BitwiseOperationType::Msb8 => 3,
             BitwiseOperationType::Msb16 => 4,
             BitwiseOperationType::Zero => 5,
-            BitwiseOperationType::IsByte => 6,
+            BitwiseOperationType::AreBytes => 6,
             BitwiseOperationType::IsHalf => 7,
             BitwiseOperationType::IsB20 => 8,
             BitwiseOperationType::Hwsl => 9,
@@ -478,7 +478,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
         data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
         data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
         data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[6]);
         data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
         data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
         data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
@@ -786,7 +786,7 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
 ///
 /// The PAGE table has no transition constraints (it's a pure lookup table).
 /// It interacts with:
-/// - IS_BYTE bus: range checks for init/fini values
+/// - ARE_BYTES bus: range checks for init/fini values
 /// - Memory bus: provides initial and final memory tokens
 pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];

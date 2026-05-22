@@ -366,21 +366,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // 6. Range-check every addr byte. The addr columns are reconstructed as a
-    // linear combination (addr_lo = b0 + 256*b1 + 65536*b2 + 2^24*b3, etc.)
-    // for the MEMW lookup and the no-overflow / alignment constraints. Without
-    // an explicit byte range check on each cell, an attacker can keep the
-    // field-element value of that linear combination correct while encoding
-    // arbitrary non-byte values in the individual cells (e.g. addr[0]=0,
-    // addr[1]=V_lo * 256^{-1} mod p), bypassing the alignment check.
-    for b in 0..8 {
+    // 6. Range-check every addr byte (4 ARE_BYTES pairs). The addr columns are
+    // reconstructed as a linear combination (addr_lo = b0 + 256*b1 + 65536*b2 +
+    // 2^24*b3, etc.) for the MEMW lookup and the no-overflow / alignment
+    // constraints. Without an explicit byte range check on each cell, an
+    // attacker can keep the field-element value of that linear combination
+    // correct while encoding arbitrary non-byte values in the individual cells
+    // (e.g. addr[0]=0, addr[1]=V_lo * 256^{-1} mod p), bypassing the alignment
+    // check. Spec emits 8 IS_BYTE templates; we merge `(addr[2i], addr[2i+1])`.
+    for i in 0..4 {
         interactions.push(BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::addr(b),
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::addr(2 * i),
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::addr(2 * i + 1),
+                    packing: Packing::Direct,
+                },
+            ],
         ));
     }
 
