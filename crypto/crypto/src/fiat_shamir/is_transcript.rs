@@ -23,12 +23,26 @@ pub trait IsStarkTranscript<F: IsField, S: IsField + IsSubFieldOf<F>>: IsTranscr
     /// For a coset g*H where H has order n: z is in g*H iff z^n = g^n.
     ///
     /// This is O(log n) instead of O(n) linear search.
+    ///
+    /// # Precondition
+    ///
+    /// `trace_length > 0` and `lde_length` is an exact multiple of
+    /// `trace_length`. The LDE-coset check is computed as
+    /// `(z^trace_length)^(lde_length / trace_length)`, which equals
+    /// `z^lde_length` only under this invariant. A violation silently
+    /// evaluates the wrong power and can fail to reject points inside the
+    /// LDE coset (soundness regression). Debug builds assert this; release
+    /// builds trust the caller.
     fn sample_z_ood_with_domain_params(
         &mut self,
         trace_length: usize,
         lde_length: usize,
         coset_offset: &FieldElement<S>,
     ) -> FieldElement<F> {
+        debug_assert!(
+            trace_length > 0 && lde_length.is_multiple_of(trace_length),
+            "sample_z_ood_with_domain_params: lde_length ({lde_length}) must be a positive multiple of trace_length ({trace_length})",
+        );
         // Coset membership reference value, precomputed once. The power map runs
         // in the base field S (cheap) and the scalar result is lifted to F — we
         // never lift `coset_offset` into F before exponentiating.
