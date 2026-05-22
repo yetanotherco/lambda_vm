@@ -17,6 +17,7 @@ pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 pub mod lookup;
+pub(crate) mod par;
 pub mod proof;
 pub mod prover;
 #[cfg(feature = "disk-spill")]
