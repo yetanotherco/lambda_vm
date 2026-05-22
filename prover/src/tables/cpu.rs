@@ -491,6 +491,33 @@ impl CpuOperation {
                 // Arithmetic right shift
                 (arg1 as i64).wrapping_shr(effective) as u64
             }
+        } else if self.decode.op_mul && self.decode.word_instr {
+            // MULW
+            (arg1 as i64).wrapping_mul(arg2 as i64) as u64
+        } else if self.decode.op_divrem && self.decode.word_instr {
+            // DIVUW/DIVW/REMUW/REMW
+
+            // REMUW/REMW if true, DIVUW/DIVW otherwise
+            let rem = self.decode.muldiv_selector;
+
+            // DIVW/REMW if self.decode.signed == true, DIVUW/REMUW otherwise
+            if self.decode.signed {
+                if arg2 == 0 {
+                    if rem { arg1 } else { u64::MAX }
+                } else if arg1 as i64 == i64::MIN && arg2 as i64 == -1 {
+                    if rem { 0 } else { arg1 }
+                } else if rem {
+                    (arg1 as i64).wrapping_rem(arg2 as i64) as u64
+                } else {
+                    (arg1 as i64).wrapping_div(arg2 as i64) as u64
+                }
+            } else if arg2 == 0 {
+                if rem { arg1 } else { u64::MAX }
+            } else if rem {
+                arg1 % arg2
+            } else {
+                arg1 / arg2
+            }
         } else {
             // For SLT and other operations, use the executor's result
             // SLT res is 0 or 1, verified by SltResZeroConstraint
