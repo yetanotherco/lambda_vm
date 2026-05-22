@@ -846,7 +846,7 @@ pub trait IsStarkVerifier<
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
-                    air.context().num_transition_constraints(),
+                    air.context().num_transition_constraints,
                     air.context().trace_columns
                 );
                 return false;
