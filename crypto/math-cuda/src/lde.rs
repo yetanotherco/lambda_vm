@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use rayon::prelude::*;
 
 use crate::Result;
 use crate::device::{Backend, backend};
@@ -69,7 +68,10 @@ pub(crate) fn pack_ext3_to_pinned_slabs(columns: &[&[u64]], pinned: &mut [u64], 
     let m = columns.len();
     debug_assert!(pinned.len() >= 3 * m * n);
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
+    // Sequential, not `par_iter`: this runs while the per-worker pinned
+    // staging mutex is held. Rayon inside a held mutex risks recursive
+    // stealing-during-wait deadlocks — see `Backend::pinned_staging` docs.
+    columns.iter().enumerate().for_each(|(c, col)| {
         // SAFETY: each task writes to disjoint `[(c*3 + k)*n .. ..+n]` regions
         // of `pinned`. The outer `&mut [u64]` borrow guarantees no aliasing.
         let slab_a = unsafe {
@@ -96,7 +98,9 @@ fn unpack_pinned_slabs_to_ext3(pinned: &[u64], outputs: &mut [&mut [u64]], lde_s
     let m = outputs.len();
     debug_assert!(pinned.len() >= 3 * m * lde_size);
     let pinned_const = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
+    // Sequential, not `par_iter_mut`: runs inside a held pinned-staging
+    // mutex; rayon-inside-mutex risks deadlock (see `Backend::pinned_staging`).
+    outputs.iter_mut().enumerate().for_each(|(c, dst)| {
         // SAFETY: each task reads from disjoint `[(c*3 + k)*lde_size .. ..+lde_size]`
         // regions of `pinned`. Caller borrows `pinned` for the duration of the call.
         let slab_a = unsafe {
@@ -178,19 +182,14 @@ fn d2h_bytes_via_pinned_hashes(
     stream.memcpy_dtoh(dev_bytes, pinned_bytes)?;
     stream.synchronize()?;
 
-    // Single-threaded `copy_from_slice` faults virgin pageable pages one at
-    // a time; the mm_struct rwsem serialises them at prover scale. Chunk so
-    // ~N cores pre-fault+write in parallel.
-    const CHUNK: usize = 64 * 1024;
-    let src_ptr = pinned_bytes.as_ptr() as usize;
-    dst.par_chunks_mut(CHUNK).enumerate().for_each(|(i, d)| {
-        // SAFETY: each task reads `[i*CHUNK .. i*CHUNK + d.len()]` of
-        // `pinned_bytes`, which is disjoint per `i` and lives until `staging`
-        // is dropped below.
-        let src =
-            unsafe { std::slice::from_raw_parts((src_ptr as *const u8).add(i * CHUNK), d.len()) };
-        d.copy_from_slice(src);
-    });
+    // Sequential, not `par_chunks_mut`: this runs while the per-worker
+    // pinned_hashes mutex is held. Rayon inside a held mutex risks
+    // recursive stealing-during-wait deadlocks — see
+    // `Backend::pinned_staging` docs. Page-fault parallelism on virgin
+    // destination pages is recovered at the outer level: per-worker
+    // staging buffers let rayon's outer `par_iter` dispatch multiple LDE
+    // calls in parallel, each faulting its own destination pages.
+    dst.copy_from_slice(pinned_bytes);
     drop(staging);
     Ok(())
 }
@@ -367,18 +366,14 @@ pub fn coset_lde_batch_base(
     // SAFETY: staging is locked, the slice alias ends before we unlock.
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    // Pack columns into first m*n slots of the pinned buffer. Parallel: pinned
-    // writes are DRAM-bandwidth bound, so rayon spreads the cost across CPU
-    // cores.
-    let pinned_base_ptr = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        // SAFETY: each task writes to a disjoint `[c*n..c*n+n]` region of
-        // `pinned`, and the outer `staging` lock guarantees no other call is
-        // using the buffer concurrently.
-        let dst =
-            unsafe { std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n) };
-        dst.copy_from_slice(col);
-    });
+    // Pack columns into first m*n slots of the pinned buffer. Sequential
+    // (not `par_iter`) because this runs inside the held pinned-staging
+    // mutex — see `Backend::pinned_staging` docs. Pre-fault parallelism on
+    // the destination is recovered at the outer level via per-worker
+    // staging slots.
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
+    }
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
     // tail of each column is already the zero-pad the CPU path does.
@@ -459,12 +454,11 @@ pub fn coset_lde_batch_base(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
 
-    // Split pinned → per-column Vec<u64>s. The first write to each virgin
-    // Vec page-faults, which can dominate total time. Parallelise so the
-    // fault cost spreads across CPU cores.
-    let pinned_ptr = pinned.as_ptr() as usize;
+    // Split pinned → per-column Vec<u64>s. Sequential (not `into_par_iter`)
+    // because this runs inside the held pinned-staging mutex — see
+    // `Backend::pinned_staging` docs. Fault-cost parallelism is recovered
+    // at the outer level (per-worker staging slots).
     let out: Vec<Vec<u64>> = (0..m)
-        .into_par_iter()
         .map(|c| {
             // set_len skips the O(N) zero-init that vec![0; n] would do.
             // copy_from_slice below writes every slot before any reader
@@ -475,10 +469,7 @@ pub fn coset_lde_batch_base(
                 unsafe { v.set_len(lde_size) };
                 v
             };
-            let src = unsafe {
-                std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
-            };
-            v.copy_from_slice(src);
+            v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
             v
         })
         .collect();
@@ -602,15 +593,14 @@ pub fn coset_lde_batch_base_into(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
 
-    // Parallel copy pinned → caller outputs. Caller's Vecs may still fault
-    // on first write; we spread that cost across rayon cores.
-    let pinned_ptr = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let src = unsafe {
-            std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
-        };
-        dst.copy_from_slice(src);
-    });
+    // Sequential copy pinned → caller outputs (not `par_iter_mut`): runs
+    // inside the held pinned-staging mutex; rayon-inside-mutex risks
+    // recursive stealing-during-wait deadlocks (see
+    // `Backend::pinned_staging`). Fault-cost parallelism is recovered at
+    // the outer level via per-worker staging slots.
+    for (c, dst) in outputs.iter_mut().enumerate() {
+        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+    }
     drop(staging);
     Ok(())
 }
@@ -734,12 +724,12 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    let pinned_base_ptr = pinned.as_mut_ptr() as usize;
-    columns.par_iter().enumerate().for_each(|(c, col)| {
-        let dst =
-            unsafe { std::slice::from_raw_parts_mut((pinned_base_ptr as *mut u64).add(c * n), n) };
-        dst.copy_from_slice(col);
-    });
+    // Sequential pack (not `par_iter`): runs inside the held pinned-staging
+    // mutex (see `Backend::pinned_staging` docs). Per-worker staging slots
+    // give the outer parallelism back.
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
+    }
 
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
     for c in 0..m {
@@ -833,14 +823,11 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    // Pinned LDE → caller outputs (post-sync host memcpy).
-    let pinned_ptr = pinned.as_ptr() as usize;
-    outputs.par_iter_mut().enumerate().for_each(|(c, dst)| {
-        let src = unsafe {
-            std::slice::from_raw_parts((pinned_ptr as *const u64).add(c * lde_size), lde_size)
-        };
-        dst.copy_from_slice(src);
-    });
+    // Sequential pinned → caller outputs (not `par_iter_mut`): runs inside
+    // the held pinned-staging mutex (see `Backend::pinned_staging` docs).
+    for (c, dst) in outputs.iter_mut().enumerate() {
+        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+    }
     drop(staging);
 
     if keep_device_buf {

@@ -102,16 +102,26 @@ const STREAM_POOL_SIZE: usize = 32;
 pub struct Backend {
     pub ctx: Arc<CudaContext>,
     streams: Vec<Arc<CudaStream>>,
-    /// Single shared pinned staging buffer, grown to the biggest LDE size
-    /// seen. Concurrent batched LDE calls serialise on it; in exchange the
-    /// process keeps only ONE gigabyte-sized pinned allocation (per-stream
-    /// buffers 32×-inflated memory use and multiplied the one-time pinning
-    /// cost for every first use of a new table size).
-    pinned_staging: Mutex<PinnedStaging>,
-    /// Separate pinned staging for Merkle leaf hashes. Sized `num_rows * 32`
-    /// bytes. It lives alongside the LDE staging so the GPU→host D2H for
-    /// hashed leaves runs at full PCIe line-rate.
-    pinned_hashes: Mutex<PinnedStaging>,
+    /// Per-rayon-worker pinned staging buffers, grown lazily to the biggest
+    /// LDE size each worker sees. Indexed by `rayon::current_thread_index()`
+    /// (or 0 for non-rayon callers).
+    ///
+    /// Per-worker (not single-shared) because the LDE call holds the lock
+    /// across an internal rayon `par_chunks_mut`/`par_iter` window: with a
+    /// single shared mutex, rayon work-stealing can yield a lock-holder onto
+    /// another task waiting for the same lock — classic recursive-rayon
+    /// deadlock. Per-worker buffers eliminate cross-worker contention so
+    /// each `par_iter` worker hits a distinct mutex.
+    ///
+    /// Each entry starts empty (`PinnedStaging::empty()` is a zero-cost null
+    /// handle); only the slots actually used by the running workers ever
+    /// allocate pinned memory. Worst-case footprint is `N_workers ×
+    /// max_LDE_size` of pinned host RAM.
+    pinned_staging: Vec<Mutex<PinnedStaging>>,
+    /// Per-worker pinned staging for Merkle leaf hashes. Same layout as
+    /// `pinned_staging`; sized `num_rows * 32` bytes per slot. Lives
+    /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
+    pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
 
@@ -166,8 +176,20 @@ impl Backend {
         for _ in 0..STREAM_POOL_SIZE {
             streams.push(ctx.new_stream()?);
         }
-        let pinned_staging = Mutex::new(PinnedStaging::empty());
-        let pinned_hashes = Mutex::new(PinnedStaging::empty());
+        // Size to the rayon worker count, plus one for non-rayon callers
+        // who land on slot 0 (`rayon::current_thread_index()` returns None
+        // outside a rayon context — we map that to 0).
+        //
+        // `current_num_threads()` returns the default-pool size if no custom
+        // pool is in use, which is the cpu count. Stable across the
+        // backend's lifetime since rayon's pool is fixed at first use.
+        let n_slots = rayon::current_num_threads().max(1);
+        let pinned_staging: Vec<Mutex<PinnedStaging>> = (0..n_slots)
+            .map(|_| Mutex::new(PinnedStaging::empty()))
+            .collect();
+        let pinned_hashes: Vec<Mutex<PinnedStaging>> = (0..n_slots)
+            .map(|_| Mutex::new(PinnedStaging::empty()))
+            .collect();
         // Separate "utility" stream for twiddle uploads and other bookkeeping;
         // not part of the pool that callers rotate through.
         let util_stream = ctx.new_stream()?;
@@ -219,16 +241,29 @@ impl Backend {
         self.streams[idx].clone()
     }
 
-    /// Shared pinned staging buffer. Grows to the largest LDE the process
-    /// has seen so far. Concurrent callers serialise on the mutex.
+    /// Per-rayon-worker pinned staging buffer. Returns the slot for the
+    /// current worker (or slot 0 outside a rayon context). Grows lazily to
+    /// the largest LDE the worker has seen. See the field docs for the
+    /// rationale behind the per-worker split.
     pub fn pinned_staging(&self) -> &Mutex<PinnedStaging> {
-        &self.pinned_staging
+        &self.pinned_staging[self.worker_slot(self.pinned_staging.len())]
     }
 
-    /// Separate pinned staging for Merkle leaf hash output. Sized in u64
+    /// Per-worker pinned staging for Merkle leaf hash output. Sized in u64
     /// units. Caller should reserve `(num_rows * 32 + 7) / 8` u64s.
     pub fn pinned_hashes(&self) -> &Mutex<PinnedStaging> {
-        &self.pinned_hashes
+        &self.pinned_hashes[self.worker_slot(self.pinned_hashes.len())]
+    }
+
+    /// Map `rayon::current_thread_index()` to a slot index, with a defensive
+    /// clamp in case the rayon pool grew past the Vec we sized at init.
+    fn worker_slot(&self, len: usize) -> usize {
+        let idx = rayon::current_thread_index().unwrap_or(0);
+        // Should be unreachable with rayon's fixed default pool, but if a
+        // larger custom pool sneaks in we still want safety — fall back to
+        // slot 0 (correctness preserved, just contention).
+        debug_assert!(idx < len, "rayon worker {idx} >= staging slots {len}");
+        idx.min(len.saturating_sub(1))
     }
 
     pub fn fwd_twiddles_for(&self, log_n: u64) -> Result<Arc<CudaSlice<u64>>> {
