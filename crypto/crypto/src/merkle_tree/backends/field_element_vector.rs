@@ -71,6 +71,23 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementVectorBackend
     }
 }
 
+impl<F, D: Digest, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
+where
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    /// Hash raw bytes using the same digest (`D`) as this backend's leaf hashing.
+    /// Enables callers to pre-serialize field elements into a byte buffer and hash
+    /// once, avoiding per-element allocations while staying consistent with the
+    /// backend's hash function.
+    pub fn hash_bytes(data: &[u8]) -> [u8; NUM_BYTES] {
+        let mut hasher = D::new();
+        hasher.update(data);
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&hasher.finalize());
+        result
+    }
+}
+
 impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where

@@ -9,13 +9,13 @@ use math::field::{
     extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 
-use crate::constraints::transition::TransitionConstraint;
+use crate::constraints::transition::TransitionConstraintEvaluator;
 use crate::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
-use crate::prover::{IsStarkProver, Prover};
+use crate::test_utils::multi_prove_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
@@ -38,7 +38,7 @@ fn test_multiplicity_one() {
     fn sender_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Multiplicity::One means every row sends with multiplicity 1
@@ -61,7 +61,7 @@ fn test_multiplicity_one() {
     fn receiver_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver also uses Multiplicity::One
@@ -113,7 +113,7 @@ fn test_multiplicity_one() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -140,7 +140,7 @@ fn test_multiplicity_sum() {
     fn sender_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Multiplicity::Sum(0, 1) means multiplicity = col[0] + col[1]
@@ -163,7 +163,7 @@ fn test_multiplicity_sum() {
     fn receiver_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver uses Column(2) as multiplicity
@@ -223,7 +223,7 @@ fn test_multiplicity_sum() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
@@ -250,7 +250,7 @@ fn test_multiplicity_negated() {
     fn sender_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Multiplicity::Negated(0) means multiplicity = 1 - col[0]
@@ -274,7 +274,7 @@ fn test_multiplicity_negated() {
     fn receiver_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
                 TEST_BUS,
@@ -331,7 +331,7 @@ fn test_multiplicity_negated() {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];

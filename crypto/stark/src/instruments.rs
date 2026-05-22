@@ -1,12 +1,34 @@
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
+
+pub fn set_heap_reader(f: fn() -> Option<usize>) {
+    let _ = HEAP_READER.set(f);
+}
+
+pub fn heap_bytes() -> Option<usize> {
+    HEAP_READER.get().and_then(|f| f())
+}
+
+pub type HeapSnapshot = (&'static str, usize);
+
+pub fn snap(label: &'static str) -> Option<HeapSnapshot> {
+    heap_bytes().map(|b| (label, b))
+}
+
+pub struct ProveHeapProfile {
+    pub before: Option<usize>,
+    pub after_execute: Option<usize>,
+    pub after_trace_build: Option<usize>,
+    pub after_air: Option<usize>,
+}
 
 /// Sub-operation timing breakdown for a single table in Rounds 2-4.
 #[derive(Clone, Debug, Default)]
 pub struct TableSubOps {
-    /// reconstruct_round1 (expand_pool_to_lde)
-    pub trace_lde: Duration,
     /// evaluator.evaluate()
     pub constraints: Duration,
     /// decompose_and_extend_d2
@@ -28,11 +50,11 @@ pub struct TableSubOps {
 /// Sub-operation breakdown for Round 1 aux commit pass.
 #[derive(Clone, Debug, Default)]
 pub struct Round1SubOps {
-    /// Main trace: expand_pool_to_lde (LDE/FFT)
+    /// Main trace: expand_columns_to_lde (LDE/FFT)
     pub main_lde: Duration,
     /// Main trace: commit_columns_bit_reversed (Merkle)
     pub main_merkle: Duration,
-    /// Aux trace: expand_pool_to_lde (LDE/FFT)
+    /// Aux trace: expand_columns_to_lde (LDE/FFT)
     pub aux_lde: Duration,
     /// Aux trace: commit_columns_bit_reversed (Merkle)
     pub aux_merkle: Duration,
@@ -49,6 +71,7 @@ pub struct MultiProveTiming {
     pub round1_sub: Round1SubOps,
     /// (name, rows, duration, sub_ops) per table for rounds 2-4.
     pub table_timings: Vec<(String, usize, Duration, TableSubOps)>,
+    pub heap_snapshots: Vec<HeapSnapshot>,
 }
 
 /// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.

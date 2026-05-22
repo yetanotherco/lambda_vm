@@ -1,0 +1,26 @@
+[package]
+name = "math-cuda"
+description = "CUDA-accelerated FFT/NTT for Goldilocks (base field) used by the lambda-vm STARK prover"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "std",
+    "cuda-version-from-build-system",
+    "fallback-latest",
+    "dynamic-loading",
+] }
+math = { path = "../math" }
+rayon = "1.7"
+
+[dev-dependencies]
+crypto = { path = "../crypto" }
+rand = { version = "0.8.5", features = ["std"] }
+rand_chacha = "0.3.1"
+rayon = "1.7"
+sha3 = "0.10.8"
+stark = { path = "../stark" }

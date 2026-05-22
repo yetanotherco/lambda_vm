@@ -21,7 +21,7 @@
 //! - `carry[0]`, `carry[1]`: Carries from 64-bit addition
 //!
 //! ## Bus Interactions
-//! - Sender: IS_BYTE (×1 for next_pc_low[1])
+//! - Sender: ARE_BYTES (×1 for `[next_pc_low[1], 0]`, spec template `IS_BYTE<next_pc_low[1]>`)
 //! - Sender: AND_BYTE (×1 for masking LSB)
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
@@ -32,7 +32,6 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
@@ -230,20 +229,23 @@ pub fn generate_branch_trace(
 /// Creates all bus interactions for the BRANCH table.
 ///
 /// The BRANCH table:
-/// - **Sends** IS_BYTE lookup for next_pc_low[1] range check
+/// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
 /// - **Sends** AND_BYTE lookup for LSB masking (next_pc_low[0] = unmasked_low_byte & 254)
 /// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // IS_BYTE[next_pc_low[1]] - range check bits 8-15
+        // ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
         BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::NEXT_PC_LOW_1,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::NEXT_PC_LOW_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
         // AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
@@ -526,31 +528,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 

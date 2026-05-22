@@ -1,18 +1,24 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
+/// Memory-mapped private input region start address.
+/// Layout: 4-byte LE length prefix at this address, data at +4.
+/// The host pre-loads the input; the guest reads directly (no ecall).
+/// Must match `executor::vm::memory::PRIVATE_INPUT_START_INDEX`.
 #[cfg(target_arch = "riscv64")]
-// TODO: This should be properly defined
-const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
+pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
 #[cfg(target_arch = "riscv64")]
-enum SyscallNumbers {
+pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    GetPrivateInputs = 4,
     Commit = 64,
     Halt = 93,
 }
+
+/// Syscall number for KeccakPermute (u64::MAX - 1).
+#[cfg(target_arch = "riscv64")]
+const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
 #[cfg(target_arch = "riscv64")]
 /// This is a template for printing in the vm
@@ -76,36 +82,33 @@ pub fn commit(slice: &[u8]) {
     }
 }
 
+/// Read private input bytes from the memory-mapped region at
+/// `PRIVATE_INPUT_START = 0xFF000000`.
+///
+/// The host pre-loads the input before execution; this function reads the
+/// 4-byte LE length prefix and then copies the data bytes into a new `Vec`.
+/// No ecall is performed — it's a plain memory read (ZisK-style).
 #[cfg(target_arch = "riscv64")]
-pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
-    print_string("get_private_input called\n");
-    let mut dest = vec![0u8; MAX_PRIVATE_INPUT_SIZE];
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") dest.as_mut_ptr(),
-            in("a7") SyscallNumbers::GetPrivateInputs as usize,
-        )
-    }
-    let len = u32::from_le_bytes(
-        dest[0..4]
-            .try_into()
-            .map_err(|_| SyscallError::WrongPrivateInputSize)?,
-    ) as usize;
-    dest.drain(0..4);
-    dest.truncate(len);
-
-    Ok(dest)
+pub fn get_private_input() -> Vec<u8> {
+    // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
+    // execution. The 4-byte LE length prefix is always valid (written by the
+    // executor). The data pointer and length are within the memory-mapped region.
+    let len_ptr = PRIVATE_INPUT_START as *const u32;
+    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
+    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+    let slice = unsafe { core::slice::from_raw_parts(data_ptr, len) };
+    slice.to_vec()
 }
 
-#[derive(Debug)]
-pub enum SyscallError {
-    WrongPrivateInputSize,
+#[cfg(not(target_arch = "riscv64"))]
+pub fn get_private_input() -> Vec<u8> {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
-    print_string("sys_halt called\n");
+    // NOTE: no print_string here — the Print ecall is unmatched on the Ecall bus
+    // and would cause a verification failure.
     unsafe {
         asm!(
             "ecall",
@@ -118,6 +121,24 @@ pub fn sys_halt() -> ! {
 
 #[cfg(not(target_arch = "riscv64"))]
 pub fn sys_halt() -> ! {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
+pub fn keccak_permute(state: &mut [u64; 25]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a7") KECCAK_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
+pub fn keccak_permute(_state: &mut [u64; 25]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

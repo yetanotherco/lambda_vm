@@ -1,0 +1,7 @@
+[package]
+name = "fibonacci-program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = "6.0.1"

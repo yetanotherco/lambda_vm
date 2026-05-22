@@ -43,8 +43,9 @@ pub enum BusId {
     // =========================================================================
     // Range checks (BITWISE table provides)
     // =========================================================================
-    /// Range check: value is a valid byte [0, 256)
-    IsByte = 0,
+    /// `ARE_BYTES[X, Y]`: range check that both X and Y are valid bytes [0, 256).
+    /// Single-byte checks (spec template `IS_BYTE<X>`) send the second value as 0.
+    AreBytes = 0,
     /// Range check: value is a valid halfword [0, 2^16)
     IsHalfword,
     /// Range check: value is a 20-bit value [0, 2^20)
@@ -109,13 +110,17 @@ pub enum BusId {
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit,
+    /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
+    Keccak,
+    /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
+    KeccakRc,
 }
 
 impl BusId {
     /// Human-readable name for debug output.
     pub fn name(&self) -> &'static str {
         match self {
-            BusId::IsByte => "IsByte",
+            BusId::AreBytes => "AreBytes",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
             BusId::AndByte => "AndByte",
@@ -137,6 +142,8 @@ impl BusId {
             BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::Keccak => "Keccak",
+            BusId::KeccakRc => "KeccakRc",
         }
     }
 }
@@ -146,7 +153,7 @@ impl TryFrom<u64> for BusId {
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(BusId::IsByte),
+            0 => Ok(BusId::AreBytes),
             1 => Ok(BusId::IsHalfword),
             2 => Ok(BusId::IsB20),
             3 => Ok(BusId::AndByte),
@@ -168,6 +175,8 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
+            22 => Ok(BusId::Keccak),
+            23 => Ok(BusId::KeccakRc),
             other => Err(other),
         }
     }
@@ -668,7 +677,13 @@ impl DecodeEntry {
             }
 
             Instruction::CSR { .. } => {
-                // CSR instructions not yet supported in prover
+                // CSR instructions are executed as no-ops by the VM (see
+                // executor Instruction::CSR arm returning dst_val: 0,
+                // src1/2_val: 0). Mirror that here by treating them as
+                // `ADDI x0, x0, 0` — same pattern as `Fence`. This sets
+                // `op_add=true` so CM54's multiplicity is non-zero and the
+                // CPU's PC-update Memw sender fires.
+                entry.op_add = true;
             }
 
             Instruction::EcallEbreak => {

@@ -5,6 +5,7 @@ use crate::tables::bitwise::{
     generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
 use crate::tables::types::FE;
+use crate::test_utils::multi_prove_ram;
 use math::field::element::FieldElement;
 use stark::proof::options::ProofOptions;
 
@@ -94,7 +95,7 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 10 interactions (one for each lookup type; HWSLC merged into HWSL)
+    // Should have 10 interactions (one per lookup type; HWSLC merged into HWSL)
     assert_eq!(interactions.len(), 10);
 }
 
@@ -379,7 +380,7 @@ fn test_preprocessed_commitment_is_nonzero() {
 mod soundness_tests {
     use super::*;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use stark::constraints::transition::TransitionConstraint;
+    use stark::constraints::transition::TransitionConstraintEvaluator;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -418,7 +419,7 @@ mod soundness_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         use crate::tables::types::BusId;
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
                 BusId::AndByte,
@@ -469,7 +470,7 @@ mod soundness_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         use crate::tables::types::BusId;
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
                 BusId::AndByte,
@@ -590,7 +591,7 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
@@ -638,7 +639,7 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
@@ -708,7 +709,7 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =

@@ -1,14 +1,10 @@
 use super::boundary::BoundaryConstraints;
-#[cfg(all(debug_assertions, not(feature = "parallel")))]
-use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-#[cfg(not(feature = "parallel"))]
-use math::polynomial::Polynomial;
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
 use rayon::{
@@ -51,6 +47,7 @@ where
         logup_table_offset: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
+        let num_base = air.num_base_transition_constraints();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
@@ -86,6 +83,7 @@ where
                     || {
                         (
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                            vec![FieldElement::<Field>::zero(); num_base],
                             vec![FieldElement::<Field>::zero(); num_periodic],
                             Frame::preallocate(
                                 num_offsets,
@@ -95,7 +93,7 @@ where
                             ),
                         )
                     },
-                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                    |(transition_buf, base_buf, periodic_buf, frame), (i, boundary)| {
                         frame.fill_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
@@ -110,24 +108,38 @@ where
                             logup_table_offset,
                             &packing_shifts,
                         );
-                        air.compute_transition_into(&ctx, transition_buf);
+                        air.compute_transition_prover(&ctx, base_buf, transition_buf);
 
                         let acc_transition = if is_uniform {
                             // All constraints share one zerofier: factor it out of the sum.
                             let z = zerofier_data.get_uniform(i);
-                            let sum = transition_buf
+                            // F×E inner product for base constraints (3 muls per term)
+                            let mut sum = base_buf
                                 .iter()
-                                .zip(transition_coefficients)
+                                .zip(&transition_coefficients[..num_base])
                                 .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                            // E×E for extension constraints (9 muls per term)
+                            sum = transition_buf[num_base..]
+                                .iter()
+                                .zip(&transition_coefficients[num_base..])
+                                .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                             z * &sum
                         } else {
-                            transition_buf
+                            let mut sum = base_buf
                                 .iter()
                                 .enumerate()
-                                .zip(transition_coefficients)
+                                .zip(&transition_coefficients[..num_base])
                                 .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
                                     acc + zerofier_data.get(c_idx, i) * eval * beta
-                                })
+                                });
+                            sum = transition_buf[num_base..]
+                                .iter()
+                                .enumerate()
+                                .zip(&transition_coefficients[num_base..])
+                                .fold(sum, |acc, ((j, eval), beta)| {
+                                    acc + zerofier_data.get(num_base + j, i) * eval * beta
+                                });
+                            sum
                         };
 
                         acc_transition + boundary
@@ -140,6 +152,7 @@ where
         #[cfg(not(feature = "parallel"))]
         {
             let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
+            let mut base_buf = vec![FieldElement::<Field>::zero(); num_base];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
             let mut frame =
                 Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
@@ -162,23 +175,37 @@ where
                         logup_table_offset,
                         &packing_shifts,
                     );
-                    air.compute_transition_into(&ctx, &mut transition_buf);
+                    air.compute_transition_prover(&ctx, &mut base_buf, &mut transition_buf);
 
                     let acc_transition = if is_uniform {
                         let z = zerofier_data.get_uniform(i);
-                        let sum = transition_buf
+                        // F×E inner product for base constraints (3 muls per term)
+                        let mut sum = base_buf
                             .iter()
-                            .zip(transition_coefficients)
+                            .zip(&transition_coefficients[..num_base])
                             .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                        // E×E for extension constraints (9 muls per term)
+                        sum = transition_buf[num_base..]
+                            .iter()
+                            .zip(&transition_coefficients[num_base..])
+                            .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                         z * &sum
                     } else {
-                        transition_buf
+                        let mut sum = base_buf
                             .iter()
                             .enumerate()
-                            .zip(transition_coefficients)
+                            .zip(&transition_coefficients[..num_base])
                             .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
                                 acc + zerofier_data.get(c_idx, i) * eval * beta
-                            })
+                            });
+                        sum = transition_buf[num_base..]
+                            .iter()
+                            .enumerate()
+                            .zip(&transition_coefficients[num_base..])
+                            .fold(sum, |acc, ((j, eval), beta)| {
+                                acc + zerofier_data.get(num_base + j, i) * eval * beta
+                            });
+                        sum
                     };
 
                     acc_transition + boundary
@@ -249,9 +276,6 @@ where
                 })
                 .collect::<Vec<Vec<FieldElement<Field>>>>();
 
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
-
         let trace_length = domain.interpolation_domain_size;
         let lde_periodic_columns = air
             .get_periodic_column_polynomials(trace_length)
@@ -295,15 +319,6 @@ where
                     )
             })
             .collect();
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let boundary_zerofiers = Vec::new();
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        check_boundary_polys_divisibility(boundary_polys, boundary_zerofiers);
-
-        #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let _transition_evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
 
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
 

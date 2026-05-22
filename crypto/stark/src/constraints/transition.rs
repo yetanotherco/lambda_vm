@@ -7,9 +7,9 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
 
-/// TransitionConstraint represents the behaviour that a transition constraint
+/// TransitionConstraintEvaluator represents the behaviour that a transition constraint
 /// over the computation that wants to be proven must comply with.
-pub trait TransitionConstraint<F, E>: Send + Sync
+pub trait TransitionConstraintEvaluator<F, E>: Send + Sync
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
@@ -30,7 +30,7 @@ where
     /// the evaluation.
     /// Once computed, the evaluation should be inserted in the `transition_evaluations`
     /// vector, in the index corresponding to the constraint as given by `constraint_idx()`.
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -82,6 +82,27 @@ where
     /// Default value is 0, meaning the constraint applies to all rows including the last.
     fn end_exemptions(&self) -> usize {
         0
+    }
+
+    /// Prover-optimized evaluation that writes base-field constraints to `base_evals`
+    /// and extension-field constraints to `ext_evals`.
+    ///
+    /// Constraints with `constraint_idx() < base_evals.len()` are "base" constraints
+    /// and MUST override this to write `FieldElement<F>` into `base_evals[constraint_idx()]`.
+    /// Extension constraints (LogUp etc.) use the default, which asserts the index is
+    /// in the extension range and delegates to `evaluate()`.
+    fn evaluate_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    ) {
+        debug_assert!(
+            self.constraint_idx() >= base_evals.len(),
+            "Base constraint idx {} must override evaluate_prover()",
+            self.constraint_idx(),
+        );
+        self.evaluate_verifier(evaluation_context, ext_evals);
     }
 
     /// Method for calculating the end exemptions polynomial.
@@ -265,5 +286,147 @@ where
         .inv()
         .unwrap()
             * end_exemptions_poly.evaluate(z)
+    }
+}
+
+// =============================================================================
+// User-facing TransitionConstraint trait + adapter
+// =============================================================================
+
+use crate::table::TableView;
+
+/// User-facing trait for defining transition constraints.
+///
+/// Implement `evaluate()` to define the polynomial identity; the verifier and
+/// prover evaluation paths are auto-generated via `.boxed()`.
+///
+/// The `evaluate` method is generic over its field types so the same polynomial
+/// works for both the prover (`TableView<F, E>`) and verifier (`TableView<E, E>`).
+pub trait TransitionConstraint<F, E>: Send + Sync
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    /// The degree of the constraint as a multivariate polynomial.
+    fn degree(&self) -> usize;
+
+    /// Unique index in `[0, N)` where N is the total number of transition constraints.
+    fn constraint_idx(&self) -> usize;
+
+    /// Number of exempted rows at the end of the trace.
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    /// Evaluate the constraint polynomial on a trace step.
+    ///
+    /// Generic over the field so the same polynomial works for both
+    /// prover (FF=F, returns FieldElement<F>) and verifier (FF=E, returns FieldElement<E>).
+    fn evaluate<FF, EE>(&self, step: &TableView<FF, EE>) -> FieldElement<FF>
+    where
+        FF: IsSubFieldOf<EE>,
+        EE: IsField;
+
+    /// Periodicity (default 1 = every row).
+    fn period(&self) -> usize {
+        1
+    }
+
+    /// Offset for periodic application (default 0).
+    fn offset(&self) -> usize {
+        0
+    }
+
+    /// Exemptions period (default None).
+    fn exemptions_period(&self) -> Option<usize> {
+        None
+    }
+
+    /// Offset for periodic exemptions (default None).
+    fn periodic_exemptions_offset(&self) -> Option<usize> {
+        None
+    }
+
+    /// Wrap into a boxed `TransitionConstraintEvaluator` for the evaluator.
+    ///
+    /// The adapter auto-generates `evaluate_verifier()` and `evaluate_prover()`
+    /// from the generic `evaluate()`.
+    fn boxed(self) -> Box<dyn TransitionConstraintEvaluator<F, E>>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(TransitionConstraintAdapter(self))
+    }
+}
+
+/// Adapter: implements `TransitionConstraintEvaluator` for any `TransitionConstraint`.
+///
+/// Auto-generates `evaluate_verifier()` (E×E path) and `evaluate_prover()` (F path)
+/// from the user's generic `evaluate()`.
+pub struct TransitionConstraintAdapter<T>(pub T);
+
+impl<T, F, E> TransitionConstraintEvaluator<F, E> for TransitionConstraintAdapter<T>
+where
+    T: TransitionConstraint<F, E> + 'static,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn degree(&self) -> usize {
+        self.0.degree()
+    }
+    fn constraint_idx(&self) -> usize {
+        self.0.constraint_idx()
+    }
+    fn end_exemptions(&self) -> usize {
+        self.0.end_exemptions()
+    }
+    fn period(&self) -> usize {
+        self.0.period()
+    }
+    fn offset(&self) -> usize {
+        self.0.offset()
+    }
+    fn exemptions_period(&self) -> Option<usize> {
+        self.0.exemptions_period()
+    }
+    fn periodic_exemptions_offset(&self) -> Option<usize> {
+        self.0.periodic_exemptions_offset()
+    }
+
+    fn evaluate_verifier(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        evals: &mut [FieldElement<E>],
+    ) {
+        let idx = self.0.constraint_idx();
+        match ctx {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                evals[idx] = self.0.evaluate(frame.get_evaluation_step(0)).to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                evals[idx] = self.0.evaluate(frame.get_evaluation_step(0));
+            }
+        }
+    }
+
+    fn evaluate_prover(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    ) {
+        let idx = self.0.constraint_idx();
+        if idx < base_evals.len() {
+            // Base-field fast path: write FieldElement<F> directly
+            if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
+                base_evals[idx] = self.0.evaluate(frame.get_evaluation_step(0));
+            } else {
+                unreachable!("evaluate_prover called with non-Prover context");
+            }
+        } else {
+            // Fallback: AIR did not opt into base-field splitting,
+            // delegate to the verifier path which writes E evals.
+            self.evaluate_verifier(ctx, ext_evals);
+        }
     }
 }

@@ -40,8 +40,7 @@ where
     }
 
     pub fn sample(&mut self) -> [u8; 32] {
-        let mut result_hash = [0_u8; 32];
-        result_hash.copy_from_slice(&self.hasher.finalize_reset());
+        let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
         result_hash.reverse();
         self.hasher.update(result_hash);
         result_hash

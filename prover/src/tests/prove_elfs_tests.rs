@@ -15,10 +15,9 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -29,6 +28,7 @@ use executor::elf::Elf;
 
 // Import shared utilities
 use crate::VmAirs;
+use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
 type F = GoldilocksField;
@@ -60,11 +60,11 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(_) => return false,
-        };
+    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -106,7 +106,7 @@ fn test_cpu_only_no_bus() {
     let proof_options = ProofOptions::default_test_options();
 
     // Create AIR with NO bus interactions
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![], // NO bus interactions
     };
@@ -125,7 +125,7 @@ fn test_cpu_only_no_bus() {
         _,
     )> = vec![(&cpu_air, &mut cpu_trace, &())];
 
-    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Prover failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
@@ -158,7 +158,8 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -597,7 +598,8 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -607,7 +609,8 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memws.is_empty(),
         "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
@@ -624,7 +627,8 @@ fn test_prove_elfs_test_sb_sh_8() {
 #[test]
 fn test_prove_elfs_lw_sw() {
     let (elf, logs, _instructions) = run_asm_elf("lw_sw");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memw_aligneds.is_empty(),
         "lw_sw should produce MEMW_A rows for aligned word accesses"
@@ -644,7 +648,8 @@ fn test_prove_elfs_lw_sw() {
 #[test]
 fn test_prove_elfs_test_memw_split_ts() {
     let (elf, logs, _instructions) = run_asm_elf("test_memw_split_ts");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         !traces.memws.is_empty(),
         "test_memw_split_ts should produce MEMW rows (split old_timestamps from sb+sb+lh)"
@@ -683,7 +688,8 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -717,6 +723,101 @@ fn test_prove_elfs_all_instructions_64() {
 }
 
 #[test]
+fn test_prove_elfs_keccak() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    // Must use from_elf_and_logs (not from_logs_minimal) because keccak accesses
+    // RAM (stack memory), which requires PAGE tables for Memory bus balance.
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak prove/verify failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_keccak_multi_call() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest initializes lane[i] = i + 1 and applies keccak-f[1600] three times.
+    // Cross-check the committed output against tiny-keccak's independent
+    // implementation of the permutation.
+    let mut expected_state: [u64; 25] = core::array::from_fn(|i| (i + 1) as u64);
+    for _ in 0..3 {
+        tiny_keccak::keccakf(&mut expected_state);
+    }
+    let mut expected_bytes = Vec::with_capacity(200);
+    for lane in expected_state {
+        expected_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed state must match tiny-keccak after 3 keccak-f[1600] calls"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak multi-call prove/verify failed"
+    );
+}
+
+/// Verifier REJECTS a forged trace where an addr byte cell is set to a
+/// non-byte field element.
+///
+/// Without the ARE_BYTES range checks on addr(0..7), an attacker could keep
+/// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
+/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// alignment check) and folding the carry into addr(1) as a non-byte
+/// FE-element. This test asserts that mutating addr(1) to a non-byte value
+/// unbalances the verifier's bus checks and the proof is rejected.
+#[test]
+fn test_prove_elfs_keccak_unaligned_state_addr() {
+    use crate::tables::keccak::cols as keccak_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
+    // value outside [0, 256). The new ARE_BYTES bus sender will emit this
+    // value with multiplicity MU=1; the ARE_BYTES preprocessed table only
+    // contains 0..256, so the bus cannot balance.
+    traces.keccak.main_table.set(
+        0,
+        keccak_cols::addr(1),
+        FieldElement::<GoldilocksField>::from(257u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a keccak proof whose addr cells are not bytes"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
@@ -731,7 +832,8 @@ fn test_prove_elfs_test_commit_4() {
         "Public output should match committed bytes"
     );
 
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -756,7 +858,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs
     let table_counts = traces.table_counts();
@@ -767,14 +870,14 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1004,7 +1107,7 @@ fn test_debug_memory_bus_tokens() {
 
     let z: i128 = 1000;
     let alpha: i128 = 2;
-    let bus_id: i128 = 17; // BusId::Memory
+    let bus_id: i128 = 16; // BusId::Memory
 
     // Compute fingerprint for a token
     let fingerprint =
@@ -1126,7 +1229,15 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        &Default::default(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
@@ -1382,57 +1493,58 @@ fn test_debug_memory_tokens_sb_sh() {
         println!("Found {} imbalanced memory tokens", imbalanced);
     }
 
-    // === Count IS_BYTE lookups from PAGE (C1 init + C2 fini) ===
-    println!("\n=== IS_BYTE Lookup Counts (from PAGE tables) ===");
-    let mut is_byte_from_page = [0u64; 256];
+    // === Count ARE_BYTES lookups from PAGE (batched [init, fini] per row) ===
+    println!("\n=== ARE_BYTES Lookup Counts (from PAGE tables) ===");
+    let mut page_pair_counts: HashMap<(u8, u8), u64> = HashMap::new();
     let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
     for (page_idx, page_trace) in traces.pages.iter().enumerate() {
         let page_size = traces.page_configs[page_idx].page_size;
         for row in 0..page_trace.num_rows().min(page_size) {
-            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as usize;
-            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as usize;
-            is_byte_from_page[init] += 1; // C1
-            is_byte_from_page[fini] += 1; // C2
+            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as u8;
+            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as u8;
+            *page_pair_counts.entry((init, fini)).or_insert(0) += 1;
         }
     }
+    let page_are_bytes_total: u64 = page_pair_counts.values().sum();
     println!(
-        "Total PAGE rows: {}, Expected IS_BYTE: {} (2 per row)",
-        total_page_rows,
-        total_page_rows * 2
+        "Total PAGE rows: {}, Expected ARE_BYTES (1 per row): {}",
+        total_page_rows, total_page_rows,
     );
     println!(
-        "IS_BYTE[0]: {} lookups (most bytes are 0)",
-        is_byte_from_page[0]
+        "ARE_BYTES[0, 0] from PAGE: {} lookups (most rows are (0,0))",
+        page_pair_counts.get(&(0, 0)).copied().unwrap_or(0)
     );
 
-    // Check if bitwise table has matching multiplicities for IS_BYTE
-    // IS_BYTE uses rows 0..255 for each byte value, MU_IS_BYTE is column 17
+    // BITWISE row for ARE_BYTES[X, Y] at Z=0 is X + 256*Y. We only sum
+    // multiplicity at the (X, Y) pairs PAGE actually touches. Other senders
+    // (e.g. CPU's paired ARE_BYTES checks) also bump this same MU_ARE_BYTES
+    // column and may hit the same (X, Y) rows, so this is a coarse sanity
+    // check (BITWISE mult >= PAGE's contribution), not an exact balance.
     use crate::tables::bitwise::cols as bitwise_cols;
-    let bitwise_is_byte_mult: u64 = (0..256usize)
-        .map(|byte_val| {
-            // IS_BYTE lookup is at row with X=byte_val, Y=0, Z=0
-            // Row index = X + Y*256 + Z*256*256 = X (for Y=0, Z=0)
+    let bitwise_are_bytes_mult_over_page_pairs: u64 = page_pair_counts
+        .keys()
+        .map(|&(x, y)| {
+            let row = x as usize + 256 * y as usize;
             traces
                 .bitwise
                 .main_table
-                .get(byte_val, bitwise_cols::MU_IS_BYTE)
+                .get(row, bitwise_cols::MU_ARE_BYTES)
                 .to_raw()
         })
         .sum();
     println!(
-        "Bitwise IS_BYTE total multiplicity: {}",
-        bitwise_is_byte_mult
-    );
-
-    // Also count total IS_BYTE lookups expected from collect_bitwise_from_page
-    let is_byte_total_from_page: u64 = is_byte_from_page.iter().sum();
-    println!(
-        "Total IS_BYTE lookups from PAGE (counted): {}",
-        is_byte_total_from_page
+        "Bitwise ARE_BYTES mult summed over PAGE (init, fini) rows: {}",
+        bitwise_are_bytes_mult_over_page_pairs
     );
     println!(
-        "Difference: {} (should be 0 if PAGE IS_BYTE matches Bitwise)",
-        bitwise_is_byte_mult as i64 - is_byte_total_from_page as i64
+        "Total ARE_BYTES lookups from PAGE (counted): {}",
+        page_are_bytes_total
+    );
+    // Note: this can be >= 0 because CPU byte-pair ARE_BYTES senders may also
+    // hit some of the same (init, fini) rows. It should never be negative.
+    println!(
+        "Difference: {} (>= 0 expected; PAGE pairs may also receive from CPU)",
+        bitwise_are_bytes_mult_over_page_pairs as i64 - page_are_bytes_total as i64
     );
 
     // === Verify PAGE AIR uses correct page_base ===
@@ -1456,7 +1568,8 @@ fn test_debug_memory_tokens_sb_sh() {
 #[test]
 fn test_deep_stack_passes() {
     let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1477,7 +1590,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1493,13 +1607,13 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1536,7 +1650,8 @@ fn test_deep_stack_missing_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
@@ -1547,13 +1662,13 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1580,20 +1695,22 @@ fn test_deep_stack_missing_pages_rejected() {
 // Heap allocation tests (runtime page detection)
 // =============================================================================
 
-/// heap_alloc writes to 4 pages (0x80000..0x83000) far from ELF segments and
+/// heap_alloc writes to addresses 0x80000..0x83000 far from ELF segments and
 /// stack, plus a stack write. Tests that MemoryState-based page detection
 /// discovers all heap and stack pages, and run-length encodes them.
+/// With 256KB pages, all 4 writes (0x80000..0x83000) fit in a single page.
 #[test]
 fn test_heap_alloc_passes() {
     let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
 
-    // Verify runtime_page_ranges encodes the heap pages as a contiguous range
+    // Verify runtime_page_ranges includes the heap page
     let ranges = traces.runtime_page_ranges();
-    // 4 contiguous heap pages (0x80000..0x83000) should be one range
+    // With 256KB pages, all 4 writes land on one page containing 0x80000
     assert!(
-        ranges.iter().any(|r| r.base == 0x80000 && r.count == 4),
-        "Expected contiguous heap range (0x80000, 4), got {:?}",
+        ranges.iter().any(|r| r.base == 0x80000 && r.count == 1),
+        "Expected heap range (0x80000, 1), got {:?}",
         ranges
     );
 
@@ -1614,16 +1731,17 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
 
-    // Should have a range covering heap pages 0x80000..0x83000
+    // With 256KB pages, all heap writes fit in 1 page + 1 stack page
     let total_pages: u64 = runtime_page_ranges.iter().map(|r| r.count).sum();
     assert!(
-        total_pages >= 5,
-        "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",
+        total_pages >= 2,
+        "Expected at least 2 runtime pages (1 heap + 1 stack), got {}",
         total_pages
     );
 
@@ -1634,13 +1752,13 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
     );
-    let proof = Prover::multi_prove(
+    let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1789,7 +1907,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 5);
+    assert_eq!(verifier_air_refs.len(), 8);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
@@ -1806,7 +1924,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         (&airs.decode, &mut decode_trace, &()),
     ];
 
-    let proof = Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
         .expect("Proof generation should succeed");
 
     assert_eq!(proof.proofs.len(), 2);
@@ -1899,6 +2017,295 @@ fn test_verify_rejects_inflated_table_counts() {
     );
 }
 
+/// Proves a program that uses W-suffix instructions (ADDIW, SRLIW) on a
+/// register holding a 64-bit value with non-zero upper 32 bits.
+/// Verifies that the full 64-bit value is preserved in the MEMW_R chain.
+#[test]
+fn test_prove_wsuffix_64bit() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_wsuffix_64bit");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
+    assert!(result, "W-suffix 64-bit register test should verify");
+}
+
+/// Proves a minimal Rust std program that uses `init_allocator()` and
+/// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
+/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
+/// the Rust toolchain, and the allocator's memory access patterns.
+#[test]
+fn test_prove_allocator_minimal_reproducer() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
+            .expect("allocator.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "allocator.elf should verify"
+    );
+    assert_eq!(proof.public_output, b"Hello World");
+}
+
+/// Minimal Rust program that proves: no_std, no_main, no allocator, no
+/// syscalls crate. Only Commit + Halt ecalls (both have receivers).
+#[test]
+fn test_pure_commit_rust() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
+            .expect("pure_commit.elf not found — run `make compile-programs-rust`");
+    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "pure_commit.elf should verify"
+    );
+    assert_eq!(proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+/// Backward-compatibility: `prove_with_inputs` with empty input must match `prove`.
+#[test]
+fn test_prove_with_input_empty() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let result =
+        crate::prove_with_inputs(&elf_bytes, &[]).expect("prove_with_inputs should succeed on sub");
+    assert!(
+        crate::verify(&result, &elf_bytes).expect("verify should not error"),
+        "prove_with_inputs(empty) proof should verify"
+    );
+}
+
+/// ASM test: reads private input from 0xFF000000, commits 8 bytes.
+#[test]
+fn test_prove_private_input_xpage() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let proof =
+        crate::prove_with_inputs(&elf_bytes, &input).expect("prove_with_inputs should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "proof should verify"
+    );
+    assert_eq!(proof.public_output, input[4..12].to_vec());
+}
+
+/// Same ASM, different input values — output depends on input.
+#[test]
+fn test_prove_private_input_different_values() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = vec![
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+        0x00,
+    ];
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "proof should verify"
+    );
+    assert_eq!(proof.public_output, input[4..12].to_vec());
+}
+
+/// End-to-end: EF zkVM IO interface — demo guest reads its private input via
+/// `read_input` and emits it back through TWO `write_output` calls. The
+/// COMMIT AIR's running `x254` index concatenates them; the resulting proof's
+/// `public_output` must equal the original input.
+#[test]
+fn test_prove_ef_io_demo_concatenates() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_demo.elf"))
+            .expect("ef_io_demo.elf not found — run `make compile-programs-rust`");
+    let input: &[u8] = b"hello world!";
+    let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "ef_io_demo should verify"
+    );
+    assert_eq!(
+        proof.public_output, input,
+        "two write_output calls must concatenate"
+    );
+}
+
+/// End-to-end: Rust std program with private input.
+#[test]
+fn test_prove_commit_sum() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/commit_sum.elf"))
+            .expect("commit_sum.elf not found — run `make compile-programs-rust`");
+    let input = &[3u8, 5u8];
+    let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        "commit_sum should verify"
+    );
+    assert_eq!(proof.public_output, vec![8u8]);
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_empty_block() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex empty block should verify"
+    );
+    assert_eq!(proof.public_output.len(), 160);
+}
+
+// =============================================================================
+// Security: private-input tamper tests
+// =============================================================================
+
+/// Verifier must reject when num_private_input_pages is zeroed out.
+/// The proof contains a non-preprocessed PAGE sub-proof for the private input,
+/// but the verifier expects 0 such pages → proof count mismatch.
+#[test]
+fn test_verify_rejects_tampered_num_private_input_pages_zero() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    // Baseline: untampered proof must verify.
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("verify should not error"),
+        "Baseline proof must verify before tampering"
+    );
+    assert!(
+        vm_proof.num_private_input_pages > 0,
+        "proof should have private pages"
+    );
+
+    // Tamper: zero out private input pages.
+    let tampered = crate::VmProof {
+        num_private_input_pages: 0,
+        ..vm_proof
+    };
+
+    let result = crate::verify(&tampered, &elf_bytes);
+    assert!(
+        result.is_err() || !result.unwrap(),
+        "Verifier must reject proof with num_private_input_pages zeroed out"
+    );
+}
+
+/// Verifier must reject when num_private_input_pages is inflated beyond actual.
+/// The proof has 1 private page but we claim 2 → proof count mismatch.
+#[test]
+fn test_verify_rejects_inflated_num_private_input_pages() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    assert_eq!(
+        vm_proof.num_private_input_pages, 1,
+        "16 bytes fits in 1 page"
+    );
+
+    let tampered = crate::VmProof {
+        num_private_input_pages: 2,
+        ..vm_proof
+    };
+
+    let result = crate::verify(&tampered, &elf_bytes);
+    assert!(
+        result.is_err() || !result.unwrap(),
+        "Verifier must reject proof with inflated num_private_input_pages"
+    );
+}
+
+/// Verifier must reject num_private_input_pages that exceeds the max bound.
+/// The early bounds check should catch this before constructing AIRs.
+#[test]
+fn test_verify_rejects_num_private_input_pages_exceeds_max() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    let tampered = crate::VmProof {
+        num_private_input_pages: 1000,
+        ..vm_proof
+    };
+
+    assert!(
+        crate::verify(&tampered, &elf_bytes).is_err(),
+        "Verifier must error on num_private_input_pages exceeding max"
+    );
+}
+
+/// Verifier must reject tampered public_output when private input is used.
+/// Ensures the COMMIT bus balance check still works with non-preprocessed pages.
+#[test]
+fn test_verify_rejects_private_input_with_tampered_public_output() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0u8..16).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    assert!(
+        crate::verify(&vm_proof, &elf_bytes).expect("verify"),
+        "Baseline must verify"
+    );
+
+    let mut tampered_output = vm_proof.public_output.clone();
+    tampered_output[0] ^= 0x01;
+    let tampered = crate::VmProof {
+        public_output: tampered_output,
+        ..vm_proof
+    };
+
+    let verified =
+        crate::verify(&tampered, &elf_bytes).expect("verify should not error on tampered output");
+    assert!(
+        !verified,
+        "Verifier must reject proof with tampered public_output (private input present)"
+    );
+}
+
+/// VmProof must not contain a field that stores the raw private input bytes.
+/// This is a structural check: the proof struct should only carry
+/// `num_private_input_pages`, not the actual input data.
+#[test]
+fn test_proof_does_not_contain_private_input_field() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let input: Vec<u8> = (0xA0u8..0xB0).collect();
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
+
+    // The VmProof struct should only contain num_private_input_pages (a count),
+    // not the actual bytes. Verify the proof's public fields don't contain them.
+    assert_eq!(vm_proof.num_private_input_pages, 1);
+    // public_output is the committed output, NOT the private input.
+    // It should contain bytes [4..12] of the input (what the ASM program commits).
+    assert_eq!(vm_proof.public_output, input[4..12].to_vec());
+    // No `private_input` field exists — this is enforced by the type system,
+    // but explicitly document that the proof carries only the page count.
+    assert!(
+        vm_proof.num_private_input_pages <= 1,
+        "Only the page count is stored, not the bytes"
+    );
+}
+
 /// Regression test: addiw with negative immediate must verify.
 /// arg2_sign_bit is the sign bit of rv2 (bit 31), not of arg2, per spec
 /// constraint CPU-CE61: MSB16[arg2_sign_bit; rv2[1]].
@@ -1908,4 +2315,21 @@ fn test_addiw_neg_immediate() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_addiw_neg");
     let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(result, "addiw with negative immediate should verify");
+}
+
+/// Regression test: both main and aux field element counts must be nonzero for any real ELF.
+/// Guards against silent under-count if a table is added to `Traces` but not enumerated in
+/// `total_field_elements` or `total_auxiliary_field_elements`.
+#[test]
+fn test_count_elements_nonzero() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("addi_one");
+    let (main, aux) = crate::count_elements(&elf_bytes, &[]).expect("count_elements failed");
+    assert!(
+        main > 0,
+        "total_field_elements should be nonzero (got {main})"
+    );
+    assert!(
+        aux > 0,
+        "total_auxiliary_field_elements should be nonzero (got {aux})"
+    );
 }

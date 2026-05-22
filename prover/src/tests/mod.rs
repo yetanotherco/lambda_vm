@@ -10,10 +10,14 @@ pub mod branch_constraints_tests;
 pub mod commit_tests;
 #[cfg(test)]
 pub mod constraints_tests;
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
 pub mod cpu_tests;
 #[cfg(test)]
 pub mod decode_tests;
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]

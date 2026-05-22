@@ -36,11 +36,10 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -713,51 +712,23 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedC
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let v = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = v.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let v = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = v;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
 /// Creates all constraints for the MEMW_A table (4 total).
-pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     vec![
-        Box::new(MemwAlignedConstraint::new(
-            MemwAlignedConstraintKind::MuSumIsBit,
-            0,
-        )),
-        Box::new(MemwAlignedConstraint::new(
-            MemwAlignedConstraintKind::W2ImpliesMuSum,
-            1,
-        )),
-        Box::new(IsBitConstraint::unconditional(cols::MU_READ, 2)),
-        Box::new(IsBitConstraint::unconditional(cols::MU_WRITE, 3)),
+        MemwAlignedConstraint::new(MemwAlignedConstraintKind::MuSumIsBit, 0).boxed(),
+        MemwAlignedConstraint::new(MemwAlignedConstraintKind::W2ImpliesMuSum, 1).boxed(),
+        IsBitConstraint::unconditional(cols::MU_READ, 2).boxed(),
+        IsBitConstraint::unconditional(cols::MU_WRITE, 3).boxed(),
     ]
 }
 

@@ -1,11 +1,19 @@
-# LambdaVM specification
-This repository contains specification for [`LambdaVM`](https://github.com/yetanotherco/lambda_vm).
-The specification is written in [`Typst`](https://typst.app/) and can be rendered by [`shiroa`](https://myriad-dreamin.github.io/shiroa/) as either a file (pdf) or a wiki (html).
+# Lambda VM Specification
 
-## Installation & Development setup
-1. [Install `Typst`](https://github.com/typst/typst?tab=readme-ov-file#installation).
-2. [Install `shiroa`](https://myriad-dreamin.github.io/shiroa/guide/installation.html).
-3. Clone this repository.
-4. Open the repository in a terminal and execute `shiroa serve`.
+Formal specification of the Lambda VM. Covers the per-chip AIR constraints (CPU, decode, bitwise, branch, LT, shift, MUL, DVRM, MEMW, LOAD, page, register, halt, commit, keccak), the memory argument, and the LogUp lookup framework that links the tables.
 
-At this point, the wiki version is hosted locally and is actively updated as you modify the specification files.
+The specification is written in [Typst](https://typst.app/) and rendered as either a PDF or a browsable HTML wiki using [shiroa](https://myriad-dreamin.github.io/shiroa/).
+
+## Rendering it locally
+
+1. [Install Typst](https://github.com/typst/typst?tab=readme-ov-file#installation).
+2. [Install shiroa](https://myriad-dreamin.github.io/shiroa/guide/installation.html).
+3. From this directory, run:
+
+   ```sh
+   shiroa serve
+   ```
+
+   shiroa will host the HTML wiki locally and live-reload as you edit the `.typ` source files.
+
+To produce a PDF instead, see the shiroa documentation for the `build` command.
