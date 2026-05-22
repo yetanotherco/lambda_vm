@@ -161,6 +161,11 @@ where
     precomputed_tree: Option<Arc<BatchedMerkleTree<Field>>>,
     precomputed_root: Option<Commitment>,
     num_precomputed_cols: usize,
+    /// Device-side LDE buffer kept for downstream GPU rounds when the R1 fused
+    /// pipeline produced one. Carried alongside the commit data so the
+    /// .zip() chain in Phase D stays compiler-aligned by construction.
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
 }
 
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
@@ -220,8 +225,13 @@ pub struct MainTraceCommitResult<Field: IsFFTField>
 where
     FieldElement<Field>: AsBytes,
 {
-    pub(crate) tree: BatchedMerkleTree<Field>,
-    pub(crate) root: Commitment,
+    /// Primary commitment tree: the main trace for `commit_main_trace`, the
+    /// multiplicity columns for `commit_preprocessed_trace`.
+    pub(crate) commit_tree: BatchedMerkleTree<Field>,
+    /// Root of `commit_tree`.
+    pub(crate) commit_root: Commitment,
+    /// Secondary tree for preprocessed traces: the static precomputed columns.
+    /// `None` for non-preprocessed tables.
     pub(crate) precomputed_tree: Option<BatchedMerkleTree<Field>>,
     pub(crate) precomputed_root: Option<Commitment>,
     pub(crate) num_precomputed_cols: usize,
@@ -637,7 +647,9 @@ pub trait IsStarkProver<
             columns,
             domain.blowup_factor,
             &twiddles.coset_weights,
-        ) {
+        )
+        .is_some()
+        {
             return;
         }
 
@@ -688,14 +700,16 @@ pub trait IsStarkProver<
             {
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
-                #[cfg(feature = "instruments")]
-                let zero = std::time::Duration::from_secs(0);
                 let root = tree.root;
+                // Fused GPU path produces LDE + leaves + tree as one pipeline,
+                // so the wall-clock total lands in `main_lde_dur`. Bill the
+                // merkle bucket equal to LDE so the sum (lde + merkle) stays
+                // comparable to the non-GPU path's combined LDE+commit total.
                 #[cfg(feature = "instruments")]
-                crate::instruments::accum_r1_main(main_lde_dur, zero);
+                crate::instruments::accum_r1_main(main_lde_dur, main_lde_dur);
                 return Ok(MainTraceCommitResult {
-                    tree,
-                    root,
+                    commit_tree: tree,
+                    commit_root: root,
                     precomputed_tree: None,
                     precomputed_root: None,
                     num_precomputed_cols: 0,
@@ -730,8 +744,8 @@ pub trait IsStarkProver<
         }
 
         Ok(MainTraceCommitResult {
-            tree,
-            root,
+            commit_tree: tree,
+            commit_root: root,
             precomputed_tree: None,
             precomputed_root: None,
             num_precomputed_cols: 0,
@@ -797,8 +811,8 @@ pub trait IsStarkProver<
         }
 
         Ok(MainTraceCommitResult {
-            tree: mult_tree,
-            root: mult_root,
+            commit_tree: mult_tree,
+            commit_root: mult_root,
             precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
@@ -1804,9 +1818,6 @@ pub trait IsStarkProver<
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
-        #[cfg(feature = "cuda")]
-        let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
-            Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1851,17 +1862,17 @@ pub trait IsStarkProver<
                 if let Some(ref pre_r) = r.precomputed_root {
                     transcript.append_bytes(pre_r);
                 }
-                transcript.append_bytes(&r.root);
+                transcript.append_bytes(&r.commit_root);
                 main_commits.push(MainCommitData {
-                    main_tree: Arc::new(r.tree),
-                    main_root: r.root,
+                    main_tree: Arc::new(r.commit_tree),
+                    main_root: r.commit_root,
                     precomputed_tree: r.precomputed_tree.map(Arc::new),
                     precomputed_root: r.precomputed_root,
                     num_precomputed_cols: r.num_precomputed_cols,
+                    #[cfg(feature = "cuda")]
+                    gpu_main: r.gpu_main,
                 });
                 main_ldes.push(r.columns);
-                #[cfg(feature = "cuda")]
-                main_gpu_handles.push(r.gpu_main);
             }
         }
 
@@ -1955,10 +1966,18 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K. The optional ext3 GPU LDE handle
-        // (retained when the R1 fused pipeline fires) is carried in a side
-        // vector under `cfg(cuda)` so AuxResult stays a clean 3-tuple in both
-        // cfg variants.
+        // Parallel aux commit in chunks of K. The closure returns a cfg-gated
+        // AuxResult — under cuda it carries the optional ext3 GPU LDE handle
+        // as a fourth element so the .zip() chain in Phase D stays
+        // compiler-aligned with no side vectors.
+        #[cfg(feature = "cuda")]
+        type AuxResult<FE> = (
+            Option<Arc<BatchedMerkleTree<FE>>>,
+            Option<Commitment>,
+            Vec<Vec<FieldElement<FE>>>,
+            Option<math_cuda::lde::GpuLdeExt3>,
+        );
+        #[cfg(not(feature = "cuda"))]
         type AuxResult<FE> = (
             Option<Arc<BatchedMerkleTree<FE>>>,
             Option<Commitment>,
@@ -1966,9 +1985,6 @@ pub trait IsStarkProver<
         );
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
-        #[cfg(feature = "cuda")]
-        let mut aux_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeExt3>> =
-            Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1979,11 +1995,8 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "parallel"))]
             let iter = chunk_range;
 
-            // Per-iter the closure produces `(AuxResult, Option<GpuLdeExt3>)`
-            // under cuda, or `AuxResult` alone under non-cuda. Splitting them
-            // at the sequential collection step keeps the two-vec layout.
             #[allow(clippy::type_complexity)]
-            let chunk_aux: Vec<Result<_, ProvingError>> = iter
+            let chunk_aux: Vec<Result<AuxResult<FieldExtension>, ProvingError>> = iter
                 .map(|idx| {
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let domain = &domains[idx];
@@ -2012,13 +2025,16 @@ pub trait IsStarkProver<
                             {
                                 #[cfg(feature = "instruments")]
                                 let aux_lde_dur = t_sub.elapsed();
-                                #[cfg(feature = "instruments")]
-                                let zero = std::time::Duration::from_secs(0);
                                 let root = tree.root;
+                                // Fused GPU path: bill merkle equal to LDE so
+                                // the (lde + merkle) sum stays comparable to
+                                // the non-GPU path's combined R1 total.
                                 #[cfg(feature = "instruments")]
-                                crate::instruments::accum_r1_aux(aux_lde_dur, zero);
+                                crate::instruments::accum_r1_aux(aux_lde_dur, aux_lde_dur);
                                 return Ok((
-                                    (Some(Arc::new(tree)), Some(root), columns),
+                                    Some(Arc::new(tree)),
+                                    Some(root),
+                                    columns,
                                     Some(handle),
                                 ));
                             }
@@ -2053,35 +2069,26 @@ pub trait IsStarkProver<
                         }
 
                         #[cfg(feature = "cuda")]
-                        return Ok((
-                            (Some(Arc::new(tree)), Some(root), columns),
-                            None::<math_cuda::lde::GpuLdeExt3>,
-                        ));
+                        return Ok((Some(Arc::new(tree)), Some(root), columns, None));
                         #[cfg(not(feature = "cuda"))]
                         Ok((Some(Arc::new(tree)), Some(root), columns))
                     } else {
                         #[cfg(feature = "cuda")]
-                        return Ok(((None, None, Vec::new()), None::<math_cuda::lde::GpuLdeExt3>));
+                        return Ok((None, None, Vec::new(), None));
                         #[cfg(not(feature = "cuda"))]
                         Ok((None, None, Vec::new()))
                     }
                 })
                 .collect();
 
-            // Sequential: append aux roots to forked transcripts and split
-            // the optional GPU handle into its own side vector under cuda.
+            // Sequential: append aux roots to forked transcripts.
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                #[cfg(feature = "cuda")]
-                let (aux_triple, aux_gpu_h) = result?;
-                #[cfg(not(feature = "cuda"))]
-                let aux_triple = result?;
-                let (aux_tree, aux_root, cached_aux) = aux_triple;
-                if let Some(ref root) = aux_root {
+                let aux_full = result?;
+                // Tuple shape is cfg-gated; `.1` is the root in both variants.
+                if let Some(ref root) = aux_full.1 {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-                aux_results.push((aux_tree, aux_root, cached_aux));
-                #[cfg(feature = "cuda")]
-                aux_gpu_handles.push(aux_gpu_h);
+                aux_results.push(aux_full);
             }
         }
 
@@ -2091,18 +2098,16 @@ pub trait IsStarkProver<
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
 
-        #[cfg(feature = "cuda")]
-        let mut main_gpu_iter = main_gpu_handles.into_iter();
-        #[cfg(feature = "cuda")]
-        let mut aux_gpu_iter = aux_gpu_handles.into_iter();
-
-        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
-            main_commits
-                .into_iter()
-                .zip(main_ldes)
-                .zip(aux_results)
-                .zip(bus_inputs_vec)
+        for (((main_commit, main_lde), aux_full), bus_public_inputs) in main_commits
+            .into_iter()
+            .zip(main_ldes)
+            .zip(aux_results)
+            .zip(bus_inputs_vec)
         {
+            #[cfg(feature = "cuda")]
+            let (aux_tree, aux_root, cached_aux, gpu_aux) = aux_full;
+            #[cfg(not(feature = "cuda"))]
+            let (aux_tree, aux_root, cached_aux) = aux_full;
             commitments.push(Round1Commitments {
                 main_merkle_tree: main_commit.main_tree,
                 main_merkle_root: main_commit.main_root,
@@ -2118,12 +2123,8 @@ pub trait IsStarkProver<
             cached_ldes.push(Lde {
                 main: main_lde,
                 aux: cached_aux,
-                gpu_main: main_gpu_iter
-                    .next()
-                    .expect("main_gpu_handles length mismatch"),
-                gpu_aux: aux_gpu_iter
-                    .next()
-                    .expect("aux_gpu_handles length mismatch"),
+                gpu_main: main_commit.gpu_main,
+                gpu_aux,
             });
             #[cfg(not(feature = "cuda"))]
             cached_ldes.push(Lde {
