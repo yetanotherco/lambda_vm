@@ -329,9 +329,9 @@ fn test_bus_interactions_count() {
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (shared bus for HALT, COMMIT, and KECCAK, mult = ECALL)
-    // - 1 IS_BYTE for (RS1, RS2) paired
-    // - 1 IS_BYTE for (RD, 0)
-    // - 12 IS_BYTE (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
+    // - 1 ARE_BYTES for (RS1, RS2) paired
+    // - 1 ARE_BYTES for (RD, 0)
+    // - 12 ARE_BYTES (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
     // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
     // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 58
     assert_eq!(interactions.len(), 58);

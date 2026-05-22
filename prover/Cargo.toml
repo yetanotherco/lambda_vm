@@ -2,6 +2,7 @@
 name = "lambda-vm-prover"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [features]
 default = ["parallel"]
@@ -27,6 +28,9 @@ bincode = "1"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+# Enable stark's test-utils so cross-crate tests can reach
+# `compute_precomputed_commitment_for_testing`. Only active under cargo test/bench.
+stark = { path = "../crypto/stark", features = ["test-utils"] }
 
 [[bench]]
 name = "vm_prover_benchmark"
