@@ -4,6 +4,8 @@ use math::{
     traits::AsBytes,
 };
 
+/// One committed FRI layer: the bit-reversed evaluation vector plus the Merkle
+/// tree (quad leaves, one per arity-4 fold orbit) committing it.
 #[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 pub struct FriLayer<F, B>
 where

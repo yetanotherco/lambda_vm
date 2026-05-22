@@ -3,11 +3,12 @@ pub mod fri_decommit;
 pub(crate) mod fri_functions;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::field::element::FieldElement;
-use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
+pub use math::field::element::FieldElement;
+use math::field::traits::IsSubFieldOf;
+use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 
-use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
+use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend, MERKLE_CAP_HEIGHT};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
@@ -15,9 +16,16 @@ use self::fri_functions::{
     compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place,
 };
 
-/// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
-/// initial FFT. Use this when the caller already has the evaluation vector
-/// (e.g. from a fused LDE pipeline).
+/// FRI commit phase with arity-4 folding, from pre-computed bit-reversed
+/// evaluations (skipping the initial FFT — use when the caller already has the
+/// evaluation vector, e.g. from a fused LDE pipeline).
+///
+/// `number_layers` is `log2(trace_length)`. The first fold (p₀ → p₁) is
+/// uncommitted — its inputs come from the DEEP/trace openings. The remaining
+/// folds are grouped into `number_layers / 2` committed arity-4 layers; each
+/// commits its input evaluations with quad leaves and folds twice. The folding
+/// continues until the layer collapses to a constant, returned as the last
+/// value (one extra binary fold happens for even `number_layers`).
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
@@ -35,52 +43,62 @@ where
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
-    // The loop commits `number_layers - 1` folded layers; the final fold below
-    // produces the (uncommitted) last value.
-    let num_committed_layers = number_layers.saturating_sub(1);
-    let mut fri_layer_list = Vec::with_capacity(num_committed_layers);
+    // Committed arity-4 layers. One uncommitted initial fold, then the rest are
+    // paired up; integer division also folds an extra binary step when
+    // `number_layers` is even, collapsing the final layer to a constant.
+    let num_committed = number_layers / 2;
+    let mut fri_layer_list = Vec::with_capacity(num_committed);
 
-    for _ in 0..num_committed_layers {
-        // <<<< Receive challenge 𝜁ₖ₋₁
+    // <<<< Receive challenge 𝜁₀ — uncommitted initial fold p₀ → p₁. The
+    // verifier always replays this fold, so the prover always performs it.
+    {
         let zeta = transcript.sample_field_element();
-
-        // Fold evaluations in-place (no FFT needed).
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
-
-        // Build the Merkle tree from consecutive pairs.
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-            .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
-            .expect("FRI commit: Merkle tree construction must succeed");
-        let root = merkle_tree.root;
-        fri_layer_list.push(FriLayer::new(&evals, merkle_tree));
-
-        // >>>> Send commitment: [pₖ]
-        transcript.append_bytes(&root);
-
-        // Update twiddles for the next level.
         update_twiddles_in_place(&mut inv_twiddles);
     }
 
-    // <<<< Receive challenge: 𝜁ₙ₋₁
-    let zeta = transcript.sample_field_element();
+    for _ in 0..num_committed {
+        // Commit the current layer with quad leaves: one leaf per fold orbit.
+        let leaves: Vec<[FieldElement<E>; 4]> = evals
+            .chunks_exact(4)
+            .map(|chunk| {
+                [
+                    chunk[0].clone(),
+                    chunk[1].clone(),
+                    chunk[2].clone(),
+                    chunk[3].clone(),
+                ]
+            })
+            .collect();
+        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+            .expect("FRI commit: Merkle tree construction must succeed");
+        let cap = merkle_tree.cap(MERKLE_CAP_HEIGHT);
 
-    // Final fold.
-    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+        // >>>> Send commitment cap: [pₖ] (before sampling this layer's challenges).
+        for node in &cap {
+            transcript.append_bytes(node);
+        }
+        fri_layer_list.push(FriLayer::new(&evals, merkle_tree));
 
-    let last_value = evals
-        .first()
-        .expect("FRI evals are non-empty after folding")
-        .clone();
+        // Fold by 4 = two binary folds with independent challenges.
+        let zeta_a = transcript.sample_field_element();
+        fold_evaluations_in_place(&mut evals, &zeta_a, &inv_twiddles);
+        update_twiddles_in_place(&mut inv_twiddles);
 
-    // >>>> Send value: pₙ
+        let zeta_b = transcript.sample_field_element();
+        fold_evaluations_in_place(&mut evals, &zeta_b, &inv_twiddles);
+        update_twiddles_in_place(&mut inv_twiddles);
+    }
+
+    // >>>> Send value: pₙ — the constant value of the final layer.
+    let last_value = evals.first().cloned().unwrap_or_else(FieldElement::zero);
     transcript.append_field_element(&last_value);
 
     (last_value, fri_layer_list)
 }
 
+/// FRI query phase. For each query index, reveal the 4-element fold orbit and
+/// one authentication path per committed arity-4 layer.
 pub fn query_phase<F: IsField>(
     fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>],
     iotas: &[usize],
@@ -88,41 +106,50 @@ pub fn query_phase<F: IsField>(
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    if !fri_layers.is_empty() {
-        let num_layers = fri_layers.len();
-        iotas
-            .iter()
-            .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
-                let mut layers_auth_paths = Vec::with_capacity(num_layers);
-
-                let mut index = *iota_s;
-                for layer in fri_layers {
-                    // symmetric element
-                    let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                    let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
-                    layers_auth_paths.push(auth_path_sym);
-
-                    index >>= 1;
-                }
-
-                FriDecommitment {
-                    layers_auth_paths,
-                    layers_evaluations_sym,
-                }
-            })
-            .collect()
-    } else {
-        // For 0 FRI layers (small traces), return empty decommitments for each query.
-        // The verifier still needs one decommitment entry per query, even if the
-        // FRI layer data is empty.
-        iotas
+    if fri_layers.is_empty() {
+        // No committed layers (tiny traces): the verifier still needs one
+        // decommitment entry per query, even if empty.
+        return iotas
             .iter()
             .map(|_| FriDecommitment {
                 layers_auth_paths: vec![],
-                layers_evaluations_sym: vec![],
+                layers_evaluations: vec![],
             })
-            .collect()
+            .collect();
     }
+
+    let num_layers = fri_layers.len();
+    iotas
+        .iter()
+        .map(|iota_s| {
+            let mut layers_auth_paths = Vec::with_capacity(num_layers);
+            let mut layers_evaluations = Vec::with_capacity(num_layers);
+
+            let mut index = *iota_s;
+            for layer in fri_layers {
+                // The fold orbit: four consecutive (bit-reversed) evaluations
+                // that fold together into one next-layer value.
+                let base = index & !3;
+                let orbit = [
+                    layer.evaluation[base].clone(),
+                    layer.evaluation[base + 1].clone(),
+                    layer.evaluation[base + 2].clone(),
+                    layer.evaluation[base + 3].clone(),
+                ];
+                let auth_path = layer
+                    .merkle_tree
+                    .get_proof_by_pos_capped(index >> 2, MERKLE_CAP_HEIGHT)
+                    .expect("FRI query: layer orbit index in bounds");
+                layers_evaluations.push(orbit);
+                layers_auth_paths.push(auth_path);
+
+                index >>= 2;
+            }
+
+            FriDecommitment {
+                layers_auth_paths,
+                layers_evaluations,
+            }
+        })
+        .collect()
 }

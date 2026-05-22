@@ -1,5 +1,5 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
+    config::{BatchedMerkleTreeBackend, FriLayerMerkleTreeBackend},
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -269,6 +269,18 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // A primitive 4th root of unity of the FRI LDE domain. Inside an arity-4
+        // fold orbit the two conjugate-pair twiddles differ by this root.
+        let lde_root_order = domain.lde_length.trailing_zeros();
+        let zeta4 = if lde_root_order >= 2 {
+            domain.lde_primitive_root.pow(1u64 << (lde_root_order - 2))
+        } else {
+            FieldElement::<Field>::one()
+        };
+        let zeta4_inv = zeta4
+            .inv()
+            .expect("primitive 4th root of unity is invertible");
+
         proof
             .query_list
             .iter()
@@ -282,6 +294,8 @@ pub trait IsStarkVerifier<
                     *iota_s,
                     proof_s,
                     eval,
+                    zeta4.clone(),
+                    zeta4_inv.clone(),
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
                 )
@@ -301,10 +315,10 @@ pub trait IsStarkVerifier<
         domain.lde_coset_element(reverse_index(raw, domain.lde_length as u64))
     }
 
-    /// Verifies the validity of the opening proof.
+    /// Verifies the validity of the opening proof against a Merkle cap.
     fn verify_opening<E>(
         proof: &Proof<Commitment>,
-        root: &Commitment,
+        cap: &[Commitment],
         index: usize,
         value: &[FieldElement<E>],
     ) -> bool
@@ -314,15 +328,15 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+        proof.verify_capped::<BatchedMerkleTreeBackend<E>>(cap, index, &value.to_owned())
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
-    /// of a `PolynomialOpenings` against the given `root` at iota positions
-    /// `iota*2` and `iota*2 + 1`.
+    /// of a `PolynomialOpenings` against the given Merkle `cap` at iota positions
+    /// `iota*2` and `iota*2 + 1`. A single-node `cap` slice checks against a root.
     fn verify_opening_pair<E>(
         opening: &PolynomialOpenings<E>,
-        root: &Commitment,
+        cap: &[Commitment],
         iota: usize,
     ) -> bool
     where
@@ -331,10 +345,10 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        Self::verify_opening::<E>(&opening.proof, root, iota * 2, &opening.evaluations)
+        Self::verify_opening::<E>(&opening.proof, cap, iota * 2, &opening.evaluations)
             && Self::verify_opening::<E>(
                 &opening.proof_sym,
-                root,
+                cap,
                 iota * 2 + 1,
                 &opening.evaluations_sym,
             )
@@ -354,29 +368,32 @@ pub trait IsStarkVerifier<
         // Main trace (multiplicities for preprocessed, full trace for normal).
         let mut ok = Self::verify_opening_pair::<Field>(
             &deep_poly_openings.main_trace_polys,
-            &proof.lde_trace_main_merkle_root,
+            &proof.lde_trace_main_merkle_cap,
             iota,
         );
 
         // Precomputed trace (preprocessed tables only). Mismatched presence is
         // unreachable in practice (multi_verify rejects such proofs upstream),
         // but a defensive check keeps this function self-contained.
+        // The precomputed tree is uncapped: its root is a single-node cap.
         ok &= match (
             &proof.lde_trace_precomputed_merkle_root,
             &deep_poly_openings.precomputed_trace_polys,
         ) {
-            (Some(root), Some(opening)) => Self::verify_opening_pair::<Field>(opening, root, iota),
+            (Some(root), Some(opening)) => {
+                Self::verify_opening_pair::<Field>(opening, core::slice::from_ref(root), iota)
+            }
             (None, None) => true,
             _ => false,
         };
 
         // Auxiliary trace.
         ok &= match (
-            proof.lde_trace_aux_merkle_root,
+            &proof.lde_trace_aux_merkle_cap,
             &deep_poly_openings.aux_trace_polys,
         ) {
-            (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, &root, iota)
+            (Some(cap), Some(opening)) => {
+                Self::verify_opening_pair::<FieldExtension>(opening, cap, iota)
             }
             (None, None) => true,
             _ => false,
@@ -389,7 +406,7 @@ pub trait IsStarkVerifier<
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_composition_poly_opening(
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
-        composition_poly_merkle_root: &Commitment,
+        composition_poly_merkle_cap: &[Commitment],
         iota: &usize,
     ) -> bool
     where
@@ -402,8 +419,8 @@ pub trait IsStarkVerifier<
         deep_poly_openings
             .composition_poly
             .proof
-            .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-                composition_poly_merkle_root,
+            .verify_capped::<BatchedMerkleTreeBackend<FieldExtension>>(
+                composition_poly_merkle_cap,
                 *iota,
                 &value,
             )
@@ -427,51 +444,25 @@ pub trait IsStarkVerifier<
             .all(|(iota_n, deep_poly_opening)| {
                 Self::verify_composition_poly_opening(
                     deep_poly_opening,
-                    &proof.composition_poly_root,
+                    &proof.composition_poly_cap,
                     iota_n,
                 ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
             })
     }
 
-    /// Verifies the openings of a fold polynomial of an inner layer of FRI.
-    fn verify_fri_layer_openings(
-        merkle_root: &Commitment,
-        auth_path_sym: &Proof<Commitment>,
-        evaluation: &FieldElement<FieldExtension>,
-        evaluation_sym: &FieldElement<FieldExtension>,
-        iota: usize,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
-        } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
-        };
-
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-            merkle_root,
-            iota >> 1,
-            &evaluations,
-        )
-    }
-
-    /// Verify a single FRI query
-    /// `zetas`: the vector of all challenges sent by the verifier to the prover at the commit
-    /// phase to fold polynomials.
-    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements 𝜐 and -𝜐
-    /// of the evaluation domain of FRI layer 0.
-    /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
-    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
-    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
+    /// Verify a single FRI query under arity-4 folding. `zetas` holds 𝜁₀ for the
+    /// uncommitted initial fold and two challenges per committed arity-4 layer.
+    /// `zeta4` / `zeta4_inv` are a primitive 4th root of unity and its inverse,
+    /// relating the two conjugate-pair twiddles inside one fold orbit.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
         fri_decommitment: &FriDecommitment<FieldExtension>,
         evaluation_point_inv: FieldElement<Field>,
+        zeta4: FieldElement<Field>,
+        zeta4_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
     ) -> bool
@@ -479,72 +470,70 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
-
-        let p0_eval = deep_composition_evaluation;
-        let p0_eval_sym = deep_composition_evaluation_sym;
-
-        // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
-        let mut index = iota;
-
-        // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
-        if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+        let caps = &proof.fri_layers_merkle_caps;
+        if caps.len() != fri_decommitment.layers_auth_paths.len()
+            || caps.len() != fri_decommitment.layers_evaluations.len()
+        {
+            return false;
+        }
+        // Each committed layer needs two challenges; zetas[0] is the initial fold.
+        if zetas.len() != 1 + 2 * caps.len() {
+            return false;
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+        let p0 = deep_composition_evaluation;
+        let p0_sym = deep_composition_evaluation_sym;
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+        // Uncommitted initial fold p₀ → p₁ at the query point, twiddle 𝜐⁻¹.
+        let mut v = (p0 + p0_sym) + evaluation_point_inv.clone() * &zetas[0] * (p0 - p0_sym);
+        let mut index = iota;
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
-
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
-                    }
-                },
-            )
+        let mut ok = true;
+        for (j, cap) in caps.iter().enumerate() {
+            let orbit = &fri_decommitment.layers_evaluations[j];
+            let auth_path = &fri_decommitment.layers_auth_paths[j];
+            // tw_a = 𝜐⁻^(2^(1+2j)): twiddle of the tracked conjugate pair.
+            let tw_a = evaluation_point_inv.pow(1u64 << (1 + 2 * j));
+            // The tracked value must be the orbit element at index&3.
+            if orbit[index & 3] != v {
+                ok = false;
+            }
+            // The orbit (quad leaf) must open against this layer's cap.
+            let leaf_ok = auth_path.verify_capped::<FriLayerMerkleTreeBackend<FieldExtension>>(
+                cap,
+                index >> 2,
+                orbit,
+            );
+            if !leaf_ok {
+                ok = false;
+            }
+            // Fold the orbit by 4 = two binary folds, in storage order. The two
+            // storage pairs (o0,o1),(o2,o3) sit at coset points y0, y1 = ζ4·y0;
+            // their twiddles are 1/y0, 1/y1. `tw_a` (= 1/tracked-point) equals
+            // one of them up to the sign (-1)^(index&1), which is folded into
+            // the difference terms.
+            let (d01, d23) = if index & 1 == 0 {
+                (&orbit[0] - &orbit[1], &orbit[2] - &orbit[3])
+            } else {
+                (&orbit[1] - &orbit[0], &orbit[3] - &orbit[2])
+            };
+            let (tw_p0, tw_p1) = if (index >> 1) & 1 == 0 {
+                (tw_a.clone(), &tw_a * &zeta4_inv)
+            } else {
+                (&tw_a * &zeta4, tw_a.clone())
+            };
+            let zeta_a = &zetas[1 + 2 * j];
+            let zeta_b = &zetas[2 + 2 * j];
+            let a = (&orbit[0] + &orbit[1]) + (tw_p0.clone() * zeta_a) * d01;
+            let b = (&orbit[2] + &orbit[3]) + (tw_p1 * zeta_a) * d23;
+            // Second fold of the pair (a,b); its twiddle is tw_p0².
+            let tw2 = tw_p0.square();
+            v = (&a + &b) + (tw2 * zeta_b) * (&a - &b);
+            index >>= 2;
+        }
+        // After all committed layers the polynomial is a constant; the tracked
+        // value must equal the final value sent by the prover.
+        ok && v == proof.fri_last_value
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -765,12 +754,16 @@ pub trait IsStarkVerifier<
 
                 // Add BOTH commitments to transcript (Fiat-Shamir binding).
                 // Precomputed commitment binds challenges to correct precomputed values.
-                // Multiplicities commitment binds challenges to actual lookups made.
+                // Multiplicities commitment cap binds challenges to actual lookups made.
                 transcript.append_bytes(&expected_precomputed);
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+                for node in &proof.lde_trace_main_merkle_cap {
+                    transcript.append_bytes(node);
+                }
             } else {
-                // Normal table: use commitment from proof
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+                // Normal table: use commitment cap from proof
+                for node in &proof.lde_trace_main_merkle_cap {
+                    transcript.append_bytes(node);
+                }
             }
         }
 
@@ -826,9 +819,11 @@ pub trait IsStarkVerifier<
                 table_transcript.append_bytes(&(idx as u64).to_le_bytes());
             }
 
-            // Phase C: replay aux commitment
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                table_transcript.append_bytes(&root);
+            // Phase C: replay aux commitment cap
+            if let Some(cap) = &proof.lde_trace_aux_merkle_cap {
+                for node in cap {
+                    table_transcript.append_bytes(node);
+                }
             }
 
             // Bind table_contribution (L) to transcript, matching prover.
@@ -945,7 +940,9 @@ pub trait IsStarkVerifier<
         let boundary_coeffs = coefficients;
 
         // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
+        for node in &proof.composition_poly_cap {
+            transcript.append_bytes(node);
+        }
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -996,20 +993,22 @@ pub trait IsStarkVerifier<
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
-        // >>>> Send challenge 𝜁ₙ₋₁
+        // Arity-4 FRI commit phase: 𝜁₀ for the uncommitted initial fold, then
+        // two challenges per committed layer. Each layer's cap is absorbed
+        // before its two challenges are sampled.
+        let merkle_caps = &proof.fri_layers_merkle_caps;
+        let mut zetas = Vec::with_capacity(1 + 2 * merkle_caps.len());
+        // >>>> Send challenge 𝜁₀
         zetas.push(transcript.sample_field_element());
+        for cap in merkle_caps {
+            // <<<< Receive commitment cap: [pₖ]
+            for node in cap {
+                transcript.append_bytes(node);
+            }
+            // >>>> Send the two fold challenges of this committed layer
+            zetas.push(transcript.sample_field_element());
+            zetas.push(transcript.sample_field_element());
+        }
 
         // <<<< Receive value: pₙ
         transcript.append_field_element(&proof.fri_last_value);

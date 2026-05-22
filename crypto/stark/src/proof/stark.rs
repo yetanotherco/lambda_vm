@@ -5,7 +5,10 @@ use math::field::{
 };
 
 use crate::{
-    config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
+    config::{Commitment, MerkleCap},
+    fri::fri_decommit::FriDecommitment,
+    lookup::BusPublicInputs,
+    table::Table,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,24 +38,25 @@ pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Length of the execution trace
     pub trace_length: usize,
-    // Commitments of the trace columns
+    // Commitment cap of the trace columns
     // [tⱼ]
-    pub lde_trace_main_merkle_root: Commitment,
-    // Commitments of auxiliary trace columns
+    pub lde_trace_main_merkle_cap: MerkleCap,
+    // Commitment cap of auxiliary trace columns
     // [tⱼ]
-    pub lde_trace_aux_merkle_root: Option<Commitment>,
+    pub lde_trace_aux_merkle_cap: Option<MerkleCap>,
     // For preprocessed tables: commitment to precomputed columns only.
     // Verifier checks this matches the hardcoded commitment from AIR.
+    // Kept as a single root (uncapped) so the AIR-hardcoded constants stay valid.
     pub lde_trace_precomputed_merkle_root: Option<Commitment>,
     // tⱼ(zgᵏ)
     pub trace_ood_evaluations: Table<E>,
-    // Commitments to Hᵢ
-    pub composition_poly_root: Commitment,
+    // Commitment cap to Hᵢ
+    pub composition_poly_cap: MerkleCap,
     // Hᵢ(z^N)
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     // [pₖ]
-    pub fri_layers_merkle_roots: Vec<Commitment>,
-    // pₙ
+    pub fri_layers_merkle_caps: Vec<MerkleCap>,
+    // pₙ — the constant value of the final FRI layer
     pub fri_last_value: FieldElement<E>,
     // Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
     pub query_list: Vec<FriDecommitment<E>>,

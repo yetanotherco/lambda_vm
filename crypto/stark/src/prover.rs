@@ -33,7 +33,9 @@ use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{
+    BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment, MERKLE_CAP_HEIGHT, MerkleCap,
+};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
@@ -91,11 +93,12 @@ where
 {
     /// Merkle tree over the trace columns (multiplicities only for preprocessed tables).
     pub(crate) tree: Arc<BatchedMerkleTree<F>>,
-    /// Root of `tree`.
-    pub(crate) root: Commitment,
+    /// Cap of `tree`.
+    pub(crate) cap: MerkleCap,
     /// Preprocessed tables only: Merkle tree over precomputed columns.
     pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
-    /// Preprocessed tables only: root of `precomputed_tree`.
+    /// Preprocessed tables only: root of `precomputed_tree` (kept uncapped so the
+    /// AIR-hardcoded precomputed-commitment constants stay valid).
     pub(crate) precomputed_root: Option<Commitment>,
     /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
     pub(crate) num_precomputed_cols: usize,
@@ -106,10 +109,10 @@ where
     FieldElement<F>: AsBytes,
 {
     /// Build a `TableCommit` for a plain (non-preprocessed) table.
-    fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
+    fn plain(tree: BatchedMerkleTree<F>, cap: MerkleCap) -> Self {
         Self {
             tree: Arc::new(tree),
-            root,
+            cap,
             precomputed_tree: None,
             precomputed_root: None,
             num_precomputed_cols: 0,
@@ -119,25 +122,25 @@ where
     /// Build a `TableCommit` for a preprocessed table.
     fn preprocessed(
         tree: BatchedMerkleTree<F>,
-        root: Commitment,
+        cap: MerkleCap,
         precomputed_tree: BatchedMerkleTree<F>,
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
         Self {
             tree: Arc::new(tree),
-            root,
+            cap,
             precomputed_tree: Some(Arc::new(precomputed_tree)),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
         }
     }
 
-    /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
+    /// Cheap clone. Only bumps Arc refcounts and copies the small cap vec.
     fn share(&self) -> Self {
         Self {
             tree: Arc::clone(&self.tree),
-            root: self.root,
+            cap: self.cap.clone(),
             precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
             precomputed_root: self.precomputed_root,
             num_precomputed_cols: self.num_precomputed_cols,
@@ -295,8 +298,8 @@ where
     pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
-    /// The commitment to the composition polynomial parts.
-    pub(crate) composition_poly_root: Commitment,
+    /// The commitment cap to the composition polynomial parts.
+    pub(crate) composition_poly_cap: MerkleCap,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -309,10 +312,10 @@ pub(crate) struct Round3<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
+    /// The constant value of the final FRI layer.
     fri_last_value: FieldElement<E>,
-    /// The commitments to the fold polynomials of the inner layers of FRI.
-    fri_layers_merkle_roots: Vec<Commitment>,
+    /// The commitment caps to the fold polynomials of the inner layers of FRI.
+    fri_layers_merkle_caps: Vec<MerkleCap>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
     /// parts at the domain values corresponding to the FRI query challenges and their symmetric counterparts.
     deep_poly_openings: DeepPolynomialOpenings<F, E>,
@@ -493,7 +496,7 @@ pub trait IsStarkProver<
     /// but avoids allocating the cloned and transposed matrices entirely.
     fn commit_columns_bit_reversed<E>(
         columns: &[Vec<FieldElement<E>>],
-    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    ) -> Option<(BatchedMerkleTree<E>, MerkleCap)>
     where
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
@@ -503,8 +506,8 @@ pub trait IsStarkProver<
         }
         let hashed_leaves = keccak_leaves_bit_reversed(columns);
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
+        let cap = tree.cap(MERKLE_CAP_HEIGHT);
+        Some((tree, cap))
     }
 
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
@@ -529,8 +532,8 @@ pub trait IsStarkProver<
         let twiddles = LdeTwiddles::new(&domain);
         let evals =
             Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) = Self::commit_columns_bit_reversed(&evals)?;
-        Some(commitment)
+        let (tree, _) = Self::commit_columns_bit_reversed(&evals)?;
+        Some(tree.root)
     }
 
     /// Compute LDE evaluations with pre-computed twiddle factors and coset weights.
@@ -639,22 +642,25 @@ pub trait IsStarkProver<
         let commit = match precomputed {
             None => {
                 #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                let (mut tree, cap) = Self::commit_columns_bit_reversed(&columns)
                     .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
                     tree.spill_nodes_to_disk()
                         .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
                 }
-                TableCommit::plain(tree, root)
+                TableCommit::plain(tree, cap)
             }
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
-                let (mut precomputed_tree, precomputed_root) =
+                let (mut precomputed_tree, _) =
                     Self::commit_columns_bit_reversed(&columns[..num_cols])
                         .ok_or(ProvingError::EmptyCommitment)?;
+                // Preprocessed columns stay uncapped: their single root is checked
+                // against the AIR-hardcoded commitment.
+                let precomputed_root = precomputed_tree.root;
                 #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) =
+                let (mut mult_tree, mult_cap) =
                     Self::commit_columns_bit_reversed(&columns[num_cols..])
                         .ok_or(ProvingError::EmptyCommitment)?;
                 debug_assert_eq!(
@@ -672,7 +678,7 @@ pub trait IsStarkProver<
                 }
                 TableCommit::preprocessed(
                     mult_tree,
-                    mult_root,
+                    mult_cap,
                     precomputed_tree,
                     precomputed_root,
                     num_cols,
@@ -768,7 +774,7 @@ pub trait IsStarkProver<
     /// composition polynomial.
     fn commit_composition_polynomial(
         lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
+    ) -> Option<(BatchedMerkleTree<FieldExtension>, MerkleCap)>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
@@ -784,8 +790,8 @@ pub trait IsStarkProver<
         let hashed_leaves =
             keccak_leaves_row_pair_bit_reversed(lde_composition_poly_parts_evaluations);
         let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
+        let cap = tree.cap(MERKLE_CAP_HEIGHT);
+        Some((tree, cap))
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
@@ -939,7 +945,7 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let Some((composition_poly_merkle_tree, composition_poly_root)) =
+        let Some((composition_poly_merkle_tree, composition_poly_cap)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
         else {
             return Err(ProvingError::EmptyCommitment);
@@ -953,7 +959,7 @@ pub trait IsStarkProver<
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
-            composition_poly_root,
+            composition_poly_cap,
         })
     }
 
@@ -1113,9 +1119,9 @@ pub trait IsStarkProver<
 
         let query_list = fri::query_phase(&fri_layers, &iotas);
 
-        let fri_layers_merkle_roots: Vec<_> = fri_layers
+        let fri_layers_merkle_caps: Vec<MerkleCap> = fri_layers
             .iter()
-            .map(|layer| layer.merkle_tree.root)
+            .map(|layer| layer.merkle_tree.cap(MERKLE_CAP_HEIGHT))
             .collect();
 
         let deep_poly_openings =
@@ -1129,7 +1135,7 @@ pub trait IsStarkProver<
 
         Round4 {
             fri_last_value,
-            fri_layers_merkle_roots,
+            fri_layers_merkle_caps,
             deep_poly_openings,
             query_list,
             nonce,
@@ -1306,8 +1312,8 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let proof = composition_poly_merkle_tree
-            .get_proof_by_pos(index)
-            .unwrap();
+            .get_proof_by_pos_capped(index, MERKLE_CAP_HEIGHT)
+            .expect("composition poly opening: leaf index in bounds");
 
         let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
             .iter()
@@ -1343,6 +1349,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         tree: &BatchedMerkleTree<C>,
         challenge: usize,
+        cap_height: usize,
         gather: G,
     ) -> PolynomialOpenings<C>
     where
@@ -1354,8 +1361,12 @@ pub trait IsStarkProver<
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
+            proof: tree
+                .get_proof_by_pos_capped(index, cap_height)
+                .expect("trace opening: leaf index in bounds"),
+            proof_sym: tree
+                .get_proof_by_pos_capped(index_sym, cap_height)
+                .expect("trace opening: symmetric leaf index in bounds"),
             evaluations: gather(reverse_index(index, domain_size)),
             evaluations_sym: gather(reverse_index(index_sym, domain_size)),
         }
@@ -1384,18 +1395,28 @@ pub trait IsStarkProver<
             // For preprocessed tables, open the main split (multiplicities only);
             // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
-                })
+                Self::open_polys_with(
+                    domain,
+                    &main_commit.tree,
+                    *index,
+                    MERKLE_CAP_HEIGHT,
+                    |row| lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols),
+                )
             } else {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row(row)
-                })
+                Self::open_polys_with(
+                    domain,
+                    &main_commit.tree,
+                    *index,
+                    MERKLE_CAP_HEIGHT,
+                    |row| lde_trace.gather_main_row(row),
+                )
             };
 
             // For preprocessed tables, also open the precomputed-columns tree.
+            // The precomputed tree stays uncapped (cap_height 0): its root is
+            // checked against the AIR-hardcoded commitment.
             let precomputed_trace_opening = main_commit.precomputed_tree.as_ref().map(|tree| {
-                Self::open_polys_with(domain, tree, *index, |row| {
+                Self::open_polys_with(domain, tree, *index, 0, |row| {
                     lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
                 })
             });
@@ -1407,7 +1428,7 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                Self::open_polys_with(domain, &aux.tree, *index, MERKLE_CAP_HEIGHT, |row| {
                     lde_trace.gather_aux_row(row)
                 })
             });
@@ -1582,13 +1603,15 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+            // Sequential: append caps to shared transcript (Fiat-Shamir ordering)
             for result in chunk_results {
                 let (commit, cached_main) = result?;
                 if let Some(ref pre_root) = commit.precomputed_root {
                     transcript.append_bytes(pre_root);
                 }
-                transcript.append_bytes(&commit.root);
+                for node in &commit.cap {
+                    transcript.append_bytes(node);
+                }
                 main_commits.push(commit);
                 main_ldes.push(cached_main);
             }
@@ -1727,7 +1750,7 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                        let (mut tree, cap) = Self::commit_columns_bit_reversed(&columns)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
@@ -1738,18 +1761,20 @@ pub trait IsStarkProver<
                                 ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
                             })?;
                         }
-                        Ok((Some(TableCommit::plain(tree, root)), columns))
+                        Ok((Some(TableCommit::plain(tree, cap)), columns))
                     } else {
                         Ok((None, Vec::new()))
                     }
                 })
                 .collect();
 
-            // Sequential: append aux roots to forked transcripts
+            // Sequential: append aux caps to forked transcripts
             for (j, result) in chunk_aux.into_iter().enumerate() {
                 let (aux_commit, cached_aux) = result?;
                 if let Some(ref c) = aux_commit {
-                    table_transcripts[chunk_start + j].append_bytes(&c.root);
+                    for node in &c.cap {
+                        table_transcripts[chunk_start + j].append_bytes(node);
+                    }
                 }
                 aux_results.push((aux_commit, cached_aux));
             }
@@ -1986,7 +2011,9 @@ pub trait IsStarkProver<
         )?;
 
         // >>>> Send commitments: [H₁], [H₂]
-        transcript.append_bytes(&round_2_result.composition_poly_root);
+        for node in &round_2_result.composition_poly_cap {
+            transcript.append_bytes(node);
+        }
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -2063,20 +2090,20 @@ pub trait IsStarkProver<
 
         Ok(StarkProof {
             // [t]
-            lde_trace_main_merkle_root: round_1_result.main.root,
+            lde_trace_main_merkle_cap: round_1_result.main.cap.clone(),
             // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
+            lde_trace_aux_merkle_cap: round_1_result.aux.as_ref().map(|x| x.cap.clone()),
             // For preprocessed tables: commitment to precomputed columns only
             lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
             // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
             // [H₁] and [H₂]
-            composition_poly_root: round_2_result.composition_poly_root,
+            composition_poly_cap: round_2_result.composition_poly_cap,
             // Hᵢ(z^N)
             composition_poly_parts_ood_evaluation: round_3_result
                 .composition_poly_parts_ood_evaluation,
             // [pₖ]
-            fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
+            fri_layers_merkle_caps: round_4_result.fri_layers_merkle_caps,
             // pₙ
             fri_last_value: round_4_result.fri_last_value,
             // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
