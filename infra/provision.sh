@@ -26,7 +26,7 @@ apt-get upgrade "${APT_OPTS[@]}"
 # --- 2. apt packages ---------------------------------------------------------
 log "apt install base packages + clang/lld/llvm + xz-utils"
 apt-get install "${APT_OPTS[@]}" \
-    ca-certificates curl wget gnupg vim git zip unzip openssl libssl-dev \
+    ca-certificates curl wget gnupg vim git zip unzip openssl libssl-dev jq \
     build-essential rsyslog htop rsync pkg-config locales ufw \
     clang lld llvm xz-utils
 
