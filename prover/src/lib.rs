@@ -36,7 +36,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::statement_seed;
+use crate::statement::absorb_statement;
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -451,16 +451,13 @@ impl VmAirs {
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
-    transcript_seed: &[u8],
+    transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    let mut transcript = DefaultTranscript::<E>::new(transcript_seed);
     for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-        } else {
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
         }
+        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
@@ -509,9 +506,9 @@ pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
-    transcript_seed: &[u8],
+    transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript_seed);
+    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
     compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
 
@@ -658,7 +655,9 @@ pub fn prove_with_options_and_inputs(
 
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
-    let transcript_seed = statement_seed(
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
         elf_bytes,
         &traces.public_output_bytes,
         &table_counts,
@@ -669,7 +668,7 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&transcript_seed),
+        &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -774,10 +773,12 @@ pub fn verify_with_options(
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
 
-    // Recompute the statement seed from the proof bundle: a tampered statement
-    // field makes this diverge from the prover's seed, so every derived
-    // challenge differs and verification rejects.
-    let transcript_seed = statement_seed(
+    // Bind the statement into the verifier's transcript. A tampered statement
+    // field makes this diverge from the prover's transcript state, so every
+    // derived challenge differs and verification rejects.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
         elf_bytes,
         &vm_proof.public_output,
         &vm_proof.table_counts,
@@ -785,11 +786,15 @@ pub fn verify_with_options(
         &vm_proof.runtime_page_ranges,
     );
 
+    // Fork the post-absorb state: the replay helper advances through Phase A
+    // independently of the multi_verify transcript, but both must start from
+    // the same statement-bound state.
+    let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
-        &transcript_seed,
+        &mut transcript_for_replay,
     ) {
         Some(balance) => balance,
         None => return Ok(false),
@@ -798,7 +803,7 @@ pub fn verify_with_options(
     Ok(Verifier::multi_verify(
         &air_refs,
         &vm_proof.proof,
-        &mut DefaultTranscript::<E>::new(&transcript_seed),
+        &mut transcript,
         &expected_bus_balance,
     ))
 }

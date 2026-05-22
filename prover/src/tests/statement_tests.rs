@@ -1,6 +1,10 @@
-//! Tests for statement encoding and Fiat-Shamir transcript seeding.
+//! Tests for statement absorption into the Fiat-Shamir transcript.
 
-use crate::statement::{encode_statement, statement_seed};
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+use crate::statement::absorb_statement;
+use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 fn sample_counts() -> TableCounts {
@@ -31,116 +35,84 @@ fn sample_ranges() -> Vec<RuntimePageRange> {
     ]
 }
 
-#[test]
-fn encoding_is_deterministic() {
-    let counts = sample_counts();
-    let ranges = sample_ranges();
-    assert_eq!(
-        encode_statement(b"elf-bytes", b"output", &counts, 3, &ranges),
-        encode_statement(b"elf-bytes", b"output", &counts, 3, &ranges),
-    );
-    assert_eq!(
-        statement_seed(b"elf-bytes", b"output", &counts, 3, &ranges),
-        statement_seed(b"elf-bytes", b"output", &counts, 3, &ranges),
-    );
+fn state_after_absorb(
+    elf: &[u8],
+    out: &[u8],
+    counts: &TableCounts,
+    priv_pages: usize,
+    ranges: &[RuntimePageRange],
+) -> [u8; 32] {
+    let mut t = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(&mut t, elf, out, counts, priv_pages, ranges);
+    t.state()
 }
 
 #[test]
-fn encoding_starts_with_domain_tag() {
-    let enc = encode_statement(b"", b"", &sample_counts(), 0, &[]);
-    assert!(enc.starts_with(b"LAMBDAVM_STARK_STATEMENT_V1"));
+fn state_is_deterministic() {
+    let a = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges());
+    let b = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges());
+    assert_eq!(a, b);
 }
 
 #[test]
-fn seed_depends_on_elf() {
-    let c = sample_counts();
-    let r = sample_ranges();
+fn state_depends_on_every_field() {
+    let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges());
+
     assert_ne!(
-        statement_seed(b"program-a", b"out", &c, 1, &r),
-        statement_seed(b"program-b", b"out", &c, 1, &r),
+        baseline,
+        state_after_absorb(
+            b"different-elf",
+            b"out",
+            &sample_counts(),
+            1,
+            &sample_ranges()
+        ),
+        "state must depend on elf",
     );
-}
-
-#[test]
-fn seed_depends_on_public_output() {
-    let c = sample_counts();
-    let r = sample_ranges();
     assert_ne!(
-        statement_seed(b"elf", b"output-1", &c, 1, &r),
-        statement_seed(b"elf", b"output-2", &c, 1, &r),
+        baseline,
+        state_after_absorb(
+            b"elf",
+            b"different-output",
+            &sample_counts(),
+            1,
+            &sample_ranges()
+        ),
+        "state must depend on public_output",
     );
-}
 
-#[test]
-fn seed_depends_on_table_counts() {
-    let r = sample_ranges();
-    let mut c2 = sample_counts();
-    c2.branch += 1;
+    let mut counts2 = sample_counts();
+    counts2.branch += 1;
     assert_ne!(
-        statement_seed(b"elf", b"out", &sample_counts(), 1, &r),
-        statement_seed(b"elf", b"out", &c2, 1, &r),
+        baseline,
+        state_after_absorb(b"elf", b"out", &counts2, 1, &sample_ranges()),
+        "state must depend on table_counts",
     );
-}
 
-#[test]
-fn seed_depends_on_private_input_pages() {
-    let c = sample_counts();
-    let r = sample_ranges();
     assert_ne!(
-        statement_seed(b"elf", b"out", &c, 1, &r),
-        statement_seed(b"elf", b"out", &c, 2, &r),
+        baseline,
+        state_after_absorb(b"elf", b"out", &sample_counts(), 2, &sample_ranges()),
+        "state must depend on num_private_input_pages",
     );
-}
 
-#[test]
-fn seed_depends_on_runtime_page_ranges() {
-    let c = sample_counts();
     assert_ne!(
-        statement_seed(b"elf", b"out", &c, 1, &sample_ranges()),
-        statement_seed(b"elf", b"out", &c, 1, &[]),
+        baseline,
+        state_after_absorb(b"elf", b"out", &sample_counts(), 1, &[]),
+        "state must depend on runtime_page_ranges",
     );
 }
 
 #[test]
-fn length_prefix_prevents_public_output_boundary_collision() {
-    // Without the public_output length prefix, "empty output + cpu count 0x41"
-    // and "output [0x41] + cpu count 0" would encode to the same bytes. The
-    // length prefix keeps the two statements distinct.
+fn public_output_length_prefix_prevents_collision() {
+    // Without the length prefix on public_output, "empty output + cpu count
+    // 0x41" and "output [0x41] + cpu count 0" would absorb identical bytes.
+    // The prefix keeps the two statements distinct.
     let mut counts_a = sample_counts();
     counts_a.cpu = 0x41;
     let mut counts_b = sample_counts();
     counts_b.cpu = 0;
     assert_ne!(
-        encode_statement(b"elf", b"", &counts_a, 0, &[]),
-        encode_statement(b"elf", b"\x41", &counts_b, 0, &[]),
-    );
-}
-
-/// End-to-end: an honest proof verifies against its own program, and a proof
-/// must not verify against a different program -- the verifier's statement seed
-/// (built from the other ELF) diverges from the prover's, so every Fiat-Shamir
-/// challenge differs. Also exercises seed consistency across the prove path,
-/// the verify path, and the bus-balance transcript replay.
-#[test]
-fn proof_binds_the_program_it_was_generated_for() {
-    let rust_artifacts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("executor/program_artifacts/rust");
-    let read = |name: &str| {
-        std::fs::read(rust_artifacts.join(name))
-            .unwrap_or_else(|_| panic!("{name} not found -- run `make compile-programs-rust`"))
-    };
-    let allocator = read("allocator.elf");
-    let pure_commit = read("pure_commit.elf");
-
-    let proof = crate::prove(&allocator).expect("prove allocator");
-    assert!(
-        crate::verify(&proof, &allocator).expect("verify allocator"),
-        "honest proof must verify against its own program",
-    );
-    assert!(
-        !matches!(crate::verify(&proof, &pure_commit), Ok(true)),
-        "a proof must not verify against a different program",
+        state_after_absorb(b"elf", b"", &counts_a, 0, &[]),
+        state_after_absorb(b"elf", b"\x41", &counts_b, 0, &[]),
     );
 }

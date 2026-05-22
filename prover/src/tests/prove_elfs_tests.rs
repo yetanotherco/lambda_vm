@@ -67,11 +67,12 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
-        &[],
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -882,11 +883,12 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        &[],
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1619,11 +1621,12 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        &[],
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1675,11 +1678,12 @@ fn test_deep_stack_missing_pages_rejected() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        &[],
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1766,11 +1770,12 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        &[],
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
