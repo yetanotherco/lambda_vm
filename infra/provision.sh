@@ -50,6 +50,7 @@ TEAM_KEYS=(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFzvQKhE/xqRxHbit/dZNej7T5eVLmF8CAGL7to6o3QY joaquin@mail.com"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA2GAeixuqP4XwujuSK9KDgdmyglGzlQQsXztnve+bra gabriel@mail.com"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKQnPPUb4gzmsmjDP98mNKXbpHrp9bIIL7QiRjyWEG6f julian@mail.com"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBzniAUYGJXguBjfz2+uGUUC7XLVmk58FhCsEBMx2r5k mauro@mail.com"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ6mrcWIyU+/LrNZLivNIOYr6ld/CXefoq1hyXLsHDfV it"
 )
 for u in admin app; do
