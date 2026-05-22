@@ -1,5 +1,6 @@
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
+#[cfg(test)]
 use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -313,13 +314,12 @@ where
     }
 }
 
-/// Given a slice of trace polynomials, an evaluation point `x`, the frame offsets
-/// corresponding to the computation of the transitions, and a primitive root,
-/// outputs the trace evaluations of each trace polynomial over the values used to
-/// compute a transition.
-/// Example: For a simple Fibonacci computation, if t(x) is the trace polynomial of
-/// the computation, this will output evaluations t(x), t(g * x), t(g^2 * z).
-pub fn get_trace_evaluations<F, E>(
+/// Reference Horner-based trace-evaluation used as an oracle by the prover
+/// tests (`tests::prover_tests`). The production prover uses the LDE-based
+/// barycentric `get_trace_evaluations_from_lde` below; the two are
+/// cross-checked in tests.
+#[cfg(test)]
+pub(crate) fn get_trace_evaluations<F, E>(
     main_trace_polys: &[Polynomial<FieldElement<F>>],
     aux_trace_polys: &[Polynomial<FieldElement<E>>],
     x: &FieldElement<E>,
