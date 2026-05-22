@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod auto_storage_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
@@ -42,5 +44,7 @@ pub mod page_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod register_tests;
+#[cfg(test)]
+pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
