@@ -10,7 +10,7 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
-    proof::stark::{DeepPolynomialOpening, MultiProof},
+    proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
@@ -262,7 +262,7 @@ pub trait IsStarkVerifier<
         let mut evaluation_point_inverse = challenges
             .iotas
             .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
             .collect::<Vec<FieldElement<Field>>>();
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
@@ -289,21 +289,16 @@ pub trait IsStarkVerifier<
     }
 
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
+    /// Returns the LDE-coset element for FRI query challenge `iota`. The
+    /// `sym` flag picks the symmetric counterpart (`iota*2+1`) instead of the
+    /// primary index (`iota*2`).
     fn query_challenge_to_evaluation_point(
         iota: usize,
+        sym: bool,
         domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        let index = reverse_index(iota * 2, domain.lde_length as u64);
-        domain.lde_coset_element(index)
-    }
-
-    /// Returns the symmetric field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
-    fn query_challenge_to_evaluation_point_sym(
-        iota: usize,
-        domain: &VerifierDomain<Field>,
-    ) -> FieldElement<Field> {
-        let index = reverse_index(iota * 2 + 1, domain.lde_length as u64);
-        domain.lde_coset_element(index)
+        let raw = iota * 2 + if sym { 1 } else { 0 };
+        domain.lde_coset_element(reverse_index(raw, domain.lde_length as u64))
     }
 
     /// Verifies the validity of the opening proof.
@@ -322,6 +317,29 @@ pub trait IsStarkVerifier<
         proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
     }
 
+    /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
+    /// of a `PolynomialOpenings` against the given `root` at iota positions
+    /// `iota*2` and `iota*2 + 1`.
+    fn verify_opening_pair<E>(
+        opening: &PolynomialOpenings<E>,
+        root: &Commitment,
+        iota: usize,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+        Field: IsSubFieldOf<E>,
+    {
+        Self::verify_opening::<E>(&opening.proof, root, iota * 2, &opening.evaluations)
+            && Self::verify_opening::<E>(
+                &opening.proof_sym,
+                root,
+                iota * 2 + 1,
+                &opening.evaluations_sym,
+            )
+    }
+
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_trace_openings(
@@ -333,75 +351,38 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let index = iota * 2;
-        let index_sym = iota * 2 + 1;
-        let mut result = true;
-
-        // Verify main trace (multiplicities for preprocessed, full trace for normal)
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof,
+        // Main trace (multiplicities for preprocessed, full trace for normal).
+        let mut ok = Self::verify_opening_pair::<Field>(
+            &deep_poly_openings.main_trace_polys,
             &proof.lde_trace_main_merkle_root,
-            index,
-            &deep_poly_openings.main_trace_polys.evaluations,
-        );
-        result &= Self::verify_opening::<Field>(
-            &deep_poly_openings.main_trace_polys.proof_sym,
-            &proof.lde_trace_main_merkle_root,
-            index_sym,
-            &deep_poly_openings.main_trace_polys.evaluations_sym,
+            iota,
         );
 
-        // Verify precomputed trace (for preprocessed tables only)
-        match (
+        // Precomputed trace (preprocessed tables only). Mismatched presence is
+        // unreachable in practice (multi_verify rejects such proofs upstream),
+        // but a defensive check keeps this function self-contained.
+        ok &= match (
             &proof.lde_trace_precomputed_merkle_root,
             &deep_poly_openings.precomputed_trace_polys,
         ) {
-            // Unreachable: multi_verify() already rejected proofs with None root for preprocessed AIRs,
-            // and non-preprocessed AIRs never have openings. No valid execution path reaches here.
-            (None, Some(_)) => result = false,
-            (Some(_), None) => result = false,
-            (Some(precomputed_root), Some(precomputed_opening)) => {
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof,
-                    precomputed_root,
-                    index,
-                    &precomputed_opening.evaluations,
-                );
-                result &= Self::verify_opening::<Field>(
-                    &precomputed_opening.proof_sym,
-                    precomputed_root,
-                    index_sym,
-                    &precomputed_opening.evaluations_sym,
-                );
-            }
-            _ => {}
-        }
+            (Some(root), Some(opening)) => Self::verify_opening_pair::<Field>(opening, root, iota),
+            (None, None) => true,
+            _ => false,
+        };
 
-        // Verify auxiliary trace
-        match (
+        // Auxiliary trace.
+        ok &= match (
             proof.lde_trace_aux_merkle_root,
             &deep_poly_openings.aux_trace_polys,
         ) {
-            (None, Some(_)) => result = false,
-            (Some(_), None) => result = false,
-            (Some(aux_root), Some(aux_trace_polys_opening)) => {
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof,
-                    &aux_root,
-                    index,
-                    &aux_trace_polys_opening.evaluations,
-                );
-                result &= Self::verify_opening::<FieldExtension>(
-                    &aux_trace_polys_opening.proof_sym,
-                    &aux_root,
-                    index_sym,
-                    &aux_trace_polys_opening.evaluations_sym,
-                );
+            (Some(root), Some(opening)) => {
+                Self::verify_opening_pair::<FieldExtension>(opening, &root, iota)
             }
-            _ => {}
-        }
+            (None, None) => true,
+            _ => false,
+        };
 
-        result
+        ok
     }
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
@@ -597,7 +578,7 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations.as_slice())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
+            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
@@ -621,7 +602,7 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations_sym.as_slice())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
+            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, true, domain);
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
