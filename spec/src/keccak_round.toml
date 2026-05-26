@@ -191,8 +191,8 @@ name = "theta"
 
 [[constraints.theta]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["idx", ["idx", ["idx", "start", "x"], 1], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["idx", ["idx", ["idx", "start", "x"], 1], "z"]]
 output = ["idx", ["idx", ["idx", "Cxz", "x"], 0], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -200,8 +200,8 @@ ref = "keccak:c:theta_cxz_start"
 
 [[constraints.theta]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"]]
 output = ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 1]], "z"]
 iters = [["x", 0, 4], ["y", 2, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -237,8 +237,8 @@ iters = [["x", 0, 4], ["z", 0, 3]]
 
 [[constraints.theta]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "Cxz", ["mod", ["-", "x", 1], 5]], 3], "z"], ["idx", ["idx", "rotated_Cxz", ["mod", ["+", "x", 1], 5]], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", ["mod", ["-", "x", 1], 5]], 3], "z"], ["idx", ["idx", "rotated_Cxz", ["mod", ["+", "x", 1], 5]], "z"]]
 output = ["idx", ["idx", "Dxz", "x"], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -246,8 +246,8 @@ ref = "keccak:c:Dxz"
 
 [[constraints.theta]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "start", "x"], "y"], "z"], ["idx", ["idx", "Dxz", "x"], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"], ["idx", ["idx", "Dxz", "x"], "z"]]
 output = ["idx", ["idx", ["idx", "theta", "x"], "y"], "z"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -289,16 +289,16 @@ name = "chi"
 
 [[constraints.chi]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["-", 255, ["idx", ["idx", ["idx", "pi", ["mod", ["+", "x", 1], 5]], "y"], "z"]], ["idx",["idx",["idx", "pi", ["mod", ["+", "x", 2], 5]], "y"], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["-", 255, ["idx", ["idx", ["idx", "pi", ["mod", ["+", "x", 1], 5]], "y"], "z"]], ["idx",["idx",["idx", "pi", ["mod", ["+", "x", 2], 5]], "y"], "z"]]
 output = ["idx", ["idx", ["idx", "chi_ANDs", "x"], "y"], "z"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
 
 [[constraints.chi]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "pi", "x"], "y"], "z"], ["idx",["idx",["idx", "chi_ANDs", "x"], "y"], "z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "pi", "x"], "y"], "z"], ["idx",["idx",["idx", "chi_ANDs", "x"], "y"], "z"]]
 output = ["idx", ["idx", ["idx", "chi", "x"], "y"], "z"]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
@@ -308,8 +308,8 @@ name = "iota"
 
 [[constraints.iota]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", ["idx", ["idx", "chi", 0], 0], "z"], ["idx","rc","z"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "chi", 0], 0], "z"], ["idx","rc","z"]]
 output = ["idx", "iota", "z"]
 iter = ["z", 0, 7]
 multiplicity = "μ"

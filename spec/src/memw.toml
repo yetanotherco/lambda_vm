@@ -162,31 +162,31 @@ iter = ["i", 0, 6]
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = [["idx", "old_timestamp", 0], "timestamp", 0]
-output = 1
+tag = "ALU"
+input = [["idx", "old_timestamp", 0], "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 multiplicity = "μ_sum"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = [["idx", "old_timestamp", 1], "timestamp", 0]
-output = 1
+tag = "ALU"
+input = [["idx", "old_timestamp", 1], "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 multiplicity = "w2"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = [["idx", "old_timestamp", "i"], "timestamp", 0]
-output = 1
+tag = "ALU"
+input = [["idx", "old_timestamp", "i"], "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 iter = ["i", 2, 3]
 multiplicity = "w4"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = [["idx", "old_timestamp", "i"], "timestamp", 0]
-output = 1
+tag = "ALU"
+input = [["idx", "old_timestamp", "i"], "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 iter = ["i", 4, 7]
 multiplicity = "write8"
 

@@ -61,8 +61,9 @@ First, we provide a mapping from an an ALU operation "descriptor" to the numeric
     *EQ*][3][
     *LT*][4][
     *SHIFT*][5][
-    *MUL*][6][
-    *DIVREM*][7]
+    *SHIFTW*][6][
+    *MUL*][7][
+    *DIVREM*][8]
 )
 
 We will illustrate how each instruction should be expressed in this (uncompressed) decoding table.
@@ -113,9 +114,9 @@ Further clarification is provided in the notes following the table.
   ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []),
   ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []),
   ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []),
-  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []),
-  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
-  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], []),
+  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
   // OP
   ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
   ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
@@ -123,9 +124,9 @@ Further clarification is provided in the notes following the table.
   ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []),
   ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []),
   ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []),
-  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
-  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
+  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
   // OP - M
   ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`signed2`], [#ref_note(<note_word_instr>)]),
   ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`signed2`, `muldiv_selector`], []),

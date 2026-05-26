@@ -150,9 +150,9 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = ["old_timestamp", "timestamp", 0]
-output = 1
+tag = "ALU"
+input = ["old_timestamp", "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 multiplicity = "μ_sum"
 
 [[constraint_groups]]

@@ -92,6 +92,15 @@ desc = """\
        """
 
 [[variables.types]]
+label = "DWordWHBB"
+subtypes = ["Byte", "Byte", "Half", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as a `Word`, a `Half` and two `Byte` variables. \
+       The `Word` is the *most* significant digit.
+       """
+
+[[variables.types]]
 label = "WordBL"
 subtypes = ["Byte", "Byte", "Byte", "Byte"]
 desc = """\

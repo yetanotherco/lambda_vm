@@ -261,10 +261,9 @@ input = ["write_register"]
 ref = "cpu:c:range_write_register"
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["instruction_length"]
-multiplicity = 1
 ref = "cpu:c:range_c_type_instruction"
 
 [[constraints.range]]
@@ -280,10 +279,9 @@ input = ["ALU"]
 ref = "cpu:c:range_ALU"
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["alu_flags"]
-multiplicity = 1
 ref = "cpu:c:range_alu_flags"
 
 [[constraints.range]]
@@ -305,10 +303,9 @@ input = ["MEMORY"]
 ref = "cpu:c:range_MEMORY"
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["mem_flags"]
-multiplicity = 1
 ref = "cpu:c:range_mem_flags"
 
 [[constraints.range]]
