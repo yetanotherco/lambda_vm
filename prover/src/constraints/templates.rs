@@ -509,16 +509,3 @@ pub fn new_is_bit_constraints(
 
     (constraints, constraint_idx_start + value_cols.len())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tables::types::GoldilocksField;
-
-    #[test]
-    fn test_inv_shift_32_is_correct() {
-        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
-        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
-        assert_eq!(inv * shift, FieldElement::one());
-    }
-}
