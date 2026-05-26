@@ -1456,8 +1456,11 @@ where
 /// is non-zero — which is an over-approximation of `m != 0` (we don't miss any
 /// non-zero rows, we just might process some m=0 rows due to cancellation).
 ///
-/// The threshold check: if more than `SPARSE_ACTIVE_FRAC` of the chunk is active,
-/// return None to fall back to the dense path (gather/scatter overhead not worth it).
+/// The threshold check: if more than `SPARSE_NUM / SPARSE_DEN` of the chunk
+/// is active, return `None` to fall back to the dense path (gather/scatter
+/// overhead not worth it). The scan early-aborts as soon as the active count
+/// passes the threshold so we never allocate more than `~chunk_len * 7/8`
+/// entries — important for non-parallel builds where `chunk_len = trace_len`.
 #[inline]
 fn sparse_active_rows<F>(
     multiplicity: &Multiplicity,
@@ -1469,54 +1472,83 @@ where
     F: IsField,
 {
     let zero = FieldElement::<F>::zero();
-    // If more than this fraction of rows are active, skip sparse path.
+    // If strictly more than this fraction of rows are active, skip sparse path.
     // (Numerator/denominator comparison to avoid floating point.)
     const SPARSE_NUM: usize = 7;
     const SPARSE_DEN: usize = 8;
+    let max_active = chunk_len * SPARSE_NUM / SPARSE_DEN;
 
-    let collect_if_sparse = |active: Vec<usize>| -> Option<Vec<usize>> {
-        if active.len() * SPARSE_DEN > chunk_len * SPARSE_NUM {
-            None
-        } else {
-            Some(active)
+    // Generic bounded collector: aborts as soon as `active.len()` would exceed
+    // the sparse threshold, avoiding the wasted allocation Codex flagged for
+    // dense chunks at full-trace length.
+    let collect_bounded = |is_active: &dyn Fn(usize) -> bool| -> Option<Vec<usize>> {
+        let mut active = Vec::new();
+        for i in 0..chunk_len {
+            if is_active(i) {
+                if active.len() >= max_active {
+                    return None;
+                }
+                active.push(i);
+            }
         }
+        Some(active)
     };
 
     match multiplicity {
         Multiplicity::One => None,
         Multiplicity::Column(col) => {
             let c = &main_segment_cols[*col];
-            let active: Vec<usize> = (0..chunk_len)
-                .filter(|&i| c[chunk_start + i] != zero)
-                .collect();
-            collect_if_sparse(active)
+            collect_bounded(&|i| c[chunk_start + i] != zero)
         }
         Multiplicity::Sum(col_a, col_b) => {
             let ca = &main_segment_cols[*col_a];
             let cb = &main_segment_cols[*col_b];
-            let active: Vec<usize> = (0..chunk_len)
-                .filter(|&i| {
-                    let row = chunk_start + i;
-                    ca[row] != zero || cb[row] != zero
-                })
-                .collect();
-            collect_if_sparse(active)
+            collect_bounded(&|i| {
+                let row = chunk_start + i;
+                ca[row] != zero || cb[row] != zero
+            })
         }
         Multiplicity::Sum3(col_a, col_b, col_c) => {
             let ca = &main_segment_cols[*col_a];
             let cb = &main_segment_cols[*col_b];
             let cc = &main_segment_cols[*col_c];
-            let active: Vec<usize> = (0..chunk_len)
-                .filter(|&i| {
-                    let row = chunk_start + i;
-                    ca[row] != zero || cb[row] != zero || cc[row] != zero
-                })
-                .collect();
-            collect_if_sparse(active)
+            collect_bounded(&|i| {
+                let row = chunk_start + i;
+                ca[row] != zero || cb[row] != zero || cc[row] != zero
+            })
         }
         // Negated = 1 - col is dense (usually 1 when col is a bit flag).
         // Diff and Linear could cancel arbitrarily; safest to treat as dense.
         Multiplicity::Negated(_) | Multiplicity::Diff(_, _) | Multiplicity::Linear(_) => None,
+    }
+}
+
+/// Iterator over active row indices within a chunk: either the explicit sparse
+/// index slice or the full `0..chunk_len` range when the interaction is dense.
+/// Used by the batched term-column builder to walk active rows without
+/// materializing `(0..chunk_len).collect::<Vec<_>>()` for the dense side of a
+/// half-sparse pair (Claude/Codex review finding).
+enum ActiveIter<'a> {
+    Sparse(core::slice::Iter<'a, usize>),
+    Dense(core::ops::Range<usize>),
+}
+
+impl<'a> ActiveIter<'a> {
+    fn new(active: Option<&'a Vec<usize>>, chunk_len: usize) -> Self {
+        match active {
+            Some(v) => ActiveIter::Sparse(v.iter()),
+            None => ActiveIter::Dense(0..chunk_len),
+        }
+    }
+}
+
+impl Iterator for ActiveIter<'_> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            ActiveIter::Sparse(it) => it.next().copied(),
+            ActiveIter::Dense(r) => r.next(),
+        }
     }
 }
 
@@ -1804,31 +1836,27 @@ where
             z - &lc
         };
 
-        let indices_a: Vec<usize> = match &active_a {
-            Some(v) => v.clone(),
-            None => (0..chunk_len).collect(),
-        };
-        let indices_b: Vec<usize> = match &active_b {
-            Some(v) => v.clone(),
-            None => (0..chunk_len).collect(),
-        };
+        // Length per side without materializing the index vector. For dense
+        // interactions this is just `chunk_len`; for sparse it's the kept
+        // active vector's length.
+        let len_a = active_a.as_ref().map(|v| v.len()).unwrap_or(chunk_len);
+        let len_b = active_b.as_ref().map(|v| v.len()).unwrap_or(chunk_len);
 
-        let mut fingerprints: Vec<FieldElement<E>> =
-            Vec::with_capacity(indices_a.len() + indices_b.len());
-        for &i in &indices_a {
+        let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(len_a + len_b);
+        for i in ActiveIter::new(active_a.as_ref(), chunk_len) {
             fingerprints.push(compute_fp(interaction_a, &bus_id_a, chunk_start + i));
         }
-        for &i in &indices_b {
+        for i in ActiveIter::new(active_b.as_ref(), chunk_len) {
             fingerprints.push(compute_fp(interaction_b, &bus_id_b, chunk_start + i));
         }
 
         FieldElement::inplace_batch_inverse(&mut fingerprints)
             .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-        let (fp_a_inv, fp_b_inv) = fingerprints.split_at(indices_a.len());
+        let (fp_a_inv, fp_b_inv) = fingerprints.split_at(len_a);
 
         // Scatter a-terms (overwrite: result_chunk starts at zero).
-        for (k, &i) in indices_a.iter().enumerate() {
+        for (k, i) in ActiveIter::new(active_a.as_ref(), chunk_len).enumerate() {
             let row = chunk_start + i;
             let m_a = interaction_a
                 .multiplicity
@@ -1837,7 +1865,7 @@ where
             result_chunk[i] = if negate_a { -term } else { term };
         }
         // Add b-terms on top of whatever a left behind (possibly zero).
-        for (k, &i) in indices_b.iter().enumerate() {
+        for (k, i) in ActiveIter::new(active_b.as_ref(), chunk_len).enumerate() {
             let row = chunk_start + i;
             let m_b = interaction_b
                 .multiplicity
