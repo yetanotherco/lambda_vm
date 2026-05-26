@@ -781,7 +781,7 @@ fn test_prove_elfs_keccak_multi_call() {
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///
-/// Without the IS_BYTE range checks on addr(0..7), an attacker could keep
+/// Without the ARE_BYTES range checks on addr(0..7), an attacker could keep
 /// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
 /// address as a field element while setting addr(0)=0 (passing the AndByte
 /// alignment check) and folding the carry into addr(1) as a non-byte
@@ -802,8 +802,8 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
-    // value outside [0, 256). The new IS_BYTE bus sender will emit this
-    // value with multiplicity MU=1; the IS_BYTE preprocessed table only
+    // value outside [0, 256). The new ARE_BYTES bus sender will emit this
+    // value with multiplicity MU=1; the ARE_BYTES preprocessed table only
     // contains 0..256, so the bus cannot balance.
     traces.keccak.main_table.set(
         0,
@@ -1493,8 +1493,8 @@ fn test_debug_memory_tokens_sb_sh() {
         println!("Found {} imbalanced memory tokens", imbalanced);
     }
 
-    // === Count IS_BYTE lookups from PAGE (batched [init, fini] per row) ===
-    println!("\n=== IS_BYTE Lookup Counts (from PAGE tables) ===");
+    // === Count ARE_BYTES lookups from PAGE (batched [init, fini] per row) ===
+    println!("\n=== ARE_BYTES Lookup Counts (from PAGE tables) ===");
     let mut page_pair_counts: HashMap<(u8, u8), u64> = HashMap::new();
     let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
     for (page_idx, page_trace) in traces.pages.iter().enumerate() {
@@ -1505,46 +1505,46 @@ fn test_debug_memory_tokens_sb_sh() {
             *page_pair_counts.entry((init, fini)).or_insert(0) += 1;
         }
     }
-    let page_is_byte_total: u64 = page_pair_counts.values().sum();
+    let page_are_bytes_total: u64 = page_pair_counts.values().sum();
     println!(
-        "Total PAGE rows: {}, Expected IS_BYTE (1 per row): {}",
+        "Total PAGE rows: {}, Expected ARE_BYTES (1 per row): {}",
         total_page_rows, total_page_rows,
     );
     println!(
-        "IS_BYTE[0, 0] from PAGE: {} lookups (most rows are (0,0))",
+        "ARE_BYTES[0, 0] from PAGE: {} lookups (most rows are (0,0))",
         page_pair_counts.get(&(0, 0)).copied().unwrap_or(0)
     );
 
-    // BITWISE row for IS_BYTE[X, Y] at Z=0 is X + 256*Y. We only sum
+    // BITWISE row for ARE_BYTES[X, Y] at Z=0 is X + 256*Y. We only sum
     // multiplicity at the (X, Y) pairs PAGE actually touches. Other senders
-    // (e.g. CPU's paired IS_BYTE checks) also bump this same MU_IS_BYTE
+    // (e.g. CPU's paired ARE_BYTES checks) also bump this same MU_ARE_BYTES
     // column and may hit the same (X, Y) rows, so this is a coarse sanity
     // check (BITWISE mult >= PAGE's contribution), not an exact balance.
     use crate::tables::bitwise::cols as bitwise_cols;
-    let bitwise_is_byte_mult_over_page_pairs: u64 = page_pair_counts
+    let bitwise_are_bytes_mult_over_page_pairs: u64 = page_pair_counts
         .keys()
         .map(|&(x, y)| {
             let row = x as usize + 256 * y as usize;
             traces
                 .bitwise
                 .main_table
-                .get(row, bitwise_cols::MU_IS_BYTE)
+                .get(row, bitwise_cols::MU_ARE_BYTES)
                 .to_raw()
         })
         .sum();
     println!(
-        "Bitwise IS_BYTE mult summed over PAGE (init, fini) rows: {}",
-        bitwise_is_byte_mult_over_page_pairs
+        "Bitwise ARE_BYTES mult summed over PAGE (init, fini) rows: {}",
+        bitwise_are_bytes_mult_over_page_pairs
     );
     println!(
-        "Total IS_BYTE lookups from PAGE (counted): {}",
-        page_is_byte_total
+        "Total ARE_BYTES lookups from PAGE (counted): {}",
+        page_are_bytes_total
     );
-    // Note: this can be >= 0 because CPU byte-pair IS_BYTE senders may also
+    // Note: this can be >= 0 because CPU byte-pair ARE_BYTES senders may also
     // hit some of the same (init, fini) rows. It should never be negative.
     println!(
         "Difference: {} (>= 0 expected; PAGE pairs may also receive from CPU)",
-        bitwise_is_byte_mult_over_page_pairs as i64 - page_is_byte_total as i64
+        bitwise_are_bytes_mult_over_page_pairs as i64 - page_are_bytes_total as i64
     );
 
     // === Verify PAGE AIR uses correct page_base ===
