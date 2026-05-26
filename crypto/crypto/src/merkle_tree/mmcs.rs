@@ -1,19 +1,26 @@
 //! Multi-Matrix Commitment Scheme (MMCS): a single Merkle root that
-//! commits to multiple matrices of (different) heights, with one
-//! authentication path per query covering all matrices.
+//! commits to multiple matrices of (different or equal) heights, with
+//! one authentication path per query covering all matrices.
 //!
-//! Plonky3-style layer injection: sort matrices by `padded_height` desc;
-//! layer 0 = largest matrix's leaves; compress pairs upward; at each
-//! layer whose length matches a smaller matrix's `padded_height`, inject
-//! that matrix's leaves via `compress(node_i, matrix.leaves[i])`.
+//! Plonky3-style layer injection: sort matrices by `padded_height` desc
+//! (ties broken by `tag` asc); layer 0 starts with the first max-height
+//! matrix's leaves and sequentially compresses in additional max-height
+//! matrices; each upper layer compresses pairs of children then injects
+//! every matrix whose `padded_height` matches that layer's length.
 //!
-//! MVP scope:
-//! - All matrices have distinct `padded_height` (matches lambda-vm topology).
-//! - No SIMD, no streaming, no caps. Standalone module, not wired to prover.
+//! Scope:
+//! - Multiple matrices may share a `padded_height` (matches lambda-vm's
+//!   chunked-table topology: 3 CPU chunks all at 2^20, BITWISE at 2^20,
+//!   etc.). Combination order at a layer is deterministic (tag asc).
+//! - No SIMD / parallel hashing yet.
+//! - No streaming chunked absorption — caller materializes full leaf
+//!   digest arrays per matrix.
+//! - Single root (no caps).
 //!
 //! Security: see `docs/mmcs-streaming-design.md` for the 8-vector threat
 //! model; each vector is tested below.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::traits::IsMerkleTreeBackend;
@@ -35,7 +42,6 @@ pub enum MmcsError {
     EmptyMatrix,
     NotPowerOfTwo,
     Empty,
-    DuplicateHeight,
     IndexOutOfBounds,
 }
 
@@ -92,40 +98,52 @@ impl<B: IsMerkleTreeBackend> MmcsBuilder<B> {
         if self.matrices.is_empty() {
             return Err(MmcsError::Empty);
         }
-        // Deterministic order: height desc, tag asc. Verifier reproduces.
+        // Deterministic sort: height desc, then tag asc. The verifier
+        // reproduces this exact ordering so prover/verifier agree on
+        // which matrix contributes when.
         self.matrices.sort_by(|a, b| {
             b.padded_height()
                 .cmp(&a.padded_height())
                 .then(a.tag.cmp(&b.tag))
         });
-        for w in self.matrices.windows(2) {
-            if w[0].padded_height() == w[1].padded_height() {
-                return Err(MmcsError::DuplicateHeight);
-            }
-        }
 
         let max_height = self.matrices[0].padded_height();
         let depth = max_height.trailing_zeros() as usize;
-        let mut layers: Vec<Vec<B::Node>> = Vec::with_capacity(depth + 1);
-        // Layer 0 = largest matrix's leaves.
-        layers.push(self.matrices[0].leaf_digests.clone());
 
+        // Group matrix indices by padded_height (preserving tag-asc order
+        // within each group because `matrices` is already sorted).
+        let mut by_height: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (idx, m) in self.matrices.iter().enumerate() {
+            by_height.entry(m.padded_height()).or_default().push(idx);
+        }
+
+        let mut layers: Vec<Vec<B::Node>> = Vec::with_capacity(depth + 1);
+
+        // Layer 0: combine all max-height matrices in tag-asc order.
+        let top_group = by_height
+            .get(&max_height)
+            .expect("max_height bucket exists");
+        let mut layer0: Vec<B::Node> = self.matrices[top_group[0]].leaf_digests.clone();
+        for &mi in &top_group[1..] {
+            for (node, leaf) in layer0.iter_mut().zip(self.matrices[mi].leaf_digests.iter()) {
+                *node = B::hash_new_parent(node, leaf);
+            }
+        }
+        layers.push(layer0);
+
+        // Walk upward; at each new layer, compress pairs then inject all
+        // matrices at this layer's length in tag-asc order.
         for level in 0..depth {
             let cur = &layers[level];
             let new_len = cur.len() / 2;
-            let mut next: Vec<B::Node> = Vec::with_capacity(new_len);
-            for i in 0..new_len {
-                next.push(B::hash_new_parent(&cur[2 * i], &cur[2 * i + 1]));
-            }
-            // Inject any non-largest matrix at this layer length.
-            if let Some(matrix) = self
-                .matrices
-                .iter()
-                .skip(1)
-                .find(|m| m.padded_height() == new_len)
-            {
-                for (node, inject) in next.iter_mut().zip(matrix.leaf_digests.iter()) {
-                    *node = B::hash_new_parent(node, inject);
+            let mut next: Vec<B::Node> = (0..new_len)
+                .map(|i| B::hash_new_parent(&cur[2 * i], &cur[2 * i + 1]))
+                .collect();
+            if let Some(group) = by_height.get(&new_len) {
+                for &mi in group {
+                    for (node, leaf) in next.iter_mut().zip(self.matrices[mi].leaf_digests.iter()) {
+                        *node = B::hash_new_parent(node, leaf);
+                    }
                 }
             }
             layers.push(next);
@@ -149,6 +167,7 @@ impl<B: IsMerkleTreeBackend> Mmcs<B> {
         &top[0]
     }
 
+    /// `(tag, padded_height)` per matrix in deterministic sort order.
     pub fn spec(&self) -> Vec<(MatrixTag, usize)> {
         self.matrices
             .iter()
@@ -188,6 +207,8 @@ impl<B: IsMerkleTreeBackend> Mmcs<B> {
 
 #[derive(Debug, Clone)]
 pub struct MmcsOpening<N> {
+    /// `(tag, leaf_at_shifted_index)` per matrix, in the builder's sort
+    /// order (height desc, tag asc).
     pub matrix_leaves: Vec<(MatrixTag, N)>,
     pub siblings: Vec<N>,
     pub global_index: usize,
@@ -209,18 +230,12 @@ impl<N: PartialEq + Eq + Clone> MmcsOpening<N> {
                 return false;
             }
         }
-        for w in specs.windows(2) {
-            if w[0].1 == w[1].1 {
-                return false;
-            }
-            if !w[0].1.is_power_of_two() || !w[1].1.is_power_of_two() {
+        for (_, ph) in &specs {
+            if !ph.is_power_of_two() || *ph == 0 {
                 return false;
             }
         }
         let max_height = specs[0].1;
-        if !max_height.is_power_of_two() || max_height == 0 {
-            return false;
-        }
         if self.global_index >= max_height {
             return false;
         }
@@ -229,9 +244,21 @@ impl<N: PartialEq + Eq + Clone> MmcsOpening<N> {
             return false;
         }
 
-        let mut current = self.matrix_leaves[0].1.clone();
-        let mut idx = self.global_index;
+        // Walk `matrix_leaves` left to right with a cursor; the leaves
+        // are grouped by height (largest first) and within each group
+        // are sorted by tag.
+        let mut cursor = 0usize;
 
+        // Reconstruct layer-0 at global_index: combine all max-height
+        // matrices' leaves at global_index in tag-asc order.
+        let mut current = self.matrix_leaves[cursor].1.clone();
+        cursor += 1;
+        while cursor < self.matrix_leaves.len() && specs[cursor].1 == max_height {
+            current = B::hash_new_parent(&current, &self.matrix_leaves[cursor].1);
+            cursor += 1;
+        }
+
+        let mut idx = self.global_index;
         for level in 0..depth {
             let sibling = &self.siblings[level];
             current = if idx & 1 == 0 {
@@ -242,20 +269,16 @@ impl<N: PartialEq + Eq + Clone> MmcsOpening<N> {
             idx >>= 1;
 
             let new_len = max_height >> (level + 1);
-            if let Some((tag, _)) = specs.iter().find(|(_, ph)| *ph == new_len) {
-                let inject = self
-                    .matrix_leaves
-                    .iter()
-                    .find(|(t, _)| t == tag)
-                    .map(|(_, leaf)| leaf);
-                let inject = match inject {
-                    Some(l) => l,
-                    None => return false,
-                };
-                current = B::hash_new_parent(&current, inject);
+            while cursor < self.matrix_leaves.len() && specs[cursor].1 == new_len {
+                current = B::hash_new_parent(&current, &self.matrix_leaves[cursor].1);
+                cursor += 1;
             }
         }
 
+        if cursor != self.matrix_leaves.len() {
+            // Unconsumed leaves => topology mismatch.
+            return false;
+        }
         &current == expected_root
     }
 }
@@ -307,6 +330,8 @@ mod tests {
         b.finalize().expect("finalize")
     }
 
+    // ---------- Basic ----------
+
     #[test]
     fn build_single_matrix_round_trips() {
         let (tag, leaves) = make_matrix(0xAA, 8);
@@ -340,6 +365,74 @@ mod tests {
         assert_eq!(r1, r3);
     }
 
+    // ---------- Same-height topology (lambda-vm style) ----------
+
+    #[test]
+    fn same_height_pair_round_trips() {
+        // Two matrices both at max_height — combined into layer 0.
+        let m1 = make_matrix(0x01, 4);
+        let m2 = make_matrix(0x02, 4);
+        let tree = build(vec![m1, m2]);
+        for i in 0..4 {
+            let opening = tree.open(i).expect("open");
+            assert!(
+                opening.verify::<TestBackend>(tree.root(), &tree.spec()),
+                "round-trip at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn lambda_vm_style_multi_chunk_round_trips() {
+        // 3 max-height chunks (CPU-like), 2 mid-height (MEMW-like at 1/2),
+        // 1 small (REGISTER-like at 1/8). Heights: 8, 8, 8, 4, 4, 1.
+        let cpus = vec![
+            make_matrix(0x01, 8),
+            make_matrix(0x02, 8),
+            make_matrix(0x03, 8),
+        ];
+        let memws = vec![make_matrix(0x10, 4), make_matrix(0x11, 4)];
+        let reg = make_matrix(0xF0, 1);
+        let mut all = cpus;
+        all.extend(memws);
+        all.push(reg);
+        let tree = build(all);
+        for i in 0..8 {
+            let opening = tree.open(i).expect("open");
+            assert!(
+                opening.verify::<TestBackend>(tree.root(), &tree.spec()),
+                "round-trip at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn insertion_order_does_not_change_root() {
+        // Multi-permutation determinism: any permutation of the same set
+        // of matrices must produce the same root.
+        let a = make_matrix(0x01, 8);
+        let b = make_matrix(0x02, 8);
+        let c = make_matrix(0x03, 4);
+        let r1 = *build(vec![a.clone(), b.clone(), c.clone()]).root();
+        let r2 = *build(vec![c.clone(), a.clone(), b.clone()]).root();
+        let r3 = *build(vec![b, c, a]).root();
+        assert_eq!(r1, r2);
+        assert_eq!(r1, r3);
+    }
+
+    #[test]
+    fn same_height_tampered_leaf_rejected() {
+        let m1 = make_matrix(0x01, 4);
+        let m2 = make_matrix(0x02, 4);
+        let tree = build(vec![m1, m2]);
+        let mut opening = tree.open(2).expect("open");
+        // Flip one bit of the second max-height matrix's leaf.
+        opening.matrix_leaves[1].1[0] ^= 1;
+        assert!(!opening.verify::<TestBackend>(tree.root(), &tree.spec()));
+    }
+
+    // ---------- Threat model (vectors 1-8) ----------
+
     #[test]
     fn v1_cross_matrix_row_swap_is_rejected() {
         let big = make_matrix(0xAA, 4);
@@ -359,13 +452,15 @@ mod tests {
     }
 
     #[test]
-    fn v3_same_height_matrices_rejected_in_mvp() {
+    fn v3_layer_injection_order_deterministic_under_permutation() {
+        // Two matrices at same height — combining is in tag-asc order
+        // regardless of insertion. Already covered above; pin it here.
         let m1 = make_matrix(0x01, 4);
         let m2 = make_matrix(0x02, 4);
-        let mut b: MmcsBuilder<TestBackend> = MmcsBuilder::new();
-        b.add_matrix(m1.0, m1.1).expect("add 1");
-        b.add_matrix(m2.0, m2.1).expect("add 2");
-        assert_eq!(b.finalize().err(), Some(MmcsError::DuplicateHeight));
+        assert_eq!(
+            *build(vec![m1.clone(), m2.clone()]).root(),
+            *build(vec![m2, m1]).root()
+        );
     }
 
     #[test]
