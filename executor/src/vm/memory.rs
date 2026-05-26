@@ -81,77 +81,108 @@ impl Memory {
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(4) {
+            let bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            Ok(u32::from_le_bytes(bytes))
+        } else {
+            Ok(u32::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address.wrapping_add(1)),
+                self.load_byte(address.wrapping_add(2)),
+                self.load_byte(address.wrapping_add(3)),
+            ]))
         }
-        let bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        Ok(u32::from_le_bytes(bytes))
     }
 
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
-        }
         let bytes = value.to_le_bytes();
-        self.cells.insert(address, bytes);
+        if address.is_multiple_of(4) {
+            self.cells.insert(address, bytes);
+        } else {
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address.wrapping_add(i as u64), *b);
+            }
+        }
         Ok(())
     }
 
     /// Load a doubleword (64-bit) from memory - for LD instruction
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(4) {
+            let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            let high_bytes = self
+                .cells
+                .get(&address.wrapping_add(4))
+                .cloned()
+                .unwrap_or_default();
+            let low = u32::from_le_bytes(low_bytes) as u64;
+            let high = u32::from_le_bytes(high_bytes) as u64;
+            Ok(low | (high << 32))
+        } else {
+            let mut bytes = [0u8; 8];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = self.load_byte(address.wrapping_add(i as u64));
+            }
+            Ok(u64::from_le_bytes(bytes))
         }
-        let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
-        let low = u32::from_le_bytes(low_bytes) as u64;
-        let high = u32::from_le_bytes(high_bytes) as u64;
-        Ok(low | (high << 32))
     }
 
     /// Store a doubleword (64-bit) to memory - for SD instruction
     pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(4) {
+            let low = (value & 0xFFFFFFFF) as u32;
+            let high = (value >> 32) as u32;
+            self.cells.insert(address, low.to_le_bytes());
+            self.cells
+                .insert(address.wrapping_add(4), high.to_le_bytes());
+        } else {
+            let bytes = value.to_le_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address.wrapping_add(i as u64), *b);
+            }
         }
-        let low = (value & 0xFFFFFFFF) as u32;
-        let high = (value >> 32) as u32;
-        self.cells.insert(address, low.to_le_bytes());
-        self.cells.insert(address + 4, high.to_le_bytes());
         Ok(())
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        if !address.is_multiple_of(2) {
-            unimplemented!(
-                "Unaligned load half memory access at address 0x{:016x}",
-                address
-            );
+        // A halfword fits in a single 4-byte cell when the byte offset is 0, 1,
+        // or 2. Offset 3 straddles into the next cell.
+        if address % 4 <= 2 {
+            let aligned_address = address - address % 4;
+            let bytes = self
+                .cells
+                .get(&aligned_address)
+                .cloned()
+                .unwrap_or_default();
+            let offset = (address % 4) as usize;
+            Ok(u16::from_le_bytes(
+                bytes[offset..offset + 2]
+                    .try_into()
+                    .map_err(|_| MemoryError::LoadHalf)?,
+            ))
+        } else {
+            Ok(u16::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address.wrapping_add(1)),
+            ]))
         }
-        let aligned_address = address - address % 4;
-        let bytes = self
-            .cells
-            .get(&aligned_address)
-            .cloned()
-            .unwrap_or_default();
-        let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
-        Ok(u16::from_le_bytes(
-            value.try_into().map_err(|_| MemoryError::LoadHalf)?,
-        ))
     }
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(2) {
-            return Err(MemoryError::UnalignedAccess);
-        }
-        let aligned_address = address - address % 4;
-        let entry = self
-            .cells
-            .entry(aligned_address)
-            .or_insert_with(|| [0, 0, 0, 0]);
         let bytes = value.to_le_bytes();
-        entry[(address % 4) as usize] = bytes[0];
-        entry[(address % 4) as usize + 1] = bytes[1];
+        if address % 4 <= 2 {
+            let aligned_address = address - address % 4;
+            let entry = self
+                .cells
+                .entry(aligned_address)
+                .or_insert_with(|| [0, 0, 0, 0]);
+            let offset = (address % 4) as usize;
+            entry[offset] = bytes[0];
+            entry[offset + 1] = bytes[1];
+        } else {
+            self.store_byte(address, bytes[0]);
+            self.store_byte(address.wrapping_add(1), bytes[1]);
+        }
         Ok(())
     }
 
