@@ -57,7 +57,14 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     nodes: Vec<B::Node>,
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) mmap_backing: Option<MmapNodeBacking>,
+    mmap_backing: Option<MmapNodeBacking>,
+}
+
+#[cfg(all(test, feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> MerkleTree<B> {
+    pub(crate) fn has_mmap_backing(&self) -> bool {
+        self.mmap_backing.is_some()
+    }
 }
 
 // `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,

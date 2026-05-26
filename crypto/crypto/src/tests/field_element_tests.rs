@@ -1,6 +1,5 @@
 //! Tests for the field-element Merkle tree backend.
 
-use alloc::vec::Vec;
 use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 

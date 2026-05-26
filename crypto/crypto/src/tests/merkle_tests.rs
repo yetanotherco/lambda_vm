@@ -137,10 +137,10 @@ fn batch_proof_len_is_expected_for_long_pos_list() {
     assert_eq!(batch_proof.path.len(), 2);
 }
 
-#[cfg(all(test, feature = "serde", feature = "disk-spill"))]
+#[cfg(all(feature = "serde", feature = "disk-spill"))]
 mod disk_spill_serde_tests {
     use crate::merkle_tree::backends::field_element::FieldElementBackend;
-    use crate::merkle_tree::merkle::*;
+    use crate::merkle_tree::merkle::MerkleTree;
     use math::field::{element::FieldElement, goldilocks::GoldilocksField};
     use sha3::Keccak256;
 
@@ -168,7 +168,7 @@ mod disk_spill_serde_tests {
 
         let restored: MerkleTree<Backend> =
             bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(restored.mmap_backing.is_none());
+        assert!(!restored.has_mmap_backing());
         assert_eq!(restored.root, unspilled.root);
     }
 }
