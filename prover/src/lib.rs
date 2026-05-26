@@ -17,6 +17,7 @@ pub mod constraints;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+mod statement;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
@@ -35,6 +36,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::statement::absorb_statement;
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -449,8 +451,8 @@ impl VmAirs {
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
+    transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
     for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
@@ -516,8 +518,9 @@ pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
+    transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a(airs, proof);
+    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
     compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
 
@@ -656,10 +659,28 @@ pub fn prove_with_options_and_inputs(
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+
+    // Bind the full statement (program, public output, table layout) into the
+    // Fiat-Shamir transcript so every challenge depends on it.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+    );
+
     // Phase 4: Prove (multi_prove)
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -680,12 +701,6 @@ pub fn prove_with_options_and_inputs(
             },
         );
     }
-
-    let num_private_input_pages = traces
-        .page_configs
-        .iter()
-        .filter(|c| c.is_private_input)
-        .count();
 
     Ok(VmProof {
         proof,
@@ -769,10 +784,29 @@ pub fn verify_with_options(
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
+
+    // Bind the statement into the verifier's transcript. A tampered statement
+    // field makes this diverge from the prover's transcript state, so every
+    // derived challenge differs and verification rejects.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        elf_bytes,
+        &vm_proof.public_output,
+        &vm_proof.table_counts,
+        vm_proof.num_private_input_pages,
+        &vm_proof.runtime_page_ranges,
+    );
+
+    // Fork the post-absorb state: the replay helper advances through Phase A
+    // independently of the multi_verify transcript, but both must start from
+    // the same statement-bound state.
+    let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        &mut transcript_for_replay,
     ) {
         Some(balance) => balance,
         None => return Ok(false),
@@ -781,7 +815,7 @@ pub fn verify_with_options(
     Ok(Verifier::multi_verify(
         &air_refs,
         &vm_proof.proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut transcript,
         &expected_bus_balance,
     ))
 }
