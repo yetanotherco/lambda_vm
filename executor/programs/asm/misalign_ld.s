@@ -10,6 +10,12 @@ main:
 	li	t1, 0x000000AA
 	sw	t1, 8(t0)
 	ld	a0, 1(t0)
+	li	t2, 0xAADEADBEEF80FF12
+	bne	a0, t2, .Lfail
 	li	a0, 0
+	li	a7, 93
+	ecall
+.Lfail:
+	li	a0, 1
 	li	a7, 93
 	ecall
