@@ -321,6 +321,176 @@ fn test_recursion_cycle_count() {
     eprintln!("============================================================");
 }
 
+/// Diagnostic: count the distinct 4 KB memory pages the recursion guest
+/// touches when verifying a small inner proof.
+///
+/// We suspect the outer prover's 125 GB OOM wall is dominated by per-page
+/// PAGE-table overhead. The number of PAGE tables the prover would build
+/// equals the number of distinct 4 KB pages the executor touches — code,
+/// heap, private input, and stack. This test surfaces that count without
+/// running the prover.
+///
+/// Layout (per `executor::constants` + `bench_vs/lambda/recursion/src/main.rs`):
+/// - Code/static: whatever PT_LOAD segments the recursion ELF carries.
+/// - Heap: `_end .. 0xC000_0000` (`MAX_MEMORY_SIZE`); `TlsfHeap` scatters
+///   allocations across this region.
+/// - Private input: starts at `PRIVATE_INPUT_START_INDEX = 0xFF000000`.
+/// - Stack: top of address space (down from `STACK_TOP = 0xFFFFFFFFFFFFFFF0`).
+///
+/// Interpretation (rough):
+/// - <1,000 pages: PAGE-table overhead is not the bottleneck.
+/// - 10k-100k pages: TLSF heap fragmentation; design a tighter bump allocator
+///   and re-measure.
+/// - >100k pages: postcard decode dominates; consider streaming decode.
+#[test]
+#[ignore = "diagnostic: counts distinct 4 KB memory pages touched by the recursion guest"]
+fn test_recursion_page_count() {
+    use executor::constants::PRIVATE_INPUT_START_INDEX;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashSet;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[page-count] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let elf_for_vkey = Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
+    eprintln!("[page-count] postcard blob: {} bytes", blob.len());
+
+    // Precompute the recursion ELF's PT_LOAD ranges so we can bucket code/
+    // static pages separately from heap. `Elf::load` already expands BSS
+    // (memsz > filesz) into zero-valued words, so these ranges cover
+    // .text + .rodata + .data + .bss.
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let segment_ranges: Vec<(u64, u64)> = program
+        .data
+        .iter()
+        .map(|seg| (seg.base_addr, seg.base_addr + (seg.values.len() as u64 * 4)))
+        .collect();
+    eprintln!(
+        "[page-count] recursion ELF: {} PT_LOAD segment(s)",
+        segment_ranges.len(),
+    );
+    for (i, (lo, hi)) in segment_ranges.iter().enumerate() {
+        eprintln!(
+            "[page-count]   segment[{i}]: 0x{lo:016x} .. 0x{hi:016x} ({} bytes)",
+            hi - lo,
+        );
+    }
+
+    // Stream through execution — running to completion via `Executor::run`
+    // would accumulate ~67 M `Log` records (~2.7 GB) we don't need. We only
+    // care about the *final* memory state.
+    eprintln!("[page-count] executing recursion guest (streaming) ...");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+    let start = std::time::Instant::now();
+    let mut chunks: usize = 0;
+    let mut total_cycles: u64 = 0;
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        total_cycles += logs.len() as u64;
+        chunks += 1;
+        if chunks.is_multiple_of(50) {
+            eprintln!(
+                "[page-count]   ... {chunks} chunks, {total_cycles} cycles, {:?} elapsed",
+                start.elapsed()
+            );
+        }
+    }
+    let exec_time = start.elapsed();
+
+    // Collect the set of distinct 4 KB pages from every cell touched during
+    // (a) program loading, (b) private-input loading, (c) execution.
+    const PAGE_MASK: u64 = !0xFFFu64;
+    let cells = executor.memory().cells();
+    let total_cells = cells.len();
+    let pages: HashSet<u64> = cells.keys().map(|&a| a & PAGE_MASK).collect();
+
+    // Bucket by region. A "code/static" page is any page that overlaps a
+    // PT_LOAD segment. Stack lives near the top of the 64-bit address
+    // space; private input lives in the [0xFF000000, ...) window above the
+    // 3 GB heap ceiling.
+    const HEAP_CEILING: u64 = 0xC000_0000;
+    const STACK_FLOOR: u64 = 0xFFFF_FFFF_0000_0000;
+
+    let mut code_pages = 0usize;
+    let mut heap_pages = 0usize;
+    let mut private_input_pages = 0usize;
+    let mut stack_pages = 0usize;
+    let mut other_pages = 0usize;
+
+    for &page in &pages {
+        let page_end = page.saturating_add(0x1000);
+        let in_code = segment_ranges
+            .iter()
+            .any(|&(lo, hi)| page < hi && lo < page_end);
+        if in_code {
+            code_pages += 1;
+        } else if page >= STACK_FLOOR {
+            stack_pages += 1;
+        } else if page >= PRIVATE_INPUT_START_INDEX {
+            private_input_pages += 1;
+        } else if page < HEAP_CEILING {
+            heap_pages += 1;
+        } else {
+            other_pages += 1;
+        }
+    }
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  RECURSION GUEST PAGE-COUNT SUMMARY");
+    eprintln!("============================================================");
+    eprintln!("  Total cycles                  : {total_cycles}");
+    eprintln!("  Executor wall time            : {exec_time:?}");
+    eprintln!("  Memory cells touched (4 B ea) : {total_cells}");
+    eprintln!("  Distinct 4 KB pages touched   : {}", pages.len());
+    eprintln!();
+    eprintln!("  Pages per region:");
+    eprintln!("    code/static (ELF segments)     : {code_pages}");
+    eprintln!("    heap (0..0xC000_0000)          : {heap_pages}");
+    eprintln!("    private input (0xFF000000..)   : {private_input_pages}");
+    eprintln!("    stack (>= 0xFFFFFFFF_00000000) : {stack_pages}");
+    if other_pages > 0 {
+        eprintln!("    other (unclassified)           : {other_pages}");
+    }
+    eprintln!();
+    eprintln!("  Interpretation (PAGE-table overhead):");
+    eprintln!("    <1k pages     → PAGE overhead is not the bottleneck.");
+    eprintln!("    10k-100k      → TLSF heap fragmentation; try a bump alloc.");
+    eprintln!("    >100k         → postcard decode dominates; stream-decode?");
+    eprintln!("============================================================");
+}
+
 /// Diagnostic: build a PC histogram of the recursion guest's execution.
 ///
 /// Streams chunks of logs via `Executor::resume()` so the in-memory state
