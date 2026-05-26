@@ -1,4 +1,7 @@
-use executor::{elf::Elf, vm::execution::Executor};
+use executor::{
+    elf::Elf,
+    vm::execution::{Executor, ExecutorError},
+};
 
 /// Run a program and verify it exits successfully (exit code 0).
 ///
@@ -467,6 +470,25 @@ fn test_misalign_sw() {
 #[test]
 fn test_misalign_sd() {
     run_program("./program_artifacts/asm/misalign_sd.elf");
+}
+
+#[test]
+fn test_misaligned_pc_traps() {
+    let elf_data = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let err = loop {
+        match executor.resume() {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("expected misaligned PC trap, program halted normally"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(err, ExecutorError::InstructionAddressMisaligned(2)),
+        "expected InstructionAddressMisaligned(2), got {:?}",
+        err
+    );
 }
 
 #[test]
