@@ -114,7 +114,7 @@ Further clarification is provided in the notes following the table.
   ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []),
   ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []),
   ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []),
-  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], []),
+  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
   ([`SRLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
   ([`SRAI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
   // OP
@@ -185,7 +185,7 @@ We note the following about the above decoding table:
   enum.item(
     referenceable_note(
       "note_word_instr",
-      [`word_instr`: `[W]` indicates that $#`word_instr` = 1$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant.]
+      [`word_instr`: `[W]` indicates that $#`word_instr` = 1$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant. Similarly, `SHIFT[W]` indicates the `SHIFTW` operation for the `W`-variant, and `SHIFT` otherwise.]
     )
   ),
   enum.item(
