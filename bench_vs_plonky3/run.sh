@@ -257,8 +257,9 @@ cv_pct_file() {
         { s += $1; ss += $1 * $1; n++ }
         END {
             if (n == 0) { print "n/a"; exit }
+            if (n < 2) { print "n/a"; exit }
             m = s / n
-            v = (ss / n) - (m * m)
+            v = (ss - n * m * m) / (n - 1)
             if (v < 0) v = 0
             sd = sqrt(v)
             if (m == 0) print "n/a"

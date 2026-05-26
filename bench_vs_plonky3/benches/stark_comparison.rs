@@ -150,10 +150,10 @@ fn bench_plonky3_verify(c: &mut Criterion) {
     let config = plonky3_config::matched_params_config();
     let proof = p3_prove(&config, &air, trace, &pis);
 
+    let verify_config = plonky3_config::matched_params_config();
     group.bench_with_input(BenchmarkId::new("fibonacci", TRACE_LABEL), &ROWS, |b, _| {
         b.iter(|| {
-            let config = plonky3_config::matched_params_config();
-            p3_verify(&config, &air, &proof, &pis).unwrap();
+            p3_verify(&verify_config, &air, &proof, &pis).unwrap();
         });
     });
     group.finish();

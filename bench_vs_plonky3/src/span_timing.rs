@@ -12,7 +12,8 @@ pub type SpanResults = Arc<Mutex<Vec<(String, f64)>>>;
 
 struct SpanState {
     name: String,
-    active_since: Option<Instant>,
+    depth: u32,
+    started_at: Option<Instant>,
     accumulated: Duration,
 }
 
@@ -46,32 +47,37 @@ where
             id.into_u64(),
             SpanState {
                 name: attrs.metadata().name().to_string(),
-                active_since: None,
+                depth: 0,
+                started_at: None,
                 accumulated: Duration::ZERO,
             },
         );
     }
 
     fn on_enter(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-            && entry.active_since.is_none()
-        {
-            entry.active_since = Some(Instant::now());
+        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+            if entry.depth == 0 {
+                entry.started_at = Some(Instant::now());
+            }
+            entry.depth += 1;
         }
     }
 
     fn on_exit(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64())
-            && let Some(start) = entry.active_since.take()
-        {
-            entry.accumulated += start.elapsed();
+        if let Some(entry) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+            entry.depth = entry.depth.saturating_sub(1);
+            if entry.depth == 0
+                && let Some(start) = entry.started_at.take()
+            {
+                entry.accumulated += start.elapsed();
+            }
         }
     }
 
     fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         if let Some(entry) = self.spans.lock().unwrap().remove(&id.into_u64()) {
             let mut total = entry.accumulated;
-            if let Some(start) = entry.active_since {
+            if let Some(start) = entry.started_at {
                 total += start.elapsed();
             }
             self.results

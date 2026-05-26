@@ -63,6 +63,9 @@ pub fn params_config(blowup: u8, queries: usize, grinding: u8) -> P3Config {
     let fri_params = FriParameters {
         log_blowup: blowup.trailing_zeros() as usize,
         log_final_poly_len: 0,
+        // Radix-2 FRI folding (one fold per round) to match Lambda's
+        // `fold_evaluations_in_place` (N -> N/2). Plonky3's production
+        // config uses arity 8-16 (max_log_arity = 3-4) for fewer rounds.
         max_log_arity: 1,
         num_queries: queries,
         commit_proof_of_work_bits: grinding as usize,
