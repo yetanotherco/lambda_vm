@@ -821,14 +821,16 @@ fn test_host_verify_step_timings() {
 }
 
 /// Diagnostic: cycle count for the **deserialize-only** counterpart of the
-/// recursion guest. Same input layout (`(VmProof, Vec<u8>, ProofOptions)`)
-/// and same proof, but the guest just postcard-decodes the blob and halts —
-/// it never calls `verify_with_options`.
+/// recursion guest. Same input layout
+/// (`(VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)`) and same proof, but
+/// the guest just postcard-decodes the blob and halts — it never calls
+/// `verify_with_options`.
 ///
 /// The cycle delta between this and `test_recursion_cycle_count` is the
-/// actual cost of the STARK verifier inside the VM. The flamegraph
-/// suggested postcard decode was ~93% of the recursion guest's cycles; this
-/// test pins down that number directly.
+/// actual cost of the STARK verifier inside the VM. Historically (40.5 B-cycle
+/// recursion guest) postcard decode was ~15.6 M cycles — negligible. Now that
+/// the recursion guest is ~67 M cycles, the same absolute cost would be ~23%
+/// of total; this test re-measures it.
 #[test]
 #[ignore = "diagnostic: runs the deserialize-only guest, prints cycle count"]
 fn test_deserialize_only_cycle_count() {
