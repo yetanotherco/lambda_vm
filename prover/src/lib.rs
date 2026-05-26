@@ -454,7 +454,6 @@ pub(crate) fn replay_transcript_phase_a(
         for node in &proof.lde_trace_main_merkle_cap {
             transcript.append_bytes(node);
         }
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();

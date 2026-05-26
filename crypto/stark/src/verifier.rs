@@ -1,5 +1,5 @@
 use super::{
-    config::{BatchedMerkleTreeBackend, FriLayerMerkleTreeBackend},
+    config::{BatchedMerkleTreeBackend, FriLayerMerkleTreeBackend, MERKLE_CAP_HEIGHT},
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -478,6 +478,17 @@ pub trait IsStarkVerifier<
         }
         // Each committed layer needs two challenges; zetas[0] is the initial fold.
         if zetas.len() != 1 + 2 * caps.len() {
+            return false;
+        }
+        // Sanity-check each cap: a malformed proof can supply caps of arbitrary
+        // size, which would otherwise let `verify_capped` index past its end
+        // (Codex finding) or, if absurdly large, blow up the per-query work.
+        // Honest caps are clamped to `2^MERKLE_CAP_HEIGHT` by `MerkleTree::cap`.
+        const MAX_FRI_CAP_LEN: usize = 1 << MERKLE_CAP_HEIGHT;
+        if !caps
+            .iter()
+            .all(|c| !c.is_empty() && c.len().is_power_of_two() && c.len() <= MAX_FRI_CAP_LEN)
+        {
             return false;
         }
 

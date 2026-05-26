@@ -174,6 +174,12 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
 
         let depth = num_leaves.trailing_zeros() as usize;
         let cap_height = cap.len().trailing_zeros() as usize;
+        // A cap can be at most as wide as the leaves layer: anything larger
+        // would underflow `depth - cap_height` below and either panic in
+        // debug or wrap around in release.
+        if cap_height > depth {
+            return false;
+        }
         // Process level by level, from the leaves up to the cap level, same as
         // `get_batch_auth_path_positions`.
         for _ in 0..depth - cap_height {

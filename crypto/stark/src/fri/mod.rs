@@ -43,9 +43,12 @@ where
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
-    // Committed arity-4 layers. One uncommitted initial fold, then the rest are
-    // paired up; integer division also folds an extra binary step when
-    // `number_layers` is even, collapsing the final layer to a constant.
+    // Committed arity-4 layers. One uncommitted initial fold halves the
+    // evaluations to trace_length, then `number_layers / 2` arity-4 layers fold
+    // four-at-a-time. For odd `number_layers` (e.g. trace_length = 8, 32, …)
+    // the final `evals` slice has 2 elements but they are equal — the
+    // polynomial is degree 0 by then — so taking `evals[0]` as the last value
+    // is still correct.
     let num_committed = number_layers / 2;
     let mut fri_layer_list = Vec::with_capacity(num_committed);
 
