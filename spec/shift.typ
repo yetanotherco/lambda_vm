@@ -109,7 +109,10 @@ Copies of this variable are used for any full limbs shifted in when $#`right` = 
 Moreover, `X[4]` contains a copy of `extension` shifted over by the right number of bits, to allow the construction of $#`in >>> shift` mod 16$ as the appropriate intermediate.
 
 = Constraints
-First, we constrain `bit_shift` based on whether we are left or right-shifting.
+First, we range check our inputs appropriately.
+#render_constraint_table(chip, config, groups: "input")
+
+Then, we constrain `bit_shift` based on whether we are left or right-shifting.
 @shift:c:zbs makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. 
 This flag is used to indicate the special case that $#`right` = 1$ and $#`shift` = 0 mod 16$.
 #render_constraint_table(chip, config, groups: "bit_shift")
