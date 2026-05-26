@@ -1,8 +1,7 @@
 	.attribute	5, "rv64i2p1_m2p0"
 	.globl	main
 main:
-	# Misaligned LW at offset 1 from a 4-aligned base.
-	# Access reads bytes [33, 34, 35, 36], crossing two 4-byte cells.
+	# Misaligned LW: 4-byte load at address 33.
 	li	t0, 32
 	li	t1, 0x80FF1234
 	sw	t1, 0(t0)
