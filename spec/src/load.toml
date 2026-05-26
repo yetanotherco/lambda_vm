@@ -110,6 +110,7 @@ input = [0, "base_address", ["cast", "res", ["BaseField", 8]], "timestamp", "rea
 output = "res"
 multiplicity = "μ"
 
+# TODO? MSB8 batching?
 [[constraints.all]]
 kind = "interaction"
 tag = "MSB8"
