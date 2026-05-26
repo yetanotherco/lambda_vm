@@ -1,4 +1,4 @@
-use std::ops::Div;
+use core::ops::Div;
 
 use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
@@ -205,7 +205,7 @@ where
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
 
@@ -246,7 +246,7 @@ where
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
         }
@@ -276,8 +276,10 @@ where
             let denominator = -trace_primitive_root
                 .pow(self.offset() * trace_length / self.period())
                 + z.pow(trace_length / self.period());
-            // The denominator isn't zero because z is sampled outside the set of primitive roots.
-            return unsafe { numerator.div(denominator).unwrap_unchecked() }
+            // The denominator is non-zero: z is sampled outside the set of primitive roots.
+            return numerator
+                .div(denominator)
+                .expect("zerofier denominator is non-zero: z is sampled out-of-domain")
                 * end_exemptions_poly.evaluate(z);
         }
 
