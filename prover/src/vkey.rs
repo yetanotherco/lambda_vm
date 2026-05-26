@@ -1,11 +1,9 @@
 //! Verifying key for the lambda-vm STARK verifier.
 //!
 //! Caches preprocessed-table Merkle commitments that the verifier would
-//! otherwise recompute on every call. Mirrors the SP1 `MachineVerifyingKey`
-//! pattern (preprocessed commitments derived once at setup, never recomputed
-//! per-proof) and the prover-side companion in
-//! <https://github.com/yetanotherco/lambda_vm/pull/282> (which caches the
-//! same data on the prover side).
+//! otherwise recompute on every call. The prover-side companion at
+//! <https://github.com/yetanotherco/lambda_vm/pull/282> caches the same
+//! data on the prover side.
 //!
 //! ## Current scope
 //!
