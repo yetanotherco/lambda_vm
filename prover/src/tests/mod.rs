@@ -11,6 +11,8 @@ pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod commit_tests;
 #[cfg(test)]
+pub mod compute_commit_bus_offset_tests;
+#[cfg(test)]
 pub mod constraints_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;
@@ -46,5 +48,7 @@ pub mod prove_elfs_tests;
 pub mod register_tests;
 #[cfg(test)]
 pub mod templates_tests;
+#[cfg(test)]
+pub mod statement_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
