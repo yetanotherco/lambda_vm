@@ -914,6 +914,133 @@ fn test_deserialize_only_cycle_count() {
     eprintln!("============================================================");
 }
 
+/// Diagnostic: PC histogram for the **deserialize-only** guest.
+///
+/// Sibling of `test_recursion_pc_histogram`, but targeting the
+/// deserialize-only control guest so we can locate the hot kernel inside the
+/// 15.7 M-cycle postcard decode itself. Every cycle goes through the
+/// histogram (no sampling), so attribution is exact — the previous sampled
+/// flamegraph at 1:1000 had broken stack reconstruction on skipped
+/// CALL/RETURNs, which made it unreliable for a workload this small.
+///
+/// Usage after running this test:
+/// ```
+/// addr2line -e \
+///   bench_vs/lambda/deserialize-only/target/riscv64im-lambda-vm-elf/release/deserialize-only-bench \
+///   -f -C 0x<pc>
+/// # or, if the system addr2line can't read RISC-V ELFs:
+/// riscv64-unknown-elf-addr2line -e <elf> -f -C 0x<pc>
+/// ```
+#[test]
+#[ignore = "diagnostic: ~1 min; PC histogram for the deserialize-only guest"]
+fn test_deserialize_only_pc_histogram() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let deser_elf_bytes = read_guest_elf(&root, "deserialize-only", "deserialize-only-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    eprintln!("[deser-pc-hist] proving inner (empty, blowup=2, fri_queries=1) ...");
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let elf_for_vkey = Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
+            .expect("postcard encode failed");
+    eprintln!("[deser-pc-hist] postcard blob: {} bytes", blob.len());
+
+    eprintln!("[deser-pc-hist] executing deserialize-only guest (building PC histogram) ...");
+    let program = Elf::load(&deser_elf_bytes).expect("ELF load failed");
+    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
+
+    let start = std::time::Instant::now();
+    // ~50k unique PCs is plenty: the deserialize-only guest is ~74 KB of ELF
+    // (~18k 4-byte instructions); the hot inner loop is much smaller still.
+    let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(50_000);
+    let mut total_cycles: u64 = 0;
+    let mut chunks: usize = 0;
+    while let Some(logs) = executor.resume().expect("executor resume failed") {
+        for log in logs {
+            *pc_hist.entry(log.current_pc).or_insert(0) += 1;
+        }
+        total_cycles += logs.len() as u64;
+        chunks += 1;
+        if chunks.is_multiple_of(50) {
+            eprintln!(
+                "[deser-pc-hist]   ... {chunks} chunks, {total_cycles} cycles, {} unique PCs, {:?}",
+                pc_hist.len(),
+                start.elapsed()
+            );
+        }
+    }
+    let exec_time = start.elapsed();
+
+    let mut entries: Vec<(u64, u64)> = pc_hist.into_iter().collect();
+    entries.sort_unstable_by_key(|(_pc, count)| std::cmp::Reverse(*count));
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  DESERIALIZE-ONLY GUEST PC HISTOGRAM");
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Unique PCs   : {}", entries.len());
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Top 100 PCs by cycle count:");
+    eprintln!(
+        "  {:>4}  {:>18}  {:>14}  {:>7}  {:>7}",
+        "rank", "pc", "cycles", "%", "cum %"
+    );
+    let mut cumulative: u64 = 0;
+    for (rank, (pc, count)) in entries.iter().take(100).enumerate() {
+        cumulative += count;
+        let pct = 100.0 * (*count as f64) / (total_cycles as f64);
+        let cum_pct = 100.0 * (cumulative as f64) / (total_cycles as f64);
+        eprintln!(
+            "  {:>4}  {:#018x}  {:>14}  {:>6.2}%  {:>6.2}%",
+            rank + 1,
+            pc,
+            count,
+            pct,
+            cum_pct
+        );
+    }
+    eprintln!("============================================================");
+    eprintln!();
+    eprintln!("  To map PCs to source functions:");
+    eprintln!("    ELF=bench_vs/lambda/deserialize-only/target/\\");
+    eprintln!("        riscv64im-lambda-vm-elf/release/deserialize-only-bench");
+    eprintln!("    addr2line -e $ELF -f -C 0x<pc>");
+    eprintln!("  (use riscv64-unknown-elf-addr2line if system addr2line can't read the ELF)");
+    eprintln!("============================================================");
+}
+
 /// Diagnostic: bucket the recursion guest's cycles by which verifier step
 /// is currently executing.
 ///
