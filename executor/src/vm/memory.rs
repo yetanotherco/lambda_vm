@@ -85,11 +85,12 @@ impl Memory {
             let bytes = self.cells.get(&address).cloned().unwrap_or_default();
             Ok(u32::from_le_bytes(bytes))
         } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
             Ok(u32::from_le_bytes([
                 self.load_byte(address),
-                self.load_byte(address.wrapping_add(1)),
-                self.load_byte(address.wrapping_add(2)),
-                self.load_byte(address.wrapping_add(3)),
+                self.load_byte(address + 1),
+                self.load_byte(address + 2),
+                self.load_byte(address + 3),
             ]))
         }
     }
@@ -99,8 +100,9 @@ impl Memory {
         if address.is_multiple_of(4) {
             self.cells.insert(address, bytes);
         } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
             for (i, b) in bytes.iter().enumerate() {
-                self.store_byte(address.wrapping_add(i as u64), *b);
+                self.store_byte(address + i as u64, *b);
             }
         }
         Ok(())
@@ -110,18 +112,15 @@ impl Memory {
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
         if address.is_multiple_of(8) {
             let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
-            let high_bytes = self
-                .cells
-                .get(&address.wrapping_add(4))
-                .cloned()
-                .unwrap_or_default();
+            let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
             let low = u32::from_le_bytes(low_bytes) as u64;
             let high = u32::from_le_bytes(high_bytes) as u64;
             Ok(low | (high << 32))
         } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
             let mut bytes = [0u8; 8];
             for (i, b) in bytes.iter_mut().enumerate() {
-                *b = self.load_byte(address.wrapping_add(i as u64));
+                *b = self.load_byte(address + i as u64);
             }
             Ok(u64::from_le_bytes(bytes))
         }
@@ -133,12 +132,12 @@ impl Memory {
             let low = (value & 0xFFFFFFFF) as u32;
             let high = (value >> 32) as u32;
             self.cells.insert(address, low.to_le_bytes());
-            self.cells
-                .insert(address.wrapping_add(4), high.to_le_bytes());
+            self.cells.insert(address + 4, high.to_le_bytes());
         } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
             let bytes = value.to_le_bytes();
             for (i, b) in bytes.iter().enumerate() {
-                self.store_byte(address.wrapping_add(i as u64), *b);
+                self.store_byte(address + i as u64, *b);
             }
         }
         Ok(())
@@ -155,9 +154,10 @@ impl Memory {
             let offset = (address % 4) as usize;
             Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
         } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
             Ok(u16::from_le_bytes([
                 self.load_byte(address),
-                self.load_byte(address.wrapping_add(1)),
+                self.load_byte(address + 1),
             ]))
         }
     }
@@ -174,8 +174,9 @@ impl Memory {
             entry[offset] = bytes[0];
             entry[offset + 1] = bytes[1];
         } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
             self.store_byte(address, bytes[0]);
-            self.store_byte(address.wrapping_add(1), bytes[1]);
+            self.store_byte(address + 1, bytes[1]);
         }
         Ok(())
     }
