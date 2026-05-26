@@ -145,16 +145,40 @@ impl Memory {
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        Ok(u16::from_le_bytes([
-            self.load_byte(address),
-            self.load_byte(address.wrapping_add(1)),
-        ]))
+        if address % 4 <= 2 {
+            let aligned_address = address - address % 4;
+            let bytes = self
+                .cells
+                .get(&aligned_address)
+                .cloned()
+                .unwrap_or_default();
+            let offset = (address % 4) as usize;
+            Ok(u16::from_le_bytes(
+                bytes[offset..offset + 2].try_into().unwrap(),
+            ))
+        } else {
+            Ok(u16::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address.wrapping_add(1)),
+            ]))
+        }
     }
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
         let bytes = value.to_le_bytes();
-        self.store_byte(address, bytes[0]);
-        self.store_byte(address.wrapping_add(1), bytes[1]);
+        if address % 4 <= 2 {
+            let aligned_address = address - address % 4;
+            let entry = self
+                .cells
+                .entry(aligned_address)
+                .or_insert_with(|| [0, 0, 0, 0]);
+            let offset = (address % 4) as usize;
+            entry[offset] = bytes[0];
+            entry[offset + 1] = bytes[1];
+        } else {
+            self.store_byte(address, bytes[0]);
+            self.store_byte(address.wrapping_add(1), bytes[1]);
+        }
         Ok(())
     }
 
