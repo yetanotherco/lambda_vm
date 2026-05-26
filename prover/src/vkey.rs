@@ -43,7 +43,7 @@ use crate::tables::register;
 /// `version` directly; the deferred `vk_digest` PR will bind
 /// `compute_digest()` into the proof, at which point a stale `version` will
 /// cause verification to fail as a side effect of the digest mismatch.
-pub const VKEY_VERSION: u32 = 3;
+pub const VKEY_VERSION: u32 = 1;
 
 /// Placeholder commitment stored in [`VmVerifyingKey::pages`] for
 /// private-input page slots, where there is no preprocessed commitment to
