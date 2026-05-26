@@ -86,11 +86,7 @@ pub struct TableCounts {
 }
 
 impl TableCounts {
-    /// Validate that all required tables have at least one chunk.
-    ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
-    /// Sum of all chunk counts across split tables.
+    /// Sum of all chunk counts across the split tables.
     pub fn total(&self) -> usize {
         self.cpu
             + self.lt
@@ -486,15 +482,27 @@ pub(crate) fn compute_commit_bus_offset(
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
     let alpha_sq = alpha * alpha;
 
-    let mut total = FieldElement::<E>::zero();
-    for (i, &value) in public_output.iter().enumerate() {
-        let linear_combination = bus_id
-            + (FieldElement::<E>::from(i as u64) * alpha)
-            + (FieldElement::<E>::from(value as u64) * alpha_sq);
-        let fingerprint = z - linear_combination;
-        total += fingerprint.inv().ok()?;
-    }
-    Some(total)
+    // fingerprint_i = z - (BusId::Commit + i·α + value_i·α²)
+    let mut fingerprints: Vec<FieldElement<E>> = public_output
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let linear_combination = bus_id
+                + (FieldElement::<E>::from(i as u64) * alpha)
+                + (FieldElement::<E>::from(value as u64) * alpha_sq);
+            z - linear_combination
+        })
+        .collect();
+
+    // Batch inversion: 1 inversion + O(3N) muls instead of N field inversions.
+    // `Err` iff some fingerprint is zero (a collision) — treat as failure.
+    FieldElement::inplace_batch_inverse(&mut fingerprints).ok()?;
+
+    Some(
+        fingerprints
+            .iter()
+            .fold(FieldElement::<E>::zero(), |acc, term| acc + term),
+    )
 }
 
 /// Compute the expected COMMIT bus balance for a `MultiProof`.
