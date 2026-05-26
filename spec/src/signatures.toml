@@ -114,9 +114,9 @@ tag = "COMMIT"
 kind = "interaction"
 input = ["BaseField", "Byte"]
 
-# ALU_BYTE[res; selector, X, Y]
+# BYTE_ALU[res; selector, X, Y]
 [[signatures]]
-tag = "ALU_BYTE"
+tag = "BYTE_ALU"
 kind = "interaction"
 input = ["Byte", "Byte", "Byte"]
 output = "Byte"

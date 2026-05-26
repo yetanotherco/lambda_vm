@@ -127,22 +127,22 @@ name = "contributions"
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [0, "X", "Y"]
 output = "AND"
 multiplicity = ["-", "μ_AND"]
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "OR_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [1, "X", "Y"]
 output = "OR"
 multiplicity = ["-", "μ_OR"]
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [2, "X", "Y"]
 output = "XOR"
 multiplicity = ["-", "μ_XOR"]
 
