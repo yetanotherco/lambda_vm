@@ -1,10 +1,10 @@
 //! Deserialize-only counterpart to the recursion guest.
 //!
 //! Reads the same private-input blob as `recursion-bench`, postcard-decodes
-//! `(VmProof, Vec<u8>, ProofOptions)`, then commits success and halts —
-//! without ever calling `verify_with_options`. The cycle delta between this
-//! guest and `recursion-bench` is the actual cost of the STARK verifier
-//! inside the VM (everything else being equal).
+//! `(VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)`, then commits success
+//! and halts — without ever calling `verify_with_options`. The cycle delta
+//! between this guest and `recursion-bench` is the actual cost of the STARK
+//! verifier inside the VM (everything else being equal).
 
 #![no_std]
 #![no_main]
@@ -16,7 +16,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 use embedded_alloc::TlsfHeap as Heap;
-use lambda_vm_prover::{ProofOptions, VmProof};
+use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
 // Required to pull in the riscv crate's critical-section implementation.
 use riscv as _;
 
@@ -75,7 +75,7 @@ pub fn main() -> ! {
     init_allocator();
 
     let blob = read_private_input();
-    let decoded: (VmProof, Vec<u8>, ProofOptions) =
+    let decoded: (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey) =
         postcard::from_bytes(blob).expect("failed to deserialize");
 
     // Force the commit byte to depend on the actually-decoded value. Without
@@ -86,7 +86,8 @@ pub fn main() -> ! {
     // to a deep field of the decoded value, the decode has to run.
     let proof_options_byte = decoded.2.blowup_factor;
     let inner_elf_byte = *decoded.1.first().unwrap_or(&0);
-    let marker = proof_options_byte ^ inner_elf_byte;
+    let vkey_byte = decoded.3.bitwise[0];
+    let marker = proof_options_byte ^ inner_elf_byte ^ vkey_byte;
 
     commit(&[marker]);
     halt()
