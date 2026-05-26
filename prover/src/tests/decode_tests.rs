@@ -1064,10 +1064,12 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
