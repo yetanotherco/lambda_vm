@@ -428,7 +428,7 @@ multiplicity = "write_register"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMORY"
-input = ["timestamp", "res", "rv2", "mem_flags"]
+input = ["timestamp", ["cast", "res", "DWordWL"], "rv2", "mem_flags"]
 output = "rvd"
 multiplicity = "MEMORY"
 

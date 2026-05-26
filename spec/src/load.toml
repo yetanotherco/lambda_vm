@@ -4,7 +4,7 @@ name = "LOAD"
 
 [[variables.input]]
 name = "base_address"
-type = "DWordHL"
+type = "DWordWL"
 desc = "The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
 pad = 0
 
@@ -72,8 +72,8 @@ pad = 0
 
 
 [[assumptions]]
-desc = "`IS_HALF[base_address[i]]`"
-iter = ["i", 0, 3]
+desc = "`IS_WORD[base_address[i]]`"
+iter = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`IS_WORD[timestamp[i]]`"
@@ -116,7 +116,7 @@ poly = ["*", ["+", "read2", "read4", "read8"], ["not", "μ"]]
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, ["cast", "base_address", "DWordWL"], ["cast", "res", ["BaseField", 8]], "timestamp", "read2", "read4", "read8"]
+input = [0, "base_address", ["cast", "res", ["BaseField", 8]], "timestamp", "read2", "read4", "read8"]
 output = "res"
 multiplicity = "μ"
 
