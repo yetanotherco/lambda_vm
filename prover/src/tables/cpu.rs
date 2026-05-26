@@ -504,8 +504,6 @@ impl CpuOperation {
             if self.decode.signed {
                 if arg2 == 0 {
                     if rem { arg1 } else { u64::MAX }
-                } else if arg1 as i64 == i64::MIN && arg2 as i64 == -1 {
-                    if rem { 0 } else { arg1 }
                 } else if rem {
                     (arg1 as i64).wrapping_rem(arg2 as i64) as u64
                 } else {
