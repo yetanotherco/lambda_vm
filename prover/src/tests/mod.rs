@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod auto_storage_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
@@ -23,14 +25,30 @@ pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod keccak_rnd_tests;
+#[cfg(test)]
+pub mod load_tests;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
 #[cfg(test)]
+pub mod memw_aligned_tests;
+#[cfg(test)]
+pub mod memw_register_tests;
+#[cfg(test)]
+pub mod memw_tests;
+#[cfg(test)]
 pub mod mul_tests;
+#[cfg(test)]
+pub mod page_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]
+pub mod register_tests;
+#[cfg(test)]
 pub mod statement_tests;
+#[cfg(test)]
+pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
