@@ -62,7 +62,7 @@ pad = 0
 name = "instruction_length"
 type = "Byte"
 desc = "The number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
-pad = 4
+pad = 0
 
 [[variables.input]]
 name = "word_instr"
@@ -123,7 +123,7 @@ pad = 0
 name = "next_pc"
 type = "DWordWL"
 desc = "The program counter for the next instruction"
-pad = 5
+pad = 1
 
 [[variables.output]]
 name = "rvd"
