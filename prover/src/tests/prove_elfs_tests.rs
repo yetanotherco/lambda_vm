@@ -498,10 +498,7 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 }
 
-// MULW where the 32-bit i32 product overflows past bit 31.
-// CPU sends the i32-wrapped value (low 32 bits) over the MUL bus, while the
-// MUL chip computes the raw 64-bit product of sign-extended operands; the
-// CPU's compute_res must use the word_instr branch to keep both sides equal.
+// MULW where the 32-bit product overflows past bit 31.
 #[test]
 fn test_prove_elfs_mulw_overflow() {
     let (elf, logs, instructions) = run_asm_elf("mulw_overflow");
@@ -514,8 +511,6 @@ fn test_prove_elfs_mulw_overflow() {
 }
 
 // DIVUW where the 32-bit unsigned quotient has bit 31 set.
-// CPU must send the zero-extended quotient over the DVRM bus, not the
-// sign-extended one, to balance the bus against the chip's raw u64 div.
 #[test]
 fn test_prove_elfs_divuw_high_bit() {
     let (elf, logs, instructions) = run_asm_elf("divuw_high_bit");
@@ -528,7 +523,6 @@ fn test_prove_elfs_divuw_high_bit() {
 }
 
 // REMUW where the 32-bit unsigned remainder has bit 31 set.
-// Same bus-balance requirement as divuw_high_bit but on the rem output.
 #[test]
 fn test_prove_elfs_remuw_high_bit() {
     let (elf, logs, instructions) = run_asm_elf("remuw_high_bit");
