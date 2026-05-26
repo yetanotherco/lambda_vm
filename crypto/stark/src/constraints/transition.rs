@@ -119,12 +119,12 @@ where
         if end_exemptions == 0 {
             return Vec::new();
         }
-        // FIXME: when offset != 0 the roots may need to be scaled by
-        // trace_root^(offset * trace_length / period) — carried over unresolved
-        // from the original coefficient-form end_exemptions_poly.
-        let decrement = trace_primitive_root.pow(trace_length - self.period());
+        // Last row in the constraint's evaluation domain is g^(offset + N - period);
+        // walking backward by g^period gives the remaining end-exemption roots.
+        let period = self.period();
+        let decrement = trace_primitive_root.pow(trace_length - period);
+        let mut current = trace_primitive_root.pow(self.offset() + trace_length - period);
         let mut roots = Vec::with_capacity(end_exemptions);
-        let mut current = decrement.clone();
         for _ in 0..end_exemptions {
             roots.push(current.clone());
             current = &current * &decrement;
@@ -211,6 +211,12 @@ where
                 .zip(denominators.iter())
                 .map(|(num, denom_inv)| num * denom_inv)
                 .collect();
+
+            // Mirror the else-branch fast path: with no end exemptions the zerofier stays
+            // cyclic, so return the short period-length vector and let the consumer cycle.
+            if self.end_exemptions() == 0 {
+                return evaluations;
+            }
 
             // FIXME: Instead of computing this evaluations for each constraint, they can be computed
             // once for every constraint with the same end exemptions (combination of end_exemptions()
