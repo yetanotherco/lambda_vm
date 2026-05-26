@@ -103,6 +103,13 @@ impl Executor {
         self.get_return_values()
     }
 
+    /// Read-only access to the executor's memory. Exposed for diagnostic
+    /// tooling that needs to inspect the final memory state (e.g. counting
+    /// distinct 4 KB pages touched) after a streaming `resume()` loop.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
     /// Run to completion and return all logs (consumes executor)
     pub fn run(mut self) -> Result<ExecutionResult, ExecutorError> {
         let mut logs = Vec::with_capacity(CHUNK_SIZE);

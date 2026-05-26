@@ -205,6 +205,13 @@ impl Memory {
         Ok(self.public_output.clone())
     }
 
+    /// Read-only access to the underlying 4-byte cell map. Exposed for
+    /// diagnostic tooling (e.g. counting the distinct 4 KB memory pages a
+    /// program touches) — not part of the normal execution interface.
+    pub fn cells(&self) -> &U64HashMap<[u8; 4]> {
+        &self.cells
+    }
+
     /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
     /// 4-byte LE length prefix followed by the raw data. The guest reads these
     /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
