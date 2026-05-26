@@ -146,9 +146,9 @@ Further clarification is provided in the notes following the table.
   ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`invert`], [#ref_note(<note_signed>)]),
   // LOAD
   ([`LD        rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_8B`], []),
-  ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [#sym.not`[U]`], [`MEMORY`, `mem_4B`], [#ref_note(<note_signed>)]),
-  ([`LH[U]     rd, rs1, imm`], [`ADD`], [], [#sym.not`[U]`], [`MEMORY`, `mem_2B`], [#ref_note(<note_signed>)]),
-  ([`LB[U]     rd, rs1, imm`], [`ADD`], [], [#sym.not`[U]`], [`MEMORY`, ], [#ref_note(<note_signed>)]),
+  ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_4B`], [#ref_note(<note_signed>)]),
+  ([`LH[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_2B`], [#ref_note(<note_signed>)]),
+  ([`LB[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`], [#ref_note(<note_signed>)]),
   // STORE
   ([`SD       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_8B`], []),
   ([`SW       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_4B`], []),

@@ -126,6 +126,11 @@ type = "Bit"
 desc = "whether the memory access (read or write) touches exactly $8$ bytes."
 
 [[variables.auxiliary]]
+name = "mem_signed"
+type = "Bit"
+desc = "Whether the memory operation is a signed one, this is distinct from `signed` to enable the `JALR` flag to alias `mem_flags`"
+
+[[variables.auxiliary]]
 name = "JALR"
 type = "Bit"
 desc = "The branch is a JAL(R)"
@@ -148,7 +153,7 @@ desc = "The combined memory flags (or JALR when BRANCHing)"
 def = ["+",
           "JALR",
           "memory_op",
-          ["*", 2, "signed"],
+          ["*", 2, "mem_signed"],
           ["*", 4, "mem_2B"],
           ["*", 8, "mem_4B"],
           ["*", 16, "mem_8B"]
