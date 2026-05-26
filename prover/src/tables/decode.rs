@@ -36,7 +36,9 @@
 //! - **Receiver**: DECODE bus - receives lookups from CPU table
 
 use executor::elf::Elf;
-use executor::vm::instruction::decoding::{Instruction, InstructionError};
+use executor::vm::instruction::decoding::{
+    DecodedInstruction, InstructionError, decode_segment_words,
+};
 use executor::vm::memory::U64HashMap;
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -104,16 +106,16 @@ pub type PcToRow = HashMap<u64, usize>;
 /// Empty rows use pc=7 with EBREAK=1, which makes them unprovable
 /// since CPU asserts EBREAK=0.
 pub fn generate_decode_trace(
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
     // Build entries and PC-to-row mapping
     let mut pc_to_row = HashMap::with_capacity(instructions.len());
     let entries: Vec<_> = instructions
         .iter()
         .enumerate()
-        .map(|(row_idx, (&pc, &instr))| {
+        .map(|(row_idx, (&pc, &decoded))| {
             pc_to_row.insert(pc, row_idx);
-            DecodeEntry::from_instruction(pc, instr)
+            DecodeEntry::from_instruction(pc, decoded.instr, decoded.len == 2)
         })
         .collect();
 
@@ -260,7 +262,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// ## Returns
 /// The Merkle root commitment over the LDE of precomputed columns.
 pub fn compute_precomputed_commitment(
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
     options: &ProofOptions,
 ) -> Commitment {
     // Step 1: Generate trace (MU=0, we only need precomputed columns)
@@ -319,12 +321,16 @@ pub fn compute_precomputed_commitment(
 ///
 /// This is the minimal computation needed for verifier to compute
 /// the DECODE commitment from the program.
-pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, InstructionError> {
+pub fn instructions_from_elf(
+    elf: &Elf,
+) -> Result<U64HashMap<DecodedInstruction>, InstructionError> {
     let mut map = U64HashMap::default();
     for seg in elf.data.iter().filter(|s| s.is_executable) {
-        for (i, &word) in seg.values.iter().enumerate() {
-            let pc = seg.base_addr + (i as u64 * 4);
-            map.insert(pc, Instruction::parse(word)?);
+        // Walk the segment as a variable-length instruction stream (the executor's
+        // `InstructionCache` uses the same `decode_segment_words`, so the prover,
+        // verifier and executor cannot disagree on instruction boundaries or c_type).
+        for (byte_offset, decoded) in decode_segment_words(&seg.values)? {
+            map.insert(seg.base_addr + byte_offset, decoded);
         }
     }
     Ok(map)
@@ -373,11 +379,14 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     // Process all ELF segments for DECODE (only executable segments)
     for segment in &elf.data {
         if segment.is_executable {
-            for (i, &word) in segment.values.iter().enumerate() {
-                let addr = segment.base_addr + (i as u64 * 4);
-                let instruction = Instruction::parse(word)?;
+            for (byte_offset, decoded) in decode_segment_words(&segment.values)? {
+                let addr = segment.base_addr + byte_offset;
                 pc_to_row.insert(addr, decode_entries.len());
-                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
+                decode_entries.push(DecodeEntry::from_instruction(
+                    addr,
+                    decoded.instr,
+                    decoded.len == 2,
+                ));
             }
         }
     }

@@ -61,7 +61,7 @@ fn test_keccak_syscall_rejects_unaligned_state_addr() {
     registers.write(10, 0x1001).unwrap();
 
     let err = Instruction::EcallEbreak
-        .run(&mut pc, &mut registers, &mut memory)
+        .run(&mut pc, &mut registers, &mut memory, 4)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -79,7 +79,7 @@ fn test_keccak_syscall_rejects_overflowing_state_range() {
     registers.write(10, u64::MAX - 191).unwrap();
 
     let err = Instruction::EcallEbreak
-        .run(&mut pc, &mut registers, &mut memory)
+        .run(&mut pc, &mut registers, &mut memory, 4)
         .unwrap_err();
     assert!(matches!(
         err,

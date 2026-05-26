@@ -54,7 +54,7 @@ impl FlamegraphGenerator {
             // Update call stack based on instruction type
             let instruction = instructions
                 .get(log.current_pc)
-                .copied()
+                .map(|decoded| decoded.instr)
                 .ok_or(FlamegraphError::InstructionNotFound)?;
             self.update_stack(log, instruction);
         }

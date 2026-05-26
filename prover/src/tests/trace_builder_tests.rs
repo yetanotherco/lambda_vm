@@ -6,7 +6,7 @@ use crate::tables::lt;
 use crate::tables::memw_register;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
-use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
+use executor::vm::instruction::decoding::{ArithOp, Comparison, DecodedInstruction, Instruction};
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 
@@ -41,10 +41,16 @@ fn make_and_log(pc: u64, rs1_val: u64, rs2_val: u64, result: u64) -> Log {
 }
 
 /// Build instructions map for test logs
-fn make_instructions(logs: &[Log], instrs: &[Instruction]) -> U64HashMap<Instruction> {
+fn make_instructions(logs: &[Log], instrs: &[Instruction]) -> U64HashMap<DecodedInstruction> {
     let mut map = U64HashMap::default();
     for (log, instr) in logs.iter().zip(instrs.iter()) {
-        map.insert(log.current_pc, *instr);
+        map.insert(
+            log.current_pc,
+            DecodedInstruction {
+                instr: *instr,
+                len: 4,
+            },
+        );
     }
     map
 }

@@ -480,9 +480,13 @@ impl DecodeEntry {
     /// Creates a DecodeEntry from a PC and Instruction.
     ///
     /// Extracts all decode-time information: pc, registers, flags, immediate.
-    pub fn from_instruction(pc: u64, instruction: Instruction) -> Self {
+    /// `c_type` is `true` when the instruction was encoded as a 2-byte RV64C
+    /// compressed instruction, which the CPU `next_pc` constraint reads as
+    /// `instr_size = 4 - 2*c_type`.
+    pub fn from_instruction(pc: u64, instruction: Instruction, c_type: bool) -> Self {
         let mut entry = Self {
             pc,
+            c_type,
             ..Default::default()
         };
 

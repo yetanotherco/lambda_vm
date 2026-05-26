@@ -11,7 +11,11 @@ use crate::tables::types::{DecodeEntry, FE};
 
 use executor::{
     elf::Elf,
-    vm::{execution::Executor, instruction::decoding::Instruction, memory::U64HashMap},
+    vm::{
+        execution::Executor,
+        instruction::decoding::{DecodedInstruction, Instruction},
+        memory::U64HashMap,
+    },
 };
 
 /// Helper to create 4 operations from a template (required for power-of-2 trace).
@@ -362,7 +366,7 @@ fn test_column_arrays() {
 // =============================================================================
 
 /// Helper to run an ELF and return the logs and instructions
-fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<DecodedInstruction>) {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
     let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
@@ -371,7 +375,7 @@ fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>
 }
 
 /// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<DecodedInstruction>) {
     run_elf(&format!(
         "{}/executor/program_artifacts/asm/{}.elf",
         env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
@@ -411,7 +415,7 @@ fn test_cpu_operation_from_log_arith() {
         dst_val: 300,
     };
 
-    let op = CpuOperation::from_log_and_instruction(&log, 0, instruction);
+    let op = CpuOperation::from_log_and_instruction(&log, 0, instruction, false);
 
     assert_eq!(op.decode.pc, 0x1000);
     assert_eq!(op.next_pc, 0x1004);
@@ -445,7 +449,7 @@ fn test_cpu_operation_from_log_branch() {
         dst_val: 0,
     };
 
-    let op = CpuOperation::from_log_and_instruction(&log, 4, instruction);
+    let op = CpuOperation::from_log_and_instruction(&log, 4, instruction, false);
 
     assert_eq!(op.timestamp, 4);
     assert_eq!(op.decode.pc, 0x2000);
@@ -477,7 +481,7 @@ fn test_cpu_operation_from_log_word_instr() {
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
     };
 
-    let op = CpuOperation::from_log_and_instruction(&log, 8, instruction);
+    let op = CpuOperation::from_log_and_instruction(&log, 8, instruction, false);
 
     assert!(op.decode.word_instr);
     assert!(op.decode.op_add);
