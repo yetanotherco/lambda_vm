@@ -2,7 +2,7 @@
 //! `Polynomial::coset_lde_full_expand` for a sweep of realistic sizes and
 //! blowup factors.
 
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bowers_fft::LayerTwiddles;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsField, IsPrimeField};

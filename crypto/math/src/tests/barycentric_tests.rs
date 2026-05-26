@@ -1,9 +1,8 @@
-use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
+use crate::fft::roots_of_unity::get_powers_of_primitive_root_coset;
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
 use crate::polynomial::{
     Polynomial, barycentric_inv_denoms, interpolate_coset_eval_ext_with_g_n_inv,
-    interpolate_coset_eval_with_g_n_inv,
 };
 
 type FE = FieldElement<GoldilocksField>;
@@ -32,7 +31,7 @@ fn barycentric_matches_horner_simple() {
     let n_inv = FE::from(n as u64).inv().unwrap();
     let g_n_inv = g_pow_n.inv().unwrap();
     let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
-    let result = interpolate_coset_eval_with_g_n_inv(
+    let result = interpolate_coset_eval_ext_with_g_n_inv(
         &z_pow_n,
         &g_pow_n,
         &n_inv,
@@ -65,7 +64,7 @@ fn barycentric_matches_horner_various_sizes() {
         let n_inv = FE::from(n as u64).inv().unwrap();
         let g_n_inv = g_pow_n.inv().unwrap();
         let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
-        let result = interpolate_coset_eval_with_g_n_inv(
+        let result = interpolate_coset_eval_ext_with_g_n_inv(
             &z_pow_n,
             &g_pow_n,
             &n_inv,
@@ -136,7 +135,7 @@ fn barycentric_from_lde_stride() {
     let n_inv = FE::from(n as u64).inv().unwrap();
     let g_n_inv = g_pow_n.inv().unwrap();
     let inv_denoms = barycentric_inv_denoms(&z, &trace_coset);
-    let result = interpolate_coset_eval_with_g_n_inv(
+    let result = interpolate_coset_eval_ext_with_g_n_inv(
         &z_pow_n,
         &g_pow_n,
         &n_inv,

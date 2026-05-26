@@ -272,7 +272,7 @@ fn test_from_i64_max_value() {
 #[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
-    use crate::fft::cpu::roots_of_unity::{
+    use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
     use crate::field::traits::{IsFFTField, RootsConfig};
@@ -319,30 +319,36 @@ mod fft_tests {
         (fft_eval, naive_eval)
     }
 
-    fn gen_fft_and_naive_interpolate<F: IsFFTField + Send + Sync>(
+    /// FFT interpolation round-trip: interpolate the evals back into a
+    /// coefficient-form polynomial via FFT, then re-evaluate that polynomial
+    /// at every twiddle via Horner (`Polynomial::evaluate`). The two
+    /// representations agree iff `interpolate_fft` produced the right
+    /// polynomial — an independent check using a different algorithm, with
+    /// no naive Lagrange `interpolate` needed.
+    fn gen_fft_interpolate_round_trip<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
+    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
         let twiddles =
             get_powers_of_primitive_root(order, 1 << order, RootsConfig::Natural).unwrap();
 
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
         let fft_poly = Polynomial::interpolate_fft::<F>(fft_evals).unwrap();
+        let recovered = evaluate_slice(&fft_poly, &twiddles);
 
-        (fft_poly, naive_poly)
+        (recovered, fft_evals.to_vec())
     }
 
-    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField + Send + Sync>(
+    fn gen_fft_coset_interpolate_round_trip<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
         offset: &FieldElement<F>,
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
+    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
         let twiddles = get_powers_of_primitive_root_coset(order, 1 << order, offset).unwrap();
 
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
         let fft_poly = Polynomial::interpolate_offset_fft(fft_evals, offset).unwrap();
+        let recovered = evaluate_slice(&fft_poly, &twiddles);
 
-        (fft_poly, naive_poly)
+        (recovered, fft_evals.to_vec())
     }
 
     fn gen_fft_interpolate_and_evaluate<F: IsFFTField + Send + Sync>(
@@ -403,16 +409,16 @@ mod fft_tests {
         fn test_fft_interpolate_matches_naive(fft_evals in field_vec(4)
                                                        .prop_filter("Avoid polynomials of size not power of two",
                                                                     |evals| evals.len().is_power_of_two())) {
-            let (fft_poly, naive_poly) = gen_fft_and_naive_interpolate(&fft_evals);
-            prop_assert_eq!(fft_poly, naive_poly);
+            let (recovered, original) = gen_fft_interpolate_round_trip(&fft_evals);
+            prop_assert_eq!(recovered, original);
         }
 
         #[test]
         fn test_fft_interpolate_coset_matches_naive(offset in offset(), fft_evals in field_vec(4)
                                                        .prop_filter("Avoid polynomials of size not power of two",
                                                                     |evals| evals.len().is_power_of_two())) {
-            let (fft_poly, naive_poly) = gen_fft_and_naive_coset_interpolate(&fft_evals, &offset);
-            prop_assert_eq!(fft_poly, naive_poly);
+            let (recovered, original) = gen_fft_coset_interpolate_round_trip(&fft_evals, &offset);
+            prop_assert_eq!(recovered, original);
         }
 
         #[test]
