@@ -392,8 +392,7 @@ fn run_lambda(args: &Args) -> BenchMetrics {
         .len();
 
     let start = Instant::now();
-    let verified =
-        Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
+    let verified = Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
     let verify_s = start.elapsed().as_secs_f64();
     assert!(verified, "lambda verify failed");
 
