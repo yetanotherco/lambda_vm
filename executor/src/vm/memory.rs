@@ -153,9 +153,7 @@ impl Memory {
                 .cloned()
                 .unwrap_or_default();
             let offset = (address % 4) as usize;
-            Ok(u16::from_le_bytes(
-                bytes[offset..offset + 2].try_into().unwrap(),
-            ))
+            Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
         } else {
             Ok(u16::from_le_bytes([
                 self.load_byte(address),
