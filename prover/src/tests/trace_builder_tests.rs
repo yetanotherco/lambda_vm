@@ -563,7 +563,6 @@ fn test_lt_generates_bitwise_lookups() {
     );
 }
 
-#[cfg(test)]
 mod keccak_tests {
     use crate::tables::bitwise::BitwiseOperationType;
     use crate::tables::keccak::cols as core_cols;
@@ -773,7 +772,6 @@ mod keccak_tests {
     }
 }
 
-#[cfg(test)]
 mod routing_tests {
     use crate::tables::memw::MemwOperation;
     use crate::tables::trace_builder::*;
