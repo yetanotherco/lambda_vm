@@ -108,7 +108,7 @@ impl Memory {
 
     /// Load a doubleword (64-bit) from memory - for LD instruction
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
-        if address.is_multiple_of(4) {
+        if address.is_multiple_of(8) {
             let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
             let high_bytes = self
                 .cells
@@ -129,7 +129,7 @@ impl Memory {
 
     /// Store a doubleword (64-bit) to memory - for SD instruction
     pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
-        if address.is_multiple_of(4) {
+        if address.is_multiple_of(8) {
             let low = (value & 0xFFFFFFFF) as u32;
             let high = (value >> 32) as u32;
             self.cells.insert(address, low.to_le_bytes());
@@ -145,7 +145,7 @@ impl Memory {
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        if address % 4 <= 2 {
+        if address.is_multiple_of(2) {
             let aligned_address = address - address % 4;
             let bytes = self
                 .cells
@@ -166,7 +166,7 @@ impl Memory {
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
         let bytes = value.to_le_bytes();
-        if address % 4 <= 2 {
+        if address.is_multiple_of(2) {
             let aligned_address = address - address % 4;
             let entry = self
                 .cells
