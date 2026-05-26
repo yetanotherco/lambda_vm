@@ -1961,6 +1961,7 @@ dependencies = [
  "math",
  "rayon",
  "serde",
+ "sha3",
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
