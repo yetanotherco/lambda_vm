@@ -80,7 +80,7 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
 fi
 
 # --- Plonky3 section (optional) --------------------------------------------
-# Built when `bench_vs_artifacts/p3/headline/metrics.txt` exists.
+# Built when `bench_vs_artifacts/p3/metrics.txt` exists.
 
 p3_parse() {
     local file=$1
@@ -91,7 +91,7 @@ p3_parse() {
 p3_fmt_seconds() {
     LC_NUMERIC=C awk -v s="$1" 'BEGIN {
         if (s == "") { print "n/a"; exit }
-        if (s + 0 < 1) printf "%.0fms", s * 1000
+        if (s + 0 < 1) printf "%.1fms", s * 1000
         else printf "%.3fs", s
     }'
 }
@@ -154,6 +154,10 @@ if [ -f "$P3_FILE" ]; then
     P3_MRKDWN="${P3_MRKDWN}\\n*Plonky3:* $(p3_fmt_seconds "$H_P3_PROVE") prove · $(p3_fmt_seconds "$H_P3_VERIFY") verify · $(p3_fmt_mb "$H_P3_PROOF") proof · $(p3_fmt_gb "$H_P3_RSS") RSS"
     P3_MRKDWN="${P3_MRKDWN}\\n*Ratio L/P3:* ${PROVE_RATIO_FMT} prove · ${PROOF_RATIO} proof · ${RSS_RATIO} RSS"
 
+    P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_MRKDWN"'"}}'
+else
+    echo "warning: $P3_FILE not found — Plonky3 benchmark step likely failed; section will surface this in Slack" >&2
+    P3_MRKDWN="*Plonky3 section omitted:* \`bench_vs_artifacts/p3/metrics.txt\` not produced (benchmark step failed or was skipped). See workflow logs."
     P3_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs Plonky3"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$P3_MRKDWN"'"}}'
 fi
 

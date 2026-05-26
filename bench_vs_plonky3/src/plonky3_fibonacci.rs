@@ -93,9 +93,9 @@ impl<AB: AirBuilder> Air<AB> for P3FibonacciAir {
 /// Generates a Fibonacci trace for Plonky3.
 ///
 /// For `num_sequences` sequences and `num_rows` rows (must be power of 2),
-/// produces a `RowMajorMatrix` with `2 * num_sequences` columns.
-/// Use `rows_for_lambda_trace(lambda_trace_length)` when comparing against
-/// Lambda's one-column-per-sequence trace.
+/// produces a `RowMajorMatrix` with `2 * num_sequences` columns. When
+/// comparing against Lambda's one-column-per-sequence trace, pass
+/// `lambda_trace_length / 2` as `num_rows`.
 ///
 /// Each sequence `s` starts with initial values matching Lambda's
 /// `create_initial_values()`: `left = s + 1`, `right = s + 2`.
@@ -122,19 +122,6 @@ pub fn generate_fibonacci_trace(
     }
 
     RowMajorMatrix::new(values, width)
-}
-
-/// Returns the number of packed Plonky3 rows for a Lambda trace length.
-pub fn rows_for_lambda_trace(lambda_trace_length: usize) -> usize {
-    assert!(
-        lambda_trace_length >= 2,
-        "lambda_trace_length must contain at least two rows"
-    );
-    assert!(
-        lambda_trace_length.is_power_of_two(),
-        "lambda_trace_length must be a power of 2"
-    );
-    lambda_trace_length / 2
 }
 
 /// Builds public values matching `generate_fibonacci_trace`'s initial values:
