@@ -424,10 +424,49 @@ fn test_lw_sw_offset() {
     run_program("./program_artifacts/asm/lw_sw_offset.elf");
 }
 
-#[ignore = "Unaligned memory access not properly implemented yet"]
 #[test]
 fn test_lw_sw_offset_odd() {
     run_program("./program_artifacts/asm/lw_sw_offset_odd.elf");
+}
+
+#[test]
+fn test_misalign_lh() {
+    run_program("./program_artifacts/asm/misalign_lh.elf");
+}
+
+#[test]
+fn test_misalign_lhu() {
+    run_program("./program_artifacts/asm/misalign_lhu.elf");
+}
+
+#[test]
+fn test_misalign_lw() {
+    run_program("./program_artifacts/asm/misalign_lw.elf");
+}
+
+#[test]
+fn test_misalign_lwu() {
+    run_program("./program_artifacts/asm/misalign_lwu.elf");
+}
+
+#[test]
+fn test_misalign_ld() {
+    run_program("./program_artifacts/asm/misalign_ld.elf");
+}
+
+#[test]
+fn test_misalign_sh() {
+    run_program("./program_artifacts/asm/misalign_sh.elf");
+}
+
+#[test]
+fn test_misalign_sw() {
+    run_program("./program_artifacts/asm/misalign_sw.elf");
+}
+
+#[test]
+fn test_misalign_sd() {
+    run_program("./program_artifacts/asm/misalign_sd.elf");
 }
 
 #[test]

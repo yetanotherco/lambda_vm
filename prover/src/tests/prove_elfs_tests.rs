@@ -498,6 +498,97 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 }
 
+// Misaligned load/store regression tests. Each program issues one load or
+// store whose effective address is not naturally aligned to the access width,
+// crossing one or more 4-byte cell boundaries in the executor's memory map.
+#[test]
+fn test_prove_elfs_misalign_lh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lhu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lhu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lhu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lwu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lwu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lwu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_ld() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_ld");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_ld failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sd() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sd");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sd failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_test_shift_8() {
     let (elf, logs, instructions) = run_asm_elf("test_shift_8");
