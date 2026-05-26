@@ -375,7 +375,7 @@ fn run_lambda(args: &Args) -> BenchMetrics {
     );
 
     let start = Instant::now();
-    let _proof = Prover::<F, E, _>::prove(
+    let proof = Prover::<F, E, _>::prove(
         &air,
         &mut trace,
         &pub_inputs,
@@ -387,13 +387,13 @@ fn run_lambda(args: &Args) -> BenchMetrics {
         emit_lambda_breakdown(args, rows, ms(prove_s));
     }
 
-    let proof_size_bytes = serde_cbor::to_vec(&_proof)
+    let proof_size_bytes = serde_cbor::to_vec(&proof)
         .expect("lambda proof serialization failed")
         .len();
 
     let start = Instant::now();
     let verified =
-        Verifier::<F, E, _>::verify(&_proof, &air, &mut DefaultTranscript::<E>::new(&[]));
+        Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[]));
     let verify_s = start.elapsed().as_secs_f64();
     assert!(verified, "lambda verify failed");
 
@@ -414,13 +414,11 @@ fn run_p3(args: &Args) -> BenchMetrics {
     let trace = plonky3_fibonacci::generate_fibonacci_trace(args.num_sequences, rows);
     let pis = plonky3_fibonacci::public_values(args.num_sequences);
 
-    let (prove_s, _proof, span_results) = if args.breakdown {
+    let (prove_s, proof, span_results) = if args.breakdown {
         let (subscriber, results) = p3_span_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let start = Instant::now();
-        let proof = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            p3_uni_stark::prove(&config, &air, trace, &pis)
-        };
+        let proof = p3_uni_stark::prove(&config, &air, trace, &pis);
         (start.elapsed().as_secs_f64(), proof, Some(results))
     } else {
         let start = Instant::now();
@@ -432,7 +430,7 @@ fn run_p3(args: &Args) -> BenchMetrics {
         print_breakdown("p3", args.log_rows, rows, "prove_total", ms(prove_s), "");
         if let Some(results) = span_results {
             let mut span_data = results.lock().unwrap().clone();
-            span_data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            span_data.sort_by(|a, b| b.1.total_cmp(&a.1));
             for (name, elapsed_ms) in span_data {
                 if elapsed_ms >= 0.1 {
                     let extra = format!("\tspan={name}");
@@ -442,12 +440,12 @@ fn run_p3(args: &Args) -> BenchMetrics {
         }
     }
 
-    let proof_size_bytes = serde_cbor::to_vec(&_proof)
+    let proof_size_bytes = serde_cbor::to_vec(&proof)
         .expect("p3 proof serialization failed")
         .len();
 
     let start = Instant::now();
-    p3_uni_stark::verify(&config, &air, &_proof, &pis).expect("p3 verify failed");
+    p3_uni_stark::verify(&config, &air, &proof, &pis).expect("p3 verify failed");
     let verify_s = start.elapsed().as_secs_f64();
 
     BenchMetrics {

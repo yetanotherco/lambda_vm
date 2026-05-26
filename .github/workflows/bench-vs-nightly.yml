@@ -63,6 +63,7 @@ jobs:
             --no-color
 
       - name: Refresh Plonky3 to latest main
+        continue-on-error: true
         run: |
           cargo update --manifest-path bench_vs_plonky3/Cargo.toml \
             -p p3-air -p p3-field -p p3-goldilocks -p p3-matrix \
@@ -71,6 +72,7 @@ jobs:
             -p p3-uni-stark -p p3-dft
 
       - name: Run Plonky3 nightly benchmark
+        continue-on-error: true
         run: |
           bash ./bench_vs_plonky3/run.sh \
             --log-rows 21 --num-sequences 16 --runs 10 --scalar \
