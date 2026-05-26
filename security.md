@@ -14,7 +14,7 @@ We take the security of our project seriously. If you discover a vulnerability, 
    - The affected versions or components.
    - Any potential impact or severity details.
 
-Alternatively, you can send an email to **[security@lambdaclass.com](mailto:security@lambdaclass.com)** with the same details.
+Alternatively, you can send an email to **[security@yetanothercompany.xyz](mailto:security@yetanothercompany.xyz)** with the same details.
 
 ### Guidelines for Reporting
 
