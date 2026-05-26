@@ -41,19 +41,32 @@ pub(crate) fn absorb_statement(
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
     t.append_bytes(public_output);
 
-    // table_counts: fixed-width u64s in declared order.
-    // Reordering or adding a field requires bumping DOMAIN_TAG above.
+    // table_counts: fixed-width u64s in declared order. The exhaustive
+    // destructure makes any field added to TableCounts a compile error here —
+    // that's the signal to extend the loop below and bump DOMAIN_TAG.
+    let &TableCounts {
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
+    } = table_counts;
     for count in [
-        table_counts.cpu,
-        table_counts.lt,
-        table_counts.memw,
-        table_counts.memw_aligned,
-        table_counts.load,
-        table_counts.mul,
-        table_counts.dvrm,
-        table_counts.shift,
-        table_counts.branch,
-        table_counts.memw_register,
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
     }
@@ -63,7 +76,10 @@ pub(crate) fn absorb_statement(
     // runtime_page_ranges: count-prefixed; each entry fixed width.
     t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
     for r in runtime_page_ranges {
-        t.append_bytes(&r.base.to_le_bytes());
-        t.append_bytes(&r.count.to_le_bytes());
+        // Exhaustive destructure: any field added to RuntimePageRange becomes
+        // a compile error here.
+        let &RuntimePageRange { base, count } = r;
+        t.append_bytes(&base.to_le_bytes());
+        t.append_bytes(&count.to_le_bytes());
     }
 }
