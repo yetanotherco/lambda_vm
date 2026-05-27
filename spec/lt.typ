@@ -17,6 +17,7 @@
 #let lt = raw(chip.name)
 
 The #lt chip constrains an indicator bit for the less-than relation, signed or unsigned.
+If the `invert` flag is set, it inverts the result.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -90,3 +91,7 @@ The chip contributes the following to the lookup argument.
 The table can be padded to the next power of two with the following value assignments:
 
 #render_chip_padding_table(chip, config)
+
+= Potential optimizations
+
+- Split the chip into a signed and an unsigned chip, making the unsigned version cheaper.

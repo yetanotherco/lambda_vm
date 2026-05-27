@@ -380,7 +380,6 @@ input = ["rv1", "arg2", "alu_flags"]
 output = ["cast", "res", "DWordWL"]
 multiplicity = "ALU"
 
-# TODO: double check
 [[constraints.alu]]
 kind = "interaction"
 tag = "CPU32"

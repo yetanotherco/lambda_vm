@@ -23,21 +23,25 @@
       ("add.typ", [`ADD`/`SUB` template], <add>),
       ("neg.typ", [`NEG` template], <neg>),
     )),
-    ("MEMORY", (
-      ("memw.typ", [`MEMW` chip], <memw>),
-    )),
     ("CPU", (
       ("decode.typ", [`DECODE` table], <decode>),
       ("cpu.typ", [`CPU` chip], <cpu>),
+      ("cpu32.typ", [`CPU32` chip], <cpu32>),
     )),
     ("ALU", (
       ("shift.typ", [`SHIFT` chip], <shift>),
       ("branch.typ", [`BRANCH` chip], <branch>),
       ("lt.typ", [`LT` chip], <lt>),
+      ("eq.typ", [`EQ` chip], <eq>),
       ("mul.typ", [`MUL` chip], <mul>),
       ("dvrm.typ", [`DVRM` chip], <dvrm>),
-      ("load.typ", [`LOAD` chip], <load>),
       ("bitwise.typ", [`BITWISE` chips], <bitwise>),
+      ("bytewise.typ", [`BYTEWISE` chip], <bytewise>)
+    )),
+    ("MEMORY", (
+      ("memw.typ", [`MEMW` chip], <memw>),
+      ("load.typ", [`LOAD` chip], <load>),
+      ("store.typ", [`STORE` chip], <store>),
     )),
     ("ECALLS", (
       ("about_ecalls.typ", [About `ECALL`], <ecall>),
