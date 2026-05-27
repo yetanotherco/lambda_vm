@@ -1,4 +1,4 @@
-use crypto::merkle_tree::mmcs::MmcsOpening;
+use crypto::merkle_tree::mmcs::{MatrixTag, MmcsOpening};
 use crypto::merkle_tree::proof::Proof;
 use math::field::{
     element::FieldElement,
@@ -18,27 +18,50 @@ pub struct PolynomialOpenings<F: IsField> {
     pub evaluations_sym: Vec<FieldElement<F>>,
 }
 
-/// Per-query main-trace opening backed by the shared MMCS.
+/// Per-query main-trace opening.
 ///
-/// The (iota, iota_sym) pair are consecutive global indices in the LDE.
-/// Each carries its own `MmcsOpening` because they live at different
-/// positions in the layer-0 array — there is no shared sibling sub-path
-/// between them at the leaf level (only at higher tree levels, which the
-/// MMCS opening encodes).
+/// Non-preprocessed tables are committed under the shared main-trace MMCS,
+/// so a query carries an `MmcsOpening` pair (one per iota / iota_sym).
+/// Preprocessed tables keep their multiplicities slice in their OWN
+/// per-table Merkle tree (distinct from the shared MMCS) and use the
+/// legacy `PolynomialOpenings` layout. The per-table root for the latter
+/// lives in `StarkProof::lde_trace_main_merkle_root`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
-pub struct MainTraceOpening<F: IsField> {
-    pub evaluations: Vec<FieldElement<F>>,
-    pub evaluations_sym: Vec<FieldElement<F>>,
-    pub mmcs_opening: MmcsOpening<Commitment>,
-    pub mmcs_opening_sym: MmcsOpening<Commitment>,
+pub enum MainTraceOpening<F: IsField> {
+    /// Opening into the shared main-trace MMCS (non-preprocessed tables).
+    Mmcs {
+        evaluations: Vec<FieldElement<F>>,
+        evaluations_sym: Vec<FieldElement<F>>,
+        mmcs_opening: MmcsOpening<Commitment>,
+        mmcs_opening_sym: MmcsOpening<Commitment>,
+    },
+    /// Opening into this table's own multiplicities Merkle tree
+    /// (preprocessed tables).
+    Tree(PolynomialOpenings<F>),
+}
+
+impl<F: IsField> MainTraceOpening<F> {
+    pub fn evaluations(&self) -> &[FieldElement<F>] {
+        match self {
+            Self::Mmcs { evaluations, .. } => evaluations,
+            Self::Tree(p) => &p.evaluations,
+        }
+    }
+
+    pub fn evaluations_sym(&self) -> &[FieldElement<F>] {
+        match self {
+            Self::Mmcs { evaluations_sym, .. } => evaluations_sym,
+            Self::Tree(p) => &p.evaluations_sym,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     pub composition_poly: PolynomialOpenings<E>,
-    pub main_trace_polys: PolynomialOpenings<F>,
+    pub main_trace_polys: MainTraceOpening<F>,
     /// For preprocessed tables: openings for precomputed columns.
     /// These are verified against the hardcoded precomputed commitment.
     pub precomputed_trace_polys: Option<PolynomialOpenings<F>>,
@@ -52,9 +75,11 @@ pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Length of the execution trace
     pub trace_length: usize,
-    // Commitments of the trace columns
-    // [tⱼ]
-    pub lde_trace_main_merkle_root: Commitment,
+    /// For PREPROCESSED tables only: per-table Merkle root over the
+    /// multiplicities columns (the non-precomputed slice). Preprocessed
+    /// tables stay out of the shared main-trace MMCS, so their main slice
+    /// keeps its own per-table tree. `None` for non-preprocessed tables.
+    pub lde_trace_main_merkle_root: Option<Commitment>,
     // Commitments of auxiliary trace columns
     // [tⱼ]
     pub lde_trace_aux_merkle_root: Option<Commitment>,
@@ -90,8 +115,18 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
+///
+/// Non-preprocessed tables share a single main-trace MMCS authenticated by
+/// `main_mmcs_root`; `main_mmcs_spec` lists `(MatrixTag, padded_height)`
+/// per committed table in the MMCS sort order. Preprocessed tables stay
+/// out of this MMCS — each carries its own per-table Merkle root in
+/// `StarkProof::lde_trace_main_merkle_root` plus the AIR-pinned
+/// precomputed root. Both groups' roots are absorbed in spec-fixed order
+/// during Phase A.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
+    pub main_mmcs_root: Commitment,
+    pub main_mmcs_spec: Vec<(MatrixTag, usize)>,
 }

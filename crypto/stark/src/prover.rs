@@ -27,14 +27,11 @@ use rayon::prelude::{
 use crate::debug::validate_trace;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
-#[allow(unused_imports)]
-use crate::mmcs_leaf::hash_tagged_row_bytes;
-use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+use crate::proof::stark::{DeepPolynomialOpenings, MainTraceOpening, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
-#[allow(unused_imports)]
 use crypto::merkle_tree::mmcs::{MatrixTag, Mmcs, MmcsBuilder, MmcsError};
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
@@ -120,23 +117,6 @@ where
         }
     }
 
-    /// Build a `TableCommit` for a preprocessed table.
-    fn preprocessed(
-        tree: BatchedMerkleTree<F>,
-        root: Commitment,
-        precomputed_tree: BatchedMerkleTree<F>,
-        precomputed_root: Commitment,
-        num_precomputed_cols: usize,
-    ) -> Self {
-        Self {
-            tree: Arc::new(tree),
-            root,
-            precomputed_tree: Some(Arc::new(precomputed_tree)),
-            precomputed_root: Some(precomputed_root),
-            num_precomputed_cols,
-        }
-    }
-
     /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
     fn share(&self) -> Self {
         Self {
@@ -148,53 +128,130 @@ where
         }
     }
 
-    fn is_preprocessed(&self) -> bool {
-        self.precomputed_tree.is_some()
-    }
 }
 
 /// Per-table commitment artifacts for the main trace under the shared
 /// MMCS protocol. The `mmcs` Arc is the SAME instance for every table in
 /// the multi-proof — Phase A builds it once.
 ///
-/// Currently unused at the wire-up level; defined here as the keystone
-/// type for the upcoming MMCS Phase C wire-up (see
-/// `docs/mmcs-streaming-c1-spec.md`). Marked `allow(dead_code)` until the
-/// follow-up commit consumes it.
-#[allow(dead_code)]
-pub(crate) struct MainCommit<F: IsField>
+/// `padded_height` is this table's LDE height (a power of two), needed to
+/// translate the table's local FRI iota into a global MMCS index when
+/// opening (see `open_deep_composition_poly`).
+pub(crate) enum MainCommit<F: IsField>
 where
     FieldElement<F>: AsBytes,
 {
-    /// Shared MMCS across all tables in the multi-proof.
-    pub(crate) mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
-    /// This table's MatrixTag within the MMCS.
-    pub(crate) tag: MatrixTag,
-    /// Preprocessed tables only: separate Merkle tree over precomputed columns.
-    pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
-    /// Preprocessed tables only: root of `precomputed_tree`.
-    pub(crate) precomputed_root: Option<Commitment>,
-    /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
-    pub(crate) num_precomputed_cols: usize,
+    /// Non-preprocessed table: committed under the shared MMCS.
+    Shared {
+        mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+        tag: MatrixTag,
+        /// Padded height (== LDE row count); needed to translate a local
+        /// FRI iota into a global MMCS index.
+        padded_height: usize,
+    },
+    /// Preprocessed table: two per-table Merkle trees, NOT in the MMCS.
+    Preprocessed {
+        multiplicities_tree: Arc<BatchedMerkleTree<F>>,
+        multiplicities_root: Commitment,
+        precomputed_tree: Arc<BatchedMerkleTree<F>>,
+        precomputed_root: Commitment,
+        num_precomputed_cols: usize,
+    },
 }
 
-#[allow(dead_code)]
 impl<F: IsField> MainCommit<F>
 where
     FieldElement<F>: AsBytes,
 {
-    fn is_preprocessed(&self) -> bool {
-        self.precomputed_tree.is_some()
+    fn precomputed_root(&self) -> Option<Commitment> {
+        match self {
+            Self::Shared { .. } => None,
+            Self::Preprocessed {
+                precomputed_root, ..
+            } => Some(*precomputed_root),
+        }
+    }
+
+    fn main_tree_root(&self) -> Option<Commitment> {
+        match self {
+            Self::Shared { .. } => None,
+            Self::Preprocessed {
+                multiplicities_root,
+                ..
+            } => Some(*multiplicities_root),
+        }
     }
 
     /// Cheap clone. Only bumps Arc refcounts.
     fn share(&self) -> Self {
-        Self {
-            mmcs: Arc::clone(&self.mmcs),
-            tag: self.tag,
-            precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
-            precomputed_root: self.precomputed_root,
-            num_precomputed_cols: self.num_precomputed_cols,
+        match self {
+            Self::Shared {
+                mmcs,
+                tag,
+                padded_height,
+            } => Self::Shared {
+                mmcs: Arc::clone(mmcs),
+                tag: *tag,
+                padded_height: *padded_height,
+            },
+            Self::Preprocessed {
+                multiplicities_tree,
+                multiplicities_root,
+                precomputed_tree,
+                precomputed_root,
+                num_precomputed_cols,
+            } => Self::Preprocessed {
+                multiplicities_tree: Arc::clone(multiplicities_tree),
+                multiplicities_root: *multiplicities_root,
+                precomputed_tree: Arc::clone(precomputed_tree),
+                precomputed_root: *precomputed_root,
+                num_precomputed_cols: *num_precomputed_cols,
+            },
+        }
+    }
+}
+
+/// Per-table Phase-A output. Non-preprocessed tables contribute their
+/// tagged leaf vector to the shared MMCS; preprocessed tables ship two
+/// independent per-table Merkle trees that stay out of the MMCS.
+enum MainPhaseAOutput<F: IsField>
+where
+    FieldElement<F>: AsBytes,
+{
+    Shared {
+        tag: MatrixTag,
+        leaves: Vec<Commitment>,
+        padded_height: usize,
+    },
+    Preprocessed {
+        multiplicities_tree: Arc<BatchedMerkleTree<F>>,
+        multiplicities_root: Commitment,
+        precomputed_tree: Arc<BatchedMerkleTree<F>>,
+        precomputed_root: Commitment,
+        num_precomputed_cols: usize,
+    },
+}
+
+impl<F: IsField> MainPhaseAOutput<F>
+where
+    FieldElement<F>: AsBytes,
+{
+    fn precomputed_root(&self) -> Option<Commitment> {
+        match self {
+            Self::Shared { .. } => None,
+            Self::Preprocessed {
+                precomputed_root, ..
+            } => Some(*precomputed_root),
+        }
+    }
+
+    fn main_tree_root(&self) -> Option<Commitment> {
+        match self {
+            Self::Shared { .. } => None,
+            Self::Preprocessed {
+                multiplicities_root,
+                ..
+            } => Some(*multiplicities_root),
         }
     }
 }
@@ -209,8 +266,8 @@ where
 {
     /// The table of evaluations over the LDE of the main and auxiliary trace tables.
     pub(crate) lde_trace: LDETraceTable<Field, FieldExtension>,
-    /// Commitment to the main trace.
-    pub(crate) main: TableCommit<Field>,
+    /// Commitment to the main trace (shared MMCS handle + per-table tag).
+    pub(crate) main: MainCommit<Field>,
     /// Commitment to the auxiliary (RAP) trace, if any.
     pub(crate) aux: Option<TableCommit<FieldExtension>>,
     /// The challenges of the RAP round.
@@ -228,7 +285,7 @@ where
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
-    main: TableCommit<Field>,
+    main: MainCommit<Field>,
     aux: Option<TableCommit<FieldExtension>>,
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
@@ -452,6 +509,87 @@ where
     result
 }
 
+fn map_mmcs_err(e: MmcsError) -> ProvingError {
+    ProvingError::WrongParameter(format!("MMCS: {e:?}"))
+}
+
+/// Build the unified main-trace MMCS from the per-table Phase A outputs.
+/// Returns the root, the (tag, padded_height) spec, and the shared Arc that
+/// every table's `MainCommit` borrows.
+#[allow(clippy::type_complexity)]
+fn build_main_mmcs<F>(
+    outputs: &[MainPhaseAOutput<F>],
+) -> Result<
+    (
+        Commitment,
+        Vec<(MatrixTag, usize)>,
+        Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+    ),
+    ProvingError,
+>
+where
+    F: IsField + Send + Sync,
+    FieldElement<F>: AsBytes + Send + Sync,
+{
+    let mut builder: MmcsBuilder<BatchedMerkleTreeBackend<F>> = MmcsBuilder::new();
+    for output in outputs {
+        if let MainPhaseAOutput::Shared {
+            tag,
+            leaves,
+            padded_height: _,
+        } = output
+        {
+            builder
+                .add_matrix(*tag, leaves.clone())
+                .map_err(map_mmcs_err)?;
+        }
+    }
+    let mmcs = builder.finalize().map_err(map_mmcs_err)?;
+    let root = *mmcs.root();
+    let spec = mmcs.spec();
+    Ok((root, spec, Arc::new(mmcs)))
+}
+
+/// Tagged per-row leaf digest for the main-trace MMCS.
+pub fn compute_tagged_leaves_bit_reversed<E>(
+    columns: &[Vec<FieldElement<E>>],
+    tag: MatrixTag,
+) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    if columns.is_empty() || columns[0].is_empty() {
+        return Vec::new();
+    }
+    let num_rows = columns[0].len();
+    let num_cols = columns.len();
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    debug_assert!(num_rows.is_power_of_two());
+    let total_bytes = num_cols * byte_len;
+    let hash_leaf =
+        |buf: &mut [u8], row_idx: usize| -> Commitment {
+            let br_idx = reverse_index(row_idx, num_rows as u64);
+            for (col_idx, col) in columns.iter().enumerate() {
+                col[br_idx]
+                    .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+            }
+            crate::mmcs_leaf::hash_tagged_row_bytes(tag, buf)
+        };
+    #[cfg(feature = "parallel")]
+    {
+        (0..num_rows)
+            .into_par_iter()
+            .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf(buf, i))
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut buf = vec![0u8; total_bytes];
+        (0..num_rows).map(|i| hash_leaf(&mut buf, i)).collect()
+    }
+}
+
 /// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
 /// leaf per row-pair, where leaf `i` hashes the BE concatenation of
 /// `parts[..][br_0] ++ parts[..][br_1]` with
@@ -653,20 +791,26 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
-    /// with the owned LDE columns (consumed later in Phase D).
+    /// Compute the main-trace LDE and the per-table inputs needed by the
+    /// shared MMCS build. Returns a `MainPhaseAOutput` (tagged leaves + the
+    /// optional precomputed-columns Merkle tree) together with the owned
+    /// LDE columns consumed later in Phase D.
     ///
-    /// `precomputed`: if present, the leading `num_cols` columns are committed
-    /// as a separate Merkle tree (the precomputed split for preprocessed
-    /// tables) and the root is checked against the AIR-hardcoded commitment.
+    /// `tag`: the table's MatrixTag, fed into every leaf hash so the MMCS
+    /// can authenticate (matrix, row) pairs uniquely.
+    /// `precomputed`: if present, the leading `num_cols` columns are
+    /// committed as a separate Merkle tree (the precomputed split) and the
+    /// root is checked against the AIR-hardcoded commitment. The remaining
+    /// columns feed the MMCS leaves. If absent, every column feeds the MMCS.
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        tag: MatrixTag,
         precomputed: Option<(Commitment, usize)>,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<(TableCommit<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
+    ) -> Result<(MainPhaseAOutput<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -686,54 +830,58 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
 
-        let commit = match precomputed {
+        let output = match precomputed {
             None => {
-                #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
-                    .ok_or(ProvingError::EmptyCommitment)?;
-                #[cfg(feature = "disk-spill")]
-                if storage_mode == StorageMode::Disk {
-                    tree.spill_nodes_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
+                let leaves = compute_tagged_leaves_bit_reversed::<Field>(&columns, tag);
+                if leaves.is_empty() {
+                    return Err(ProvingError::EmptyCommitment);
                 }
-                TableCommit::plain(tree, root)
+                let padded_height = leaves.len();
+                MainPhaseAOutput::Shared {
+                    tag,
+                    leaves,
+                    padded_height,
+                }
             }
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
                     Self::commit_columns_bit_reversed(&columns[..num_cols])
                         .ok_or(ProvingError::EmptyCommitment)?;
-                #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) =
-                    Self::commit_columns_bit_reversed(&columns[num_cols..])
-                        .ok_or(ProvingError::EmptyCommitment)?;
                 debug_assert_eq!(
                     precomputed_root, expected_precomputed_root,
-                    "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+                    "Prover precomputed commitment must match the AIR-pinned value"
                 );
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
                     precomputed_tree.spill_nodes_to_disk().map_err(|e| {
                         ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}"))
                     })?;
-                    mult_tree
-                        .spill_nodes_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
                 }
-                TableCommit::preprocessed(
-                    mult_tree,
-                    mult_root,
-                    precomputed_tree,
+                #[allow(unused_mut)]
+                let (mut multiplicities_tree, multiplicities_root) =
+                    Self::commit_columns_bit_reversed(&columns[num_cols..])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                #[cfg(feature = "disk-spill")]
+                if storage_mode == StorageMode::Disk {
+                    multiplicities_tree.spill_nodes_to_disk().map_err(|e| {
+                        ProvingError::DiskSpill(format!("multiplicities Merkle tree: {e}"))
+                    })?;
+                }
+                MainPhaseAOutput::Preprocessed {
+                    multiplicities_tree: Arc::new(multiplicities_tree),
+                    multiplicities_root,
+                    precomputed_tree: Arc::new(precomputed_tree),
                     precomputed_root,
-                    num_cols,
-                )
+                    num_precomputed_cols: num_cols,
+                }
             }
         };
 
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
-        Ok((commit, columns))
+        Ok((output, columns))
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -1426,30 +1574,9 @@ pub trait IsStarkProver<
 
         let lde_trace = &round_1_result.lde_trace;
         let main_commit = &round_1_result.main;
-        let is_preprocessed = main_commit.is_preprocessed();
-        let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
         for index in indexes_to_open.iter() {
-            // For preprocessed tables, open the main split (multiplicities only);
-            // for normal tables, open all main columns.
-            let main_trace_opening = if is_preprocessed {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
-                })
-            } else {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row(row)
-                })
-            };
-
-            // For preprocessed tables, also open the precomputed-columns tree.
-            let precomputed_trace_opening = main_commit.precomputed_tree.as_ref().map(|tree| {
-                Self::open_polys_with(domain, tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
-                })
-            });
-
             let composition_openings = Self::open_composition_poly(
                 &round_2_result.composition_poly_merkle_tree,
                 &round_2_result.lde_composition_poly_evaluations,
@@ -1461,6 +1588,69 @@ pub trait IsStarkProver<
                     lde_trace.gather_aux_row(row)
                 })
             });
+
+            let (main_trace_opening, precomputed_trace_opening) = match main_commit {
+                MainCommit::Shared {
+                    mmcs,
+                    padded_height,
+                    ..
+                } => {
+                    let max_height = mmcs
+                        .spec()
+                        .first()
+                        .map(|(_, h)| *h)
+                        .expect("MMCS spec is non-empty");
+                    debug_assert!(
+                        padded_height.is_power_of_two() && max_height >= *padded_height
+                    );
+                    let shift = (max_height / *padded_height).trailing_zeros() as usize;
+                    let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+                    let primary = *index * 2;
+                    let sym = *index * 2 + 1;
+                    let evaluations = lde_trace.gather_main_row(reverse_index(primary, domain_size));
+                    let evaluations_sym = lde_trace.gather_main_row(reverse_index(sym, domain_size));
+                    let mmcs_opening = mmcs
+                        .open(primary << shift)
+                        .expect("MMCS open: prover-side primary index in range");
+                    let mmcs_opening_sym = mmcs
+                        .open(sym << shift)
+                        .expect("MMCS open: prover-side sym index in range");
+                    let opening = MainTraceOpening::Mmcs {
+                        evaluations,
+                        evaluations_sym,
+                        mmcs_opening,
+                        mmcs_opening_sym,
+                    };
+                    (opening, None)
+                }
+                MainCommit::Preprocessed {
+                    multiplicities_tree,
+                    precomputed_tree,
+                    num_precomputed_cols,
+                    ..
+                } => {
+                    let num_precomputed_cols = *num_precomputed_cols;
+                    let mult = Self::open_polys_with(
+                        domain,
+                        multiplicities_tree,
+                        *index,
+                        |row| {
+                            lde_trace.gather_main_row_range(
+                                row,
+                                num_precomputed_cols,
+                                total_cols,
+                            )
+                        },
+                    );
+                    let pre = Self::open_polys_with(
+                        domain,
+                        precomputed_tree,
+                        *index,
+                        |row| lde_trace.gather_main_row_range(row, 0, num_precomputed_cols),
+                    );
+                    (MainTraceOpening::Tree(mult), Some(pre))
+                }
+            };
 
             openings.push(DeepPolynomialOpening {
                 composition_poly: composition_openings,
@@ -1524,8 +1714,6 @@ pub trait IsStarkProver<
                 num_airs
             )));
         }
-        // `main_tags` is reserved for the upcoming MMCS wire-up; not consumed yet.
-        let _ = main_tags;
 
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = air_trace_pairs
@@ -1611,7 +1799,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
+        let mut phase_a_outputs: Vec<MainPhaseAOutput<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
@@ -1628,6 +1816,7 @@ pub trait IsStarkProver<
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
+                    let tag = main_tags[idx];
 
                     let precomputed = air
                         .is_preprocessed()
@@ -1636,6 +1825,7 @@ pub trait IsStarkProver<
                         *trace,
                         domain,
                         twiddles,
+                        tag,
                         precomputed,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
@@ -1643,17 +1833,57 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+            // Sequential: per table, absorb its preprocessed root and then
+            // its own per-table multiplicities root (preprocessed only). The
+            // shared MMCS root is absorbed once after the loop. Order must
+            // match the verifier replay.
             for result in chunk_results {
-                let (commit, cached_main) = result?;
-                if let Some(ref pre_root) = commit.precomputed_root {
+                let (output, cached_main) = result?;
+                if let Some(ref pre_root) = output.precomputed_root() {
                     transcript.append_bytes(pre_root);
                 }
-                transcript.append_bytes(&commit.root);
-                main_commits.push(commit);
+                if let Some(ref main_root) = output.main_tree_root() {
+                    transcript.append_bytes(main_root);
+                }
+                phase_a_outputs.push(output);
                 main_ldes.push(cached_main);
             }
         }
+
+        // Build the unified main-trace MMCS once over Shared (non-preprocessed)
+        // entries. Preprocessed tables stay out of the MMCS and keep their
+        // own per-table Merkle trees (already absorbed above).
+        let (main_mmcs_root, main_mmcs_spec, mmcs_arc) =
+            build_main_mmcs::<Field>(&phase_a_outputs)?;
+        transcript.append_bytes(&main_mmcs_root);
+
+        let main_commits: Vec<MainCommit<Field>> = phase_a_outputs
+            .into_iter()
+            .map(|o| match o {
+                MainPhaseAOutput::Shared {
+                    tag,
+                    padded_height,
+                    leaves: _,
+                } => MainCommit::Shared {
+                    mmcs: Arc::clone(&mmcs_arc),
+                    tag,
+                    padded_height,
+                },
+                MainPhaseAOutput::Preprocessed {
+                    multiplicities_tree,
+                    multiplicities_root,
+                    precomputed_tree,
+                    precomputed_root,
+                    num_precomputed_cols,
+                } => MainCommit::Preprocessed {
+                    multiplicities_tree,
+                    multiplicities_root,
+                    precomputed_tree,
+                    precomputed_root,
+                    num_precomputed_cols,
+                },
+            })
+            .collect();
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
@@ -1962,17 +2192,22 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof { proofs })
+        Ok(MultiProof {
+            proofs,
+            main_mmcs_root,
+            main_mmcs_spec,
+        })
     }
 
-    /// Generate a STARK proof for a single AIR/trace.
-    /// This is equivalent to calling `multi_prove` with a single-element slice.
+    /// Generate a single-AIR STARK proof, returned as a one-element
+    /// `MultiProof`. The MMCS root + spec live at the multi-proof level (see
+    /// `MultiProof`), so single-table callers consume the wrapper directly.
     fn prove(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
         pub_inputs: &PI,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1983,9 +2218,8 @@ pub trait IsStarkProver<
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        // Single-AIR path: synthesize a default tag. Callers that want
-        // multi-table soundness should call `multi_prove` directly with
-        // distinct tags.
+        // Single-AIR path: synthesize a default tag. Callers that need
+        // distinct chip identities call `multi_prove` directly.
         let main_tags = [MatrixTag::new([0; 8])];
         Self::multi_prove(
             air_trace_pairs,
@@ -1994,7 +2228,6 @@ pub trait IsStarkProver<
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
         )
-        .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
@@ -2128,12 +2361,13 @@ pub trait IsStarkProver<
         info!("End proof generation");
 
         Ok(StarkProof {
-            // [t]
-            lde_trace_main_merkle_root: round_1_result.main.root,
+            // For preprocessed tables: per-table Merkle root over multiplicities
+            // (preprocessed tables stay out of the shared main-trace MMCS).
+            lde_trace_main_merkle_root: round_1_result.main.main_tree_root(),
             // [t]
             lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
             // For preprocessed tables: commitment to precomputed columns only
-            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
+            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root(),
             // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
             // [H₁] and [H₂]

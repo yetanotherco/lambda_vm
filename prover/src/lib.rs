@@ -503,9 +503,10 @@ impl VmAirs {
 // =============================================================================
 
 /// Replay the prover's Phase A (main trace commitments) to recover the shared
-/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
-/// trace commitments in the same order as the prover, then samples two
-/// challenge elements.
+/// LogUp challenges (z, alpha). Mirrors `multi_verify` Phase A absorb order:
+/// for each table, absorb its precomputed root and (preprocessed only) its
+/// per-table multiplicities Merkle root; then absorb the shared main-trace
+/// MMCS root once at the end.
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
@@ -514,9 +515,12 @@ pub(crate) fn replay_transcript_phase_a(
     for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
+            if let Some(root) = &proof.lde_trace_main_merkle_root {
+                transcript.append_bytes(root);
+            }
         }
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
     }
+    transcript.append_bytes(&multi_proof.main_mmcs_root);
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
     (z, alpha)

@@ -875,7 +875,7 @@ fn test_injected_bus_public_inputs_on_non_logup_air_rejected() {
 
     // Inject fake bus_public_inputs into a non-LogUp proof.
     // DummyAIR has has_trace_interaction() = false, so this must be rejected.
-    proof.bus_public_inputs = Some(BusPublicInputs {
+    proof.proofs[0].bus_public_inputs = Some(BusPublicInputs {
         table_contribution: FieldElement::<DummyF>::from(42u64),
         #[cfg(feature = "debug-checks")]
         per_bus_sums: Default::default(),

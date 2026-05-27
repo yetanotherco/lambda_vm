@@ -19,7 +19,7 @@ type Felt = FieldElement<GoldilocksField>;
 
 fn make_valid_simple_proof() -> (
     SimpleAdditionAIR<GoldilocksField>,
-    crate::proof::stark::StarkProof<
+    crate::proof::stark::MultiProof<
         GoldilocksField,
         GoldilocksField,
         SimpleAdditionPublicInputs<GoldilocksField>,
@@ -99,7 +99,7 @@ fn test_verify_fails_with_wrong_inputs() {
     let (air, mut proof) = make_valid_simple_proof();
 
     // Tamper with the proof's public inputs
-    proof.public_inputs = SimpleAdditionPublicInputs {
+    proof.proofs[0].public_inputs = SimpleAdditionPublicInputs {
         a: Felt::from(99u64), // Wrong value - doesn't match trace
         b: Felt::from(2u64),
     };
@@ -124,11 +124,13 @@ fn test_verify_rejects_truncated_composition_poly_parts_ood() {
     let (air, mut proof) = make_valid_simple_proof();
 
     assert!(
-        !proof.composition_poly_parts_ood_evaluation.is_empty(),
+        !proof.proofs[0]
+            .composition_poly_parts_ood_evaluation
+            .is_empty(),
         "test precondition: a valid proof has at least one composition poly part",
     );
     // Drop one entry so the per-query opening has more parts than the header.
-    proof.composition_poly_parts_ood_evaluation.pop();
+    proof.proofs[0].composition_poly_parts_ood_evaluation.pop();
 
     assert!(
         !Verifier::verify(
@@ -150,15 +152,28 @@ fn test_verify_rejects_opening_column_count_mismatch() {
 
     // Append a phantom extra evaluation column to the first query's
     // main-trace opening so the (base + aux) count exceeds `ood_evaluations_table_width`.
-    if let Some(opening) = proof.deep_poly_openings.first_mut() {
+    use crate::proof::stark::MainTraceOpening;
+    if let Some(opening) = proof.proofs[0].deep_poly_openings.first_mut() {
         let extra = opening
             .main_trace_polys
-            .evaluations
+            .evaluations()
             .last()
             .cloned()
             .unwrap_or_else(Felt::zero);
-        opening.main_trace_polys.evaluations.push(extra);
-        opening.main_trace_polys.evaluations_sym.push(extra);
+        match &mut opening.main_trace_polys {
+            MainTraceOpening::Mmcs {
+                evaluations,
+                evaluations_sym,
+                ..
+            } => {
+                evaluations.push(extra);
+                evaluations_sym.push(extra);
+            }
+            MainTraceOpening::Tree(p) => {
+                p.evaluations.push(extra);
+                p.evaluations_sym.push(extra);
+            }
+        }
     } else {
         panic!("test precondition: a valid proof has at least one deep poly opening");
     }

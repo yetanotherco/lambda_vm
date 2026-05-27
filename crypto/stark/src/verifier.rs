@@ -340,23 +340,36 @@ pub trait IsStarkVerifier<
             )
     }
 
-    /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
-    /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
+    /// Verify the main MMCS opening + precomputed/aux Merkle openings at FRI
+    /// challenge `iota`. `main_tag`, `main_mmcs_root`, `main_mmcs_spec` come
+    /// from the surrounding multi-proof.
     fn verify_trace_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
+        main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+        main_mmcs_root: &Commitment,
+        main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Main trace (multiplicities for preprocessed, full trace for normal).
-        let mut ok = Self::verify_opening_pair::<Field>(
-            &deep_poly_openings.main_trace_polys,
-            &proof.lde_trace_main_merkle_root,
-            iota,
-        );
+        use crate::proof::stark::MainTraceOpening;
+        let main_ok = match &deep_poly_openings.main_trace_polys {
+            MainTraceOpening::Mmcs { .. } => Self::verify_main_mmcs_pair(
+                &deep_poly_openings.main_trace_polys,
+                iota,
+                main_tag,
+                main_mmcs_root,
+                main_mmcs_spec,
+            ),
+            MainTraceOpening::Tree(opening) => match &proof.lde_trace_main_merkle_root {
+                Some(root) => Self::verify_opening_pair::<Field>(opening, root, iota),
+                None => false,
+            },
+        };
+        let mut ok = main_ok;
 
         // Precomputed trace (preprocessed tables only). Mismatched presence is
         // unreachable in practice (multi_verify rejects such proofs upstream),
@@ -383,6 +396,26 @@ pub trait IsStarkVerifier<
         };
 
         ok
+    }
+
+    /// Authenticate the main-trace MMCS pair for one query.
+    fn verify_main_mmcs_pair(
+        main_opening: &crate::proof::stark::MainTraceOpening<Field>,
+        iota: usize,
+        main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+        main_mmcs_root: &Commitment,
+        main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        verify_main_mmcs_pair_inner::<Field>(
+            main_opening,
+            iota,
+            main_tag,
+            main_mmcs_root,
+            main_mmcs_spec,
+        )
     }
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
@@ -415,9 +448,12 @@ pub trait IsStarkVerifier<
     fn step_4_verify_trace_and_composition_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
+        main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+        main_mmcs_root: &Commitment,
+        main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         challenges
@@ -429,7 +465,14 @@ pub trait IsStarkVerifier<
                     deep_poly_opening,
                     &proof.composition_poly_root,
                     iota_n,
-                ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
+                ) && Self::verify_trace_openings(
+                    proof,
+                    deep_poly_opening,
+                    *iota_n,
+                    main_tag,
+                    main_mmcs_root,
+                    main_mmcs_spec,
+                )
             })
     }
 
@@ -570,7 +613,7 @@ pub trait IsStarkVerifier<
             if let Some(p) = &opening.precomputed_trace_polys {
                 lde_base.extend_from_slice(&p.evaluations);
             }
-            lde_base.extend_from_slice(&opening.main_trace_polys.evaluations);
+            lde_base.extend_from_slice(opening.main_trace_polys.evaluations());
 
             let lde_aux: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys
@@ -594,7 +637,7 @@ pub trait IsStarkVerifier<
             if let Some(p) = &opening.precomputed_trace_polys {
                 lde_base_sym.extend_from_slice(&p.evaluations_sym);
             }
-            lde_base_sym.extend_from_slice(&opening.main_trace_polys.evaluations_sym);
+            lde_base_sym.extend_from_slice(opening.main_trace_polys.evaluations_sym());
 
             let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys
@@ -721,7 +764,7 @@ pub trait IsStarkVerifier<
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         if airs.len() != multi_proof.proofs.len() {
@@ -740,8 +783,6 @@ pub trait IsStarkVerifier<
             );
             return false;
         }
-        // `main_tags` is reserved for the upcoming MMCS verifier replay.
-        let _ = main_tags;
 
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
@@ -749,18 +790,24 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
         // =====================================================================
-        // For preprocessed tables, use the hardcoded commitment (verifier cannot
-        // trust the prover). For normal tables, use the commitment from the proof.
+        // Per table: validate the optional precomputed commitment against
+        // the hardcoded AIR value (the only one the verifier trusts), and
+        // absorb it into the transcript. After every table, absorb the
+        // single shared MMCS root that commits to every main trace. Also
+        // cross-check `main_mmcs_spec` against the (tag, padded_height_lde)
+        // pairs reproduced from the AIRs.
 
+        let mut expected_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
+            Vec::with_capacity(airs.len());
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
             if air.is_preprocessed() {
-                // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
-                // This is the critical soundness check - ensures prover used correct precomputed values.
+                // Preprocessed table: validate + absorb both its AIR-pinned
+                // precomputed root and its own per-table multiplicities root.
+                // Stays OUT of the shared MMCS spec.
                 let expected_precomputed = air.precomputed_commitment();
                 match &proof.lde_trace_precomputed_merkle_root {
-                    Some(actual) if *actual == expected_precomputed => {
-                        // OK - commitment matches hardcoded
-                    }
+                    Some(actual) if *actual == expected_precomputed => {}
                     Some(actual) => {
                         error!(
                             "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
@@ -773,17 +820,41 @@ pub trait IsStarkVerifier<
                         return false;
                     }
                 }
-
-                // Add BOTH commitments to transcript (Fiat-Shamir binding).
-                // Precomputed commitment binds challenges to correct precomputed values.
-                // Multiplicities commitment binds challenges to actual lookups made.
                 transcript.append_bytes(&expected_precomputed);
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+
+                match &proof.lde_trace_main_merkle_root {
+                    Some(root) => transcript.append_bytes(root),
+                    None => {
+                        error!(
+                            "Preprocessed table {idx} proof missing multiplicities Merkle root"
+                        );
+                        return false;
+                    }
+                }
             } else {
-                // Normal table: use commitment from proof
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+                // Non-preprocessed table: nothing per-table; the shared MMCS
+                // root absorbed below covers its main columns.
+                if proof.lde_trace_main_merkle_root.is_some() {
+                    error!(
+                        "Non-preprocessed table {idx} unexpectedly supplied a per-table main root"
+                    );
+                    return false;
+                }
+                expected_spec.push((main_tags[idx], lde_size));
             }
         }
+
+        // Deterministic sort matches `MmcsBuilder::finalize` (height desc, tag asc).
+        expected_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if expected_spec != multi_proof.main_mmcs_spec {
+            error!(
+                "main_mmcs_spec mismatch: expected {:?}, got {:?}",
+                expected_spec, multi_proof.main_mmcs_spec,
+            );
+            return false;
+        }
+
+        transcript.append_bytes(&multi_proof.main_mmcs_root);
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -847,12 +918,15 @@ pub trait IsStarkVerifier<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
-            // Rounds 2-4: verify
+            // Rounds 2-4: verify (per-table MMCS context threaded through).
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &mut table_transcript,
                 lookup_challenges.clone(),
+                main_tags[idx],
+                &multi_proof.main_mmcs_root,
+                &multi_proof.main_mmcs_spec,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -899,25 +973,22 @@ pub trait IsStarkVerifier<
         true
     }
 
-    /// Verify a single STARK proof.
-    /// This is equivalent to calling `multi_verify` with a single-element slice.
+    /// Verify a single-AIR STARK proof packaged as a one-element `MultiProof`.
+    /// Equivalent to `multi_verify(&[air], proof, &[default_tag], ...)`.
     fn verify(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+        proof: &MultiProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
-        let multi_proof = MultiProof {
-            proofs: vec![proof.clone()],
-        };
         let main_tags = [crypto::merkle_tree::mmcs::MatrixTag::new([0; 8])];
         Self::multi_verify(
             &[air],
-            &multi_proof,
+            proof,
             &main_tags,
             transcript,
             &FieldElement::zero(),
@@ -1061,14 +1132,22 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies a single table after round 1 has been replayed.
+    ///
+    /// `main_tag`, `main_mmcs_root`, `main_mmcs_spec` come from the shared
+    /// multi-proof and are needed to authenticate the per-table main-trace
+    /// openings in step 4.
+    #[allow(clippy::too_many_arguments)]
     fn verify_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+        main_mmcs_root: &Commitment,
+        main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let domain = new_verifier_domain(air, proof.trace_length);
@@ -1142,7 +1221,13 @@ pub trait IsStarkVerifier<
         let timer4 = Instant::now();
 
         #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
+        if !Self::step_4_verify_trace_and_composition_openings(
+            proof,
+            &challenges,
+            main_tag,
+            main_mmcs_root,
+            main_mmcs_spec,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
             return false;
@@ -1167,4 +1252,65 @@ pub trait IsStarkVerifier<
 
         true
     }
+}
+
+fn verify_main_mmcs_pair_inner<F>(
+    main_opening: &crate::proof::stark::MainTraceOpening<F>,
+    iota: usize,
+    main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+    main_mmcs_root: &Commitment,
+    main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+) -> bool
+where
+    F: IsField,
+    FieldElement<F>: AsBytes + Sync + Send + math::traits::ByteConversion,
+{
+    use crate::mmcs_leaf::hash_tagged_row;
+    use crate::proof::stark::MainTraceOpening;
+
+    let (evaluations, evaluations_sym, mmcs_opening, mmcs_opening_sym) = match main_opening {
+        MainTraceOpening::Mmcs {
+            evaluations,
+            evaluations_sym,
+            mmcs_opening,
+            mmcs_opening_sym,
+        } => (evaluations, evaluations_sym, mmcs_opening, mmcs_opening_sym),
+        MainTraceOpening::Tree(_) => return false,
+    };
+
+    let table_idx = match main_mmcs_spec.iter().position(|(t, _)| *t == main_tag) {
+        Some(i) => i,
+        None => return false,
+    };
+    let table_height = main_mmcs_spec[table_idx].1;
+    let max_height = match main_mmcs_spec.first().map(|(_, h)| *h) {
+        Some(h) => h,
+        None => return false,
+    };
+    if !table_height.is_power_of_two() || max_height < table_height {
+        return false;
+    }
+    let shift = (max_height / table_height).trailing_zeros() as usize;
+    let g_primary = (iota * 2) << shift;
+    let g_sym = (iota * 2 + 1) << shift;
+    let leaf_primary = hash_tagged_row::<F>(main_tag, evaluations);
+    let leaf_sym = hash_tagged_row::<F>(main_tag, evaluations_sym);
+    if mmcs_opening.global_index != g_primary || mmcs_opening_sym.global_index != g_sym {
+        return false;
+    }
+    let leaves = &mmcs_opening.matrix_leaves;
+    let leaves_sym = &mmcs_opening_sym.matrix_leaves;
+    if table_idx >= leaves.len() || table_idx >= leaves_sym.len() {
+        return false;
+    }
+    if leaves[table_idx].0 != main_tag || leaves[table_idx].1 != leaf_primary {
+        return false;
+    }
+    if leaves_sym[table_idx].0 != main_tag || leaves_sym[table_idx].1 != leaf_sym {
+        return false;
+    }
+    let ok = mmcs_opening.verify::<BatchedMerkleTreeBackend<F>>(main_mmcs_root, main_mmcs_spec);
+    let ok_sym =
+        mmcs_opening_sym.verify::<BatchedMerkleTreeBackend<F>>(main_mmcs_root, main_mmcs_spec);
+    ok && ok_sym
 }
