@@ -74,7 +74,48 @@ pub const fn generate_row(round: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
 
 static KECCAK_RC_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
-fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+/// Hardcoded KECCAK_RC preprocessed commitments per `blowup_factor`. Generated
+/// by the `compute_static_commitments` binary at the project's standard
+/// `coset_offset` (the one the `ProofOptions` constructors use) and pinned by
+/// `keccak_rc_hardcoded_matches_recompute_*` tests so any drift in the AIR,
+/// FFT pipeline, or `coset_offset` is caught at test time. The verifier
+/// reads these from its compiled binary — no input data is trusted.
+pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
+    // (blowup_factor, commitment)
+    (
+        2,
+        [
+            0xe8, 0x06, 0x8b, 0xb2, 0xbd, 0x3d, 0x80, 0xf3, 0x92, 0x95, 0x31, 0x1a, 0xfd, 0x55,
+            0xba, 0x12, 0x3f, 0x76, 0xeb, 0x44, 0x32, 0x57, 0x9d, 0xb7, 0x7f, 0x1e, 0x63, 0xb4,
+            0x98, 0xb5, 0xb0, 0xb7,
+        ],
+    ),
+    (
+        4,
+        [
+            0xa9, 0xfb, 0xc9, 0x15, 0x1c, 0x22, 0x75, 0xe7, 0x56, 0xeb, 0x6d, 0xf9, 0xfe, 0x83,
+            0x2a, 0xb1, 0xa7, 0x1a, 0x20, 0x71, 0x9b, 0x0c, 0xff, 0x6b, 0x3f, 0x57, 0xc6, 0x84,
+            0x3e, 0xbf, 0xc8, 0xaa,
+        ],
+    ),
+    (
+        8,
+        [
+            0x5c, 0x30, 0xf6, 0xa0, 0xcf, 0x78, 0x43, 0x15, 0x5b, 0x5d, 0x18, 0x34, 0x44, 0xba,
+            0x81, 0x9a, 0x64, 0x05, 0x5c, 0x79, 0x26, 0x18, 0x09, 0x24, 0x6b, 0xa2, 0x3f, 0x5f,
+            0x77, 0x09, 0xd5, 0xfc,
+        ],
+    ),
+];
+
+fn lookup_hardcoded(blowup_factor: u8) -> Option<Commitment> {
+    HARDCODED_PREPROCESSED_COMMITMENTS
+        .iter()
+        .find(|(b, _)| *b == blowup_factor)
+        .map(|(_, commitment)| *commitment)
+}
+
+pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     // Generate precomputed columns
     let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
         .map(|_| Vec::with_capacity(NUM_ROWS))
@@ -121,6 +162,15 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    if let Some(hardcoded) = lookup_hardcoded(options.blowup_factor) {
+        return hardcoded;
+    }
+    log::warn!(
+        "keccak_rc preprocessed commitment not hardcoded for blowup_factor={}; \
+         falling back to recompute. Add to HARDCODED_PREPROCESSED_COMMITMENTS by running \
+         `cargo run --bin compute_static_commitments --release`.",
+        options.blowup_factor,
+    );
     *KECCAK_RC_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
 }
 

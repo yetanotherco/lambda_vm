@@ -178,6 +178,47 @@ pub const fn is_preprocessed() -> bool {
 /// The cache is keyed only by table content, not by options.
 static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
+/// Hardcoded BITWISE preprocessed commitments per `blowup_factor`. Generated
+/// by the `compute_static_commitments` binary at the project's standard
+/// `coset_offset` (the one the `ProofOptions` constructors use) and pinned by
+/// `bitwise_hardcoded_matches_recompute_*` tests so any drift in the AIR,
+/// FFT pipeline, or `coset_offset` is caught at test time. The verifier
+/// reads these from its compiled binary — no input data is trusted.
+pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
+    // (blowup_factor, commitment)
+    (
+        2,
+        [
+            0xfb, 0x46, 0xff, 0x1c, 0xed, 0x4c, 0x97, 0xfb, 0xb2, 0x17, 0x55, 0x24, 0x08, 0x04,
+            0x15, 0xee, 0xbe, 0xa6, 0xee, 0x86, 0x69, 0xaf, 0x3a, 0x4f, 0x9e, 0x2a, 0x44, 0x81,
+            0xf9, 0xb0, 0xf3, 0xff,
+        ],
+    ),
+    (
+        4,
+        [
+            0xb5, 0xc4, 0xc0, 0x80, 0x03, 0x5b, 0xb6, 0x12, 0x78, 0x8c, 0x4d, 0xd4, 0x9e, 0x3d,
+            0xc4, 0xe2, 0xef, 0x95, 0xf0, 0xbf, 0xe8, 0x1d, 0x98, 0xec, 0x7f, 0x58, 0x3a, 0x47,
+            0x18, 0x03, 0x7e, 0xa5,
+        ],
+    ),
+    (
+        8,
+        [
+            0x8a, 0x18, 0x70, 0x51, 0x34, 0x1a, 0x65, 0xaa, 0x79, 0x17, 0x07, 0x9a, 0xf3, 0x0b,
+            0xcb, 0xd0, 0x7c, 0xe3, 0x2a, 0xce, 0x89, 0x9a, 0xfd, 0xc8, 0x0d, 0x6b, 0x48, 0x43,
+            0x83, 0x5d, 0x18, 0xb8,
+        ],
+    ),
+];
+
+fn lookup_hardcoded(blowup_factor: u8) -> Option<Commitment> {
+    HARDCODED_PREPROCESSED_COMMITMENTS
+        .iter()
+        .find(|(b, _)| *b == blowup_factor)
+        .map(|(_, commitment)| *commitment)
+}
+
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
@@ -188,7 +229,7 @@ static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 /// Critical for security: the commitment must be over LDE values (not raw values)
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
-fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     // Step 1: Generate precomputed columns in parallel
     // Each column is generated independently by iterating over all row indices
     #[cfg(feature = "parallel")]
@@ -280,9 +321,22 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     tree.root
 }
 
-/// Returns the preprocessed commitment for the bitwise table, with caching.
+/// Returns the preprocessed commitment for the bitwise table.
+///
+/// Looks up `blowup_factor` in [`HARDCODED_PREPROCESSED_COMMITMENTS`] first;
+/// on miss, falls back to computing from scratch (and caches the result for
+/// the process lifetime).
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    if let Some(hardcoded) = lookup_hardcoded(options.blowup_factor) {
+        return hardcoded;
+    }
+    log::warn!(
+        "bitwise preprocessed commitment not hardcoded for blowup_factor={}; \
+         falling back to recompute. Add to HARDCODED_PREPROCESSED_COMMITMENTS by running \
+         `cargo run --bin compute_static_commitments --release`.",
+        options.blowup_factor,
+    );
     *BITWISE_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
 }
 
