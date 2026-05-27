@@ -196,6 +196,25 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Diff two `proof-size --json` reports and emit a comparison suitable
+    /// for posting to a PR / Slack channel. Pure post-processing — does not
+    /// run the prover. Designed to mirror the `tooling/loc` workflow:
+    ///   cli proof-size base.elf --json > base.json
+    ///   cli proof-size pr.elf   --json > pr.json
+    ///   cli proof-size-diff base.json pr.json --format github > comment.md
+    ProofSizeDiff {
+        /// JSON report from the baseline (e.g. main) build.
+        #[arg(value_hint = ValueHint::FilePath)]
+        previous: PathBuf,
+        /// JSON report from the candidate (e.g. PR) build.
+        #[arg(value_hint = ValueHint::FilePath)]
+        current: PathBuf,
+        /// Output format: `github` (markdown table for PR comments),
+        /// `slack` (Slack-flavoured markdown), or `text` (plain table).
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -230,6 +249,11 @@ fn main() -> ExitCode {
             private_input,
             json,
         } => cmd_proof_size(elf, proof, private_input, json),
+        Commands::ProofSizeDiff {
+            previous,
+            current,
+            format,
+        } => cmd_proof_size_diff(previous, current, &format),
     }
 }
 
@@ -593,10 +617,22 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
 /// One row of the proof-size report. `bytes` are the serialized length of
 /// the corresponding piece of the proof under the same encoder used for the
 /// full bundle (bincode v1).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ProofSizeEntry {
-    section: &'static str,
+    section: String,
     bytes: usize,
+}
+
+/// Top-level JSON shape emitted by `cli proof-size --json` and consumed by
+/// `cli proof-size-diff`. Stable enough for CI to depend on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProofSizeReport {
+    elf: String,
+    total_vm_proof_bytes: usize,
+    multi_proof_bytes: usize,
+    sub_proof_count: usize,
+    main_mmcs_spec_entries: usize,
+    sections: Vec<ProofSizeEntry>,
 }
 
 fn ser_len<T: serde::Serialize>(value: &T) -> usize {
@@ -711,40 +747,31 @@ fn cmd_proof_size(
     s_other = multi_proof_bytes.saturating_sub(accounted);
 
     let entries: Vec<ProofSizeEntry> = vec![
-        ProofSizeEntry { section: "main_mmcs_root", bytes: main_mmcs_root_bytes },
-        ProofSizeEntry { section: "main_mmcs_spec", bytes: main_mmcs_spec_bytes },
-        ProofSizeEntry { section: "per_table_main_merkle_root (preprocessed)", bytes: s_per_table_main_root },
-        ProofSizeEntry { section: "per_table_precomputed_merkle_root", bytes: s_precomputed_root },
-        ProofSizeEntry { section: "per_table_aux_merkle_root", bytes: s_aux_root },
-        ProofSizeEntry { section: "deep_poly_openings.main_trace_polys", bytes: s_main_trace_openings },
-        ProofSizeEntry { section: "deep_poly_openings.precomputed_trace_polys", bytes: s_precomputed_trace_openings },
-        ProofSizeEntry { section: "deep_poly_openings.aux_trace_polys", bytes: s_aux_trace_openings },
-        ProofSizeEntry { section: "deep_poly_openings.composition_poly", bytes: s_composition_openings },
-        ProofSizeEntry { section: "fri_layers_merkle_roots", bytes: s_fri_layers_roots },
-        ProofSizeEntry { section: "fri_query_list", bytes: s_fri_query_list },
-        ProofSizeEntry { section: "trace_ood_evaluations", bytes: s_trace_ood },
-        ProofSizeEntry { section: "composition_poly_parts_ood_evaluation", bytes: s_composition_ood },
-        ProofSizeEntry { section: "bus_public_inputs", bytes: s_bus_public_inputs },
-        ProofSizeEntry { section: "other (headers / public_inputs / nonce / ...)", bytes: s_other },
+        ProofSizeEntry { section: "main_mmcs_root".into(), bytes: main_mmcs_root_bytes },
+        ProofSizeEntry { section: "main_mmcs_spec".into(), bytes: main_mmcs_spec_bytes },
+        ProofSizeEntry { section: "per_table_main_merkle_root (preprocessed)".into(), bytes: s_per_table_main_root },
+        ProofSizeEntry { section: "per_table_precomputed_merkle_root".into(), bytes: s_precomputed_root },
+        ProofSizeEntry { section: "per_table_aux_merkle_root".into(), bytes: s_aux_root },
+        ProofSizeEntry { section: "deep_poly_openings.main_trace_polys".into(), bytes: s_main_trace_openings },
+        ProofSizeEntry { section: "deep_poly_openings.precomputed_trace_polys".into(), bytes: s_precomputed_trace_openings },
+        ProofSizeEntry { section: "deep_poly_openings.aux_trace_polys".into(), bytes: s_aux_trace_openings },
+        ProofSizeEntry { section: "deep_poly_openings.composition_poly".into(), bytes: s_composition_openings },
+        ProofSizeEntry { section: "fri_layers_merkle_roots".into(), bytes: s_fri_layers_roots },
+        ProofSizeEntry { section: "fri_query_list".into(), bytes: s_fri_query_list },
+        ProofSizeEntry { section: "trace_ood_evaluations".into(), bytes: s_trace_ood },
+        ProofSizeEntry { section: "composition_poly_parts_ood_evaluation".into(), bytes: s_composition_ood },
+        ProofSizeEntry { section: "bus_public_inputs".into(), bytes: s_bus_public_inputs },
+        ProofSizeEntry { section: "other (headers / public_inputs / nonce / ...)".into(), bytes: s_other },
     ];
 
     if json {
-        #[derive(serde::Serialize)]
-        struct Report<'a> {
-            elf: String,
-            total_vm_proof_bytes: usize,
-            multi_proof_bytes: usize,
-            sub_proof_count: usize,
-            main_mmcs_spec_entries: usize,
-            sections: &'a [ProofSizeEntry],
-        }
-        let report = Report {
+        let report = ProofSizeReport {
             elf: elf_path.display().to_string(),
             total_vm_proof_bytes: total,
             multi_proof_bytes,
             sub_proof_count: vm_proof.proof.proofs.len(),
             main_mmcs_spec_entries: vm_proof.proof.main_mmcs_spec.len(),
-            sections: &entries,
+            sections: entries.clone(),
         };
         match serde_json::to_string_pretty(&report) {
             Ok(s) => println!("{s}"),
@@ -776,4 +803,200 @@ fn cmd_proof_size(
     }
 
     ExitCode::SUCCESS
+}
+
+// =============================================================================
+// proof-size-diff: read two ProofSizeReport JSONs and emit a comparison.
+// =============================================================================
+
+fn cmd_proof_size_diff(previous: PathBuf, current: PathBuf, format: &str) -> ExitCode {
+    let prev: ProofSizeReport = match load_report(&previous) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to load previous report ({}): {}", previous.display(), e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let curr: ProofSizeReport = match load_report(&current) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to load current report ({}): {}", current.display(), e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let rendered = match format {
+        "github" => render_github(&prev, &curr),
+        "slack" => render_slack(&prev, &curr),
+        "text" | "txt" => render_text(&prev, &curr),
+        other => {
+            eprintln!("Unknown --format value: {other:?}. Try github | slack | text.");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{rendered}");
+    ExitCode::SUCCESS
+}
+
+fn load_report(path: &PathBuf) -> Result<ProofSizeReport, String> {
+    let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&s).map_err(|e| e.to_string())
+}
+
+/// Pair sections from two reports by name. The order returned mirrors the
+/// section order of `curr`; any section present in `prev` but missing in
+/// `curr` is appended at the end so the diff is lossless.
+fn paired_sections<'a>(
+    prev: &'a ProofSizeReport,
+    curr: &'a ProofSizeReport,
+) -> Vec<(String, Option<usize>, Option<usize>)> {
+    let mut out: Vec<(String, Option<usize>, Option<usize>)> = Vec::new();
+    for c in &curr.sections {
+        let p = prev.sections.iter().find(|p| p.section == c.section);
+        out.push((c.section.clone(), p.map(|p| p.bytes), Some(c.bytes)));
+    }
+    for p in &prev.sections {
+        if curr.sections.iter().all(|c| c.section != p.section) {
+            out.push((p.section.clone(), Some(p.bytes), None));
+        }
+    }
+    out
+}
+
+fn fmt_delta(prev: Option<usize>, curr: Option<usize>) -> String {
+    match (prev, curr) {
+        (Some(p), Some(c)) => {
+            let d = c as i64 - p as i64;
+            let pct = if p == 0 { 0.0 } else { d as f64 * 100.0 / p as f64 };
+            format!("{:+} ({:+.2}%)", d, pct)
+        }
+        (None, Some(c)) => format!("+{} (new)", c),
+        (Some(p), None) => format!("-{} (gone)", p),
+        (None, None) => "—".to_string(),
+    }
+}
+
+fn fmt_total_delta(prev: usize, curr: usize) -> String {
+    let d = curr as i64 - prev as i64;
+    let pct = if prev == 0 { 0.0 } else { d as f64 * 100.0 / prev as f64 };
+    format!("{:+} ({:+.2}%)", d, pct)
+}
+
+fn render_text(prev: &ProofSizeReport, curr: &ProofSizeReport) -> String {
+    let mut s = String::new();
+    s.push_str("== Proof size diff ==\n");
+    s.push_str(&format!("previous: {}  ({} bytes)\n", prev.elf, prev.total_vm_proof_bytes));
+    s.push_str(&format!("current:  {}  ({} bytes)\n", curr.elf, curr.total_vm_proof_bytes));
+    s.push_str(&format!(
+        "total delta: {}\n\n",
+        fmt_total_delta(prev.total_vm_proof_bytes, curr.total_vm_proof_bytes)
+    ));
+    s.push_str(&format!("{:<48}{:>12}{:>12}{:>22}\n", "section", "previous", "current", "delta"));
+    s.push_str(&format!("{}\n", "-".repeat(94)));
+    for (section, p, c) in paired_sections(prev, curr) {
+        let p_str = p.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        let c_str = c.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        s.push_str(&format!("{:<48}{:>12}{:>12}{:>22}\n", section, p_str, c_str, fmt_delta(p, c)));
+    }
+    s
+}
+
+fn render_github(prev: &ProofSizeReport, curr: &ProofSizeReport) -> String {
+    let mut s = String::new();
+    s.push_str("### 📦 Proof size diff\n\n");
+    s.push_str(&format!(
+        "| | bytes |\n|---|---:|\n| previous (`{}`) | {} |\n| current (`{}`) | {} |\n| **total delta** | **{}** |\n\n",
+        prev.elf,
+        prev.total_vm_proof_bytes,
+        curr.elf,
+        curr.total_vm_proof_bytes,
+        fmt_total_delta(prev.total_vm_proof_bytes, curr.total_vm_proof_bytes),
+    ));
+    s.push_str("<details><summary>Per-section breakdown</summary>\n\n");
+    s.push_str("| section | previous | current | delta |\n|---|---:|---:|---:|\n");
+    for (section, p, c) in paired_sections(prev, curr) {
+        let p_str = p.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        let c_str = c.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        s.push_str(&format!("| `{}` | {} | {} | {} |\n", section, p_str, c_str, fmt_delta(p, c)));
+    }
+    s.push_str("\n</details>\n");
+    s
+}
+
+fn render_slack(prev: &ProofSizeReport, curr: &ProofSizeReport) -> String {
+    let mut s = String::new();
+    s.push_str("*Proof size diff*\n");
+    s.push_str(&format!(
+        "previous (`{}`): {} bytes\n",
+        prev.elf, prev.total_vm_proof_bytes
+    ));
+    s.push_str(&format!(
+        "current  (`{}`): {} bytes\n",
+        curr.elf, curr.total_vm_proof_bytes
+    ));
+    s.push_str(&format!(
+        "*total delta*: {}\n\n```\n",
+        fmt_total_delta(prev.total_vm_proof_bytes, curr.total_vm_proof_bytes)
+    ));
+    s.push_str(&format!("{:<48}{:>12}{:>12}{:>22}\n", "section", "previous", "current", "delta"));
+    for (section, p, c) in paired_sections(prev, curr) {
+        let p_str = p.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        let c_str = c.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        s.push_str(&format!("{:<48}{:>12}{:>12}{:>22}\n", section, p_str, c_str, fmt_delta(p, c)));
+    }
+    s.push_str("```\n");
+    s
+}
+
+#[cfg(test)]
+mod proof_size_diff_tests {
+    use super::*;
+
+    fn r(elf: &str, total: usize, sections: &[(&str, usize)]) -> ProofSizeReport {
+        ProofSizeReport {
+            elf: elf.into(),
+            total_vm_proof_bytes: total,
+            multi_proof_bytes: total,
+            sub_proof_count: 1,
+            main_mmcs_spec_entries: 0,
+            sections: sections
+                .iter()
+                .map(|(s, b)| ProofSizeEntry { section: (*s).into(), bytes: *b })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn text_diff_shows_total_and_per_section_delta() {
+        let prev = r("base.elf", 100, &[("a", 60), ("b", 40)]);
+        let curr = r("pr.elf", 110, &[("a", 50), ("b", 60)]);
+        let out = render_text(&prev, &curr);
+        assert!(out.contains("total delta: +10"));
+        assert!(out.contains("-10"));
+        assert!(out.contains("+20"));
+    }
+
+    #[test]
+    fn diff_handles_new_and_removed_sections() {
+        let prev = r("base.elf", 50, &[("a", 30), ("gone", 20)]);
+        let curr = r("pr.elf", 60, &[("a", 30), ("new", 30)]);
+        let pairs = paired_sections(&prev, &curr);
+        // Order: current sections first, then prev-only.
+        assert_eq!(pairs[0].0, "a");
+        assert_eq!(pairs[1].0, "new");
+        assert_eq!(pairs[2].0, "gone");
+        let text = render_text(&prev, &curr);
+        assert!(text.contains("(new)"));
+        assert!(text.contains("(gone)"));
+    }
+
+    #[test]
+    fn github_format_has_collapsible_section() {
+        let prev = r("base.elf", 100, &[("a", 100)]);
+        let curr = r("pr.elf", 90, &[("a", 90)]);
+        let out = render_github(&prev, &curr);
+        assert!(out.contains("### 📦 Proof size diff"));
+        assert!(out.contains("<details>"));
+        assert!(out.contains("-10 (-10.00%)"));
+    }
 }
