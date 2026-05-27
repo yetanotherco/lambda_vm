@@ -340,9 +340,11 @@ pub trait IsStarkVerifier<
             )
     }
 
-    /// Verify the main MMCS opening + precomputed/aux Merkle openings at FRI
-    /// challenge `iota`. `main_tag`, `main_mmcs_root`, `main_mmcs_spec` come
-    /// from the surrounding multi-proof.
+    /// Verify the main MMCS opening + precomputed + aux openings at FRI
+    /// challenge `iota`. `main_*` and `aux_*` come from the surrounding
+    /// multi-proof. Aux is `None` when no AIR in the multi-proof has an
+    /// aux trace.
+    #[allow(clippy::too_many_arguments)]
     fn verify_trace_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
@@ -350,10 +352,12 @@ pub trait IsStarkVerifier<
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
         main_mmcs_root: &Commitment,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        aux_mmcs_root: Option<&Commitment>,
+        aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
         use crate::proof::stark::MainTraceOpening;
         let main_ok = match &deep_poly_openings.main_trace_polys {
@@ -383,16 +387,14 @@ pub trait IsStarkVerifier<
             _ => false,
         };
 
-        // Auxiliary trace.
-        ok &= match (
-            proof.lde_trace_aux_merkle_root,
-            &deep_poly_openings.aux_trace_polys,
-        ) {
-            (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, &root, iota)
-            }
-            (None, None) => true,
-            _ => false,
+        // Auxiliary trace: shared MMCS opening for tables with aux, or
+        // None when this AIR has no aux at all.
+        ok &= match (&deep_poly_openings.aux_trace_polys, aux_mmcs_root) {
+            (Some(opening), Some(root)) => verify_aux_mmcs_pair_inner::<FieldExtension>(
+                opening, iota, main_tag, root, aux_mmcs_spec,
+            ),
+            (None, _) => true,
+            (Some(_), None) => false,
         };
 
         ok
@@ -445,16 +447,19 @@ pub trait IsStarkVerifier<
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
     /// parts at the domain elements and their symmetric counterparts corresponding to all the FRI query
     /// index challenges.
+    #[allow(clippy::too_many_arguments)]
     fn step_4_verify_trace_and_composition_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
         main_mmcs_root: &Commitment,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        aux_mmcs_root: Option<&Commitment>,
+        aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
         challenges
             .iotas
@@ -472,6 +477,8 @@ pub trait IsStarkVerifier<
                     main_tag,
                     main_mmcs_root,
                     main_mmcs_spec,
+                    aux_mmcs_root,
+                    aux_mmcs_spec,
                 )
             })
     }
@@ -618,7 +625,7 @@ pub trait IsStarkVerifier<
             let lde_aux: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys
                 .as_ref()
-                .map(|a| a.evaluations.as_slice())
+                .map(|a| a.evaluations())
                 .unwrap_or(&[]);
 
             let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
@@ -642,7 +649,7 @@ pub trait IsStarkVerifier<
             let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys
                 .as_ref()
-                .map(|a| a.evaluations_sym.as_slice())
+                .map(|a| a.evaluations_sym())
                 .unwrap_or(&[]);
 
             let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, true, domain);
@@ -765,7 +772,7 @@ pub trait IsStarkVerifier<
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
         if airs.len() != multi_proof.proofs.len() {
             error!(
@@ -893,11 +900,48 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
+        // Phase C: validate + absorb the shared aux MMCS root (if any)
         // =====================================================================
-        // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
-        // the prover's forking and makes per-table verification independent.
+        // The aux MMCS lives at multi-proof level: a single absorb into the
+        // SHARED transcript replaces the per-table aux root absorb of the
+        // pre-MMCS protocol. Verify the spec mirrors the prover-side
+        // filtered-by-has_aux_trace order before binding.
+        let mut expected_aux_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
+            Vec::new();
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            if air.has_aux_trace() {
+                let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
+                expected_aux_spec.push((main_tags[idx], lde_size));
+            }
+        }
+        expected_aux_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if expected_aux_spec != multi_proof.aux_mmcs_spec {
+            error!(
+                "aux_mmcs_spec mismatch: expected {:?}, got {:?}",
+                expected_aux_spec, multi_proof.aux_mmcs_spec,
+            );
+            return false;
+        }
+        match (&multi_proof.aux_mmcs_root, expected_aux_spec.is_empty()) {
+            (Some(root), false) => transcript.append_bytes(root),
+            (None, true) => {}
+            (Some(_), true) => {
+                error!("aux_mmcs_root present but no AIR has an aux trace");
+                return false;
+            }
+            (None, false) => {
+                error!("aux_mmcs_root missing but some AIR has an aux trace");
+                return false;
+            }
+        }
+
+        // =====================================================================
+        // Rounds 2-4: Forked per table
+        // =====================================================================
+        // Each table gets an independent transcript fork (cloned from the
+        // shared state after the aux MMCS absorb above, domain-separated by
+        // table index). This matches the prover's forking and makes
+        // per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             // Must match prover: fork with domain separator for multi-table,
@@ -906,11 +950,6 @@ pub trait IsStarkVerifier<
             let mut table_transcript = transcript.clone();
             if num_tables > 1 {
                 table_transcript.append_bytes(&(idx as u64).to_le_bytes());
-            }
-
-            // Phase C: replay aux commitment
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                table_transcript.append_bytes(&root);
             }
 
             // Bind table_contribution (L) to transcript, matching prover.
@@ -927,6 +966,8 @@ pub trait IsStarkVerifier<
                 main_tags[idx],
                 &multi_proof.main_mmcs_root,
                 &multi_proof.main_mmcs_spec,
+                multi_proof.aux_mmcs_root.as_ref(),
+                &multi_proof.aux_mmcs_spec,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -982,7 +1023,7 @@ pub trait IsStarkVerifier<
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
         PI: Clone,
     {
         let main_tags = [crypto::merkle_tree::mmcs::MatrixTag::new([0; 8])];
@@ -1133,9 +1174,8 @@ pub trait IsStarkVerifier<
 
     /// Verifies a single table after round 1 has been replayed.
     ///
-    /// `main_tag`, `main_mmcs_root`, `main_mmcs_spec` come from the shared
-    /// multi-proof and are needed to authenticate the per-table main-trace
-    /// openings in step 4.
+    /// `main_*` / `aux_*` come from the shared multi-proof and authenticate
+    /// the per-table trace openings in step 4.
     #[allow(clippy::too_many_arguments)]
     fn verify_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -1145,10 +1185,12 @@ pub trait IsStarkVerifier<
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
         main_mmcs_root: &Commitment,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        aux_mmcs_root: Option<&Commitment>,
+        aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
         let domain = new_verifier_domain(air, proof.trace_length);
 
@@ -1227,6 +1269,8 @@ pub trait IsStarkVerifier<
             main_tag,
             main_mmcs_root,
             main_mmcs_spec,
+            aux_mmcs_root,
+            aux_mmcs_spec,
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
@@ -1312,5 +1356,65 @@ where
     let ok = mmcs_opening.verify::<BatchedMerkleTreeBackend<F>>(main_mmcs_root, main_mmcs_spec);
     let ok_sym =
         mmcs_opening_sym.verify::<BatchedMerkleTreeBackend<F>>(main_mmcs_root, main_mmcs_spec);
+    ok && ok_sym
+}
+
+/// Aux-trace counterpart of [`verify_main_mmcs_pair_inner`]. Same shape,
+/// but rehashes the row using the AUX domain separator so an aux opening
+/// cannot authenticate a main leaf (or vice versa).
+fn verify_aux_mmcs_pair_inner<E>(
+    aux_opening: &crate::proof::stark::AuxTraceOpening<E>,
+    iota: usize,
+    main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+    aux_mmcs_root: &Commitment,
+    aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+) -> bool
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+{
+    use crate::mmcs_leaf::hash_tagged_row_aux;
+    use crate::proof::stark::AuxTraceOpening;
+    let AuxTraceOpening::Mmcs {
+        evaluations,
+        evaluations_sym,
+        mmcs_opening,
+        mmcs_opening_sym,
+    } = aux_opening;
+
+    let table_idx = match aux_mmcs_spec.iter().position(|(t, _)| *t == main_tag) {
+        Some(i) => i,
+        None => return false,
+    };
+    let table_height = aux_mmcs_spec[table_idx].1;
+    let max_height = match aux_mmcs_spec.first().map(|(_, h)| *h) {
+        Some(h) => h,
+        None => return false,
+    };
+    if !table_height.is_power_of_two() || max_height < table_height {
+        return false;
+    }
+    let shift = (max_height / table_height).trailing_zeros() as usize;
+    let g_primary = (iota * 2) << shift;
+    let g_sym = (iota * 2 + 1) << shift;
+    let leaf_primary = hash_tagged_row_aux::<E>(main_tag, evaluations);
+    let leaf_sym = hash_tagged_row_aux::<E>(main_tag, evaluations_sym);
+    if mmcs_opening.global_index != g_primary || mmcs_opening_sym.global_index != g_sym {
+        return false;
+    }
+    let leaves = &mmcs_opening.matrix_leaves;
+    let leaves_sym = &mmcs_opening_sym.matrix_leaves;
+    if table_idx >= leaves.len() || table_idx >= leaves_sym.len() {
+        return false;
+    }
+    if leaves[table_idx].0 != main_tag || leaves[table_idx].1 != leaf_primary {
+        return false;
+    }
+    if leaves_sym[table_idx].0 != main_tag || leaves_sym[table_idx].1 != leaf_sym {
+        return false;
+    }
+    let ok = mmcs_opening.verify::<BatchedMerkleTreeBackend<E>>(aux_mmcs_root, aux_mmcs_spec);
+    let ok_sym =
+        mmcs_opening_sym.verify::<BatchedMerkleTreeBackend<E>>(aux_mmcs_root, aux_mmcs_spec);
     ok && ok_sym
 }

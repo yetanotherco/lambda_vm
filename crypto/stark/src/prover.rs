@@ -81,55 +81,6 @@ pub enum ProvingError {
     DiskSpill(String),
 }
 
-/// Commitment artifacts for one trace table (main or auxiliary). Used for both
-/// plain and preprocessed tables. Preprocessed tables additionally carry a
-/// separate Merkle tree over their precomputed columns, hence the optional
-/// `precomputed_tree`/`precomputed_root` pair and the `num_precomputed_cols`
-/// index used when opening positions.
-pub(crate) struct TableCommit<F: IsField>
-where
-    FieldElement<F>: AsBytes,
-{
-    /// Merkle tree over the trace columns (multiplicities only for preprocessed tables).
-    pub(crate) tree: Arc<BatchedMerkleTree<F>>,
-    /// Root of `tree`.
-    pub(crate) root: Commitment,
-    /// Preprocessed tables only: Merkle tree over precomputed columns.
-    pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
-    /// Preprocessed tables only: root of `precomputed_tree`.
-    pub(crate) precomputed_root: Option<Commitment>,
-    /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
-    pub(crate) num_precomputed_cols: usize,
-}
-
-impl<F: IsField> TableCommit<F>
-where
-    FieldElement<F>: AsBytes,
-{
-    /// Build a `TableCommit` for a plain (non-preprocessed) table.
-    fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
-        Self {
-            tree: Arc::new(tree),
-            root,
-            precomputed_tree: None,
-            precomputed_root: None,
-            num_precomputed_cols: 0,
-        }
-    }
-
-    /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
-    fn share(&self) -> Self {
-        Self {
-            tree: Arc::clone(&self.tree),
-            root: self.root,
-            precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
-            precomputed_root: self.precomputed_root,
-            num_precomputed_cols: self.num_precomputed_cols,
-        }
-    }
-
-}
-
 /// Per-table commitment artifacts for the main trace under the shared
 /// MMCS protocol. The `mmcs` Arc is the SAME instance for every table in
 /// the multi-proof — Phase A builds it once.
@@ -256,6 +207,54 @@ where
     }
 }
 
+/// Per-table aux-trace commitment under the shared aux MMCS.
+/// Mirror of [`MainCommit::Shared`]: the `mmcs` Arc is shared across every
+/// table that contributes an aux trace; `tag` + `padded_height` identify
+/// this table's slot inside that MMCS.
+pub(crate) enum AuxCommit<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    Shared {
+        mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<E>>>,
+        tag: MatrixTag,
+        padded_height: usize,
+    },
+}
+
+impl<E: IsField> AuxCommit<E>
+where
+    FieldElement<E>: AsBytes,
+{
+    fn share(&self) -> Self {
+        match self {
+            Self::Shared {
+                mmcs,
+                tag,
+                padded_height,
+            } => Self::Shared {
+                mmcs: Arc::clone(mmcs),
+                tag: *tag,
+                padded_height: *padded_height,
+            },
+        }
+    }
+}
+
+/// Per-table aux Phase-C output collected BEFORE the shared aux MMCS is
+/// built. `leaves` are aux-tagged Keccak digests over the committed aux-trace
+/// LDE rows. Consumed by the single `MmcsBuilder::finalize` call once
+/// every aux-bearing table has produced them.
+struct AuxPhaseCOutput<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    tag: MatrixTag,
+    leaves: Vec<Commitment>,
+    _marker: PhantomData<E>,
+    padded_height: usize,
+}
+
 /// A container for the results of the first round of the STARK Prove protocol.
 pub(crate) struct Round1<Field, FieldExtension>
 where
@@ -269,7 +268,7 @@ where
     /// Commitment to the main trace (shared MMCS handle + per-table tag).
     pub(crate) main: MainCommit<Field>,
     /// Commitment to the auxiliary (RAP) trace, if any.
-    pub(crate) aux: Option<TableCommit<FieldExtension>>,
+    pub(crate) aux: Option<AuxCommit<FieldExtension>>,
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
@@ -286,7 +285,7 @@ where
     FieldElement<FieldExtension>: AsBytes,
 {
     main: MainCommit<Field>,
-    aux: Option<TableCommit<FieldExtension>>,
+    aux: Option<AuxCommit<FieldExtension>>,
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
@@ -318,7 +317,7 @@ where
         Round1 {
             lde_trace: LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor),
             main: self.main.share(),
-            aux: self.aux.as_ref().map(TableCommit::share),
+            aux: self.aux.as_ref().map(AuxCommit::share),
             rap_challenges: self.rap_challenges.clone(),
             bus_public_inputs: self.bus_public_inputs.clone(),
         }
@@ -548,6 +547,82 @@ where
     let root = *mmcs.root();
     let spec = mmcs.spec();
     Ok((root, spec, Arc::new(mmcs)))
+}
+
+/// Tagged per-row leaf digest for the AUX-trace MMCS. Mirror of
+/// [`compute_tagged_leaves_bit_reversed`] but uses the aux domain
+/// separator so aux/main leaves cannot collide.
+pub fn compute_tagged_leaves_bit_reversed_aux<E>(
+    columns: &[Vec<FieldElement<E>>],
+    tag: MatrixTag,
+) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    if columns.is_empty() || columns[0].is_empty() {
+        return Vec::new();
+    }
+    let num_rows = columns[0].len();
+    let num_cols = columns.len();
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    debug_assert!(num_rows.is_power_of_two());
+    let total_bytes = num_cols * byte_len;
+    let hash_leaf =
+        |buf: &mut [u8], row_idx: usize| -> Commitment {
+            let br_idx = reverse_index(row_idx, num_rows as u64);
+            for (col_idx, col) in columns.iter().enumerate() {
+                col[br_idx]
+                    .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+            }
+            crate::mmcs_leaf::hash_tagged_row_bytes_aux(tag, buf)
+        };
+    #[cfg(feature = "parallel")]
+    {
+        (0..num_rows)
+            .into_par_iter()
+            .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf(buf, i))
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut buf = vec![0u8; total_bytes];
+        (0..num_rows).map(|i| hash_leaf(&mut buf, i)).collect()
+    }
+}
+
+/// Build the shared AUX-trace MMCS from per-table Phase-C outputs (only
+/// tables that have an aux trace participate). Returns `None`/`empty spec`
+/// when no table contributes aux.
+#[allow(clippy::type_complexity)]
+fn build_aux_mmcs<E>(
+    outputs: &[Option<AuxPhaseCOutput<E>>],
+) -> Result<
+    (
+        Option<Commitment>,
+        Vec<(MatrixTag, usize)>,
+        Option<Arc<Mmcs<BatchedMerkleTreeBackend<E>>>>,
+    ),
+    ProvingError,
+>
+where
+    E: IsField + Send + Sync,
+    FieldElement<E>: AsBytes + Send + Sync,
+{
+    let any = outputs.iter().any(|o| o.is_some());
+    if !any {
+        return Ok((None, Vec::new(), None));
+    }
+    let mut builder: MmcsBuilder<BatchedMerkleTreeBackend<E>> = MmcsBuilder::new();
+    for out in outputs.iter().flatten() {
+        builder
+            .add_matrix(out.tag, out.leaves.clone())
+            .map_err(map_mmcs_err)?;
+    }
+    let mmcs = builder.finalize().map_err(map_mmcs_err)?;
+    let root = *mmcs.root();
+    let spec = mmcs.spec();
+    Ok((Some(root), spec, Some(Arc::new(mmcs))))
 }
 
 /// Tagged per-row leaf digest for the main-trace MMCS.
@@ -1584,9 +1659,31 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                    lde_trace.gather_aux_row(row)
-                })
+                let AuxCommit::Shared { mmcs, padded_height, .. } = aux;
+                let max_height = mmcs
+                    .spec()
+                    .first()
+                    .map(|(_, h)| *h)
+                    .expect("aux MMCS spec is non-empty when aux commit exists");
+                debug_assert!(padded_height.is_power_of_two() && max_height >= *padded_height);
+                let shift = (max_height / *padded_height).trailing_zeros() as usize;
+                let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+                let primary = *index * 2;
+                let sym = *index * 2 + 1;
+                let evaluations = lde_trace.gather_aux_row(reverse_index(primary, domain_size));
+                let evaluations_sym = lde_trace.gather_aux_row(reverse_index(sym, domain_size));
+                let mmcs_opening = mmcs
+                    .open(primary << shift)
+                    .expect("aux MMCS open: prover-side primary index in range");
+                let mmcs_opening_sym = mmcs
+                    .open(sym << shift)
+                    .expect("aux MMCS open: prover-side sym index in range");
+                crate::proof::stark::AuxTraceOpening::Mmcs {
+                    evaluations,
+                    evaluations_sym,
+                    mmcs_opening,
+                    mmcs_opening_sym,
+                }
             });
 
             let (main_trace_opening, precomputed_trace_opening) = match main_commit {
@@ -1959,30 +2056,20 @@ pub trait IsStarkProver<
             heap_snaps.push(s);
         }
 
-        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
-        // Each table gets its own transcript fork.
+        // Pass 2: parallel aux-LDE + tagged-leaf computation, then a single
+        // shared aux MMCS build. The aux MMCS root is absorbed into the
+        // SHARED transcript BEFORE per-table forking, so every table's
+        // forked transcript sees the same aux MMCS commitment without
+        // dragging per-table aux roots through Fiat-Shamir.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
-        let mut table_transcripts: Vec<_> = (0..num_airs)
-            .map(|idx| {
-                let mut t = transcript.clone();
-                if num_airs > 1 {
-                    t.append_bytes(&(idx as u64).to_le_bytes());
-                }
-                t
-            })
-            .collect();
-
-        // Parallel aux commit in chunks of K. Each entry holds the optional aux
-        // `TableCommit` (`None` when the AIR has no aux trace) and the cached
-        // aux LDE columns consumed in Phase D.
-        #[allow(clippy::type_complexity)]
-        let mut aux_results: Vec<(
-            Option<TableCommit<FieldExtension>>,
-            Vec<Vec<FieldElement<FieldExtension>>>,
-        )> = Vec::with_capacity(num_airs);
+        // Per-table aux Phase-C outputs. `None` entries are tables with no
+        // aux trace and contribute neither leaves nor an MMCS slot.
+        let mut aux_outputs: Vec<Option<AuxPhaseCOutput<FieldExtension>>> =
+            Vec::with_capacity(num_airs);
+        let mut aux_ldes: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
+            Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1998,6 +2085,7 @@ pub trait IsStarkProver<
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
+                    let tag = main_tags[idx];
 
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
@@ -2017,34 +2105,80 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
-                            .ok_or(ProvingError::EmptyCommitment)?;
+                        let leaves =
+                            compute_tagged_leaves_bit_reversed_aux::<FieldExtension>(&columns, tag);
+                        if leaves.is_empty() {
+                            return Err(ProvingError::EmptyCommitment);
+                        }
+                        let padded_height = leaves.len();
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
-
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            tree.spill_nodes_to_disk().map_err(|e| {
-                                ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
-                            })?;
-                        }
-                        Ok((Some(TableCommit::plain(tree, root)), columns))
+                        let output = AuxPhaseCOutput::<FieldExtension> {
+                            tag,
+                            leaves,
+                            padded_height,
+                            _marker: PhantomData,
+                        };
+                        Ok((Some(output), columns))
                     } else {
                         Ok((None, Vec::new()))
                     }
                 })
                 .collect();
 
-            // Sequential: append aux roots to forked transcripts
-            for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_commit, cached_aux) = result?;
-                if let Some(ref c) = aux_commit {
-                    table_transcripts[chunk_start + j].append_bytes(&c.root);
-                }
-                aux_results.push((aux_commit, cached_aux));
+            for result in chunk_aux {
+                let (output, cached_aux) = result?;
+                aux_outputs.push(output);
+                aux_ldes.push(cached_aux);
             }
         }
+
+        // Build the shared aux MMCS over the non-None entries. Order is
+        // spec-fixed (matches `main_tags` order, filtered to has-aux).
+        let (aux_mmcs_root_opt, aux_mmcs_spec, aux_mmcs_arc) =
+            build_aux_mmcs::<FieldExtension>(&aux_outputs)?;
+
+        // Absorb the aux MMCS root into the SHARED transcript before
+        // forking — every table's fork inherits this binding identically.
+        if let Some(ref root) = aux_mmcs_root_opt {
+            transcript.append_bytes(root);
+        }
+
+        // Pre-fork all transcripts (cheap, sequential — must match verifier ordering).
+        // Happens AFTER aux MMCS absorb so each fork inherits the binding.
+        let mut table_transcripts: Vec<_> = (0..num_airs)
+            .map(|idx| {
+                let mut t = transcript.clone();
+                if num_airs > 1 {
+                    t.append_bytes(&(idx as u64).to_le_bytes());
+                }
+                t
+            })
+            .collect();
+
+        // Reassemble per-table aux commits from the shared MMCS Arc.
+        let aux_commits: Vec<Option<AuxCommit<FieldExtension>>> = aux_outputs
+            .into_iter()
+            .map(|o| {
+                o.map(|out| AuxCommit::Shared {
+                    mmcs: Arc::clone(
+                        aux_mmcs_arc
+                            .as_ref()
+                            .expect("MMCS Arc populated when at least one aux output present"),
+                    ),
+                    tag: out.tag,
+                    padded_height: out.padded_height,
+                })
+            })
+            .collect();
+        #[allow(clippy::type_complexity)]
+        let aux_results: Vec<(
+            Option<AuxCommit<FieldExtension>>,
+            Vec<Vec<FieldElement<FieldExtension>>>,
+        )> = aux_commits
+            .into_iter()
+            .zip(aux_ldes)
+            .collect();
 
         // Build commitments and cached LDEs as separate vecs:
         // commitments are borrowed in Phase D, LDEs are consumed by value.
@@ -2196,6 +2330,8 @@ pub trait IsStarkProver<
             proofs,
             main_mmcs_root,
             main_mmcs_spec,
+            aux_mmcs_root: aux_mmcs_root_opt,
+            aux_mmcs_spec,
         })
     }
 
@@ -2364,8 +2500,6 @@ pub trait IsStarkProver<
             // For preprocessed tables: per-table Merkle root over multiplicities
             // (preprocessed tables stay out of the shared main-trace MMCS).
             lde_trace_main_merkle_root: round_1_result.main.main_tree_root(),
-            // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
             // For preprocessed tables: commitment to precomputed columns only
             lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root(),
             // tⱼ(zgᵏ)

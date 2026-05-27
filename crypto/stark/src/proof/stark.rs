@@ -57,6 +57,37 @@ impl<F: IsField> MainTraceOpening<F> {
     }
 }
 
+/// Per-query aux-trace opening. Symmetric to [`MainTraceOpening`], minus
+/// the `Tree` variant — every aux table that exists goes through the
+/// shared aux MMCS (there's no preprocessed-equivalent for aux).
+///
+/// `Option<AuxTraceOpening>` in `DeepPolynomialOpening.aux_trace_polys`
+/// carries the "this AIR has no aux trace at all" case.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub enum AuxTraceOpening<E: IsField> {
+    Mmcs {
+        evaluations: Vec<FieldElement<E>>,
+        evaluations_sym: Vec<FieldElement<E>>,
+        mmcs_opening: MmcsOpening<Commitment>,
+        mmcs_opening_sym: MmcsOpening<Commitment>,
+    },
+}
+
+impl<E: IsField> AuxTraceOpening<E> {
+    pub fn evaluations(&self) -> &[FieldElement<E>] {
+        match self {
+            Self::Mmcs { evaluations, .. } => evaluations,
+        }
+    }
+
+    pub fn evaluations_sym(&self) -> &[FieldElement<E>] {
+        match self {
+            Self::Mmcs { evaluations_sym, .. } => evaluations_sym,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
@@ -65,7 +96,9 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     /// For preprocessed tables: openings for precomputed columns.
     /// These are verified against the hardcoded precomputed commitment.
     pub precomputed_trace_polys: Option<PolynomialOpenings<F>>,
-    pub aux_trace_polys: Option<PolynomialOpenings<E>>,
+    /// `None` when the AIR has no aux trace; otherwise an MMCS opening
+    /// against the shared aux MMCS (root at `MultiProof::aux_mmcs_root`).
+    pub aux_trace_polys: Option<AuxTraceOpening<E>>,
 }
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
@@ -80,9 +113,6 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     /// tables stay out of the shared main-trace MMCS, so their main slice
     /// keeps its own per-table tree. `None` for non-preprocessed tables.
     pub lde_trace_main_merkle_root: Option<Commitment>,
-    // Commitments of auxiliary trace columns
-    // [tⱼ]
-    pub lde_trace_aux_merkle_root: Option<Commitment>,
     // For preprocessed tables: commitment to precomputed columns only.
     // Verifier checks this matches the hardcoded commitment from AIR.
     pub lde_trace_precomputed_merkle_root: Option<Commitment>,
@@ -119,14 +149,23 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// Non-preprocessed tables share a single main-trace MMCS authenticated by
 /// `main_mmcs_root`; `main_mmcs_spec` lists `(MatrixTag, padded_height)`
 /// per committed table in the MMCS sort order. Preprocessed tables stay
-/// out of this MMCS — each carries its own per-table Merkle root in
+/// out of the main MMCS — each carries its own per-table Merkle root in
 /// `StarkProof::lde_trace_main_merkle_root` plus the AIR-pinned
 /// precomputed root. Both groups' roots are absorbed in spec-fixed order
 /// during Phase A.
+///
+/// Aux traces (only present for AIRs with LogUp interactions) share a
+/// SECOND MMCS authenticated by `aux_mmcs_root`; `aux_mmcs_spec` lists
+/// `(MatrixTag, padded_height)` for the subset of tables that contribute
+/// aux. `aux_mmcs_root` is `None` when no table in the multi-proof has an
+/// aux trace. Domain-separated from the main MMCS via `LEAF_DOMAIN_TAG_AUX`
+/// so that no aux opening can authenticate a main leaf (or vice versa).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
     pub main_mmcs_root: Commitment,
     pub main_mmcs_spec: Vec<(MatrixTag, usize)>,
+    pub aux_mmcs_root: Option<Commitment>,
+    pub aux_mmcs_spec: Vec<(MatrixTag, usize)>,
 }
