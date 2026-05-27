@@ -891,4 +891,3 @@ fn imm_from_instruction(instruction: Instruction) -> u64 {
         _ => 0,
     }
 }
-

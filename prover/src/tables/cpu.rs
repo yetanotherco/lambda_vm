@@ -231,8 +231,8 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
-        let ecall_keccak = f.ecall
-            && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let ecall_keccak =
+            f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
@@ -512,7 +512,11 @@ pub fn generate_cpu_trace(
         // Inline-PC coordination columns.
         let pc_double_read = (!word && f.read_register1 && f.rs1 == 255) as u64;
         let ts_lo = op.timestamp & 0xFFFF_FFFF;
-        let prev_pc_ts_borrow = if pc_double_read == 0 && ts_lo < 3 { 1 } else { 0 };
+        let prev_pc_ts_borrow = if pc_double_read == 0 && ts_lo < 3 {
+            1
+        } else {
+            0
+        };
         data[base + cols::PC_DOUBLE_READ] = FE::from(pc_double_read);
         data[base + cols::PREV_PC_TIMESTAMP_BORROW] = FE::from(prev_pc_ts_borrow);
 
@@ -603,7 +607,7 @@ fn res_cast_wl() -> BusValue {
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode_shrunk as pd;
 
-    let mut interactions = Vec::new();
+    let mut interactions = Vec::with_capacity(24);
 
     // -------------------------------------------------------------------------
     // DECODE: instruction fetch (mult = 1 - word_instr; word rows go to CPU32).

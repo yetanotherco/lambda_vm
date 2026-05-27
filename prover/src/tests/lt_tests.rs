@@ -162,6 +162,7 @@ fn test_multiplicity_different_signed_flags() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1]) + LT x1 = 9 interactions
-    assert_eq!(interactions.len(), 9);
+    // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1]) + LT receiver x1
+    // + ALU receiver x1 (shrink-cpu: CPU/CPU32 dispatch SLT/BLT/BGE) = 10.
+    assert_eq!(interactions.len(), 10);
 }

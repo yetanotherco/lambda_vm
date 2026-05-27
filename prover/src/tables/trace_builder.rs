@@ -819,7 +819,9 @@ fn cpu32_chip_op(
     let s2_or_inv = (c.alu_flags >> 6) & 1 == 1;
     let muldiv = (c.alu_flags >> 7) & 1 == 1;
     if op == alu_op::SHIFT || op == alu_op::SHIFTW {
-        shift_ops.push(ShiftOperation::new(aux.arg1, aux.arg2, s2_or_inv, signed, true));
+        shift_ops.push(ShiftOperation::new(
+            aux.arg1, aux.arg2, s2_or_inv, signed, true,
+        ));
     } else if op == alu_op::MUL {
         mul_ops.push((
             MulOperation::new_alu(aux.arg1, signed, aux.arg2, s2_or_inv),

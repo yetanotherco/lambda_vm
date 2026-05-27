@@ -68,7 +68,8 @@ where
         (cols::RES_0, cols::RES_1)
     };
     let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-    step.get_main_evaluation_element(0, lo_col) + step.get_main_evaluation_element(0, hi_col) * shift_16
+    step.get_main_evaluation_element(0, lo_col)
+        + step.get_main_evaluation_element(0, hi_col) * shift_16
 }
 
 // =========================================================================
@@ -217,16 +218,16 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
         // MEMORY · imm
         let mut expected = &memory * &imm;
         // BRANCH · (1 - JALR) · rv2
-        expected = expected + &branch * (&one - &jalr) * &rv2;
+        expected += &branch * (&one - &jalr) * &rv2;
         // BRANCH · JALR · instruction_length (low word only)
         if self.word_idx == 0 {
             let instr_len = step
                 .get_main_evaluation_element(0, cols::INSTRUCTION_LENGTH)
                 .clone();
-            expected = expected + &branch * &jalr * instr_len;
+            expected += &branch * &jalr * instr_len;
         }
         // (1 - MEMORY) · (1 - BRANCH) · (rv2 + imm)
-        expected = expected + (&one - &memory) * (&one - &branch) * (&rv2 + &imm);
+        expected += (&one - &memory) * (&one - &branch) * (&rv2 + &imm);
 
         arg2 - expected
     }
