@@ -17,6 +17,7 @@ pub mod constraints;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod mmcs_commit;
 mod statement;
 pub mod tables;
 pub mod test_utils;
