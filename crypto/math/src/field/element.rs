@@ -25,16 +25,20 @@ use num_traits::Num;
     feature = "lambdaworks-serde-string"
 ))]
 use serde::Deserialize;
+#[cfg(feature = "lambdaworks-serde-string")]
+use serde::de::MapAccess;
 #[cfg(any(
     feature = "lambdaworks-serde-binary",
     feature = "lambdaworks-serde-string"
 ))]
-use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
+#[cfg(feature = "lambdaworks-serde-string")]
+use serde::ser::SerializeStruct;
 #[cfg(any(
     feature = "lambdaworks-serde-binary",
     feature = "lambdaworks-serde-string"
 ))]
-use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde::ser::{Serialize, Serializer};
 
 use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
@@ -697,10 +701,15 @@ where
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("FieldElement", 1)?;
-        let data = self.value().to_bytes_be();
-        state.serialize_field("value", &data)?;
-        state.end()
+        // Emit the field element's big-endian byte representation as a single
+        // byte block rather than a struct-wrapped `Vec<u8>`. Wire-compatible
+        // with the previous form on postcard / bincode (both encode a Vec<u8>
+        // as `[len][raw bytes]` for u8 sequences and `serialize_bytes` as
+        // `[len][raw bytes]`), but lets the deserializer read the bytes in
+        // one block via `visit_bytes` instead of byte-by-byte via
+        // `Vec<u8>::deserialize::visit_seq`, which was the dominant cost in
+        // the recursion guest's postcard decode (~20% of cycles).
+        serializer.serialize_bytes(&self.value().to_bytes_be())
     }
 }
 
@@ -730,60 +739,60 @@ where
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Value,
-        }
+        struct BytesVisitor<F>(PhantomData<fn() -> F>);
 
-        struct FieldElementVisitor<F>(PhantomData<fn() -> F>);
-
-        impl<'de, F: IsField> Visitor<'de> for FieldElementVisitor<F> {
+        impl<'de, F> Visitor<'de> for BytesVisitor<F>
+        where
+            F: IsField,
+            F::BaseType: ByteConversion,
+        {
             type Value = FieldElement<F>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct FieldElement")
+                formatter.write_str("big-endian byte representation of a FieldElement")
             }
 
-            fn visit_map<M>(self, mut map: M) -> Result<FieldElement<F>, M::Error>
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<FieldElement<F>, E>
             where
-                M: MapAccess<'de>,
+                E: de::Error,
             {
-                let mut value: Option<alloc::vec::Vec<u8>> = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Value => {
-                            if value.is_some() {
-                                return Err(de::Error::duplicate_field("value"));
-                            }
-                            value = Some(map.next_value()?);
-                        }
-                    }
-                }
-                let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
-                let val = F::BaseType::from_bytes_be(&value).unwrap();
+                let val = F::BaseType::from_bytes_be(v)
+                    .map_err(|_| de::Error::custom("FieldElement::from_bytes_be failed"))?;
                 Ok(FieldElement::from_raw(val))
             }
 
+            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<FieldElement<F>, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(v)
+            }
+
+            // Fallback: some formats (notably bincode 1's seq path under
+            // certain configurations) materialize the bytes as a `seq` of
+            // `u8` rather than calling `visit_bytes`. Read into a bounded
+            // stack buffer to avoid the per-element `Vec::push` that
+            // previously dominated decode cycles. 64 bytes covers every
+            // field currently in use (Goldilocks: 8, cubic: 24).
             fn visit_seq<S>(self, mut seq: S) -> Result<FieldElement<F>, S::Error>
             where
                 S: SeqAccess<'de>,
             {
-                let mut value: Option<alloc::vec::Vec<u8>> = None;
-                while let Some(val) = seq.next_element()? {
-                    if value.is_some() {
-                        return Err(de::Error::duplicate_field("value"));
+                const MAX_BYTES: usize = 64;
+                let mut buf = [0u8; MAX_BYTES];
+                let mut len = 0usize;
+                while let Some(b) = seq.next_element::<u8>()? {
+                    if len >= MAX_BYTES {
+                        return Err(de::Error::custom("FieldElement bytes exceed buffer"));
                     }
-                    value = Some(val);
+                    buf[len] = b;
+                    len += 1;
                 }
-                let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
-                let val = F::BaseType::from_bytes_be(&value).unwrap();
-                Ok(FieldElement::from_raw(val))
+                self.visit_bytes(&buf[..len])
             }
         }
 
-        const FIELDS: &[&str] = &["value"];
-        deserializer.deserialize_struct("FieldElement", FIELDS, FieldElementVisitor(PhantomData))
+        deserializer.deserialize_bytes(BytesVisitor(PhantomData))
     }
 }
 
