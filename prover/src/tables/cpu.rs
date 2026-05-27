@@ -236,10 +236,16 @@ impl CpuOperation {
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
-        // delegate that only advances the PC and sends the CPU32 lookup.
+        // delegate that only advances the PC and sends the CPU32 lookup. We still
+        // carry the real register values (rv1/rv2/rvd) so the CPU32 op-generation
+        // and its register MEMW accesses can use them — `generate_cpu_trace`
+        // zeroes the operational columns on the delegate row.
         if f.word_instr {
             return Self {
                 next_pc: decode.pc.wrapping_add(f.instruction_length as u64),
+                rv1: log.src1_val,
+                rv2: if f.read_register2 { log.src2_val } else { 0 },
+                rvd: log.dst_val,
                 ecall_commit,
                 commit_buf_addr,
                 commit_count,
@@ -378,24 +384,31 @@ impl CpuOperation {
         let f = self.decode.fields;
         let mut ops = Vec::with_capacity(7);
 
+        // Must mirror the trace columns exactly. On word delegate rows the CPU
+        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (instruction_length stays);
+        // CPU32 emits its own range checks for the real decoded values.
+        let word = f.word_instr;
+        let z = |v: u8| if word { 0 } else { v };
+        let res = if word { 0 } else { self.res };
+
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
-            f.rs1,
-            f.rs2,
+            z(f.rs1),
+            z(f.rs2),
         ));
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
-            f.rd,
+            z(f.rd),
             f.instruction_length,
         ));
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
-            f.alu_flags,
-            f.mem_flags,
+            z(f.alu_flags),
+            z(f.mem_flags),
         ));
 
         for i in 0..4 {
-            let half = ((self.res >> (i * 16)) & 0xFFFF) as u16;
+            let half = ((res >> (i * 16)) & 0xFFFF) as u16;
             ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
@@ -450,8 +463,18 @@ pub fn generate_cpu_trace(
         data[base + cols::READ_REGISTER2] = FE::from(effective(f.read_register2 && f.rs2 != 0));
         data[base + cols::WRITE_REGISTER] = FE::from(effective(f.write_register && f.rd != 0));
 
-        data[base + cols::IMM_0] = FE::from(op.decode.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.decode.imm >> 32);
+        // On word delegate rows, all operational data columns are 0 (CPU32 owns
+        // the real values); the register-zero / arg2 / rvd=res constraints all
+        // hold with read flags = 0. `op` still carries the real rv1/rv2/rvd for
+        // the CPU32 op-generation, so we mask the columns here.
+        let (imm, rvd, rv1, rv2, arg2, res) = if word {
+            (0, 0, 0, 0, 0, 0)
+        } else {
+            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
+        };
+
+        data[base + cols::IMM_0] = FE::from(imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(imm >> 32);
 
         data[base + cols::INSTRUCTION_LENGTH] = FE::from(f.instruction_length as u64);
         data[base + cols::WORD_INSTR] = FE::from(word as u64);
@@ -468,20 +491,20 @@ pub fn generate_cpu_trace(
         data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
         data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
 
-        data[base + cols::RVD_0] = FE::from(op.rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(op.rvd >> 32);
+        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
+        data[base + cols::RVD_1] = FE::from(rvd >> 32);
 
         // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
-        data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF_FFFF);
-        data[base + cols::RV1_1] = FE::from(op.rv1 >> 32);
-        data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF_FFFF);
-        data[base + cols::RV2_1] = FE::from(op.rv2 >> 32);
-        data[base + cols::ARG2_0] = FE::from(op.arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(op.arg2 >> 32);
+        data[base + cols::RV1_0] = FE::from(rv1 & 0xFFFF_FFFF);
+        data[base + cols::RV1_1] = FE::from(rv1 >> 32);
+        data[base + cols::RV2_0] = FE::from(rv2 & 0xFFFF_FFFF);
+        data[base + cols::RV2_1] = FE::from(rv2 >> 32);
+        data[base + cols::ARG2_0] = FE::from(arg2 & 0xFFFF_FFFF);
+        data[base + cols::ARG2_1] = FE::from(arg2 >> 32);
 
         // res as DWordHL (4 × 16-bit halves).
         for i in 0..4 {
-            data[base + cols::RES[i]] = FE::from((op.res >> (i * 16)) & 0xFFFF);
+            data[base + cols::RES[i]] = FE::from((res >> (i * 16)) & 0xFFFF);
         }
 
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);

@@ -200,6 +200,15 @@ impl ShiftOperation {
         }
     }
 
+    /// The raw shift output the chip writes to `OUT` (DWordWL) and sends on the
+    /// ALU bus as `res`. Unlike [`compute_result`](Self::compute_result), this is
+    /// NOT sign-extended for word shifts — the CPU32 applies that extension to
+    /// obtain `rvd`. For non-word shifts the two coincide.
+    pub fn compute_out(&self) -> u64 {
+        let aux = self.compute_aux();
+        aux.out[0] as u64 | ((aux.out[1] as u64) << 32)
+    }
+
     /// Compute all auxiliary values for trace generation.
     fn compute_aux(&self) -> ShiftAux {
         let left = !self.direction;
