@@ -111,6 +111,7 @@ impl Memory {
     /// Load a doubleword (64-bit) from memory - for LD instruction
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
         if address.is_multiple_of(8) {
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
             let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
             let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
             let low = u32::from_le_bytes(low_bytes) as u64;
@@ -131,6 +132,7 @@ impl Memory {
         if address.is_multiple_of(8) {
             let low = (value & 0xFFFFFFFF) as u32;
             let high = (value >> 32) as u32;
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
             self.cells.insert(address, low.to_le_bytes());
             self.cells.insert(address + 4, high.to_le_bytes());
         } else {
