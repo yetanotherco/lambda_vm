@@ -26,6 +26,7 @@ pub mod branch;
 pub mod bytewise;
 pub mod commit;
 pub mod cpu;
+pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
 pub mod eq;
@@ -42,6 +43,7 @@ pub mod mul;
 pub mod page;
 pub mod register;
 pub mod shift;
+pub mod store;
 pub mod trace_builder;
 
 pub use types::BusId;
