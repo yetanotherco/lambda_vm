@@ -40,7 +40,7 @@ use stark::trace::TraceTable;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16,
+    NEG_INV_2_64, SHIFT_16, alu_op,
 };
 
 // =========================================================================
@@ -893,11 +893,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C21: Receiver for quotient result
-    // DVRM[q::DWordWL; n, d, signed, 0] with multiplicity -μ_q
+    // DVRM-C21: Quotient result on the unified ALU bus.
+    // ALU[q::DWordWL; n, d, opsel(DIVREM) + 32*signed] | μ_q  (muldiv bit 7 = 0)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_Q),
         vec![
             // n as DWordHL (4 halfwords → 2 words)
@@ -910,27 +910,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
+            // flags = DIVREM + 32*signed (quotient: muldiv selector = 0)
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::DIVREM as i64),
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+            ]),
             // q as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 0 (quotient)
-            BusValue::constant(0),
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C22: Receiver for remainder result
-    // DVRM[r::DWordWL; n, d, signed, 1] with multiplicity -μ_r
+    // DVRM-C22: Remainder result on the unified ALU bus.
+    // ALU[r::DWordWL; n, d, opsel(DIVREM) + 32*signed + 128] | μ_r  (muldiv bit 7 = 1)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_R),
         vec![
             // n as DWordHL
@@ -943,18 +944,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
+            // flags = DIVREM + 32*signed + 128 (remainder: muldiv selector = 1)
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::DIVREM as i64 + 128),
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+            ]),
             // r as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::R_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 1 (remainder)
-            BusValue::constant(1),
         ],
     ));
 

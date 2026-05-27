@@ -425,48 +425,52 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LOAD receiver (from CPU)
+    // MEMORY receiver (from CPU) — shrink-cpu unified high-level memory op.
     // -------------------------------------------------------------------------
-    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8, signed] | -μ
-    //
-    // res is DWordBL (8 bytes) but packed as DWordWL (2 words) for the bus.
-    // DWordBL packing: 8 bytes → 2 bus elements [lo32, hi32]
+    // MEMORY[out=res::DWordWL; timestamp, address, value, mem_flags] | -μ
+    // The CPU dispatches LOAD here (mem_flags bit 0 = memory_op = 0). The `value`
+    // field carries the store value and is 0 for loads; `out` is the loaded res.
+    // mem_flags = 2*signed + 4*read2 + 8*read4 + 16*read8 (memory_op = 0).
     interactions.push(BusInteraction::receiver(
-        BusId::Load,
+        BusId::MemoryOp,
         Multiplicity::Column(cols::MU),
         vec![
-            // res::DWordWL - pack 8 bytes as 2 words
-            BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
-            },
-            // base_address (DWordWL = 2 words)
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
             // timestamp (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            // read flags
+            // address = base_address (DWordWL = 2 words)
             BusValue::Packed {
-                start_column: cols::READ2,
-                packing: Packing::Direct,
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::DWordWL,
             },
+            // value (store value) = 0 for loads
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // mem_flags byte
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 2,
+                    column: cols::SIGNED,
+                },
+                LinearTerm::Column {
+                    coefficient: 4,
+                    column: cols::READ2,
+                },
+                LinearTerm::Column {
+                    coefficient: 8,
+                    column: cols::READ4,
+                },
+                LinearTerm::Column {
+                    coefficient: 16,
+                    column: cols::READ8,
+                },
+            ]),
+            // out = res::DWordWL (8 bytes packed as 2 words) — the loaded value
             BusValue::Packed {
-                start_column: cols::READ4,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::READ8,
-                packing: Packing::Direct,
-            },
-            // signed flag
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
         ],
     ));

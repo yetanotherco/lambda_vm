@@ -78,6 +78,18 @@ impl StoreOperation {
             write8: bytes == 8,
         }
     }
+
+    /// The 8 `ARE_BYTES[value[i], 0]` range checks this op sends, for the BITWISE
+    /// table's multiplicity bookkeeping.
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+        (0..8)
+            .map(|i| {
+                let byte = ((self.value >> (i * 8)) & 0xFF) as u8;
+                BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, byte)
+            })
+            .collect()
+    }
 }
 
 /// Generates the STORE trace. Each store has a distinct timestamp, so rows are

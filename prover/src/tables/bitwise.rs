@@ -389,6 +389,9 @@ pub fn update_multiplicities(
             BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
+            BitwiseOperationType::ByteAluAnd => cols::MU_BYTE_ALU_AND,
+            BitwiseOperationType::ByteAluOr => cols::MU_BYTE_ALU_OR,
+            BitwiseOperationType::ByteAluXor => cols::MU_BYTE_ALU_XOR,
         };
 
         // Increment multiplicity
@@ -424,8 +427,10 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (indices 11-20)
-            (cols::MU_AND..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
+            // Check all multiplicity columns (MU_AND..=MU_BYTE_ALU_XOR), including
+            // the shrink-cpu BYTE_ALU columns (rows used only by a BYTE_ALU lookup
+            // must not be trimmed).
+            (cols::MU_AND..=cols::MU_BYTE_ALU_XOR).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -466,6 +471,10 @@ pub enum BitwiseOperationType {
     IsHalf,
     IsB20,
     Hwsl,
+    // shrink-cpu rework: unified `BYTE_ALU` lookups, keyed by opsel.
+    ByteAluAnd,
+    ByteAluOr,
+    ByteAluXor,
 }
 
 /// A lookup request to the BITWISE precomputed table.

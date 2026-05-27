@@ -294,16 +294,8 @@ impl RegisterState {
 
 /// Get byte count and signed flag from CpuOperation memory flags.
 fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
-    let byte_count = if op.decode.memory_8bytes {
-        8
-    } else if op.decode.memory_4bytes {
-        4
-    } else if op.decode.memory_2bytes {
-        2
-    } else {
-        1
-    };
-    (byte_count, op.decode.signed)
+    let f = &op.decode.fields;
+    (f.mem_bytes(), f.mem_signed())
 }
 
 /// Pack a 64-bit register value into the MEMW value format.
@@ -387,12 +379,12 @@ fn collect_ops_from_cpu(
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
-        if op.decode.op_load {
+        if op.decode.fields.is_load() {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
-        } else if op.decode.op_store {
+        } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
         }
@@ -454,32 +446,37 @@ fn collect_ops_from_cpu(
             });
         }
 
-        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
-
-        // Collect LT operations from SLT/BLT instructions
-        if op.decode.op_slt || op.decode.op_blt {
-            let arg1 = op.compute_arg1();
-            let arg2 = op.compute_arg2();
-            lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
+        // --- ALU chip dispatch (no state tracking) ---
+        // Word (`*W`) instructions are delegated to CPU32 (which itself drives
+        // the ALU chips); the main CPU does not send the ALU bus for them, so we
+        // must not emit chip ops here. CPU32 op-generation is B5b.
+        let f = op.decode.fields;
+        if !f.word_instr {
+            // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
+            // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
+            if f.is_lt() {
+                lt_ops.push(LtOperation::new_alu(
+                    op.rv1,
+                    op.arg2,
+                    f.alu_signed(),
+                    f.alu_signed2_or_invert(),
+                ));
+            }
+            // SHIFT: SLL/SRL/SRA. direction = invert bit (0 = left, 1 = right).
+            // The full arg2 goes on the ALU bus as in2; the chip uses its low
+            // byte for the (mod 32/64) computation.
+            if f.is_shift() {
+                shift_ops.push(ShiftOperation::new(
+                    op.rv1,
+                    op.arg2,
+                    f.alu_signed2_or_invert(),
+                    f.alu_signed(),
+                    f.word_instr,
+                ));
+            }
         }
 
-        // Collect SHIFT operations
-        if op.decode.op_shift {
-            let input = op.compute_arg1();
-            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
-            let direction = op.decode.mp_selector; // 0=left, 1=right
-            let signed = op.decode.signed;
-            let word_instr = op.decode.word_instr;
-            shift_ops.push(ShiftOperation::new(
-                input,
-                shift_amount,
-                direction,
-                signed,
-                word_instr,
-            ));
-        }
-
-        // Collect bitwise lookups
+        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
@@ -586,19 +583,21 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
         *byte = (store_value >> (j * 8)) & 0xFF;
     }
 
-    // Create MEMW operation (write) - M7 uses timestamp+1
+    // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
+    // the old inline M7). It uses the base timestamp — the same the CPU sends on
+    // the MEMORY bus — per spec store.toml.
     let memw_op = MemwOperation::new(
         false, // is_register = false
         base_address,
         value_bytes,
-        op.timestamp + 1,
+        op.timestamp,
         byte_count as u8,
         false, // is_read = false (write)
     )
     .with_old(old_values, old_timestamps);
 
-    // Update memory state (using timestamp+1 to match M7)
-    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
+    // Update memory state at the base timestamp (matches the STORE MEMW write).
+    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp);
 
     memw_op
 }
@@ -611,12 +610,16 @@ fn collect_register_ops_from_cpu(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let mut memw_ops = Vec::with_capacity(4);
-    let d = &op.decode;
+    let d = &op.decode.fields;
+    // Word (`*W`) rows are CPU32 delegates: the main CPU's read/write_register
+    // columns are 0, so it sends no register MEMW. CPU32 does the register I/O
+    // (B5b). Mirror that here so the MEMW bus stays balanced.
+    let real = !d.word_instr;
 
     // M1: Read rs1 register at timestamp+0
     // Skip x0 (hardwired zero). x255 (the register where the pc is stored) is handled
     // via read_pc/write_pc since regs[] only covers indices 0..31.
-    if d.read_register1 && d.rs1 != 0 {
+    if real && d.read_register1 && d.rs1 != 0 {
         let reg_value = pack_register_value(op.rv1);
         let reg_addr = 2 * d.rs1 as u64;
         let (_old_val, old_ts) = if d.rs1 == 255 {
@@ -638,7 +641,7 @@ fn collect_register_ops_from_cpu(
     }
 
     // M3: Read rs2 register at timestamp+1
-    if d.read_register2 && d.rs2 != 0 {
+    if real && d.read_register2 && d.rs2 != 0 {
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
@@ -652,7 +655,7 @@ fn collect_register_ops_from_cpu(
     }
 
     // M5: Write rd register at timestamp+2
-    if d.write_register && d.rd != 0 {
+    if real && d.write_register && d.rd != 0 {
         let reg_value = pack_register_value(op.rvd);
         let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
@@ -1445,21 +1448,19 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
     let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        // ARE_BYTES[RS1, RS2] pair (both zero in padding)
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            0,
-            0,
-        ));
-        // ARE_BYTES[RD, 0] single (zero in padding)
-        ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            0,
-        ));
-        // 12 ARE_BYTES lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
-        for _ in 0..12 {
+        // The shrunk CPU sends, per row (incl. padding where all values are 0):
+        // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
+        // 4× IS_HALF (the four `res` halves).
+        for _ in 0..3 {
             ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
+                0,
+                0,
+            ));
+        }
+        for _ in 0..4 {
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 0,
                 0,
             ));
@@ -2077,6 +2078,10 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    // shrink-cpu rework chips (driven by the CPU ALU/MEMORY dispatch).
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -2144,41 +2149,69 @@ fn collect_all_ops(
             BranchOperation::new(
                 op.decode.pc,
                 op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.compute_arg1(), // register value must match CPU's arg1 for bus signature
-                op.decode.op_jalr,
+                op.rv1,        // register value must match the CPU's BRANCH bus signature
+                op.decode.fields.jalr(),
             )
         })
         .collect();
 
-    // Collect MUL operations from CPU ops where op_mul = true
+    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
+    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
     let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| op.decode.op_mul)
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
         .map(|op| {
-            let lhs = op.compute_arg1();
-            let lhs_signed = op.decode.signed;
-            // rhs_signed = mp_selector per spec CPU-CA44:
-            // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
-            let rhs_signed = op.decode.mp_selector;
-            let rhs = op.compute_arg2();
-            let wants_hi = op.decode.muldiv_selector;
+            let f = op.decode.fields;
             (
-                MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                wants_hi,
+                MulOperation::new_alu(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+                f.alu_muldiv(),
             )
         })
         .collect();
 
-    // Collect DVRM operations from CPU ops where op_divrem = true
+    // Collect DVRM operations from non-word DIV/REM instructions.
     let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| op.decode.op_divrem)
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
         .map(|op| {
-            let n = op.compute_arg1();
-            let d = op.compute_arg2();
-            let signed = op.decode.signed;
-            let wants_remainder = op.decode.muldiv_selector;
-            (DvrmOperation::new(n, d, signed), wants_remainder)
+            let f = op.decode.fields;
+            (
+                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+                f.alu_muldiv(),
+            )
+        })
+        .collect();
+
+    // Collect the shrink-cpu ALU/MEMORY chip ops (non-word rows).
+    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
+    let eq_ops: Vec<eq::EqOperation> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+        .collect();
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+        .collect();
+    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
+    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
+    // table row).
+    let store_ops: Vec<store::StoreOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.fields.is_store())
+        .map(|op| {
+            // The MEMORY bus and the STORE chip's MEMW write share the base
+            // timestamp (spec store.toml uses one `timestamp` for both).
+            store::StoreOperation::new(
+                op.res,
+                op.timestamp,
+                op.rv2,
+                op.decode.fields.mem_bytes() as u8,
+            )
         })
         .collect();
 
@@ -2212,6 +2245,9 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
     }
 }
 
@@ -2246,6 +2282,9 @@ fn build_traces(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
     } = ops;
 
     // =====================================================================
@@ -2262,6 +2301,16 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+    // shrink-cpu chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
+    for op in &bytewise_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
+    for op in &eq_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
+    for op in &store_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
@@ -2296,7 +2345,7 @@ fn build_traces(
     let halt_op = cpu_ops
         .iter()
         .rev()
-        .find(|op| op.decode.op_ecall)
+        .find(|op| op.decode.fields.ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
@@ -2375,21 +2424,21 @@ fn build_traces(
     // wire-up), so they are generated empty — one padded (μ=0) chunk each, which
     // contributes nothing to any bus.
     let eqs = chunk_and_generate::<eq::EqOperation>(
-        &[],
+        &eq_ops,
         max_rows.eq,
         eq::generate_eq_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
-        &[],
+        &bytewise_ops,
         max_rows.bytewise,
         bytewise::generate_bytewise_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
     let stores = chunk_and_generate::<store::StoreOperation>(
-        &[],
+        &store_ops,
         max_rows.store,
         store::generate_store_trace,
         #[cfg(feature = "disk-spill")]
@@ -2641,7 +2690,7 @@ pub fn count_table_lengths(
         cpu_count += 1;
 
         // Memory ops from load/store
-        if cpu_op.decode.op_load {
+        if cpu_op.decode.fields.is_load() {
             let (memw_op, _load_op, _bitwise) =
                 collect_load_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
@@ -2651,7 +2700,7 @@ pub fn count_table_lengths(
                 &mut memw_register_count,
             );
             load_count += 1;
-        } else if cpu_op.decode.op_store {
+        } else if cpu_op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
@@ -2696,17 +2745,18 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        // CPU-side per-instruction-kind counters
-        if cpu_op.decode.op_slt || cpu_op.decode.op_blt {
+        // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
+        let f = &cpu_op.decode.fields;
+        if !f.word_instr && f.is_lt() {
             lt_count += 1;
         }
-        if cpu_op.decode.op_shift {
+        if !f.word_instr && f.is_shift() {
             shift_count += 1;
         }
-        if cpu_op.decode.op_mul {
+        if !f.word_instr && f.is_mul() {
             mul_count += 1;
         }
-        if cpu_op.decode.op_divrem {
+        if !f.word_instr && f.is_divrem() {
             dvrm_count += 1;
         }
         if cpu_op.branch_cond {

@@ -113,7 +113,8 @@ pub fn generate_decode_trace(
         .enumerate()
         .map(|(row_idx, (&pc, &instr))| {
             pc_to_row.insert(pc, row_idx);
-            DecodeEntry::from_instruction(pc, instr)
+            // instruction_length = 4 (RV64C compressed decode is a separate workstream).
+            DecodeEntry::from_instruction(pc, instr, 4)
         })
         .collect();
 
@@ -161,7 +162,8 @@ pub fn generate_decode_trace(
         data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
     }
 
-    // Fill padding rows with DECODE padding pattern: pc=7, EBREAK=1
+    // Fill padding rows with the DECODE padding pattern: odd pc=1, all flags 0
+    // (unprovable as a fetch target; same row the CPU pads to).
     let padding_entry = DecodeEntry::padding_entry();
     for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
@@ -360,7 +362,7 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
                 let addr = segment.base_addr + (i as u64 * 4);
                 let instruction = Instruction::parse(word)?;
                 pc_to_row.insert(addr, decode_entries.len());
-                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
+                decode_entries.push(DecodeEntry::from_instruction(addr, instruction, 4));
             }
         }
     }

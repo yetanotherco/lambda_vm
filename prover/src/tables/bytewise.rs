@@ -69,6 +69,25 @@ impl BytewiseOperation {
             other => panic!("BYTEWISE only handles AND/OR/XOR, got opcode {other}"),
         }
     }
+
+    /// The 8 `BYTE_ALU` lookups this op sends, for the BITWISE table's
+    /// multiplicity bookkeeping (one per byte, keyed by opsel).
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+        let kind = match self.op {
+            alu_op::AND => BitwiseOperationType::ByteAluAnd,
+            alu_op::OR => BitwiseOperationType::ByteAluOr,
+            alu_op::XOR => BitwiseOperationType::ByteAluXor,
+            other => panic!("BYTEWISE only handles AND/OR/XOR, got opcode {other}"),
+        };
+        (0..8)
+            .map(|i| {
+                let a = ((self.a >> (i * 8)) & 0xFF) as u8;
+                let b = ((self.b >> (i * 8)) & 0xFF) as u8;
+                BitwiseOperation::byte_op(kind, a, b)
+            })
+            .collect()
+    }
 }
 
 /// Generates the BYTEWISE trace from a list of operations.

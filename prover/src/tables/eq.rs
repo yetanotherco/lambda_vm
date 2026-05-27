@@ -91,6 +91,26 @@ impl EqOperation {
     pub fn compute_res(&self) -> bool {
         self.compute_eq() ^ self.invert
     }
+
+    /// The BITWISE lookups this op sends (4× `IS_HALF` on the `diff` halves and
+    /// one `ZERO` on their sum), for the BITWISE table's multiplicity bookkeeping.
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+        let diff = self.a.wrapping_sub(self.b);
+        let mut ops = Vec::with_capacity(5);
+        let mut sum = 0u32;
+        for i in 0..4 {
+            let half = ((diff >> (i * 16)) & 0xFFFF) as u32;
+            sum += half;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+        ops.push(BitwiseOperation::zero(sum));
+        ops
+    }
 }
 
 /// Generates the EQ trace from a list of operations.

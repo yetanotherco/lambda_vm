@@ -41,8 +41,31 @@ use stark::trace::TraceTable;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
 };
+
+/// Total row multiplicity across both buses (`Mul` + `ALU`, lo + hi), used by
+/// the internal range-check sends so they fire once per row-instance.
+fn row_mult() -> Multiplicity {
+    Multiplicity::Linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MU_LO,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MU_HI,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MU_ALU_LO,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MU_ALU_HI,
+        },
+    ])
+}
 
 // =========================================================================
 // Column indices for MUL table
@@ -112,14 +135,19 @@ pub mod cols {
     /// raw_product[3]: Intermediate convolution value
     pub const RAW_PRODUCT_3: usize = 23;
 
-    // Multiplicity columns
-    /// μ_lo: multiplicity for lo result lookups
+    // Multiplicity columns. The `Mul` bus serves dvrm's internal `d*q` checks;
+    // the `ALU` bus serves the CPU's MUL/MULH dispatch (shrink-cpu rework).
+    /// μ_lo: `Mul` bus multiplicity for lo result lookups
     pub const MU_LO: usize = 24;
-    /// μ_hi: multiplicity for hi result lookups
+    /// μ_hi: `Mul` bus multiplicity for hi result lookups
     pub const MU_HI: usize = 25;
+    /// μ_alu_lo: `ALU` bus multiplicity for lo result lookups (CPU MUL)
+    pub const MU_ALU_LO: usize = 26;
+    /// μ_alu_hi: `ALU` bus multiplicity for hi result lookups (CPU MULH)
+    pub const MU_ALU_HI: usize = 27;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 26;
+    pub const NUM_COLUMNS: usize = 28;
 }
 
 // =========================================================================
@@ -146,25 +174,44 @@ pub struct MulOperation {
     pub rhs: u64,
     /// Whether rhs is treated as signed
     pub rhs_signed: bool,
+    /// `true` if dispatched by the CPU on the unified `ALU` bus; `false` for
+    /// internal `Mul`-bus lookups (dvrm's `d*q` consistency).
+    pub alu: bool,
 }
 
-/// Multiplicities for a MUL operation (separate for lo and hi lookups).
+/// Multiplicities for a MUL operation, split by bus (`Mul` vs `ALU`) and lo/hi.
 #[derive(Debug, Clone, Default)]
 pub struct MulMultiplicities {
-    /// Count of lookups requesting lo result
+    /// `Mul` bus count requesting lo result
     pub mu_lo: u64,
-    /// Count of lookups requesting hi result
+    /// `Mul` bus count requesting hi result
     pub mu_hi: u64,
+    /// `ALU` bus count requesting lo result
+    pub mu_alu_lo: u64,
+    /// `ALU` bus count requesting hi result
+    pub mu_alu_hi: u64,
 }
 
 impl MulOperation {
-    /// Create a new MUL operation.
+    /// Create a new internal (`Mul`-bus) MUL operation.
     pub fn new(lhs: u64, lhs_signed: bool, rhs: u64, rhs_signed: bool) -> Self {
         Self {
             lhs,
             lhs_signed,
             rhs,
             rhs_signed,
+            alu: false,
+        }
+    }
+
+    /// Create a new CPU-dispatched (`ALU`-bus) MUL operation.
+    pub fn new_alu(lhs: u64, lhs_signed: bool, rhs: u64, rhs_signed: bool) -> Self {
+        Self {
+            lhs,
+            lhs_signed,
+            rhs,
+            rhs_signed,
+            alu: true,
         }
     }
 
@@ -288,10 +335,11 @@ pub fn generate_mul_trace(
 
     for (op, wants_hi) in operations {
         let entry = op_map.entry(op.clone()).or_default();
-        if *wants_hi {
-            entry.mu_hi += 1;
-        } else {
-            entry.mu_lo += 1;
+        match (op.alu, *wants_hi) {
+            (false, false) => entry.mu_lo += 1,
+            (false, true) => entry.mu_hi += 1,
+            (true, false) => entry.mu_alu_lo += 1,
+            (true, true) => entry.mu_alu_hi += 1,
         }
     }
 
@@ -342,9 +390,11 @@ pub fn generate_mul_trace(
         data[base + cols::RAW_PRODUCT_2] = FE::from(raw[2]);
         data[base + cols::RAW_PRODUCT_3] = FE::from(raw[3]);
 
-        // Fill multiplicities
+        // Fill multiplicities (Mul bus + ALU bus, each lo/hi)
         data[base + cols::MU_LO] = FE::from(multiplicities.mu_lo);
         data[base + cols::MU_HI] = FE::from(multiplicities.mu_hi);
+        data[base + cols::MU_ALU_LO] = FE::from(multiplicities.mu_alu_lo);
+        data[base + cols::MU_ALU_HI] = FE::from(multiplicities.mu_alu_hi);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -405,7 +455,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -419,7 +469,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for col in [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -438,7 +488,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -459,7 +509,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * lo[0] - 2^-48 * lo[1] - 2^-32 * lo[2] - 2^-16 * lo[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -493,7 +543,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-32 * hi[0] - 2^-16 * hi[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -539,7 +589,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * hi[0] - 2^-48 * hi[1] - 2^-32 * hi[2] - 2^-16 * hi[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -665,6 +715,65 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             // muldiv_selector = 1 (hi)
             BusValue::constant(1),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // ALU receivers (shrink-cpu): the CPU dispatches MUL/MULH/MULHSU/MULHU here.
+    // ALU[out::DWordWL; lhs, rhs, flags] where flags =
+    //   opsel(MUL) + 32*lhs_signed + 64*rhs_signed (+128 for the hi result).
+    // -------------------------------------------------------------------------
+    let mul_flags = |hi: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Constant(alu_op::MUL as i64 + hi),
+            LinearTerm::Column {
+                coefficient: 32,
+                column: cols::LHS_SIGNED,
+            },
+            LinearTerm::Column {
+                coefficient: 64,
+                column: cols::RHS_SIGNED,
+            },
+        ])
+    };
+    // ALU lo (muldiv bit 7 = 0)
+    interactions.push(BusInteraction::receiver(
+        BusId::Alu,
+        Multiplicity::Column(cols::MU_ALU_LO),
+        vec![
+            BusValue::Packed {
+                start_column: cols::LHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::RHS_0,
+                packing: Packing::DWordHL,
+            },
+            mul_flags(0),
+            BusValue::Packed {
+                start_column: cols::LO_0,
+                packing: Packing::DWordHL,
+            },
+        ],
+    ));
+    // ALU hi (muldiv bit 7 = 1 => +128)
+    interactions.push(BusInteraction::receiver(
+        BusId::Alu,
+        Multiplicity::Column(cols::MU_ALU_HI),
+        vec![
+            BusValue::Packed {
+                start_column: cols::LHS_0,
+                packing: Packing::DWordHL,
+            },
+            BusValue::Packed {
+                start_column: cols::RHS_0,
+                packing: Packing::DWordHL,
+            },
+            mul_flags(128),
+            BusValue::Packed {
+                start_column: cols::HI_0,
+                packing: Packing::DWordHL,
+            },
         ],
     ));
 

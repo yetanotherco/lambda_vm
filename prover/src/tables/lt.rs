@@ -28,11 +28,11 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
 
 // =========================================================================
 // Column indices for LT table
@@ -80,12 +80,20 @@ pub mod cols {
     /// rhs_msb: Bit (MSB of rhs, i.e., bit 63)
     pub const RHS_MSB: usize = 13;
 
-    // Multiplicity column
-    /// μ: multiplicity for bus interactions
+    // Multiplicity column (LT bus: memw/memw_aligned/dvrm timestamp & |r|<|d| checks)
+    /// μ: multiplicity for the `Lt` bus receiver
     pub const MU: usize = 14;
 
+    // shrink-cpu rework: the CPU dispatches SLT/BLT/BGE on the unified `ALU` bus.
+    /// invert: Bit — invert the comparison (BGE/BGEU); `out = lt XOR invert`.
+    pub const INVERT: usize = 15;
+    /// out: the ALU result `lt XOR invert` (the low word; high word is 0).
+    pub const OUT: usize = 16;
+    /// μ_alu: multiplicity for the `ALU` bus receiver (CPU comparisons).
+    pub const MU_ALU: usize = 17;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 15;
+    pub const NUM_COLUMNS: usize = 18;
 }
 
 // =========================================================================
@@ -103,21 +111,48 @@ pub struct LtOperation {
     pub rhs: u64,
     /// Whether to do signed comparison
     pub signed: bool,
+    /// Whether to invert the result (`out = lt XOR invert`); used for BGE/BGEU.
+    pub invert: bool,
+    /// `true` if this lookup is dispatched by the CPU on the unified `ALU` bus;
+    /// `false` if it is an internal `Lt`-bus lookup (memw/memw_aligned/dvrm).
+    pub alu: bool,
 }
 
 impl LtOperation {
-    /// Create a new LT operation.
+    /// Create a new `Lt`-bus LT operation (memw/dvrm internal less-than checks).
     pub fn new(lhs: u64, rhs: u64, signed: bool) -> Self {
-        Self { lhs, rhs, signed }
+        Self {
+            lhs,
+            rhs,
+            signed,
+            invert: false,
+            alu: false,
+        }
     }
 
-    /// Compute the less-than result.
+    /// Create a new `ALU`-bus LT operation (CPU SLT/BLT/BGE dispatch).
+    pub fn new_alu(lhs: u64, rhs: u64, signed: bool, invert: bool) -> Self {
+        Self {
+            lhs,
+            rhs,
+            signed,
+            invert,
+            alu: true,
+        }
+    }
+
+    /// Compute the raw less-than result (before inversion).
     pub fn compute_lt(&self) -> bool {
         if self.signed {
             (self.lhs as i64) < (self.rhs as i64)
         } else {
             self.lhs < self.rhs
         }
+    }
+
+    /// The ALU output: `lt XOR invert`.
+    pub fn compute_out(&self) -> bool {
+        self.compute_lt() ^ self.invert
     }
 }
 
@@ -186,8 +221,17 @@ pub fn generate_lt_trace(
         data[base + cols::LHS_MSB] = FE::from(lhs_msb);
         data[base + cols::RHS_MSB] = FE::from(rhs_msb);
 
-        // Multiplicity: aggregated count of this operation
-        data[base + cols::MU] = FE::from(*multiplicity);
+        // ALU-bus fields: invert + the inverted output.
+        data[base + cols::INVERT] = FE::from(op.invert as u64);
+        data[base + cols::OUT] = FE::from(op.compute_out() as u64);
+
+        // Multiplicity routed to the bus this op belongs to. Internal `Lt`-bus
+        // lookups increment MU; CPU `ALU`-bus comparisons increment MU_ALU.
+        if op.alu {
+            data[base + cols::MU_ALU] = FE::from(*multiplicity);
+        } else {
+            data[base + cols::MU] = FE::from(*multiplicity);
+        }
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -210,7 +254,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // Output: lhs_msb
         BusInteraction::sender(
             BusId::Msb16,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![
                 BusValue::Packed {
                     start_column: cols::LHS_2,
@@ -225,7 +269,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // MSB16[rhs[2]] -> rhs_msb
         BusInteraction::sender(
             BusId::Msb16,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![
                 BusValue::Packed {
                     start_column: cols::RHS_2,
@@ -240,7 +284,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[0]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_0,
                 packing: Packing::Direct,
@@ -249,7 +293,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_1,
                 packing: Packing::Direct,
@@ -258,7 +302,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[2]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_2,
                 packing: Packing::Direct,
@@ -267,7 +311,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[3]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_3,
                 packing: Packing::Direct,
@@ -276,7 +320,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_1,
                 packing: Packing::Direct,
@@ -285,7 +329,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[rhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Sum(cols::MU, cols::MU_ALU),
             vec![BusValue::Packed {
                 start_column: cols::RHS_1,
                 packing: Packing::Direct,
@@ -319,6 +363,40 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::LT,
                     packing: Packing::Direct,
                 },
+            ],
+        ),
+        // ALU[lhs, rhs, opsel(LT) + 32*signed + 64*invert] -> out  (receiver).
+        // The CPU dispatches SLT/BLT/BGE here on the unified ALU bus. lhs/rhs are
+        // packed DWordHHW -> [lo32, hi32] (matching the CPU's DWordWL operands);
+        // the output is [out, 0] (a comparison result fits in the low word).
+        BusInteraction::receiver(
+            BusId::Alu,
+            Multiplicity::Column(cols::MU_ALU),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::LHS_0,
+                    packing: Packing::DWordHHW,
+                },
+                BusValue::Packed {
+                    start_column: cols::RHS_0,
+                    packing: Packing::DWordHHW,
+                },
+                BusValue::linear(vec![
+                    LinearTerm::Constant(alu_op::LT as i64),
+                    LinearTerm::Column {
+                        coefficient: 32,
+                        column: cols::SIGNED,
+                    },
+                    LinearTerm::Column {
+                        coefficient: 64,
+                        column: cols::INVERT,
+                    },
+                ]),
+                BusValue::Packed {
+                    start_column: cols::OUT,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
             ],
         ),
     ]

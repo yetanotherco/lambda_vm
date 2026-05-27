@@ -24,7 +24,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
 
 // =========================================================================
 // Column indices
@@ -74,7 +74,21 @@ pub mod cols {
     // Multiplicity
     pub const MU: usize = 25;
 
-    pub const NUM_COLUMNS: usize = 26;
+    // shrink-cpu rework: the unified ALU bus carries the full (un-reduced) shift
+    // amount `arg2` as in2. SHIFT_AMOUNT (col 4) is its low byte (used by the
+    // computation, which reduces mod 32/64); these hold the remaining bits so
+    // the bus value `in2 = arg2` can be reconstructed. Range-checked (byte/half)
+    // so the decomposition is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`.
+    /// bits 8-15 of the shift amount (byte)
+    pub const SHIFT_B1: usize = 26;
+    /// bits 16-31 of the shift amount (half)
+    pub const SHIFT_H1: usize = 27;
+    /// bits 32-47 of the shift amount (half)
+    pub const SHIFT_H2: usize = 28;
+    /// bits 48-63 of the shift amount (half)
+    pub const SHIFT_H3: usize = 29;
+
+    pub const NUM_COLUMNS: usize = 30;
 
     // Helpers for iteration
     pub const IN: [usize; 4] = [IN_0, IN_1, IN_2, IN_3];
@@ -92,8 +106,10 @@ pub mod cols {
 pub struct ShiftOperation {
     /// Input value as 4 halfwords (DWordHL)
     pub in_halves: [u16; 4],
-    /// Shift amount (byte)
+    /// Shift amount low byte (used by the computation; effective = mod 32/64).
     pub shift: u8,
+    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
+    pub shift_amount: u64,
     /// 0 = left, 1 = right
     pub direction: bool,
     /// Whether arithmetic (signed) right shift
@@ -103,7 +119,15 @@ pub struct ShiftOperation {
 }
 
 impl ShiftOperation {
-    pub fn new(value: u64, shift: u8, direction: bool, signed: bool, word_instr: bool) -> Self {
+    /// `shift_amount` is the full (un-reduced) shift operand `arg2`; only its low
+    /// byte feeds the computation (the result depends on `arg2 mod 32/64`).
+    pub fn new(
+        value: u64,
+        shift_amount: u64,
+        direction: bool,
+        signed: bool,
+        word_instr: bool,
+    ) -> Self {
         Self {
             in_halves: [
                 (value & 0xFFFF) as u16,
@@ -111,7 +135,8 @@ impl ShiftOperation {
                 ((value >> 32) & 0xFFFF) as u16,
                 ((value >> 48) & 0xFFFF) as u16,
             ],
-            shift,
+            shift: (shift_amount & 0xFF) as u8,
+            shift_amount,
             direction,
             signed,
             word_instr,
@@ -332,6 +357,11 @@ pub fn generate_shift_trace(
             data[base + cols::IN[i]] = FE::from(op.in_halves[i] as u64);
         }
         data[base + cols::SHIFT_AMOUNT] = FE::from(op.shift as u64);
+        // High bits of the full shift amount (for the ALU bus in2 = arg2).
+        data[base + cols::SHIFT_B1] = FE::from((op.shift_amount >> 8) & 0xFF);
+        data[base + cols::SHIFT_H1] = FE::from((op.shift_amount >> 16) & 0xFFFF);
+        data[base + cols::SHIFT_H2] = FE::from((op.shift_amount >> 32) & 0xFFFF);
+        data[base + cols::SHIFT_H3] = FE::from((op.shift_amount >> 48) & 0xFFFF);
         data[base + cols::DIRECTION] = FE::from(op.direction as u64);
         data[base + cols::SIGNED] = FE::from(op.signed as u64);
         data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
@@ -561,43 +591,94 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C15: SHIFT[out; in, shift, direction, signed, word_instr] | -μ (receiver)
+    // Unified ALU receiver (shrink-cpu): the CPU dispatches SLL/SRL/SRA here.
+    // ALU[out::DWordWL; in1=in, in2=shift_amount, flags] where
+    //   flags = opsel(SHIFT=5, +word_instr→SHIFTW=6) + 32*signed + 64*direction.
+    // in2 = the full shift amount: [SHIFT_AMOUNT + 256*SHIFT_B1 + 2^16*SHIFT_H1,
+    //                               SHIFT_H2 + 2^16*SHIFT_H3].
     interactions.push(BusInteraction::receiver(
-        BusId::Shift,
+        BusId::Alu,
         Multiplicity::Column(cols::MU),
         vec![
+            // in1 = in as DWordHL (4 halfwords → 2 words)
+            BusValue::Packed {
+                start_column: cols::IN_0,
+                packing: Packing::DWordHL,
+            },
+            // in2 = full shift amount, low word
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::SHIFT_AMOUNT,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::SHIFT_B1,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::SHIFT_H1,
+                },
+            ]),
+            // in2 high word
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::SHIFT_H2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::SHIFT_H3,
+                },
+            ]),
+            // flags = opsel(SHIFT) + word_instr + 32*signed + 64*direction
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::SHIFT as i64),
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WORD_INSTR,
+                },
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+                LinearTerm::Column {
+                    coefficient: 64,
+                    column: cols::DIRECTION,
+                },
+            ]),
             // out as DWordWL (2 elements)
             BusValue::Packed {
                 start_column: cols::OUT_0,
                 packing: Packing::DWordWL,
             },
-            // in as DWordHL (4 halfwords → 2 elements)
-            BusValue::Packed {
-                start_column: cols::IN_0,
-                packing: Packing::DWordHL,
-            },
-            // shift
-            BusValue::Packed {
-                start_column: cols::SHIFT_AMOUNT,
-                packing: Packing::Direct,
-            },
-            // direction
-            BusValue::Packed {
-                start_column: cols::DIRECTION,
-                packing: Packing::Direct,
-            },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // word_instr
-            BusValue::Packed {
-                start_column: cols::WORD_INSTR,
-                packing: Packing::Direct,
-            },
         ],
     ));
+
+    // Range checks for the high shift-amount bits (so the in2 decomposition is
+    // unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT itself is
+    // byte-checked via the AND_BYTE[shift, mask] lookups.
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::SHIFT_B1,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+        ],
+    ));
+    for half_col in [cols::SHIFT_H1, cols::SHIFT_H2, cols::SHIFT_H3] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: half_col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     interactions
 }
@@ -932,6 +1013,21 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             op.shift,
             mask,
         ));
+
+        // Range checks for the high shift-amount bits (match the ALU-bus in2
+        // reconstruction): ARE_BYTES[bits 8-15] + IS_HALF[bits 16-31/32-47/48-63].
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
+        ));
+        for shift in [16, 32, 48] {
+            let half = ((op.shift_amount >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
     }
 
     bitwise_ops
