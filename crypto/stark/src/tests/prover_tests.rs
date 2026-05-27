@@ -533,7 +533,7 @@ fn commit_lde_columns_matches_interpolate_then_evaluate() {
     use crate::config::BatchedMerkleTree;
     use crate::prover::commit_lde_columns;
     use crate::trace::columns2rows;
-    use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+    use math::fft::bit_reversing::in_place_bit_reverse_permute;
 
     let blowup_factor = 4usize;
     let coset_offset = Felt::from(3u64);

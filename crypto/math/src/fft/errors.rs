@@ -8,6 +8,8 @@ pub enum FFTError {
     InputError(usize),
     OrderError(u64),
     DomainSizeError(usize),
+    /// A coset offset of zero was supplied; it has no multiplicative inverse.
+    InvalidCosetOffset,
 }
 
 impl Display for FFTError {
@@ -22,6 +24,9 @@ impl Display for FFTError {
             }
             FFTError::DomainSizeError(_) => {
                 write!(f, "Domain size exceeds two adicity of the field")
+            }
+            FFTError::InvalidCosetOffset => {
+                write!(f, "Coset offset is zero, which is not invertible")
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Batched coset LDE must agree with running the CPU single-column LDE on
 //! each column independently. Sweeps a few realistic (n, blowup, m) tuples.
 
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bowers_fft::LayerTwiddles;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsField, IsPrimeField};
