@@ -583,6 +583,11 @@ fn test_mulw_neg() {
 }
 
 #[test]
+fn test_mulw_overflow() {
+    run_program("./program_artifacts/asm/mulw_overflow.elf");
+}
+
+#[test]
 fn test_divw() {
     run_program("./program_artifacts/asm/divw.elf");
 }
@@ -608,6 +613,11 @@ fn test_divuw() {
 }
 
 #[test]
+fn test_divuw_high_bit() {
+    run_program("./program_artifacts/asm/divuw_high_bit.elf");
+}
+
+#[test]
 fn test_remw() {
     run_program("./program_artifacts/asm/remw.elf");
 }
@@ -630,6 +640,11 @@ fn test_remuw_zero() {
 #[test]
 fn test_remuw() {
     run_program("./program_artifacts/asm/remuw.elf");
+}
+
+#[test]
+fn test_remuw_high_bit() {
+    run_program("./program_artifacts/asm/remuw_high_bit.elf");
 }
 
 // ==================== 64-bit Load/Store ====================
