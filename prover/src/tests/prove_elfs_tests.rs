@@ -80,6 +80,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     Verifier::multi_verify(
         &airs.air_refs(),
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs.air_refs()),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -135,6 +136,7 @@ fn test_cpu_only_no_bus() {
         Verifier::multi_verify(
             &airs,
             &multi_proof,
+            &stark::mmcs_leaf::synth_main_tags_for(&airs),
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         ),
@@ -895,6 +897,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let verified = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1633,6 +1636,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let verified = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1690,6 +1694,7 @@ fn test_deep_stack_missing_pages_rejected() {
     let verified = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1782,6 +1787,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let verified = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1942,6 +1948,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let verified = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     );

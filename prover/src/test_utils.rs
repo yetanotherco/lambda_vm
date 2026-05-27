@@ -100,8 +100,10 @@ pub fn multi_prove_ram<PI>(
 where
     PI: Send + Sync + Clone,
 {
+    let main_tags = stark::mmcs_leaf::synth_main_tags(air_trace_pairs.len());
     Prover::<F, E, PI>::multi_prove(
         air_trace_pairs,
+        &main_tags,
         transcript,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,

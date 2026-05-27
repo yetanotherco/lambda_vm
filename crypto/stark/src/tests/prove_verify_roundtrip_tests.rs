@@ -18,7 +18,6 @@ use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
 use crate::test_utils::multi_prove_ram;
 use crate::traits::AIR;
-use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -168,7 +167,7 @@ fn test_verify_serialized_multi_table_proofs() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &received_proofs,
             &mut DefaultTranscript::<E>::new(&[]),

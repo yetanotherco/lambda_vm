@@ -1495,6 +1495,7 @@ pub trait IsStarkProver<
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        main_tags: &[MatrixTag],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
@@ -1515,6 +1516,16 @@ pub trait IsStarkProver<
         let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
 
         let num_airs = air_trace_pairs.len();
+
+        if main_tags.len() != num_airs {
+            return Err(ProvingError::WrongParameter(format!(
+                "main_tags len ({}) does not match number of AIRs ({})",
+                main_tags.len(),
+                num_airs
+            )));
+        }
+        // `main_tags` is reserved for the upcoming MMCS wire-up; not consumed yet.
+        let _ = main_tags;
 
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = air_trace_pairs
@@ -1972,8 +1983,13 @@ pub trait IsStarkProver<
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
+        // Single-AIR path: synthesize a default tag. Callers that want
+        // multi-table soundness should call `multi_prove` directly with
+        // distinct tags.
+        let main_tags = [MatrixTag::new([0; 8])];
         Self::multi_prove(
             air_trace_pairs,
+            &main_tags,
             transcript,
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,

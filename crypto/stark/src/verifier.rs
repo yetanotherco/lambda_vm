@@ -716,6 +716,7 @@ pub trait IsStarkVerifier<
     fn multi_verify(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        main_tags: &[crypto::merkle_tree::mmcs::MatrixTag],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
@@ -731,6 +732,16 @@ pub trait IsStarkVerifier<
             );
             return false;
         }
+        if main_tags.len() != airs.len() {
+            error!(
+                "main_tags count ({}) does not match AIR count ({})",
+                main_tags.len(),
+                airs.len()
+            );
+            return false;
+        }
+        // `main_tags` is reserved for the upcoming MMCS verifier replay.
+        let _ = main_tags;
 
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
@@ -903,7 +914,14 @@ pub trait IsStarkVerifier<
         let multi_proof = MultiProof {
             proofs: vec![proof.clone()],
         };
-        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
+        let main_tags = [crypto::merkle_tree::mmcs::MatrixTag::new([0; 8])];
+        Self::multi_verify(
+            &[air],
+            &multi_proof,
+            &main_tags,
+            transcript,
+            &FieldElement::zero(),
+        )
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has

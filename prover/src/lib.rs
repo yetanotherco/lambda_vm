@@ -736,8 +736,10 @@ pub fn prove_with_options_and_inputs(
     );
 
     // Phase 4: Prove (multi_prove)
+    let main_tags = airs.air_tags();
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
+        &main_tags,
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
@@ -870,9 +872,11 @@ pub fn verify_with_options(
         None => return Ok(false),
     };
 
+    let main_tags = airs.air_tags();
     Ok(Verifier::multi_verify(
         &air_refs,
         &vm_proof.proof,
+        &main_tags,
         &mut transcript,
         &expected_bus_balance,
     ))

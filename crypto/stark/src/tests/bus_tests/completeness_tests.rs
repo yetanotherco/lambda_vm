@@ -19,7 +19,6 @@ use crate::proof::options::ProofOptions;
 use crate::test_utils::multi_prove_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
-use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -127,7 +126,7 @@ fn test_multi_table_proof() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -190,7 +189,7 @@ fn test_all_padding() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -253,7 +252,7 @@ fn test_single_operation() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -316,7 +315,7 @@ fn test_duplicate_operations() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -384,7 +383,7 @@ fn test_serialization_roundtrip() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &deserialized,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -524,7 +523,7 @@ fn test_bus_value_features() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(crate::test_utils::multi_verify_ram(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),

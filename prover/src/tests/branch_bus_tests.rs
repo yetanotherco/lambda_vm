@@ -348,6 +348,7 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )
@@ -438,6 +439,7 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )

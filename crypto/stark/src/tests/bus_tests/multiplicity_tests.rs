@@ -18,7 +18,6 @@ use crate::proof::options::ProofOptions;
 use crate::test_utils::multi_prove_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
-use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -119,7 +118,7 @@ fn test_multiplicity_one() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -229,7 +228,7 @@ fn test_multiplicity_sum() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -337,7 +336,7 @@ fn test_multiplicity_negated() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

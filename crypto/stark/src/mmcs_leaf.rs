@@ -31,6 +31,22 @@ use crate::config::Commitment;
 /// any encoding change so old proofs cannot be silently re-interpreted.
 pub const LEAF_DOMAIN_TAG: &[u8] = b"LAMBDAVM_MAIN_MMCS_LEAF_V1";
 
+/// Synthesize `n` distinct [`MatrixTag`]s derived from positional index.
+/// Useful for generic stark tests where the caller does not own a stable
+/// chip-type assignment. Production code in lambda-vm uses
+/// `VmAirs::air_tags()` instead, which encodes chip type + chunk index.
+pub fn synth_main_tags(n: usize) -> Vec<MatrixTag> {
+    (0..n)
+        .map(|i| MatrixTag::new((i as u64).to_le_bytes()))
+        .collect()
+}
+
+/// Convenience: synthesize `MatrixTag`s sized to a slice. Equivalent to
+/// `synth_main_tags(slice.len())`.
+pub fn synth_main_tags_for<T>(slice: &[T]) -> Vec<MatrixTag> {
+    synth_main_tags(slice.len())
+}
+
 /// Hash one row's worth of column bytes into a leaf digest using the
 /// canonical tagged format. `row_bytes_be` is the concatenation of every
 /// committed column's element written big-endian, in column order.

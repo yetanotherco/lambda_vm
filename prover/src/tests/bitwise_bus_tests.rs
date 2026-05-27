@@ -205,6 +205,7 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )
@@ -315,6 +316,7 @@ fn prove_and_verify_custom(
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )

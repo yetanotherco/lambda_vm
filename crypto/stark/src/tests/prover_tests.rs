@@ -12,7 +12,6 @@ use crate::{
     tests::domain_cache_stats,
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
-    verifier::{IsStarkVerifier, Verifier},
 };
 use math::{
     field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField},
@@ -304,7 +303,7 @@ fn test_multi_prove_mixed_coset_offsets() {
     > = vec![&air_1, &air_2];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),
@@ -380,7 +379,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
     > = vec![&air_1, &air_2, &air_3];
 
     assert!(
-        Verifier::multi_verify(
+        crate::test_utils::multi_verify_ram(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),

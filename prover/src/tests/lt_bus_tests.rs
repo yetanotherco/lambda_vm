@@ -301,6 +301,7 @@ fn prove_and_verify(ops: &[LtOperation]) -> bool {
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )
@@ -385,6 +386,7 @@ fn prove_and_verify_custom(ops: &[LtOperation], receiver_rows: &[CustomLtRow]) -
     Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     )

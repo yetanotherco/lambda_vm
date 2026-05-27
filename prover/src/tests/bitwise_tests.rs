@@ -599,6 +599,7 @@ mod soundness_tests {
         let result = Verifier::multi_verify(
             &airs,
             &multi_proof,
+            &stark::mmcs_leaf::synth_main_tags_for(&airs),
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         );
@@ -647,6 +648,7 @@ mod soundness_tests {
         let result = Verifier::multi_verify(
             &airs,
             &multi_proof,
+            &stark::mmcs_leaf::synth_main_tags_for(&airs),
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         );
@@ -718,6 +720,7 @@ mod soundness_tests {
         let result = Verifier::multi_verify(
             &verifier_airs,
             &multi_proof,
+            &stark::mmcs_leaf::synth_main_tags_for(&verifier_airs),
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         );

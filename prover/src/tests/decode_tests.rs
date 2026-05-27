@@ -981,6 +981,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let result = Verifier::multi_verify(
         &verifier_airs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_airs),
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     );
@@ -1076,6 +1077,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let result = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
+        &stark::mmcs_leaf::synth_main_tags_for(&verifier_air_refs),
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
