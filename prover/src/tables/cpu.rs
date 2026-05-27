@@ -500,19 +500,18 @@ impl CpuOperation {
             // REMUW/REMW if true, DIVUW/DIVW otherwise
             let rem = self.decode.muldiv_selector;
 
-            // DIVW/REMW if self.decode.signed == true, DIVUW/REMUW otherwise
-            if self.decode.signed {
-                if arg2 == 0 {
-                    if rem { arg1 } else { u64::MAX }
-                } else if rem {
-                    (arg1 as i64).wrapping_rem(arg2 as i64) as u64
-                } else {
-                    (arg1 as i64).wrapping_div(arg2 as i64) as u64
-                }
-            } else if arg2 == 0 {
+            if arg2 == 0 {
                 if rem { arg1 } else { u64::MAX }
             } else if rem {
-                arg1 % arg2
+                // REMW if self.decode.signed == true, REMUW otherwise
+                if self.decode.signed {
+                    (arg1 as i64).wrapping_rem(arg2 as i64) as u64
+                } else {
+                    arg1 % arg2
+                }
+            // DIVW if self.decode.signed == true, DIVUW otherwise
+            } else if self.decode.signed {
+                (arg1 as i64).wrapping_div(arg2 as i64) as u64
             } else {
                 arg1 / arg2
             }
