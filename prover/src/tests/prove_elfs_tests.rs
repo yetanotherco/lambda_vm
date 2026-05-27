@@ -147,10 +147,12 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &vm_proof.table_counts,
     );
     let air_refs = airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
     Verifier::multi_verify(
