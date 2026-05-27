@@ -369,7 +369,7 @@ output = "rv2_sign"
 [[constraints.ext]]
 kind = "arith"
 constraint = "$#`arg2[0]` = #`rv2[:2]` + #`imm[0]`$"
-poly = ["-", ["idx", "arg2", 0], ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "imm", 0]]
+poly = ["-", ["idx", "arg2", 0], ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "imm", 0]]
 
 [[constraints.ext]]
 kind = "arith"

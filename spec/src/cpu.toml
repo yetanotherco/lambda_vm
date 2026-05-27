@@ -349,11 +349,11 @@ prefix = "A"
 
 [[constraints.alu]]
 kind = "arith"
-constraint = "$#`arg2` = #`MEMORY` * #`imm` + #`BRANCH` * (1 - #`JALR`) * #`instruction_length` * #`BRANCH` * #`JALR` * #`rv2` + (1 - #`MEMORY`) * (1 - #`BRANCH`) * (#`rv2` + #`imm`)$"
+constraint = "$#`arg2` = #`MEMORY` * #`imm` + #`BRANCH` * (1 - #`JALR`) * #`rv2` * #`BRANCH` * #`JALR` * #`instruction_length` + (1 - #`MEMORY`) * (1 - #`BRANCH`) * (#`rv2` + #`imm`)$"
 poly = ["-", ["idx", "arg2", "i"],
     ["*", "MEMORY", ["idx", "imm", "i"]],
-    ["*", "BRANCH", ["not", "JALR"], "instruction_length"],
-    ["*", "BRANCH", "JALR", ["idx", "rv2", "i"]],
+    ["*", "BRANCH", ["not", "JALR"], ["idx", "rv2", "i"]],
+    ["*", "BRANCH", "JALR", ["idx", ["arr", "instruction_length", 0], "i"]],
     ["*", ["not", "MEMORY"], ["not", "BRANCH"], ["idx", ["+", "rv2", "imm"], "i"]]
 ]
 iter = ["i", 0, 1]
