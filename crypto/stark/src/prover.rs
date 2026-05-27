@@ -27,11 +27,15 @@ use rayon::prelude::{
 use crate::debug::validate_trace;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
+#[allow(unused_imports)]
+use crate::mmcs_leaf::hash_tagged_row_bytes;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
+#[allow(unused_imports)]
+use crypto::merkle_tree::mmcs::{MatrixTag, Mmcs, MmcsBuilder, MmcsError};
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -149,6 +153,52 @@ where
     }
 }
 
+/// Per-table commitment artifacts for the main trace under the shared
+/// MMCS protocol. The `mmcs` Arc is the SAME instance for every table in
+/// the multi-proof — Phase A builds it once.
+///
+/// Currently unused at the wire-up level; defined here as the keystone
+/// type for the upcoming MMCS Phase C wire-up (see
+/// `docs/mmcs-streaming-c1-spec.md`). Marked `allow(dead_code)` until the
+/// follow-up commit consumes it.
+#[allow(dead_code)]
+pub(crate) struct MainCommit<F: IsField>
+where
+    FieldElement<F>: AsBytes,
+{
+    /// Shared MMCS across all tables in the multi-proof.
+    pub(crate) mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+    /// This table's MatrixTag within the MMCS.
+    pub(crate) tag: MatrixTag,
+    /// Preprocessed tables only: separate Merkle tree over precomputed columns.
+    pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
+    /// Preprocessed tables only: root of `precomputed_tree`.
+    pub(crate) precomputed_root: Option<Commitment>,
+    /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
+    pub(crate) num_precomputed_cols: usize,
+}
+
+#[allow(dead_code)]
+impl<F: IsField> MainCommit<F>
+where
+    FieldElement<F>: AsBytes,
+{
+    fn is_preprocessed(&self) -> bool {
+        self.precomputed_tree.is_some()
+    }
+
+    /// Cheap clone. Only bumps Arc refcounts.
+    fn share(&self) -> Self {
+        Self {
+            mmcs: Arc::clone(&self.mmcs),
+            tag: self.tag,
+            precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
+            precomputed_root: self.precomputed_root,
+            num_precomputed_cols: self.num_precomputed_cols,
+        }
+    }
+}
+
 /// A container for the results of the first round of the STARK Prove protocol.
 pub(crate) struct Round1<Field, FieldExtension>
 where
@@ -201,7 +251,7 @@ where
     FieldElement<FieldExtension>: AsBytes,
 {
     /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
-    /// The `TableCommit::share` calls are cheap — only bump Arc refcounts.
+    /// The `share` calls are cheap — only bump Arc refcounts.
     fn build_round1(
         &self,
         lde: Lde<Field, FieldExtension>,

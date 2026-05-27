@@ -273,6 +273,67 @@ impl VmAirs {
         pairs
     }
 
+    /// Build the parallel `Vec<MatrixTag>` for the main-trace MMCS, in the
+    /// exact same order as [`Self::air_trace_pairs`] and [`Self::air_refs`].
+    /// Prover and verifier MUST call this on identical `VmAirs` configurations.
+    ///
+    /// Currently unused at the call sites; defined here as the foundation
+    /// for the upcoming MMCS Phase C wire-up (see
+    /// `docs/mmcs-streaming-c1-spec.md`).
+    #[allow(dead_code)]
+    pub fn air_tags(&self) -> Vec<crypto::merkle_tree::mmcs::MatrixTag> {
+        use crate::tables::mmcs_tags::{
+            CHIP_BITWISE, CHIP_BRANCH, CHIP_COMMIT, CHIP_CPU, CHIP_DECODE, CHIP_DVRM, CHIP_HALT,
+            CHIP_KECCAK, CHIP_KECCAK_RC, CHIP_KECCAK_RND, CHIP_LOAD, CHIP_LT, CHIP_MEMW,
+            CHIP_MEMW_ALIGNED, CHIP_MEMW_REGISTER, CHIP_MUL, CHIP_PAGE, CHIP_REGISTER, CHIP_SHIFT,
+            chip_tag,
+        };
+        let mut tags = vec![
+            chip_tag(CHIP_BITWISE, 0),
+            chip_tag(CHIP_DECODE, 0),
+            chip_tag(CHIP_HALT, 0),
+            chip_tag(CHIP_COMMIT, 0),
+            chip_tag(CHIP_KECCAK, 0),
+            chip_tag(CHIP_KECCAK_RND, 0),
+            chip_tag(CHIP_KECCAK_RC, 0),
+            chip_tag(CHIP_REGISTER, 0),
+        ];
+        for i in 0..self.cpus.len() {
+            tags.push(chip_tag(CHIP_CPU, i as u32));
+        }
+        for i in 0..self.lts.len() {
+            tags.push(chip_tag(CHIP_LT, i as u32));
+        }
+        for i in 0..self.shifts.len() {
+            tags.push(chip_tag(CHIP_SHIFT, i as u32));
+        }
+        for i in 0..self.memws.len() {
+            tags.push(chip_tag(CHIP_MEMW, i as u32));
+        }
+        for i in 0..self.memw_aligneds.len() {
+            tags.push(chip_tag(CHIP_MEMW_ALIGNED, i as u32));
+        }
+        for i in 0..self.loads.len() {
+            tags.push(chip_tag(CHIP_LOAD, i as u32));
+        }
+        for i in 0..self.muls.len() {
+            tags.push(chip_tag(CHIP_MUL, i as u32));
+        }
+        for i in 0..self.dvrms.len() {
+            tags.push(chip_tag(CHIP_DVRM, i as u32));
+        }
+        for i in 0..self.branches.len() {
+            tags.push(chip_tag(CHIP_BRANCH, i as u32));
+        }
+        for i in 0..self.pages.len() {
+            tags.push(chip_tag(CHIP_PAGE, i as u32));
+        }
+        for i in 0..self.memw_registers.len() {
+            tags.push(chip_tag(CHIP_MEMW_REGISTER, i as u32));
+        }
+        tags
+    }
+
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![

@@ -1,3 +1,4 @@
+use crypto::merkle_tree::mmcs::MmcsOpening;
 use crypto::merkle_tree::proof::Proof;
 use math::field::{
     element::FieldElement,
@@ -15,6 +16,22 @@ pub struct PolynomialOpenings<F: IsField> {
     pub proof_sym: Proof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
+}
+
+/// Per-query main-trace opening backed by the shared MMCS.
+///
+/// The (iota, iota_sym) pair are consecutive global indices in the LDE.
+/// Each carries its own `MmcsOpening` because they live at different
+/// positions in the layer-0 array — there is no shared sibling sub-path
+/// between them at the leaf level (only at higher tree levels, which the
+/// MMCS opening encodes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct MainTraceOpening<F: IsField> {
+    pub evaluations: Vec<FieldElement<F>>,
+    pub evaluations_sym: Vec<FieldElement<F>>,
+    pub mmcs_opening: MmcsOpening<Commitment>,
+    pub mmcs_opening_sym: MmcsOpening<Commitment>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

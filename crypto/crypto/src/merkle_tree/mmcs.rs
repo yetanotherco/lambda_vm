@@ -31,6 +31,7 @@ use super::traits::IsMerkleTreeBackend;
 /// Per-matrix domain separator. Caller-defined; verifier reconstructs
 /// from chip spec.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MatrixTag(pub [u8; 8]);
 
 impl MatrixTag {
@@ -269,6 +270,11 @@ impl<B: IsMerkleTreeBackend> Mmcs<B> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound = "N: serde::Serialize + serde::de::DeserializeOwned")
+)]
 pub struct MmcsOpening<N> {
     /// `(tag, leaf_at_shifted_index)` per matrix, in the builder's sort
     /// order (height desc, tag asc).
