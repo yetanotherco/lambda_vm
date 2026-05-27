@@ -15,17 +15,21 @@
 //! selects sign- vs zero-extension of the inputs; the output `rvd` is always
 //! sign-extended (RV64 `*W` semantics).
 //!
-//! NOTE: this module currently provides the column layout and trace generation.
-//! Bus interactions and constraints are added in a follow-up step; the chip is
-//! not yet registered in `VmAirs`.
+//! NOTE: the chip (columns, trace, constraints, bus interactions) is complete
+//! but not yet registered in `VmAirs` — that happens in the atomic CPU/DECODE
+//! wire-up. Register reads use the cast-to-`DWordWL` encoding (Q9, see
+//! `shrink-cpu-spec-questions.md`).
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{FE, GoldilocksExtension, GoldilocksField, SHIFT_16, packed_decode_shrunk};
+use super::types::{
+    BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, packed_decode_shrunk,
+};
 use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
 
 // =========================================================================
@@ -246,6 +250,332 @@ pub fn generate_cpu32_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+// =========================================================================
+// Bus interactions
+// =========================================================================
+
+/// 2^16, to combine two halves into a word.
+const HALF_SHIFT: i64 = 1 << 16;
+
+/// The 8-element MEMW value/old for a register read: `[lo_word, hi_word, 0×6]`
+/// where `lo_word = lo0 + 2^16·lo1` (Q9: cast `DWordWHH` → `DWordWL`).
+fn register_dword(lo0: usize, lo1: usize, hi: usize) -> Vec<BusValue> {
+    let mut v = vec![
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: lo0,
+            },
+            LinearTerm::Column {
+                coefficient: HALF_SHIFT,
+                column: lo1,
+            },
+        ]),
+        BusValue::Packed {
+            start_column: hi,
+            packing: Packing::Direct,
+        },
+    ];
+    v.extend(std::iter::repeat_n(BusValue::constant(0), 6));
+    v
+}
+
+/// `timestamp + offset` as DWordWL: `[TIMESTAMP_0 + offset, TIMESTAMP_1]`.
+fn timestamp_plus(offset: i64) -> Vec<BusValue> {
+    vec![
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP_0,
+            },
+            LinearTerm::Constant(offset),
+        ]),
+        BusValue::Packed {
+            start_column: cols::TIMESTAMP_1,
+            packing: Packing::Direct,
+        },
+    ]
+}
+
+/// MEMW register **read** (24 elements: `old == value`, `is_register=1`, `write2=1`).
+fn reg_read(
+    rs: usize,
+    lo0: usize,
+    lo1: usize,
+    hi: usize,
+    ts_offset: i64,
+    mult: usize,
+) -> BusInteraction {
+    let mut values = register_dword(lo0, lo1, hi); // old
+    values.push(BusValue::constant(1)); // is_register
+    values.push(BusValue::linear(vec![LinearTerm::Column {
+        coefficient: 2,
+        column: rs,
+    }])); // base_address[0] = 2*rs
+    values.push(BusValue::constant(0)); // base_address[1]
+    values.extend(register_dword(lo0, lo1, hi)); // value
+    values.extend(timestamp_plus(ts_offset));
+    values.push(BusValue::constant(1)); // write2 = 1 (register = 2 words)
+    values.push(BusValue::constant(0)); // write4
+    values.push(BusValue::constant(0)); // write8
+    BusInteraction::sender(BusId::Memw, Multiplicity::Column(mult), values)
+}
+
+/// MEMW register **write** (16 elements: `value = [val_lo, val_hi, 0×6]`, `write2=1`).
+fn reg_write(
+    rd: usize,
+    val_lo: usize,
+    val_hi: usize,
+    ts_offset: i64,
+    mult: usize,
+) -> BusInteraction {
+    let mut values = vec![
+        BusValue::constant(1), // is_register
+        BusValue::linear(vec![LinearTerm::Column {
+            coefficient: 2,
+            column: rd,
+        }]), // base_address[0] = 2*rd
+        BusValue::constant(0), // base_address[1]
+        BusValue::Packed {
+            start_column: val_lo,
+            packing: Packing::Direct,
+        },
+        BusValue::Packed {
+            start_column: val_hi,
+            packing: Packing::Direct,
+        },
+    ];
+    values.extend(std::iter::repeat_n(BusValue::constant(0), 6)); // value[2..8]
+    values.extend(timestamp_plus(ts_offset));
+    values.push(BusValue::constant(1)); // write2 = 1
+    values.push(BusValue::constant(0)); // write4
+    values.push(BusValue::constant(0)); // write8
+    BusInteraction::sender(BusId::Memw, Multiplicity::Column(mult), values)
+}
+
+/// All bus interactions for the CPU32 table.
+pub fn bus_interactions() -> Vec<BusInteraction> {
+    use packed_decode_shrunk as pd;
+    let mut interactions = Vec::new();
+
+    // DECODE[pc, imm, packed_decode] (sender, mult μ); word_instr is constant 1,
+    // and there are no MEMORY/BRANCH/ECALL/mem_flags terms (CPU32 is ALU-only).
+    interactions.push(BusInteraction::sender(
+        BusId::Decode,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1 << pd::READ_REG1,
+                    column: cols::READ_REGISTER1,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::READ_REG2,
+                    column: cols::READ_REGISTER2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::WRITE_REG,
+                    column: cols::WRITE_REGISTER,
+                },
+                LinearTerm::Constant(1 << pd::WORD_INSTR), // word_instr = 1
+                LinearTerm::Column {
+                    coefficient: 1 << pd::ALU,
+                    column: cols::ALU,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::ADD,
+                    column: cols::ADD,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::SUB,
+                    column: cols::SUB,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::RS1,
+                    column: cols::RS1,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::RS2,
+                    column: cols::RS2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::RD,
+                    column: cols::RD,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::INSTRUCTION_LENGTH,
+                    column: cols::INSTRUCTION_LENGTH,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << pd::ALU_FLAGS,
+                    column: cols::ALU_FLAGS,
+                },
+            ]),
+        ],
+    ));
+
+    // Byte range checks: ARE_BYTES[x, 0].
+    for col in [
+        cols::INSTRUCTION_LENGTH,
+        cols::ALU_FLAGS,
+        cols::RS1,
+        cols::RS2,
+        cols::RD,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::AreBytes,
+            Multiplicity::Column(cols::MU),
+            vec![
+                BusValue::Packed {
+                    start_column: col,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
+        ));
+    }
+
+    // IS_HALF for the rv1/rv2 low-word halves and the res halves.
+    for col in [
+        cols::RV1_0,
+        cols::RV1_1,
+        cols::RV2_0,
+        cols::RV2_1,
+        cols::RES_0,
+        cols::RES_1,
+        cols::RES_2,
+        cols::RES_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // Register reads (rv1 @ ts+0, rv2 @ ts+1) and write (rvd @ ts+2).
+    interactions.push(reg_read(
+        cols::RS1,
+        cols::RV1_0,
+        cols::RV1_1,
+        cols::RV1_2,
+        0,
+        cols::READ_REGISTER1,
+    ));
+    interactions.push(reg_read(
+        cols::RS2,
+        cols::RV2_0,
+        cols::RV2_1,
+        cols::RV2_2,
+        1,
+        cols::READ_REGISTER2,
+    ));
+    interactions.push(reg_write(
+        cols::RD,
+        cols::RVD_0,
+        cols::RVD_1,
+        2,
+        cols::WRITE_REGISTER,
+    ));
+
+    // ALU[arg1, arg2, alu_flags] -> res (sender, mult ALU). res is DWordHL cast to DWordWL.
+    interactions.push(BusInteraction::sender(
+        BusId::Alu,
+        Multiplicity::Column(cols::ALU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::ARG1_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::ALU_FLAGS,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES_0,
+                packing: Packing::DWordHL,
+            },
+        ],
+    ));
+
+    // BYTE_ALU[AND, 32, alu_flags] -> 32·signed (extracts the signed bit).
+    interactions.push(BusInteraction::sender(
+        BusId::ByteAlu,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::constant(alu_op::AND as u64),
+            BusValue::constant(1u64 << pd::ALU_FLAGS_SIGNED), // 32
+            BusValue::Packed {
+                start_column: cols::ALU_FLAGS,
+                packing: Packing::Direct,
+            },
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 1 << pd::ALU_FLAGS_SIGNED,
+                column: cols::SIGNED,
+            }]),
+        ],
+    ));
+
+    // MSB16 sign extraction (high half of each low word).
+    for (half_col, sign_col) in [
+        (cols::RV1_1, cols::RV1_SIGN),
+        (cols::RV2_1, cols::RV2_SIGN),
+        (cols::RES_1, cols::RES_SIGN),
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::Msb16,
+            Multiplicity::Column(cols::MU),
+            vec![
+                BusValue::Packed {
+                    start_column: half_col,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: sign_col,
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
+    }
+
+    // CPU32[timestamp, pc, instruction_length] (receiver from the main CPU).
+    interactions.push(BusInteraction::receiver(
+        BusId::Cpu32,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::INSTRUCTION_LENGTH,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    interactions
 }
 
 // =========================================================================

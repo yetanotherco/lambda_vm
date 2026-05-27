@@ -192,7 +192,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // ALU[a, b, opsel(EQ) + 64*invert] -> res  (receiver)
+    // ALU[a, b, opsel(EQ) + 64*invert] -> res  (receiver).
+    // The ALU output is DWordWL (2 elements); for a comparison it is [res, 0]
+    // (the bit in the low word, 0 in the high word).
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
         Multiplicity::Column(cols::MU),
@@ -212,10 +214,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::INVERT,
                 },
             ]),
+            // out = [res, 0] (DWordWL)
             BusValue::Packed {
                 start_column: cols::RES,
                 packing: Packing::Direct,
             },
+            BusValue::constant(0),
         ],
     ));
 

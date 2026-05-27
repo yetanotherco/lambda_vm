@@ -135,6 +135,9 @@ pub enum BusId {
     /// The CPU (sender) dispatches to `LOAD`/`STORE` based on `mem_flags`.
     /// Distinct from the low-level [`Memory`](BusId::Memory) token bus.
     MemoryOp,
+    /// CPU → CPU32 delegation of word (`*W`) instructions:
+    /// `CPU32[timestamp, pc, instruction_length]`.
+    Cpu32,
 }
 
 impl BusId {
@@ -168,6 +171,7 @@ impl BusId {
             BusId::ByteAlu => "ByteAlu",
             BusId::Alu => "Alu",
             BusId::MemoryOp => "MemoryOp",
+            BusId::Cpu32 => "Cpu32",
         }
     }
 }
@@ -204,6 +208,7 @@ impl TryFrom<u64> for BusId {
             24 => Ok(BusId::ByteAlu),
             25 => Ok(BusId::Alu),
             26 => Ok(BusId::MemoryOp),
+            27 => Ok(BusId::Cpu32),
             other => Err(other),
         }
     }

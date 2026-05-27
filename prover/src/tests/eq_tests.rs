@@ -120,5 +120,6 @@ fn test_bus_interactions_shape() {
         .collect();
     assert_eq!(alu.len(), 1);
     assert!(!alu[0].is_sender, "ALU is a receiver for EQ");
-    assert_eq!(alu[0].values.len(), 4);
+    // [a, b, flags, res, 0] — the ALU output is DWordWL ([res, 0]).
+    assert_eq!(alu[0].values.len(), 5);
 }

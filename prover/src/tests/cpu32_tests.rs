@@ -2,9 +2,12 @@
 //! sign-extension / register-zero constraints.
 
 use crate::tables::cpu32::{
-    Cpu32Constraint, Cpu32ConstraintKind, Cpu32Operation, cols, generate_cpu32_trace,
+    Cpu32Constraint, Cpu32ConstraintKind, Cpu32Operation, bus_interactions, cols,
+    generate_cpu32_trace,
 };
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField, alu_op, build_alu_flags};
+use crate::tables::types::{
+    BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, build_alu_flags,
+};
 use stark::constraints::transition::TransitionConstraint;
 use stark::table::TableView;
 
@@ -224,4 +227,34 @@ fn test_constraints_catch_corruption() {
         FE::zero(),
         "RegZero should catch rv2≠0 when unread"
     );
+}
+
+#[test]
+fn test_bus_interactions_shape() {
+    let interactions = bus_interactions();
+    assert_eq!(interactions.len(), 23);
+
+    let count = |bus: BusId, sender: bool| {
+        interactions
+            .iter()
+            .filter(|i| i.bus_id == u64::from(bus) && i.is_sender == sender)
+            .count()
+    };
+
+    assert_eq!(count(BusId::Decode, true), 1);
+    assert_eq!(count(BusId::AreBytes, true), 5);
+    assert_eq!(count(BusId::IsHalfword, true), 8);
+    assert_eq!(count(BusId::Memw, true), 3); // rv1 read, rv2 read, rvd write
+    assert_eq!(count(BusId::Alu, true), 1);
+    assert_eq!(count(BusId::ByteAlu, true), 1);
+    assert_eq!(count(BusId::Msb16, true), 3);
+
+    // CPU32 is a receiver (the main CPU sends the delegation).
+    let cpu32: Vec<_> = interactions
+        .iter()
+        .filter(|i| i.bus_id == u64::from(BusId::Cpu32))
+        .collect();
+    assert_eq!(cpu32.len(), 1);
+    assert!(!cpu32[0].is_sender, "CPU32 receives from the main CPU");
+    assert_eq!(cpu32[0].values.len(), 3); // [timestamp, pc, instruction_length]
 }
