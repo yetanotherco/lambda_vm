@@ -39,10 +39,13 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
+use super::bytewise;
 use super::commit::{self, CommitOperation};
 use super::cpu::{self, CpuOperation};
+use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
+use super::eq;
 use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
@@ -56,6 +59,7 @@ use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
+use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -2050,6 +2054,11 @@ pub struct Traces {
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    // shrink-cpu rework chips (split into chunks of their max_rows)
+    pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub cpu32s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -2362,6 +2371,38 @@ fn build_traces(
         storage_mode,
     )?;
 
+    // shrink-cpu rework chips. Not yet driven by the CPU dispatch (Phase A of the
+    // wire-up), so they are generated empty — one padded (μ=0) chunk each, which
+    // contributes nothing to any bus.
+    let eqs = chunk_and_generate::<eq::EqOperation>(
+        &[],
+        max_rows.eq,
+        eq::generate_eq_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
+        &[],
+        max_rows.bytewise,
+        bytewise::generate_bytewise_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let stores = chunk_and_generate::<store::StoreOperation>(
+        &[],
+        max_rows.store,
+        store::generate_store_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
+        &[],
+        max_rows.cpu32,
+        cpu32::generate_cpu32_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
@@ -2488,6 +2529,10 @@ fn build_traces(
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
         memw_registers,
+        eqs,
+        bytewises,
+        stores,
+        cpu32s,
     })
 }
 
@@ -2728,11 +2773,14 @@ impl Traces {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::bytewise::cols::NUM_COLUMNS as BYTEWISE_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::cpu32::cols::NUM_COLUMNS as CPU32_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -2749,6 +2797,7 @@ impl Traces {
         use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+        use super::store::cols::NUM_COLUMNS as STORE_COLS;
 
         let Traces {
             cpus,
@@ -2770,6 +2819,10 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -2816,6 +2869,18 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
+        for t in eqs {
+            total += (t.num_rows() * EQ_COLS) as u64;
+        }
+        for t in bytewises {
+            total += (t.num_rows() * BYTEWISE_COLS) as u64;
+        }
+        for t in stores {
+            total += (t.num_rows() * STORE_COLS) as u64;
+        }
+        for t in cpu32s {
+            total += (t.num_rows() * CPU32_COLS) as u64;
+        }
         total
     }
 
@@ -2851,6 +2916,10 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
+        let n_eq = aux_cols(super::eq::bus_interactions().len());
+        let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
+        let n_store = aux_cols(super::store::bus_interactions().len());
+        let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -2872,6 +2941,10 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -2918,6 +2991,18 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
+        for t in eqs {
+            total += (t.num_rows() * n_eq) as u64;
+        }
+        for t in bytewises {
+            total += (t.num_rows() * n_bytewise) as u64;
+        }
+        for t in stores {
+            total += (t.num_rows() * n_store) as u64;
+        }
+        for t in cpu32s {
+            total += (t.num_rows() * n_cpu32) as u64;
+        }
         total
     }
 
@@ -2934,6 +3019,10 @@ impl Traces {
             shift: self.shifts.len(),
             branch: self.branches.len(),
             memw_register: self.memw_registers.len(),
+            eq: self.eqs.len(),
+            bytewise: self.bytewises.len(),
+            store: self.stores.len(),
+            cpu32: self.cpu32s.len(),
         }
     }
 

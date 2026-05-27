@@ -37,6 +37,9 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::bytewise::{
+    bus_interactions as bytewise_bus_interactions, cols as bytewise_cols,
+};
 use crate::tables::commit::{
     bus_interactions as commit_bus_interactions, cols as commit_cols,
     create_constraints as commit_constraints,
@@ -44,10 +47,14 @@ use crate::tables::commit::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::cpu32::{
+    bus_interactions as cpu32_bus_interactions, cols as cpu32_cols, cpu32_constraints,
+};
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
+use crate::tables::eq::{bus_interactions as eq_bus_interactions, cols as eq_cols, eq_constraints};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
 use crate::tables::keccak_rc::{
@@ -78,6 +85,9 @@ use crate::tables::register::{
 };
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
+};
+use crate::tables::store::{
+    bus_interactions as store_bus_interactions, cols as store_cols, store_constraints,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -576,6 +586,70 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("SHIFT")
+}
+
+/// Create the EQ AIR (shrink-cpu rework).
+pub fn create_eq_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = eq_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: eq_bus_interactions(),
+    };
+    AirWithBuses::new(
+        eq_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("EQ")
+}
+
+/// Create the BYTEWISE AIR (shrink-cpu rework). No polynomial constraints.
+pub fn create_bytewise_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: bytewise_bus_interactions(),
+    };
+    AirWithBuses::new(
+        bytewise_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("BYTEWISE")
+}
+
+/// Create the STORE AIR (shrink-cpu rework).
+pub fn create_store_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = store_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: store_bus_interactions(),
+    };
+    AirWithBuses::new(
+        store_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("STORE")
+}
+
+/// Create the CPU32 AIR (shrink-cpu rework).
+pub fn create_cpu32_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = cpu32_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: cpu32_bus_interactions(),
+    };
+    AirWithBuses::new(
+        cpu32_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("CPU32")
 }
 
 /// Create MEMW AIR with constraints and bus interactions.

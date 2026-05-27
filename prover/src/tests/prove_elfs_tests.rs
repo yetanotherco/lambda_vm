@@ -1845,6 +1845,10 @@ fn test_verify_rejects_zero_table_counts() {
             shift: 0,
             branch: 0,
             memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
         },
         ..vm_proof
     };
@@ -1913,6 +1917,10 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
         memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 

@@ -16,7 +16,7 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V1";
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V2";
 
 fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
@@ -55,6 +55,10 @@ pub(crate) fn absorb_statement(
         shift,
         branch,
         memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
     } = table_counts;
     for count in [
         cpu,
@@ -67,6 +71,10 @@ pub(crate) fn absorb_statement(
         shift,
         branch,
         memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
     }

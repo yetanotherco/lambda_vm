@@ -19,6 +19,10 @@ fn sample_counts() -> TableCounts {
         shift: 1,
         branch: 2,
         memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
     }
 }
 
