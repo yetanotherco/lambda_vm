@@ -41,7 +41,7 @@ The #cpu32 chip is comprised of #nr_variables variables that are expressed using
 Most constraints correspond to those already present in the CPU, and we present them here first,
 including some updates to the range checking corresponding to the differing types.
 
-#render_constraint_table(chip, config, groups: ("decode", "range", "alu", "mem"))
+#render_constraint_table(chip, config, groups: ("decode", "range", "alu", "mem", "logup"))
 
 Then, we have the constraints corresponding to the sign-extension and definition of `arg1`, `arg2` and `rd`.
 This includes a step where we extract the `signed` bit from the `alu_flags`, as this determines

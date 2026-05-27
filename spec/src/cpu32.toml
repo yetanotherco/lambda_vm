@@ -335,6 +335,15 @@ input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["id
 multiplicity = "write_register"
 
 [[constraint_groups]]
+name = "logup"
+
+[[constraints.logup]]
+kind = "interaction"
+tag = "CPU32"
+input = ["timestamp", "pc", "instruction_length"]
+multiplicity = ["-", "μ"]
+
+[[constraint_groups]]
 name = "ext"
 
 [[constraints.ext]]

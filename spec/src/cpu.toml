@@ -383,7 +383,7 @@ multiplicity = "ALU"
 [[constraints.alu]]
 kind = "interaction"
 tag = "CPU32"
-input = ["timestamp", "pc"]
+input = ["timestamp", "pc", "instruction_length"]
 multiplicity = "word_instr"
 
 
