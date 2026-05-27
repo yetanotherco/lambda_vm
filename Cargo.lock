@@ -570,6 +570,8 @@ dependencies = [
  "env_logger",
  "executor",
  "lambda-vm-prover",
+ "serde",
+ "serde_json",
  "stark",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
