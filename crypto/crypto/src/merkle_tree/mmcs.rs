@@ -23,6 +23,9 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use super::traits::IsMerkleTreeBackend;
 
 /// Per-matrix domain separator. Caller-defined; verifier reconstructs
@@ -119,34 +122,29 @@ impl<B: IsMerkleTreeBackend> MmcsBuilder<B> {
 
         let mut layers: Vec<Vec<B::Node>> = Vec::with_capacity(depth + 1);
 
-        // Layer 0: combine all max-height matrices in tag-asc order.
+        // Layer 0: combine all max-height matrices' leaves at row i in
+        // tag-asc order. Row-parallel: each row independently folds K
+        // matrices (K is small — 1-5 typically), so the per-row sequential
+        // chain is short while rows scale across cores. Mirrors Plonky3's
+        // `first_digest_layer` parallelism, minus the SIMD vertical packing
+        // (lambda-vm uses scalar Keccak).
         let top_group = by_height
             .get(&max_height)
             .expect("max_height bucket exists");
-        let mut layer0: Vec<B::Node> = self.matrices[top_group[0]].leaf_digests.clone();
-        for &mi in &top_group[1..] {
-            for (node, leaf) in layer0.iter_mut().zip(self.matrices[mi].leaf_digests.iter()) {
-                *node = B::hash_new_parent(node, leaf);
-            }
-        }
+        let layer0: Vec<B::Node> = build_combined_layer::<B>(max_height, top_group, &self.matrices);
         layers.push(layer0);
 
-        // Walk upward; at each new layer, compress pairs then inject all
-        // matrices at this layer's length in tag-asc order.
+        // Walk upward: compress pairs (pair-parallel), then inject any
+        // matrices at this layer's length (row-parallel).
         for level in 0..depth {
             let cur = &layers[level];
             let new_len = cur.len() / 2;
-            let mut next: Vec<B::Node> = (0..new_len)
-                .map(|i| B::hash_new_parent(&cur[2 * i], &cur[2 * i + 1]))
-                .collect();
+            let mut next: Vec<B::Node> = compress_pairs::<B>(cur);
             if let Some(group) = by_height.get(&new_len) {
-                for &mi in group {
-                    for (node, leaf) in next.iter_mut().zip(self.matrices[mi].leaf_digests.iter()) {
-                        *node = B::hash_new_parent(node, leaf);
-                    }
-                }
+                inject_matrices::<B>(&mut next, group, &self.matrices);
             }
             layers.push(next);
+            let _ = new_len;
         }
 
         Ok(Mmcs {
@@ -154,6 +152,71 @@ impl<B: IsMerkleTreeBackend> MmcsBuilder<B> {
             matrices: self.matrices,
         })
     }
+}
+
+/// Build layer 0 by folding all matrices at `max_height` at row `i`, in
+/// tag-asc order (`group` already preserves this). Row-parallel.
+fn build_combined_layer<B: IsMerkleTreeBackend>(
+    max_height: usize,
+    group: &[usize],
+    matrices: &[MmcsMatrix<B::Node>],
+) -> Vec<B::Node> {
+    let inner = |i: usize| -> B::Node {
+        let mut acc = matrices[group[0]].leaf_digests[i].clone();
+        for &mi in &group[1..] {
+            acc = B::hash_new_parent(&acc, &matrices[mi].leaf_digests[i]);
+        }
+        acc
+    };
+    #[cfg(feature = "parallel")]
+    {
+        (0..max_height).into_par_iter().map(inner).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (0..max_height).map(inner).collect()
+    }
+}
+
+/// Compress pairs of children into the next layer up. Pair-parallel.
+fn compress_pairs<B: IsMerkleTreeBackend>(prev: &[B::Node]) -> Vec<B::Node> {
+    let new_len = prev.len() / 2;
+    let inner = |i: usize| -> B::Node { B::hash_new_parent(&prev[2 * i], &prev[2 * i + 1]) };
+    #[cfg(feature = "parallel")]
+    {
+        (0..new_len).into_par_iter().map(inner).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (0..new_len).map(inner).collect()
+    }
+}
+
+/// Inject all matrices in `group` into `layer` (row-parallel).
+fn inject_matrices<B: IsMerkleTreeBackend>(
+    layer: &mut [B::Node],
+    group: &[usize],
+    matrices: &[MmcsMatrix<B::Node>],
+) {
+    let n = layer.len();
+    let updated: Vec<B::Node> = {
+        let inner = |i: usize| -> B::Node {
+            let mut acc = layer[i].clone();
+            for &mi in group {
+                acc = B::hash_new_parent(&acc, &matrices[mi].leaf_digests[i]);
+            }
+            acc
+        };
+        #[cfg(feature = "parallel")]
+        {
+            (0..n).into_par_iter().map(inner).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..n).map(inner).collect()
+        }
+    };
+    layer.clone_from_slice(&updated);
 }
 
 pub struct Mmcs<B: IsMerkleTreeBackend> {
