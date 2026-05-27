@@ -40,7 +40,7 @@ use stark::trace::{TraceTable, columns2rows};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 
 // =========================================================================
 // Column indices for BITWISE table
@@ -94,8 +94,14 @@ pub mod cols {
     pub const MU_IS_B20: usize = 19;
     /// Multiplicity for HWSL lookups
     pub const MU_HWSL: usize = 20;
+    /// Multiplicity for `BYTE_ALU[opsel=AND]` lookups (shrink-cpu rework)
+    pub const MU_BYTE_ALU_AND: usize = 21;
+    /// Multiplicity for `BYTE_ALU[opsel=OR]` lookups (shrink-cpu rework)
+    pub const MU_BYTE_ALU_OR: usize = 22;
+    /// Multiplicity for `BYTE_ALU[opsel=XOR]` lookups (shrink-cpu rework)
+    pub const MU_BYTE_ALU_XOR: usize = 23;
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 21;
+    pub const NUM_COLUMNS: usize = 24;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
@@ -744,6 +750,68 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::SLLC,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // BYTE_ALU[opsel, X, Y] -> out (shrink-cpu rework).
+        // Unifies AND/OR/XOR into one bus keyed by the `alu_op` descriptor.
+        // Implemented as one receiver per opsel, reusing the precomputed
+        // AND/OR/XOR result columns (the "single 2^20 column" in bitwise.typ is
+        // an optimization note, not a requirement).
+        BusInteraction::receiver(
+            BusId::ByteAlu,
+            Multiplicity::Column(cols::MU_BYTE_ALU_AND),
+            vec![
+                BusValue::constant(alu_op::AND as u64),
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::AND,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        BusInteraction::receiver(
+            BusId::ByteAlu,
+            Multiplicity::Column(cols::MU_BYTE_ALU_OR),
+            vec![
+                BusValue::constant(alu_op::OR as u64),
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OR,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        BusInteraction::receiver(
+            BusId::ByteAlu,
+            Multiplicity::Column(cols::MU_BYTE_ALU_XOR),
+            vec![
+                BusValue::constant(alu_op::XOR as u64),
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::XOR,
                     packing: Packing::Direct,
                 },
             ],
