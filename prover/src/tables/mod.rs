@@ -36,6 +36,7 @@ pub mod lt;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;
+pub mod mmcs_tags;
 pub mod mul;
 pub mod page;
 pub mod register;
