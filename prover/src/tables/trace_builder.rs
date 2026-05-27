@@ -1043,7 +1043,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 ///
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
-fn is_register_op(op: &MemwOperation) -> bool {
+pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
     if !op.is_register || op.width != 2 {
         return false;
     }
@@ -1367,7 +1367,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
+/// - ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
 /// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
@@ -1387,9 +1387,9 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
 
-        // IS_BYTE[next_pc_low[1], 0] - range check for byte value
+        // ARE_BYTES[next_pc_low[1], 0] - range check for byte value
         bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::IsByte,
+            BitwiseOperationType::AreBytes,
             next_pc_low_1,
         ));
 
@@ -1426,14 +1426,14 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
-/// Generates IS_BYTE ops for CPU padding rows.
+/// Generates ARE_BYTES ops for CPU padding rows.
 ///
 /// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
-/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// Per padding row: 1 AreBytes(0,0) for RS1+RS2, 1 AreBytes(0) for RD, and
+/// 12 AreBytes(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -1441,21 +1441,21 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
     let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        // IS_BYTE[RS1, RS2] pair (both zero in padding)
+        // ARE_BYTES[RS1, RS2] pair (both zero in padding)
         ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::IsByte,
+            BitwiseOperationType::AreBytes,
             0,
             0,
         ));
-        // IS_BYTE[RD, 0] single (zero in padding)
+        // ARE_BYTES[RD, 0] single (zero in padding)
         ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::IsByte,
+            BitwiseOperationType::AreBytes,
             0,
         ));
-        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
+        // 12 ARE_BYTES lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
         for _ in 0..12 {
             ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsByte,
+                BitwiseOperationType::AreBytes,
                 0,
                 0,
             ));
@@ -1464,10 +1464,10 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
     ops
 }
 
-/// Collects IS_BYTE lookups from PAGE data (init and fini values).
+/// Collects ARE_BYTES lookups from PAGE data (init and fini values).
 ///
-/// Each PAGE row generates 1 batched IS_BYTE lookup:
-/// - C1+C2: IS_BYTE[init, fini] — range-checks both bytes in one interaction
+/// Each PAGE row generates 1 batched ARE_BYTES lookup:
+/// - C1+C2: ARE_BYTES[init, fini] — range-checks both bytes in one interaction
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
 ///
@@ -1540,7 +1540,7 @@ fn collect_bitwise_from_page(
         .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
-    // For each page and each byte, add IS_BYTE lookups for init and fini
+    // For each page and each byte, add ARE_BYTES lookups for init and fini
     for &page_base in &page_bases {
         let init_data = elf_page_data.get(&page_base);
 
@@ -1553,9 +1553,9 @@ fn collect_bitwise_from_page(
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1+C2: IS_BYTE[init, fini] — batched range check for both bytes
+            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsByte,
+                BitwiseOperationType::AreBytes,
                 init,
                 fini,
             ));
@@ -1612,7 +1612,7 @@ fn expand_commit_operations_for_ecall(
 /// - IsHalfword for address_incr halfwords (4 per real row, mult = mu)
 /// - Zero for end detection (1 per real row, mult = mu)
 ///
-/// Note: IsByte for value is intentionally omitted per spec.
+/// Note: AreBytes for value is intentionally omitted per spec.
 fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
@@ -1667,11 +1667,11 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 /// Derives all page bases from `memory_state.cells.keys()` — this includes
 /// Collect BITWISE lookups generated by the keccak chips.
 ///
-/// The keccak round chip sends XOR_BYTE, AND_BYTE, HWSL, and IS_BYTE
+/// The keccak round chip sends XOR_BYTE, AND_BYTE, HWSL, and ARE_BYTES
 /// interactions; the keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
-fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
     let mut ops = Vec::new();
@@ -1685,14 +1685,17 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
             7,
         ));
 
-        // Range-check addr bytes (paired with the IS_BYTE sends in
+        // Range-check addr bytes (paired with the ARE_BYTES sends in
         // keccak::bus_interactions): without this the field-element value of
         // the addr_lo / addr_hi linear combinations is unconstrained per byte.
-        for b in 0..8 {
-            let byte = ((state_addr >> (b * 8)) & 0xFF) as u8;
-            ops.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
-                byte,
+        // 4 paired ops matching the (addr[2i], addr[2i+1]) sender pairing.
+        for i in 0..4 {
+            let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
+            let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                lo,
+                hi,
             ));
         }
 
@@ -1742,7 +1745,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // theta: HWSL for rotated C (20) + IS_BYTE on Cxz_left (40).
+            // theta: HWSL for rotated C (20) + ARE_BYTES on Cxz_left (20 pairs).
             // Cxz_right is range-checked via IS_BIT polynomial constraints
             // on the keccak_rnd chip, not via lookups (spec d75944ee).
             let mut rotated_c = [[0u8; 8]; 5];
@@ -1757,13 +1760,11 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                         ((halfword >> 8) & 0xFF) as u8,
                         1,
                     ));
-                    // IS_BYTE for cxz_left bytes
-                    ops.push(BitwiseOperation::single_byte(
-                        BitwiseOperationType::IsByte,
+                    // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
+                    // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
+                    ops.push(BitwiseOperation::byte_op(
+                        BitwiseOperationType::AreBytes,
                         (shifted & 0xFF) as u8,
-                    ));
-                    ops.push(BitwiseOperation::single_byte(
-                        BitwiseOperationType::IsByte,
                         ((shifted >> 8) & 0xFF) as u8,
                     ));
                 }
@@ -1823,7 +1824,7 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                 }
             }
 
-            // rho: HWSL (100) + IS_BYTE (400)
+            // rho: HWSL (100) + ARE_BYTES (200 pairs)
             for x in 0..5 {
                 for y in 0..5 {
                     let rho_offset = KECCAK_RHO[x][y] as usize;
@@ -1842,22 +1843,17 @@ fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOpe
                             ((halfword >> 8) & 0xFF) as u8,
                             rnc_val,
                         ));
-                        // IS_BYTE for rot_left
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
+                        // ARE_BYTES paired as (rot_left[b], rot_right[b]) for
+                        // each byte of the halfword, matching the sender pairing
+                        // in keccak_rnd::bus_interactions.
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
                             (shifted & 0xFF) as u8,
-                        ));
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
-                            ((shifted >> 8) & 0xFF) as u8,
-                        ));
-                        // IS_BYTE for rot_right
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
                             (carry & 0xFF) as u8,
                         ));
-                        ops.push(BitwiseOperation::single_byte(
-                            BitwiseOperationType::IsByte,
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            ((shifted >> 8) & 0xFF) as u8,
                             ((carry >> 8) & 0xFF) as u8,
                         ));
                     }
@@ -2260,7 +2256,7 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
+    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
     if let Some(elf) = elf {
         bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
     }
@@ -2270,12 +2266,12 @@ fn build_traces(
         .filter(|op| !op.end)
         .map(|op| op.value)
         .collect();
-    // COMMIT table sends IsByte and IsHalfword lookups
+    // COMMIT table sends AreBytes and IsHalfword lookups
     bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-    // KECCAK_RND sends XOR/AND/IS_BYTE/HWSL; KECCAK core sends IS_HALF
+    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
     bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
 
-    // CPU padding rows send IS_BYTE with all-zero values.
+    // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
     let num_padding_rows: usize = cpu_ops
         .chunks(max_rows.cpu)
@@ -3233,260 +3229,5 @@ impl Traces {
         )?;
         traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
         Ok(traces)
-    }
-}
-
-#[cfg(test)]
-mod keccak_tests {
-    use super::*;
-    use crate::tables::keccak::cols as core_cols;
-    use crate::tables::keccak_rnd::cols as rnd_cols;
-    use crate::tables::types::FE;
-    use executor::vm::instruction::execution::keccak_f1600;
-
-    fn make_keccak_ops() -> (KeccakOperation, KeccakRoundOperation) {
-        let input = [0u64; 25];
-        let mut output = input;
-        keccak_f1600(&mut output);
-        let kop = KeccakOperation {
-            timestamp: 42,
-            state_addr: 0x1000,
-            input,
-            output,
-        };
-        let rop = KeccakRoundOperation {
-            timestamp: 42,
-            input,
-            output,
-        };
-        (kop, rop)
-    }
-
-    #[test]
-    fn test_keccak_bitwise_ops_count() {
-        let (kop, _) = make_keccak_ops();
-        let ops = collect_bitwise_from_keccak(&[kop]);
-
-        let xor = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::XorByte)
-            .count();
-        let and = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::AndByte)
-            .count();
-        let is_byte = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::IsByte)
-            .count();
-        let hwsl = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::Hwsl)
-            .count();
-        let is_half = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
-            .count();
-
-        assert_eq!(xor, 24 * 608, "XorByte count");
-        assert_eq!(and, 24 * 200 + 1, "AndByte count");
-        // Cxz_right Byte→Bit (spec d75944ee): drops 40 IS_BYTE per round.
-        // +8 per call to range-check the addr bytes used in alignment / no-overflow.
-        assert_eq!(is_byte, 24 * 440 + 8, "IsByte count");
-        assert_eq!(hwsl, 24 * 120, "Hwsl count");
-        assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 109 + 24 * 1368, "Total bitwise ops");
-    }
-
-    #[test]
-    fn test_keccak_round_trace_matches_f1600() {
-        let (_, rop) = make_keccak_ops();
-        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
-
-        let mut ref_state = [0u64; 25];
-        for round in 0..24 {
-            let rc = executor::vm::instruction::execution::KECCAK_RC[round];
-            let mut c = [0u64; 5];
-            for x in 0..5 {
-                c[x] = ref_state[x]
-                    ^ ref_state[x + 5]
-                    ^ ref_state[x + 10]
-                    ^ ref_state[x + 15]
-                    ^ ref_state[x + 20];
-            }
-            let mut d = [0u64; 5];
-            for x in 0..5 {
-                d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-            }
-            for i in 0..25 {
-                ref_state[i] ^= d[i % 5];
-            }
-            let mut b = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    b[y + 5 * ((2 * x + 3 * y) % 5)] = ref_state[x + 5 * y]
-                        .rotate_left(executor::vm::instruction::execution::KECCAK_RHO[x][y]);
-                }
-            }
-            for x in 0..5 {
-                for y in 0..5 {
-                    ref_state[x + 5 * y] =
-                        b[x + 5 * y] ^ (!b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
-                }
-            }
-            ref_state[0] ^= rc;
-
-            let base = round * rnd_cols::NUM_COLUMNS;
-            for (lane, &lane_val) in ref_state.iter().enumerate() {
-                let x = lane % 5;
-                let y = lane / 5;
-                for byte_idx in 0..8 {
-                    let expected = FE::from((lane_val >> (byte_idx * 8)) & 0xFF);
-                    let col = if x == 0 && y == 0 {
-                        rnd_cols::iota(byte_idx)
-                    } else {
-                        rnd_cols::chi(x, y, byte_idx)
-                    };
-                    let trace_val = &rnd_trace.main_table.data[base + col];
-                    assert_eq!(
-                        &expected, trace_val,
-                        "Round {round} lane ({x},{y}) byte {byte_idx}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_keccak_core_round_state_consistency() {
-        let (kop, rop) = make_keccak_ops();
-        let core_trace = keccak::generate_keccak_trace(&[kop]);
-        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
-
-        // Round 0 start == core input_state
-        for x in 0..5 {
-            for y in 0..5 {
-                for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
-                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
-                    assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
-                }
-            }
-        }
-
-        // Round 23 out == core output_state
-        let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
-        for x in 0..5 {
-            for y in 0..5 {
-                for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
-                    let rnd_val = if x == 0 && y == 0 {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
-                    } else {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
-                    };
-                    assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_keccak_bus_interaction_counts() {
-        assert_eq!(
-            keccak::bus_interactions().len(),
-            138,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 8 IS_BYTE addr + 1 Keccak send + 1 Keccak recv"
-        );
-        assert_eq!(
-            keccak_rnd::bus_interactions().len(),
-            1371,
-            "KECCAK_RND: 3 IO + 460 theta + 500 rho + 400 chi + 8 iota \
-             (Cxz_right Byte→Bit drops 40 IS_BYTE per spec d75944ee)"
-        );
-        assert_eq!(
-            keccak_rc::bus_interactions().len(),
-            1,
-            "KECCAK_RC: 1 receiver"
-        );
-    }
-
-    #[test]
-    fn test_keccak_column_counts() {
-        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
-        assert_eq!(
-            rnd_cols::NUM_COLUMNS,
-            1480,
-            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
-        );
-        assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
-    }
-
-    #[test]
-    fn test_keccak_constraint_counts() {
-        let (core_constraints, _) = keccak::create_constraints(0);
-        assert_eq!(
-            core_constraints.len(),
-            51,
-            "KECCAK core: 25 ADD pairs + no-overflow"
-        );
-
-        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
-        assert_eq!(
-            rnd_constraints.len(),
-            20,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
-        );
-    }
-}
-
-#[cfg(test)]
-mod routing_tests {
-    use super::*;
-
-    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
-        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
-            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
-    }
-
-    #[test]
-    fn test_is_register_op_delta_at_boundary_routes_in() {
-        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
-        let op = make_register_op(0x10000, 0);
-        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_delta_above_boundary_falls_back() {
-        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
-        let op = make_register_op(0x10001, 0);
-        assert!(
-            !is_register_op(&op),
-            "delta = 2^16 + 1 should fall back to MEMW_A"
-        );
-    }
-
-    #[test]
-    fn test_is_register_op_delta_one_routes_in() {
-        // delta = 1: minimum allowed value
-        let op = make_register_op(1, 0);
-        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_delta_zero_falls_back() {
-        // delta = 0: ts[0] not strictly greater than old_ts[0]
-        let op = make_register_op(5, 5);
-        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
-    }
-
-    #[test]
-    fn test_is_register_op_upper_limb_mismatch_falls_back() {
-        // ts_hi != old_ts_hi: shared upper limb assumption violated
-        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
-        assert!(
-            !is_register_op(&op),
-            "different upper limbs should fall back to MEMW_A"
-        );
     }
 }

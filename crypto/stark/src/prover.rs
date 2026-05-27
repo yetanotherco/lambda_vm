@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
@@ -25,7 +25,6 @@ use rayon::prelude::{
 
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
-use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
@@ -50,34 +49,6 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
     &'a PI,
 );
-
-#[cfg(test)]
-pub(crate) mod domain_cache_stats {
-    use std::cell::Cell;
-
-    thread_local! {
-        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    }
-
-    pub(crate) fn reset() {
-        COUNTS.with(|c| c.set((0, 0)));
-    }
-
-    pub(crate) fn get() -> (usize, usize) {
-        COUNTS.with(Cell::get)
-    }
-
-    pub(crate) fn record(was_hit: bool) {
-        COUNTS.with(|c| {
-            let (hits, misses) = c.get();
-            c.set(if was_hit {
-                (hits + 1, misses)
-            } else {
-                (hits, misses + 1)
-            });
-        });
-    }
-}
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -109,29 +80,77 @@ pub enum ProvingError {
     DiskSpill(String),
 }
 
-/// A container for the intermediate results of the commitments to a trace table, main or auxiliary in case of RAP,
-/// in the first round of the STARK Prove protocol.
-pub struct Round1CommitmentData<F>
+/// Commitment artifacts for one trace table (main or auxiliary). Used for both
+/// plain and preprocessed tables. Preprocessed tables additionally carry a
+/// separate Merkle tree over their precomputed columns, hence the optional
+/// `precomputed_tree`/`precomputed_root` pair and the `num_precomputed_cols`
+/// index used when opening positions.
+pub(crate) struct TableCommit<F: IsField>
 where
-    F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// The Merkle trees constructed to obtain the commitment of the entire trace table.
-    /// For preprocessed tables, this contains only the multiplicity columns.
-    /// Wrapped in Arc to share with Round1Commitments without deep-cloning (~64MB per table).
-    pub(crate) lde_trace_merkle_tree: Arc<BatchedMerkleTree<F>>,
-    /// The root of the Merkle tree in `lde_trace_merkle_tree`.
-    pub(crate) lde_trace_merkle_root: Commitment,
-    /// For preprocessed tables: Merkle tree over precomputed columns only.
-    pub(crate) precomputed_merkle_tree: Option<Arc<BatchedMerkleTree<F>>>,
-    /// For preprocessed tables: root of the precomputed Merkle tree.
-    pub(crate) precomputed_merkle_root: Option<Commitment>,
-    /// For preprocessed tables: number of precomputed columns (for splitting during opening).
+    /// Merkle tree over the trace columns (multiplicities only for preprocessed tables).
+    pub(crate) tree: Arc<BatchedMerkleTree<F>>,
+    /// Root of `tree`.
+    pub(crate) root: Commitment,
+    /// Preprocessed tables only: Merkle tree over precomputed columns.
+    pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
+    /// Preprocessed tables only: root of `precomputed_tree`.
+    pub(crate) precomputed_root: Option<Commitment>,
+    /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
     pub(crate) num_precomputed_cols: usize,
 }
 
+impl<F: IsField> TableCommit<F>
+where
+    FieldElement<F>: AsBytes,
+{
+    /// Build a `TableCommit` for a plain (non-preprocessed) table.
+    fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
+        Self {
+            tree: Arc::new(tree),
+            root,
+            precomputed_tree: None,
+            precomputed_root: None,
+            num_precomputed_cols: 0,
+        }
+    }
+
+    /// Build a `TableCommit` for a preprocessed table.
+    fn preprocessed(
+        tree: BatchedMerkleTree<F>,
+        root: Commitment,
+        precomputed_tree: BatchedMerkleTree<F>,
+        precomputed_root: Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        Self {
+            tree: Arc::new(tree),
+            root,
+            precomputed_tree: Some(Arc::new(precomputed_tree)),
+            precomputed_root: Some(precomputed_root),
+            num_precomputed_cols,
+        }
+    }
+
+    /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
+    fn share(&self) -> Self {
+        Self {
+            tree: Arc::clone(&self.tree),
+            root: self.root,
+            precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
+            precomputed_root: self.precomputed_root,
+            num_precomputed_cols: self.num_precomputed_cols,
+        }
+    }
+
+    fn is_preprocessed(&self) -> bool {
+        self.precomputed_tree.is_some()
+    }
+}
+
 /// A container for the results of the first round of the STARK Prove protocol.
-pub struct Round1<Field, FieldExtension>
+pub(crate) struct Round1<Field, FieldExtension>
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
@@ -140,56 +159,28 @@ where
 {
     /// The table of evaluations over the LDE of the main and auxiliary trace tables.
     pub(crate) lde_trace: LDETraceTable<Field, FieldExtension>,
-    /// The intermediate results of the commitment to the main trace table.
-    pub(crate) main: Round1CommitmentData<Field>,
-    /// The intermediate results of the commitment to the auxiliary trace table in case of RAP.
-    pub(crate) aux: Option<Round1CommitmentData<FieldExtension>>,
+    /// Commitment to the main trace.
+    pub(crate) main: TableCommit<Field>,
+    /// Commitment to the auxiliary (RAP) trace, if any.
+    pub(crate) aux: Option<TableCommit<FieldExtension>>,
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
     pub(crate) bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
-/// Intermediate results from committing a main trace in Phase A of sequential proving.
-/// Holds the Merkle tree/root for the main trace and optionally for precomputed columns.
-struct MainCommitData<Field: IsFFTField>
-where
-    FieldElement<Field>: AsBytes,
-{
-    main_tree: Arc<BatchedMerkleTree<Field>>,
-    main_root: Commitment,
-    precomputed_tree: Option<Arc<BatchedMerkleTree<Field>>>,
-    precomputed_root: Option<Commitment>,
-    num_precomputed_cols: usize,
-}
-
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
 /// Borrowed (not consumed) when building `Round1` in Phase D.
-pub struct Round1Commitments<Field, FieldExtension>
+pub(crate) struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
-    /// Merkle tree of the main trace (multiplicities for preprocessed tables).
-    /// Wrapped in Arc to share with Round1CommitmentData without deep-cloning.
-    main_merkle_tree: Arc<BatchedMerkleTree<Field>>,
-    /// Root of the main trace Merkle tree.
-    main_merkle_root: Commitment,
-    /// For preprocessed tables: Merkle tree over precomputed columns.
-    precomputed_merkle_tree: Option<Arc<BatchedMerkleTree<Field>>>,
-    /// For preprocessed tables: root of the precomputed Merkle tree.
-    precomputed_merkle_root: Option<Commitment>,
-    /// For preprocessed tables: number of precomputed columns.
-    num_precomputed_cols: usize,
-    /// Merkle tree of the auxiliary trace (None if no aux trace).
-    aux_merkle_tree: Option<Arc<BatchedMerkleTree<FieldExtension>>>,
-    /// Root of the auxiliary trace Merkle tree (None if no aux trace).
-    aux_merkle_root: Option<Commitment>,
-    /// The RAP challenges used for auxiliary trace construction.
+    main: TableCommit<Field>,
+    aux: Option<TableCommit<FieldExtension>>,
     rap_challenges: Vec<FieldElement<FieldExtension>>,
-    /// Bus interaction public inputs (initial and final aux column values).
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
@@ -210,45 +201,17 @@ where
     FieldElement<FieldExtension>: AsBytes,
 {
     /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
+    /// The `TableCommit::share` calls are cheap — only bump Arc refcounts.
     fn build_round1(
         &self,
         lde: Lde<Field, FieldExtension>,
         step_size: usize,
         blowup_factor: usize,
-        has_aux_trace: bool,
     ) -> Round1<Field, FieldExtension> {
-        let lde_trace = LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
-
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Arc::clone(&self.main_merkle_tree),
-            lde_trace_merkle_root: self.main_merkle_root,
-            precomputed_merkle_tree: self.precomputed_merkle_tree.as_ref().map(Arc::clone),
-            precomputed_merkle_root: self.precomputed_merkle_root,
-            num_precomputed_cols: self.num_precomputed_cols,
-        };
-
-        let aux = if has_aux_trace {
-            Some(Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Arc::clone(
-                    self.aux_merkle_tree
-                        .as_ref()
-                        .expect("aux tree must exist when has_aux_trace"),
-                ),
-                lde_trace_merkle_root: self
-                    .aux_merkle_root
-                    .expect("aux root must exist when has_aux_trace"),
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            })
-        } else {
-            None
-        };
-
         Round1 {
-            lde_trace,
-            main,
-            aux,
+            lde_trace: LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor),
+            main: self.main.share(),
+            aux: self.aux.as_ref().map(TableCommit::share),
             rap_challenges: self.rap_challenges.clone(),
             bus_public_inputs: self.bus_public_inputs.clone(),
         }
@@ -264,7 +227,7 @@ where
 /// The `coset_weights` vector stores `[n_inv, n_inv*g, n_inv*g², ..., n_inv*g^{n-1}]`
 /// where `g` is the coset offset and `n_inv = 1/n`. These are used in the iFFT+coset-shift
 /// step of `expand_columns_to_lde`.
-pub struct LdeTwiddles<F: IsFFTField> {
+pub(crate) struct LdeTwiddles<F: IsFFTField> {
     inv: LayerTwiddles<F>,
     fwd: LayerTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
@@ -323,7 +286,7 @@ pub fn table_parallelism() -> usize {
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
-pub struct Round2<F>
+pub(crate) struct Round2<F>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -337,7 +300,7 @@ where
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
-pub struct Round3<F: IsField> {
+pub(crate) struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main ans auxiliary, at the out-of-domain challenge.
     trace_ood_evaluations: Table<F>,
     /// Evaluations of the composition polynomial parts at the out-of-domain challenge.
@@ -345,7 +308,7 @@ pub struct Round3<F: IsField> {
 }
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
-pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
+pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
     fri_last_value: FieldElement<E>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
@@ -407,22 +370,36 @@ where
         "num_rows must be a power of two for reverse_index"
     );
 
+    let total_bytes = num_cols * byte_len;
+
+    let hash_leaf = |buf: &mut [u8], row_idx: usize| -> Commitment {
+        let br_idx = reverse_index(row_idx, num_rows as u64);
+        for col_idx in 0..num_cols {
+            columns[col_idx][br_idx]
+                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+        }
+        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+    };
+
     #[cfg(feature = "parallel")]
     let iter = (0..num_rows).into_par_iter();
     #[cfg(not(feature = "parallel"))]
     let iter = 0..num_rows;
 
-    iter.map(|row_idx| {
-        let br_idx = reverse_index(row_idx, num_rows as u64);
-        let total_bytes = num_cols * byte_len;
+    // Per-thread buffer reuse: map_init allocates one buffer per Rayon thread,
+    // eliminating millions of small heap allocations under parallel contention.
+    #[cfg(feature = "parallel")]
+    let result: Vec<Commitment> = iter
+        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf(buf, i))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let result: Vec<Commitment> = {
         let mut buf = vec![0u8; total_bytes];
-        for col_idx in 0..num_cols {
-            columns[col_idx][br_idx]
-                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-        }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-    })
-    .collect()
+        iter.map(|i| hash_leaf(&mut buf, i)).collect()
+    };
+
+    result
 }
 
 /// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
@@ -453,16 +430,11 @@ where
 
     let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
 
-    #[cfg(feature = "parallel")]
-    let iter = (0..num_leaves).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let iter = 0..num_leaves;
+    let total_bytes = 2 * num_parts * byte_len;
 
-    iter.map(|leaf_idx| {
+    let hash_leaf_pair = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
         let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
         let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-        let total_bytes = 2 * num_parts * byte_len;
-        let mut buf = vec![0u8; total_bytes];
         let mut offset = 0;
         for part in parts.iter() {
             part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
@@ -472,15 +444,38 @@ where
             part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
             offset += byte_len;
         }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-    })
-    .collect()
+        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+    };
+
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_leaves).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_leaves;
+
+    #[cfg(feature = "parallel")]
+    let result: Vec<Commitment> = iter
+        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf_pair(buf, i))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let result: Vec<Commitment> = {
+        let mut buf = vec![0u8; total_bytes];
+        iter.map(|i| hash_leaf_pair(&mut buf, i)).collect()
+    };
+
+    result
 }
 
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
+///
+/// Note: many default-method signatures expose `pub(crate)` round-state types
+/// (`Round1`, `Round2`, `Round3`, `Round4`, `LdeTwiddles`). These are internal
+/// helpers — only `prove`, `multi_prove` are meant for callers. The
+/// `private_interfaces` allow is removed once these helpers move off the trait.
+#[allow(private_interfaces)]
 pub trait IsStarkProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
@@ -515,7 +510,10 @@ pub trait IsStarkProver<
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
-    /// useful for setting up soundness test scenarios.
+    /// useful for setting up soundness test scenarios. Only available under
+    /// `cfg(test)` (in-crate) or with the `test-utils` Cargo feature
+    /// (cross-crate tests).
+    #[cfg(any(test, feature = "test-utils"))]
     fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -605,25 +603,20 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Compute main LDE, commit, and return the Merkle tree/root along with the
-    /// owned LDE columns (consumed later in Phase D).
+    /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
+    /// with the owned LDE columns (consumed later in Phase D).
+    ///
+    /// `precomputed`: if present, the leading `num_cols` columns are committed
+    /// as a separate Merkle tree (the precomputed split for preprocessed
+    /// tables) and the root is checked against the AIR-hardcoded commitment.
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        precomputed: Option<(Commitment, usize)>,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<
-        (
-            BatchedMerkleTree<Field>,
-            Commitment,
-            Option<BatchedMerkleTree<Field>>,
-            Option<Commitment>,
-            usize,
-            Vec<Vec<FieldElement<Field>>>,
-        ),
-        ProvingError,
-    >
+    ) -> Result<(TableCommit<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -642,94 +635,55 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        #[allow(unused_mut)]
-        let (mut tree, root) =
-            Self::commit_columns_bit_reversed(&columns).ok_or(ProvingError::EmptyCommitment)?;
+
+        let commit = match precomputed {
+            None => {
+                #[allow(unused_mut)]
+                let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                #[cfg(feature = "disk-spill")]
+                if storage_mode == StorageMode::Disk {
+                    tree.spill_nodes_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
+                }
+                TableCommit::plain(tree, root)
+            }
+            Some((expected_precomputed_root, num_cols)) => {
+                #[allow(unused_mut)]
+                let (mut precomputed_tree, precomputed_root) =
+                    Self::commit_columns_bit_reversed(&columns[..num_cols])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                #[allow(unused_mut)]
+                let (mut mult_tree, mult_root) =
+                    Self::commit_columns_bit_reversed(&columns[num_cols..])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                debug_assert_eq!(
+                    precomputed_root, expected_precomputed_root,
+                    "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+                );
+                #[cfg(feature = "disk-spill")]
+                if storage_mode == StorageMode::Disk {
+                    precomputed_tree.spill_nodes_to_disk().map_err(|e| {
+                        ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}"))
+                    })?;
+                    mult_tree
+                        .spill_nodes_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
+                }
+                TableCommit::preprocessed(
+                    mult_tree,
+                    mult_root,
+                    precomputed_tree,
+                    precomputed_root,
+                    num_cols,
+                )
+            }
+        };
+
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            tree.spill_nodes_to_disk()
-                .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
-        }
-
-        Ok((tree, root, None, None, 0, columns))
-    }
-
-    /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
-    #[allow(clippy::type_complexity)]
-    fn commit_preprocessed_trace(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        precomputed_commitment: Commitment,
-        num_precomputed_cols: usize,
-        twiddles: &LdeTwiddles<Field>,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<
-        (
-            BatchedMerkleTree<Field>,
-            Commitment,
-            Option<BatchedMerkleTree<Field>>,
-            Option<Commitment>,
-            usize,
-            Vec<Vec<FieldElement<Field>>>,
-        ),
-        ProvingError,
-    >
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let mut columns = trace.extract_columns_main(lde_size);
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            trace.main_table.advise_drop_cache();
-        }
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
-        #[cfg(feature = "instruments")]
-        let main_lde_dur = t_sub.elapsed();
-
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        #[allow(unused_mut)]
-        let (mut precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&columns[..num_precomputed_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
-
-        #[allow(unused_mut)]
-        let (mut mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&columns[num_precomputed_cols..])
-                .ok_or(ProvingError::EmptyCommitment)?;
-        #[cfg(feature = "instruments")]
-        crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
-
-        debug_assert_eq!(
-            precomputed_root, precomputed_commitment,
-            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
-        );
-
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            precomputed_tree
-                .spill_nodes_to_disk()
-                .map_err(|e| ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}")))?;
-            mult_tree
-                .spill_nodes_to_disk()
-                .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
-        }
-
-        Ok((
-            mult_tree,
-            mult_root,
-            Some(precomputed_tree),
-            Some(precomputed_root),
-            num_precomputed_cols,
-            columns,
-        ))
+        Ok((commit, columns))
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -760,12 +714,7 @@ pub trait IsStarkProver<
             Vec::new()
         };
 
-        Ok(commitment.build_round1(
-            Lde { main, aux },
-            air.step_size(),
-            domain.blowup_factor,
-            air.has_aux_trace(),
-        ))
+        Ok(commitment.build_round1(Lde { main, aux }, air.step_size(), domain.blowup_factor))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
@@ -875,50 +824,20 @@ pub trait IsStarkProver<
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
         let two_inv = two_base.inv().expect("2 is non-zero in the field");
-        let (h0_evals, h1_evals) = {
-            #[cfg(feature = "parallel")]
-            {
-                let (h0, h1): (Vec<_>, Vec<_>) = (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
-                        let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                        // F × E → E (base field scalar on left for mixed multiplication)
-                        (&two_inv * &sum, &inv_2x[i] * &diff)
-                    })
-                    .unzip();
-                (h0, h1)
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                let mut h0 = Vec::with_capacity(n);
-                let mut h1 = Vec::with_capacity(n);
-                for i in 0..n {
-                    let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
-                    let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                    h0.push(&two_inv * &sum);
-                    h1.push(&inv_2x[i] * &diff);
-                }
-                (h0, h1)
-            }
-        };
+        let (h0_evals, h1_evals) = crate::par::map_unzip(n, |i| {
+            let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
+            let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
+            // F × E → E (base field scalar on left for mixed multiplication)
+            (&two_inv * &sum, &inv_2x[i] * &diff)
+        });
 
         // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
         // The squared coset offset is g² (= coset_offset²).
         let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
-
-        #[cfg(feature = "parallel")]
-        let (lde_h0, lde_h1) = rayon::join(
+        let (lde_h0, lde_h1) = crate::par::join(
             || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
             || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
         );
-
-        #[cfg(not(feature = "parallel"))]
-        let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
-        );
-
         vec![lde_h0, lde_h1]
     }
 
@@ -1303,14 +1222,11 @@ pub trait IsStarkProver<
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
         let num_total_cols = num_main_cols + num_aux_cols;
 
-        // === Phase 1: Column compression (Plonky3-style) ===
-        // Instead of iterating all ~95 columns per row in the hot loop, we precompute:
-        //   compressed_k[i] = Σ_j gamma[j][k] * lde_trace.get_main(i, j)   for i in 0..lde_size
-        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k]
-        // This moves the column sum outside the hot loop. Since the new path evaluates
-        // DEEP directly at all 2N LDE points, no stride is needed — every row is used.
-
-        // Precompute OOD compressed values (one per eval point)
+        // OOD column compression (Plonky3-style): precompute one value per eval point,
+        //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
+        // The per-LDE-point trace column sums are NOT precomputed — they are fused
+        // directly into the hot loop below. DEEP is evaluated at all 2N LDE points
+        // (no stride), so every row is used.
         let mut ood_compressed: Vec<FieldElement<FieldExtension>> =
             vec![FieldElement::zero(); num_eval_points];
         for j in 0..num_total_cols {
@@ -1321,37 +1237,28 @@ pub trait IsStarkProver<
             }
         }
 
-        // Compressed traces at ALL 2N LDE points (Plonky3-style).
-        // Eliminates the iFFT(N)+FFT(2N) extension by computing directly at LDE size.
-        let compressed: Vec<Vec<FieldElement<FieldExtension>>> = (0..num_eval_points)
+        // Fused single-pass: compute column compression AND DEEP polynomial inline.
+        // Eliminates the intermediate `compressed` allocation (~400 MB for CPU table)
+        // and reduces to a single rayon dispatch instead of num_eval_points + 1.
+        // Each row i's column data is reused across all eval points k within a rayon
+        // task, so the k=1 read hits L1 cache after k=0 just loaded it.
+
+        // Pre-gather gamma references per eval point for cache-friendly access.
+        let main_gammas_by_k: Vec<Vec<&FieldElement<FieldExtension>>> = (0..num_eval_points)
             .map(|k| {
-                let main_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_main_cols)
+                (0..num_main_cols)
                     .map(|j| &trace_terms_gammas[j][k])
-                    .collect();
-                let aux_gammas: Vec<&FieldElement<FieldExtension>> = (0..num_aux_cols)
+                    .collect()
+            })
+            .collect();
+        let aux_gammas_by_k: Vec<Vec<&FieldElement<FieldExtension>>> = (0..num_eval_points)
+            .map(|k| {
+                (0..num_aux_cols)
                     .map(|j| &trace_terms_gammas[num_main_cols + j][k])
-                    .collect();
-
-                #[cfg(feature = "parallel")]
-                let iter = (0..lde_size).into_par_iter();
-                #[cfg(not(feature = "parallel"))]
-                let iter = 0..lde_size;
-
-                iter.map(|i| {
-                    let mut sum = FieldElement::<FieldExtension>::zero();
-                    for (j, gamma) in main_gammas.iter().enumerate() {
-                        sum += lde_trace.get_main(i, j) * *gamma;
-                    }
-                    for (j, gamma) in aux_gammas.iter().enumerate() {
-                        sum += lde_trace.get_aux(i, j) * *gamma;
-                    }
-                    sum
-                })
-                .collect()
+                    .collect()
             })
             .collect();
 
-        // Hot loop at all 2N LDE points — no FFT extension needed.
         #[cfg(feature = "parallel")]
         let iter = (0..lde_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -1367,10 +1274,18 @@ pub trait IsStarkProver<
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
 
-            // Trace terms (compressed)
+            // Trace terms: for each eval point k, compute the column sum inline
+            // and multiply by the denominator inverse in one pass.
             for k in 0..num_eval_points {
                 let inv_t_k_i = &denoms[(1 + k) * lde_size + i];
-                result += inv_t_k_i * (&compressed[k][i] - &ood_compressed[k]);
+                let mut col_sum = FieldElement::<FieldExtension>::zero();
+                for (j, gamma) in main_gammas_by_k[k].iter().enumerate() {
+                    col_sum += lde_trace.get_main(i, j) * *gamma;
+                }
+                for (j, gamma) in aux_gammas_by_k[k].iter().enumerate() {
+                    col_sum += lde_trace.get_aux(i, j) * *gamma;
+                }
+                result += inv_t_k_i * (col_sum - &ood_compressed[k]);
             }
 
             result
@@ -1420,85 +1335,29 @@ pub trait IsStarkProver<
         }
     }
 
-    /// Computes values and validity proofs of the evaluations of the trace polynomials
-    /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
-    /// element. Gathers row data from column-major LDE storage.
-    fn open_trace_polys_main(
+    /// Computes values and validity proofs of the evaluations of trace polynomials at
+    /// the FRI query challenge `challenge` and its symmetric counterpart. The caller
+    /// supplies a `gather` closure that pulls the row data from the column-major LDE
+    /// storage (full main row, ranged main row, or aux row).
+    fn open_polys_with<C, G>(
         domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<Field>,
-        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        tree: &BatchedMerkleTree<C>,
         challenge: usize,
-    ) -> PolynomialOpenings<Field>
+        gather: G,
+    ) -> PolynomialOpenings<C>
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
-
+        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.gather_main_row(reverse_index(index, domain_size as u64)),
-            evaluations_sym: lde_trace
-                .gather_main_row(reverse_index(index_sym, domain_size as u64)),
-        }
-    }
-
-    /// Variant that opens only a range of main columns (for preprocessed tables).
-    fn open_trace_polys_main_range(
-        domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<Field>,
-        lde_trace: &LDETraceTable<Field, FieldExtension>,
-        challenge: usize,
-        col_start: usize,
-        col_end: usize,
-    ) -> PolynomialOpenings<Field>
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
-
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
-        PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.gather_main_row_range(
-                reverse_index(index, domain_size as u64),
-                col_start,
-                col_end,
-            ),
-            evaluations_sym: lde_trace.gather_main_row_range(
-                reverse_index(index_sym, domain_size as u64),
-                col_start,
-                col_end,
-            ),
-        }
-    }
-
-    /// Opens auxiliary trace polynomials at the given challenge index.
-    fn open_trace_polys_aux(
-        domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<FieldExtension>,
-        lde_trace: &LDETraceTable<Field, FieldExtension>,
-        challenge: usize,
-    ) -> PolynomialOpenings<FieldExtension>
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let domain_size = domain.lde_roots_of_unity_coset.len();
-
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
-        PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.gather_aux_row(reverse_index(index, domain_size as u64)),
-            evaluations_sym: lde_trace.gather_aux_row(reverse_index(index_sym, domain_size as u64)),
+            evaluations: gather(reverse_index(index, domain_size)),
+            evaluations_sym: gather(reverse_index(index_sym, domain_size)),
         }
     }
 
@@ -1515,47 +1374,31 @@ pub trait IsStarkProver<
     {
         let mut openings = Vec::with_capacity(indexes_to_open.len());
 
-        // Check if this is a preprocessed table (has separate precomputed tree)
-        let is_preprocessed = round_1_result.main.precomputed_merkle_tree.is_some();
-        let num_precomputed_cols = round_1_result.main.num_precomputed_cols;
-        let total_cols = round_1_result.lde_trace.num_main_cols();
+        let lde_trace = &round_1_result.lde_trace;
+        let main_commit = &round_1_result.main;
+        let is_preprocessed = main_commit.is_preprocessed();
+        let num_precomputed_cols = main_commit.num_precomputed_cols;
+        let total_cols = lde_trace.num_main_cols();
 
         for index in indexes_to_open.iter() {
-            // For preprocessed tables, open main (multiplicities) with column range
-            // For normal tables, open all columns
+            // For preprocessed tables, open the main split (multiplicities only);
+            // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
-                Self::open_trace_polys_main_range(
-                    domain,
-                    &round_1_result.main.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace,
-                    *index,
-                    num_precomputed_cols,
-                    total_cols,
-                )
+                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                    lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
+                })
             } else {
-                Self::open_trace_polys_main(
-                    domain,
-                    &round_1_result.main.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace,
-                    *index,
-                )
+                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                    lde_trace.gather_main_row(row)
+                })
             };
 
-            // For preprocessed tables, also open precomputed tree
-            let precomputed_trace_opening = round_1_result
-                .main
-                .precomputed_merkle_tree
-                .as_ref()
-                .map(|tree| {
-                    Self::open_trace_polys_main_range(
-                        domain,
-                        tree,
-                        &round_1_result.lde_trace,
-                        *index,
-                        0,
-                        num_precomputed_cols,
-                    )
-                });
+            // For preprocessed tables, also open the precomputed-columns tree.
+            let precomputed_trace_opening = main_commit.precomputed_tree.as_ref().map(|tree| {
+                Self::open_polys_with(domain, tree, *index, |row| {
+                    lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
+                })
+            });
 
             let composition_openings = Self::open_composition_poly(
                 &round_2_result.composition_poly_merkle_tree,
@@ -1564,12 +1407,9 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_trace_polys_aux(
-                    domain,
-                    &aux.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace,
-                    *index,
-                )
+                Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                    lde_trace.gather_aux_row(row)
+                })
             });
 
             openings.push(DeepPolynomialOpening {
@@ -1660,14 +1500,14 @@ pub trait IsStarkProver<
             let (domain, twiddles) = domain_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    let d = new_domain(*air, trace_length);
+                    let d = Domain::new(*air, trace_length);
                     let t = LdeTwiddles::new(&d);
                     (Arc::new(d), Arc::new(t))
                 })
                 .clone();
 
             #[cfg(test)]
-            domain_cache_stats::record(was_hit);
+            crate::tests::domain_cache_stats::record(was_hit);
 
             domains.push(domain);
             twiddle_caches.push(twiddles);
@@ -1710,7 +1550,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
+        let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
@@ -1728,42 +1568,28 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
-                    if air.is_preprocessed() {
-                        Self::commit_preprocessed_trace(
-                            *trace,
-                            domain,
-                            air.precomputed_commitment(),
-                            air.num_precomputed_columns(),
-                            twiddles,
-                            #[cfg(feature = "disk-spill")]
-                            storage_mode,
-                        )
-                    } else {
-                        Self::commit_main_trace(
-                            *trace,
-                            domain,
-                            twiddles,
-                            #[cfg(feature = "disk-spill")]
-                            storage_mode,
-                        )
-                    }
+                    let precomputed = air
+                        .is_preprocessed()
+                        .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+                    Self::commit_main_trace(
+                        *trace,
+                        domain,
+                        twiddles,
+                        precomputed,
+                        #[cfg(feature = "disk-spill")]
+                        storage_mode,
+                    )
                 })
                 .collect();
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
             for result in chunk_results {
-                let (tree, root, pre_tree, pre_root, n_pre, cached_main) = result?;
-                if let Some(ref pre_r) = pre_root {
-                    transcript.append_bytes(pre_r);
+                let (commit, cached_main) = result?;
+                if let Some(ref pre_root) = commit.precomputed_root {
+                    transcript.append_bytes(pre_root);
                 }
-                transcript.append_bytes(&root);
-                main_commits.push(MainCommitData {
-                    main_tree: Arc::new(tree),
-                    main_root: root,
-                    precomputed_tree: pre_tree.map(Arc::new),
-                    precomputed_root: pre_root,
-                    num_precomputed_cols: n_pre,
-                });
+                transcript.append_bytes(&commit.root);
+                main_commits.push(commit);
                 main_ldes.push(cached_main);
             }
         }
@@ -1858,11 +1684,12 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K
+        // Parallel aux commit in chunks of K. Each entry holds the optional aux
+        // `TableCommit` (`None` when the AIR has no aux trace) and the cached
+        // aux LDE columns consumed in Phase D.
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<(
-            Option<Arc<BatchedMerkleTree<FieldExtension>>>,
-            Option<Commitment>,
+            Option<TableCommit<FieldExtension>>,
             Vec<Vec<FieldElement<FieldExtension>>>,
         )> = Vec::with_capacity(num_airs);
 
@@ -1911,21 +1738,20 @@ pub trait IsStarkProver<
                                 ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
                             })?;
                         }
-
-                        Ok((Some(Arc::new(tree)), Some(root), columns))
+                        Ok((Some(TableCommit::plain(tree, root)), columns))
                     } else {
-                        Ok((None, None, Vec::new()))
+                        Ok((None, Vec::new()))
                     }
                 })
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_tree, aux_root, cached_aux) = result?;
-                if let Some(ref root) = aux_root {
-                    table_transcripts[chunk_start + j].append_bytes(root);
+                let (aux_commit, cached_aux) = result?;
+                if let Some(ref c) = aux_commit {
+                    table_transcripts[chunk_start + j].append_bytes(&c.root);
                 }
-                aux_results.push((aux_tree, aux_root, cached_aux));
+                aux_results.push((aux_commit, cached_aux));
             }
         }
 
@@ -1934,21 +1760,15 @@ pub trait IsStarkProver<
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((main_commit, main_lde), (aux_tree, aux_root, cached_aux)), bus_public_inputs) in
-            main_commits
-                .into_iter()
-                .zip(main_ldes)
-                .zip(aux_results)
-                .zip(bus_inputs_vec)
+        for (((main_commit, main_lde), (aux_commit, cached_aux)), bus_public_inputs) in main_commits
+            .into_iter()
+            .zip(main_ldes)
+            .zip(aux_results)
+            .zip(bus_inputs_vec)
         {
             commitments.push(Round1Commitments {
-                main_merkle_tree: main_commit.main_tree,
-                main_merkle_root: main_commit.main_root,
-                precomputed_merkle_tree: main_commit.precomputed_tree,
-                precomputed_merkle_root: main_commit.precomputed_root,
-                num_precomputed_cols: main_commit.num_precomputed_cols,
-                aux_merkle_tree: aux_tree,
-                aux_merkle_root: aux_root,
+                main: main_commit,
+                aux: aux_commit,
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
             });
@@ -2020,12 +1840,8 @@ pub trait IsStarkProver<
                     let table_start = Instant::now();
 
                     // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result = commitment.build_round1(
-                        lde,
-                        air.step_size(),
-                        domain.blowup_factor,
-                        air.has_aux_trace(),
-                    );
+                    let round_1_result =
+                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
@@ -2247,11 +2063,11 @@ pub trait IsStarkProver<
 
         Ok(StarkProof {
             // [t]
-            lde_trace_main_merkle_root: round_1_result.main.lde_trace_merkle_root,
+            lde_trace_main_merkle_root: round_1_result.main.root,
             // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.lde_trace_merkle_root),
+            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
             // For preprocessed tables: commitment to precomputed columns only
-            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_merkle_root,
+            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
             // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
             // [H₁] and [H₂]
