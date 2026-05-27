@@ -592,3 +592,198 @@ mod tests {
         assert_eq!(tree.open(4).err(), Some(MmcsError::IndexOutOfBounds));
     }
 }
+
+#[cfg(test)]
+mod bench {
+    //! Micro-benchmark comparing MMCS build against N independent
+    //! `MerkleTree` builds for a lambda-vm-style topology. Marked
+    //! `#[ignore]` so it doesn't run by default; trigger with
+    //!     cargo test -p crypto --features parallel mmcs_bench -- --ignored --nocapture
+    use super::*;
+    use crate::merkle_tree::merkle::MerkleTree;
+    use sha3::{Digest, Keccak256};
+    use std::time::Instant;
+
+    struct BenchBackend;
+    type Node = [u8; 32];
+    impl IsMerkleTreeBackend for BenchBackend {
+        type Node = Node;
+        type Data = Node;
+        fn hash_data(leaf: &Node) -> Node {
+            *leaf
+        }
+        fn hash_new_parent(a: &Node, b: &Node) -> Node {
+            let mut h = Keccak256::new();
+            h.update(a);
+            h.update(b);
+            h.finalize().into()
+        }
+    }
+
+    fn synthetic_chip_leaves(seed: u8, height: usize) -> Vec<Node> {
+        (0..height)
+            .map(|i| {
+                let mut h = Keccak256::new();
+                h.update([seed]);
+                h.update((i as u64).to_le_bytes());
+                h.finalize().into()
+            })
+            .collect()
+    }
+
+    /// lambda-vm-style topology, scaled down so the bench finishes fast:
+    /// - 3 chips at 2^14 (CPU-like chunked)
+    /// - 2 chips at 2^12 (MEMW-like)
+    /// - 2 chips at 2^10 (LT-like)
+    /// - 1 chip at 2^8  (HALT/COMMIT-like)
+    fn lambda_vm_topology() -> Vec<(MatrixTag, Vec<Node>)> {
+        let mut out = Vec::new();
+        let mut seed = 0u8;
+        for height in [1 << 14, 1 << 14, 1 << 14] {
+            out.push((
+                MatrixTag::new([seed; 8]),
+                synthetic_chip_leaves(seed, height),
+            ));
+            seed = seed.wrapping_add(1);
+        }
+        for height in [1 << 12, 1 << 12] {
+            out.push((
+                MatrixTag::new([seed; 8]),
+                synthetic_chip_leaves(seed, height),
+            ));
+            seed = seed.wrapping_add(1);
+        }
+        for height in [1 << 10, 1 << 10] {
+            out.push((
+                MatrixTag::new([seed; 8]),
+                synthetic_chip_leaves(seed, height),
+            ));
+            seed = seed.wrapping_add(1);
+        }
+        {
+            let height = 1 << 8;
+            out.push((
+                MatrixTag::new([seed; 8]),
+                synthetic_chip_leaves(seed, height),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn mmcs_bench_lambda_vm_topology() {
+        let chips = lambda_vm_topology();
+        let total_leaves: usize = chips.iter().map(|(_, l)| l.len()).sum();
+        let max_h = chips.iter().map(|(_, l)| l.len()).max().unwrap();
+
+        // Warm caches.
+        for _ in 0..2 {
+            let mut b: MmcsBuilder<BenchBackend> = MmcsBuilder::new();
+            for (t, l) in &chips {
+                b.add_matrix(*t, l.clone()).unwrap();
+            }
+            let _ = b.finalize().unwrap();
+        }
+
+        // MMCS build.
+        let t0 = Instant::now();
+        let iters = 5;
+        let mut mmcs_root = [0u8; 32];
+        for _ in 0..iters {
+            let mut b: MmcsBuilder<BenchBackend> = MmcsBuilder::new();
+            for (t, l) in &chips {
+                b.add_matrix(*t, l.clone()).unwrap();
+            }
+            let m = b.finalize().unwrap();
+            mmcs_root = *m.root();
+        }
+        let mmcs_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // N independent trees build.
+        let t0 = Instant::now();
+        let mut n_roots = Vec::new();
+        for _ in 0..iters {
+            let roots: Vec<Node> = chips
+                .iter()
+                .map(|(_, leaves)| {
+                    let tree = MerkleTree::<BenchBackend>::build_from_hashed_leaves(leaves.clone())
+                        .unwrap();
+                    tree.root
+                })
+                .collect();
+            n_roots = roots;
+        }
+        let ntrees_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // Sanity: per-chip roots equal one of the layer-0 contributions for
+        // MMCS *only* when the chip is the sole max-height matrix — we don't
+        // assert equality, just print stats so reviewers can spot anomalies.
+        let _ = (mmcs_root, n_roots);
+
+        println!();
+        println!("┌─────────────────────────────────────────────────────────────┐");
+        println!("│ MMCS micro-bench (lambda-vm-style topology)                 │");
+        println!("├─────────────────────────────────────────────────────────────┤");
+        println!(
+            "│ Chips: {:<3}    Σh_i: {:<10}   max_h: {:<10}    │",
+            chips.len(),
+            total_leaves,
+            max_h
+        );
+        println!(
+            "│ Build N independent trees:  {:>8.0} µs                  │",
+            ntrees_us
+        );
+        println!(
+            "│ Build single MMCS tree:     {:>8.0} µs                  │",
+            mmcs_us
+        );
+        println!(
+            "│ MMCS / N-trees ratio:       {:>8.3}                     │",
+            mmcs_us / ntrees_us
+        );
+        println!("└─────────────────────────────────────────────────────────────┘");
+    }
+
+    #[test]
+    #[ignore]
+    fn mmcs_opening_count_lambda_vm_topology() {
+        let chips = lambda_vm_topology();
+        let mut b: MmcsBuilder<BenchBackend> = MmcsBuilder::new();
+        for (t, l) in &chips {
+            b.add_matrix(*t, l.clone()).unwrap();
+        }
+        let tree = b.finalize().unwrap();
+        let opening = tree.open(0).unwrap();
+
+        // Path siblings + per-matrix leaves -> total opening hashes.
+        let mmcs_hashes = opening.siblings.len() + opening.matrix_leaves.len() - 1;
+
+        // Today (N independent trees): each chip's opening path is log2(h_i)
+        // hashes; verifier must hash one extra per opening for the leaf
+        // compute. Total per-query hashes = Σ (log2(h_i) + 1).
+        let ntrees_hashes: usize = chips
+            .iter()
+            .map(|(_, l)| l.len().trailing_zeros() as usize + 1)
+            .sum();
+
+        println!();
+        println!("┌─────────────────────────────────────────────────────────────┐");
+        println!("│ MMCS per-query opening hash count                           │");
+        println!("├─────────────────────────────────────────────────────────────┤");
+        println!(
+            "│ N independent trees: {:>4} hashes per query             │",
+            ntrees_hashes
+        );
+        println!(
+            "│ Unified MMCS:        {:>4} hashes per query             │",
+            mmcs_hashes
+        );
+        println!(
+            "│ Reduction factor:    {:>4.2}x                              │",
+            ntrees_hashes as f64 / mmcs_hashes as f64
+        );
+        println!("└─────────────────────────────────────────────────────────────┘");
+    }
+}
