@@ -52,6 +52,7 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
+use super::dvrm::DvrmOperation;
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use executor::vm::{
@@ -492,28 +493,16 @@ impl CpuOperation {
                 (arg1 as i64).wrapping_shr(effective) as u64
             }
         } else if self.decode.op_mul && self.decode.word_instr {
-            // MULW
-            (arg1 as i64).wrapping_mul(arg2 as i64) as u64
+            // MULW: low 64 bits of arg1 * arg2 (signedness doesn't affect the low bits).
+            arg1.wrapping_mul(arg2)
         } else if self.decode.op_divrem && self.decode.word_instr {
-            // DIVUW/DIVW/REMUW/REMW
-
-            // REMUW/REMW if true, DIVUW/DIVW otherwise
-            let rem = self.decode.muldiv_selector;
-
-            if arg2 == 0 {
-                if rem { arg1 } else { u64::MAX }
-            } else if rem {
-                // REMW if self.decode.signed == true, REMUW otherwise
-                if self.decode.signed {
-                    (arg1 as i64).wrapping_rem(arg2 as i64) as u64
-                } else {
-                    arg1 % arg2
-                }
-            // DIVW if self.decode.signed == true, DIVUW otherwise
-            } else if self.decode.signed {
-                (arg1 as i64).wrapping_div(arg2 as i64) as u64
+            // DIVUW/DIVW/REMUW/REMW. Reuse the DVRM spec implementation so the CPU
+            // and DVRM tables stay in lockstep on division semantics.
+            let dvrm = DvrmOperation::new(arg1, arg2, self.decode.signed);
+            if self.decode.muldiv_selector {
+                dvrm.compute_remainder()
             } else {
-                arg1 / arg2
+                dvrm.compute_quotient()
             }
         } else {
             // For SLT and other operations, use the executor's result
