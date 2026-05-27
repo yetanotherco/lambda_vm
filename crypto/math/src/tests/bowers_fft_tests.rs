@@ -2,13 +2,11 @@
 //!
 //! Separated from the main implementation to keep the library code concise.
 
-use super::bowers_fft::*;
-use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use crate::fft::cpu::fft::in_place_nr_2radix_fft;
-use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+use crate::fft::bowers_fft::*;
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
-use crate::field::traits::{IsFFTField, RootsConfig};
+use crate::field::traits::IsFFTField;
 use alloc::vec;
 use alloc::vec::Vec;
 use proptest::{collection, prelude::*};
@@ -415,55 +413,6 @@ fn test_fft_ifft_roundtrip_edge_cases() {
 }
 
 // =========================================================================
-// Bowers vs Native FFT comparison tests
-// =========================================================================
-
-fn compare_bowers_vs_native(input: &[FE]) {
-    let order = input.len().trailing_zeros() as u64;
-
-    // Native Cooley-Tukey FFT
-    let native_twiddles =
-        get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse)
-            .unwrap();
-    let mut native_result = input.to_vec();
-    in_place_nr_2radix_fft::<F, F>(&mut native_result, &native_twiddles);
-    in_place_bit_reverse_permute(&mut native_result);
-
-    // Bowers FFT
-    let layer_twiddles = LayerTwiddles::<F>::new(order).unwrap();
-    let mut bowers_result = input.to_vec();
-    bowers_fft_opt_fused(&mut bowers_result, &layer_twiddles).unwrap();
-    in_place_bit_reverse_permute(&mut bowers_result);
-
-    assert_eq!(bowers_result, native_result);
-}
-
-#[test]
-fn test_bowers_vs_native_various_sizes() {
-    for order in 0..=10u64 {
-        let input: Vec<FE> = (0..(1 << order)).map(|i| FE::from(i as u64)).collect();
-        compare_bowers_vs_native(&input);
-    }
-}
-
-#[test]
-fn test_bowers_vs_native_edge_cases() {
-    // All zeros
-    let zeros: Vec<FE> = (0..64).map(|_| FE::zero()).collect();
-    compare_bowers_vs_native(&zeros);
-
-    // All ones
-    let ones: Vec<FE> = (0..64).map(|_| FE::one()).collect();
-    compare_bowers_vs_native(&ones);
-
-    // Alternating
-    let alternating: Vec<FE> = (0..64)
-        .map(|i| if i % 2 == 0 { FE::zero() } else { FE::one() })
-        .collect();
-    compare_bowers_vs_native(&alternating);
-}
-
-// =========================================================================
 // Property-based tests (proptest)
 // =========================================================================
 
@@ -496,25 +445,6 @@ proptest! {
         in_place_bit_reverse_permute(&mut result);
 
         prop_assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn proptest_bowers_matches_native_fft(coeffs in field_vec(8)) {
-        let order = coeffs.len().trailing_zeros() as u64;
-
-        // Native FFT
-        let native_twiddles = get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse).unwrap();
-        let mut native_result = coeffs.clone();
-        in_place_nr_2radix_fft::<F, F>(&mut native_result, &native_twiddles);
-        in_place_bit_reverse_permute(&mut native_result);
-
-        // Bowers FFT
-        let layer_twiddles = LayerTwiddles::<F>::new(order).unwrap();
-        let mut bowers_result = coeffs;
-        bowers_fft_opt_fused(&mut bowers_result, &layer_twiddles).unwrap();
-        in_place_bit_reverse_permute(&mut bowers_result);
-
-        prop_assert_eq!(bowers_result, native_result);
     }
 
     #[test]
@@ -675,7 +605,7 @@ mod parallel_tests {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_adaptive_threshold_scales_with_threads() {
-    use crate::fft::cpu::bowers_fft::bowers_fft_opt_fused_parallel;
+    use crate::fft::bowers_fft::bowers_fft_opt_fused_parallel;
     use rayon::ThreadPoolBuilder;
 
     // Test with different thread counts

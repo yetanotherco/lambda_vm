@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;

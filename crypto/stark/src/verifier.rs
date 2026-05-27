@@ -18,7 +18,7 @@ use log::error;
 #[cfg(feature = "debug-checks")]
 use log::info;
 use math::{
-    fft::cpu::bit_reversing::reverse_index,
+    fft::bit_reversing::reverse_index,
     field::{
         element::FieldElement,
         traits::{IsFFTField, IsField, IsSubFieldOf},

@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};

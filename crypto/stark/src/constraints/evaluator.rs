@@ -74,9 +74,69 @@ where
         let num_aux_cols = lde_trace.num_aux_cols();
         let num_offsets = offsets.len();
 
+        // Per-row evaluation, shared by the parallel and sequential paths below:
+        // fill the frame, evaluate transition constraints, accumulate with zerofiers.
+        let eval_row = |i: usize,
+                        boundary: FieldElement<FieldExtension>,
+                        transition_buf: &mut [FieldElement<FieldExtension>],
+                        base_buf: &mut [FieldElement<Field>],
+                        periodic_buf: &mut [FieldElement<Field>],
+                        frame: &mut Frame<Field, FieldExtension>|
+         -> FieldElement<FieldExtension> {
+            frame.fill_from_lde(lde_trace, i, offsets);
+
+            for (j, col) in lde_periodic_columns.iter().enumerate() {
+                periodic_buf[j] = col[i].clone();
+            }
+
+            let ctx = TransitionEvaluationContext::new_prover(
+                frame,
+                periodic_buf,
+                rap_challenges,
+                &logup_alpha_powers,
+                logup_table_offset,
+                &packing_shifts,
+            );
+            air.compute_transition_prover(&ctx, base_buf, transition_buf);
+
+            let acc_transition = if is_uniform {
+                // All constraints share one zerofier: factor it out of the sum.
+                let z = zerofier_data.get_uniform(i);
+                // F×E inner product for base constraints (3 muls per term)
+                let mut sum = base_buf
+                    .iter()
+                    .zip(&transition_coefficients[..num_base])
+                    .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                // E×E for extension constraints (9 muls per term)
+                sum = transition_buf[num_base..]
+                    .iter()
+                    .zip(&transition_coefficients[num_base..])
+                    .fold(sum, |acc, (eval, beta)| acc + eval * beta);
+                z * &sum
+            } else {
+                let mut sum = base_buf
+                    .iter()
+                    .enumerate()
+                    .zip(&transition_coefficients[..num_base])
+                    .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
+                        acc + zerofier_data.get(c_idx, i) * eval * beta
+                    });
+                sum = transition_buf[num_base..]
+                    .iter()
+                    .enumerate()
+                    .zip(&transition_coefficients[num_base..])
+                    .fold(sum, |acc, ((j, eval), beta)| {
+                        acc + zerofier_data.get(num_base + j, i) * eval * beta
+                    });
+                sum
+            };
+
+            acc_transition + boundary
+        };
+
         #[cfg(feature = "parallel")]
         {
-            let evaluations_t: Vec<_> = boundary_evaluation
+            boundary_evaluation
                 .into_par_iter()
                 .enumerate()
                 .map_init(
@@ -94,59 +154,10 @@ where
                         )
                     },
                     |(transition_buf, base_buf, periodic_buf, frame), (i, boundary)| {
-                        frame.fill_from_lde(lde_trace, i, offsets);
-
-                        for (j, col) in lde_periodic_columns.iter().enumerate() {
-                            periodic_buf[j] = col[i].clone();
-                        }
-
-                        let ctx = TransitionEvaluationContext::new_prover(
-                            frame,
-                            periodic_buf,
-                            rap_challenges,
-                            &logup_alpha_powers,
-                            logup_table_offset,
-                            &packing_shifts,
-                        );
-                        air.compute_transition_prover(&ctx, base_buf, transition_buf);
-
-                        let acc_transition = if is_uniform {
-                            // All constraints share one zerofier: factor it out of the sum.
-                            let z = zerofier_data.get_uniform(i);
-                            // F×E inner product for base constraints (3 muls per term)
-                            let mut sum = base_buf
-                                .iter()
-                                .zip(&transition_coefficients[..num_base])
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                            // E×E for extension constraints (9 muls per term)
-                            sum = transition_buf[num_base..]
-                                .iter()
-                                .zip(&transition_coefficients[num_base..])
-                                .fold(sum, |acc, (eval, beta)| acc + eval * beta);
-                            z * &sum
-                        } else {
-                            let mut sum = base_buf
-                                .iter()
-                                .enumerate()
-                                .zip(&transition_coefficients[..num_base])
-                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                });
-                            sum = transition_buf[num_base..]
-                                .iter()
-                                .enumerate()
-                                .zip(&transition_coefficients[num_base..])
-                                .fold(sum, |acc, ((j, eval), beta)| {
-                                    acc + zerofier_data.get(num_base + j, i) * eval * beta
-                                });
-                            sum
-                        };
-
-                        acc_transition + boundary
+                        eval_row(i, boundary, transition_buf, base_buf, periodic_buf, frame)
                     },
                 )
-                .collect();
-            evaluations_t
+                .collect()
         }
 
         #[cfg(not(feature = "parallel"))]
@@ -161,54 +172,14 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    frame.fill_from_lde(lde_trace, i, offsets);
-
-                    for (j, col) in lde_periodic_columns.iter().enumerate() {
-                        periodic_buf[j] = col[i].clone();
-                    }
-
-                    let ctx = TransitionEvaluationContext::new_prover(
-                        &frame,
-                        &periodic_buf,
-                        rap_challenges,
-                        &logup_alpha_powers,
-                        logup_table_offset,
-                        &packing_shifts,
-                    );
-                    air.compute_transition_prover(&ctx, &mut base_buf, &mut transition_buf);
-
-                    let acc_transition = if is_uniform {
-                        let z = zerofier_data.get_uniform(i);
-                        // F×E inner product for base constraints (3 muls per term)
-                        let mut sum = base_buf
-                            .iter()
-                            .zip(&transition_coefficients[..num_base])
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                        // E×E for extension constraints (9 muls per term)
-                        sum = transition_buf[num_base..]
-                            .iter()
-                            .zip(&transition_coefficients[num_base..])
-                            .fold(sum, |acc, (eval, beta)| acc + eval * beta);
-                        z * &sum
-                    } else {
-                        let mut sum = base_buf
-                            .iter()
-                            .enumerate()
-                            .zip(&transition_coefficients[..num_base])
-                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                acc + zerofier_data.get(c_idx, i) * eval * beta
-                            });
-                        sum = transition_buf[num_base..]
-                            .iter()
-                            .enumerate()
-                            .zip(&transition_coefficients[num_base..])
-                            .fold(sum, |acc, ((j, eval), beta)| {
-                                acc + zerofier_data.get(num_base + j, i) * eval * beta
-                            });
-                        sum
-                    };
-
-                    acc_transition + boundary
+                    eval_row(
+                        i,
+                        boundary,
+                        &mut transition_buf,
+                        &mut base_buf,
+                        &mut periodic_buf,
+                        &mut frame,
+                    )
                 })
                 .collect()
         }
