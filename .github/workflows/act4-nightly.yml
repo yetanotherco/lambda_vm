@@ -29,6 +29,12 @@ jobs:
     env:
       LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
     steps:
+      - name: Scrub root-owned leftovers from previous Docker runs
+        run: |
+          if [ -d test-results ] || [ -d out ]; then
+            docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 rm -rf test-results out
+          fi
+
       - name: Checkout zkevm-test-monitor
         uses: actions/checkout@v4
         with:
