@@ -31,7 +31,7 @@ jobs:
       - name: Scrub root-owned leftovers from previous Docker runs
         run: |
           if [ -d test-results ] || [ -d out ]; then
-            docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 rm -rf test-results out
+            docker run --rm -v "$PWD:/work" -w /work ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff rm -rf test-results out
           fi
 
       - name: Checkout zkevm-test-monitor
@@ -58,6 +58,8 @@ jobs:
       - name: Compute pass/fail from summaries
         id: summary
         if: always()
+        env:
+          STEP_RUN_OUTCOME: ${{ steps.run.outcome }}
         run: |
           mkdir -p out
           shopt -s nullglob
@@ -85,7 +87,7 @@ jobs:
             FAILED=$((FAILED + n))
           done
           echo "Total failed tests: $FAILED"
-          if [ "${{ steps.run.outcome }}" = "failure" ]; then
+          if [ "$STEP_RUN_OUTCOME" = "failure" ]; then
             echo "./run exited non-zero"
             exit 1
           fi
@@ -119,6 +121,9 @@ jobs:
           fi
 
       - name: Download test artifacts
+        # An early test-job failure may upload nothing. Still file the issue,
+        # since the summary script falls back when out/summary.md is absent.
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: act4-results-${{ github.run_id }}
