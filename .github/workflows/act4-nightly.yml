@@ -115,6 +115,14 @@ jobs:
             test-results/lambdavm/
           retention-days: 30
 
+      - name: Remove root-owned Docker leftovers
+        # Leave the shared runner workspace clean for other workflows.
+        if: always()
+        run: |
+          if [ -d test-results ] || [ -d out ]; then
+            docker run --rm -v "$PWD:/work" -w /work "$UBUNTU_IMAGE" rm -rf test-results out
+          fi
+
   report:
     needs: test
     if: failure()
