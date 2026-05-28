@@ -4,6 +4,8 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
+#[cfg(feature = "phased-fft")]
+use crate::fft::phased_fft::{PhasedFftContext, bowers_phased_fft_with_buf};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -264,6 +266,59 @@ fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     bowers_fft_opt_fused(buffer, twiddles)
 }
 
+/// Minimum LDE size at which the phased FFT path becomes competitive
+/// on x86 server hardware. Below this we keep the single-pass Bowers
+/// to amortise the transpose / phase-twiddle fixed overhead.
+#[cfg(feature = "phased-fft")]
+const PHASED_FFT_THRESHOLD: usize = 1 << 21;
+
+/// Dispatch a forward FFT and produce **natural-order** output.
+///
+/// Behaviour is identical for both backends:
+///   - Bowers DIF (default): `bowers_fft_opt_fused_parallel(...)` followed
+///     by `in_place_bit_reverse_permute(...)`.
+///   - Phased Bailey four-step (when `phased-fft` is enabled AND the
+///     buffer is large enough): natural-order output directly, no
+///     trailing bit-reverse.
+///
+/// Callers that previously wrote
+/// ```ignore
+/// dispatch_fft(buf, tw)?;
+/// in_place_bit_reverse_permute(buf);
+/// ```
+/// should switch to `dispatch_fft_natural(buf, tw)?;` to let both
+/// backends share a single call site.
+#[inline]
+fn dispatch_fft_natural<F, E>(
+    buffer: &mut [FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync + Clone,
+{
+    #[cfg(feature = "phased-fft")]
+    {
+        let n = buffer.len();
+        if n >= PHASED_FFT_THRESHOLD && n.is_power_of_two() {
+            let log_n = n.trailing_zeros() as usize;
+            // Building the context per call costs O(M + K) field elements
+            // (inner LayerTwiddles); negligible relative to the FFT itself.
+            // A cached / thread-local context would be a follow-up
+            // optimisation if we want to land this for real.
+            if let Ok(ctx) = PhasedFftContext::<F>::new(log_n) {
+                let mut scratch: Vec<FieldElement<E>> = Vec::with_capacity(n);
+                return bowers_phased_fft_with_buf(buffer, &ctx, &mut scratch);
+            }
+        }
+    }
+    dispatch_fft(buffer, twiddles)?;
+    in_place_bit_reverse_permute(buffer);
+    Ok(())
+}
+
 /// Dispatch inverse FFT (DIT) to parallel or sequential implementation based on buffer size.
 #[inline]
 fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
@@ -444,8 +499,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             *coeff = w * &*coeff;
         }
 
-        dispatch_fft(buffer, fwd_twiddles)?;
-        in_place_bit_reverse_permute(buffer);
+        dispatch_fft_natural(buffer, fwd_twiddles)?;
 
         Ok(())
     }
@@ -497,8 +551,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.resize(lde_size, FieldElement::zero());
 
         // 4. Forward FFT on the full buffer
-        dispatch_fft(buffer, fwd_twiddles)?;
-        in_place_bit_reverse_permute(buffer);
+        dispatch_fft_natural(buffer, fwd_twiddles)?;
 
         Ok(())
     }
@@ -540,9 +593,14 @@ where
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
     let mut result = coeffs.to_vec();
-    dispatch_fft(&mut result, &layer_twiddles)?;
     if permute_to_natural {
-        in_place_bit_reverse_permute(&mut result);
+        // Natural output: route through the phased-FFT-aware wrapper so
+        // both backends share one call site.
+        dispatch_fft_natural(&mut result, &layer_twiddles)?;
+    } else {
+        // Bit-reversed output requested explicitly: keep the legacy
+        // Bowers path which produces bit-reversed by design.
+        dispatch_fft(&mut result, &layer_twiddles)?;
     }
     Ok(result)
 }

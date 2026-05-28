@@ -3,6 +3,8 @@ pub mod bit_reversing;
 pub mod bowers_fft;
 pub mod errors;
 #[cfg(feature = "alloc")]
+pub mod phased_fft;
+#[cfg(feature = "alloc")]
 pub mod roots_of_unity;
 
 #[cfg(all(test, feature = "alloc"))]

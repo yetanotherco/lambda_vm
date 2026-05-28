@@ -34,6 +34,10 @@ default = ["parallel", "std"]
 std = ["alloc", "serde?/std", "serde_json?/std"]
 alloc = []
 parallel = ["dep:rayon"]
+# Route the forward FFT through the phased (Bailey four-step) path when the
+# LDE size is large enough. Output convention unchanged — natural order.
+# Off by default so A/B bench can toggle.
+phased-fft = ["parallel"]
 lambdaworks-serde-binary = ["dep:serde", "alloc"]
 lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
@@ -45,4 +49,8 @@ getrandom = { version = "0.2.15", features = ["js"] }
 
 [[bench]]
 name = "goldilocks_benchmark"
+harness = false
+
+[[bench]]
+name = "phased_fft_benchmark"
 harness = false
