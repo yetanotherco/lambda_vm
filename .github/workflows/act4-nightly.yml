@@ -64,7 +64,7 @@ jobs:
             echo "$msg" | tee out/summary.md
             echo "$msg" >> "$GITHUB_STEP_SUMMARY"
             echo "failed=-1" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
 
           {
@@ -82,6 +82,7 @@ jobs:
           done
           echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
           echo "Total failed tests: $FAILED"
+          [ "$FAILED" -eq 0 ]
 
       - name: Upload artifacts
         if: always()
@@ -94,7 +95,7 @@ jobs:
           retention-days: 30
 
       - name: Open or update issue on failure
-        if: steps.run.outcome == 'failure' || steps.summary.outputs.failed != '0'
+        if: failure()
         uses: actions/github-script@v7
         with:
           script: |
@@ -145,8 +146,3 @@ jobs:
               console.log(`Created issue #${created.data.number}`);
             }
 
-      - name: Fail job on failure
-        if: steps.run.outcome == 'failure' || steps.summary.outputs.failed != '0'
-        run: |
-          echo "ACT4 run failed (run outcome: ${{ steps.run.outcome }}, failed tests: ${{ steps.summary.outputs.failed }})"
-          exit 1
