@@ -5,7 +5,7 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
 #[cfg(feature = "phased-fft")]
-use crate::fft::phased_fft::{PhasedFftContext, bowers_phased_fft_with_buf};
+use crate::fft::phased_fft::{PhasedFftContext, bowers_phased_fft_seq_with_buf};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -308,9 +308,17 @@ where
             // (inner LayerTwiddles); negligible relative to the FFT itself.
             // A cached / thread-local context would be a follow-up
             // optimisation if we want to land this for real.
+            //
+            // Use the SEQUENTIAL-inner phased path: this dispatch is
+            // invoked from the prover's per-column `par_iter` LDE, which
+            // already saturates the rayon pool. The parallel-inner variant
+            // would nest a second rayon level and oversubscribe. The
+            // Bailey cache-blocking (lower DRAM traffic) — the win at
+            // memory-bound sizes — applies regardless of intra-FFT
+            // parallelism.
             if let Ok(ctx) = PhasedFftContext::<F>::new(log_n) {
                 let mut scratch: Vec<FieldElement<E>> = Vec::with_capacity(n);
-                return bowers_phased_fft_with_buf(buffer, &ctx, &mut scratch);
+                return bowers_phased_fft_seq_with_buf(buffer, &ctx, &mut scratch);
             }
         }
     }

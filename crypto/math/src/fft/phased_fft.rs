@@ -41,7 +41,6 @@ use crate::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
-use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(feature = "parallel")]
@@ -52,11 +51,66 @@ use rayon::prelude::*;
 /// tiles are ~3× larger but still fit).
 const TRANSPOSE_TILE: usize = 32;
 
-/// Out-of-place tiled transpose.
+/// Out-of-place tiled transpose, parallelised over bands of output rows.
+///
+/// Same contract as [`tiled_transpose`] but splits `output` into
+/// `TRANSPOSE_TILE`-row bands processed in parallel. Each band reads a
+/// `TRANSPOSE_TILE`-wide column strip of `input` (tiled along `rows` for
+/// cache locality) and writes a contiguous chunk of `output`. Use for
+/// the standalone single-FFT path where no outer parallel loop exists.
+#[cfg(feature = "parallel")]
+pub fn tiled_transpose_par<T: Clone + Send + Sync>(
+    input: &[T],
+    output: &mut [T],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(input.len(), rows * cols);
+    debug_assert_eq!(output.len(), rows * cols);
+
+    output
+        .par_chunks_mut(rows * TRANSPOSE_TILE)
+        .enumerate()
+        .for_each(|(band, out_band)| {
+            let c0 = band * TRANSPOSE_TILE;
+            let c_end = (c0 + TRANSPOSE_TILE).min(cols);
+            for tile_r in (0..rows).step_by(TRANSPOSE_TILE) {
+                let r_end = (tile_r + TRANSPOSE_TILE).min(rows);
+                for c in c0..c_end {
+                    let out_row = &mut out_band[(c - c0) * rows..(c - c0) * rows + rows];
+                    for r in tile_r..r_end {
+                        out_row[r] = input[r * cols + c].clone();
+                    }
+                }
+            }
+        });
+}
+
+/// Dispatch to the parallel transpose when the feature is on, else the
+/// sequential one. Used by the standalone single-FFT path.
+#[inline]
+fn transpose_single<T: Clone + Send + Sync>(
+    input: &[T],
+    output: &mut [T],
+    rows: usize,
+    cols: usize,
+) {
+    #[cfg(feature = "parallel")]
+    tiled_transpose_par(input, output, rows, cols);
+    #[cfg(not(feature = "parallel"))]
+    tiled_transpose(input, output, rows, cols);
+}
+
+/// Out-of-place tiled transpose (sequential).
 ///
 /// `input` is `rows × cols` row-major; `output` becomes `cols × rows`
 /// row-major. Tile-based for cache locality: each tile pair is
 /// `TRANSPOSE_TILE × TRANSPOSE_TILE` elements, sized to fit L1.
+///
+/// Use this when the caller is already parallelising at a coarser grain
+/// (e.g. across columns in [`bowers_phased_fft_multicol`]); nesting a
+/// parallel transpose under a parallel column loop oversubscribes the
+/// pool.
 pub fn tiled_transpose<T: Clone>(input: &[T], output: &mut [T], rows: usize, cols: usize) {
     debug_assert_eq!(input.len(), rows * cols);
     debug_assert_eq!(output.len(), rows * cols);
@@ -206,6 +260,54 @@ where
     FieldElement<F>: Send + Sync,
     FieldElement<E>: Send + Sync + Clone,
 {
+    // Standalone single-FFT path: parallelise *within* this FFT.
+    phased_fft_core(input, ctx, buf, true)
+}
+
+/// Sequential-inner variant of [`bowers_phased_fft_with_buf`].
+///
+/// Runs the transposes, inner row-FFTs and phase-twiddle pass on a
+/// single thread. Use when the caller already parallelises at a coarser
+/// grain — e.g. the prover's per-column `par_iter` LDE — so nesting a
+/// second rayon level here would oversubscribe the pool. The Bailey
+/// cache-blocking (reduced DRAM traffic) still applies; only intra-FFT
+/// parallelism is dropped.
+pub fn bowers_phased_fft_seq_with_buf<F, E>(
+    input: &mut [FieldElement<E>],
+    ctx: &PhasedFftContext<F>,
+    buf: &mut Vec<FieldElement<E>>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync + Clone,
+{
+    phased_fft_core(input, ctx, buf, false)
+}
+
+/// Core Bailey four-step worker shared by the single-FFT and
+/// multi-column entry points.
+///
+/// `parallel` selects the intra-FFT parallelism strategy:
+///   - `true`  — parallelise the transposes, per-row inner FFTs and the
+///     phase-twiddle pass (the only work in flight).
+///   - `false` — fully sequential, for callers already saturating the
+///     pool at a coarser grain (one column per worker in
+///     [`bowers_phased_fft_multicol`]); avoids nested-rayon
+///     oversubscription.
+fn phased_fft_core<F, E>(
+    input: &mut [FieldElement<E>],
+    ctx: &PhasedFftContext<F>,
+    buf: &mut Vec<FieldElement<E>>,
+    parallel: bool,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync + Clone,
+{
     let n = 1usize << ctx.log_n;
     if input.len() != n {
         return Err(FFTError::InputError(input.len()));
@@ -221,75 +323,67 @@ where
     }
     let buf: &mut [FieldElement<E>] = &mut buf.as_mut_slice()[..n];
 
-    // ===== Step 1: transpose input (M × K) → buf (K × M) =====
-    tiled_transpose(input, buf, m, k);
-
-    // ===== Step 2: FFT_M on each of K rows in buf =====
-    #[cfg(feature = "parallel")]
-    {
-        buf.par_chunks_mut(m).try_for_each(|row| -> Result<(), FFTError> {
-            bowers_fft_opt_fused(row, &twiddles_m)?;
-            in_place_bit_reverse_permute(row);
-            Ok(())
-        })?;
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        for row in buf.chunks_exact_mut(m) {
-            bowers_fft_opt_fused(row, &twiddles_m)?;
+    let transpose = |src: &[FieldElement<E>], dst: &mut [FieldElement<E>], r: usize, c: usize| {
+        if parallel {
+            transpose_single(src, dst, r, c);
+        } else {
+            tiled_transpose(src, dst, r, c);
+        }
+    };
+    let run_rows = |slice: &mut [FieldElement<E>],
+                    row_len: usize,
+                    tw: &LayerTwiddles<F>|
+     -> Result<(), FFTError> {
+        #[cfg(feature = "parallel")]
+        if parallel {
+            return slice
+                .par_chunks_mut(row_len)
+                .try_for_each(|row| -> Result<(), FFTError> {
+                    bowers_fft_opt_fused(row, tw)?;
+                    in_place_bit_reverse_permute(row);
+                    Ok(())
+                });
+        }
+        for row in slice.chunks_exact_mut(row_len) {
+            bowers_fft_opt_fused(row, tw)?;
             in_place_bit_reverse_permute(row);
         }
-    }
+        Ok(())
+    };
 
-    // ===== Step 3: phase twiddle multiply =====
-    // For row s ∈ [0, K), col d ∈ [0, M):
-    //   buf[s·M + d] *= ω_N^(s·d).
-    // We compute one row at a time: per row s, ω_s = ω_N^s, and step
-    // the accumulator by ω_s as d increases. K rows are independent,
-    // parallelise across them.
-    apply_phase_twiddles::<F, E>(buf, k, m, omega_n);
-
-    // ===== Step 4: transpose buf (K × M) → input (M × K) =====
-    tiled_transpose(buf, input, k, m);
-
-    // ===== Step 5: FFT_K on each of M rows in input =====
-    #[cfg(feature = "parallel")]
-    {
-        input
-            .par_chunks_mut(k)
-            .try_for_each(|row| -> Result<(), FFTError> {
-                bowers_fft_opt_fused(row, twiddles_k_ref)?;
-                in_place_bit_reverse_permute(row);
-                Ok(())
-            })?;
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        for row in input.chunks_exact_mut(k) {
-            bowers_fft_opt_fused(row, twiddles_k_ref)?;
-            in_place_bit_reverse_permute(row);
-        }
-    }
-
-    // ===== Step 6: final transpose input (M × K) → buf (K × M) =====
-    // This puts the result in natural order: buf[k_2·M + k_1] holds
-    // Y[k_1·K + k_2] = Y[linear index]; verify with the derivation in
-    // the module docstring.
-    //
-    // Equivalent statement: input was M × K with row k_1 containing
-    // Y[k_1·K + 0], Y[k_1·K + 1], …, Y[k_1·K + K-1]. We want Y[0],
-    // Y[1], …, Y[N-1] contiguous, which is the same data read
-    // "down columns then across rows" — i.e., a transpose to K × M.
-    //
-    // Actually re-deriving from the Bailey identity with our index
-    // choice (j = r·K + c, k = u·M + v):
-    //   After step 5 row k_1 = v contains Y[u·M + v] for u ∈ [0, K).
-    //   That's NOT linear order (linear would put Y[0]..Y[K-1] in row 0
-    //   of an M × K matrix). Need one more transpose.
-    tiled_transpose(input, buf, m, k);
-    input.clone_from_slice(buf);
+    // Step 1: transpose input (M × K) → buf (K × M).
+    transpose(input, buf, m, k);
+    // Step 2: FFT_M on each of K rows in buf.
+    run_rows(buf, m, twiddles_m)?;
+    // Step 3: phase twiddle multiply on buf (K × M).
+    apply_phase_twiddles::<F, E>(buf, k, m, omega_n, parallel);
+    // Step 4: transpose buf (K × M) → input (M × K).
+    transpose(buf, input, k, m);
+    // Step 5: FFT_K on each of M rows in input.
+    run_rows(input, k, twiddles_k_ref)?;
+    // Step 6: final transpose to natural linear order. Lands in buf, so
+    // copy back (parallel copy to stay off the serial critical path).
+    transpose(input, buf, m, k);
+    copy_into(input, buf, parallel);
 
     Ok(())
+}
+
+/// `dst.clone_from_slice(src)`, parallelised when requested.
+#[inline]
+fn copy_into<E>(dst: &mut [FieldElement<E>], src: &[FieldElement<E>], parallel: bool)
+where
+    E: IsField,
+    FieldElement<E>: Send + Sync + Clone,
+{
+    #[cfg(feature = "parallel")]
+    if parallel {
+        dst.par_chunks_mut(1 << 16)
+            .zip(src.par_chunks(1 << 16))
+            .for_each(|(d, s)| d.clone_from_slice(s));
+        return;
+    }
+    dst.clone_from_slice(src);
 }
 
 /// Apply the inter-phase twiddle correction in-place.
@@ -298,12 +392,13 @@ where
 /// root of unity where `N = rows · cols`. Multiplies `buf[s·cols + d]`
 /// by `ω_N^(s·d)` for `s ∈ [0, rows)`, `d ∈ [0, cols)`.
 ///
-/// Rows are independent so the loop parallelises across `s`.
+/// Rows are independent; parallelises across `s` when `parallel`.
 fn apply_phase_twiddles<F, E>(
     buf: &mut [FieldElement<E>],
     rows: usize,
     cols: usize,
     omega_n: &FieldElement<F>,
+    parallel: bool,
 ) where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField + Send + Sync,
@@ -312,26 +407,25 @@ fn apply_phase_twiddles<F, E>(
 {
     debug_assert_eq!(buf.len(), rows * cols);
 
-    #[cfg(feature = "parallel")]
-    let row_iter = buf.par_chunks_mut(cols).enumerate();
-    #[cfg(not(feature = "parallel"))]
-    let row_iter = buf.chunks_exact_mut(cols).enumerate();
-
-    row_iter.for_each(|(s, row)| {
+    let apply_row = |(s, row): (usize, &mut [FieldElement<E>])| {
         if s == 0 {
-            // ω_N^0 = 1; row 0 is identity — nothing to do.
             return;
         }
-        // ω_s = ω_N^s. Step the accumulator by ω_s for each successive d.
         let omega_s = omega_n.pow(s as u64);
         let mut accum = FieldElement::<F>::one();
         for slot in row.iter_mut() {
             *slot = &accum * &*slot;
             accum = &accum * &omega_s;
         }
-    });
-}
+    };
 
+    #[cfg(feature = "parallel")]
+    if parallel {
+        buf.par_chunks_mut(cols).enumerate().for_each(apply_row);
+        return;
+    }
+    buf.chunks_exact_mut(cols).enumerate().for_each(apply_row);
+}
 
 /// Multi-column phased FFT: runs N-point FFTs over many columns in
 /// parallel, sharing the PhasedFftContext and amortising the scratch
@@ -365,7 +459,9 @@ where
             .try_for_each_init(
                 || Vec::<FieldElement<E>>::with_capacity(n),
                 |buf, col| -> Result<(), FFTError> {
-                    bowers_phased_fft_with_buf(col, ctx, buf)
+                    // Sequential inner: this loop already parallelises
+                    // across columns; nesting would oversubscribe rayon.
+                    phased_fft_core(col, ctx, buf, false)
                 },
             )?;
     }

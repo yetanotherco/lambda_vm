@@ -10,6 +10,9 @@ parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 disk-spill = ["stark/disk-spill"]
+# Route the LDE forward FFT through the phased (Bailey four-step) path in
+# the math crate. Off by default; enable for A/B benching of large tables.
+phased-fft = ["math/phased-fft"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

@@ -95,19 +95,42 @@ pub struct MaxRowsConfig {
     pub memw_register: usize,
 }
 
+/// Optional global chunk-size scale, read from `LAMBDA_MAXROWS_SCALE_LOG2`.
+///
+/// Returns a left-shift amount applied uniformly to every per-table
+/// `max_rows`. `0` (default / unset / invalid) leaves production sizing
+/// untouched. Setting e.g. `2` multiplies every chunk size by 4, which
+/// — preserving the equal-memory geometry across tables — quarters the
+/// chunk count, cutting per-instance FRI/Merkle/OOD overhead and pushing
+/// LDE sizes above the phased-FFT threshold. Trade-off: ~`scale`× larger
+/// peak working set per table instance, and (for non-power-of-two traces)
+/// more padding waste. Sweep on the bench server to find the optimum.
+///
+/// Clamped to `0..=4` so a stray value can't request a 16M+× blow-up.
+fn maxrows_scale_log2_from_env() -> u32 {
+    match std::env::var("LAMBDA_MAXROWS_SCALE_LOG2") {
+        Ok(s) => match s.trim().parse::<u32>() {
+            Ok(v) => v.min(4),
+            Err(_) => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
 impl Default for MaxRowsConfig {
     fn default() -> Self {
+        let shift = maxrows_scale_log2_from_env();
         Self {
-            cpu: max_rows::CPU,
-            memw: max_rows::MEMW,
-            memw_aligned: max_rows::MEMW_A,
-            dvrm: max_rows::DVRM,
-            mul: max_rows::MUL,
-            lt: max_rows::LT,
-            shift: max_rows::SHIFT,
-            load: max_rows::LOAD,
-            branch: max_rows::BRANCH,
-            memw_register: max_rows::MEMW_R,
+            cpu: max_rows::CPU << shift,
+            memw: max_rows::MEMW << shift,
+            memw_aligned: max_rows::MEMW_A << shift,
+            dvrm: max_rows::DVRM << shift,
+            mul: max_rows::MUL << shift,
+            lt: max_rows::LT << shift,
+            shift: max_rows::SHIFT << shift,
+            load: max_rows::LOAD << shift,
+            branch: max_rows::BRANCH << shift,
+            memw_register: max_rows::MEMW_R << shift,
         }
     }
 }
