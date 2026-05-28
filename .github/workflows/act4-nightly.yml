@@ -42,7 +42,7 @@ jobs:
           fi
 
       - name: Checkout zkevm-test-monitor
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: eth-act/zkevm-test-monitor
           ref: c9e710b43448576920f7e841a2b68bab8b7a20f8
@@ -92,11 +92,15 @@ jobs:
             FAILED=$((FAILED + n))
           done
           echo "Total failed tests: $FAILED"
+          if [ "${{ steps.run.outcome }}" = "failure" ]; then
+            echo "./run exited non-zero"
+            exit 1
+          fi
           [ "$FAILED" -eq 0 ]
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: act4-results-${{ github.run_id }}
           path: |
@@ -122,12 +126,12 @@ jobs:
           fi
 
       - name: Download test artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: act4-results-${{ github.run_id }}
 
       - name: Open or update issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const fs = require('fs');
