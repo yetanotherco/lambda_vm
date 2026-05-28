@@ -27,7 +27,7 @@ jobs:
     runs-on: [self-hosted, bench]
     timeout-minutes: 360
     env:
-      LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Checkout zkevm-test-monitor
         uses: actions/checkout@v4
