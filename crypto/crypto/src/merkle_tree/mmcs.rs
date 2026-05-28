@@ -47,16 +47,30 @@ pub enum MmcsError {
     NotPowerOfTwo,
     Empty,
     IndexOutOfBounds,
+    /// Returned by [`StreamingMmcsBuilder::add_matrix`] when the caller
+    /// supplies a `(height, tag)` pair that violates the required
+    /// (height desc, tag asc) insertion order.
+    OutOfOrder,
 }
 
 struct MmcsMatrix<N> {
     tag: MatrixTag,
+    /// Source row hashes. Populated by the one-shot [`MmcsBuilder`] and
+    /// consulted by [`Mmcs::open`] to fill the per-matrix leaf in an
+    /// opening. Empty when the Mmcs was produced by [`StreamingMmcsBuilder`]
+    /// (which discards per-chip leaves as it folds them), in which case
+    /// `Mmcs::open` is unavailable but `root()` / `spec()` still work.
     leaf_digests: Vec<N>,
+    /// Padded height (= leaf_digests.len() for one-shot, or the height
+    /// recorded at insertion time for streaming). Carried separately so
+    /// `padded_height()` reports the right value when `leaf_digests` is
+    /// empty.
+    padded_height: usize,
 }
 
 impl<N> MmcsMatrix<N> {
     fn padded_height(&self) -> usize {
-        self.leaf_digests.len()
+        self.padded_height
     }
 }
 
@@ -94,7 +108,12 @@ impl<B: IsMerkleTreeBackend> MmcsBuilder<B> {
         if !leaf_digests.len().is_power_of_two() {
             return Err(MmcsError::NotPowerOfTwo);
         }
-        self.matrices.push(MmcsMatrix { tag, leaf_digests });
+        let padded_height = leaf_digests.len();
+        self.matrices.push(MmcsMatrix {
+            tag,
+            leaf_digests,
+            padded_height,
+        });
         Ok(())
     }
 
@@ -154,6 +173,230 @@ impl<B: IsMerkleTreeBackend> MmcsBuilder<B> {
         })
     }
 }
+
+/// Streaming MMCS builder. Equivalent to [`MmcsBuilder`] in output
+/// (identical root + spec + opening *root* bytes for the same input set)
+/// but folds per-chip leaves at the MAX height into a single shared
+/// running layer-0 as they arrive, instead of holding every max-height
+/// chip's leaf vector alive simultaneously.
+///
+/// # Why "max height only"?
+///
+/// MMCS layer-0 at the max height is built by left-folding every chip's
+/// leaves at row `i`. With no left-anchor to compose with, the running
+/// fold `acc = hash(acc, chip_k[i])` is mathematically equivalent to the
+/// one-shot `hash(hash(hash(chip_0[i], chip_1[i]), chip_2[i]), ...)`.
+///
+/// For chips at heights BELOW max, the MMCS injection rule is
+/// `next[i] = hash(hash(hash(next[i], chip_0[i]), chip_1[i]), ...)`,
+/// which mixes the upward-compressed `next[i]` into the left-fold. Keccak
+/// (and any non-associative hash) makes it impossible to pre-fold the
+/// chips into a single summary and inject that summary later — the
+/// resulting digest would differ from the one-shot builder, breaking
+/// verifier compatibility. So we keep per-chip leaves for non-max heights
+/// and inject them in left-fold order at `finalize`.
+///
+/// # Memory
+///
+/// Peak savings come from the max-height chips, which is where the
+/// dominant per-row storage lives in lambda-vm (CPU chunks at 2^20).
+/// Smaller-height chips contribute proportionally less per chip, so
+/// keeping their per-chip leaves alive has modest impact.
+///
+/// # Add order
+///
+/// Callers MUST call [`StreamingMmcsBuilder::add_matrix`] in the same
+/// order that [`MmcsBuilder::finalize`] would sort the matrices in:
+/// height descending, then tag ascending within each height. The builder
+/// returns [`MmcsError::OutOfOrder`] if a call would break this.
+pub struct StreamingMmcsBuilder<B: IsMerkleTreeBackend> {
+    /// Max-height layer-0 — incrementally folded as max-height chips
+    /// arrive. `None` until the first chip is added (which fixes the
+    /// max height).
+    layer0: Option<Vec<B::Node>>,
+    /// Per-chip leaves for chips at heights < max_height, grouped by
+    /// height. Within each group, chips are in tag-asc order (enforced
+    /// by `add_matrix`).
+    by_height_below_max: BTreeMap<usize, Vec<Vec<B::Node>>>,
+    /// `(tag, padded_height)` in caller-supplied order. Populates the
+    /// final `Mmcs.matrices` (used by `spec()`).
+    matrix_specs: Vec<(MatrixTag, usize)>,
+    max_height: Option<usize>,
+}
+
+impl<B: IsMerkleTreeBackend> Default for StreamingMmcsBuilder<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: IsMerkleTreeBackend> StreamingMmcsBuilder<B> {
+    pub fn new() -> Self {
+        Self {
+            layer0: None,
+            by_height_below_max: BTreeMap::new(),
+            matrix_specs: Vec::new(),
+            max_height: None,
+        }
+    }
+
+    /// Add a chip's leaves to the in-progress MMCS. The vector is
+    /// consumed so the caller can drop the chip's source data
+    /// immediately on return.
+    ///
+    /// At the MAX height the leaves are folded into the shared layer-0
+    /// running and the vector is freed. At lower heights the vector is
+    /// stored verbatim until `finalize`.
+    pub fn add_matrix(
+        &mut self,
+        tag: MatrixTag,
+        leaf_digests: Vec<B::Node>,
+    ) -> Result<(), MmcsError> {
+        if leaf_digests.is_empty() {
+            return Err(MmcsError::EmptyMatrix);
+        }
+        if !leaf_digests.len().is_power_of_two() {
+            return Err(MmcsError::NotPowerOfTwo);
+        }
+        // Order check first — protects all subsequent invariants.
+        let h = leaf_digests.len();
+        if let Some(&(prev_tag, prev_h)) = self.matrix_specs.last() {
+            let ord = core::cmp::Ord::cmp(&prev_h, &h)
+                .reverse()
+                .then(prev_tag.cmp(&tag));
+            if !matches!(ord, core::cmp::Ordering::Less) {
+                return Err(MmcsError::OutOfOrder);
+            }
+        }
+        if self.matrix_specs.iter().any(|(t, _)| *t == tag) {
+            return Err(MmcsError::DuplicateTag);
+        }
+
+        match self.max_height {
+            None => {
+                // First chip — its height fixes max_height; its leaves
+                // seed the running layer-0.
+                self.max_height = Some(h);
+                self.layer0 = Some(leaf_digests);
+            }
+            Some(max_h) if h == max_h => {
+                // Subsequent max-height chip — fold into running layer-0.
+                let running = self
+                    .layer0
+                    .as_mut()
+                    .expect("layer0 populated once max_height is set");
+                debug_assert_eq!(running.len(), leaf_digests.len());
+                fold_into::<B>(running, &leaf_digests);
+            }
+            Some(_) => {
+                // Below max — stash per-chip leaves, drop at finalize.
+                self.by_height_below_max
+                    .entry(h)
+                    .or_default()
+                    .push(leaf_digests);
+            }
+        }
+        self.matrix_specs.push((tag, h));
+        Ok(())
+    }
+
+    /// Compress the running layer-0 upward, injecting lower-height chips
+    /// at the matching level using the same left-fold the one-shot
+    /// [`MmcsBuilder::finalize`] uses.
+    ///
+    /// The returned [`Mmcs`] has empty `leaf_digests` for each matrix
+    /// because the streaming builder consumed them. `root()` / `spec()`
+    /// are fully functional; callers that also need [`Mmcs::open`] must
+    /// regenerate the chip leaves or use [`MmcsBuilder`].
+    pub fn finalize(self) -> Result<Mmcs<B>, MmcsError> {
+        if self.matrix_specs.is_empty() {
+            return Err(MmcsError::Empty);
+        }
+        let max_height = self.max_height.ok_or(MmcsError::Empty)?;
+        let depth = max_height.trailing_zeros() as usize;
+
+        let StreamingMmcsBuilder {
+            layer0,
+            mut by_height_below_max,
+            matrix_specs,
+            max_height: _,
+        } = self;
+
+        let mut layers: Vec<Vec<B::Node>> = Vec::with_capacity(depth + 1);
+        layers.push(layer0.ok_or(MmcsError::Empty)?);
+
+        for level in 0..depth {
+            let mut next = compress_pairs::<B>(&layers[level]);
+            let new_len = max_height >> (level + 1);
+            if let Some(chips) = by_height_below_max.remove(&new_len) {
+                inject_chips_left_fold::<B>(&mut next, &chips);
+            }
+            layers.push(next);
+        }
+
+        // Carry tag + height into the Mmcs so `spec()` reports the right
+        // pairs. leaf_digests stays empty — opens are not supported on
+        // streaming output (caller must use the one-shot builder when
+        // openings are needed).
+        let matrices = matrix_specs
+            .into_iter()
+            .map(|(tag, padded_height)| MmcsMatrix {
+                tag,
+                leaf_digests: Vec::new(),
+                padded_height,
+            })
+            .collect();
+        Ok(Mmcs { layers, matrices })
+    }
+}
+
+/// Per-row fold: `acc[i] = hash_new_parent(acc[i], other[i])`.
+fn fold_into<B: IsMerkleTreeBackend>(acc: &mut [B::Node], other: &[B::Node]) {
+    debug_assert_eq!(acc.len(), other.len());
+    let n = acc.len();
+    let updated: Vec<B::Node> = {
+        let inner = |i: usize| -> B::Node { B::hash_new_parent(&acc[i], &other[i]) };
+        #[cfg(feature = "parallel")]
+        {
+            (0..n).into_par_iter().map(inner).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..n).map(inner).collect()
+        }
+    };
+    acc.clone_from_slice(&updated);
+}
+
+/// Left-fold inject several chips' leaves into `layer` at every row in
+/// tag-asc chip order:
+/// `layer[i] = hash(hash(hash(layer[i], chips[0][i]), chips[1][i]), ...)`.
+/// Mirrors `inject_matrices` in the one-shot path.
+fn inject_chips_left_fold<B: IsMerkleTreeBackend>(
+    layer: &mut [B::Node],
+    chips: &[Vec<B::Node>],
+) {
+    let n = layer.len();
+    let updated: Vec<B::Node> = {
+        let inner = |i: usize| -> B::Node {
+            let mut acc = layer[i].clone();
+            for chip in chips {
+                acc = B::hash_new_parent(&acc, &chip[i]);
+            }
+            acc
+        };
+        #[cfg(feature = "parallel")]
+        {
+            (0..n).into_par_iter().map(inner).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..n).map(inner).collect()
+        }
+    };
+    layer.clone_from_slice(&updated);
+}
+
 
 /// Build layer 0 by folding all matrices at `max_height` at row `i`, in
 /// tag-asc order (`group` already preserves this). Row-parallel.
@@ -596,6 +839,124 @@ mod tests {
         let big = make_matrix(0xAA, 4);
         let tree = build(vec![big]);
         assert_eq!(tree.open(4).err(), Some(MmcsError::IndexOutOfBounds));
+    }
+
+    // ---------- StreamingMmcsBuilder equivalence ----------
+
+    fn build_streaming(
+        matrices_in_spec_order: Vec<(MatrixTag, Vec<Node>)>,
+    ) -> Mmcs<TestBackend> {
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        for (tag, leaves) in matrices_in_spec_order {
+            b.add_matrix(tag, leaves).expect("streaming add_matrix");
+        }
+        b.finalize().expect("streaming finalize")
+    }
+
+    /// Convert an arbitrary input set into the (height desc, tag asc)
+    /// order required by `StreamingMmcsBuilder`. Matches the sort
+    /// `MmcsBuilder::finalize` does internally.
+    fn spec_sorted(mut v: Vec<(MatrixTag, Vec<Node>)>) -> Vec<(MatrixTag, Vec<Node>)> {
+        v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    #[test]
+    fn streaming_root_matches_oneshot_single_matrix() {
+        let m = make_matrix(0xAA, 8);
+        let r_oneshot = *build(vec![m.clone()]).root();
+        let r_stream = *build_streaming(spec_sorted(vec![m])).root();
+        assert_eq!(r_oneshot, r_stream);
+    }
+
+    #[test]
+    fn streaming_root_matches_oneshot_lambdavm_topology() {
+        let inputs = vec![
+            make_matrix(0x01, 8),
+            make_matrix(0x02, 8),
+            make_matrix(0x03, 8),
+            make_matrix(0x10, 4),
+            make_matrix(0x11, 4),
+            make_matrix(0xF0, 1),
+        ];
+        let r_oneshot = *build(inputs.clone()).root();
+        let r_stream = *build_streaming(spec_sorted(inputs)).root();
+        assert_eq!(r_oneshot, r_stream);
+    }
+
+    #[test]
+    fn streaming_spec_matches_oneshot() {
+        let inputs = vec![
+            make_matrix(0x01, 8),
+            make_matrix(0x02, 4),
+            make_matrix(0x03, 8),
+            make_matrix(0x04, 2),
+        ];
+        let oneshot = build(inputs.clone());
+        let stream = build_streaming(spec_sorted(inputs));
+        assert_eq!(oneshot.spec(), stream.spec());
+    }
+
+    #[test]
+    fn streaming_rejects_height_ascending() {
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        let (t0, l0) = make_matrix(0x01, 4);
+        let (t1, l1) = make_matrix(0x02, 8);
+        b.add_matrix(t0, l0).expect("first add");
+        assert_eq!(b.add_matrix(t1, l1), Err(MmcsError::OutOfOrder));
+    }
+
+    #[test]
+    fn streaming_rejects_same_height_tag_descending() {
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        let (t0, l0) = make_matrix(0x02, 4);
+        let (t1, l1) = make_matrix(0x01, 4);
+        b.add_matrix(t0, l0).expect("first add");
+        assert_eq!(b.add_matrix(t1, l1), Err(MmcsError::OutOfOrder));
+    }
+
+    #[test]
+    fn streaming_rejects_duplicate_tag_same_height() {
+        // Same tag and same height violates (height desc, tag asc); the
+        // order check fires first.
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        let (t, l) = make_matrix(0x01, 4);
+        b.add_matrix(t, l.clone()).expect("first add");
+        assert_eq!(b.add_matrix(t, l), Err(MmcsError::OutOfOrder));
+    }
+
+    #[test]
+    fn streaming_rejects_duplicate_tag_smaller_height() {
+        // Same tag at a strictly smaller height passes the order check,
+        // so the dup-tag scan catches it instead.
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        let (t, l) = make_matrix(0x01, 4);
+        b.add_matrix(t, l).expect("first add");
+        let l2: Vec<Node> = vec![[0; 32]; 2];
+        assert_eq!(b.add_matrix(t, l2), Err(MmcsError::DuplicateTag));
+    }
+
+    #[test]
+    fn streaming_rejects_empty_and_non_power_of_two() {
+        let mut b: StreamingMmcsBuilder<TestBackend> = StreamingMmcsBuilder::new();
+        let tag = MatrixTag::new([0; 8]);
+        assert_eq!(b.add_matrix(tag, Vec::new()), Err(MmcsError::EmptyMatrix));
+        let bad: Vec<Node> = vec![[0; 32]; 3];
+        assert_eq!(b.add_matrix(tag, bad), Err(MmcsError::NotPowerOfTwo));
+    }
+
+    #[test]
+    fn streaming_root_matches_oneshot_pure_same_height() {
+        let inputs = vec![
+            make_matrix(0x01, 8),
+            make_matrix(0x02, 8),
+            make_matrix(0x03, 8),
+            make_matrix(0x04, 8),
+            make_matrix(0x05, 8),
+        ];
+        let r_oneshot = *build(inputs.clone()).root();
+        let r_stream = *build_streaming(spec_sorted(inputs)).root();
+        assert_eq!(r_oneshot, r_stream);
     }
 }
 
