@@ -234,11 +234,19 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
 }
 
 // =========================================================================
-// mem group: ¬MEMORY ⇒ rvd = cast(res, WL)
+// mem group: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
 // =========================================================================
 
-/// `(1 − MEMORY) · (rvd[i] − cast(res, WL)[i]) = 0`. For LOAD/STORE `rvd` comes
-/// from the MEMORY bus; otherwise it is the (cast) ALU result.
+/// `(1 − MEMORY) · (1 − JALR) · (rvd[i] − cast(res, WL)[i]) = 0`.
+///
+/// `JALR = mem_flags` under `BRANCH` (Q6 alias). Under `!MEMORY` the
+/// `mem_flags` byte is bit-bounded by the decode (= 0 for non-BRANCH rows,
+/// ∈ {0,1} for BRANCH rows), so multiplying by `(1 − mem_flags)` exempts
+/// only the JAL/JALR rows. Those rows have `rvd` pinned to
+/// `pc + instruction_length` by [`JalrRvdConstraint`] (deviation Q10 — the
+/// spec's `res = rv1 + arg2` yields `rs1_value + 4` for JALR rows because
+/// the decode doesn't override `rs1 := x255` like it does for JAL).
+/// For LOAD/STORE `rvd` comes from the MEMORY bus.
 pub struct RvdEqResConstraint {
     /// 0 = low word, 1 = high word.
     word_idx: usize,
@@ -256,7 +264,7 @@ impl RvdEqResConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResConstraint {
     fn degree(&self) -> usize {
-        2
+        3
     }
 
     fn constraint_idx(&self) -> usize {
@@ -272,9 +280,76 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResCons
         let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
         let one = FieldElement::<F>::one();
         let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
+        let jalr = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
         let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
         let res_w = res_word(step, high);
-        (one - memory) * (rvd - res_w)
+        (&one - &memory) * (&one - &jalr) * (rvd - res_w)
+    }
+}
+
+// =========================================================================
+// branch group (Q10 deviation): BRANCH·JALR ⇒ rvd = cast(pc + len, WL)
+// =========================================================================
+
+/// `BRANCH · JALR · (rvd[i] − cast(pc + instruction_length, WL)[i]) = 0`.
+///
+/// Pins JAL/JALR's return-address write to the correct value (`pc + len`)
+/// independently of `res`. See [`RvdEqResConstraint`] for why this exists
+/// and how the two constraints partition the rvd domain.
+///
+/// **Carry caveat:** the constraint expresses `cast(pc + instruction_length,
+/// DWordWL)` assuming `pc[0] + instruction_length < 2^32`, which holds for
+/// any realistic ELF (text segment lives below 2^31). A fully carry-aware
+/// version would need a borrow column; the project's existing
+/// `next_pc = pc + len` arithmetic relies on the same assumption.
+pub struct JalrRvdConstraint {
+    /// 0 = low word, 1 = high word.
+    word_idx: usize,
+    constraint_idx: usize,
+}
+
+impl JalrRvdConstraint {
+    pub fn new(word_idx: usize, constraint_idx: usize) -> Self {
+        Self {
+            word_idx,
+            constraint_idx,
+        }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrRvdConstraint {
+    fn degree(&self) -> usize {
+        // BRANCH (deg 1) · jalr (deg 1) · (rvd - expected) (deg 1) = 3.
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let high = self.word_idx == 1;
+        let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
+        let pc_col = if high { cols::PC_1 } else { cols::PC_0 };
+        let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
+        let jalr = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
+        let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
+        let pc = step.get_main_evaluation_element(0, pc_col).clone();
+        // expected = (pc + len) for low word; (pc) for high word.
+        // The carry from low → high is omitted (pc < 2^31 in practice).
+        let expected = if high {
+            pc
+        } else {
+            let il = step
+                .get_main_evaluation_element(0, cols::INSTRUCTION_LENGTH)
+                .clone();
+            pc + il
+        };
+        branch * jalr * (rvd - expected)
     }
 }
 
@@ -439,7 +514,7 @@ pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 /// - rvd = res: 2
 /// - branch_cond: 1
 /// - next_pc: 2
-pub const NUM_CPU_CONSTRAINTS: usize = 13 + 3 + 2 + 2 + 2 + 4 + 2 + 1 + 2;
+pub const NUM_CPU_CONSTRAINTS: usize = 13 + 3 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2;
 
 /// Creates all CPU transition constraints.
 ///
@@ -494,10 +569,16 @@ pub fn create_all_cpu_constraints() -> (
         next_idx += 1;
     }
 
-    // mem: ¬MEMORY ⇒ rvd = cast(res, WL)
+    // mem: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
     other.push(RvdEqResConstraint::new(0, next_idx).boxed());
     next_idx += 1;
     other.push(RvdEqResConstraint::new(1, next_idx).boxed());
+    next_idx += 1;
+
+    // branch (Q10 deviation): BRANCH·JALR ⇒ rvd = cast(pc + instruction_length, WL)
+    other.push(JalrRvdConstraint::new(0, next_idx).boxed());
+    next_idx += 1;
+    other.push(JalrRvdConstraint::new(1, next_idx).boxed());
     next_idx += 1;
 
     // branch: branch_cond + next_pc

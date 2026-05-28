@@ -564,9 +564,11 @@ fn test_arg2_constraint_degree() {
 
 #[test]
 fn test_rvd_eq_res_constraint_degree() {
-    // (1 - MEMORY)·(rvd[i] - cast(res, WL)[i]): degree 2.
-    assert_eq!(RvdEqResConstraint::new(0, 0).degree(), 2);
-    assert_eq!(RvdEqResConstraint::new(1, 0).degree(), 2);
+    // (1 - MEMORY)·(1 - JALR)·(rvd[i] - cast(res, WL)[i]): degree 3.
+    // The extra `(1 - mem_flags)` factor exempts JAL/JALR rows (rvd pinned by
+    // JalrRvdConstraint instead). Stays at degree 3 to fit the blowup=2 budget.
+    assert_eq!(RvdEqResConstraint::new(0, 0).degree(), 3);
+    assert_eq!(RvdEqResConstraint::new(1, 0).degree(), 3);
 }
 
 #[test]
@@ -597,7 +599,7 @@ fn test_create_all_cpu_constraints_count() {
     // + branch_cond 1 + next_pc 2): 14.
     assert_eq!(is_bit.len(), 13);
     assert_eq!(add.len(), 4);
-    assert_eq!(other.len(), 14);
+    assert_eq!(other.len(), 16);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
     assert_eq!(is_bit.len() + add.len() + other.len(), NUM_CPU_CONSTRAINTS);
 }

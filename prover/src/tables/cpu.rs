@@ -313,9 +313,20 @@ impl CpuOperation {
         };
 
         // rvd: loaded value for LOAD; 0 for STORE (output unused); res otherwise.
+        // SPECIAL CASE (deviation Q10): for `BRANCH ∧ JALR` rows the return
+        // address is `pc + instruction_length`, not `res = rv1 + arg2`. The
+        // ADD fast-path computes `res = rv1 + arg2` and for JAL it happens
+        // to equal `pc + instruction_length` because the decode forces
+        // `rs1 := x255` → `rv1 = pc`. JALR has no such override (its `rv1`
+        // is the user's rs1_value, needed by the BRANCH bus for target
+        // computation), so `res = rs1_value + 4` ≠ return address. The
+        // RvdEqResConstraint is correspondingly excluded for JALR rows, and
+        // a dedicated `JalrRvdConstraint` pins `rvd` to `pc + len` instead.
         let store = f.memory && jalr; // under MEMORY, mem_flags bit 0 = memory_op (1 = store)
         let rvd = if f.memory {
             if store { 0 } else { log.dst_val }
+        } else if f.branch && jalr {
+            decode.pc.wrapping_add(f.instruction_length as u64)
         } else {
             res
         };
