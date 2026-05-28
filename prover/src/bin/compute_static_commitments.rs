@@ -1,8 +1,8 @@
 //! Prints hardcoded `(bitwise, keccak_rc)` preprocessed-table commitments for
-//! a fixed set of `blowup_factor` values. Paste the output into the
+//! a fixed set of `blowup_factor` values. The output is pasted into the
 //! `HARDCODED_PREPROCESSED_COMMITMENTS` constants in
 //! `prover/src/tables/{bitwise,keccak_rc}.rs`. The
-//! `static_commitments_tests` test suite then pins the values so any drift in
+//! `static_commitments_tests` test suite pins the values so any drift in
 //! the AIR or FFT pipeline is caught at test time.
 //!
 //! Run with:

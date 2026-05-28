@@ -10,7 +10,7 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 
 use crate::tables::{bitwise, keccak_rc};
 
-fn lookup(table: &[(u8, [u8; 32])], blowup: u8) -> [u8; 32] {
+fn find_hardcoded(table: &[(u8, [u8; 32])], blowup: u8) -> [u8; 32] {
     table
         .iter()
         .find(|(b, _)| *b == blowup)
@@ -18,32 +18,56 @@ fn lookup(table: &[(u8, [u8; 32])], blowup: u8) -> [u8; 32] {
         .unwrap_or_else(|| panic!("no hardcoded commitment for blowup_factor={blowup}"))
 }
 
-#[test]
-fn bitwise_hardcoded_matches_recompute_blowup_2() {
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+fn assert_bitwise_matches(blowup: u8) {
+    let options = GoldilocksCubicProofOptions::with_blowup(blowup)
+        .expect("blowup must be a valid power of 2");
     let computed = bitwise::compute_preprocessed_commitment(&options);
-    let hardcoded = lookup(
-        bitwise::HARDCODED_PREPROCESSED_COMMITMENTS,
-        options.blowup_factor,
-    );
+    let hardcoded = find_hardcoded(bitwise::HARDCODED_PREPROCESSED_COMMITMENTS, blowup);
     assert_eq!(
         computed, hardcoded,
-        "bitwise commitment drifted for blowup=2; regenerate constants via \
+        "bitwise commitment drifted for blowup={blowup}; regenerate constants via \
+         `cargo run --bin compute_static_commitments --release`",
+    );
+}
+
+fn assert_keccak_rc_matches(blowup: u8) {
+    let options = GoldilocksCubicProofOptions::with_blowup(blowup)
+        .expect("blowup must be a valid power of 2");
+    let computed = keccak_rc::compute_preprocessed_commitment(&options);
+    let hardcoded = find_hardcoded(keccak_rc::HARDCODED_PREPROCESSED_COMMITMENTS, blowup);
+    assert_eq!(
+        computed, hardcoded,
+        "keccak_rc commitment drifted for blowup={blowup}; regenerate constants via \
          `cargo run --bin compute_static_commitments --release`",
     );
 }
 
 #[test]
+fn bitwise_hardcoded_matches_recompute_blowup_2() {
+    assert_bitwise_matches(2);
+}
+
+#[test]
+fn bitwise_hardcoded_matches_recompute_blowup_4() {
+    assert_bitwise_matches(4);
+}
+
+#[test]
+fn bitwise_hardcoded_matches_recompute_blowup_8() {
+    assert_bitwise_matches(8);
+}
+
+#[test]
 fn keccak_rc_hardcoded_matches_recompute_blowup_2() {
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
-    let computed = keccak_rc::compute_preprocessed_commitment(&options);
-    let hardcoded = lookup(
-        keccak_rc::HARDCODED_PREPROCESSED_COMMITMENTS,
-        options.blowup_factor,
-    );
-    assert_eq!(
-        computed, hardcoded,
-        "keccak_rc commitment drifted for blowup=2; regenerate constants via \
-         `cargo run --bin compute_static_commitments --release`",
-    );
+    assert_keccak_rc_matches(2);
+}
+
+#[test]
+fn keccak_rc_hardcoded_matches_recompute_blowup_4() {
+    assert_keccak_rc_matches(4);
+}
+
+#[test]
+fn keccak_rc_hardcoded_matches_recompute_blowup_8() {
+    assert_keccak_rc_matches(8);
 }

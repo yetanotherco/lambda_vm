@@ -180,9 +180,9 @@ static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Hardcoded BITWISE preprocessed commitments per `blowup_factor`. Generated
 /// by the `compute_static_commitments` binary at the project's standard
-/// `coset_offset` (the one the `ProofOptions` constructors use) and pinned by
-/// `bitwise_hardcoded_matches_recompute_*` tests so any drift in the AIR,
-/// FFT pipeline, or `coset_offset` is caught at test time. The verifier
+/// `coset_offset = 3` (the value every in-tree `ProofOptions` constructor
+/// pins) and pinned by `bitwise_hardcoded_matches_recompute_*` tests so any
+/// drift in the AIR or FFT pipeline is caught at test time. The verifier
 /// reads these from its compiled binary — no input data is trusted.
 pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
     // (blowup_factor, commitment)
@@ -212,7 +212,7 @@ pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
     ),
 ];
 
-fn lookup_hardcoded(blowup_factor: u8) -> Option<Commitment> {
+fn find_hardcoded(blowup_factor: u8) -> Option<Commitment> {
     HARDCODED_PREPROCESSED_COMMITMENTS
         .iter()
         .find(|(b, _)| *b == blowup_factor)
@@ -229,6 +229,12 @@ fn lookup_hardcoded(blowup_factor: u8) -> Option<Commitment> {
 /// Critical for security: the commitment must be over LDE values (not raw values)
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
+///
+/// Exposed for the `compute_static_commitments` binary and the
+/// drift-detection tests in `static_commitments_tests`. Production callers
+/// should go through [`preprocessed_commitment`] so the hardcoded const-table
+/// shortcut is used when applicable.
+#[doc(hidden)]
 pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     // Step 1: Generate precomputed columns in parallel
     // Each column is generated independently by iterating over all row indices
@@ -328,7 +334,7 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// the process lifetime).
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    if let Some(hardcoded) = lookup_hardcoded(options.blowup_factor) {
+    if let Some(hardcoded) = find_hardcoded(options.blowup_factor) {
         return hardcoded;
     }
     log::warn!(

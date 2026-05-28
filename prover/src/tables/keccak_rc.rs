@@ -76,9 +76,9 @@ static KECCAK_RC_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Hardcoded KECCAK_RC preprocessed commitments per `blowup_factor`. Generated
 /// by the `compute_static_commitments` binary at the project's standard
-/// `coset_offset` (the one the `ProofOptions` constructors use) and pinned by
-/// `keccak_rc_hardcoded_matches_recompute_*` tests so any drift in the AIR,
-/// FFT pipeline, or `coset_offset` is caught at test time. The verifier
+/// `coset_offset = 3` (the value every in-tree `ProofOptions` constructor
+/// pins) and pinned by `keccak_rc_hardcoded_matches_recompute_*` tests so any
+/// drift in the AIR or FFT pipeline is caught at test time. The verifier
 /// reads these from its compiled binary — no input data is trusted.
 pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
     // (blowup_factor, commitment)
@@ -108,13 +108,18 @@ pub(crate) const HARDCODED_PREPROCESSED_COMMITMENTS: &[(u8, Commitment)] = &[
     ),
 ];
 
-fn lookup_hardcoded(blowup_factor: u8) -> Option<Commitment> {
+fn find_hardcoded(blowup_factor: u8) -> Option<Commitment> {
     HARDCODED_PREPROCESSED_COMMITMENTS
         .iter()
         .find(|(b, _)| *b == blowup_factor)
         .map(|(_, commitment)| *commitment)
 }
 
+/// Exposed for the `compute_static_commitments` binary and the
+/// drift-detection tests in `static_commitments_tests`. Production callers
+/// should go through [`preprocessed_commitment`] so the hardcoded const-table
+/// shortcut is used when applicable.
+#[doc(hidden)]
 pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     // Generate precomputed columns
     let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
@@ -162,7 +167,7 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    if let Some(hardcoded) = lookup_hardcoded(options.blowup_factor) {
+    if let Some(hardcoded) = find_hardcoded(options.blowup_factor) {
         return hardcoded;
     }
     log::warn!(
