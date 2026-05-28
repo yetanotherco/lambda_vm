@@ -20,6 +20,8 @@ jobs:
       contents: read
     env:
       LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # ubuntu:24.04 linux/amd64 manifest digest (bench runner is x64).
+      UBUNTU_IMAGE: ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff
     steps:
       - name: Validate LAMBDAVM_SHA format
         run: |
@@ -31,7 +33,7 @@ jobs:
       - name: Scrub root-owned leftovers from previous Docker runs
         run: |
           if [ -d test-results ] || [ -d out ]; then
-            docker run --rm -v "$PWD:/work" -w /work ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff rm -rf test-results out
+            docker run --rm -v "$PWD:/work" -w /work "$UBUNTU_IMAGE" rm -rf test-results out
           fi
 
       - name: Checkout zkevm-test-monitor
@@ -46,6 +48,15 @@ jobs:
           jq --arg sha "$LAMBDAVM_SHA" '.zkvms.lambdavm.commit = $sha' config.json > config.json.tmp
           mv config.json.tmp config.json
           jq '.zkvms.lambdavm' config.json
+
+      - name: Pin Dockerfile base image to digest
+        run: |
+          dockerfile=docker/build-lambdavm/Dockerfile
+          sed -i "s|^FROM ubuntu:24.04|FROM ${UBUNTU_IMAGE}|" "$dockerfile"
+          if grep -qE '^FROM .*ubuntu:24\.04' "$dockerfile"; then
+            echo "Unpinned ubuntu:24.04 still present in $dockerfile"
+            exit 1
+          fi
 
       - name: Build + test lambdavm
         id: run
