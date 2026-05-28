@@ -65,7 +65,7 @@ root.
 
 ## Delete the server
 
-To stop hourly charges, delete the server:
+To delete the server:
 
 ```bash
 scw baremetal server delete <server_id> zone=<zone>
