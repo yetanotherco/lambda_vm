@@ -12,23 +12,29 @@ on:
   pull_request:
     types: [labeled]
 
-permissions:
-  contents: read
-  issues: write
-
 concurrency:
   group: act4-nightly
   cancel-in-progress: false
 
 jobs:
-  act4:
-    # TEMPORARY label gate: only fire on the 'run-act4' label.
-    if: github.event_name != 'pull_request' || github.event.label.name == 'run-act4'
+  test:
+    if: >-
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      && (github.event_name != 'pull_request' || github.event.label.name == 'run-act4')
     runs-on: [self-hosted, bench]
     timeout-minutes: 360
+    permissions:
+      contents: read
     env:
       LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
     steps:
+      - name: Validate LAMBDAVM_SHA format
+        run: |
+          if [[ ! "$LAMBDAVM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid LAMBDAVM_SHA: $LAMBDAVM_SHA"
+            exit 1
+          fi
+
       - name: Scrub root-owned leftovers from previous Docker runs
         run: |
           if [ -d test-results ] || [ -d out ]; then
@@ -39,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: eth-act/zkevm-test-monitor
-          ref: main
+          ref: c9e710b43448576920f7e841a2b68bab8b7a20f8
 
       - name: Pin lambdavm.commit to current main SHA
         run: |
@@ -69,7 +75,6 @@ jobs:
             msg="No ACT4 summary files were produced. See run.log."
             echo "$msg" | tee out/summary.md
             echo "$msg" >> "$GITHUB_STEP_SUMMARY"
-            echo "failed=-1" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
@@ -86,7 +91,6 @@ jobs:
             n=$(jq '.failed // 0' "$f")
             FAILED=$((FAILED + n))
           done
-          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
           echo "Total failed tests: $FAILED"
           [ "$FAILED" -eq 0 ]
 
@@ -100,8 +104,29 @@ jobs:
             test-results/lambdavm/
           retention-days: 30
 
-      - name: Open or update issue on failure
-        if: failure()
+  report:
+    needs: test
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Validate LAMBDAVM_SHA format
+        run: |
+          if [[ ! "$LAMBDAVM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid LAMBDAVM_SHA: $LAMBDAVM_SHA"
+            exit 1
+          fi
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: act4-results-${{ github.run_id }}
+
+      - name: Open or update issue
         uses: actions/github-script@v7
         with:
           script: |
@@ -149,4 +174,3 @@ jobs:
               });
               console.log(`Created issue #${created.data.number}`);
             }
-
