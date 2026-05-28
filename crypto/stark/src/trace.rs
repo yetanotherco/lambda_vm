@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 #[cfg(test)]
@@ -216,8 +218,13 @@ where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
-    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
+    /// LDE columns for the main trace, Arc-wrapped so chunk-mate tables
+    /// can share access without copying the large column data — needed by
+    /// the per-chunk MMCS open path which rehashes chunk-mate rows on
+    /// demand. Read-only after construction.
+    pub(crate) main_columns: Arc<Vec<Vec<FieldElement<F>>>>,
+    /// Same shape for aux columns.
+    pub(crate) aux_columns: Arc<Vec<Vec<FieldElement<E>>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
 }
@@ -227,16 +234,35 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    /// Creates a column-major LDETraceTable by consuming column vectors directly.
-    /// No transpose is performed — columns are stored as-is.
+    /// Creates a column-major LDETraceTable by consuming column vectors
+    /// directly. Wraps each column slice in an `Arc` so the resulting
+    /// table can be cheaply shared across threads and per-chunk open
+    /// helpers.
     pub fn from_columns(
         main_columns: Vec<Vec<FieldElement<F>>>,
         aux_columns: Vec<Vec<FieldElement<E>>>,
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
-        let lde_step_size = trace_step_size * blowup_factor;
+        Self::from_columns_arc(
+            Arc::new(main_columns),
+            Arc::new(aux_columns),
+            trace_step_size,
+            blowup_factor,
+        )
+    }
 
+    /// Creates an `LDETraceTable` from already-`Arc`-wrapped column data.
+    /// Useful when the same column data is being shared with other
+    /// consumers (e.g. a per-chunk MMCS open context) and the caller
+    /// wants to avoid re-allocating the Arc.
+    pub fn from_columns_arc(
+        main_columns: Arc<Vec<Vec<FieldElement<F>>>>,
+        aux_columns: Arc<Vec<Vec<FieldElement<E>>>>,
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> Self {
+        let lde_step_size = trace_step_size * blowup_factor;
         Self {
             main_columns,
             aux_columns,
@@ -245,10 +271,28 @@ where
         }
     }
 
-    /// Consume self and return the owned column vectors.
+    /// Consume self and return the Arc-wrapped column vectors. Callers
+    /// that need to mutate or destructure should clone the inner Vecs.
     #[allow(clippy::type_complexity)]
-    pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
+    pub fn into_columns(
+        self,
+    ) -> (
+        Arc<Vec<Vec<FieldElement<F>>>>,
+        Arc<Vec<Vec<FieldElement<E>>>>,
+    ) {
         (self.main_columns, self.aux_columns)
+    }
+
+    /// Cheap clone of the underlying main-column Arc. Used by per-chunk
+    /// MMCS open helpers that need read-only shared access without
+    /// owning a copy.
+    pub fn main_columns_arc(&self) -> Arc<Vec<Vec<FieldElement<F>>>> {
+        Arc::clone(&self.main_columns)
+    }
+
+    /// Cheap clone of the underlying aux-column Arc. See [`main_columns_arc`].
+    pub fn aux_columns_arc(&self) -> Arc<Vec<Vec<FieldElement<E>>>> {
+        Arc::clone(&self.aux_columns)
     }
 
     pub fn num_main_cols(&self) -> usize {
