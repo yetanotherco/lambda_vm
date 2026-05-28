@@ -106,7 +106,6 @@ jobs:
               ? fs.readFileSync('out/summary.md', 'utf8')
               : '_summary not available_';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const labels = ['ci', 'act4-nightly', 'failed'];
 
             const body = [
               `## ACT4 nightly failure`,
@@ -123,7 +122,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
-              labels: labels.join(','),
+              labels: 'act4-nightly',
             });
 
             if (existing.data.length > 0) {
@@ -140,7 +139,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `ACT4 nightly failed @ ${shortSha}`,
-                labels,
+                labels: ['act4-nightly'],
                 body,
               });
               console.log(`Created issue #${created.data.number}`);
