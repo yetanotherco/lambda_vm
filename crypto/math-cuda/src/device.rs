@@ -102,21 +102,10 @@ const STREAM_POOL_SIZE: usize = 32;
 pub struct Backend {
     pub ctx: Arc<CudaContext>,
     streams: Vec<Arc<CudaStream>>,
-    /// Per-rayon-worker pinned staging buffers, grown lazily to the biggest
-    /// LDE size each worker sees. Indexed by `rayon::current_thread_index()`
-    /// (or 0 for non-rayon callers).
-    ///
-    /// Per-worker (not single-shared) because the LDE call holds the lock
-    /// across an internal rayon `par_chunks_mut`/`par_iter` window: with a
-    /// single shared mutex, rayon work-stealing can yield a lock-holder onto
-    /// another task waiting for the same lock — classic recursive-rayon
-    /// deadlock. Per-worker buffers eliminate cross-worker contention so
-    /// each `par_iter` worker hits a distinct mutex.
-    ///
-    /// Each entry starts empty (`PinnedStaging::empty()` is a zero-cost null
-    /// handle); only the slots actually used by the running workers ever
-    /// allocate pinned memory. Worst-case footprint is `N_workers ×
-    /// max_LDE_size` of pinned host RAM.
+    /// Per-rayon-worker pinned staging buffers. Indexed by
+    /// `rayon::current_thread_index()` (0 for non-rayon callers). Each slot
+    /// grows lazily on first use, idle slots stay at zero allocation.
+    /// Worst-case footprint is `N_workers × max_LDE_size` of pinned host RAM.
     pinned_staging: Vec<Mutex<PinnedStaging>>,
     /// Per-worker pinned staging for Merkle leaf hashes. Same layout as
     /// `pinned_staging`; sized `num_rows * 32` bytes per slot. Lives
