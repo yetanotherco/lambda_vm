@@ -6,6 +6,11 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+  # TEMPORARY: remove before merging to main.
+  # Manually trigger by adding the 'run-act4' label to a PR from this branch
+  # (re-trigger: remove the label, then re-add it).
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
@@ -17,6 +22,8 @@ concurrency:
 
 jobs:
   act4:
+    # TEMPORARY label gate: only fire on the 'run-act4' label.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-act4'
     runs-on: [self-hosted, bench]
     timeout-minutes: 360
     env:
