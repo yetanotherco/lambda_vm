@@ -6,11 +6,6 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
-  # TEMPORARY: remove before merging to main.
-  # Manually trigger by adding the 'run-act4' label to PR #631
-  # (re-trigger: remove the label, then re-add it).
-  pull_request:
-    types: [labeled]
 
 concurrency:
   group: act4-nightly
@@ -18,15 +13,13 @@ concurrency:
 
 jobs:
   test:
-    if: >-
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
-      && (github.event_name != 'pull_request' || github.event.label.name == 'run-act4')
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, bench]
     timeout-minutes: 360
     permissions:
       contents: read
     env:
-      LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+      LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       # ubuntu:24.04 linux/amd64 manifest digest (bench runner is x64).
       UBUNTU_IMAGE: ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff
     steps:
@@ -129,7 +122,7 @@ jobs:
       contents: read
       issues: write
     env:
-      LAMBDAVM_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+      LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Validate LAMBDAVM_SHA format
         run: |
