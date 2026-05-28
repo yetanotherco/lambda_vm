@@ -483,6 +483,30 @@ impl<B: IsMerkleTreeBackend> Mmcs<B> {
     }
 
     pub fn open(&self, global_index: usize) -> Result<MmcsOpening<B::Node>, MmcsError> {
+        self.open_with_leaves(global_index, |m_idx, local_idx| {
+            self.matrices[m_idx].leaf_digests[local_idx].clone()
+        })
+    }
+
+    /// Like [`Mmcs::open`] but pulls each matrix's per-row leaf from a
+    /// caller-supplied closure instead of `self.matrices[i].leaf_digests`.
+    /// Required when this `Mmcs` was produced by [`StreamingMmcsBuilder`]
+    /// (which discards per-chip leaves at build time): the closure
+    /// rehashes the row from the chip's source data on demand.
+    ///
+    /// The closure receives `(matrix_idx_in_spec_order, local_idx)` where
+    /// `local_idx = global_index >> log2(max_height / m.padded_height())`,
+    /// and must return the same digest the one-shot builder would have
+    /// stored at that position. Returning a wrong digest produces an
+    /// opening whose `verify` will fail on the prover side.
+    pub fn open_with_leaves<F>(
+        &self,
+        global_index: usize,
+        mut leaf_fn: F,
+    ) -> Result<MmcsOpening<B::Node>, MmcsError>
+    where
+        F: FnMut(usize, usize) -> B::Node,
+    {
         let max_height = self.matrices[0].padded_height();
         if global_index >= max_height {
             return Err(MmcsError::IndexOutOfBounds);
@@ -490,10 +514,10 @@ impl<B: IsMerkleTreeBackend> Mmcs<B> {
         let depth = max_height.trailing_zeros() as usize;
 
         let mut matrix_leaves: Vec<(MatrixTag, B::Node)> = Vec::with_capacity(self.matrices.len());
-        for matrix in &self.matrices {
+        for (m_idx, matrix) in self.matrices.iter().enumerate() {
             let shift = (max_height / matrix.padded_height()).trailing_zeros() as usize;
-            let idx = global_index >> shift;
-            matrix_leaves.push((matrix.tag, matrix.leaf_digests[idx].clone()));
+            let local_idx = global_index >> shift;
+            matrix_leaves.push((matrix.tag, leaf_fn(m_idx, local_idx)));
         }
 
         let mut siblings: Vec<B::Node> = Vec::with_capacity(depth);
@@ -943,6 +967,48 @@ mod tests {
         assert_eq!(b.add_matrix(tag, Vec::new()), Err(MmcsError::EmptyMatrix));
         let bad: Vec<Node> = vec![[0; 32]; 3];
         assert_eq!(b.add_matrix(tag, bad), Err(MmcsError::NotPowerOfTwo));
+    }
+
+    #[test]
+    fn streaming_open_with_leaves_round_trips_against_one_shot() {
+        // Lambda-vm topology built two ways: one-shot builds a fully-
+        // populated Mmcs whose `open` works directly; streaming builds an
+        // empty-leaves Mmcs whose `open_with_leaves` must produce the
+        // same opening when fed the same chip leaves.
+        let inputs = vec![
+            make_matrix(0x01, 8),
+            make_matrix(0x02, 8),
+            make_matrix(0x03, 8),
+            make_matrix(0x10, 4),
+            make_matrix(0x11, 4),
+            make_matrix(0xF0, 1),
+        ];
+        let oneshot = build(inputs.clone());
+        let stream = build_streaming(spec_sorted(inputs.clone()));
+        assert_eq!(*oneshot.root(), *stream.root());
+        assert_eq!(oneshot.spec(), stream.spec());
+
+        let sorted = spec_sorted(inputs);
+        let leaves_by_tag: std::collections::HashMap<MatrixTag, Vec<Node>> =
+            sorted.iter().map(|(t, l)| (*t, l.clone())).collect();
+        let spec = stream.spec();
+
+        for global_index in 0..8 {
+            let from_oneshot = oneshot.open(global_index).expect("oneshot open");
+            let from_stream = stream
+                .open_with_leaves(global_index, |m_idx, local_idx| {
+                    let tag = spec[m_idx].0;
+                    leaves_by_tag[&tag][local_idx]
+                })
+                .expect("streaming open_with_leaves");
+            assert_eq!(from_oneshot.global_index, from_stream.global_index);
+            assert_eq!(from_oneshot.siblings, from_stream.siblings);
+            assert_eq!(from_oneshot.matrix_leaves, from_stream.matrix_leaves);
+            assert!(
+                from_stream.verify::<TestBackend>(stream.root(), &spec),
+                "streaming opening must verify"
+            );
+        }
     }
 
     #[test]
