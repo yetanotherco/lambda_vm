@@ -107,7 +107,6 @@ jobs:
           script: |
             const fs = require('fs');
             const sha = process.env.LAMBDAVM_SHA;
-            const shortSha = sha.substring(0, 8);
             const summary = fs.existsSync('out/summary.md')
               ? fs.readFileSync('out/summary.md', 'utf8')
               : '_summary not available_';
@@ -144,7 +143,7 @@ jobs:
               const created = await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: `ACT4 nightly failed @ ${shortSha}`,
+                title: 'ACT4 nightly failure',
                 labels: ['act4-nightly'],
                 body,
               });
