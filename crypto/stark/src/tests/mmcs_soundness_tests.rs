@@ -26,11 +26,7 @@ type F = GoldilocksField;
 /// Build a baseline multi-proof over (DummyAIR, BitFlagsAIR). Both are
 /// non-preprocessed → every main opening is `MainTraceOpening::Mmcs`.
 #[allow(clippy::type_complexity)]
-fn baseline_proof() -> (
-    DummyAIR,
-    BitFlagsAIR,
-    MultiProof<F, F, ()>,
-) {
+fn baseline_proof() -> (DummyAIR, BitFlagsAIR, MultiProof<F, F, ()>) {
     let proof_options = ProofOptions::default_test_options();
     let air_1 = DummyAIR::new(&proof_options);
     let air_2 = BitFlagsAIR::new(&proof_options);
@@ -40,16 +36,15 @@ fn baseline_proof() -> (
         &dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>,
         &mut _,
         &_,
-    )> = vec![
-        (&air_1, &mut trace_1, &()),
-        (&air_2, &mut trace_2, &()),
-    ];
-    let proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
+    )> = vec![(&air_1, &mut trace_1, &()), (&air_2, &mut trace_2, &())];
+    let proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
     (air_1, air_2, proof)
 }
 
-fn verify(airs: &[&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>], proof: &MultiProof<F, F, ()>) -> bool {
+fn verify(
+    airs: &[&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>],
+    proof: &MultiProof<F, F, ()>,
+) -> bool {
     multi_verify_ram(
         airs,
         proof,
@@ -58,12 +53,18 @@ fn verify(airs: &[&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>], p
     )
 }
 
-/// First-iota opening for the first table in the multi-proof, in the Mmcs
-/// variant. Helper for tests that need a mutable handle into the per-query
-/// MMCS opening fields.
-fn first_mmcs_opening_mut(
-    proof: &mut MultiProof<F, F, ()>,
-) -> &mut MainTraceOpening<F> {
+/// First chunk index whose main MMCS root is `Some` — i.e., the first
+/// chunk that has at least one non-preprocessed table. Used by the
+/// tampering tests to locate a real root/spec to mutate.
+fn first_populated_main_chunk(proof: &MultiProof<F, F, ()>) -> usize {
+    proof
+        .main_mmcs_roots
+        .iter()
+        .position(|r| r.is_some())
+        .expect("at least one chunk must have a main MMCS root in this baseline")
+}
+
+fn first_mmcs_opening_mut(proof: &mut MultiProof<F, F, ()>) -> &mut MainTraceOpening<F> {
     &mut proof.proofs[0].deep_poly_openings[0].main_trace_polys
 }
 
@@ -80,7 +81,11 @@ fn tampered_main_mmcs_root_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
         vec![&air_1, &air_2];
-    proof.main_mmcs_root[0] ^= 1;
+    let chunk_idx = first_populated_main_chunk(&proof);
+    let root = proof.main_mmcs_roots[chunk_idx]
+        .as_mut()
+        .expect("populated");
+    root[0] ^= 1;
     assert!(
         !verify(&airs, &proof),
         "tampered main MMCS root must be rejected"
@@ -92,8 +97,8 @@ fn tampered_main_mmcs_spec_height_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
         vec![&air_1, &air_2];
-    let height = &mut proof.main_mmcs_spec[0].1;
-    *height /= 2;
+    let chunk_idx = first_populated_main_chunk(&proof);
+    proof.main_mmcs_specs[chunk_idx][0].1 /= 2;
     assert!(
         !verify(&airs, &proof),
         "spec height mismatch must be rejected"
@@ -105,11 +110,23 @@ fn tampered_main_mmcs_spec_tag_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
         vec![&air_1, &air_2];
-    proof.main_mmcs_spec[0].0 = MatrixTag::new([0xFF; 8]);
+    let chunk_idx = first_populated_main_chunk(&proof);
+    proof.main_mmcs_specs[chunk_idx][0].0 = MatrixTag::new([0xFF; 8]);
     assert!(
         !verify(&airs, &proof),
         "spec tag mismatch must be rejected"
     );
+}
+
+#[test_log::test]
+fn tampered_chunk_size_rejected() {
+    // Pinned chunk_size mismatch should produce verifier rejection (per-chunk
+    // Vec lengths no longer line up with the verifier's chunking).
+    let (air_1, air_2, mut proof) = baseline_proof();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
+        vec![&air_1, &air_2];
+    proof.chunk_size = proof.chunk_size.saturating_add(1);
+    assert!(!verify(&airs, &proof), "tampered chunk_size must be rejected");
 }
 
 #[test_log::test]
@@ -202,14 +219,13 @@ fn tampered_evaluations_rejected() {
 #[test_log::test]
 fn swapped_main_tags_at_verifier_rejected() {
     // The verifier reproduces `main_tags` from `synth_main_tags(num_airs)`
-    // inside `multi_verify_ram`. To simulate a verifier that "lies" about
-    // tag ordering we call `multi_verify` directly with a permuted slice.
+    // inside `multi_verify_ram`. Simulate a verifier that "lies" about
+    // tag ordering by calling `multi_verify` directly with a permuted slice.
     use crate::verifier::{IsStarkVerifier, Verifier};
     let (air_1, air_2, proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
         vec![&air_1, &air_2];
 
-    // Sanity: with the correct (synth) tag order it passes.
     let correct = synth_main_tags(airs.len());
     assert!(
         Verifier::multi_verify(
@@ -222,8 +238,6 @@ fn swapped_main_tags_at_verifier_rejected() {
         "baseline must verify with correct tags"
     );
 
-    // Swap the two tags — the spec sort order is now wrong relative to the
-    // prover's commitments, so the spec match check must reject.
     let mut swapped = correct.clone();
     swapped.swap(0, 1);
     assert!(

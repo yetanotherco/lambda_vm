@@ -504,23 +504,34 @@ impl VmAirs {
 
 /// Replay the prover's Phase A (main trace commitments) to recover the shared
 /// LogUp challenges (z, alpha). Mirrors `multi_verify` Phase A absorb order:
-/// for each table, absorb its precomputed root and (preprocessed only) its
-/// per-table multiplicities Merkle root; then absorb the shared main-trace
-/// MMCS root once at the end.
+/// for each chunk of `chunk_size` tables, in order, absorb each table's
+/// preprocessed + per-table multiplicities root (preprocessed only); then,
+/// after each chunk, absorb that chunk's main MMCS root (`Some`) or skip
+/// (`None`, when the chunk has no non-preprocessed tables).
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
     transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-        if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
-            if let Some(root) = &proof.lde_trace_main_merkle_root {
-                transcript.append_bytes(root);
+    let chunk_size = multi_proof.chunk_size as usize;
+    let num_chunks = multi_proof.main_mmcs_roots.len();
+    for chunk_idx in 0..num_chunks {
+        let chunk_start = chunk_idx * chunk_size;
+        let chunk_end = (chunk_start + chunk_size).min(airs.len());
+        for idx in chunk_start..chunk_end {
+            let air = airs[idx];
+            let proof = &multi_proof.proofs[idx];
+            if air.is_preprocessed() {
+                transcript.append_bytes(&air.precomputed_commitment());
+                if let Some(root) = &proof.lde_trace_main_merkle_root {
+                    transcript.append_bytes(root);
+                }
             }
         }
+        if let Some(root) = &multi_proof.main_mmcs_roots[chunk_idx] {
+            transcript.append_bytes(root);
+        }
     }
-    transcript.append_bytes(&multi_proof.main_mmcs_root);
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
     (z, alpha)

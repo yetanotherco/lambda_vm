@@ -32,7 +32,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, MainTraceOpening, PolynomialOp
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
-use crypto::merkle_tree::mmcs::{MatrixTag, Mmcs, MmcsBuilder, MmcsError};
+use crypto::merkle_tree::mmcs::{MatrixTag, Mmcs, MmcsError, StreamingMmcsBuilder};
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -81,26 +81,43 @@ pub enum ProvingError {
     DiskSpill(String),
 }
 
-/// Per-table commitment artifacts for the main trace under the shared
-/// MMCS protocol. The `mmcs` Arc is the SAME instance for every table in
-/// the multi-proof — Phase A builds it once.
+/// Per-chunk main MMCS context. Shared across every non-preprocessed
+/// table in a chunk: the chunk's MMCS Arc + Arc-cloned LDE columns for
+/// chunk-mate non-preprocessed tables in MMCS-spec sort order. The
+/// per-query open path uses this to rehash chunk-mate rows on demand
+/// (the streaming MMCS dropped the per-chip leaf arrays at build time).
+pub(crate) struct ChunkMainMmcsContext<F: IsField>
+where
+    FieldElement<F>: AsBytes,
+{
+    /// Chunk-scoped MMCS (built once per chunk in Phase A).
+    pub(crate) mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+    /// Arc-cloned LDE columns for the non-preprocessed chunk-mates,
+    /// indexed in MMCS spec sort order (parallel to `mmcs.spec()`).
+    /// Open path closures look up `lde_columns_in_spec_order[m_idx]` to
+    /// rehash the row at the queried local position.
+    pub(crate) lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<F>>>>>,
+}
+
+/// Per-table commitment artifacts for the main trace.
 ///
-/// `padded_height` is this table's LDE height (a power of two), needed to
-/// translate the table's local FRI iota into a global MMCS index when
-/// opening (see `open_deep_composition_poly`).
+/// `Shared` tables borrow a per-chunk MMCS context (Arc) and remember
+/// their chunk index so the verifier can look up the matching root +
+/// spec in `MultiProof::main_mmcs_roots[chunk_idx]`.
 pub(crate) enum MainCommit<F: IsField>
 where
     FieldElement<F>: AsBytes,
 {
-    /// Non-preprocessed table: committed under the shared MMCS.
+    /// Non-preprocessed table: committed under the chunk's MMCS.
     Shared {
-        mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+        chunk_ctx: Arc<ChunkMainMmcsContext<F>>,
+        chunk_idx: usize,
         tag: MatrixTag,
         /// Padded height (== LDE row count); needed to translate a local
-        /// FRI iota into a global MMCS index.
+        /// FRI iota into a global MMCS index inside this chunk's MMCS.
         padded_height: usize,
     },
-    /// Preprocessed table: two per-table Merkle trees, NOT in the MMCS.
+    /// Preprocessed table: two per-table Merkle trees, NOT in any MMCS.
     Preprocessed {
         multiplicities_tree: Arc<BatchedMerkleTree<F>>,
         multiplicities_root: Commitment,
@@ -137,11 +154,13 @@ where
     fn share(&self) -> Self {
         match self {
             Self::Shared {
-                mmcs,
+                chunk_ctx,
+                chunk_idx,
                 tag,
                 padded_height,
             } => Self::Shared {
-                mmcs: Arc::clone(mmcs),
+                chunk_ctx: Arc::clone(chunk_ctx),
+                chunk_idx: *chunk_idx,
                 tag: *tag,
                 padded_height: *padded_height,
             },
@@ -207,16 +226,26 @@ where
     }
 }
 
-/// Per-table aux-trace commitment under the shared aux MMCS.
-/// Mirror of [`MainCommit::Shared`]: the `mmcs` Arc is shared across every
-/// table that contributes an aux trace; `tag` + `padded_height` identify
-/// this table's slot inside that MMCS.
+/// Per-chunk aux MMCS context. Sister of [`ChunkMainMmcsContext`] for
+/// the aux trace.
+pub(crate) struct ChunkAuxMmcsContext<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    pub(crate) mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<E>>>,
+    /// Arc-cloned aux LDE columns for chunk-mates with aux, in MMCS
+    /// spec sort order.
+    pub(crate) lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<E>>>>>,
+}
+
+/// Per-table aux-trace commitment under a chunk's aux MMCS.
 pub(crate) enum AuxCommit<E: IsField>
 where
     FieldElement<E>: AsBytes,
 {
     Shared {
-        mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<E>>>,
+        chunk_ctx: Arc<ChunkAuxMmcsContext<E>>,
+        chunk_idx: usize,
         tag: MatrixTag,
         padded_height: usize,
     },
@@ -229,11 +258,13 @@ where
     fn share(&self) -> Self {
         match self {
             Self::Shared {
-                mmcs,
+                chunk_ctx,
+                chunk_idx,
                 tag,
                 padded_height,
             } => Self::Shared {
-                mmcs: Arc::clone(mmcs),
+                chunk_ctx: Arc::clone(chunk_ctx),
+                chunk_idx: *chunk_idx,
                 tag: *tag,
                 padded_height: *padded_height,
             },
@@ -290,13 +321,16 @@ where
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
-/// LDE columns for main (Phase A) and auxiliary (Phase C) traces, consumed by value in Phase D.
+/// LDE columns for main (Phase A) and auxiliary (Phase C) traces.
+/// Arc-wrapped so per-chunk MMCS contexts can hold cheap clones for the
+/// open path while the originating table's `Round1.lde_trace` retains
+/// the same data via Arc share (no duplication).
 ///
-/// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
-/// and Phase D (O(N × cols × lde_size)).
+/// Memory trade-off: all N tables' LDE columns are live simultaneously
+/// between Phase A/C and Phase D (O(N × cols × lde_size)).
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
-    main: Vec<Vec<FieldElement<Field>>>,
-    aux: Vec<Vec<FieldElement<FieldExtension>>>,
+    main: Arc<Vec<Vec<FieldElement<Field>>>>,
+    aux: Arc<Vec<Vec<FieldElement<FieldExtension>>>>,
 }
 
 impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
@@ -307,7 +341,9 @@ where
     FieldElement<FieldExtension>: AsBytes,
 {
     /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
-    /// The `share` calls are cheap — only bump Arc refcounts.
+    /// The `share` calls are cheap — only bump Arc refcounts. The LDE
+    /// columns are also Arc-shared (with this chunk's MMCS contexts) so
+    /// the open path can rehash chunk-mate rows without copying.
     fn build_round1(
         &self,
         lde: Lde<Field, FieldExtension>,
@@ -315,7 +351,12 @@ where
         blowup_factor: usize,
     ) -> Round1<Field, FieldExtension> {
         Round1 {
-            lde_trace: LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor),
+            lde_trace: LDETraceTable::from_columns_arc(
+                lde.main,
+                lde.aux,
+                step_size,
+                blowup_factor,
+            ),
             main: self.main.share(),
             aux: self.aux.as_ref().map(AuxCommit::share),
             rap_challenges: self.rap_challenges.clone(),
@@ -512,17 +553,73 @@ fn map_mmcs_err(e: MmcsError) -> ProvingError {
     ProvingError::WrongParameter(format!("MMCS: {e:?}"))
 }
 
-/// Build the unified main-trace MMCS from the per-table Phase A outputs.
-/// Returns the root, the (tag, padded_height) spec, and the shared Arc that
-/// every table's `MainCommit` borrows.
+/// Rehash a single main-trace LDE row to its tagged leaf digest. Used by
+/// the per-chunk open path: when `Mmcs::open_with_leaves` walks the chunk
+/// MMCS spec to gather matrix_leaves at a queried position, this helper
+/// recomputes each chunk-mate's leaf on demand from the chunk-shared LDE
+/// columns. Mirrors what the verifier computes via `hash_tagged_row`.
+pub fn rehash_main_chip_leaf<F>(
+    tag: MatrixTag,
+    columns: &Arc<Vec<Vec<FieldElement<F>>>>,
+    local_idx: usize,
+) -> Commitment
+where
+    F: IsField,
+    FieldElement<F>: AsBytes + ByteConversion,
+{
+    let num_rows = columns
+        .first()
+        .map(|c| c.len())
+        .expect("non-empty LDE columns");
+    let br_idx = reverse_index(local_idx, num_rows as u64);
+    let byte_len = <FieldElement<F> as ByteConversion>::BYTE_LEN;
+    let mut buf = vec![0u8; columns.len() * byte_len];
+    for (col_idx, col) in columns.iter().enumerate() {
+        col[br_idx].write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+    }
+    crate::mmcs_leaf::hash_tagged_row_bytes(tag, &buf)
+}
+
+/// Aux-trace counterpart of [`rehash_main_chip_leaf`] using the AUX
+/// domain separator so aux/main leaves cannot collide.
+pub fn rehash_aux_chip_leaf<E>(
+    tag: MatrixTag,
+    columns: &Arc<Vec<Vec<FieldElement<E>>>>,
+    local_idx: usize,
+) -> Commitment
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + ByteConversion,
+{
+    let num_rows = columns
+        .first()
+        .map(|c| c.len())
+        .expect("non-empty aux LDE columns");
+    let br_idx = reverse_index(local_idx, num_rows as u64);
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    let mut buf = vec![0u8; columns.len() * byte_len];
+    for (col_idx, col) in columns.iter().enumerate() {
+        col[br_idx].write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+    }
+    crate::mmcs_leaf::hash_tagged_row_bytes_aux(tag, &buf)
+}
+
+/// Build a CHUNK-scoped main MMCS via [`StreamingMmcsBuilder`]. Consumes
+/// the Shared phase-A outputs (drops their per-chip leaves once folded),
+/// returns the chunk root + spec + an `Arc<ChunkMainMmcsContext>` that
+/// every Shared table in the chunk borrows.
+///
+/// Returns `None` for the root/context when the chunk has no Shared
+/// tables (entire chunk is preprocessed).
 #[allow(clippy::type_complexity)]
-fn build_main_mmcs<F>(
-    outputs: &[MainPhaseAOutput<F>],
+fn build_chunk_main_mmcs<F>(
+    shared_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)>,
+    chunk_lde_for_shared: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<F>>>>)>,
 ) -> Result<
     (
-        Commitment,
+        Option<Commitment>,
         Vec<(MatrixTag, usize)>,
-        Arc<Mmcs<BatchedMerkleTreeBackend<F>>>,
+        Option<Arc<ChunkMainMmcsContext<F>>>,
     ),
     ProvingError,
 >
@@ -530,23 +627,41 @@ where
     F: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Send + Sync,
 {
-    let mut builder: MmcsBuilder<BatchedMerkleTreeBackend<F>> = MmcsBuilder::new();
-    for output in outputs {
-        if let MainPhaseAOutput::Shared {
-            tag,
-            leaves,
-            padded_height: _,
-        } = output
-        {
-            builder
-                .add_matrix(*tag, leaves.clone())
-                .map_err(map_mmcs_err)?;
-        }
+    if shared_outputs.is_empty() {
+        return Ok((None, Vec::new(), None));
+    }
+    debug_assert_eq!(shared_outputs.len(), chunk_lde_for_shared.len());
+
+    // Sort both vectors into MMCS spec order: height desc, tag asc.
+    let mut shared_outputs = shared_outputs;
+    shared_outputs.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let lde_by_tag: std::collections::BTreeMap<MatrixTag, Arc<Vec<Vec<FieldElement<F>>>>> =
+        chunk_lde_for_shared.into_iter().collect();
+
+    let mut builder: StreamingMmcsBuilder<BatchedMerkleTreeBackend<F>> =
+        StreamingMmcsBuilder::new();
+    let mut lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<F>>>>> =
+        Vec::with_capacity(shared_outputs.len());
+    for (tag, leaves, _padded_height) in shared_outputs {
+        let lde = lde_by_tag
+            .get(&tag)
+            .ok_or_else(|| {
+                ProvingError::WrongParameter(format!(
+                    "missing chunk LDE for tag {tag:?} during chunk MMCS build"
+                ))
+            })?
+            .clone();
+        lde_columns_in_spec_order.push(lde);
+        builder.add_matrix(tag, leaves).map_err(map_mmcs_err)?;
     }
     let mmcs = builder.finalize().map_err(map_mmcs_err)?;
     let root = *mmcs.root();
     let spec = mmcs.spec();
-    Ok((root, spec, Arc::new(mmcs)))
+    let ctx = Arc::new(ChunkMainMmcsContext {
+        mmcs: Arc::new(mmcs),
+        lde_columns_in_spec_order,
+    });
+    Ok((Some(root), spec, Some(ctx)))
 }
 
 /// Tagged per-row leaf digest for the AUX-trace MMCS. Mirror of
@@ -591,17 +706,18 @@ where
     }
 }
 
-/// Build the shared AUX-trace MMCS from per-table Phase-C outputs (only
-/// tables that have an aux trace participate). Returns `None`/`empty spec`
-/// when no table contributes aux.
+/// Build a CHUNK-scoped aux MMCS via [`StreamingMmcsBuilder`]. Sister of
+/// [`build_chunk_main_mmcs`] for the aux trace. Returns `None` for root
+/// and context when no chunk-mate has an aux trace.
 #[allow(clippy::type_complexity)]
-fn build_aux_mmcs<E>(
-    outputs: &[Option<AuxPhaseCOutput<E>>],
+fn build_chunk_aux_mmcs<E>(
+    aux_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)>,
+    chunk_aux_lde_for_shared: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<E>>>>)>,
 ) -> Result<
     (
         Option<Commitment>,
         Vec<(MatrixTag, usize)>,
-        Option<Arc<Mmcs<BatchedMerkleTreeBackend<E>>>>,
+        Option<Arc<ChunkAuxMmcsContext<E>>>,
     ),
     ProvingError,
 >
@@ -609,20 +725,40 @@ where
     E: IsField + Send + Sync,
     FieldElement<E>: AsBytes + Send + Sync,
 {
-    let any = outputs.iter().any(|o| o.is_some());
-    if !any {
+    if aux_outputs.is_empty() {
         return Ok((None, Vec::new(), None));
     }
-    let mut builder: MmcsBuilder<BatchedMerkleTreeBackend<E>> = MmcsBuilder::new();
-    for out in outputs.iter().flatten() {
-        builder
-            .add_matrix(out.tag, out.leaves.clone())
-            .map_err(map_mmcs_err)?;
+    debug_assert_eq!(aux_outputs.len(), chunk_aux_lde_for_shared.len());
+
+    let mut aux_outputs = aux_outputs;
+    aux_outputs.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let lde_by_tag: std::collections::BTreeMap<MatrixTag, Arc<Vec<Vec<FieldElement<E>>>>> =
+        chunk_aux_lde_for_shared.into_iter().collect();
+
+    let mut builder: StreamingMmcsBuilder<BatchedMerkleTreeBackend<E>> =
+        StreamingMmcsBuilder::new();
+    let mut lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<E>>>>> =
+        Vec::with_capacity(aux_outputs.len());
+    for (tag, leaves, _padded_height) in aux_outputs {
+        let lde = lde_by_tag
+            .get(&tag)
+            .ok_or_else(|| {
+                ProvingError::WrongParameter(format!(
+                    "missing chunk aux LDE for tag {tag:?} during chunk MMCS build"
+                ))
+            })?
+            .clone();
+        lde_columns_in_spec_order.push(lde);
+        builder.add_matrix(tag, leaves).map_err(map_mmcs_err)?;
     }
     let mmcs = builder.finalize().map_err(map_mmcs_err)?;
     let root = *mmcs.root();
     let spec = mmcs.spec();
-    Ok((Some(root), spec, Some(Arc::new(mmcs))))
+    let ctx = Arc::new(ChunkAuxMmcsContext {
+        mmcs: Arc::new(mmcs),
+        lde_columns_in_spec_order,
+    });
+    Ok((Some(root), spec, Some(ctx)))
 }
 
 /// Tagged per-row leaf digest for the main-trace MMCS.
@@ -987,7 +1123,14 @@ pub trait IsStarkProver<
             Vec::new()
         };
 
-        Ok(commitment.build_round1(Lde { main, aux }, air.step_size(), domain.blowup_factor))
+        Ok(commitment.build_round1(
+            Lde {
+                main: Arc::new(main),
+                aux: Arc::new(aux),
+            },
+            air.step_size(),
+            domain.blowup_factor,
+        ))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
@@ -1659,7 +1802,9 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                let AuxCommit::Shared { mmcs, padded_height, .. } = aux;
+                let AuxCommit::Shared { chunk_ctx, padded_height, .. } = aux;
+                let mmcs = &chunk_ctx.mmcs;
+                let lde_in_spec_order = &chunk_ctx.lde_columns_in_spec_order;
                 let max_height = mmcs
                     .spec()
                     .first()
@@ -1673,11 +1818,23 @@ pub trait IsStarkProver<
                 let evaluations = lde_trace.gather_aux_row(reverse_index(primary, domain_size));
                 let evaluations_sym = lde_trace.gather_aux_row(reverse_index(sym, domain_size));
                 let mmcs_opening = mmcs
-                    .open(primary << shift)
-                    .expect("aux MMCS open: prover-side primary index in range");
+                    .open_with_leaves(primary << shift, |m_idx, local_idx| {
+                        rehash_aux_chip_leaf::<FieldExtension>(
+                            mmcs.spec()[m_idx].0,
+                            &lde_in_spec_order[m_idx],
+                            local_idx,
+                        )
+                    })
+                    .expect("aux MMCS open_with_leaves: primary index in range");
                 let mmcs_opening_sym = mmcs
-                    .open(sym << shift)
-                    .expect("aux MMCS open: prover-side sym index in range");
+                    .open_with_leaves(sym << shift, |m_idx, local_idx| {
+                        rehash_aux_chip_leaf::<FieldExtension>(
+                            mmcs.spec()[m_idx].0,
+                            &lde_in_spec_order[m_idx],
+                            local_idx,
+                        )
+                    })
+                    .expect("aux MMCS open_with_leaves: sym index in range");
                 crate::proof::stark::AuxTraceOpening::Mmcs {
                     evaluations,
                     evaluations_sym,
@@ -1688,10 +1845,12 @@ pub trait IsStarkProver<
 
             let (main_trace_opening, precomputed_trace_opening) = match main_commit {
                 MainCommit::Shared {
-                    mmcs,
+                    chunk_ctx,
                     padded_height,
                     ..
                 } => {
+                    let mmcs = &chunk_ctx.mmcs;
+                    let lde_in_spec_order = &chunk_ctx.lde_columns_in_spec_order;
                     let max_height = mmcs
                         .spec()
                         .first()
@@ -1707,11 +1866,23 @@ pub trait IsStarkProver<
                     let evaluations = lde_trace.gather_main_row(reverse_index(primary, domain_size));
                     let evaluations_sym = lde_trace.gather_main_row(reverse_index(sym, domain_size));
                     let mmcs_opening = mmcs
-                        .open(primary << shift)
-                        .expect("MMCS open: prover-side primary index in range");
+                        .open_with_leaves(primary << shift, |m_idx, local_idx| {
+                            rehash_main_chip_leaf::<Field>(
+                                mmcs.spec()[m_idx].0,
+                                &lde_in_spec_order[m_idx],
+                                local_idx,
+                            )
+                        })
+                        .expect("main MMCS open_with_leaves: primary index in range");
                     let mmcs_opening_sym = mmcs
-                        .open(sym << shift)
-                        .expect("MMCS open: prover-side sym index in range");
+                        .open_with_leaves(sym << shift, |m_idx, local_idx| {
+                            rehash_main_chip_leaf::<Field>(
+                                mmcs.spec()[m_idx].0,
+                                &lde_in_spec_order[m_idx],
+                                local_idx,
+                            )
+                        })
+                        .expect("main MMCS open_with_leaves: sym index in range");
                     let opening = MainTraceOpening::Mmcs {
                         evaluations,
                         evaluations_sym,
@@ -1896,17 +2067,26 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        let mut phase_a_outputs: Vec<MainPhaseAOutput<Field>> = Vec::with_capacity(num_airs);
-        let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
+        // Per-chunk MMCS: each chunk of K tables builds its own streaming
+        // MMCS, sharing chunk LDEs via Arc so per-query opens can rehash
+        // chunk-mate rows on demand. Phase A absorb order: per table in
+        // spec order, absorb preprocessed + main-tree roots (preprocessed
+        // only); after each chunk, absorb the chunk's MMCS root (`Some`)
+        // or skip when the chunk has no Shared tables (`None`).
+        let mut main_commits: Vec<Option<MainCommit<Field>>> = (0..num_airs).map(|_| None).collect();
+        let mut main_ldes: Vec<Option<Arc<Vec<Vec<FieldElement<Field>>>>>> =
+            (0..num_airs).map(|_| None).collect();
+        let mut main_mmcs_roots_per_chunk: Vec<Option<Commitment>> = Vec::new();
+        let mut main_mmcs_specs_per_chunk: Vec<Vec<(MatrixTag, usize)>> = Vec::new();
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_range = chunk_start..chunk_end;
 
             #[cfg(feature = "parallel")]
-            let iter = chunk_range.into_par_iter();
+            let iter = chunk_range.clone().into_par_iter();
             #[cfg(not(feature = "parallel"))]
-            let iter = chunk_range;
+            let iter = chunk_range.clone();
 
             let chunk_results: Vec<Result<_, ProvingError>> = iter
                 .map(|idx| {
@@ -1930,56 +2110,90 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            // Sequential: per table, absorb its preprocessed root and then
-            // its own per-table multiplicities root (preprocessed only). The
-            // shared MMCS root is absorbed once after the loop. Order must
-            // match the verifier replay.
-            for result in chunk_results {
-                let (output, cached_main) = result?;
+            // Sequential: absorb per-table preprocessed + main-tree roots
+            // (preprocessed only) in order, then build this chunk's MMCS
+            // from the chunk's Shared outputs and absorb its root.
+            let mut chunk_shared_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)> = Vec::new();
+            let mut chunk_shared_ldes: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<Field>>>>)> =
+                Vec::new();
+            let chunk_idx = main_mmcs_roots_per_chunk.len();
+            let chunk_outputs: Vec<_> = chunk_results.into_iter().collect::<Result<_, _>>()?;
+            for (offset, (output, cached_main)) in chunk_outputs.into_iter().enumerate() {
+                let idx = chunk_start + offset;
                 if let Some(ref pre_root) = output.precomputed_root() {
                     transcript.append_bytes(pre_root);
                 }
                 if let Some(ref main_root) = output.main_tree_root() {
                     transcript.append_bytes(main_root);
                 }
-                phase_a_outputs.push(output);
-                main_ldes.push(cached_main);
+                let cached_main_arc = Arc::new(cached_main);
+                main_ldes[idx] = Some(Arc::clone(&cached_main_arc));
+                match output {
+                    MainPhaseAOutput::Shared {
+                        tag,
+                        leaves,
+                        padded_height,
+                    } => {
+                        chunk_shared_outputs.push((tag, leaves, padded_height));
+                        chunk_shared_ldes.push((tag, cached_main_arc));
+                        // MainCommit::Shared placeholder filled in after chunk MMCS build.
+                        main_commits[idx] = None;
+                    }
+                    MainPhaseAOutput::Preprocessed {
+                        multiplicities_tree,
+                        multiplicities_root,
+                        precomputed_tree,
+                        precomputed_root,
+                        num_precomputed_cols,
+                    } => {
+                        main_commits[idx] = Some(MainCommit::Preprocessed {
+                            multiplicities_tree,
+                            multiplicities_root,
+                            precomputed_tree,
+                            precomputed_root,
+                            num_precomputed_cols,
+                        });
+                    }
+                }
+            }
+
+            let (chunk_root, chunk_spec, chunk_ctx_opt) =
+                build_chunk_main_mmcs::<Field>(chunk_shared_outputs, chunk_shared_ldes)?;
+            if let Some(ref root) = chunk_root {
+                transcript.append_bytes(root);
+            }
+            main_mmcs_roots_per_chunk.push(chunk_root);
+            main_mmcs_specs_per_chunk.push(chunk_spec.clone());
+
+            // Fill in MainCommit::Shared for this chunk's Shared tables.
+            if let Some(chunk_ctx) = chunk_ctx_opt {
+                // chunk_spec is in MMCS sort order (height desc, tag asc).
+                // Use tag → padded_height lookup to populate Shared variants.
+                let height_by_tag: std::collections::BTreeMap<MatrixTag, usize> =
+                    chunk_spec.iter().copied().collect();
+                for idx in chunk_range.clone() {
+                    if main_commits[idx].is_none() {
+                        let tag = main_tags[idx];
+                        if let Some(&padded_height) = height_by_tag.get(&tag) {
+                            main_commits[idx] = Some(MainCommit::Shared {
+                                chunk_ctx: Arc::clone(&chunk_ctx),
+                                chunk_idx,
+                                tag,
+                                padded_height,
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        // Build the unified main-trace MMCS once over Shared (non-preprocessed)
-        // entries. Preprocessed tables stay out of the MMCS and keep their
-        // own per-table Merkle trees (already absorbed above).
-        let (main_mmcs_root, main_mmcs_spec, mmcs_arc) =
-            build_main_mmcs::<Field>(&phase_a_outputs)?;
-        transcript.append_bytes(&main_mmcs_root);
-
-        let main_commits: Vec<MainCommit<Field>> = phase_a_outputs
+        let main_commits: Vec<MainCommit<Field>> = main_commits
             .into_iter()
-            .map(|o| match o {
-                MainPhaseAOutput::Shared {
-                    tag,
-                    padded_height,
-                    leaves: _,
-                } => MainCommit::Shared {
-                    mmcs: Arc::clone(&mmcs_arc),
-                    tag,
-                    padded_height,
-                },
-                MainPhaseAOutput::Preprocessed {
-                    multiplicities_tree,
-                    multiplicities_root,
-                    precomputed_tree,
-                    precomputed_root,
-                    num_precomputed_cols,
-                } => MainCommit::Preprocessed {
-                    multiplicities_tree,
-                    multiplicities_root,
-                    precomputed_tree,
-                    precomputed_root,
-                    num_precomputed_cols,
-                },
-            })
+            .map(|c| c.expect("main commit populated for every table"))
+            .collect();
+        let main_ldes: Vec<Arc<Vec<Vec<FieldElement<Field>>>>> = main_ldes
+            .into_iter()
+            .map(|l| l.expect("main LDE populated for every table"))
             .collect();
 
         #[cfg(feature = "instruments")]
@@ -2064,21 +2278,25 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
-        // Per-table aux Phase-C outputs. `None` entries are tables with no
-        // aux trace and contribute neither leaves nor an MMCS slot.
-        let mut aux_outputs: Vec<Option<AuxPhaseCOutput<FieldExtension>>> =
+        // Per-chunk aux MMCS: mirror of Phase A main, applied to the aux
+        // trace. Each chunk's aux MMCS root is absorbed into the SHARED
+        // transcript BEFORE per-table forking so every fork sees the
+        // same per-chunk aux binding identically.
+        let mut aux_commits: Vec<Option<AuxCommit<FieldExtension>>> =
+            (0..num_airs).map(|_| None).collect();
+        let mut aux_ldes_arc: Vec<Arc<Vec<Vec<FieldElement<FieldExtension>>>>> =
             Vec::with_capacity(num_airs);
-        let mut aux_ldes: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
-            Vec::with_capacity(num_airs);
+        let mut aux_mmcs_roots_per_chunk: Vec<Option<Commitment>> = Vec::new();
+        let mut aux_mmcs_specs_per_chunk: Vec<Vec<(MatrixTag, usize)>> = Vec::new();
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_range = chunk_start..chunk_end;
 
             #[cfg(feature = "parallel")]
-            let iter = chunk_range.into_par_iter();
+            let iter = chunk_range.clone().into_par_iter();
             #[cfg(not(feature = "parallel"))]
-            let iter = chunk_range;
+            let iter = chunk_range.clone();
 
             let chunk_aux: Vec<Result<_, ProvingError>> = iter
                 .map(|idx| {
@@ -2126,26 +2344,60 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            for result in chunk_aux {
-                let (output, cached_aux) = result?;
-                aux_outputs.push(output);
-                aux_ldes.push(cached_aux);
+            let chunk_idx = aux_mmcs_roots_per_chunk.len();
+            let mut chunk_aux_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)> = Vec::new();
+            let mut chunk_aux_ldes: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<FieldExtension>>>>)> =
+                Vec::new();
+            let chunk_outputs: Vec<_> = chunk_aux.into_iter().collect::<Result<_, _>>()?;
+            for (offset, (maybe_output, cached_aux)) in chunk_outputs.into_iter().enumerate() {
+                let idx = chunk_start + offset;
+                let cached_arc = Arc::new(cached_aux);
+                aux_ldes_arc.push(Arc::clone(&cached_arc));
+                if let Some(out) = maybe_output {
+                    let AuxPhaseCOutput {
+                        tag,
+                        leaves,
+                        padded_height,
+                        ..
+                    } = out;
+                    chunk_aux_outputs.push((tag, leaves, padded_height));
+                    chunk_aux_ldes.push((tag, cached_arc));
+                    aux_commits[idx] = None; // filled in after MMCS build
+                } else {
+                    aux_commits[idx] = None;
+                }
+            }
+
+            let (chunk_root, chunk_spec, chunk_ctx_opt) =
+                build_chunk_aux_mmcs::<FieldExtension>(chunk_aux_outputs, chunk_aux_ldes)?;
+            if let Some(ref root) = chunk_root {
+                transcript.append_bytes(root);
+            }
+            aux_mmcs_roots_per_chunk.push(chunk_root);
+            aux_mmcs_specs_per_chunk.push(chunk_spec.clone());
+
+            if let Some(chunk_ctx) = chunk_ctx_opt {
+                let height_by_tag: std::collections::BTreeMap<MatrixTag, usize> =
+                    chunk_spec.iter().copied().collect();
+                for idx in chunk_range.clone() {
+                    let (air, _, _) = &air_trace_pairs[idx];
+                    if air.has_aux_trace() {
+                        let tag = main_tags[idx];
+                        if let Some(&padded_height) = height_by_tag.get(&tag) {
+                            aux_commits[idx] = Some(AuxCommit::Shared {
+                                chunk_ctx: Arc::clone(&chunk_ctx),
+                                chunk_idx,
+                                tag,
+                                padded_height,
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        // Build the shared aux MMCS over the non-None entries. Order is
-        // spec-fixed (matches `main_tags` order, filtered to has-aux).
-        let (aux_mmcs_root_opt, aux_mmcs_spec, aux_mmcs_arc) =
-            build_aux_mmcs::<FieldExtension>(&aux_outputs)?;
-
-        // Absorb the aux MMCS root into the SHARED transcript before
-        // forking — every table's fork inherits this binding identically.
-        if let Some(ref root) = aux_mmcs_root_opt {
-            transcript.append_bytes(root);
-        }
-
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering).
-        // Happens AFTER aux MMCS absorb so each fork inherits the binding.
+        // Happens AFTER all per-chunk aux MMCS roots have been absorbed.
         let mut table_transcripts: Vec<_> = (0..num_airs)
             .map(|idx| {
                 let mut t = transcript.clone();
@@ -2156,28 +2408,13 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Reassemble per-table aux commits from the shared MMCS Arc.
-        let aux_commits: Vec<Option<AuxCommit<FieldExtension>>> = aux_outputs
-            .into_iter()
-            .map(|o| {
-                o.map(|out| AuxCommit::Shared {
-                    mmcs: Arc::clone(
-                        aux_mmcs_arc
-                            .as_ref()
-                            .expect("MMCS Arc populated when at least one aux output present"),
-                    ),
-                    tag: out.tag,
-                    padded_height: out.padded_height,
-                })
-            })
-            .collect();
         #[allow(clippy::type_complexity)]
         let aux_results: Vec<(
             Option<AuxCommit<FieldExtension>>,
-            Vec<Vec<FieldElement<FieldExtension>>>,
+            Arc<Vec<Vec<FieldElement<FieldExtension>>>>,
         )> = aux_commits
             .into_iter()
-            .zip(aux_ldes)
+            .zip(aux_ldes_arc)
             .collect();
 
         // Build commitments and cached LDEs as separate vecs:
@@ -2328,10 +2565,11 @@ pub trait IsStarkProver<
 
         Ok(MultiProof {
             proofs,
-            main_mmcs_root,
-            main_mmcs_spec,
-            aux_mmcs_root: aux_mmcs_root_opt,
-            aux_mmcs_spec,
+            main_mmcs_roots: main_mmcs_roots_per_chunk,
+            main_mmcs_specs: main_mmcs_specs_per_chunk,
+            aux_mmcs_roots: aux_mmcs_roots_per_chunk,
+            aux_mmcs_specs: aux_mmcs_specs_per_chunk,
+            chunk_size: k as u32,
         })
     }
 

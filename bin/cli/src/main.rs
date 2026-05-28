@@ -690,8 +690,11 @@ fn cmd_proof_size(
 
     let total = ser_len(&vm_proof);
     let multi_proof_bytes = ser_len(&vm_proof.proof);
-    let main_mmcs_root_bytes = ser_len(&vm_proof.proof.main_mmcs_root);
-    let main_mmcs_spec_bytes = ser_len(&vm_proof.proof.main_mmcs_spec);
+    let main_mmcs_roots_bytes = ser_len(&vm_proof.proof.main_mmcs_roots);
+    let main_mmcs_specs_bytes = ser_len(&vm_proof.proof.main_mmcs_specs);
+    let aux_mmcs_roots_bytes = ser_len(&vm_proof.proof.aux_mmcs_roots);
+    let aux_mmcs_specs_bytes = ser_len(&vm_proof.proof.aux_mmcs_specs);
+    let chunk_size_bytes = ser_len(&vm_proof.proof.chunk_size);
 
     // Sum per-section across every sub-proof so a single number captures the
     // contribution of, e.g., "all FRI query lists across all tables".
@@ -704,14 +707,12 @@ fn cmd_proof_size(
     let mut s_trace_ood = 0usize;
     let mut s_composition_ood = 0usize;
     let mut s_per_table_main_root = 0usize;
-    let mut s_aux_root = 0usize;
     let mut s_precomputed_root = 0usize;
     let mut s_bus_public_inputs = 0usize;
     let s_other;
 
     for proof in &vm_proof.proof.proofs {
         s_per_table_main_root += ser_len(&proof.lde_trace_main_merkle_root);
-        s_aux_root += ser_len(&proof.lde_trace_aux_merkle_root);
         s_precomputed_root += ser_len(&proof.lde_trace_precomputed_merkle_root);
         s_trace_ood += ser_len(&proof.trace_ood_evaluations);
         s_composition_ood += ser_len(&proof.composition_poly_parts_ood_evaluation);
@@ -730,8 +731,11 @@ fn cmd_proof_size(
     // Anything not captured above (composition_poly_root, fri_last_value,
     // nonce, public_inputs, trace_length, headers...). Calculate as the
     // bundle delta so the breakdown still sums to ~total.
-    let accounted = main_mmcs_root_bytes
-        + main_mmcs_spec_bytes
+    let accounted = main_mmcs_roots_bytes
+        + main_mmcs_specs_bytes
+        + aux_mmcs_roots_bytes
+        + aux_mmcs_specs_bytes
+        + chunk_size_bytes
         + s_main_trace_openings
         + s_precomputed_trace_openings
         + s_aux_trace_openings
@@ -741,17 +745,18 @@ fn cmd_proof_size(
         + s_trace_ood
         + s_composition_ood
         + s_per_table_main_root
-        + s_aux_root
         + s_precomputed_root
         + s_bus_public_inputs;
     s_other = multi_proof_bytes.saturating_sub(accounted);
 
     let entries: Vec<ProofSizeEntry> = vec![
-        ProofSizeEntry { section: "main_mmcs_root".into(), bytes: main_mmcs_root_bytes },
-        ProofSizeEntry { section: "main_mmcs_spec".into(), bytes: main_mmcs_spec_bytes },
+        ProofSizeEntry { section: "main_mmcs_roots (per-chunk)".into(), bytes: main_mmcs_roots_bytes },
+        ProofSizeEntry { section: "main_mmcs_specs (per-chunk)".into(), bytes: main_mmcs_specs_bytes },
+        ProofSizeEntry { section: "aux_mmcs_roots (per-chunk)".into(), bytes: aux_mmcs_roots_bytes },
+        ProofSizeEntry { section: "aux_mmcs_specs (per-chunk)".into(), bytes: aux_mmcs_specs_bytes },
+        ProofSizeEntry { section: "chunk_size".into(), bytes: chunk_size_bytes },
         ProofSizeEntry { section: "per_table_main_merkle_root (preprocessed)".into(), bytes: s_per_table_main_root },
         ProofSizeEntry { section: "per_table_precomputed_merkle_root".into(), bytes: s_precomputed_root },
-        ProofSizeEntry { section: "per_table_aux_merkle_root".into(), bytes: s_aux_root },
         ProofSizeEntry { section: "deep_poly_openings.main_trace_polys".into(), bytes: s_main_trace_openings },
         ProofSizeEntry { section: "deep_poly_openings.precomputed_trace_polys".into(), bytes: s_precomputed_trace_openings },
         ProofSizeEntry { section: "deep_poly_openings.aux_trace_polys".into(), bytes: s_aux_trace_openings },
@@ -770,7 +775,7 @@ fn cmd_proof_size(
             total_vm_proof_bytes: total,
             multi_proof_bytes,
             sub_proof_count: vm_proof.proof.proofs.len(),
-            main_mmcs_spec_entries: vm_proof.proof.main_mmcs_spec.len(),
+            main_mmcs_spec_entries: vm_proof.proof.main_mmcs_specs.iter().map(|s| s.len()).sum::<usize>(),
             sections: entries.clone(),
         };
         match serde_json::to_string_pretty(&report) {
@@ -787,7 +792,7 @@ fn cmd_proof_size(
         println!("Total VmProof:     {:>10}  bytes", total);
         println!("MultiProof only:   {:>10}  bytes", multi_proof_bytes);
         println!("Sub-proofs:        {:>10}", vm_proof.proof.proofs.len());
-        println!("MMCS spec entries: {:>10}", vm_proof.proof.main_mmcs_spec.len());
+        println!("MMCS spec entries: {:>10}", vm_proof.proof.main_mmcs_specs.iter().map(|s| s.len()).sum::<usize>());
         println!();
         println!("{:<48}{:>14}{:>10}", "section", "bytes", "% of total");
         println!("{}", "-".repeat(72));

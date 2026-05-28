@@ -350,7 +350,7 @@ pub trait IsStarkVerifier<
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
-        main_mmcs_root: &Commitment,
+        main_mmcs_root: Option<&Commitment>,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
         aux_mmcs_root: Option<&Commitment>,
         aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
@@ -405,7 +405,7 @@ pub trait IsStarkVerifier<
         main_opening: &crate::proof::stark::MainTraceOpening<Field>,
         iota: usize,
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
-        main_mmcs_root: &Commitment,
+        main_mmcs_root: Option<&Commitment>,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
@@ -452,7 +452,7 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
-        main_mmcs_root: &Commitment,
+        main_mmcs_root: Option<&Commitment>,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
         aux_mmcs_root: Option<&Commitment>,
         aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
@@ -804,64 +804,105 @@ pub trait IsStarkVerifier<
         // cross-check `main_mmcs_spec` against the (tag, padded_height_lde)
         // pairs reproduced from the AIRs.
 
-        let mut expected_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
-            Vec::with_capacity(airs.len());
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
-            if air.is_preprocessed() {
-                // Preprocessed table: validate + absorb both its AIR-pinned
-                // precomputed root and its own per-table multiplicities root.
-                // Stays OUT of the shared MMCS spec.
-                let expected_precomputed = air.precomputed_commitment();
-                match &proof.lde_trace_precomputed_merkle_root {
-                    Some(actual) if *actual == expected_precomputed => {}
-                    Some(actual) => {
-                        error!(
-                            "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
-                            expected_precomputed, actual
-                        );
-                        return false;
-                    }
-                    None => {
-                        error!("Preprocessed table {idx} proof missing precomputed commitment");
-                        return false;
-                    }
-                }
-                transcript.append_bytes(&expected_precomputed);
-
-                match &proof.lde_trace_main_merkle_root {
-                    Some(root) => transcript.append_bytes(root),
-                    None => {
-                        error!(
-                            "Preprocessed table {idx} proof missing multiplicities Merkle root"
-                        );
-                        return false;
-                    }
-                }
-            } else {
-                // Non-preprocessed table: nothing per-table; the shared MMCS
-                // root absorbed below covers its main columns.
-                if proof.lde_trace_main_merkle_root.is_some() {
-                    error!(
-                        "Non-preprocessed table {idx} unexpectedly supplied a per-table main root"
-                    );
-                    return false;
-                }
-                expected_spec.push((main_tags[idx], lde_size));
-            }
+        // Per-chunk Phase A replay: chunk tables of size `chunk_size`. For
+        // each table absorb its preprocessed root + per-table main root
+        // (preprocessed only); at the end of each chunk, validate the
+        // chunk's main MMCS spec and absorb the chunk's main MMCS root
+        // (`Some`) or skip (`None` when the chunk has no non-preprocessed
+        // tables). Must match `multi_prove` Phase A absorb order exactly.
+        let chunk_size = multi_proof.chunk_size as usize;
+        if chunk_size == 0 {
+            error!("multi_proof.chunk_size is zero");
+            return false;
         }
-
-        // Deterministic sort matches `MmcsBuilder::finalize` (height desc, tag asc).
-        expected_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        if expected_spec != multi_proof.main_mmcs_spec {
+        let expected_num_chunks = (airs.len() + chunk_size - 1) / chunk_size;
+        if multi_proof.main_mmcs_roots.len() != expected_num_chunks
+            || multi_proof.main_mmcs_specs.len() != expected_num_chunks
+            || multi_proof.aux_mmcs_roots.len() != expected_num_chunks
+            || multi_proof.aux_mmcs_specs.len() != expected_num_chunks
+        {
             error!(
-                "main_mmcs_spec mismatch: expected {:?}, got {:?}",
-                expected_spec, multi_proof.main_mmcs_spec,
+                "per-chunk MMCS Vec lengths inconsistent with chunk_size={chunk_size}:                  expected {expected_num_chunks} chunks; got main_roots={}, main_specs={},                  aux_roots={}, aux_specs={}",
+                multi_proof.main_mmcs_roots.len(),
+                multi_proof.main_mmcs_specs.len(),
+                multi_proof.aux_mmcs_roots.len(),
+                multi_proof.aux_mmcs_specs.len(),
             );
             return false;
         }
 
-        transcript.append_bytes(&multi_proof.main_mmcs_root);
+        for chunk_idx in 0..expected_num_chunks {
+            let chunk_start = chunk_idx * chunk_size;
+            let chunk_end = (chunk_start + chunk_size).min(airs.len());
+
+            let mut expected_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
+                Vec::new();
+            for idx in chunk_start..chunk_end {
+                let (air, proof) = (airs[idx], &multi_proof.proofs[idx]);
+                let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
+                if air.is_preprocessed() {
+                    let expected_precomputed = air.precomputed_commitment();
+                    match &proof.lde_trace_precomputed_merkle_root {
+                        Some(actual) if *actual == expected_precomputed => {}
+                        Some(actual) => {
+                            error!(
+                                "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
+                                expected_precomputed, actual
+                            );
+                            return false;
+                        }
+                        None => {
+                            error!("Preprocessed table {idx} proof missing precomputed commitment");
+                            return false;
+                        }
+                    }
+                    transcript.append_bytes(&expected_precomputed);
+                    match &proof.lde_trace_main_merkle_root {
+                        Some(root) => transcript.append_bytes(root),
+                        None => {
+                            error!(
+                                "Preprocessed table {idx} proof missing multiplicities Merkle root"
+                            );
+                            return false;
+                        }
+                    }
+                } else {
+                    if proof.lde_trace_main_merkle_root.is_some() {
+                        error!(
+                            "Non-preprocessed table {idx} unexpectedly supplied a per-table main root"
+                        );
+                        return false;
+                    }
+                    expected_spec.push((main_tags[idx], lde_size));
+                }
+            }
+
+            // Deterministic sort matches `MmcsBuilder::finalize`
+            // (height desc, tag asc) — same as the streaming builder.
+            expected_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            if expected_spec != multi_proof.main_mmcs_specs[chunk_idx] {
+                error!(
+                    "chunk {chunk_idx} main_mmcs_spec mismatch: expected {:?}, got {:?}",
+                    expected_spec, multi_proof.main_mmcs_specs[chunk_idx],
+                );
+                return false;
+            }
+            match (
+                &multi_proof.main_mmcs_roots[chunk_idx],
+                expected_spec.is_empty(),
+            ) {
+                (Some(root), false) => transcript.append_bytes(root),
+                (None, true) => {}
+                (Some(_), true) => {
+                    error!("chunk {chunk_idx} main_mmcs_root present but no Shared tables");
+                    return false;
+                }
+                (None, false) => {
+                    error!("chunk {chunk_idx} main_mmcs_root missing but Shared tables exist");
+                    return false;
+                }
+            }
+        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -906,32 +947,45 @@ pub trait IsStarkVerifier<
         // SHARED transcript replaces the per-table aux root absorb of the
         // pre-MMCS protocol. Verify the spec mirrors the prover-side
         // filtered-by-has_aux_trace order before binding.
-        let mut expected_aux_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
-            Vec::new();
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if air.has_aux_trace() {
-                let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
-                expected_aux_spec.push((main_tags[idx], lde_size));
+        // Per-chunk Phase C replay (aux). Mirrors Phase A: for each chunk,
+        // validate the aux spec + absorb the aux MMCS root (or skip when
+        // the chunk has no aux-bearing tables). Must match `multi_prove`
+        // Phase C absorb order exactly.
+        for chunk_idx in 0..expected_num_chunks {
+            let chunk_start = chunk_idx * chunk_size;
+            let chunk_end = (chunk_start + chunk_size).min(airs.len());
+
+            let mut expected_aux_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
+                Vec::new();
+            for idx in chunk_start..chunk_end {
+                let (air, proof) = (airs[idx], &multi_proof.proofs[idx]);
+                if air.has_aux_trace() {
+                    let lde_size = proof.trace_length * (air.options().blowup_factor as usize);
+                    expected_aux_spec.push((main_tags[idx], lde_size));
+                }
             }
-        }
-        expected_aux_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        if expected_aux_spec != multi_proof.aux_mmcs_spec {
-            error!(
-                "aux_mmcs_spec mismatch: expected {:?}, got {:?}",
-                expected_aux_spec, multi_proof.aux_mmcs_spec,
-            );
-            return false;
-        }
-        match (&multi_proof.aux_mmcs_root, expected_aux_spec.is_empty()) {
-            (Some(root), false) => transcript.append_bytes(root),
-            (None, true) => {}
-            (Some(_), true) => {
-                error!("aux_mmcs_root present but no AIR has an aux trace");
+            expected_aux_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            if expected_aux_spec != multi_proof.aux_mmcs_specs[chunk_idx] {
+                error!(
+                    "chunk {chunk_idx} aux_mmcs_spec mismatch: expected {:?}, got {:?}",
+                    expected_aux_spec, multi_proof.aux_mmcs_specs[chunk_idx],
+                );
                 return false;
             }
-            (None, false) => {
-                error!("aux_mmcs_root missing but some AIR has an aux trace");
-                return false;
+            match (
+                &multi_proof.aux_mmcs_roots[chunk_idx],
+                expected_aux_spec.is_empty(),
+            ) {
+                (Some(root), false) => transcript.append_bytes(root),
+                (None, true) => {}
+                (Some(_), true) => {
+                    error!("chunk {chunk_idx} aux_mmcs_root present but no aux tables");
+                    return false;
+                }
+                (None, false) => {
+                    error!("chunk {chunk_idx} aux_mmcs_root missing but aux tables exist");
+                    return false;
+                }
             }
         }
 
@@ -957,17 +1011,27 @@ pub trait IsStarkVerifier<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
-            // Rounds 2-4: verify (per-table MMCS context threaded through).
+            // Per-chunk lookup: each table's main / aux MMCS root + spec
+            // come from its chunk.
+            let table_chunk_idx = idx / chunk_size;
+            let main_root_for_chunk =
+                multi_proof.main_mmcs_roots[table_chunk_idx].as_ref();
+            let main_spec_for_chunk: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)] =
+                &multi_proof.main_mmcs_specs[table_chunk_idx];
+            let aux_root_for_chunk = multi_proof.aux_mmcs_roots[table_chunk_idx].as_ref();
+            let aux_spec_for_chunk: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)] =
+                &multi_proof.aux_mmcs_specs[table_chunk_idx];
+
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &mut table_transcript,
                 lookup_challenges.clone(),
                 main_tags[idx],
-                &multi_proof.main_mmcs_root,
-                &multi_proof.main_mmcs_spec,
-                multi_proof.aux_mmcs_root.as_ref(),
-                &multi_proof.aux_mmcs_spec,
+                main_root_for_chunk,
+                main_spec_for_chunk,
+                aux_root_for_chunk,
+                aux_spec_for_chunk,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1183,7 +1247,7 @@ pub trait IsStarkVerifier<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
         main_tag: crypto::merkle_tree::mmcs::MatrixTag,
-        main_mmcs_root: &Commitment,
+        main_mmcs_root: Option<&Commitment>,
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
         aux_mmcs_root: Option<&Commitment>,
         aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
@@ -1302,7 +1366,7 @@ fn verify_main_mmcs_pair_inner<F>(
     main_opening: &crate::proof::stark::MainTraceOpening<F>,
     iota: usize,
     main_tag: crypto::merkle_tree::mmcs::MatrixTag,
-    main_mmcs_root: &Commitment,
+    main_mmcs_root: Option<&Commitment>,
     main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
 ) -> bool
 where
@@ -1320,6 +1384,12 @@ where
             mmcs_opening_sym,
         } => (evaluations, evaluations_sym, mmcs_opening, mmcs_opening_sym),
         MainTraceOpening::Tree(_) => return false,
+    };
+
+    // Shared opening requires a chunk MMCS root; if missing, reject.
+    let main_mmcs_root = match main_mmcs_root {
+        Some(r) => r,
+        None => return false,
     };
 
     let table_idx = match main_mmcs_spec.iter().position(|(t, _)| *t == main_tag) {

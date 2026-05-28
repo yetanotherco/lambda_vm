@@ -120,11 +120,31 @@ fn first_aux_mmcs_opening_mut(
         .expect("baseline must have aux openings")
 }
 
+/// First chunk index whose aux MMCS root is `Some`.
+fn first_populated_aux_chunk(proof: &MultiProof<F, E, LogReadOnlyPublicInputs<F>>) -> usize {
+    proof
+        .aux_mmcs_roots
+        .iter()
+        .position(|r| r.is_some())
+        .expect("at least one chunk must have an aux MMCS root in this baseline")
+}
+
 #[test_log::test]
 fn baseline_two_rap_tables_verify() {
     let (air_1, air_2, proof) = baseline_proof();
-    assert!(proof.aux_mmcs_root.is_some(), "aux MMCS must be present");
-    assert_eq!(proof.aux_mmcs_spec.len(), 2, "both AIRs contribute aux");
+    assert!(
+        proof.aux_mmcs_roots.iter().any(|r| r.is_some()),
+        "at least one chunk's aux MMCS must be present"
+    );
+    assert!(
+        proof
+            .aux_mmcs_specs
+            .iter()
+            .map(|s| s.len())
+            .sum::<usize>()
+            == 2,
+        "both AIRs contribute aux"
+    );
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = LogReadOnlyPublicInputs<F>>> =
         vec![&air_1, &air_2];
     assert!(verify(&airs, &proof), "baseline aux proof must verify");
@@ -135,7 +155,10 @@ fn tampered_aux_mmcs_root_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = LogReadOnlyPublicInputs<F>>> =
         vec![&air_1, &air_2];
-    let root = proof.aux_mmcs_root.as_mut().expect("baseline has root");
+    let chunk_idx = first_populated_aux_chunk(&proof);
+    let root = proof.aux_mmcs_roots[chunk_idx]
+        .as_mut()
+        .expect("populated");
     root[0] ^= 1;
     assert!(!verify(&airs, &proof));
 }
@@ -145,8 +168,12 @@ fn missing_aux_mmcs_root_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = LogReadOnlyPublicInputs<F>>> =
         vec![&air_1, &air_2];
-    proof.aux_mmcs_root = None;
-    assert!(!verify(&airs, &proof));
+    let chunk_idx = first_populated_aux_chunk(&proof);
+    proof.aux_mmcs_roots[chunk_idx] = None;
+    assert!(
+        !verify(&airs, &proof),
+        "aux_mmcs_root=None while chunk has aux tables must be rejected"
+    );
 }
 
 #[test_log::test]
@@ -154,7 +181,8 @@ fn tampered_aux_mmcs_spec_height_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = LogReadOnlyPublicInputs<F>>> =
         vec![&air_1, &air_2];
-    proof.aux_mmcs_spec[0].1 /= 2;
+    let chunk_idx = first_populated_aux_chunk(&proof);
+    proof.aux_mmcs_specs[chunk_idx][0].1 /= 2;
     assert!(!verify(&airs, &proof));
 }
 
@@ -163,7 +191,8 @@ fn tampered_aux_mmcs_spec_tag_rejected() {
     let (air_1, air_2, mut proof) = baseline_proof();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = LogReadOnlyPublicInputs<F>>> =
         vec![&air_1, &air_2];
-    proof.aux_mmcs_spec[0].0 = MatrixTag::new([0xFF; 8]);
+    let chunk_idx = first_populated_aux_chunk(&proof);
+    proof.aux_mmcs_specs[chunk_idx][0].0 = MatrixTag::new([0xFF; 8]);
     assert!(!verify(&airs, &proof));
 }
 

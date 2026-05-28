@@ -146,26 +146,46 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
 ///
-/// Non-preprocessed tables share a single main-trace MMCS authenticated by
-/// `main_mmcs_root`; `main_mmcs_spec` lists `(MatrixTag, padded_height)`
-/// per committed table in the MMCS sort order. Preprocessed tables stay
-/// out of the main MMCS — each carries its own per-table Merkle root in
+/// Non-preprocessed tables in each chunk share a main-trace MMCS
+/// authenticated by `main_mmcs_roots[chunk_idx]`. Tables are grouped into
+/// chunks of `chunk_size` (the prover's `table_parallelism()` at proving
+/// time, pinned in the proof so the verifier chunks the AIR slice the
+/// same way). Per-chunk grouping keeps openings small (at most K matrix_leaves
+/// per opening instead of N) and bounds the streaming MMCS build to one
+/// chunk's K LDEs at a time. Preprocessed tables stay out of any main
+/// MMCS; each carries its own per-table Merkle root in
 /// `StarkProof::lde_trace_main_merkle_root` plus the AIR-pinned
-/// precomputed root. Both groups' roots are absorbed in spec-fixed order
-/// during Phase A.
+/// precomputed root.
 ///
-/// Aux traces (only present for AIRs with LogUp interactions) share a
-/// SECOND MMCS authenticated by `aux_mmcs_root`; `aux_mmcs_spec` lists
-/// `(MatrixTag, padded_height)` for the subset of tables that contribute
-/// aux. `aux_mmcs_root` is `None` when no table in the multi-proof has an
-/// aux trace. Domain-separated from the main MMCS via `LEAF_DOMAIN_TAG_AUX`
-/// so that no aux opening can authenticate a main leaf (or vice versa).
+/// Phase A absorb order: for each table in spec order, absorb its
+/// preprocessed root + per-table multiplicities root (preprocessed only);
+/// after each chunk, absorb that chunk's main MMCS root (`Some`) or skip
+/// (`None`, when the chunk has no non-preprocessed tables).
+///
+/// Aux traces mirror the same chunk grouping. `aux_mmcs_roots[chunk_idx]`
+/// is `None` when no table in that chunk has an aux trace. Aux MMCS
+/// leaves are domain-separated from main via `LEAF_DOMAIN_TAG_AUX`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
-    pub main_mmcs_root: Commitment,
-    pub main_mmcs_spec: Vec<(MatrixTag, usize)>,
-    pub aux_mmcs_root: Option<Commitment>,
-    pub aux_mmcs_spec: Vec<(MatrixTag, usize)>,
+    /// Per-chunk main MMCS roots in chunk order. `None` for chunks whose
+    /// tables are all preprocessed (no main MMCS exists for that chunk).
+    pub main_mmcs_roots: Vec<Option<Commitment>>,
+    /// Per-chunk MMCS specs for the main trace, parallel to
+    /// `main_mmcs_roots`. Empty inner Vec when the corresponding root is
+    /// `None`. Each non-empty Vec lists `(MatrixTag, padded_height)` for
+    /// the non-preprocessed tables in that chunk in MMCS sort order
+    /// (height desc, tag asc).
+    pub main_mmcs_specs: Vec<Vec<(MatrixTag, usize)>>,
+    /// Per-chunk aux MMCS roots. `None` for chunks with no has_aux_trace
+    /// tables. Parallel to `main_mmcs_roots`.
+    pub aux_mmcs_roots: Vec<Option<Commitment>>,
+    /// Per-chunk aux MMCS specs. Empty inner Vec when the corresponding
+    /// `aux_mmcs_roots[i]` is `None`.
+    pub aux_mmcs_specs: Vec<Vec<(MatrixTag, usize)>>,
+    /// Pinned chunk size. Equals the prover's `table_parallelism()` at
+    /// proving time. The verifier uses this to chunk the AIR slice into
+    /// the same per-chunk grouping the prover used.
+    pub chunk_size: u32,
 }
