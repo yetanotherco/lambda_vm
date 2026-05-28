@@ -1,4 +1,5 @@
 pub mod air_tests;
+pub mod bucket_fri_soundness_tests;
 pub mod bus_tests;
 pub mod domain_cache_stats;
 pub mod fri_tests;

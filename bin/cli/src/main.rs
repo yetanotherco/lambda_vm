@@ -697,6 +697,8 @@ fn cmd_proof_size(
     let comp_mmcs_roots_bytes = ser_len(&vm_proof.proof.comp_mmcs_roots);
     let comp_mmcs_specs_bytes = ser_len(&vm_proof.proof.comp_mmcs_specs);
     let chunk_size_bytes = ser_len(&vm_proof.proof.chunk_size);
+    // Phase D: per-(chunk, bucket) batched FRI.
+    let fri_chunk_buckets_bytes = ser_len(&vm_proof.proof.fri_chunk_buckets);
 
     // Sum per-section across every sub-proof so a single number captures the
     // contribution of, e.g., "all FRI query lists across all tables".
@@ -704,8 +706,6 @@ fn cmd_proof_size(
     let mut s_precomputed_trace_openings = 0usize;
     let mut s_aux_trace_openings = 0usize;
     let mut s_composition_openings = 0usize;
-    let mut s_fri_query_list = 0usize;
-    let mut s_fri_layers_roots = 0usize;
     let mut s_trace_ood = 0usize;
     let mut s_composition_ood = 0usize;
     let mut s_per_table_main_root = 0usize;
@@ -718,8 +718,6 @@ fn cmd_proof_size(
         s_precomputed_root += ser_len(&proof.lde_trace_precomputed_merkle_root);
         s_trace_ood += ser_len(&proof.trace_ood_evaluations);
         s_composition_ood += ser_len(&proof.composition_poly_parts_ood_evaluation);
-        s_fri_query_list += ser_len(&proof.query_list);
-        s_fri_layers_roots += ser_len(&proof.fri_layers_merkle_roots);
         s_bus_public_inputs += ser_len(&proof.bus_public_inputs);
 
         for opening in &proof.deep_poly_openings {
@@ -730,9 +728,8 @@ fn cmd_proof_size(
         }
     }
 
-    // Anything not captured above (composition_poly_root, fri_last_value,
-    // nonce, public_inputs, trace_length, headers...). Calculate as the
-    // bundle delta so the breakdown still sums to ~total.
+    // Anything not captured above (public_inputs, trace_length, headers...).
+    // Calculate as the bundle delta so the breakdown still sums to ~total.
     let accounted = main_mmcs_roots_bytes
         + main_mmcs_specs_bytes
         + aux_mmcs_roots_bytes
@@ -740,12 +737,11 @@ fn cmd_proof_size(
         + comp_mmcs_roots_bytes
         + comp_mmcs_specs_bytes
         + chunk_size_bytes
+        + fri_chunk_buckets_bytes
         + s_main_trace_openings
         + s_precomputed_trace_openings
         + s_aux_trace_openings
         + s_composition_openings
-        + s_fri_query_list
-        + s_fri_layers_roots
         + s_trace_ood
         + s_composition_ood
         + s_per_table_main_root
@@ -767,12 +763,11 @@ fn cmd_proof_size(
         ProofSizeEntry { section: "deep_poly_openings.precomputed_trace_polys".into(), bytes: s_precomputed_trace_openings },
         ProofSizeEntry { section: "deep_poly_openings.aux_trace_polys".into(), bytes: s_aux_trace_openings },
         ProofSizeEntry { section: "deep_poly_openings.composition_poly".into(), bytes: s_composition_openings },
-        ProofSizeEntry { section: "fri_layers_merkle_roots".into(), bytes: s_fri_layers_roots },
-        ProofSizeEntry { section: "fri_query_list".into(), bytes: s_fri_query_list },
+        ProofSizeEntry { section: "fri_chunk_buckets (per-chunk batched FRI)".into(), bytes: fri_chunk_buckets_bytes },
         ProofSizeEntry { section: "trace_ood_evaluations".into(), bytes: s_trace_ood },
         ProofSizeEntry { section: "composition_poly_parts_ood_evaluation".into(), bytes: s_composition_ood },
         ProofSizeEntry { section: "bus_public_inputs".into(), bytes: s_bus_public_inputs },
-        ProofSizeEntry { section: "other (headers / public_inputs / nonce / ...)".into(), bytes: s_other },
+        ProofSizeEntry { section: "other (headers / public_inputs / ...)".into(), bytes: s_other },
     ];
 
     if json {

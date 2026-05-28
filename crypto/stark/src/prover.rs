@@ -39,7 +39,6 @@ use crypto::merkle_tree::mmcs::{MatrixTag, Mmcs, MmcsError, StreamingMmcsBuilder
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::{Domain, DomainConstants};
-use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
@@ -507,26 +506,26 @@ where
 
 /// A container for the results of the third round of the STARK Prove protocol.
 pub(crate) struct Round3<F: IsField> {
-    /// Evaluations of the trace polynomials, main ans auxiliary, at the out-of-domain challenge.
-    trace_ood_evaluations: Table<F>,
+    /// Evaluations of the trace polynomials, main and auxiliary, at the out-of-domain challenge.
+    pub(crate) trace_ood_evaluations: Table<F>,
     /// Evaluations of the composition polynomial parts at the out-of-domain challenge.
-    composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
+    pub(crate) composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
 }
 
-/// A container for the results of the fourth round of the STARK Prove protocol.
-pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
-    /// The commitments to the fold polynomials of the inner layers of FRI.
-    fri_layers_merkle_roots: Vec<Commitment>,
-    /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
-    /// parts at the domain values corresponding to the FRI query challenges and their symmetric counterparts.
-    deep_poly_openings: DeepPolynomialOpenings<F, E>,
-    /// The values and proofs of validity of the evaluations of the fold polynomials of the inner
-    /// layers of FRI at the values corresponding to the symmetrics of the FRI query challenges.
-    query_list: Vec<FriDecommitment<E>>,
-    /// The proof of work nonce.
-    nonce: Option<u64>,
+/// Per-table DEEP composition coefficient layout sampled at R3.5 from
+/// the per-fork transcript. Stored across chunk-mates so the bucket FRI
+/// loop can rebuild DEEP_i LDEs on demand (one at a time) and fold them
+/// into the bucket-combined accumulator without retaining K full DEEPs
+/// in memory simultaneously.
+pub(crate) struct DeepCoeffs<E: IsField> {
+    pub(crate) z: FieldElement<E>,
+    /// γⱼ for the composition-poly OOD H_j parts.
+    pub(crate) gammas: Vec<FieldElement<E>>,
+    /// γ′ⱼₖ for the trace-column OOD terms, grouped by column.
+    pub(crate) trace_term_coeffs: Vec<Vec<FieldElement<E>>>,
+    /// LDE size — matches `round_1.lde_trace`'s length and is the size
+    /// of the DEEP LDE this table contributes to its bucket.
+    pub(crate) lde_size: usize,
 }
 
 /// Returns the evaluations of the polynomial `p` over the lde domain defined by the given
@@ -1631,23 +1630,24 @@ pub trait IsStarkProver<
         }
     }
 
-    /// Returns the result of the fourth round of the STARK Prove protocol.
-    fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+    /// Round 3.5 part A — sample γ from the per-fork transcript and
+    /// build the DEEP composition coefficient layout. Cheap (a few
+    /// field elements + Vec allocations); the heavy LDE compute is
+    /// deferred to [`compute_deep_lde_with_coeffs`] which runs **inside
+    /// the bucket loop**, so DEEP_i is materialised one at a time and
+    /// folded into the bucket accumulator with `δ_fri^i` before
+    /// dropping.
+    fn sample_deep_coeffs(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
         round_2_result: &Round2<FieldExtension>,
-        round_3_result: &Round3<FieldExtension>,
-        z: &FieldElement<FieldExtension>,
+        z: FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Round4<Field, FieldExtension>
+    ) -> DeepCoeffs<FieldExtension>
     where
         FieldElement<FieldExtension>: AsBytes,
         FieldElement<Field>: AsBytes,
     {
-        let coset_offset_u64 = air.context().proof_options.coset_offset;
-        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
-
         let gamma = transcript.sample_field_element();
 
         let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
@@ -1670,84 +1670,64 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        let lde_size = domain.lde_roots_of_unity_coset.len();
+        DeepCoeffs {
+            z,
+            gammas,
+            trace_term_coeffs,
+            lde_size,
+        }
+    }
+
+    /// Round 3.5 part B — compute the DEEP composition polynomial on
+    /// the LDE coset (bit-reverse permuted, ready for FRI). Pure
+    /// computation, no transcript interaction. Called once per
+    /// chunk-mate inside the bucket loop so we can drop each DEEP_i
+    /// after folding it into the bucket-shared accumulator.
+    fn compute_deep_lde_with_coeffs(
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        coeffs: &DeepCoeffs<FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes,
+    {
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let deep_evals = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
-            z,
+            &coeffs.z,
             domain,
             &domain.trace_primitive_root,
-            &gammas,
-            &trace_term_coeffs,
+            &coeffs.gammas,
+            &coeffs.trace_term_coeffs,
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
-        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        // DEEP evaluations are already at 2N LDE points; bit-reverse
+        // to make them FRI-input compatible without an FFT extension.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
+        let mut deep_lde = deep_evals;
+        in_place_bit_reverse_permute(&mut deep_lde);
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
-        // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let (fri_last_value, fri_layers) =
-            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
-                domain.root_order as usize,
-                lde_evals,
-                transcript,
-                &coset_offset,
-                domain_size,
-            );
-        #[cfg(feature = "instruments")]
-        let r4_merkle_dur = t_sub.elapsed();
+        crate::instruments::store_r4_sub(
+            r4_fft_dur,
+            std::time::Duration::ZERO,
+            other_dur_1,
+            std::time::Duration::ZERO,
+        );
 
-        // grinding: generate nonce and append it to the transcript
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let security_bits = air.context().proof_options.grinding_factor;
-        let mut nonce = None;
-        if security_bits > 0 {
-            let nonce_value = grinding::generate_nonce(&transcript.state(), security_bits)
-                .expect("nonce not found");
-            transcript.append_bytes(&nonce_value.to_be_bytes());
-            nonce = Some(nonce_value);
-        }
-
-        let number_of_queries = air.options().fri_number_of_queries;
-        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
-
-        let query_list = fri::query_phase(&fri_layers, &iotas);
-
-        let fri_layers_merkle_roots: Vec<_> = fri_layers
-            .iter()
-            .map(|layer| layer.merkle_tree.root)
-            .collect();
-
-        let deep_poly_openings =
-            Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
-
-        #[cfg(feature = "instruments")]
-        {
-            let queries_dur = t_sub.elapsed();
-            crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
-        }
-
-        Round4 {
-            fri_last_value,
-            fri_layers_merkle_roots,
-            deep_poly_openings,
-            query_list,
-            nonce,
-        }
+        deep_lde
     }
 
     fn sample_query_indexes(
@@ -2614,6 +2594,12 @@ pub trait IsStarkProver<
             }
         }
 
+        // Capture pre-fork shared transcript state. Phase D's per-chunk
+        // bucket seed clones this and replays chunk-local data
+        // (table_contributions, comp root, all chunk-mate OODs) canonically
+        // so every bucket-mate reaches the same δ_fri / iotas state.
+        let pre_fork_transcript = transcript.clone();
+
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering).
         // Happens AFTER all per-chunk aux MMCS roots have been absorbed.
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -2689,6 +2675,8 @@ pub trait IsStarkProver<
             (0..num_airs).map(|_| None).collect();
         let mut comp_mmcs_roots_per_chunk: Vec<Option<Commitment>> = Vec::new();
         let mut comp_mmcs_specs_per_chunk: Vec<Vec<(MatrixTag, usize)>> = Vec::new();
+        let mut fri_chunk_buckets_per_chunk: Vec<Vec<crate::proof::stark::ChunkBucketFri<FieldExtension>>> =
+            Vec::new();
         let mut lde_drain = cached_ldes.into_iter();
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -2815,67 +2803,278 @@ pub trait IsStarkProver<
                 });
             }
 
-            // Phase R2b → R4 (sequential within chunk): each fork has
-            // the chunk comp root absorbed; sample z, run R3 OOD + R4
-            // FRI. Same rationale as R2a above.
+            // Phase R2b → R3.5 (parallel within chunk via rayon): each
+            // fork already saw the chunk comp root; sample z, compute +
+            // absorb own OOD, sample γ + DEEP coeffs. The heavy DEEP LDE
+            // computation is deferred to the bucket loop below. Rayon
+            // restores per-chunk-mate parallelism that c22fca9e had
+            // serialised — safe because each fork owns its mutable
+            // transcript slot and the rest of the captured state is
+            // read-only and Sync.
+            let chunk_airs: Vec<&dyn AIR<
+                Field = Field,
+                FieldExtension = FieldExtension,
+                PublicInputs = PI,
+            >> = (chunk_start..chunk_end)
+                .map(|i| air_trace_pairs[i].0)
+                .collect();
+            #[cfg(feature = "instruments")]
+            let chunk_air_names: Vec<String> =
+                chunk_airs.iter().map(|a| a.name().to_string()).collect();
+            #[cfg(feature = "instruments")]
+            let chunk_num_rows: Vec<usize> = (chunk_start..chunk_end)
+                .map(|i| air_trace_pairs[i].1.num_rows())
+                .collect();
+
             let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-            let r2b_iter = chunk_round1
-                .iter()
-                .zip(chunk_round2.iter())
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
 
-            let chunk_results: Vec<Result<_, ProvingError>> = r2b_iter
-                .map(|(j, ((round_1_result, round_2_result), table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let _ = trace; // used by instruments
-                    let domain = &domains[idx];
+            #[cfg(feature = "parallel")]
+            let r2b_iter = chunk_transcripts.par_iter_mut().enumerate();
+            #[cfg(not(feature = "parallel"))]
+            let r2b_iter = chunk_transcripts.iter_mut().enumerate();
 
-                    #[cfg(feature = "instruments")]
+            #[cfg(feature = "instruments")]
+            #[allow(clippy::type_complexity)]
+            let r2b_results: Vec<Result<(usize, Round3<FieldExtension>, DeepCoeffs<FieldExtension>, (String, usize, std::time::Duration, crate::instruments::TableSubOps)), ProvingError>> = r2b_iter
+                .map(|(j, table_transcript)| {
+                    let air = chunk_airs[j];
+                    let round_1_result = &chunk_round1[j];
+                    let round_2_result = &chunk_round2[j];
+                    let domain = &domains[chunk_start + j];
                     let table_start = Instant::now();
-
-                    let proof = Self::prove_rounds_2b_to_4(
-                        *air,
-                        *pub_inputs,
+                    let (round_3, deep_coeffs) = Self::prove_rounds_2b_to_3_5(
+                        air,
                         round_1_result,
                         round_2_result,
                         table_transcript,
                         domain,
                     )?;
-
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((j, proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok((j, proof))
+                    let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    let timing = (
+                        chunk_air_names[j].clone(),
+                        chunk_num_rows[j],
+                        table_start.elapsed(),
+                        sub_ops,
+                    );
+                    Ok((j, round_3, deep_coeffs, timing))
                 })
                 .collect();
 
-            for result in chunk_results {
+            #[cfg(not(feature = "instruments"))]
+            #[allow(clippy::type_complexity)]
+            let r2b_results: Vec<Result<(usize, Round3<FieldExtension>, DeepCoeffs<FieldExtension>), ProvingError>> = r2b_iter
+                .map(|(j, table_transcript)| {
+                    let air = chunk_airs[j];
+                    let round_1_result = &chunk_round1[j];
+                    let round_2_result = &chunk_round2[j];
+                    let domain = &domains[chunk_start + j];
+                    let (round_3, deep_coeffs) = Self::prove_rounds_2b_to_3_5(
+                        air,
+                        round_1_result,
+                        round_2_result,
+                        table_transcript,
+                        domain,
+                    )?;
+                    Ok((j, round_3, deep_coeffs))
+                })
+                .collect();
+
+            // Collect R2b results in chunk-local-index order.
+            let mut chunk_round3: Vec<Option<Round3<FieldExtension>>> =
+                (0..chunk_size).map(|_| None).collect();
+            let mut chunk_deep_coeffs: Vec<Option<DeepCoeffs<FieldExtension>>> =
+                (0..chunk_size).map(|_| None).collect();
+            for r in r2b_results {
                 #[cfg(feature = "instruments")]
                 {
-                    let (j, proof, timing) = result?;
-                    let idx = chunk_start + j;
-                    proofs[idx] = Some(proof);
+                    let (j, r3, dc, timing) = r?;
+                    chunk_round3[j] = Some(r3);
+                    chunk_deep_coeffs[j] = Some(dc);
                     table_timings.push(timing);
                 }
                 #[cfg(not(feature = "instruments"))]
                 {
-                    let (j, proof) = result?;
-                    let idx = chunk_start + j;
-                    proofs[idx] = Some(proof);
+                    let (j, r3, dc) = r?;
+                    chunk_round3[j] = Some(r3);
+                    chunk_deep_coeffs[j] = Some(dc);
                 }
+            }
+            let chunk_round3: Vec<Round3<FieldExtension>> = chunk_round3
+                .into_iter()
+                .map(|r| r.expect("R3 populated for every chunk-mate"))
+                .collect();
+            let chunk_deep_coeffs: Vec<DeepCoeffs<FieldExtension>> = chunk_deep_coeffs
+                .into_iter()
+                .map(|d| d.expect("DEEP coeffs populated for every chunk-mate"))
+                .collect();
+
+            // Chunk join 2: bucket-shared transcript built by canonical replay
+            // of chunk-local data on the pre-fork state. Verifier reconstructs
+            // identical seed from proof data only.
+            let mut bucket_seed = pre_fork_transcript.clone();
+            for j in 0..chunk_size {
+                if let Some(ref bpi) = chunk_round1[j].bus_public_inputs {
+                    bucket_seed.append_field_element(&bpi.table_contribution);
+                }
+            }
+            if let Some(ref root) = comp_mmcs_roots_per_chunk[chunk_idx] {
+                bucket_seed.append_bytes(root);
+            }
+            for j in 0..chunk_size {
+                let round_3 = &chunk_round3[j];
+                for col in round_3.trace_ood_evaluations.columns().iter() {
+                    for elem in col.iter() {
+                        bucket_seed.append_field_element(elem);
+                    }
+                }
+                for elem in round_3.composition_poly_parts_ood_evaluation.iter() {
+                    bucket_seed.append_field_element(elem);
+                }
+            }
+
+            // Bucket by lde_size (first-encounter order).
+            let mut bucket_indices: Vec<Vec<usize>> = Vec::new();
+            let mut bucket_lde_sizes: Vec<usize> = Vec::new();
+            for j in 0..chunk_size {
+                let sz = chunk_deep_coeffs[j].lde_size;
+                match bucket_lde_sizes.iter().position(|&s| s == sz) {
+                    Some(b) => bucket_indices[b].push(j),
+                    None => {
+                        bucket_lde_sizes.push(sz);
+                        bucket_indices.push(vec![j]);
+                    }
+                }
+            }
+
+            let mut chunk_buckets: Vec<crate::proof::stark::ChunkBucketFri<FieldExtension>> =
+                Vec::with_capacity(bucket_indices.len());
+            let mut bucket_iotas_per_bucket: Vec<Vec<usize>> =
+                Vec::with_capacity(bucket_indices.len());
+
+            for (members, &lde_size) in bucket_indices.iter().zip(bucket_lde_sizes.iter()) {
+                let mut bt = bucket_seed.clone();
+                bt.append_bytes(&(lde_size as u64).to_le_bytes());
+                let delta_fri: FieldElement<FieldExtension> = bt.sample_field_element();
+
+                let leader_idx = chunk_start + members[0];
+                let (leader_air, _, _) = &air_trace_pairs[leader_idx];
+                let leader_domain = &domains[leader_idx];
+                let coset_offset =
+                    FieldElement::<Field>::from(leader_air.context().proof_options.coset_offset);
+
+                // Streaming bucket combine: build each member's DEEP LDE
+                // one at a time, fold into the bucket accumulator with
+                // δ_fri^i, then drop. Peak DEEP memory inside this loop:
+                // 2 × |LDE| (current member + accumulator).
+                let mut combined: Vec<FieldElement<FieldExtension>> =
+                    vec![FieldElement::<FieldExtension>::zero(); lde_size];
+                let mut delta_power = FieldElement::<FieldExtension>::one();
+                for (i_local, &j) in members.iter().enumerate() {
+                    let idx = chunk_start + j;
+                    let domain_j = &domains[idx];
+                    let round_1_j = &chunk_round1[j];
+                    let round_2_j = &chunk_round2[j];
+                    let round_3_j = &chunk_round3[j];
+                    let coeffs_j = &chunk_deep_coeffs[j];
+                    let deep_lde_j = Self::compute_deep_lde_with_coeffs(
+                        domain_j,
+                        round_1_j,
+                        round_2_j,
+                        round_3_j,
+                        coeffs_j,
+                    );
+                    debug_assert_eq!(deep_lde_j.len(), lde_size);
+                    if i_local == 0 {
+                        // First member: avoid the multiply-by-one in the
+                        // common singleton-bucket case.
+                        combined = deep_lde_j;
+                    } else {
+                        for (acc, src) in combined.iter_mut().zip(deep_lde_j.iter()) {
+                            *acc = &*acc + &delta_power * src;
+                        }
+                    }
+                    delta_power = &delta_power * &delta_fri;
+                }
+
+                let (last_value, fri_layers) =
+                    fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+                        leader_domain.root_order as usize,
+                        combined,
+                        &mut bt,
+                        &coset_offset,
+                        lde_size,
+                    );
+
+                let security_bits = leader_air.context().proof_options.grinding_factor;
+                let nonce = if security_bits > 0 {
+                    let nonce_value = grinding::generate_nonce(&bt.state(), security_bits)
+                        .expect("bucket-FRI grinding nonce not found");
+                    bt.append_bytes(&nonce_value.to_be_bytes());
+                    Some(nonce_value)
+                } else {
+                    None
+                };
+
+                let number_of_queries = leader_air.options().fri_number_of_queries;
+                let iotas = Self::sample_query_indexes(number_of_queries, leader_domain, &mut bt);
+                let decommitments = fri::query_phase(&fri_layers, &iotas);
+                let layer_roots: Vec<Commitment> = fri_layers
+                    .iter()
+                    .map(|layer| layer.merkle_tree.root)
+                    .collect();
+                let member_tags: Vec<MatrixTag> = members
+                    .iter()
+                    .map(|&j| main_tags[chunk_start + j])
+                    .collect();
+
+                chunk_buckets.push(crate::proof::stark::ChunkBucketFri {
+                    lde_size: lde_size as u32,
+                    members: member_tags,
+                    layer_roots,
+                    last_value,
+                    decommitments,
+                    nonce,
+                });
+                bucket_iotas_per_bucket.push(iotas);
+            }
+            fri_chunk_buckets_per_chunk.push(chunk_buckets);
+
+            let mut member_bucket_idx: Vec<usize> = vec![0; chunk_size];
+            for (b, members) in bucket_indices.iter().enumerate() {
+                for &j in members.iter() {
+                    member_bucket_idx[j] = b;
+                }
+            }
+
+            // Per chunk-mate: open at bucket-shared iotas + assemble StarkProof.
+            for j in 0..chunk_size {
+                let idx = chunk_start + j;
+                let (_, _, pub_inputs) = &air_trace_pairs[idx];
+                let domain = &domains[idx];
+                let round_1_result = &chunk_round1[j];
+                let round_2_result = &chunk_round2[j];
+                let bucket_idx = member_bucket_idx[j];
+                let iotas = &bucket_iotas_per_bucket[bucket_idx];
+                let deep_poly_openings = Self::open_deep_composition_poly(
+                    domain,
+                    round_1_result,
+                    round_2_result,
+                    iotas,
+                );
+                let round_3 = &chunk_round3[j];
+                let proof = StarkProof {
+                    lde_trace_main_merkle_root: round_1_result.main.main_tree_root(),
+                    lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root(),
+                    trace_ood_evaluations: round_3.trace_ood_evaluations.clone(),
+                    composition_poly_parts_ood_evaluation: round_3
+                        .composition_poly_parts_ood_evaluation
+                        .clone(),
+                    deep_poly_openings,
+                    bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+                    public_inputs: (*pub_inputs).clone(),
+                    trace_length: domain.interpolation_domain_size,
+                };
+                proofs[idx] = Some(proof);
             }
         }
 
@@ -2909,6 +3108,7 @@ pub trait IsStarkProver<
             comp_mmcs_roots: comp_mmcs_roots_per_chunk,
             comp_mmcs_specs: comp_mmcs_specs_per_chunk,
             chunk_size: k as u32,
+            fri_chunk_buckets: fri_chunk_buckets_per_chunk,
         })
     }
 
@@ -3002,19 +3202,26 @@ pub trait IsStarkProver<
         Ok((transition_coefficients, boundary_coefficients, r2a))
     }
 
-    /// Part B of Round 2 onward: assumes the chunk composition MMCS root
-    /// has been absorbed into `transcript` already. Runs the absorb of
-    /// the per-table H_i values, R3 OOD, and R4 FRI + opens, producing
-    /// the final per-table StarkProof.
+    /// Part B of Round 2 through R3.5 (light): assumes the chunk
+    /// composition MMCS root has been absorbed into the per-fork
+    /// `transcript`. Runs z-sample, OOD computation + own-OOD absorb,
+    /// then samples γ + builds the DEEP composition **coefficients**.
+    ///
+    /// Does NOT build the DEEP LDE — that's deferred to
+    /// [`compute_deep_lde_with_coeffs`] which runs inside the bucket
+    /// FRI loop, so DEEP_i is materialised one at a time, folded into
+    /// the bucket accumulator with δ_fri^i, then dropped.
     #[allow(clippy::too_many_arguments)]
-    fn prove_rounds_2b_to_4(
+    fn prove_rounds_2b_to_3_5(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
         round_2_result: &Round2<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
-    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    ) -> Result<
+        (Round3<FieldExtension>, DeepCoeffs<FieldExtension>),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -3054,15 +3261,15 @@ pub trait IsStarkProver<
         }
 
         // ===================================
-        // ==========|   Round 4   |==========
+        // ==========|  Round 3.5  |==========
         // ===================================
-        let round_4_result = Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+        // Sample γ + build DEEP coefficients (lightweight). The DEEP LDE
+        // itself is computed later inside the bucket FRI loop.
+        let deep_coeffs = Self::sample_deep_coeffs(
             air,
             domain,
-            round_1_result,
             round_2_result,
-            &round_3_result,
-            &z,
+            z,
             transcript,
         );
 
@@ -3071,37 +3278,21 @@ pub trait IsStarkProver<
             let zero = std::time::Duration::ZERO;
             let (r2_constraints, r2_fft, r2_merkle) =
                 crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
-            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
-                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
                 constraints: r2_constraints,
                 comp_decompose: r2_fft,
                 comp_commit: r2_merkle,
                 ood: round_3_dur,
-                deep_comp: r4_deep_comp,
-                deep_extend: r4_fft,
-                fri_commit: r4_merkle,
-                queries: r4_queries,
+                deep_comp: zero,
+                deep_extend: zero,
+                fri_commit: zero,
+                queries: zero,
             });
         }
 
         info!("End proof generation");
 
-        Ok(StarkProof {
-            lde_trace_main_merkle_root: round_1_result.main.main_tree_root(),
-            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root(),
-            trace_ood_evaluations: round_3_result.trace_ood_evaluations,
-            composition_poly_parts_ood_evaluation: round_3_result
-                .composition_poly_parts_ood_evaluation,
-            fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-            fri_last_value: round_4_result.fri_last_value,
-            query_list: round_4_result.query_list,
-            deep_poly_openings: round_4_result.deep_poly_openings,
-            nonce: round_4_result.nonce,
-            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
-            public_inputs: pub_inputs.clone(),
-            trace_length: domain.interpolation_domain_size,
-        })
+        Ok((round_3_result, deep_coeffs))
     }
 }
 
