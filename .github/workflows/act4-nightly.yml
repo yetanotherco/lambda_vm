@@ -55,18 +55,28 @@ jobs:
         if: always()
         run: |
           mkdir -p out
+          shopt -s nullglob
+          summaries=(test-results/lambdavm/summary-act4-*.json)
+
+          # No summaries means the build/test pipeline failed to produce results.
+          if [ ${#summaries[@]} -eq 0 ]; then
+            msg="No ACT4 summary files were produced. See run.log."
+            echo "$msg" | tee out/summary.md
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "failed=-1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           {
             echo "## ACT4 results for lambdavm @ $LAMBDAVM_SHA"
             echo ""
-            for f in test-results/lambdavm/summary-act4-*.json; do
-              [ -f "$f" ] || continue
+            for f in "${summaries[@]}"; do
               jq -r '"- **\(.suite)**: \(.passed)/\(.total) passed (\(.failed) failed)"' "$f"
             done
           } | tee out/summary.md >> "$GITHUB_STEP_SUMMARY"
 
           FAILED=0
-          for f in test-results/lambdavm/summary-act4-*.json; do
-            [ -f "$f" ] || continue
+          for f in "${summaries[@]}"; do
             n=$(jq '.failed // 0' "$f")
             FAILED=$((FAILED + n))
           done
