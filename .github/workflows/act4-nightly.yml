@@ -2,6 +2,7 @@ name: ACT4 Nightly
 
 on:
   workflow_run:
+    # Runs after Bench Vs Nightly to make sure the self-hosted runner is available
     workflows: ["Bench Vs Nightly"]
     types: [completed]
     branches: [main]
