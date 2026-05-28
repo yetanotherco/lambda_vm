@@ -20,7 +20,7 @@
 //!
 //! ## Bus Interactions (20)
 //! - 1 IS_HALF[base_address[0] + mask] (range check: address span fits in 16 bits)
-//! - 1 LT[old_timestamp, timestamp, 0] → 1
+//! - 1 ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
 //!
@@ -42,7 +42,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::memw::MemwOperation;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW_A table chunk.
@@ -180,10 +180,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT[old_timestamp, timestamp, 0] → 1 with μ_sum
+    // ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts.
+    // (shrink-cpu: the dedicated `Lt` bus was removed; every LT lookup goes
+    // through the unified ALU bus with signed=0/invert=0.)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::Lt,
+        BusId::Alu,
         mu_sum.clone(),
         vec![
             BusValue::Packed {
@@ -194,8 +196,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
             BusValue::constant(1),
+            BusValue::constant(0),
         ],
     ));
 

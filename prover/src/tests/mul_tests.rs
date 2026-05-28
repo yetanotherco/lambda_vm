@@ -254,14 +254,14 @@ fn test_different_signed_flags_separate_rows() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Expected interactions:
+    // Expected interactions (shrink-cpu: every MUL lookup goes through the
+    // unified ALU bus — CPU MUL/MULH dispatch and dvrm's `d*q` consistency):
     // - 2x MSB16 senders (lhs sign, rhs sign)
     // - 8x IS_HALF senders (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
-    // - 2x MUL receivers (lo, hi)
-    // - 2x ALU receivers (lo, hi) — shrink-cpu: CPU/CPU32 dispatch MUL/MULH
-    // Total: 2 + 8 + 4 + 2 + 2 = 18
-    assert_eq!(interactions.len(), 18, "Expected 18 bus interactions");
+    // - 2x ALU receivers (lo, hi)
+    // Total: 2 + 8 + 4 + 2 = 16
+    assert_eq!(interactions.len(), 16, "Expected 16 bus interactions");
 }
 
 #[test]

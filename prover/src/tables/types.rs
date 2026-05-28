@@ -47,73 +47,69 @@ pub enum BusId {
     /// Single-byte checks (spec template `IS_BYTE<X>`) send the second value as 0.
     AreBytes = 0,
     /// Range check: value is a valid halfword [0, 2^16)
-    IsHalfword,
+    IsHalfword = 1,
     /// Range check: value is a 20-bit value [0, 2^20)
-    IsB20,
+    IsB20 = 2,
 
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
     /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
-    AndByte,
+    AndByte = 3,
     /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
-    OrByte,
+    OrByte = 4,
     /// Bitwise XOR of two bytes: XOR_BYTE[X, Y] -> X ^ Y
-    XorByte,
+    XorByte = 5,
     /// Most significant bit of a byte: MSB8[X] -> (X >> 7) & 1
-    Msb8,
+    Msb8 = 6,
     /// Most significant bit of a halfword: MSB16[X] -> (X >> 15) & 1
-    Msb16,
+    Msb16 = 7,
     /// Check if value is zero: ZERO[X] -> X == 0 ? 1 : 0
-    Zero,
+    Zero = 8,
 
     // =========================================================================
     // Shift helpers (BITWISE table provides)
     // =========================================================================
     /// Halfword shift left: HWSL[X, Z] -> [(X << Z) & 0xFFFF, X >> (16 - Z)]
-    Hwsl,
+    Hwsl = 9,
 
     // =========================================================================
     // Arithmetic operations (separate tables)
     // =========================================================================
-    /// Less-than comparison: LT[lhs, rhs, signed] -> lhs < rhs
-    Lt,
-    /// Multiplication: MUL[lhs, lhs_signed, rhs, rhs_signed, hi] -> product
-    Mul,
-    /// Division/Remainder: DVRM[result; n, d, signed, muldiv_selector]
-    Dvrm,
-    /// Shift operation: SHIFT[in, shift, dir, signed, word] -> out
-    Shift,
+    // The four per-chip ALU buses (LT, MUL, DVRM, SHIFT — IDs 10/11/12/13)
+    // were collapsed into [`Alu`](BusId::Alu) by the shrink-cpu rework. Their
+    // numeric IDs are reserved (not removed) so the live variants below keep
+    // their discriminants stable.
 
     // =========================================================================
     // Memory/Control
     // =========================================================================
     /// Memory word read/write with timestamps (lookup bus from CPU)
-    Memw,
-    /// Memory load with sign/zero extension (lookup bus from CPU)
-    Load,
+    Memw = 14,
+    // ID 15 (Load) is reserved: the load lookup is now dispatched through
+    // [`MemoryOp`](BusId::MemoryOp).
     /// Internal memory consistency bus: memory[is_register, address, timestamp, value]
     /// Used for read/write pairing in MEMW table (M1-M8 in spec)
-    Memory,
+    Memory = 16,
     /// Branch target computation
-    Branch,
+    Branch = 17,
 
     // =========================================================================
     // System (specs not yet defined)
     // =========================================================================
     /// Instruction decode lookup
-    Decode,
+    Decode = 18,
     /// System call handling (CPU → HALT/COMMIT for all ECALLs)
-    Ecall,
+    Ecall = 19,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte,
+    CommitNextByte = 20,
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
-    Commit,
+    Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
-    Keccak,
+    Keccak = 22,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
-    KeccakRc,
+    KeccakRc = 23,
 
     // =========================================================================
     // Byte ALU (BITWISE table provides) — shrink-cpu rework
@@ -121,7 +117,7 @@ pub enum BusId {
     /// Unified byte-level ALU lookup: `BYTE_ALU[opsel, X, Y] -> out`, where
     /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2). Collapses the
     /// separate `AndByte`/`OrByte`/`XorByte` buses into one.
-    ByteAlu,
+    ByteAlu = 24,
 
     // =========================================================================
     // Unified ALU + high-level memory dispatch — shrink-cpu rework
@@ -130,14 +126,14 @@ pub enum BusId {
     /// dispatches to the ALU chips (lt/mul/dvrm/shift/eq/bytewise/cpu32) which
     /// receive on this bus, selected by the `alu_flags` byte. Replaces the
     /// per-chip `Lt`/`Mul`/`Dvrm`/`Shift` output buses.
-    Alu,
+    Alu = 25,
     /// High-level memory op: `MEMORY[out; timestamp, address, value, mem_flags]`.
     /// The CPU (sender) dispatches to `LOAD`/`STORE` based on `mem_flags`.
     /// Distinct from the low-level [`Memory`](BusId::Memory) token bus.
-    MemoryOp,
+    MemoryOp = 26,
     /// CPU → CPU32 delegation of word (`*W`) instructions:
     /// `CPU32[timestamp, pc, instruction_length]`.
-    Cpu32,
+    Cpu32 = 27,
 }
 
 impl BusId {
@@ -154,16 +150,11 @@ impl BusId {
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
             BusId::Hwsl => "Hwsl",
-            BusId::Lt => "Lt",
-            BusId::Mul => "Mul",
-            BusId::Shift => "Shift",
             BusId::Memw => "Memw",
-            BusId::Load => "Load",
             BusId::Memory => "Memory",
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
             BusId::Keccak => "Keccak",
@@ -191,12 +182,7 @@ impl TryFrom<u64> for BusId {
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
             9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Lt),
-            11 => Ok(BusId::Mul),
-            12 => Ok(BusId::Dvrm),
-            13 => Ok(BusId::Shift),
             14 => Ok(BusId::Memw),
-            15 => Ok(BusId::Load),
             16 => Ok(BusId::Memory),
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
@@ -741,64 +727,6 @@ fn branch_cond_flags(cond: Comparison) -> (u8, bool, bool) {
 }
 
 // =========================================================================
-// packed_decode bit positions (shared between CPU and DECODE tables)
-// =========================================================================
-
-/// Bit positions for the packed_decode field.
-///
-/// This is the single source of truth for how decode fields are packed into
-/// a 51-bit value. Used by:
-/// - `DecodeEntry::packed_decode()` - packs fields into a u64
-/// - CPU table bus interaction - builds LinearTerm coefficients
-///
-/// ## Format (51 bits total)
-///
-/// ```text
-/// Bits [0-10]:  Control flags (read_reg1, read_reg2, write_reg, memory_*, etc.)
-/// Bits [11-26]: ALU operation flags (ADD, SUB, SLT, AND, OR, XOR, etc.)
-/// Bits [27-34]: rs1 register index (8 bits)
-/// Bits [35-42]: rs2 register index (8 bits)
-/// Bits [43-50]: rd register index (8 bits)
-/// ```
-pub mod packed_decode {
-    // Control flags (bits 0-10)
-    pub const READ_REG1: u32 = 0;
-    pub const READ_REG2: u32 = 1;
-    pub const WRITE_REG: u32 = 2;
-    pub const MEMORY_2BYTES: u32 = 3;
-    pub const MEMORY_4BYTES: u32 = 4;
-    pub const MEMORY_8BYTES: u32 = 5;
-    pub const C_TYPE: u32 = 6;
-    pub const SIGNED: u32 = 7;
-    pub const MP_SELECTOR: u32 = 8;
-    pub const MULDIV_SELECTOR: u32 = 9;
-    pub const WORD_INSTR: u32 = 10;
-
-    // ALU operation flags (bits 11-26)
-    pub const OP_ADD: u32 = 11;
-    pub const OP_SUB: u32 = 12;
-    pub const OP_SLT: u32 = 13;
-    pub const OP_AND: u32 = 14;
-    pub const OP_OR: u32 = 15;
-    pub const OP_XOR: u32 = 16;
-    pub const OP_SHIFT: u32 = 17;
-    pub const OP_JALR: u32 = 18;
-    pub const OP_BEQ: u32 = 19;
-    pub const OP_BLT: u32 = 20;
-    pub const OP_LOAD: u32 = 21;
-    pub const OP_STORE: u32 = 22;
-    pub const OP_MUL: u32 = 23;
-    pub const OP_DIVREM: u32 = 24;
-    pub const OP_ECALL: u32 = 25;
-    pub const OP_EBREAK: u32 = 26;
-
-    // Register indices (bits 27-50)
-    pub const RS1: u32 = 27;
-    pub const RS2: u32 = 35;
-    pub const RD: u32 = 43;
-}
-
-// =========================================================================
 // DecodeEntry - Shared decode information for CPU and DECODE tables
 // =========================================================================
 
@@ -813,26 +741,9 @@ pub mod packed_decode {
 /// - **CPU table**: `CpuOperation` contains a `DecodeEntry` plus runtime values (rv1, rv2, etc.)
 /// - **DECODE table**: Stores `DecodeEntry` directly, with multiplicity tracking
 ///
-/// ## packed_decode Format (51 bits)
-///
-/// ```text
-/// Bits [0]:     read_register1
-/// Bits [1]:     read_register2
-/// Bits [2]:     write_register
-/// Bits [3]:     memory_2bytes
-/// Bits [4]:     memory_4bytes
-/// Bits [5]:     memory_8bytes
-/// Bits [6]:     c_type
-/// Bits [7]:     signed
-/// Bits [8]:     mp_selector
-/// Bits [9]:     muldiv_selector
-/// Bits [10]:    word_instr
-/// Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
-///               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
-/// Bits [27:35]: rs1 (8 bits)
-/// Bits [35:43]: rs2 (8 bits)
-/// Bits [43:51]: rd (8 bits)
-/// ```
+/// The packed decode layout is defined by [`packed_decode_shrunk`] and produced
+/// by [`ShrunkDecode::pack`]; consult those for the bit positions of every flag,
+/// the ALU/MEM flag bytes, and the rs1/rs2/rd register indices.
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct DecodeEntry {
     /// Program counter (64-bit).

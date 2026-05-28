@@ -15,9 +15,7 @@
 //! selects sign- vs zero-extension of the inputs; the output `rvd` is always
 //! sign-extended (RV64 `*W` semantics).
 //!
-//! NOTE: the chip (columns, trace, constraints, bus interactions) is complete
-//! but not yet registered in `VmAirs` — that happens in the atomic CPU/DECODE
-//! wire-up. Register reads use the cast-to-`DWordWL` encoding (Q9, see
+//! Register reads use the cast-to-`DWordWL` encoding (Q9, see
 //! `shrink-cpu-spec-questions.md`).
 
 use math::field::element::FieldElement;

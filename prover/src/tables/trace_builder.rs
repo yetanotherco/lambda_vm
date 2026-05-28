@@ -464,7 +464,7 @@ fn collect_ops_from_cpu(
             // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
             // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
             if f.is_lt() {
-                lt_ops.push(LtOperation::new_alu(
+                lt_ops.push(LtOperation::new_with_invert(
                     op.rv1,
                     op.arg2,
                     f.alu_signed(),
@@ -712,7 +712,7 @@ fn cpu32_res(c: &cpu32::Cpu32Operation, arg1: u64, arg2: u64) -> u64 {
         // CPU32 sign-extends it to rvd.
         ShiftOperation::new(arg1, arg2, s2_or_inv, signed, true).compute_out()
     } else if op == alu_op::MUL {
-        MulOperation::new_alu(arg1, signed, arg2, s2_or_inv)
+        MulOperation::new(arg1, signed, arg2, s2_or_inv)
             .compute_product()
             .0
     } else if op == alu_op::DIVREM {
@@ -824,7 +824,7 @@ fn cpu32_chip_op(
         ));
     } else if op == alu_op::MUL {
         mul_ops.push((
-            MulOperation::new_alu(aux.arg1, signed, aux.arg2, s2_or_inv),
+            MulOperation::new(aux.arg1, signed, aux.arg2, s2_or_inv),
             muldiv,
         ));
     } else if op == alu_op::DIVREM {
@@ -2321,7 +2321,7 @@ fn collect_all_ops(
         .map(|op| {
             let f = op.decode.fields;
             (
-                MulOperation::new_alu(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
                 f.alu_muldiv(),
             )
         })

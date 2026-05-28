@@ -23,7 +23,8 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
-//! - Receiver: LT (provides less-than results to other tables)
+//! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
+//!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -80,20 +81,18 @@ pub mod cols {
     /// rhs_msb: Bit (MSB of rhs, i.e., bit 63)
     pub const RHS_MSB: usize = 13;
 
-    // Multiplicity column (LT bus: memw/memw_aligned/dvrm timestamp & |r|<|d| checks)
-    /// μ: multiplicity for the `Lt` bus receiver
-    pub const MU: usize = 14;
-
-    // shrink-cpu rework: the CPU dispatches SLT/BLT/BGE on the unified `ALU` bus.
+    // shrink-cpu rework: every LT lookup (CPU SLT/BLT/BGE dispatch and the
+    // internal memw/memw_aligned/dvrm comparisons) goes through the unified
+    // `ALU` bus, so one multiplicity column suffices.
     /// invert: Bit — invert the comparison (BGE/BGEU); `out = lt XOR invert`.
-    pub const INVERT: usize = 15;
+    pub const INVERT: usize = 14;
     /// out: the ALU result `lt XOR invert` (the low word; high word is 0).
-    pub const OUT: usize = 16;
-    /// μ_alu: multiplicity for the `ALU` bus receiver (CPU comparisons).
-    pub const MU_ALU: usize = 17;
+    pub const OUT: usize = 15;
+    /// μ: multiplicity for the `ALU` bus receiver.
+    pub const MU: usize = 16;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 18;
+    pub const NUM_COLUMNS: usize = 17;
 }
 
 // =========================================================================
@@ -101,6 +100,10 @@ pub mod cols {
 // =========================================================================
 
 /// A single LT operation to be added to the trace.
+///
+/// Every operation is dispatched on the unified `ALU` bus; the `invert` flag
+/// distinguishes plain less-than (memw/dvrm internal checks, CPU `SLT[U]`/`BLT[U]`)
+/// from the inverted form (`BGE[U]`).
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -113,31 +116,26 @@ pub struct LtOperation {
     pub signed: bool,
     /// Whether to invert the result (`out = lt XOR invert`); used for BGE/BGEU.
     pub invert: bool,
-    /// `true` if this lookup is dispatched by the CPU on the unified `ALU` bus;
-    /// `false` if it is an internal `Lt`-bus lookup (memw/memw_aligned/dvrm).
-    pub alu: bool,
 }
 
 impl LtOperation {
-    /// Create a new `Lt`-bus LT operation (memw/dvrm internal less-than checks).
+    /// Create a new LT operation with `invert = false` (plain less-than).
     pub fn new(lhs: u64, rhs: u64, signed: bool) -> Self {
         Self {
             lhs,
             rhs,
             signed,
             invert: false,
-            alu: false,
         }
     }
 
-    /// Create a new `ALU`-bus LT operation (CPU SLT/BLT/BGE dispatch).
-    pub fn new_alu(lhs: u64, rhs: u64, signed: bool, invert: bool) -> Self {
+    /// Create a new LT operation with an explicit `invert` flag (BGE/BGEU dispatch).
+    pub fn new_with_invert(lhs: u64, rhs: u64, signed: bool, invert: bool) -> Self {
         Self {
             lhs,
             rhs,
             signed,
             invert,
-            alu: true,
         }
     }
 
@@ -225,13 +223,8 @@ pub fn generate_lt_trace(
         data[base + cols::INVERT] = FE::from(op.invert as u64);
         data[base + cols::OUT] = FE::from(op.compute_out() as u64);
 
-        // Multiplicity routed to the bus this op belongs to. Internal `Lt`-bus
-        // lookups increment MU; CPU `ALU`-bus comparisons increment MU_ALU.
-        if op.alu {
-            data[base + cols::MU_ALU] = FE::from(*multiplicity);
-        } else {
-            data[base + cols::MU] = FE::from(*multiplicity);
-        }
+        // All LT lookups go through the unified ALU bus → single multiplicity.
+        data[base + cols::MU] = FE::from(*multiplicity);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -254,7 +247,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // Output: lhs_msb
         BusInteraction::sender(
             BusId::Msb16,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
                     start_column: cols::LHS_2,
@@ -269,7 +262,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // MSB16[rhs[2]] -> rhs_msb
         BusInteraction::sender(
             BusId::Msb16,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
                     start_column: cols::RHS_2,
@@ -284,7 +277,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[0]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_0,
                 packing: Packing::Direct,
@@ -293,7 +286,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_1,
                 packing: Packing::Direct,
@@ -302,7 +295,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[2]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_2,
                 packing: Packing::Direct,
@@ -311,7 +304,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs_sub_rhs[3]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_3,
                 packing: Packing::Direct,
@@ -320,7 +313,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[lhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_1,
                 packing: Packing::Direct,
@@ -329,49 +322,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // IS_HALFWORD[rhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU, cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::RHS_1,
                 packing: Packing::Direct,
             }],
         ),
-        // LT[lhs, rhs, signed] -> lt (receiver)
-        // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
-        // Uses DWordHHW packing: reads 3 columns (Word, Half, Half), produces 2 bus elements [lo32, hi32]
-        // This allows DWordWL senders (like MEMW timestamps) to match via Packing::DWordWL
-        BusInteraction::receiver(
-            BusId::Lt,
-            Multiplicity::Column(cols::MU),
-            vec![
-                // lhs as DWordHHW (reads 3 columns: Word, Half, Half; produces 2 elements: [lo32, hi32])
-                BusValue::Packed {
-                    start_column: cols::LHS_0,
-                    packing: Packing::DWordHHW,
-                },
-                // rhs as DWordHHW (reads 3 columns, produces 2 elements)
-                BusValue::Packed {
-                    start_column: cols::RHS_0,
-                    packing: Packing::DWordHHW,
-                },
-                // signed
-                BusValue::Packed {
-                    start_column: cols::SIGNED,
-                    packing: Packing::Direct,
-                },
-                // lt (output)
-                BusValue::Packed {
-                    start_column: cols::LT,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
         // ALU[lhs, rhs, opsel(LT) + 32*signed + 64*invert] -> out  (receiver).
-        // The CPU dispatches SLT/BLT/BGE here on the unified ALU bus. lhs/rhs are
-        // packed DWordHHW -> [lo32, hi32] (matching the CPU's DWordWL operands);
-        // the output is [out, 0] (a comparison result fits in the low word).
+        // Every LT lookup arrives here: the CPU dispatches SLT/BLT/BGE on the
+        // unified ALU bus, and the internal memw/memw_aligned/dvrm comparisons
+        // (timestamps and |r|<|d|) encode `signed=0, invert=0`. lhs/rhs are
+        // packed DWordHHW -> [lo32, hi32] (matching DWordWL senders); the
+        // output is [out, 0] (a comparison result fits in the low word).
         BusInteraction::receiver(
             BusId::Alu,
-            Multiplicity::Column(cols::MU_ALU),
+            Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
                     start_column: cols::LHS_0,

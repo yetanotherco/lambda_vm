@@ -217,9 +217,10 @@ fn test_lt_deduplication() {
             && row[lt::cols::RHS_0] == FE::from(10u64)
             && row[lt::cols::SIGNED] == FE::from(1u64)
         {
-            // Found our SLT row - verify multiplicity is 3. SLT is dispatched on
-            // the unified ALU bus (shrink-cpu), so it counts under MU_ALU.
-            assert_eq!(row[lt::cols::MU_ALU], FE::from(3u64));
+            // Found our SLT row - verify multiplicity is 3. Every LT lookup
+            // (including SLT) goes through the unified ALU bus (shrink-cpu) and
+            // is counted in the single `MU` column.
+            assert_eq!(row[lt::cols::MU], FE::from(3u64));
             found_slt = true;
             break;
         }

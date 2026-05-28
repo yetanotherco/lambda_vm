@@ -27,7 +27,8 @@
 //! - Sender: MSB16 (×2 for sign extraction)
 //! - Sender: IS_HALF (×8 for lo/hi range checks)
 //! - Sender: IS_B20 (×4 for carry range checks)
-//! - Receiver: MUL (×2 for lo and hi results)
+//! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
+//!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
 use std::collections::HashMap;
 
@@ -44,27 +45,10 @@ use super::types::{
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
 };
 
-/// Total row multiplicity across both buses (`Mul` + `ALU`, lo + hi), used by
-/// the internal range-check sends so they fire once per row-instance.
+/// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
+/// range-check sends so they fire once per row-instance.
 fn row_mult() -> Multiplicity {
-    Multiplicity::Linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU_LO,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU_HI,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU_ALU_LO,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::MU_ALU_HI,
-        },
-    ])
+    Multiplicity::Sum(cols::MU_LO, cols::MU_HI)
 }
 
 // =========================================================================
@@ -135,19 +119,15 @@ pub mod cols {
     /// raw_product[3]: Intermediate convolution value
     pub const RAW_PRODUCT_3: usize = 23;
 
-    // Multiplicity columns. The `Mul` bus serves dvrm's internal `d*q` checks;
-    // the `ALU` bus serves the CPU's MUL/MULH dispatch (shrink-cpu rework).
-    /// μ_lo: `Mul` bus multiplicity for lo result lookups
+    // Multiplicity columns. All MUL lookups (CPU MUL/MULH dispatch and dvrm's
+    // internal `d*q` consistency checks) go through the unified `ALU` bus.
+    /// μ_lo: `ALU` bus multiplicity for lo result lookups
     pub const MU_LO: usize = 24;
-    /// μ_hi: `Mul` bus multiplicity for hi result lookups
+    /// μ_hi: `ALU` bus multiplicity for hi result lookups
     pub const MU_HI: usize = 25;
-    /// μ_alu_lo: `ALU` bus multiplicity for lo result lookups (CPU MUL)
-    pub const MU_ALU_LO: usize = 26;
-    /// μ_alu_hi: `ALU` bus multiplicity for hi result lookups (CPU MULH)
-    pub const MU_ALU_HI: usize = 27;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 28;
+    pub const NUM_COLUMNS: usize = 26;
 }
 
 // =========================================================================
@@ -163,6 +143,10 @@ const SIGN_FILL: u64 = 0xFFFF;
 
 /// A single MUL operation to be added to the trace.
 ///
+/// Every operation is dispatched on the unified `ALU` bus (CPU MUL/MULH and
+/// dvrm's internal `d*q` consistency checks); the lo/hi half is selected by
+/// the sender's `flags` byte at lookup time.
+///
 /// Derives Hash and Eq for HashMap-based deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MulOperation {
@@ -174,44 +158,25 @@ pub struct MulOperation {
     pub rhs: u64,
     /// Whether rhs is treated as signed
     pub rhs_signed: bool,
-    /// `true` if dispatched by the CPU on the unified `ALU` bus; `false` for
-    /// internal `Mul`-bus lookups (dvrm's `d*q` consistency).
-    pub alu: bool,
 }
 
-/// Multiplicities for a MUL operation, split by bus (`Mul` vs `ALU`) and lo/hi.
+/// Multiplicities for a MUL operation, split by lo/hi result lookup.
 #[derive(Debug, Clone, Default)]
 pub struct MulMultiplicities {
-    /// `Mul` bus count requesting lo result
-    pub mu_lo: u64,
-    /// `Mul` bus count requesting hi result
-    pub mu_hi: u64,
     /// `ALU` bus count requesting lo result
-    pub mu_alu_lo: u64,
+    pub mu_lo: u64,
     /// `ALU` bus count requesting hi result
-    pub mu_alu_hi: u64,
+    pub mu_hi: u64,
 }
 
 impl MulOperation {
-    /// Create a new internal (`Mul`-bus) MUL operation.
+    /// Create a new MUL operation.
     pub fn new(lhs: u64, lhs_signed: bool, rhs: u64, rhs_signed: bool) -> Self {
         Self {
             lhs,
             lhs_signed,
             rhs,
             rhs_signed,
-            alu: false,
-        }
-    }
-
-    /// Create a new CPU-dispatched (`ALU`-bus) MUL operation.
-    pub fn new_alu(lhs: u64, lhs_signed: bool, rhs: u64, rhs_signed: bool) -> Self {
-        Self {
-            lhs,
-            lhs_signed,
-            rhs,
-            rhs_signed,
-            alu: true,
         }
     }
 
@@ -335,11 +300,10 @@ pub fn generate_mul_trace(
 
     for (op, wants_hi) in operations {
         let entry = op_map.entry(op.clone()).or_default();
-        match (op.alu, *wants_hi) {
-            (false, false) => entry.mu_lo += 1,
-            (false, true) => entry.mu_hi += 1,
-            (true, false) => entry.mu_alu_lo += 1,
-            (true, true) => entry.mu_alu_hi += 1,
+        if *wants_hi {
+            entry.mu_hi += 1;
+        } else {
+            entry.mu_lo += 1;
         }
     }
 
@@ -390,11 +354,9 @@ pub fn generate_mul_trace(
         data[base + cols::RAW_PRODUCT_2] = FE::from(raw[2]);
         data[base + cols::RAW_PRODUCT_3] = FE::from(raw[3]);
 
-        // Fill multiplicities (Mul bus + ALU bus, each lo/hi)
+        // Fill multiplicities (ALU bus, lo/hi)
         data[base + cols::MU_LO] = FE::from(multiplicities.mu_lo);
         data[base + cols::MU_HI] = FE::from(multiplicities.mu_hi);
-        data[base + cols::MU_ALU_LO] = FE::from(multiplicities.mu_alu_lo);
-        data[base + cols::MU_ALU_HI] = FE::from(multiplicities.mu_alu_hi);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -643,84 +605,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MUL receiver for lo result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, lo, 0] per spec MUL-C7
-    interactions.push(BusInteraction::receiver(
-        BusId::Mul,
-        Multiplicity::Column(cols::MU_LO),
-        vec![
-            // lhs as DWordHL (4 halfwords -> 2 words)
-            BusValue::Packed {
-                start_column: cols::LHS_0,
-                packing: Packing::DWordHL,
-            },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::RHS_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // lo as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::LO_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 0 (lo)
-            BusValue::constant(0),
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // MUL receiver for hi result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, hi, 1] per spec MUL-C8
-    interactions.push(BusInteraction::receiver(
-        BusId::Mul,
-        Multiplicity::Column(cols::MU_HI),
-        vec![
-            // lhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::LHS_0,
-                packing: Packing::DWordHL,
-            },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
-            BusValue::Packed {
-                start_column: cols::RHS_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // hi as DWordHL (result)
-            BusValue::Packed {
-                start_column: cols::HI_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 1 (hi)
-            BusValue::constant(1),
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // ALU receivers (shrink-cpu): the CPU dispatches MUL/MULH/MULHSU/MULHU here.
-    // ALU[out::DWordWL; lhs, rhs, flags] where flags =
+    // ALU receivers (shrink-cpu): every MUL lookup arrives here — CPU
+    // MUL/MULH/MULHSU/MULHU dispatch and dvrm's internal `d*q` consistency.
+    // ALU[lhs, rhs, flags, result] where flags =
     //   opsel(MUL) + 32*lhs_signed + 64*rhs_signed (+128 for the hi result).
     // -------------------------------------------------------------------------
     let mul_flags = |hi: i64| {
@@ -739,7 +626,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ALU lo (muldiv bit 7 = 0)
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
-        Multiplicity::Column(cols::MU_ALU_LO),
+        Multiplicity::Column(cols::MU_LO),
         vec![
             BusValue::Packed {
                 start_column: cols::LHS_0,
@@ -759,7 +646,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ALU hi (muldiv bit 7 = 1 => +128)
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
-        Multiplicity::Column(cols::MU_ALU_HI),
+        Multiplicity::Column(cols::MU_HI),
         vec![
             BusValue::Packed {
                 start_column: cols::LHS_0,
