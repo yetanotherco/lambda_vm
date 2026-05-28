@@ -498,6 +498,126 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 }
 
+// MULW where the 32-bit product overflows past bit 31.
+#[test]
+fn test_prove_elfs_mulw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_overflow failed"
+    );
+}
+
+// DIVUW where the 32-bit unsigned quotient has bit 31 set.
+#[test]
+fn test_prove_elfs_divuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("divuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw_high_bit failed"
+    );
+}
+
+// REMUW where the 32-bit unsigned remainder has bit 31 set.
+#[test]
+fn test_prove_elfs_remuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("remuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw_high_bit failed"
+    );
+}
+
+// MULW base case (no 32-bit overflow).
+#[test]
+fn test_prove_elfs_mulw() {
+    let (elf, logs, instructions) = run_asm_elf("mulw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw failed"
+    );
+}
+
+// DIVW signed-overflow edge case: i32::MIN / -1 returns i32::MIN per RISC-V spec.
+#[test]
+fn test_prove_elfs_divw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("divw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_overflow failed"
+    );
+}
+
+// DIVW divide-by-zero: quotient = -1 (all ones sign-extended).
+#[test]
+fn test_prove_elfs_divw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("divw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_zero failed"
+    );
+}
+
+// REMW signed-overflow edge case: i32::MIN % -1 returns 0 per RISC-V spec.
+#[test]
+fn test_prove_elfs_remw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("remw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_overflow failed"
+    );
+}
+
+// REMW divide-by-zero: remainder = dividend.
+#[test]
+fn test_prove_elfs_remw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("remw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_zero failed"
+    );
+}
+
+// DIVUW base case (no high-bit set in quotient).
+#[test]
+fn test_prove_elfs_divuw() {
+    let (elf, logs, instructions) = run_asm_elf("divuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw failed"
+    );
+}
+
+// REMUW base case (no high-bit set in remainder).
+#[test]
+fn test_prove_elfs_remuw() {
+    let (elf, logs, instructions) = run_asm_elf("remuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_test_shift_8() {
     let (elf, logs, instructions) = run_asm_elf("test_shift_8");
