@@ -46,6 +46,7 @@ jobs:
         id: run
         continue-on-error: true
         run: |
+          set -o pipefail
           mkdir -p out
           ./run all lambdavm 2>&1 | tee out/run.log
 
