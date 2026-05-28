@@ -63,6 +63,18 @@ SSH_USER=admin infra/provision_server.sh <ip>
 The wrapper switches to `sudo bash -s` automatically when `SSH_USER` isn't
 root.
 
+## Delete the server
+
+To stop hourly charges, delete the server:
+
+```bash
+scw baremetal server delete <server_id> zone=<zone>
+```
+
+When `rent_baremetal.sh` finishes it prints the exact command (with
+`<server_id>` and `<zone>` filled in) — copy that line when you're done
+with the server.
+
 ## Configuration
 
 Everything has a working default; override via env var only when needed.
