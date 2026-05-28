@@ -694,6 +694,8 @@ fn cmd_proof_size(
     let main_mmcs_specs_bytes = ser_len(&vm_proof.proof.main_mmcs_specs);
     let aux_mmcs_roots_bytes = ser_len(&vm_proof.proof.aux_mmcs_roots);
     let aux_mmcs_specs_bytes = ser_len(&vm_proof.proof.aux_mmcs_specs);
+    let comp_mmcs_roots_bytes = ser_len(&vm_proof.proof.comp_mmcs_roots);
+    let comp_mmcs_specs_bytes = ser_len(&vm_proof.proof.comp_mmcs_specs);
     let chunk_size_bytes = ser_len(&vm_proof.proof.chunk_size);
 
     // Sum per-section across every sub-proof so a single number captures the
@@ -735,6 +737,8 @@ fn cmd_proof_size(
         + main_mmcs_specs_bytes
         + aux_mmcs_roots_bytes
         + aux_mmcs_specs_bytes
+        + comp_mmcs_roots_bytes
+        + comp_mmcs_specs_bytes
         + chunk_size_bytes
         + s_main_trace_openings
         + s_precomputed_trace_openings
@@ -754,6 +758,8 @@ fn cmd_proof_size(
         ProofSizeEntry { section: "main_mmcs_specs (per-chunk)".into(), bytes: main_mmcs_specs_bytes },
         ProofSizeEntry { section: "aux_mmcs_roots (per-chunk)".into(), bytes: aux_mmcs_roots_bytes },
         ProofSizeEntry { section: "aux_mmcs_specs (per-chunk)".into(), bytes: aux_mmcs_specs_bytes },
+        ProofSizeEntry { section: "comp_mmcs_roots (per-chunk)".into(), bytes: comp_mmcs_roots_bytes },
+        ProofSizeEntry { section: "comp_mmcs_specs (per-chunk)".into(), bytes: comp_mmcs_specs_bytes },
         ProofSizeEntry { section: "chunk_size".into(), bytes: chunk_size_bytes },
         ProofSizeEntry { section: "per_table_main_merkle_root (preprocessed)".into(), bytes: s_per_table_main_root },
         ProofSizeEntry { section: "per_table_precomputed_merkle_root".into(), bytes: s_precomputed_root },

@@ -43,6 +43,13 @@ pub const LEAF_DOMAIN_TAG_MAIN: &[u8] = LEAF_DOMAIN_TAG;
 /// other.
 pub const LEAF_DOMAIN_TAG_AUX: &[u8] = b"LAMBDAVM_AUX_MMCS_LEAF_V1";
 
+/// Versioned domain separator for COMPOSITION-trace MMCS leaves.
+/// Composition leaves hash a PAIR of rows (br_0 || br_1) instead of a
+/// single row — the legacy `keccak_leaves_row_pair_bit_reversed` shape.
+/// Distinct from main/aux so no composition opening can authenticate a
+/// main or aux leaf.
+pub const LEAF_DOMAIN_TAG_COMPOSITION: &[u8] = b"LAMBDAVM_COMP_MMCS_LEAF_V1";
+
 /// Synthesize `n` distinct [`MatrixTag`]s derived from positional index.
 /// Useful for generic stark tests where the caller does not own a stable
 /// chip-type assignment. Production code in lambda-vm uses
@@ -75,6 +82,18 @@ pub fn hash_tagged_row_bytes_aux(tag: MatrixTag, row_bytes_be: &[u8]) -> Commitm
     hash_with_domain(LEAF_DOMAIN_TAG_AUX, tag, row_bytes_be)
 }
 
+/// Hash a COMPOSITION-trace MMCS leaf from a pre-concatenated `(br_0 ||
+/// br_1)` byte buffer — i.e. the two row-pair rows written big-endian,
+/// `part_0_row_0 || part_1_row_0 || ... || part_0_row_1 || part_1_row_1
+/// || ...`. Uses [`LEAF_DOMAIN_TAG_COMPOSITION`].
+#[inline]
+pub fn hash_tagged_row_pair_bytes_composition(
+    tag: MatrixTag,
+    row_pair_bytes_be: &[u8],
+) -> Commitment {
+    hash_with_domain(LEAF_DOMAIN_TAG_COMPOSITION, tag, row_pair_bytes_be)
+}
+
 #[inline]
 fn hash_with_domain(domain: &[u8], tag: MatrixTag, row_bytes_be: &[u8]) -> Commitment {
     let mut h = Keccak256::new();
@@ -103,6 +122,34 @@ where
     FieldElement<E>: ByteConversion,
 {
     hash_tagged_row_inner::<E>(LEAF_DOMAIN_TAG_AUX, tag, row)
+}
+
+/// Convenience: hash a COMPOSITION-trace row-pair from two slices of
+/// field elements (the parts evaluated at `br_0` and `br_1`), each
+/// `num_parts` long.
+pub fn hash_tagged_row_pair_composition<E>(
+    tag: MatrixTag,
+    parts_at_br_0: &[FieldElement<E>],
+    parts_at_br_1: &[FieldElement<E>],
+) -> Commitment
+where
+    E: IsField,
+    FieldElement<E>: ByteConversion,
+{
+    debug_assert_eq!(parts_at_br_0.len(), parts_at_br_1.len());
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    let num_parts = parts_at_br_0.len();
+    let mut buf = vec![0u8; 2 * num_parts * byte_len];
+    let mut offset = 0;
+    for fe in parts_at_br_0 {
+        fe.write_bytes_be(&mut buf[offset..offset + byte_len]);
+        offset += byte_len;
+    }
+    for fe in parts_at_br_1 {
+        fe.write_bytes_be(&mut buf[offset..offset + byte_len]);
+        offset += byte_len;
+    }
+    hash_tagged_row_pair_bytes_composition(tag, &buf)
 }
 
 #[inline]
@@ -156,6 +203,49 @@ mod tests {
         let main_digest = hash_tagged_row(tag, &row);
         let aux_digest = hash_tagged_row_aux(tag, &row);
         assert_ne!(main_digest, aux_digest);
+    }
+
+    #[test]
+    fn composition_domain_separates_from_main_and_aux() {
+        // Same row-pair under composition MUST differ from main + aux
+        // domains so a composition opening can't authenticate a main or
+        // aux leaf.
+        let tag = MatrixTag::new([0xCC; 8]);
+        let row0 = vec![FE::from(1u64), FE::from(2u64)];
+        let row1 = vec![FE::from(3u64), FE::from(4u64)];
+        let comp_digest = hash_tagged_row_pair_composition(tag, &row0, &row1);
+
+        // Build the equivalent flat byte buffer manually and run it
+        // through the main + aux single-domain helpers.
+        let byte_len = <FE as ByteConversion>::BYTE_LEN;
+        let mut flat = vec![0u8; (row0.len() + row1.len()) * byte_len];
+        let mut offset = 0;
+        for fe in row0.iter().chain(row1.iter()) {
+            fe.write_bytes_be(&mut flat[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        let main_digest = hash_tagged_row_bytes(tag, &flat);
+        let aux_digest = hash_tagged_row_bytes_aux(tag, &flat);
+        assert_ne!(comp_digest, main_digest);
+        assert_ne!(comp_digest, aux_digest);
+    }
+
+    #[test]
+    fn composition_bytes_helper_matches_composition_element_helper() {
+        let tag = MatrixTag::new([5; 8]);
+        let row0 = vec![FE::from(10u64), FE::from(20u64)];
+        let row1 = vec![FE::from(30u64), FE::from(40u64)];
+        let from_elements = hash_tagged_row_pair_composition(tag, &row0, &row1);
+
+        let byte_len = <FE as ByteConversion>::BYTE_LEN;
+        let mut flat = vec![0u8; 2 * row0.len() * byte_len];
+        let mut offset = 0;
+        for fe in row0.iter().chain(row1.iter()) {
+            fe.write_bytes_be(&mut flat[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        let from_bytes = hash_tagged_row_pair_bytes_composition(tag, &flat);
+        assert_eq!(from_elements, from_bytes);
     }
 
     #[test]

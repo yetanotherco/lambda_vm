@@ -251,3 +251,55 @@ fn swapped_main_tags_at_verifier_rejected() {
         "swapped main_tags must be rejected"
     );
 }
+
+// ---------- Composition MMCS soundness ----------
+
+fn first_populated_comp_chunk(proof: &MultiProof<F, F, ()>) -> usize {
+    proof
+        .comp_mmcs_roots
+        .iter()
+        .position(|r| r.is_some())
+        .expect("at least one chunk must have a comp MMCS root in this baseline")
+}
+
+#[test_log::test]
+fn tampered_comp_mmcs_root_rejected() {
+    let (air_1, air_2, mut proof) = baseline_proof();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
+        vec![&air_1, &air_2];
+    let chunk_idx = first_populated_comp_chunk(&proof);
+    let root = proof.comp_mmcs_roots[chunk_idx]
+        .as_mut()
+        .expect("populated");
+    root[0] ^= 1;
+    assert!(
+        !verify(&airs, &proof),
+        "tampered composition MMCS root must be rejected"
+    );
+}
+
+#[test_log::test]
+fn tampered_comp_mmcs_spec_height_rejected() {
+    let (air_1, air_2, mut proof) = baseline_proof();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
+        vec![&air_1, &air_2];
+    let chunk_idx = first_populated_comp_chunk(&proof);
+    proof.comp_mmcs_specs[chunk_idx][0].1 /= 2;
+    assert!(
+        !verify(&airs, &proof),
+        "composition spec height mismatch must be rejected"
+    );
+}
+
+#[test_log::test]
+fn missing_comp_mmcs_root_rejected() {
+    let (air_1, air_2, mut proof) = baseline_proof();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = F, PublicInputs = ()>> =
+        vec![&air_1, &air_2];
+    let chunk_idx = first_populated_comp_chunk(&proof);
+    proof.comp_mmcs_roots[chunk_idx] = None;
+    assert!(
+        !verify(&airs, &proof),
+        "missing composition MMCS root must be rejected (every chunk must have one)"
+    );
+}

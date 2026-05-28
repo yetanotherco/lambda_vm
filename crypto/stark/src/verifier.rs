@@ -422,26 +422,28 @@ pub trait IsStarkVerifier<
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
+    /// Verify the composition-trace MMCS opening pair for one query.
+    /// Rehashes the row-pair leaf using the COMPOSITION domain
+    /// separator, checks it matches `matrix_leaves[table_idx]`, and
+    /// authenticates against the chunk's composition root + spec.
     fn verify_composition_poly_opening(
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
-        composition_poly_merkle_root: &Commitment,
-        iota: &usize,
+        comp_mmcs_root: Option<&Commitment>,
+        comp_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+        iota: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
-        let mut value = deep_poly_openings.composition_poly.evaluations.clone();
-        value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
-
-        deep_poly_openings
-            .composition_poly
-            .proof
-            .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-                composition_poly_merkle_root,
-                *iota,
-                &value,
-            )
+        verify_comp_mmcs_pair_inner::<FieldExtension>(
+            &deep_poly_openings.composition_poly,
+            iota,
+            main_tag,
+            comp_mmcs_root,
+            comp_mmcs_spec,
+        )
     }
 
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
@@ -456,6 +458,8 @@ pub trait IsStarkVerifier<
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
         aux_mmcs_root: Option<&Commitment>,
         aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        comp_mmcs_root: Option<&Commitment>,
+        comp_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
@@ -468,8 +472,10 @@ pub trait IsStarkVerifier<
             .all(|(iota_n, deep_poly_opening)| {
                 Self::verify_composition_poly_opening(
                     deep_poly_opening,
-                    &proof.composition_poly_root,
-                    iota_n,
+                    comp_mmcs_root,
+                    comp_mmcs_spec,
+                    main_tag,
+                    *iota_n,
                 ) && Self::verify_trace_openings(
                     proof,
                     deep_poly_opening,
@@ -636,7 +642,7 @@ pub trait IsStarkVerifier<
                 challenges,
                 &lde_base,
                 lde_aux,
-                &opening.composition_poly.evaluations,
+                opening.composition_poly.evaluations(),
             )?);
 
             // Mirror for the symmetric query point.
@@ -660,7 +666,7 @@ pub trait IsStarkVerifier<
                 challenges,
                 &lde_base_sym,
                 lde_aux_sym,
-                &opening.composition_poly.evaluations_sym,
+                opening.composition_poly.evaluations_sym(),
             )?);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
@@ -820,13 +826,19 @@ pub trait IsStarkVerifier<
             || multi_proof.main_mmcs_specs.len() != expected_num_chunks
             || multi_proof.aux_mmcs_roots.len() != expected_num_chunks
             || multi_proof.aux_mmcs_specs.len() != expected_num_chunks
+            || multi_proof.comp_mmcs_roots.len() != expected_num_chunks
+            || multi_proof.comp_mmcs_specs.len() != expected_num_chunks
         {
             error!(
-                "per-chunk MMCS Vec lengths inconsistent with chunk_size={chunk_size}:                  expected {expected_num_chunks} chunks; got main_roots={}, main_specs={},                  aux_roots={}, aux_specs={}",
+                "per-chunk MMCS Vec lengths inconsistent with chunk_size={chunk_size}: \
+                 expected {expected_num_chunks} chunks; got main_roots={}, main_specs={}, \
+                 aux_roots={}, aux_specs={}, comp_roots={}, comp_specs={}",
                 multi_proof.main_mmcs_roots.len(),
                 multi_proof.main_mmcs_specs.len(),
                 multi_proof.aux_mmcs_roots.len(),
                 multi_proof.aux_mmcs_specs.len(),
+                multi_proof.comp_mmcs_roots.len(),
+                multi_proof.comp_mmcs_specs.len(),
             );
             return false;
         }
@@ -989,6 +1001,41 @@ pub trait IsStarkVerifier<
             }
         }
 
+        // Per-chunk composition MMCS spec validation. Every table has a
+        // composition polynomial, so every chunk has Some(root). The
+        // composition root is NOT absorbed here at the shared-transcript
+        // level — it gets absorbed PER-TABLE inside `verify_rounds_2_to_4`
+        // between sampling beta and sampling z (mirroring the prover,
+        // which absorbs it into each chunk-mate's fork at that point).
+        for chunk_idx in 0..expected_num_chunks {
+            let chunk_start = chunk_idx * chunk_size;
+            let chunk_end = (chunk_start + chunk_size).min(airs.len());
+
+            let mut expected_comp_spec: Vec<(crypto::merkle_tree::mmcs::MatrixTag, usize)> =
+                Vec::new();
+            for idx in chunk_start..chunk_end {
+                let proof = &multi_proof.proofs[idx];
+                let lde_size =
+                    proof.trace_length * (airs[idx].options().blowup_factor as usize);
+                // Composition MMCS padded height = lde_size / 2 (row-pair leaves).
+                expected_comp_spec.push((main_tags[idx], lde_size / 2));
+            }
+            expected_comp_spec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            if expected_comp_spec != multi_proof.comp_mmcs_specs[chunk_idx] {
+                error!(
+                    "chunk {chunk_idx} comp_mmcs_spec mismatch: expected {:?}, got {:?}",
+                    expected_comp_spec, multi_proof.comp_mmcs_specs[chunk_idx],
+                );
+                return false;
+            }
+            if multi_proof.comp_mmcs_roots[chunk_idx].is_none() {
+                error!(
+                    "chunk {chunk_idx} comp_mmcs_root missing (every chunk must commit at least one composition matrix)"
+                );
+                return false;
+            }
+        }
+
         // =====================================================================
         // Rounds 2-4: Forked per table
         // =====================================================================
@@ -1011,8 +1058,8 @@ pub trait IsStarkVerifier<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
-            // Per-chunk lookup: each table's main / aux MMCS root + spec
-            // come from its chunk.
+            // Per-chunk lookup: each table's main / aux / comp MMCS
+            // root + spec come from its chunk.
             let table_chunk_idx = idx / chunk_size;
             let main_root_for_chunk =
                 multi_proof.main_mmcs_roots[table_chunk_idx].as_ref();
@@ -1021,6 +1068,10 @@ pub trait IsStarkVerifier<
             let aux_root_for_chunk = multi_proof.aux_mmcs_roots[table_chunk_idx].as_ref();
             let aux_spec_for_chunk: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)] =
                 &multi_proof.aux_mmcs_specs[table_chunk_idx];
+            let comp_root_for_chunk =
+                multi_proof.comp_mmcs_roots[table_chunk_idx].as_ref();
+            let comp_spec_for_chunk: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)] =
+                &multi_proof.comp_mmcs_specs[table_chunk_idx];
 
             if !Self::verify_rounds_2_to_4(
                 *air,
@@ -1032,6 +1083,8 @@ pub trait IsStarkVerifier<
                 main_spec_for_chunk,
                 aux_root_for_chunk,
                 aux_spec_for_chunk,
+                comp_root_for_chunk,
+                comp_spec_for_chunk,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1102,12 +1155,18 @@ pub trait IsStarkVerifier<
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
     /// already been replayed and the RAP challenges are known.
+    ///
+    /// `comp_mmcs_root` is this table's chunk composition MMCS root,
+    /// absorbed between beta and z sampling. The prover absorbs the
+    /// same root into each chunk-mate's fork.
+    #[allow(clippy::too_many_arguments)]
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        comp_mmcs_root: Option<&Commitment>,
     ) -> Challenges<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -1138,8 +1197,11 @@ pub trait IsStarkVerifier<
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
 
-        // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
+        // <<<< Receive commitment: chunk composition MMCS root (one
+        // absorb per chunk-mate's fork, mirroring `multi_prove`).
+        if let Some(root) = comp_mmcs_root {
+            transcript.append_bytes(root);
+        }
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -1251,6 +1313,8 @@ pub trait IsStarkVerifier<
         main_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
         aux_mmcs_root: Option<&Commitment>,
         aux_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+        comp_mmcs_root: Option<&Commitment>,
+        comp_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send + math::traits::ByteConversion,
@@ -1268,8 +1332,14 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges =
-            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
+        let challenges = Self::replay_rounds_after_round_1(
+            air,
+            proof,
+            &domain,
+            transcript,
+            rap_challenges,
+            comp_mmcs_root,
+        );
 
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1335,6 +1405,8 @@ pub trait IsStarkVerifier<
             main_mmcs_spec,
             aux_mmcs_root,
             aux_mmcs_spec,
+            comp_mmcs_root,
+            comp_mmcs_spec,
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
@@ -1487,4 +1559,65 @@ where
     let ok_sym =
         mmcs_opening_sym.verify::<BatchedMerkleTreeBackend<E>>(aux_mmcs_root, aux_mmcs_spec);
     ok && ok_sym
+}
+
+/// Composition-trace counterpart of [`verify_main_mmcs_pair_inner`]. Uses
+/// `LEAF_DOMAIN_TAG_COMPOSITION` for rehash; the leaf hashes a row-PAIR
+/// rather than a single row, so the opening covers both `evaluations`
+/// (row 0 / br_0) and `evaluations_sym` (row 1 / br_1) under one MMCS
+/// opening — no separate `_sym` opening at this layer (the underlying
+/// tree's leaves are already row-pairs).
+fn verify_comp_mmcs_pair_inner<E>(
+    comp_opening: &crate::proof::stark::CompositionTraceOpening<E>,
+    iota: usize,
+    main_tag: crypto::merkle_tree::mmcs::MatrixTag,
+    comp_mmcs_root: Option<&Commitment>,
+    comp_mmcs_spec: &[(crypto::merkle_tree::mmcs::MatrixTag, usize)],
+) -> bool
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+{
+    use crate::mmcs_leaf::hash_tagged_row_pair_composition;
+    use crate::proof::stark::CompositionTraceOpening;
+
+    let comp_mmcs_root = match comp_mmcs_root {
+        Some(r) => r,
+        None => return false,
+    };
+    let CompositionTraceOpening::Mmcs {
+        evaluations,
+        evaluations_sym,
+        mmcs_opening,
+    } = comp_opening;
+
+    let table_idx = match comp_mmcs_spec.iter().position(|(t, _)| *t == main_tag) {
+        Some(i) => i,
+        None => return false,
+    };
+    let table_height = comp_mmcs_spec[table_idx].1;
+    let max_height = match comp_mmcs_spec.first().map(|(_, h)| *h) {
+        Some(h) => h,
+        None => return false,
+    };
+    if !table_height.is_power_of_two() || max_height < table_height {
+        return false;
+    }
+    let shift = (max_height / table_height).trailing_zeros() as usize;
+    // Composition opens at row-pair index iota, so the global index in
+    // the chunk MMCS is iota shifted up by the chunk-mate's depth diff.
+    let g_index = iota << shift;
+    if mmcs_opening.global_index != g_index {
+        return false;
+    }
+
+    let leaf = hash_tagged_row_pair_composition::<E>(main_tag, evaluations, evaluations_sym);
+    let leaves = &mmcs_opening.matrix_leaves;
+    if table_idx >= leaves.len() {
+        return false;
+    }
+    if leaves[table_idx].0 != main_tag || leaves[table_idx].1 != leaf {
+        return false;
+    }
+    mmcs_opening.verify::<BatchedMerkleTreeBackend<E>>(comp_mmcs_root, comp_mmcs_spec)
 }

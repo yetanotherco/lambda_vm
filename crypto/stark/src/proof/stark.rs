@@ -88,10 +88,45 @@ impl<E: IsField> AuxTraceOpening<E> {
     }
 }
 
+/// Per-query composition-trace opening. Sister of [`MainTraceOpening`]
+/// and [`AuxTraceOpening`] for the composition polynomial parts. Always
+/// `Mmcs`: every table has a composition polynomial, and the chunk-scoped
+/// composition MMCS commits to all of them.
+///
+/// Composition leaves are hashed in row-PAIR form (`br_0` + `br_1`).
+/// A single MMCS opening covers both rows since they share the same
+/// leaf in the underlying tree.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub enum CompositionTraceOpening<E: IsField> {
+    Mmcs {
+        /// Parts at `br_0`.
+        evaluations: Vec<FieldElement<E>>,
+        /// Parts at `br_1` (sym row).
+        evaluations_sym: Vec<FieldElement<E>>,
+        /// Single MMCS opening for the row-pair leaf.
+        mmcs_opening: MmcsOpening<Commitment>,
+    },
+}
+
+impl<E: IsField> CompositionTraceOpening<E> {
+    pub fn evaluations(&self) -> &[FieldElement<E>] {
+        match self {
+            Self::Mmcs { evaluations, .. } => evaluations,
+        }
+    }
+
+    pub fn evaluations_sym(&self) -> &[FieldElement<E>] {
+        match self {
+            Self::Mmcs { evaluations_sym, .. } => evaluations_sym,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
-    pub composition_poly: PolynomialOpenings<E>,
+    pub composition_poly: CompositionTraceOpening<E>,
     pub main_trace_polys: MainTraceOpening<F>,
     /// For preprocessed tables: openings for precomputed columns.
     /// These are verified against the hardcoded precomputed commitment.
@@ -118,8 +153,6 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub lde_trace_precomputed_merkle_root: Option<Commitment>,
     // tⱼ(zgᵏ)
     pub trace_ood_evaluations: Table<E>,
-    // Commitments to Hᵢ
-    pub composition_poly_root: Commitment,
     // Hᵢ(z^N)
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     // [pₖ]
@@ -184,6 +217,15 @@ pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     /// Per-chunk aux MMCS specs. Empty inner Vec when the corresponding
     /// `aux_mmcs_roots[i]` is `None`.
     pub aux_mmcs_specs: Vec<Vec<(MatrixTag, usize)>>,
+    /// Per-chunk composition MMCS roots. Always `Some` (every table has a
+    /// composition polynomial), but stored as `Option` for shape parity
+    /// with main/aux. Parallel to `main_mmcs_roots`.
+    pub comp_mmcs_roots: Vec<Option<Commitment>>,
+    /// Per-chunk composition MMCS specs. Each non-empty Vec lists
+    /// `(MatrixTag, padded_height)` for the chunk-mate composition
+    /// polynomials in MMCS sort order. `padded_height` is the row-pair
+    /// count = `lde_size / 2`.
+    pub comp_mmcs_specs: Vec<Vec<(MatrixTag, usize)>>,
     /// Pinned chunk size. Equals the prover's `table_parallelism()` at
     /// proving time. The verifier uses this to chunk the AIR slice into
     /// the same per-chunk grouping the prover used.

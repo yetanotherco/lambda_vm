@@ -27,7 +27,9 @@ use rayon::prelude::{
 use crate::debug::validate_trace;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
-use crate::proof::stark::{DeepPolynomialOpenings, MainTraceOpening, PolynomialOpenings};
+use crate::proof::stark::{
+    CompositionTraceOpening, DeepPolynomialOpenings, MainTraceOpening, PolynomialOpenings,
+};
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
@@ -433,17 +435,74 @@ pub fn table_parallelism() -> usize {
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
+/// Per-chunk composition MMCS context.
+pub(crate) struct ChunkCompMmcsContext<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    pub(crate) mmcs: Arc<Mmcs<BatchedMerkleTreeBackend<E>>>,
+    /// Arc-cloned composition LDE columns for chunk-mates, in MMCS spec
+    /// sort order. Used by the per-query open path to rehash composition
+    /// row-pair leaves on demand.
+    pub(crate) lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<E>>>>>,
+}
+
+/// Per-table composition-trace commitment under the chunk's composition MMCS.
+pub(crate) enum CompCommit<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    Shared {
+        chunk_ctx: Arc<ChunkCompMmcsContext<E>>,
+        chunk_idx: usize,
+        tag: MatrixTag,
+        /// Padded height = lde_size / 2 (row-pair leaves).
+        padded_height: usize,
+    },
+}
+
+impl<E: IsField> CompCommit<E>
+where
+    FieldElement<E>: AsBytes,
+{
+    fn share(&self) -> Self {
+        match self {
+            Self::Shared {
+                chunk_ctx,
+                chunk_idx,
+                tag,
+                padded_height,
+            } => Self::Shared {
+                chunk_ctx: Arc::clone(chunk_ctx),
+                chunk_idx: *chunk_idx,
+                tag: *tag,
+                padded_height: *padded_height,
+            },
+        }
+    }
+}
+
+/// Per-table Round 2 partial — produced by `round_2a_build_composition_lde`
+/// before the chunk composition MMCS is built.
+pub(crate) struct R2aResult<E: IsField>
+where
+    FieldElement<E>: AsBytes,
+{
+    pub(crate) lde_composition_poly_evaluations: Arc<Vec<Vec<FieldElement<E>>>>,
+    pub(crate) composition_leaves: Vec<Commitment>,
+    pub(crate) padded_height: usize,
+}
+
 pub(crate) struct Round2<F>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// Evaluations of the composition polynomial parts over the LDE domain.
-    pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
-    /// The Merkle tree built to compute the commitment to the composition polynomial parts.
-    pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
-    /// The commitment to the composition polynomial parts.
-    pub(crate) composition_poly_root: Commitment,
+    /// Evaluations of the composition polynomial parts over the LDE
+    /// domain (Arc-shared with the chunk composition MMCS context).
+    pub(crate) lde_composition_poly_evaluations: Arc<Vec<Vec<FieldElement<F>>>>,
+    /// This table's slot inside the chunk's composition MMCS.
+    pub(crate) comp: CompCommit<F>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -759,6 +818,137 @@ where
         lde_columns_in_spec_order,
     });
     Ok((Some(root), spec, Some(ctx)))
+}
+
+/// Tagged per-row-PAIR leaf digest for the COMPOSITION-trace MMCS.
+pub fn compute_tagged_leaves_row_pair_bit_reversed_composition<E>(
+    parts: &[Vec<FieldElement<E>>],
+    tag: MatrixTag,
+) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    let num_parts = parts.len();
+    if num_parts == 0 {
+        return Vec::new();
+    }
+    let num_rows = parts[0].len();
+    if num_rows == 0 {
+        return Vec::new();
+    }
+    let num_leaves = num_rows / 2;
+    debug_assert!(num_rows.is_power_of_two());
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    let total_bytes = 2 * num_parts * byte_len;
+    let hash_leaf_pair = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
+        let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+        let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+        let mut offset = 0;
+        for part in parts.iter() {
+            part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        for part in parts.iter() {
+            part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            offset += byte_len;
+        }
+        crate::mmcs_leaf::hash_tagged_row_pair_bytes_composition(tag, buf)
+    };
+    #[cfg(feature = "parallel")]
+    {
+        (0..num_leaves)
+            .into_par_iter()
+            .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf_pair(buf, i))
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut buf = vec![0u8; total_bytes];
+        (0..num_leaves).map(|i| hash_leaf_pair(&mut buf, i)).collect()
+    }
+}
+
+/// Build a CHUNK-scoped composition MMCS via StreamingMmcsBuilder.
+#[allow(clippy::type_complexity)]
+fn build_chunk_comp_mmcs<E>(
+    comp_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)>,
+    chunk_comp_lde: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<E>>>>)>,
+) -> Result<
+    (
+        Option<Commitment>,
+        Vec<(MatrixTag, usize)>,
+        Option<Arc<ChunkCompMmcsContext<E>>>,
+    ),
+    ProvingError,
+>
+where
+    E: IsField + Send + Sync,
+    FieldElement<E>: AsBytes + Send + Sync,
+{
+    if comp_outputs.is_empty() {
+        return Ok((None, Vec::new(), None));
+    }
+    debug_assert_eq!(comp_outputs.len(), chunk_comp_lde.len());
+    let mut comp_outputs = comp_outputs;
+    comp_outputs.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let lde_by_tag: std::collections::BTreeMap<MatrixTag, Arc<Vec<Vec<FieldElement<E>>>>> =
+        chunk_comp_lde.into_iter().collect();
+    let mut builder: StreamingMmcsBuilder<BatchedMerkleTreeBackend<E>> =
+        StreamingMmcsBuilder::new();
+    let mut lde_columns_in_spec_order: Vec<Arc<Vec<Vec<FieldElement<E>>>>> =
+        Vec::with_capacity(comp_outputs.len());
+    for (tag, leaves, _padded_height) in comp_outputs {
+        let lde = lde_by_tag
+            .get(&tag)
+            .ok_or_else(|| {
+                ProvingError::WrongParameter(format!(
+                    "missing chunk composition LDE for tag {tag:?}"
+                ))
+            })?
+            .clone();
+        lde_columns_in_spec_order.push(lde);
+        builder.add_matrix(tag, leaves).map_err(map_mmcs_err)?;
+    }
+    let mmcs = builder.finalize().map_err(map_mmcs_err)?;
+    let root = *mmcs.root();
+    let spec = mmcs.spec();
+    let ctx = Arc::new(ChunkCompMmcsContext {
+        mmcs: Arc::new(mmcs),
+        lde_columns_in_spec_order,
+    });
+    Ok((Some(root), spec, Some(ctx)))
+}
+
+/// Rehash a composition-trace row-PAIR leaf for the open path.
+pub fn rehash_comp_chip_leaf<E>(
+    tag: MatrixTag,
+    parts: &Arc<Vec<Vec<FieldElement<E>>>>,
+    local_idx: usize,
+) -> Commitment
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + ByteConversion,
+{
+    let num_rows = parts
+        .first()
+        .map(|c| c.len())
+        .expect("composition LDE columns non-empty by construction");
+    let num_parts = parts.len();
+    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+    let br_0 = reverse_index(2 * local_idx, num_rows as u64);
+    let br_1 = reverse_index(2 * local_idx + 1, num_rows as u64);
+    let mut buf = vec![0u8; 2 * num_parts * byte_len];
+    let mut offset = 0;
+    for part in parts.iter() {
+        part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+        offset += byte_len;
+    }
+    for part in parts.iter() {
+        part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+        offset += byte_len;
+    }
+    crate::mmcs_leaf::hash_tagged_row_pair_bytes_composition(tag, &buf)
 }
 
 /// Tagged per-row leaf digest for the main-trace MMCS.
@@ -1282,15 +1472,20 @@ pub trait IsStarkProver<
         .expect("LDE evaluation should succeed")
     }
 
-    /// Returns the result of the second round of the STARK Prove protocol.
-    fn round_2_compute_composition_polynomial(
+    /// Round 2 phase A: build the composition LDE parts + tagged leaves
+    /// for the chunk MMCS, WITHOUT committing yet. The chunk MMCS is
+    /// built externally once every chunk-mate has returned their
+    /// [`R2aResult`]; only then does the resulting chunk root get
+    /// absorbed back into each fork and R3 sampling proceeds.
+    fn round_2a_build_composition_lde(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
-    ) -> Result<Round2<FieldExtension>, ProvingError>
+        tag: MatrixTag,
+    ) -> Result<R2aResult<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1355,21 +1550,24 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let Some((composition_poly_merkle_tree, composition_poly_root)) =
-            Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
-        else {
+        let composition_leaves =
+            compute_tagged_leaves_row_pair_bit_reversed_composition::<FieldExtension>(
+                &lde_composition_poly_parts_evaluations,
+                tag,
+            );
+        if composition_leaves.is_empty() {
             return Err(ProvingError::EmptyCommitment);
-        };
+        }
+        let padded_height = composition_leaves.len();
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
-
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
-        Ok(Round2 {
-            lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
-            composition_poly_merkle_tree,
-            composition_poly_root,
+        Ok(R2aResult {
+            lde_composition_poly_evaluations: Arc::new(lde_composition_poly_parts_evaluations),
+            composition_leaves,
+            padded_height,
         })
     }
 
@@ -1709,22 +1907,41 @@ pub trait IsStarkProver<
         .collect()
     }
 
-    /// Computes values and validity proofs of the evaluations of the composition polynomial parts
-    /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
-    /// element.
+    /// Compute the composition-poly opening for one query against the
+    /// chunk composition MMCS. The opening's `mmcs_opening` carries
+    /// matrix_leaves for every chunk-mate's composition matrix; the
+    /// closure rehashes those row-pair leaves on demand from the
+    /// chunk-shared LDE columns.
     fn open_composition_poly(
-        composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
+        comp: &CompCommit<FieldExtension>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
-    ) -> PolynomialOpenings<FieldExtension>
+    ) -> CompositionTraceOpening<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send + ByteConversion,
     {
-        let proof = composition_poly_merkle_tree
-            .get_proof_by_pos(index)
-            .unwrap();
+        let CompCommit::Shared { chunk_ctx, .. } = comp;
+        let mmcs = &chunk_ctx.mmcs;
+        let lde_in_spec_order = &chunk_ctx.lde_columns_in_spec_order;
 
+        // Composition row-pair leaves are indexed by row-pair, so the
+        // opening's global_index equals the query index directly (no
+        // shift). Per-table local index = global_index >> shift, which
+        // is 0 when all chunk-mates share the max height.
+        let local_idx = index;
+        let mmcs_opening = mmcs
+            .open_with_leaves(local_idx, |m_idx, local_idx_in_matrix| {
+                rehash_comp_chip_leaf::<FieldExtension>(
+                    mmcs.spec()[m_idx].0,
+                    &lde_in_spec_order[m_idx],
+                    local_idx_in_matrix,
+                )
+            })
+            .expect("composition MMCS open_with_leaves: index in range");
+
+        // Build the (evaluations, evaluations_sym) field arrays from this
+        // table's composition LDE — same layout as the legacy opening.
         let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
             .iter()
             .flat_map(|part| {
@@ -1734,20 +1951,21 @@ pub trait IsStarkProver<
                 ]
             })
             .collect();
+        let evaluations = lde_composition_poly_parts_evaluation
+            .clone()
+            .into_iter()
+            .step_by(2)
+            .collect();
+        let evaluations_sym = lde_composition_poly_parts_evaluation
+            .into_iter()
+            .skip(1)
+            .step_by(2)
+            .collect();
 
-        PolynomialOpenings {
-            proof: proof.clone(),
-            proof_sym: proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
-                .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
-                .collect(),
+        CompositionTraceOpening::Mmcs {
+            evaluations,
+            evaluations_sym,
+            mmcs_opening,
         }
     }
 
@@ -1796,7 +2014,7 @@ pub trait IsStarkProver<
 
         for index in indexes_to_open.iter() {
             let composition_openings = Self::open_composition_poly(
-                &round_2_result.composition_poly_merkle_tree,
+                &round_2_result.comp,
                 &round_2_result.lde_composition_poly_evaluations,
                 *index,
             );
@@ -2467,32 +2685,148 @@ pub trait IsStarkProver<
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
-        let mut proofs = Vec::with_capacity(num_airs);
+        let mut proofs: Vec<Option<StarkProof<Field, FieldExtension, PI>>> =
+            (0..num_airs).map(|_| None).collect();
+        let mut comp_mmcs_roots_per_chunk: Vec<Option<Commitment>> = Vec::new();
+        let mut comp_mmcs_specs_per_chunk: Vec<Vec<(MatrixTag, usize)>> = Vec::new();
         let mut lde_drain = cached_ldes.into_iter();
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
+            let chunk_idx = comp_mmcs_roots_per_chunk.len();
 
             let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
                 lde_drain.by_ref().take(chunk_size).collect();
             let chunk_commitments = &commitments[chunk_start..chunk_end];
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-
-            #[cfg(feature = "parallel")]
-            let iter = chunk_ldes
-                .into_par_iter()
-                .zip(chunk_commitments.par_iter())
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = chunk_ldes
+            // Build Round1 per-table sequentially (build_round1 only bumps
+            // Arc refcounts), then run R2a in parallel.
+            let chunk_round1: Vec<Round1<Field, FieldExtension>> = chunk_ldes
                 .into_iter()
                 .zip(chunk_commitments.iter())
+                .enumerate()
+                .map(|(j, (lde, commitment))| {
+                    let idx = chunk_start + j;
+                    let (air, _, _) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+                    commitment.build_round1(lde, air.step_size(), domain.blowup_factor)
+                })
+                .collect();
+
+            // Bind per-table table_contribution into forks before sampling beta.
+            for (j, round_1_result) in chunk_round1.iter().enumerate() {
+                let idx = chunk_start + j;
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    table_transcripts[idx].append_field_element(&bpi.table_contribution);
+                }
+            }
+
+            // Phase R2a (sequential within chunk): sample beta + build
+            // composition LDE + tagged leaves per table. Internal
+            // parallelism inside constraint eval / FFT keeps cores busy.
+            // K is small (chunk size = table_parallelism()), so per-table
+            // serialization here costs little.
+            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+            let r2a_iter = chunk_round1
+                .iter()
                 .zip(chunk_transcripts.iter_mut())
                 .enumerate();
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, ((lde, commitment), table_transcript))| {
+            #[allow(clippy::type_complexity)]
+            let r2a_results: Vec<Result<
+                (
+                    usize,
+                    Vec<FieldElement<FieldExtension>>,
+                    Vec<FieldElement<FieldExtension>>,
+                    R2aResult<FieldExtension>,
+                ),
+                ProvingError,
+            >> = r2a_iter
+                .map(|(j, (round_1_result, table_transcript))| {
+                    let idx = chunk_start + j;
+                    let (air, _, pub_inputs) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+                    let tag = main_tags[idx];
+                    let (tc, bc, r2a) = Self::prove_round_2a(
+                        *air,
+                        *pub_inputs,
+                        round_1_result,
+                        table_transcript,
+                        domain,
+                        tag,
+                    )?;
+                    Ok((j, tc, bc, r2a))
+                })
+                .collect();
+
+            // Sequential: collect R2a outputs in chunk-local-index order;
+            // build chunk composition MMCS over them.
+            let mut chunk_r2a: Vec<Option<(
+                Vec<FieldElement<FieldExtension>>,
+                Vec<FieldElement<FieldExtension>>,
+                R2aResult<FieldExtension>,
+            )>> = (0..chunk_size).map(|_| None).collect();
+            for r in r2a_results {
+                let (j, tc, bc, r2a) = r?;
+                chunk_r2a[j] = Some((tc, bc, r2a));
+            }
+
+            let mut chunk_comp_outputs: Vec<(MatrixTag, Vec<Commitment>, usize)> = Vec::new();
+            let mut chunk_comp_ldes: Vec<(MatrixTag, Arc<Vec<Vec<FieldElement<FieldExtension>>>>)> =
+                Vec::new();
+            for (j, entry) in chunk_r2a.iter().enumerate() {
+                let idx = chunk_start + j;
+                let tag = main_tags[idx];
+                let (_, _, r2a) = entry.as_ref().expect("R2a populated");
+                chunk_comp_outputs.push((tag, r2a.composition_leaves.clone(), r2a.padded_height));
+                chunk_comp_ldes.push((tag, Arc::clone(&r2a.lde_composition_poly_evaluations)));
+            }
+
+            let (chunk_comp_root, chunk_comp_spec, chunk_comp_ctx_opt) =
+                build_chunk_comp_mmcs::<FieldExtension>(chunk_comp_outputs, chunk_comp_ldes)?;
+            // Absorb chunk composition root into EACH chunk-mate's fork.
+            if let Some(ref root) = chunk_comp_root {
+                for idx in chunk_start..chunk_end {
+                    table_transcripts[idx].append_bytes(root);
+                }
+            }
+            comp_mmcs_roots_per_chunk.push(chunk_comp_root);
+            comp_mmcs_specs_per_chunk.push(chunk_comp_spec.clone());
+
+            let chunk_comp_ctx = chunk_comp_ctx_opt
+                .expect("chunk has at least one composition matrix (every table has comp)");
+            let height_by_tag: std::collections::BTreeMap<MatrixTag, usize> =
+                chunk_comp_spec.iter().copied().collect();
+
+            // Reassemble per-table Round2 from R2a + chunk MMCS context.
+            let mut chunk_round2: Vec<Round2<FieldExtension>> = Vec::with_capacity(chunk_size);
+            for j in 0..chunk_size {
+                let idx = chunk_start + j;
+                let tag = main_tags[idx];
+                let (_, _, r2a) = chunk_r2a[j].take().unwrap();
+                let padded_height = *height_by_tag.get(&tag).expect("spec contains tag");
+                chunk_round2.push(Round2 {
+                    lde_composition_poly_evaluations: r2a.lde_composition_poly_evaluations,
+                    comp: CompCommit::Shared {
+                        chunk_ctx: Arc::clone(&chunk_comp_ctx),
+                        chunk_idx,
+                        tag,
+                        padded_height,
+                    },
+                });
+            }
+
+            // Phase R2b → R4 (sequential within chunk): each fork has
+            // the chunk comp root absorbed; sample z, run R3 OOD + R4
+            // FRI. Same rationale as R2a above.
+            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+            let r2b_iter = chunk_round1
+                .iter()
+                .zip(chunk_round2.iter())
+                .zip(chunk_transcripts.iter_mut())
+                .enumerate();
+
+            let chunk_results: Vec<Result<_, ProvingError>> = r2b_iter
+                .map(|(j, ((round_1_result, round_2_result), table_transcript))| {
                     let idx = chunk_start + j;
                     let (air, trace, pub_inputs) = &air_trace_pairs[idx];
                     let _ = trace; // used by instruments
@@ -2501,18 +2835,11 @@ pub trait IsStarkProver<
                     #[cfg(feature = "instruments")]
                     let table_start = Instant::now();
 
-                    // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result =
-                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
+                    let proof = Self::prove_rounds_2b_to_4(
                         *air,
                         *pub_inputs,
-                        &round_1_result,
+                        round_1_result,
+                        round_2_result,
                         table_transcript,
                         domain,
                     )?;
@@ -2529,23 +2856,33 @@ pub trait IsStarkProver<
                     };
 
                     #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
+                    return Ok((j, proof, table_timing));
                     #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
+                    Ok((j, proof))
                 })
                 .collect();
 
             for result in chunk_results {
                 #[cfg(feature = "instruments")]
                 {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
+                    let (j, proof, timing) = result?;
+                    let idx = chunk_start + j;
+                    proofs[idx] = Some(proof);
                     table_timings.push(timing);
                 }
                 #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
+                {
+                    let (j, proof) = result?;
+                    let idx = chunk_start + j;
+                    proofs[idx] = Some(proof);
+                }
             }
         }
+
+        let proofs: Vec<StarkProof<Field, FieldExtension, PI>> = proofs
+            .into_iter()
+            .map(|p| p.expect("every table emits a proof"))
+            .collect();
 
         #[cfg(feature = "instruments")]
         {
@@ -2569,6 +2906,8 @@ pub trait IsStarkProver<
             main_mmcs_specs: main_mmcs_specs_per_chunk,
             aux_mmcs_roots: aux_mmcs_roots_per_chunk,
             aux_mmcs_specs: aux_mmcs_specs_per_chunk,
+            comp_mmcs_roots: comp_mmcs_roots_per_chunk,
+            comp_mmcs_specs: comp_mmcs_specs_per_chunk,
             chunk_size: k as u32,
         })
     }
@@ -2607,24 +2946,30 @@ pub trait IsStarkProver<
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
     /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initializated before passing it to this method.
-    fn prove_rounds_2_to_4(
+    /// Part A of Round 2: sample beta + build the composition LDE parts
+    /// + compute tagged row-pair leaves for the chunk composition MMCS.
+    /// Returns the artefacts the chunk-level MMCS build consumes
+    /// alongside this table's tag.
+    fn prove_round_2a(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
-    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+        tag: MatrixTag,
+    ) -> Result<
+        (
+            Vec<FieldElement<FieldExtension>>,
+            Vec<FieldElement<FieldExtension>>,
+            R2aResult<FieldExtension>,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        info!("Started proof generation...");
-
-        // ===================================
-        // ==========|   Round 2   |==========
-        // ===================================
-
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
         let trace_length = domain.interpolation_domain_size;
@@ -2637,35 +2982,47 @@ pub trait IsStarkProver<
             )
             .constraints
             .len();
-
         let num_transition_constraints = air.context().num_transition_constraints;
-
         let mut coefficients: Vec<_> =
             core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
                 .take(num_boundary_constraints + num_transition_constraints)
                 .collect();
-
         let transition_coefficients: Vec<_> =
             coefficients.drain(..num_transition_constraints).collect();
         let boundary_coefficients = coefficients;
-
-        let round_2_result = Self::round_2_compute_composition_polynomial(
+        let r2a = Self::round_2a_build_composition_lde(
             air,
             pub_inputs,
             domain,
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            tag,
         )?;
+        Ok((transition_coefficients, boundary_coefficients, r2a))
+    }
 
-        // >>>> Send commitments: [H₁], [H₂]
-        transcript.append_bytes(&round_2_result.composition_poly_root);
+    /// Part B of Round 2 onward: assumes the chunk composition MMCS root
+    /// has been absorbed into `transcript` already. Runs the absorb of
+    /// the per-table H_i values, R3 OOD, and R4 FRI + opens, producing
+    /// the final per-table StarkProof.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_rounds_2b_to_4(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        domain: &Domain<Field>,
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        info!("Started proof generation (post-R2 chunk join)...");
 
-        // ===================================
-        // ==========|   Round 3   |==========
-        // ===================================
-
-        // <<<< Receive challenge: z
+        // <<<< Receive challenge: z (transcript already saw chunk comp root)
         let z = transcript.sample_z_ood(
             &domain.lde_roots_of_unity_coset,
             &domain.trace_roots_of_unity,
@@ -2677,7 +3034,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &round_2_result,
+            round_2_result,
             &z,
         );
         #[cfg(feature = "instruments")]
@@ -2699,15 +3056,11 @@ pub trait IsStarkProver<
         // ===================================
         // ==========|   Round 4   |==========
         // ===================================
-
-        // Part of this round is running FRI, which is an interactive
-        // protocol on its own. Therefore we pass it the transcript
-        // to simulate the interactions with the verifier.
         let round_4_result = Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
             air,
             domain,
             round_1_result,
-            &round_2_result,
+            round_2_result,
             &round_3_result,
             &z,
             transcript,
@@ -2735,32 +3088,17 @@ pub trait IsStarkProver<
         info!("End proof generation");
 
         Ok(StarkProof {
-            // For preprocessed tables: per-table Merkle root over multiplicities
-            // (preprocessed tables stay out of the shared main-trace MMCS).
             lde_trace_main_merkle_root: round_1_result.main.main_tree_root(),
-            // For preprocessed tables: commitment to precomputed columns only
             lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root(),
-            // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
-            // [H₁] and [H₂]
-            composition_poly_root: round_2_result.composition_poly_root,
-            // Hᵢ(z^N)
             composition_poly_parts_ood_evaluation: round_3_result
                 .composition_poly_parts_ood_evaluation,
-            // [pₖ]
             fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-            // pₙ
             fri_last_value: round_4_result.fri_last_value,
-            // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
             query_list: round_4_result.query_list,
-            // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)
-            // Open(H₁(D_LDE, -𝜐ᵢ), Open(H₂(D_LDE, -𝜐ᵢ), Open(tⱼ(D_LDE), -𝜐ᵢ)
             deep_poly_openings: round_4_result.deep_poly_openings,
-            // nonce obtained from grinding
             nonce: round_4_result.nonce,
-            // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
-            // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
         })
