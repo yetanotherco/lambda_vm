@@ -454,10 +454,8 @@ pub fn coset_lde_batch_base(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
 
-    // Split pinned → per-column Vec<u64>s. Sequential (not `into_par_iter`)
-    // because this runs inside the held pinned-staging mutex — see
-    // `Backend::pinned_staging` docs. Fault-cost parallelism is recovered
-    // at the outer level (per-worker staging slots).
+    // Split pinned into per-column Vec<u64>s. Runs under the pinned-staging
+    // lock, where rayon can deadlock. See `Backend::pinned_staging`.
     let out: Vec<Vec<u64>> = (0..m)
         .map(|c| {
             // set_len skips the O(N) zero-init that vec![0; n] would do.
