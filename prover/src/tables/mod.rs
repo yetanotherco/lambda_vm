@@ -95,27 +95,37 @@ pub struct MaxRowsConfig {
     pub memw_register: usize,
 }
 
-/// Optional global chunk-size scale, read from `LAMBDA_MAXROWS_SCALE_LOG2`.
+/// Global chunk-size scale (log2), a left-shift applied uniformly to
+/// every per-table `max_rows`. Read from `LAMBDA_MAXROWS_SCALE_LOG2`,
+/// falling back to [`DEFAULT_MAXROWS_SCALE_LOG2`] when unset/invalid.
 ///
-/// Returns a left-shift amount applied uniformly to every per-table
-/// `max_rows`. `0` (default / unset / invalid) leaves production sizing
-/// untouched. Setting e.g. `2` multiplies every chunk size by 4, which
-/// — preserving the equal-memory geometry across tables — quarters the
-/// chunk count, cutting per-instance FRI/Merkle/OOD overhead and pushing
-/// LDE sizes above the phased-FFT threshold. Trade-off: ~`scale`× larger
-/// peak working set per table instance, and (for non-power-of-two traces)
-/// more padding waste. Sweep on the bench server to find the optimum.
+/// Bigger chunks → fewer chunks → fewer full StarkProof instances, which
+/// cuts the per-instance overhead that scales with chunk count (FRI query
+/// phase ~219 queries, 20-bit grinding, OOD/DEEP, proof serialization) and
+/// pushes LDE sizes past the phased-FFT threshold into the memory-bound
+/// regime where the Bailey four-step FFT wins. Full power-of-two chunks
+/// are not padded (only the final partial chunk is), so the cached-LDE
+/// peak heap stays ~constant across scales.
+///
+/// This research branch defaults to a non-zero scale so the automated
+/// main-vs-PR bench harness exercises the larger tables without needing to
+/// inject an env var. Override to sweep: `LAMBDA_MAXROWS_SCALE_LOG2=0`
+/// reproduces production sizing, `=1`/`=2` are intermediate steps.
 ///
 /// Clamped to `0..=4` so a stray value can't request a 16M+× blow-up.
 fn maxrows_scale_log2_from_env() -> u32 {
     match std::env::var("LAMBDA_MAXROWS_SCALE_LOG2") {
         Ok(s) => match s.trim().parse::<u32>() {
             Ok(v) => v.min(4),
-            Err(_) => 0,
+            Err(_) => DEFAULT_MAXROWS_SCALE_LOG2,
         },
-        Err(_) => 0,
+        Err(_) => DEFAULT_MAXROWS_SCALE_LOG2,
     }
 }
+
+/// Default chunk-size scale for this research branch (×8 tables: CPU/MEMW
+/// 2^19→2^22, MUL/etc 2^20→2^23). Set to 0 to restore production sizing.
+const DEFAULT_MAXROWS_SCALE_LOG2: u32 = 3;
 
 impl Default for MaxRowsConfig {
     fn default() -> Self {
