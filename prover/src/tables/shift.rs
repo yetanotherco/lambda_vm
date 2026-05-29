@@ -75,20 +75,24 @@ pub mod cols {
     pub const MU: usize = 25;
 
     // shrink-cpu rework: the unified ALU bus carries the full (un-reduced) shift
-    // amount `arg2` as in2. SHIFT_AMOUNT (col 4) is its low byte (used by the
-    // computation, which reduces mod 32/64); these hold the remaining bits so
-    // the bus value `in2 = arg2` can be reconstructed. Range-checked (byte/half)
-    // so the decomposition is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`.
-    /// bits 8-15 of the shift amount (byte)
+    // amount `arg2` as in2. This mirrors the spec's `shift : DWordWHBB` layout
+    // `[Byte, Byte, Half, Word]`: SHIFT_AMOUNT (col 4) = shift[0] (low byte, used
+    // by the computation, which reduces mod 32/64), then SHIFT_B1 = shift[1],
+    // SHIFT_H1 = shift[2], SHIFT_HIGH = shift[3]. The low-word limbs are
+    // range-checked (byte/half) so the decomposition is unique → SHIFT_AMOUNT is
+    // forced to `arg2 & 0xFF`.
+    /// bits 8-15 of the shift amount (byte) — spec `shift[1]`
     pub const SHIFT_B1: usize = 26;
-    /// bits 16-31 of the shift amount (half)
+    /// bits 16-31 of the shift amount (half) — spec `shift[2]`
     pub const SHIFT_H1: usize = 27;
-    /// bits 32-47 of the shift amount (half)
-    pub const SHIFT_H2: usize = 28;
-    /// bits 48-63 of the shift amount (half)
-    pub const SHIFT_H3: usize = 29;
+    /// bits 32-63 of the shift amount (word) — spec `shift[3]`. `IS_WORD` is
+    /// *assumed* (per the spec): on the ALU bus this column equals the CPU's
+    /// `arg2` high word, which is already a well-formed 32-bit word, so it needs
+    /// no in-chip range check. The high shift bits never affect the result
+    /// (`shift mod 32/64` only uses the low byte).
+    pub const SHIFT_HIGH: usize = 28;
 
-    pub const NUM_COLUMNS: usize = 30;
+    pub const NUM_COLUMNS: usize = 29;
 
     // Helpers for iteration
     pub const IN: [usize; 4] = [IN_0, IN_1, IN_2, IN_3];
@@ -369,8 +373,7 @@ pub fn generate_shift_trace(
         // High bits of the full shift amount (for the ALU bus in2 = arg2).
         data[base + cols::SHIFT_B1] = FE::from((op.shift_amount >> 8) & 0xFF);
         data[base + cols::SHIFT_H1] = FE::from((op.shift_amount >> 16) & 0xFFFF);
-        data[base + cols::SHIFT_H2] = FE::from((op.shift_amount >> 32) & 0xFFFF);
-        data[base + cols::SHIFT_H3] = FE::from((op.shift_amount >> 48) & 0xFFFF);
+        data[base + cols::SHIFT_HIGH] = FE::from(op.shift_amount >> 32);
         data[base + cols::DIRECTION] = FE::from(op.direction as u64);
         data[base + cols::SIGNED] = FE::from(op.signed as u64);
         data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
@@ -604,7 +607,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ALU[out::DWordWL; in1=in, in2=shift_amount, flags] where
     //   flags = opsel(SHIFT=5, +word_instr→SHIFTW=6) + 32*signed + 64*direction.
     // in2 = the full shift amount: [SHIFT_AMOUNT + 256*SHIFT_B1 + 2^16*SHIFT_H1,
-    //                               SHIFT_H2 + 2^16*SHIFT_H3].
+    //                               SHIFT_HIGH].
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
         Multiplicity::Column(cols::MU),
@@ -629,17 +632,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::SHIFT_H1,
                 },
             ]),
-            // in2 high word
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::SHIFT_H2,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::SHIFT_H3,
-                },
-            ]),
+            // in2 high word = arg2 bits 32-63 (spec `shift[3]`, a Word; IS_WORD
+            // assumed via this column's bus equality with the CPU's well-formed
+            // arg2 high word).
+            BusValue::Packed {
+                start_column: cols::SHIFT_HIGH,
+                packing: Packing::Direct,
+            },
             // flags = opsel(SHIFT) + word_instr + 32*signed + 64*direction
             BusValue::linear(vec![
                 LinearTerm::Constant(alu_op::SHIFT as i64),
@@ -664,9 +663,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Range checks for the high shift-amount bits (so the in2 decomposition is
-    // unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT itself is
-    // byte-checked via the AND_BYTE[shift, mask] lookups.
+    // Range checks for the low-word high bits (so the in2 low-word decomposition
+    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT itself
+    // is byte-checked via the AND_BYTE[shift, mask] lookups. SHIFT_HIGH (the
+    // high word) needs no check: IS_WORD is assumed (it equals the CPU's
+    // well-formed arg2 high word on the bus), matching the spec's `shift[3]`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
         Multiplicity::Column(cols::MU),
@@ -678,16 +679,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
         ],
     ));
-    for half_col in [cols::SHIFT_H1, cols::SHIFT_H2, cols::SHIFT_H3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: half_col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+    interactions.push(BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::Column(cols::MU),
+        vec![BusValue::Packed {
+            start_column: cols::SHIFT_H1,
+            packing: Packing::Direct,
+        }],
+    ));
 
     interactions
 }
@@ -1023,20 +1022,20 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             mask,
         ));
 
-        // Range checks for the high shift-amount bits (match the ALU-bus in2
-        // reconstruction): ARE_BYTES[bits 8-15] + IS_HALF[bits 16-31/32-47/48-63].
+        // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+        // 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63, SHIFT_HIGH) is
+        // the spec's `shift[3]` Word; IS_WORD is assumed via its bus equality
+        // with the CPU's well-formed arg2 high word, so it needs no check.
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             ((op.shift_amount >> 8) & 0xFF) as u8,
         ));
-        for shift in [16, 32, 48] {
-            let half = ((op.shift_amount >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
     }
 
     bitwise_ops
