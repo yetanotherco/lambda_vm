@@ -68,9 +68,8 @@ pub(crate) fn pack_ext3_to_pinned_slabs(columns: &[&[u64]], pinned: &mut [u64], 
     let m = columns.len();
     debug_assert!(pinned.len() >= 3 * m * n);
     let pinned_ptr_u = pinned.as_mut_ptr() as usize;
-    // Sequential, not `par_iter`: this runs while the per-worker pinned
-    // staging mutex is held. Rayon inside a held mutex risks recursive
-    // stealing-during-wait deadlocks — see `Backend::pinned_staging` docs.
+    // Runs under the pinned-staging lock, where rayon can deadlock. See
+    // `Backend::pinned_staging`.
     columns.iter().enumerate().for_each(|(c, col)| {
         // SAFETY: each task writes to disjoint `[(c*3 + k)*n .. ..+n]` regions
         // of `pinned`. The outer `&mut [u64]` borrow guarantees no aliasing.
