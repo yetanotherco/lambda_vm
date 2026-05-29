@@ -1,0 +1,31 @@
+# Empty workspace table so this crate is NOT pulled into the main lambda-vm
+# workspace. It is meant to be consumed only via `[patch.crates-io]` in the
+# recursion guest. (Mirrors executor/programs/rust/keccak/Cargo.toml.)
+[workspace]
+
+[package]
+edition = "2018"
+name = "keccak"
+version = "0.1.5"
+authors = ["RustCrypto Developers"]
+description = """
+lambda-vm precompile shim for the `keccak` crate: routes Keccak-f[1600] /
+Keccak-p[1600, 24] to the RISC-V Keccak precompile on the riscv64 guest.
+Verbatim copy of keccak 0.1.5 except the p1600/f1600 override. Intended as a
+`[patch.crates-io]` override in the recursion guest.
+"""
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/lambdaclass/lambda_vm"
+
+[features]
+asm = []
+no_unroll = []
+simd = []
+
+[target."cfg(target_arch = \"aarch64\")".dependencies.cpufeatures]
+version = "0.2"
+
+[dev-dependencies]
+# Upstream keccak crate under a different name, so the faithfulness test can
+# compare against it without triggering a self-patch cycle.
+dev-dep-keccak = { package = "keccak", version = "0.1.5" }
