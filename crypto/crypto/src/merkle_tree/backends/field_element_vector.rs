@@ -88,6 +88,30 @@ where
     }
 }
 
+impl<F, D, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    D: Digest,
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    /// Hash a sequence of borrowed field elements into a leaf node, identical
+    /// to `hash_data` over the same sequence — but without materializing a Vec.
+    pub fn hash_elements<'a, I>(elements: I) -> [u8; NUM_BYTES]
+    where
+        I: IntoIterator<Item = &'a FieldElement<F>>,
+        F: 'a,
+    {
+        let mut hasher = D::new();
+        for element in elements {
+            hasher.update(element.as_bytes());
+        }
+        let mut result_hash = [0u8; NUM_BYTES];
+        result_hash.copy_from_slice(&hasher.finalize());
+        result_hash
+    }
+}
+
 impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where

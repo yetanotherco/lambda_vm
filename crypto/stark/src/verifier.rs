@@ -316,7 +316,8 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+        let leaf = BatchedMerkleTreeBackend::<E>::hash_elements(value.iter());
+        proof.verify_hashed::<BatchedMerkleTreeBackend<E>>(root, index, leaf)
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
@@ -398,16 +399,21 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let mut value = deep_poly_openings.composition_poly.evaluations.clone();
-        value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+        let leaf = BatchedMerkleTreeBackend::<FieldExtension>::hash_elements(
+            deep_poly_openings
+                .composition_poly
+                .evaluations
+                .iter()
+                .chain(deep_poly_openings.composition_poly.evaluations_sym.iter()),
+        );
 
         deep_poly_openings
             .composition_poly
             .proof
-            .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+            .verify_hashed::<BatchedMerkleTreeBackend<FieldExtension>>(
                 composition_poly_merkle_root,
                 *iota,
-                &value,
+                leaf,
             )
     }
 
@@ -447,16 +453,17 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
+        let (a, b) = if iota % 2 == 1 {
+            (evaluation_sym, evaluation)
         } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
+            (evaluation, evaluation_sym)
         };
+        let leaf = BatchedMerkleTreeBackend::<FieldExtension>::hash_elements([a, b]);
 
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+        auth_path_sym.verify_hashed::<BatchedMerkleTreeBackend<FieldExtension>>(
             merkle_root,
             iota >> 1,
-            &evaluations,
+            leaf,
         )
     }
 

@@ -20,24 +20,34 @@ pub struct Proof<T: PartialEq + Eq> {
 }
 
 impl<T: PartialEq + Eq> Proof<T> {
-    /// Verifies a Merkle inclusion proof for the value contained at leaf index.
-    pub fn verify<B>(&self, root_hash: &B::Node, mut index: usize, value: &B::Data) -> bool
+    /// Verify inclusion when the caller already computed the leaf hash
+    /// (lets callers hash borrowed leaf data without materializing `B::Data`).
+    pub fn verify_hashed<B>(
+        &self,
+        root_hash: &B::Node,
+        mut index: usize,
+        mut hashed_value: B::Node,
+    ) -> bool
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
-        let mut hashed_value = B::hash_data(value);
-
         for sibling_node in self.merkle_path.iter() {
             if index.is_multiple_of(2) {
                 hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
             } else {
                 hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
             }
-
             index >>= 1;
         }
-
         root_hash == &hashed_value
+    }
+
+    /// Verifies a Merkle inclusion proof for the value contained at leaf index.
+    pub fn verify<B>(&self, root_hash: &B::Node, index: usize, value: &B::Data) -> bool
+    where
+        B: IsMerkleTreeBackend<Node = T>,
+    {
+        self.verify_hashed::<B>(root_hash, index, B::hash_data(value))
     }
 }
 

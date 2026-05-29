@@ -6,6 +6,7 @@ use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 
 use crate::merkle_tree::{
     backends::field_element_vector::FieldElementVectorBackend, merkle::MerkleTree,
+    traits::IsMerkleTreeBackend,
 };
 
 type F = GoldilocksField;
@@ -119,4 +120,36 @@ fn hash_data_field_element_backend_works_with_sha2_512() {
         0,
         &values[0]
     ));
+}
+
+#[test]
+fn hash_elements_matches_hash_data_byte_for_byte() {
+    type Backend = FieldElementVectorBackend<F, Keccak256, 32>;
+
+    // Pseudo-random Vec generated from a simple LCG so the test is deterministic
+    // yet exercises a non-trivial sequence of field elements.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let v: Vec<FE> = (0..37)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            FE::from(state)
+        })
+        .collect();
+
+    let via_hash_data = Backend::hash_data(&v);
+    let via_hash_elements = Backend::hash_elements(v.iter());
+
+    assert_eq!(
+        via_hash_data, via_hash_elements,
+        "hash_elements must be byte-identical to hash_data over the same sequence"
+    );
+
+    // Empty sequence must also agree.
+    let empty: Vec<FE> = Vec::new();
+    assert_eq!(
+        Backend::hash_data(&empty),
+        Backend::hash_elements(empty.iter())
+    );
 }
