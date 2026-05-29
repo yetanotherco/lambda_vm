@@ -664,16 +664,29 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // Range checks for the low-word high bits (so the in2 low-word decomposition
-    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT itself
-    // is byte-checked via the AND_BYTE[shift, mask] lookups. SHIFT_HIGH (the
-    // high word) needs no check: IS_WORD is assumed (it equals the CPU's
-    // well-formed arg2 high word on the bus), matching the spec's `shift[3]`.
+    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT is also
+    // byte-checked implicitly via the AND_BYTE[shift, mask] lookups; we still emit
+    // the explicit ARE_BYTES[shift[0]] below to match the spec's `IS_BYTE[shift[0]]`
+    // (defense-in-depth, redundant with AND_BYTE). SHIFT_HIGH (the high word) needs
+    // no check: IS_WORD is assumed (it equals the CPU's well-formed arg2 high word
+    // on the bus), matching the spec's `shift[3]`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
         Multiplicity::Column(cols::MU),
         vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_B1,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+        ],
+    ));
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
             },
             BusValue::constant(0),
@@ -1029,6 +1042,12 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             ((op.shift_amount >> 8) & 0xFF) as u8,
+        ));
+        // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
+        // redundant with the AND_BYTE[shift, mask] lookups above).
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            op.shift,
         ));
         let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
         bitwise_ops.push(BitwiseOperation::halfword(
