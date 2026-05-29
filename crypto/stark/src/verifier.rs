@@ -792,6 +792,17 @@ pub trait IsStarkVerifier<
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
 
+        // #####################################################################
+        // ##### COMMON (shared, pre-fork) #####################################
+        // #####################################################################
+        // Everything below is computed ONCE on the shared transcript before any
+        // per-table fork: main commitments are appended, the shared LogUp
+        // challenges are sampled, the global alpha powers are derived, and the
+        // bus_public_inputs layout is validated. Only after this section do we
+        // fork the transcript per table. The exact sequence of transcript
+        // operations here is soundness-critical (Fiat-Shamir) and must match
+        // the prover byte-for-byte.
+
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
         // =====================================================================
@@ -880,9 +891,12 @@ pub trait IsStarkVerifier<
             }
         }
 
-        // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
-        // =====================================================================
+        // #####################################################################
+        // ##### PER-TABLE (forked transcript) #################################
+        // #####################################################################
+        // The shared/common section is finished. From here each table branches.
+        //
+        // Phase C + Rounds 2-4: Forked per table.
         // Each table gets an independent transcript fork (cloned from the shared
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
@@ -911,7 +925,7 @@ pub trait IsStarkVerifier<
                 *air,
                 proof,
                 &mut table_transcript,
-                lookup_challenges.clone(),
+                &lookup_challenges,
                 &logup_alpha_powers_global,
             ) {
                 error!(
@@ -1118,7 +1132,7 @@ pub trait IsStarkVerifier<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        rap_challenges: Vec<FieldElement<FieldExtension>>,
+        rap_challenges: &[FieldElement<FieldExtension>],
         logup_alpha_powers: &[FieldElement<FieldExtension>],
     ) -> bool
     where
@@ -1137,8 +1151,17 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges =
-            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
+        // `replay_rounds_after_round_1` takes ownership of `rap_challenges`
+        // (it is stored owned in the returned `Challenges`). Clone exactly once
+        // here, where ownership is actually required — this removes the
+        // per-table clone that previously lived at the `multi_verify` call site.
+        let challenges = Self::replay_rounds_after_round_1(
+            air,
+            proof,
+            &domain,
+            transcript,
+            rap_challenges.to_vec(),
+        );
 
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;
