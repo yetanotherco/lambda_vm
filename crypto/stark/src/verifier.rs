@@ -102,6 +102,7 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        logup_alpha_powers: &[FieldElement<FieldExtension>],
     ) -> bool {
         let trace_length = proof.trace_length;
         let boundary_constraints = air.boundary_constraints(
@@ -173,14 +174,15 @@ pub trait IsStarkVerifier<
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
-        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
-            if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(
-                    &challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA],
-                    air.max_bus_elements(),
-                )
+        // Reuse a prefix slice of the globally-computed alpha powers instead of
+        // recomputing the multiplication chain per table. The global vector is
+        // sized to the maximum bus element count across all AIRs, so this
+        // table's prefix is always available; `.min` is purely defensive.
+        let logup_alpha_powers_slice: &[FieldElement<FieldExtension>] =
+            if !logup_alpha_powers.is_empty() {
+                &logup_alpha_powers[..air.max_bus_elements().min(logup_alpha_powers.len())]
             } else {
-                Vec::new()
+                &[]
             };
 
         let logup_table_offset = match &proof.bus_public_inputs {
@@ -201,7 +203,7 @@ pub trait IsStarkVerifier<
             &ood_frame,
             &periodic_values,
             &challenges.rap_challenges,
-            &logup_alpha_powers,
+            logup_alpha_powers_slice,
             &logup_table_offset,
             &packing_shifts,
         );
@@ -842,6 +844,19 @@ pub trait IsStarkVerifier<
             Vec::new()
         };
 
+        // Compute the LogUp alpha powers ONCE, up to the global maximum bus
+        // element count across all AIRs. `compute_alpha_powers` returns the
+        // strict prefix sequence `[1, α, α², …]`, and the alpha challenge is
+        // shared (identical) across all tables, so each table can reuse a
+        // prefix slice of this global vector instead of recomputing the chain.
+        let logup_alpha_powers_global: Vec<FieldElement<FieldExtension>> =
+            if lookup_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                let global_max_bus = airs.iter().map(|a| a.max_bus_elements()).max().unwrap_or(0);
+                compute_alpha_powers(&lookup_challenges[LOGUP_CHALLENGE_ALPHA], global_max_bus)
+            } else {
+                Vec::new()
+            };
+
         // =====================================================================
         // Validate bus_public_inputs presence against AIR layout
         // =====================================================================
@@ -897,6 +912,7 @@ pub trait IsStarkVerifier<
                 proof,
                 &mut table_transcript,
                 lookup_challenges.clone(),
+                &logup_alpha_powers_global,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1103,6 +1119,7 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        logup_alpha_powers: &[FieldElement<FieldExtension>],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1147,7 +1164,13 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer2 = Instant::now();
 
-        if !Self::step_2_verify_claimed_composition_polynomial(air, proof, &domain, &challenges) {
+        if !Self::step_2_verify_claimed_composition_polynomial(
+            air,
+            proof,
+            &domain,
+            &challenges,
+            logup_alpha_powers,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
             return false;
