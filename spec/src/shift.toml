@@ -137,12 +137,6 @@ type = "Bit"
 desc = ""
 pad = 0
 
-
-# Assumptions
-
-[[assumptions]]
-desc = "`IS_WORD[shift[3]]`"
-
 # Constraints
 
 [[constraint_groups]]

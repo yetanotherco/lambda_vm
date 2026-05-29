@@ -70,6 +70,11 @@ name = "all"
 [[constraints.all]]
 kind = "template"
 tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
 input = ["write2"]
 
 [[constraints.all]]
@@ -96,6 +101,7 @@ poly = ["*", ["+", "write2", "write4", "write8"], ["not", "μ"]]
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "value", "i"]]
+cond = "μ"
 iter = ["i", 0, 7]
 
 [[constraints.all]]
@@ -110,7 +116,7 @@ name = "output"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "MEMORY"
+tag = "MEMOP"
 input = ["timestamp", "base_address", ["cast", "value", "DWordWL"], ["+", 1, ["*", 4, "write2"], ["*", 8, "write4"], ["*", 16, "write8"]]]
 output = ["cast", 0, "DWordWL"]
 multiplicity = ["-", "μ"]

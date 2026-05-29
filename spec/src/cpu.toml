@@ -213,6 +213,9 @@ ref = "cpu:a:mem-branch-mutex"
 desc = "When `MEMORY + BRANCH = 0`, either `rs2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`."
 ref = "cpu:a:arg2-multiplex"
 
+[[assumptions]]
+desc = "$#`!MEMORY` => #`IS_BIT<mem_flags`$"
+
 [[constraint_groups]]
 name = "decode"
 
@@ -236,6 +239,18 @@ poly = ["*", "word_instr", "BRANCH"]
 kind = "arith"
 constraint = "$#`word_instr` => #`ECALL = 0`$"
 poly = ["*", "word_instr", "ECALL"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`write_register = 0`$"
+poly = ["*", "word_instr", "write_register"]
+
+[[constraints.decode]]
+kind = "interaction"
+tag = "CPU32"
+input = ["timestamp", "pc"]
+output = "instruction_length"
+multiplicity = "word_instr"
 
 
 [[constraint_groups]]
@@ -380,12 +395,6 @@ input = ["rv1", "arg2", "alu_flags"]
 output = ["cast", "res", "DWordWL"]
 multiplicity = "ALU"
 
-[[constraints.alu]]
-kind = "interaction"
-tag = "CPU32"
-input = ["timestamp", "pc", "instruction_length"]
-multiplicity = "word_instr"
-
 
 [[constraint_groups]]
 name = "mem"
@@ -426,7 +435,7 @@ multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
-tag = "MEMORY"
+tag = "MEMOP"
 input = ["timestamp", ["cast", "res", "DWordWL"], "rv2", "mem_flags"]
 output = "rvd"
 multiplicity = "MEMORY"
@@ -468,8 +477,8 @@ prefix = "B"
 [[constraints.branch]]
 kind = "arith"
 constraint = "$#`branch_cond` = #`BRANCH` and (#`JALR` or #`res`)$"
-poly = ["+",
-        ["-", "branch_cond"],
+poly = ["-",
+        "branch_cond",
         ["*", "BRANCH", "JALR"],
         ["*", "BRANCH", ["-", 1, "JALR"], ["idx", "res", 0]]
     ]
@@ -486,6 +495,7 @@ kind = "template"
 tag = "ADD"
 input = ["pc", ["arr", "instruction_length", 0]]
 output = "next_pc"
+cond = ["not", "branch_cond"]
 desc = "Increment `pc` to `next_pc` if we're not branching"
 
 

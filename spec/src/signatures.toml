@@ -49,11 +49,12 @@ tag = "DECODE"
 kind = "interaction"
 input = ["DWordWL", "DWordWL", "BaseField"]
 
-# CPU32[timestamp, pc, instruction_length]
+# CPU32[instruction_length; timestamp, pc]
 [[signatures]]
 tag = "CPU32"
 kind = "interaction"
-input = ["DWordWL", "DWordWL", "Byte"]
+input = ["DWordWL", "DWordWL"]
+output = "Byte"
 
 # ALU[out; in1, in2, flags]
 [[signatures]]
@@ -62,9 +63,9 @@ kind = "interaction"
 input = ["DWordWL", "DWordWL", "Byte"]
 output = "DWordWL"
 
-# MEMORY[out; timestamp, address, value, flags]
+# MEMOP[out; timestamp, address, value, flags]
 [[signatures]]
-tag = "MEMORY"
+tag = "MEMOP"
 kind = "interaction"
 input = ["DWordWL", "DWordWL", "DWordWL", "Byte"]
 output = "DWordWL"

@@ -127,6 +127,16 @@ pad = 0
 name = "def"
 
 [[constraints.def]]
+kind = "template"
+tag = "IS_BIT"
+input = ["lhs_signed"]
+
+[[constraints.def]]
+kind = "template"
+tag = "IS_BIT"
+input = ["rhs_signed"]
+
+[[constraints.def]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "lhs", "i"]]

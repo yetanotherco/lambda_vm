@@ -97,36 +97,39 @@ ref = "lt:a:range_lhs"
 desc = "`IS_WORD[rhs[0]]`"
 ref = "lt:a:range_rhs"
 
-
 [[constraint_groups]]
-name = "defs"
-desc = "Enforce that variables have been correctly computed"
+name = "range"
+desc = "Range-check the inputs"
 
-[[constraints.defs]]
+[[constraints.range]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "lhs", 1]]
 multiplicity = "μ"
 ref = "lt:c:range_lhs"
 
-[[constraints.defs]]
+[[constraints.range]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "rhs", 1]]
 multiplicity = "μ"
 ref = "lt:c:range_rhs"
 
-[[constraints.defs]]
+[[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
 input = ["signed"]
 ref = "lt:c:range_signed"
 
-[[constraints.defs]]
+[[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
 input = ["invert"]
 ref = "lt:c:range_invert"
+
+[[constraint_groups]]
+name = "defs"
+desc = "Enforce that variables have been correctly computed"
 
 [[constraints.defs]]
 kind = "interaction"

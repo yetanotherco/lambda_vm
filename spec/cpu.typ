@@ -17,7 +17,7 @@
 #let cpu = raw(chip.name)
 
 The #cpu chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
-It bases its decisions on the entry of the `DECODE` table (@decode) corresponding the the current program counter (PC).
+It bases its decisions on the entry of the `DECODE` table (@decode) corresponding the current program counter (PC).
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -45,8 +45,8 @@ All values in `packed_decode` need to be checked to ensure
 the packing is correct for the interaction.
 In contrast, we know ahead of time that decoding will ensure proper range checks for `pc` and `imm`.
 Similarly, since `next_pc` will propagate through the memory argument and be looked up
-in the instruction decoding on the next cycle, it is forced to be in the correct range.
-The final value for `next_pc` is similarly fixed by the memory finalization.
+in the instruction decoding on the next cycle, it is forced to be in the correct range;
+the final value for `next_pc` is similarly fixed by the memory finalization.
 For the auxiliary columns, we need to check the limbs of `res`, since
 `rv1` and `rv2` are enforced by the memory argument, and `rvd` is correct by the correctness of the dependent chips.
 The ranges of the other auxiliary columns are enforced through later constraints.

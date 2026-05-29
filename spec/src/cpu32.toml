@@ -12,6 +12,12 @@ type = "DWordWL"
 desc = "The PC at which the instruction occurs"
 pad = 0
 
+[[variables.output]]
+name = "instruction_length"
+type = "Byte"
+desc = "The length of this instruction"
+pad = 4
+
 [[variables.auxiliary]]
 name = "rs1"
 type = "Byte"
@@ -134,12 +140,6 @@ desc = "Whether the full ALU is active"
 pad = 0
 
 [[variables.auxiliary]]
-name = "instruction_length"
-type = "Byte"
-desc = "The length of this instruction"
-pad = 4
-
-[[variables.auxiliary]]
 name = "signed"
 type = "Bit"
 desc = "Whether the instruction is signed or not. Extracted from `alu_flags`, used to determine the extension for the inputs"
@@ -193,6 +193,11 @@ multiplicity = "μ"
 [[constraint_groups]]
 name = "range"
 prefix = "R"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
 
 [[constraints.range]]
 kind = "template"
@@ -340,7 +345,8 @@ name = "logup"
 [[constraints.logup]]
 kind = "interaction"
 tag = "CPU32"
-input = ["timestamp", "pc", "instruction_length"]
+input = ["timestamp", "pc"]
+output = "instruction_length"
 multiplicity = ["-", "μ"]
 
 [[constraint_groups]]
@@ -356,7 +362,7 @@ multiplicity = "μ"
 [[constraints.ext]]
 kind = "template"
 tag = "SIGN"
-input = [["idx", "rv1", 1], 1]
+input = [["idx", "rv1", 1], "signed"]
 output = "rv1_sign"
 
 [[constraints.ext]]
@@ -366,13 +372,13 @@ poly = ["-", ["idx", "arg1", 0], ["idx", ["cast", "rv1", "DWordWL"], 0]]
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg1[1]` = (2^(32) - 1) dot #`signed` dot #`rv1_sign`$"
-poly = ["-", ["idx", "arg1", 1], ["*", ["-", ["^", 2, 32], 1], "signed", "rv1_sign"]]
+constraint = "$#`arg1[1]` = (2^(32) - 1) dot #`rv1_sign`$"
+poly = ["-", ["idx", "arg1", 1], ["*", ["-", ["^", 2, 32], 1], "rv1_sign"]]
 
 [[constraints.ext]]
 kind = "template"
 tag = "SIGN"
-input = [["idx", "rv2", 1], 1]
+input = [["idx", "rv2", 1], "signed"]
 output = "rv2_sign"
 
 [[constraints.ext]]
@@ -382,8 +388,8 @@ poly = ["-", ["idx", "arg2", 0], ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx",
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[1]` = (2^(32) - 1) dot #`signed` dot #`rv2_sign` + #`imm[1]`$"
-poly = ["-", ["idx", "arg2", 1], ["*", ["-", ["^", 2, 32], 1], "signed", "rv2_sign"], ["idx", "imm", 1]]
+constraint = "$#`arg2[1]` = (2^(32) - 1) dot #`rv2_sign` + #`imm[1]`$"
+poly = ["-", ["idx", "arg2", 1], ["*", ["-", ["^", 2, 32], 1], "rv2_sign"], ["idx", "imm", 1]]
 
 [[constraints.ext]]
 kind = "template"

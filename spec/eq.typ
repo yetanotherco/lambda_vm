@@ -27,6 +27,10 @@ It optionally inverts the result if the `invert` flag is set.
 The #eq chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
+= Assumptions
+
+#render_chip_assumptions(chip, config)
+
 = Constraints
 
 #render_constraint_table(chip, config)

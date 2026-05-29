@@ -165,7 +165,7 @@ name = "output"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "MEMORY"
+tag = "MEMOP"
 input = ["timestamp", "base_address", ["cast", 0, "DWordWL"], ["+", ["*", 2, "signed"], ["*", 4, "read2"], ["*", 8, "read4"], ["*", 16, "read8"]]]
 output = ["cast", "res", "DWordWL"]
 multiplicity = ["-", "μ"]

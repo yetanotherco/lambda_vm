@@ -8,6 +8,7 @@
   render_constraint_table,
   render_chip_padding_table,
 )
+#import "/expr.typ": expr_to_math
 
 #let config = load_config()
 #let chip = load_chip("src/decode.toml", config)
@@ -48,7 +49,8 @@ The construction of the `alu_flags` and `mem_flags` columns is given here throug
 
 #render_chip_variable_table(uncompressed_chip, config)
 
-First, we provide a mapping from an an ALU operation "descriptor" to the numerical value as used for the `alu_op` column:
+First, we provide a mapping from an an ALU operation "descriptor" to the numerical value as used for the `alu_op` column.
+This is the table used to find the value for the #expr_to_math(("opsel", "OPERATION")) notation when performing `ALU` or `BYTE_ALU` interactions.
 
 #figure(
   table(columns: (auto, auto),

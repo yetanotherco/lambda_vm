@@ -82,7 +82,7 @@ desc = "How many bytes is this instruction in the program"
 
 [[variables.auxiliary]]
 name = "alu_op"
-type = "Byte"
+type = "B4"
 desc = "Operation selector value for the ALU"
 
 [[variables.auxiliary]]

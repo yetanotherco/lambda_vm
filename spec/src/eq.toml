@@ -22,7 +22,7 @@ pad = 0
 name = "res"
 type = "Bit"
 desc = "The result"
-pad = 1
+pad = 0
 
 [[variables.auxiliary]]
 name = "diff"
@@ -34,7 +34,7 @@ pad = 0
 name = "eq"
 type = "Bit"
 desc = "The bit indicating `a == b`"
-pad = 1
+pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
@@ -88,6 +88,6 @@ poly = ["-", ["+", "res", ["*", 2, "eq", "invert"]], "eq", "invert"]
 [[constraints.all]]
 kind = "interaction"
 tag = "ALU"
-input = [["cast", "a", "DWordWL"], ["cast", "b", "DWordWL"], ["+", ["opsel", "EQ"], ["*", 64, "invert"]]]
+input = ["a", "b", ["+", ["opsel", "EQ"], ["*", 64, "invert"]]]
 output = ["arr", "res", 0]
 multiplicity = ["-", "μ"]

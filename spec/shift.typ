@@ -42,9 +42,6 @@ Here, `<<` and `>>` denote the _logical_ left and right shift operations, while 
 The `SHIFT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
-= Assumptions
-#render_chip_assumptions(chip, config)
-
 = Explanation
 This chip has a rather complex design as a result of designing it to fit in as few columns possible.
 We briefly discuss the intricacies of the design, attempting to illustrate its correctness.
