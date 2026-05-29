@@ -61,8 +61,15 @@ build_branch() {
     local branch=$1 label=$2
     echo -e "${GREEN}[$label] Checking out $branch...${NC}"
     git -C "$ROOT_DIR" checkout "$branch"
-    echo -e "${GREEN}[$label] Building release CLI (with jemalloc-stats)...${NC}"
-    cargo build --release -p cli --features jemalloc-stats --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
+    # Extra cargo features applied ONLY to the PR/feature side (not the
+    # base branch, which may lack them — e.g. `phased-fft`). Set via
+    #   PR_EXTRA_FEATURES=phased-fft ./scripts/bench_prove.sh ...
+    local features="jemalloc-stats"
+    if [ "$label" != "base" ] && [ -n "${PR_EXTRA_FEATURES:-}" ]; then
+        features="$features $PR_EXTRA_FEATURES"
+    fi
+    echo -e "${GREEN}[$label] Building release CLI (--features \"$features\")...${NC}"
+    cargo build --release -p cli --features "$features" --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
     cp "$ROOT_DIR/target/release/cli" "$TMP_DIR/cli-$label"
     echo -e "${GREEN}[$label] Binary saved.${NC}"
 }
