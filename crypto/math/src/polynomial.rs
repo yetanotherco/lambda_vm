@@ -4,7 +4,9 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
-#[cfg(feature = "phased-fft")]
+// Phased FFT is unconditionally wired on this research branch so the bench
+// harness exercises it without needing a cargo feature flag. The
+// `phased-fft` feature is retained as a no-op for compatibility.
 use crate::fft::phased_fft::{PhasedFftContext, bowers_phased_fft_seq_with_buf};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
@@ -269,7 +271,6 @@ fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
 /// Minimum LDE size at which the phased FFT path becomes competitive
 /// on x86 server hardware. Below this we keep the single-pass Bowers
 /// to amortise the transpose / phase-twiddle fixed overhead.
-#[cfg(feature = "phased-fft")]
 const PHASED_FFT_THRESHOLD: usize = 1 << 21;
 
 /// Dispatch a forward FFT and produce **natural-order** output.
@@ -299,7 +300,6 @@ where
     FieldElement<F>: Send + Sync,
     FieldElement<E>: Send + Sync + Clone,
 {
-    #[cfg(feature = "phased-fft")]
     {
         let n = buffer.len();
         if n >= PHASED_FFT_THRESHOLD && n.is_power_of_two() {
