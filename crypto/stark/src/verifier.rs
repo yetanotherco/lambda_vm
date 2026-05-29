@@ -567,11 +567,19 @@ pub trait IsStarkVerifier<
         // denominators followed by one composition denominator.
         let stride = height + 1;
 
-        // Per-entry data carried from Pass 1 to Pass 2. We own `lde_base`
-        // (concatenated precomputed + main columns) and borrow the aux and
-        // composition evaluation slices straight out of the proof opening.
+        // The composition denominator exponent is constant across all queries:
+        // it is the number of composition poly parts the proof advertises (the
+        // same array the consumer validates against). Hoist `z^N` once.
+        let number_of_parts = proof.composition_poly_parts_ood_evaluation.len();
+        let z_pow = challenges.z.pow(number_of_parts);
+
+        // Per-entry data carried from Pass 1 to Pass 2. We borrow every slice
+        // straight out of the proof opening: precomputed and main base-field
+        // columns separately (avoiding a per-query concatenation allocation),
+        // plus the aux and composition evaluation slices.
         struct DeepEntry<'a, Field: IsField, FieldExtension: IsField> {
-            lde_base: Vec<FieldElement<Field>>,
+            lde_precomputed: &'a [FieldElement<Field>],
+            lde_main: &'a [FieldElement<Field>],
             lde_aux: &'a [FieldElement<FieldExtension>],
             comp_evals: &'a [FieldElement<FieldExtension>],
             is_sym: bool,
@@ -589,20 +597,20 @@ pub trait IsStarkVerifier<
             let opening = &proof.deep_poly_openings[i];
 
             for is_sym in [false, true] {
-                // Base-field portion: precomputed columns FIRST, then main trace columns.
-                let mut lde_base: Vec<FieldElement<Field>> = Vec::new();
-                if let Some(p) = &opening.precomputed_trace_polys {
-                    if is_sym {
-                        lde_base.extend_from_slice(&p.evaluations_sym);
-                    } else {
-                        lde_base.extend_from_slice(&p.evaluations);
-                    }
-                }
-                if is_sym {
-                    lde_base.extend_from_slice(&opening.main_trace_polys.evaluations_sym);
+                // Base-field portion: precomputed columns FIRST, then main trace
+                // columns. Borrow both slices directly (empty slice when the
+                // opening carries no precomputed trace).
+                let lde_precomputed: &[FieldElement<Field>] = match &opening.precomputed_trace_polys
+                {
+                    Some(p) if is_sym => p.evaluations_sym.as_slice(),
+                    Some(p) => p.evaluations.as_slice(),
+                    None => &[],
+                };
+                let lde_main: &[FieldElement<Field>] = if is_sym {
+                    opening.main_trace_polys.evaluations_sym.as_slice()
                 } else {
-                    lde_base.extend_from_slice(&opening.main_trace_polys.evaluations);
-                }
+                    opening.main_trace_polys.evaluations.as_slice()
+                };
 
                 let lde_aux: &[FieldElement<FieldExtension>] = match &opening.aux_trace_polys {
                     Some(a) if is_sym => a.evaluations_sym.as_slice(),
@@ -626,11 +634,11 @@ pub trait IsStarkVerifier<
                     current_z = primitive_root * &current_z;
                 }
                 // One composition denominator: (upsilon - z^N).
-                let z_pow = challenges.z.pow(comp_evals.len());
                 all_denoms.push(&evaluation_point - &z_pow);
 
                 entries.push(DeepEntry {
-                    lde_base,
+                    lde_precomputed,
+                    lde_main,
                     lde_aux,
                     comp_evals,
                     is_sym,
@@ -652,7 +660,8 @@ pub trait IsStarkVerifier<
             let value = Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 challenges,
-                &entry.lde_base,
+                entry.lde_precomputed,
+                entry.lde_main,
                 entry.lde_aux,
                 entry.comp_evals,
                 trace_denoms_inv,
@@ -673,7 +682,8 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluation(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
-        lde_trace_base_evaluations: &[FieldElement<Field>],
+        lde_precomputed: &[FieldElement<Field>],
+        lde_main: &[FieldElement<Field>],
         lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
         trace_denoms_inv: &[FieldElement<FieldExtension>],
@@ -687,9 +697,9 @@ pub trait IsStarkVerifier<
         // column count does not match the OOD table width, or whose composition
         // poly parts count does not match the proof's `composition_poly_parts_ood_evaluation`.
         // Without these checks the indexing below would panic in release builds.
-        if lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len()
-            != ood_evaluations_table_width
-        {
+        let num_precomp = lde_precomputed.len();
+        let num_base = num_precomp + lde_main.len();
+        if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width {
             return None;
         }
         if trace_term_coeffs.is_empty()
@@ -702,7 +712,6 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let num_base = lde_trace_base_evaluations.len();
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
@@ -711,8 +720,11 @@ pub trait IsStarkVerifier<
                     |trace_t, (row_idx, coeff)| {
                         let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
                         // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
-                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            &lde_trace_base_evaluations[col_idx] - ood_val
+                        // Base columns are precomputed first, then main, then aux.
+                        let diff: FieldElement<FieldExtension> = if col_idx < num_precomp {
+                            &lde_precomputed[col_idx] - ood_val
+                        } else if col_idx < num_base {
+                            &lde_main[col_idx - num_precomp] - ood_val
                         } else {
                             &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
                         };
