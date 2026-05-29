@@ -33,7 +33,7 @@ desc = "whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`.
 [[variables.output]]
 name = "write_register"
 type = "Bit"
-desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."
+desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`)$."
 
 [[variables.output]]
 name = "imm"

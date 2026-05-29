@@ -366,7 +366,7 @@ poly = ["-", ["idx", "arg1", 0], ["idx", ["cast", "rv1", "DWordWL"], 0]]
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg1[1]` = (2^(32) - 1) #`signed` dot #`rv1_sign`$"
+constraint = "$#`arg1[1]` = (2^(32) - 1) dot #`signed` dot #`rv1_sign`$"
 poly = ["-", ["idx", "arg1", 1], ["*", ["-", ["^", 2, 32], 1], "signed", "rv1_sign"]]
 
 [[constraints.ext]]

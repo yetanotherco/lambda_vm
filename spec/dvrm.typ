@@ -27,8 +27,6 @@ The #dvrm chip provides division and remainder functionality, both signed and un
 The #dvrm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
-// = Assumptions
-// #render_chip_assumptions(chip, config)
 
 = Constraints
 

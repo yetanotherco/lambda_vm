@@ -89,7 +89,7 @@ input = [["+", "write2", "write4", "write8"]]
 
 [[constraints.all]]
 kind = "arith"
-constraint = "$#`write2` + #`write4` + #`write8` => #`μ`$"
+constraint = "$#`write2` + #`write4` + #`write8` => #`μ` = 1$"
 poly = ["*", ["+", "write2", "write4", "write8"], ["not", "μ"]]
 
 [[constraints.all]]
@@ -111,6 +111,6 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMORY"
-input = ["timestamp", "base_address", ["cast", "value", "DWordWL"], ["+", ["*", 4, "write2"], ["*", 8, "write4"], ["*", 16, "write8"]]]
+input = ["timestamp", "base_address", ["cast", "value", "DWordWL"], ["+", 1, ["*", 4, "write2"], ["*", 8, "write4"], ["*", 16, "write8"]]]
 output = ["cast", 0, "DWordWL"]
 multiplicity = ["-", "μ"]

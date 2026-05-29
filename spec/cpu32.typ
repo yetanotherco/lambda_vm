@@ -19,7 +19,7 @@
 The #cpu32 chip is used to delegate the 32-bit instructions of the RV64I instruction set
 from the main CPU table (@cpu).
 All 32-bit instructions are ALU-only instructions, so the BRANCH, MEMORY and ECALL paths need no elaboration.
-The timestamp and PC have already been read by the CPU table at this point, and need no further checking,
+The timestamp and PC have already been read by the CPU table at this point, and need no further checking;
 the PC for the next instruction will also already be handled by CPU.
 
 The structure follows the regular ALU path, with some extra variables and constraints to contain the required sign extensions.

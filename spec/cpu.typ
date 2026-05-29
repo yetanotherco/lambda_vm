@@ -90,7 +90,7 @@ We refer to the previous section's description of `arg2` for how
 the address is computed.
 
 The value to (potentially) be written back to `rd` is stored in `rvd`,
-which can either come from either the ALU, in case of an ALU operation or a JALR branch,
+which can either come from the ALU --- in case of an ALU operation or a JALR branch ---
 or from the MEMORY interaction.
 
 #render_constraint_table(chip, config, groups: "mem")

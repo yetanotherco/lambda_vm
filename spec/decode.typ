@@ -35,7 +35,7 @@ Empty rows with the following content can be added to achieve this:
 #render_chip_padding_table(chip, config)
 
 This is simultaneously the row that is used for padding rows in the CPU,
-if the multiplicity if nonzero,
+if the multiplicity is nonzero,
 so we need to ensure that this table has at least one row of padding.
 
 = Decoding<decode:decoding-overview>

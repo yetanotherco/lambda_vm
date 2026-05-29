@@ -171,7 +171,7 @@ pad = 0
 [[variables.auxiliary]]
 name = "branch_cond"
 type = "Bit"
-desc = "Whether a branch is taken, the branch condition evaluates to true, or we are doing an unconditional jump"
+desc = "Whether a branch is taken: the branch condition evaluates to true, or we are doing an unconditional jump"
 pad = 0
 
 # Virtual
@@ -349,7 +349,7 @@ prefix = "A"
 
 [[constraints.alu]]
 kind = "arith"
-constraint = "$#`arg2` = #`MEMORY` * #`imm` + #`BRANCH` * (1 - #`JALR`) * #`rv2` * #`BRANCH` * #`JALR` * #`instruction_length` + (1 - #`MEMORY`) * (1 - #`BRANCH`) * (#`rv2` + #`imm`)$"
+constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot (1 - #`JALR`) dot #`rv2` + #`BRANCH` dot #`JALR` dot #`instruction_length` + (1 - #`MEMORY`) dot (1 - #`BRANCH`) dot (#`rv2` + #`imm`)$"
 poly = ["-", ["idx", "arg2", "i"],
     ["*", "MEMORY", ["idx", "imm", "i"]],
     ["*", "BRANCH", ["not", "JALR"], ["idx", "rv2", "i"]],
@@ -433,7 +433,7 @@ multiplicity = "MEMORY"
 
 [[constraints.mem]]
 kind = "arith"
-constraint = "$!#`MEMORY` => #`rvd` = #`res`$"
+constraint = "$#`!MEMORY` => #`rvd` = #`res`$"
 poly = ["*", ["not", "MEMORY"], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
 iter = ["i", 0, 1]
 
