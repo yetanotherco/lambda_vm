@@ -10,7 +10,7 @@
 #   READY_TIMEOUT         default: 1800 (seconds)
 #
 # Requires: scw, jq, ssh.
-# To stop hourly charges when done: scw baremetal server delete <id> zone=<zone>
+# To delete the server when done: scw baremetal server delete <id> zone=<zone>
 
 set -euo pipefail
 
@@ -183,7 +183,7 @@ info "Handing off to provision_server.sh (Ctrl+C to skip and provision later)...
 PROVISION_FILE="$PROVISION_FILE" SSH_USER=root "$SCRIPT_DIR/provision_server.sh" "$PUBLIC_IP"
 
 echo
-echo "To stop hourly charges:"
+echo "To delete the server:"
 echo "  scw baremetal server delete $SERVER_ID zone=$SCW_ZONE"
 echo
 echo "To re-provision this server later (sshd is hardened, so admin + sudo):"
