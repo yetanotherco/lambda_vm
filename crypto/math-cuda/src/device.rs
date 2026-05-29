@@ -165,13 +165,13 @@ impl Backend {
         for _ in 0..STREAM_POOL_SIZE {
             streams.push(ctx.new_stream()?);
         }
-        // Size to the rayon worker count, plus one for non-rayon callers
-        // who land on slot 0 (`rayon::current_thread_index()` returns None
-        // outside a rayon context — we map that to 0).
+        // One slot per rayon worker. `current_thread_index()` returns
+        // `0..current_num_threads()`, and non-rayon callers (None) map to slot 0,
+        // so this many slots covers every caller.
         //
-        // `current_num_threads()` returns the default-pool size if no custom
-        // pool is in use, which is the cpu count. Stable across the
-        // backend's lifetime since rayon's pool is fixed at first use.
+        // `current_num_threads()` returns the default-pool size (the cpu count)
+        // when no custom pool is in use. Stable across the backend's lifetime
+        // since rayon's pool is fixed at first use.
         let n_slots = rayon::current_num_threads().max(1);
         let pinned_staging: Vec<Mutex<PinnedStaging>> = (0..n_slots)
             .map(|_| Mutex::new(PinnedStaging::empty()))
