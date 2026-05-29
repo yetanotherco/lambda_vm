@@ -97,6 +97,13 @@ iter = ["i", 0, 1]
 desc = "`IS_BIT<JALR>`"
 
 
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["JALR"]
 
 [[constraint_groups]]
 name = "all"

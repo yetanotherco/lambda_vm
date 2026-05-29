@@ -36,6 +36,11 @@ The #cpu32 chip is comprised of #nr_variables variables that are expressed using
 
 #render_chip_assumptions(chip, config)
 
+Some of the assumptions can be checked with only arithmetic constraints, so we
+provide these below.
+
+#render_constraint_table(chip, config, groups: "assumptions")
+
 = Constraints
 
 Most constraints correspond to those already present in the CPU, and we present them here first,

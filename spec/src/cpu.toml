@@ -210,11 +210,32 @@ desc = "`MEMORY` and `BRANCH` are mutually exclusive"
 ref = "cpu:a:mem-branch-mutex"
 
 [[assumptions]]
-desc = "When `MEMORY + BRANCH = 0`, either `rs2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`."
+desc = "When `MEMORY + BRANCH = 0`, either `read_register2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`."
 ref = "cpu:a:arg2-multiplex"
 
 [[assumptions]]
-desc = "$#`!MEMORY` => #`IS_BIT<mem_flags`$"
+desc = "$#`!MEMORY` => #`IS_BIT<mem_flags>`$"
+
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "arith"
+constraint = "$not (#`MEMORY` and #`BRANCH`)$"
+poly = ["*", "MEMORY", "BRANCH"]
+
+[[constraints.assumptions]]
+kind = "arith"
+constraint = "$(1 - #`MEMORY` - #`BRANCH`) => (#`read_register2` = 0 or #`imm[i]` = 0)$"
+poly = ["*", ["-", 1, "MEMORY", "BRANCH"], "read_register2", ["idx", "imm", "i"]]
+iter = ["i", 0, 1]
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["mem_flags"]
+cond = ["not", "MEMORY"]
+
 
 [[constraint_groups]]
 name = "decode"

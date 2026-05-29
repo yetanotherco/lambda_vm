@@ -30,6 +30,11 @@ The #cpu chip is comprised of #nr_variables variables that are expressed using #
 = Assumptions
 #render_chip_assumptions(chip, config)
 
+Additionally, the following constraints can be used to provide defense-in-depth
+validation of the assumptions.
+
+#render_constraint_table(chip, config, groups: "assumptions")
+
 = Constraints
 
 First, we perform a decoding lookup for the current PC.
