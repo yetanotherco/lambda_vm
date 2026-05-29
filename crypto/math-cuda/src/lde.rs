@@ -97,8 +97,8 @@ fn unpack_pinned_slabs_to_ext3(pinned: &[u64], outputs: &mut [&mut [u64]], lde_s
     let m = outputs.len();
     debug_assert!(pinned.len() >= 3 * m * lde_size);
     let pinned_const = pinned.as_ptr() as usize;
-    // Sequential, not `par_iter_mut`: runs inside a held pinned-staging
-    // mutex; rayon-inside-mutex risks deadlock (see `Backend::pinned_staging`).
+    // Runs under the pinned-staging lock, where rayon can deadlock. See
+    // `Backend::pinned_staging`.
     outputs.iter_mut().enumerate().for_each(|(c, dst)| {
         // SAFETY: each task reads from disjoint `[(c*3 + k)*lde_size .. ..+lde_size]`
         // regions of `pinned`. Caller borrows `pinned` for the duration of the call.
