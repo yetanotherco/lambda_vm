@@ -43,7 +43,6 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::ECALL,
     cols::PC_DOUBLE_READ,
     cols::PREV_PC_TIMESTAMP_BORROW,
-    cols::NON_PADDING,
 ];
 
 /// Creates all IS_BIT constraints for CPU flag columns.
@@ -506,15 +505,15 @@ pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 // =========================================================================
 
 /// Total number of CPU transition constraints (excludes bus lookups):
-/// - IS_BIT: 13
-/// - decode mutex: 3 (`word_instr · {MEMORY, BRANCH, ECALL}`)
+/// - IS_BIT: 12
+/// - decode mutex: 4 (`word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER}`)
 /// - ADD pair: 2, SUB pair: 2
 /// - arg2 multiplex: 2
 /// - register zero-forcing: 4 (`rv1[0..1]`, `rv2[0..1]`)
 /// - rvd = res: 2
 /// - branch_cond: 1
 /// - next_pc: 2
-pub const NUM_CPU_CONSTRAINTS: usize = 13 + 3 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2;
+pub const NUM_CPU_CONSTRAINTS: usize = 12 + 4 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2;
 
 /// Creates all CPU transition constraints.
 ///
@@ -543,8 +542,15 @@ pub fn create_all_cpu_constraints() -> (
         Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
     > = Vec::new();
 
-    // decode: word_instr mutex with MEMORY / BRANCH / ECALL
-    for &col in &[cols::MEMORY, cols::BRANCH, cols::ECALL] {
+    // decode: word_instr mutex with MEMORY / BRANCH / ECALL, and word_instr ⇒
+    // write_register = 0 (word instructions are delegated to CPU32 and must not
+    // write the main register file — leaving write_register free is unsound).
+    for &col in &[
+        cols::MEMORY,
+        cols::BRANCH,
+        cols::ECALL,
+        cols::WRITE_REGISTER,
+    ] {
         other.push(ProductZeroConstraint::new(cols::WORD_INSTR, col, next_idx).boxed());
         next_idx += 1;
     }

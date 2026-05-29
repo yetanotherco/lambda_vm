@@ -678,6 +678,10 @@ pub enum MulConstraintKind {
     LhsSign,
     /// SIGN constraint for rhs: (1 - rhs_signed) * rhs_is_negative = 0
     RhsSign,
+    /// IS_BIT range check on a sign flag column: `x * (1 - x) = 0`. Required
+    /// because `lhs_signed`/`rhs_signed` are used as bus multiplicities, so an
+    /// out-of-range value (e.g. `lhs_signed = 3`) would otherwise be accepted.
+    SignedIsBit(usize),
     /// Raw product convolution formula for index i
     RawProduct(usize),
 }
@@ -725,6 +729,12 @@ impl MulConstraint {
                     .clone();
                 let one = FieldElement::<F>::one();
                 (&one - &rhs_signed) * &rhs_is_neg
+            }
+            MulConstraintKind::SignedIsBit(col) => {
+                // x * (1 - x) = 0
+                let x = step.get_main_evaluation_element(0, col).clone();
+                let one = FieldElement::<F>::one();
+                &x * &(&one - &x)
             }
             MulConstraintKind::RawProduct(i) => {
                 // raw_product[i] = convolution formula
@@ -823,6 +833,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
         match self.kind {
             // (1 - signed) * is_negative is degree 2
             MulConstraintKind::LhsSign | MulConstraintKind::RhsSign => 2,
+            // x * (1 - x) is degree 2
+            MulConstraintKind::SignedIsBit(_) => 2,
             // Raw product: lhs_ext[j] * rhs_ext[idx-j] where each may involve
             // sign_fill * is_negative (degree 1), so product is degree 2
             // But we're summing many degree-2 terms, still degree 2
@@ -849,6 +861,18 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
 pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usize) {
     let mut idx = constraint_idx_start;
     let mut constraints = Vec::new();
+
+    // IS_BIT range checks on the sign flags (used as bus multiplicities).
+    constraints.push(MulConstraint::new(
+        MulConstraintKind::SignedIsBit(cols::LHS_SIGNED),
+        idx,
+    ));
+    idx += 1;
+    constraints.push(MulConstraint::new(
+        MulConstraintKind::SignedIsBit(cols::RHS_SIGNED),
+        idx,
+    ));
+    idx += 1;
 
     // SIGN constraints
     constraints.push(MulConstraint::new(MulConstraintKind::LhsSign, idx));

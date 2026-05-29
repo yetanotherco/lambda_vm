@@ -245,11 +245,10 @@ fn test_trace_width_and_real_row() {
     });
     let trace = generate_cpu_trace(&ops);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
-    assert_eq!(cols::NUM_COLUMNS, 39);
+    assert_eq!(cols::NUM_COLUMNS, 38);
     assert_eq!(trace.main_table.height, 4);
     let row = trace.main_table.get_row(0);
     assert_eq!(row[cols::PC_0], (PC).into());
-    assert_eq!(row[cols::NON_PADDING], 1u64.into());
     assert_eq!(row[cols::ADD], 1u64.into(), "ADD fast-path flag set");
     assert_eq!(row[cols::RES_0], 30u64.into());
 }
@@ -279,7 +278,6 @@ fn test_trace_padding_row() {
         "next_pc = pc (instruction_length = 0)"
     );
     assert_eq!(pad[cols::INSTRUCTION_LENGTH], 0u64.into());
-    assert_eq!(pad[cols::NON_PADDING], 0u64.into());
     assert_eq!(pad[cols::WORD_INSTR], 0u64.into());
 }
 
@@ -295,7 +293,6 @@ fn test_trace_word_row_columns_masked() {
     let row = trace.main_table.get_row(0);
     // Delegate row: word_instr set, but all operational columns masked to 0.
     assert_eq!(row[cols::WORD_INSTR], 1u64.into());
-    assert_eq!(row[cols::NON_PADDING], 1u64.into());
     assert_eq!(row[cols::INSTRUCTION_LENGTH], 4u64.into());
     assert_eq!(
         row[cols::RV1_0],

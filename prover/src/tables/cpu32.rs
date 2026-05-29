@@ -686,7 +686,7 @@ pub fn cpu32_constraints(
         Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
     > = Vec::new();
 
-    // IS_BIT on the flag columns.
+    // IS_BIT on the flag columns and the multiplicity.
     let (is_bit, mut idx) = new_is_bit_constraints(
         &[
             cols::READ_REGISTER1,
@@ -695,6 +695,7 @@ pub fn cpu32_constraints(
             cols::ALU,
             cols::ADD,
             cols::SUB,
+            cols::MU,
         ],
         constraint_idx_start,
     );
@@ -726,12 +727,17 @@ pub fn cpu32_constraints(
     constraints.push(sub_lo.boxed());
     constraints.push(sub_hi.boxed());
 
-    // Unread register halves are zero.
+    // Unread register limbs are zero. `rv1`/`rv2` span three limbs
+    // (low halfword, high halfword, high word), so all three must be forced to
+    // zero when the register is not read — the bus reads the full word
+    // `[lo0 + 2^16·lo1, hi]`, leaving `RV*_2` free otherwise.
     for (read_col, value_col) in [
         (cols::READ_REGISTER1, cols::RV1_0),
         (cols::READ_REGISTER1, cols::RV1_1),
+        (cols::READ_REGISTER1, cols::RV1_2),
         (cols::READ_REGISTER2, cols::RV2_0),
         (cols::READ_REGISTER2, cols::RV2_1),
+        (cols::READ_REGISTER2, cols::RV2_2),
     ] {
         constraints.push(
             Cpu32Constraint::new(

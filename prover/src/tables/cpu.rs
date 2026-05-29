@@ -137,16 +137,8 @@ pub mod cols {
     /// branch_cond: whether the branch/jump is taken (Bit).
     pub const BRANCH_COND: usize = 37;
 
-    /// non_padding: 1 on real instruction rows, 0 on padding rows. Used as the
-    /// multiplicity of the inline-PC `memory` tokens so padding rows never touch
-    /// the PC cell. See `docs/cpu-rework-deviations.md` (D-PAD): the spec uses a
-    /// constant multiplicity of 1, which assumes padding rows chain the PC; our
-    /// memory argument instead leaves the final PC write terminal, so padding
-    /// must not emit PC tokens.
-    pub const NON_PADDING: usize = 38;
-
     /// Total number of columns.
-    pub const NUM_COLUMNS: usize = 39;
+    pub const NUM_COLUMNS: usize = 38;
 
     /// res half columns as an array (DWordHL).
     pub const RES: [usize; 4] = [RES_0, RES_1, RES_2, RES_3];
@@ -530,16 +522,21 @@ pub fn generate_cpu_trace(
         };
         data[base + cols::PC_DOUBLE_READ] = FE::from(pc_double_read);
         data[base + cols::PREV_PC_TIMESTAMP_BORROW] = FE::from(prev_pc_ts_borrow);
-
-        // Real (non-padding) row.
-        data[base + cols::NON_PADDING] = FE::one();
     }
 
-    // Padding rows: pc = 1 (odd, unreachable), instruction_length = 0 so
-    // next_pc = pc + 0 = pc, all flags 0, non_padding = 0. The DECODE table has
-    // the matching padding entry at pc = 1.
+    // Padding rows: pc = next_pc = 1 (odd, unreachable), instruction_length = 0 so
+    // next_pc = pc + 0 = pc, all flags 0. The DECODE table has the matching padding
+    // entry at pc = 1. Per spec, padding rows participate in the inline-PC `memory`
+    // chain: each reads pc=1 at `timestamp - 3` and writes pc=1 at `timestamp + 1`,
+    // so their timestamps must continue the +4 cadence from the last real row (the
+    // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
+    // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
+    // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
+    let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
     for row_idx in n..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
+        let j = (row_idx - n + 1) as u64;
+        data[base + cols::TIMESTAMP] = FE::from(last_ts + 4 * j);
         data[base + cols::PC_0] = FE::from(CPU_PADDING_PC);
         data[base + cols::NEXT_PC_0] = FE::from(CPU_PADDING_PC);
     }
@@ -791,11 +788,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // Inline PC memory tokens (mult = non_padding): read PC at the coordinated
+    // Inline PC memory tokens (mult = 1, per spec): read PC at the coordinated
     // previous timestamp, write next_pc at timestamp+1. x255 lives at addresses
-    // 510/511.
+    // 510/511. Padding rows participate too (they carry PC=1 and chain their
+    // timestamps); the HALT chip's consume_pc/emit_pc bridges the last real write
+    // to the padding chain. See `docs/cpu-rework-deviations.md` (D-PAD).
     // -------------------------------------------------------------------------
-    let non_pad = Multiplicity::Column(cols::NON_PADDING);
+    let pc_mult = Multiplicity::One;
     // prev_ts_lo = timestamp - 3*(1 - pc_double_read) + 2^32 * borrow
     let prev_ts_lo = BusValue::linear(vec![
         LinearTerm::Column {
@@ -826,7 +825,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // PC read (sender): consume the existing token.
         interactions.push(BusInteraction::sender(
             BusId::Memory,
-            non_pad.clone(),
+            pc_mult.clone(),
             vec![
                 BusValue::constant(1),
                 BusValue::constant(510 + i),
@@ -842,7 +841,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // PC write (receiver): emit the next token at timestamp+1.
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
-            non_pad.clone(),
+            pc_mult.clone(),
             vec![
                 BusValue::constant(1),
                 BusValue::constant(510 + i),

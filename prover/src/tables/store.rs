@@ -322,7 +322,7 @@ pub fn store_constraints(
     > = Vec::new();
 
     let (is_bit, mut idx) = new_is_bit_constraints(
-        &[cols::WRITE2, cols::WRITE4, cols::WRITE8],
+        &[cols::WRITE2, cols::WRITE4, cols::WRITE8, cols::MU],
         constraint_idx_start,
     );
     for c in is_bit {

@@ -934,12 +934,15 @@ fn collect_commit_memw_ops(
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
 ///
-/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes every register:
+/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes the GP registers:
 /// - x1-x9, x11-x31: write 0 (zeroize)
 /// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
-/// - x255 (PC): write 1 (halted sentinel)
 ///
-/// Also updates `register_state` so `to_final_state_map()` reflects the finalized values.
+/// The PC (x255) is NOT finalized here — it is handled on the inline-PC `memory`
+/// bus by the HALT chip's consume_pc/emit_pc plus the CPU padding chain (its
+/// REGISTER final token is set separately by the caller, at the last padding
+/// timestamp). Also updates `register_state` so `to_final_state_map()` reflects
+/// the finalized GP register values.
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
     let ts = u64::MAX;
@@ -979,16 +982,9 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         register_state.write(i, 0, ts);
     }
 
-    // x255 (PC): write 1
-    {
-        let (old_val, old_ts) = register_state.read_pc();
-        let old_value = pack_register_value(old_val);
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, 510, pack_register_value(1), ts, 2, false)
-            .with_old(old_value, old_timestamps);
-        ops.push(memw_op);
-        register_state.write_pc(1, ts);
-    }
+    // x255 (PC) is finalized via the inline-PC `memory` bus + REGISTER table, not
+    // via a MEMW write at 2^64-1. See `collect_halt_ops` doc and the PC finalization
+    // in the caller.
 
     ops
 }
@@ -2431,7 +2427,7 @@ fn build_traces(
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
+    mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
@@ -2517,6 +2513,15 @@ fn build_traces(
         .find(|op| op.decode.fields.ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
+    let halt_next_pc = halt_op.next_pc;
+
+    // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
+    // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
+    // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
+    // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
+    // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
+    // must match that last write to balance the memory argument.
+    register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -2669,7 +2674,7 @@ fn build_traces(
                     || register::generate_register_trace(&register_final_state, entry_point),
                 )
             },
-            || halt::generate_halt_trace(halt_timestamp),
+            || halt::generate_halt_trace(halt_timestamp, halt_next_pc),
         );
         let (pages_v, page_configs_v) = pages_val;
         pages = pages_v;
@@ -2691,7 +2696,7 @@ fn build_traces(
             }
         }
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp);
+        halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
