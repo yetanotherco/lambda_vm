@@ -123,9 +123,12 @@ fn maxrows_scale_log2_from_env() -> u32 {
     }
 }
 
-/// Default chunk-size scale for this research branch (×8 tables: CPU/MEMW
-/// 2^19→2^22, MUL/etc 2^20→2^23). Set to 0 to restore production sizing.
-const DEFAULT_MAXROWS_SCALE_LOG2: u32 = 3;
+/// Default chunk-size scale for this research branch (×4 tables: CPU/MEMW
+/// 2^19→2^21, MUL/etc 2^20→2^22). ×8 (scale 3) regressed prove time +41%
+/// on fib_8M — bigger chunks collapse the table-level parallelism the
+/// prover relies on. ×4 is the intermediate probe. Set to 0 to restore
+/// production sizing.
+const DEFAULT_MAXROWS_SCALE_LOG2: u32 = 2;
 
 impl Default for MaxRowsConfig {
     fn default() -> Self {
