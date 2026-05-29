@@ -360,11 +360,9 @@ pub fn coset_lde_batch_base(
     // SAFETY: staging is locked, the slice alias ends before we unlock.
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    // Pack columns into first m*n slots of the pinned buffer. Sequential
-    // (not `par_iter`) because this runs inside the held pinned-staging
-    // mutex — see `Backend::pinned_staging` docs. Pre-fault parallelism on
-    // the destination is recovered at the outer level via per-worker
-    // staging slots.
+    // Pack columns into the first m*n slots of the pinned buffer. Runs under
+    // the pinned-staging lock, where rayon can deadlock. See
+    // `Backend::pinned_staging`.
     for (c, col) in columns.iter().enumerate() {
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
