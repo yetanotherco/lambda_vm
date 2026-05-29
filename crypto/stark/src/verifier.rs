@@ -25,7 +25,6 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
@@ -111,18 +110,23 @@ pub trait IsStarkVerifier<
             proof.bus_public_inputs.as_ref(),
             trace_length,
         );
-        // Precompute g^step once per distinct step to avoid the prior O(B^2)
-        // linear scan. A single pass populates a memo and resolves each
-        // constraint's step to its point in O(1) amortized.
-        let mut step_to_point: HashMap<usize, FieldElement<Field>> = HashMap::new();
+        // Precompute g^step once per distinct step. A small `Vec` with a
+        // linear scan beats `HashMap` here: boundary constraints typically
+        // number in the low tens, the recursion guest pays no allocator/hash
+        // overhead, and the AIR generally emits its constraints grouped by
+        // step so the scan hits the hot entry first.
+        let mut step_to_point: Vec<(usize, FieldElement<Field>)> = Vec::new();
         let boundary_points: Vec<FieldElement<Field>> = boundary_constraints
             .constraints
             .iter()
             .map(|c| {
-                step_to_point
-                    .entry(c.step)
-                    .or_insert_with(|| domain.trace_primitive_root.pow(c.step as u64))
-                    .clone()
+                if let Some((_, point)) = step_to_point.iter().find(|(s, _)| *s == c.step) {
+                    point.clone()
+                } else {
+                    let point = domain.trace_primitive_root.pow(c.step as u64);
+                    step_to_point.push((c.step, point.clone()));
+                    point
+                }
             })
             .collect();
 
@@ -355,37 +359,48 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         // Main trace (multiplicities for preprocessed, full trace for normal).
-        let mut ok = Self::verify_opening_pair::<Field>(
+        // Short-circuit on any failure: each opening pair is a Merkle-path
+        // verification (~20 Keccak hashes against base-field leaves); in the
+        // recursion guest this is non-trivial cycle cost worth skipping.
+        if !Self::verify_opening_pair::<Field>(
             &deep_poly_openings.main_trace_polys,
             &proof.lde_trace_main_merkle_root,
             iota,
-        );
+        ) {
+            return false;
+        }
 
         // Precomputed trace (preprocessed tables only). Mismatched presence is
         // unreachable in practice (multi_verify rejects such proofs upstream),
         // but a defensive check keeps this function self-contained.
-        ok &= match (
+        match (
             &proof.lde_trace_precomputed_merkle_root,
             &deep_poly_openings.precomputed_trace_polys,
         ) {
-            (Some(root), Some(opening)) => Self::verify_opening_pair::<Field>(opening, root, iota),
-            (None, None) => true,
-            _ => false,
-        };
+            (Some(root), Some(opening)) => {
+                if !Self::verify_opening_pair::<Field>(opening, root, iota) {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
 
         // Auxiliary trace.
-        ok &= match (
+        match (
             proof.lde_trace_aux_merkle_root,
             &deep_poly_openings.aux_trace_polys,
         ) {
             (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, &root, iota)
+                if !Self::verify_opening_pair::<FieldExtension>(opening, &root, iota) {
+                    return false;
+                }
             }
-            (None, None) => true,
-            _ => false,
-        };
+            (None, None) => {}
+            _ => return false,
+        }
 
-        ok
+        true
     }
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
@@ -489,19 +504,12 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
-
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
         // Reconstruct p₁(𝜐²)
         let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+            (p0_eval + p0_eval_sym) + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
         // Handle case with 0 FRI layers (trace_length <= 2)
@@ -511,49 +519,57 @@ pub trait IsStarkVerifier<
             return v == proof.fri_last_value;
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
+        // Guard zip alignment: the three iterables MUST have equal lengths.
+        // A malformed proof with mismatched lengths would otherwise silently
+        // truncate the verification or panic on the `len() - 1` below.
+        if fri_decommitment.layers_auth_paths.len() != fri_layers_merkle_roots.len()
+            || fri_decommitment.layers_evaluations_sym.len() != fri_layers_merkle_roots.len()
+        {
+            return false;
+        }
+
+        // For each FRI layer, verify openings then fold to the next layer's
+        // evaluation. `evaluation_point_squared` is stepped in-place instead
+        // of pre-collecting a Vec, and a failed opening short-circuits the
+        // remaining Merkle work (each call is ~log₂(N) Keccak hashes).
+        let last_layer_idx = fri_layers_merkle_roots.len() - 1;
+        let mut evaluation_point_squared = evaluation_point_inv.square();
+        for (i, ((merkle_root, auth_path_sym), evaluation_sym)) in fri_layers_merkle_roots
             .iter()
-            .enumerate()
             .zip(&fri_decommitment.layers_auth_paths)
             .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+            .enumerate()
+        {
+            // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
+            // `v` is pᵢ(𝜐^(2ⁱ)). `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
+            if !Self::verify_fri_layer_openings(
+                merkle_root,
+                auth_path_sym,
+                &v,
+                evaluation_sym,
+                index,
+            ) {
+                return false;
+            }
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+            // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
+            v = (&v + evaluation_sym)
+                + &evaluation_point_squared * &zetas[i + 1] * (&v - evaluation_sym);
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
+            // Index of the squares in the next layer = current index halved
+            // (bit-reverse ordering of the Merkle tree).
+            index >>= 1;
 
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
-                    }
-                },
-            )
+            if i == last_layer_idx {
+                return v == proof.fri_last_value;
+            }
+            evaluation_point_squared = evaluation_point_squared.square();
+        }
+
+        // Unreachable: the length guard above ensures the loop iterates at
+        // least once (we passed the is_empty check) and hits the
+        // `i == last_layer_idx` return.
+        unreachable!("loop must hit the last_layer_idx return")
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -787,11 +803,27 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        if airs.len() != multi_proof.proofs.len() {
+        Self::multi_verify_proofs(airs, &multi_proof.proofs, transcript, expected_bus_balance)
+    }
+
+    /// Slice-taking variant of [`Self::multi_verify`]. Callers that already
+    /// hold a slice of proofs (or a single proof via [`core::slice::from_ref`])
+    /// can call this directly without constructing a [`MultiProof`].
+    fn multi_verify_proofs(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: &[StarkProof<Field, FieldExtension, PI>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        if airs.len() != proofs.len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
                 airs.len(),
-                multi_proof.proofs.len()
+                proofs.len()
             );
             return false;
         }
@@ -816,7 +848,7 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
@@ -883,7 +915,7 @@ pub trait IsStarkVerifier<
         // boundary constraints on LogUp columns, so the bus balance check is
         // the only cross-table validation.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
             if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
@@ -908,7 +940,7 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
             // Must match prover: fork with domain separator for multi-table,
             // use original transcript directly for single-table.
             let num_tables = airs.len();
@@ -957,7 +989,7 @@ pub trait IsStarkVerifier<
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+            for (air, proof) in airs.iter().zip(proofs) {
                 if air.has_trace_interaction()
                     && let Some(interaction) = &proof.bus_public_inputs
                 {
@@ -990,12 +1022,13 @@ pub trait IsStarkVerifier<
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
-        PI: Clone,
     {
-        let multi_proof = MultiProof {
-            proofs: vec![proof.clone()],
-        };
-        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
+        Self::multi_verify_proofs(
+            &[air],
+            core::slice::from_ref(proof),
+            transcript,
+            &FieldElement::zero(),
+        )
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
