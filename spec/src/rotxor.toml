@@ -154,7 +154,7 @@ poly = ["-", ["idx", ["cast", "a2", "WordHL"], 0], ["idx", "a2_left", 1], ["idx"
 [[constraints.shift]]
 kind = "arith"
 constraint = "$#`a2[1]` = #`last_rot` dot #`a2_left[0]` + #`a2_right[1]`$"
-poly = ["-", ["idx", ["cast", "a2", "WordHL"], 0], ["*", "last_rot", ["idx", "a2_left", 0]], ["idx", "a2_right", 1]]
+poly = ["-", ["idx", ["cast", "a2", "WordHL"], 1], ["*", "last_rot", ["idx", "a2_left", 0]], ["idx", "a2_right", 1]]
 
 [[constraint_groups]]
 name = "xor"
