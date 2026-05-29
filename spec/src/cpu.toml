@@ -468,7 +468,7 @@ kind = "interaction"
 tag = "memory"
 input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], ["idx", "next_pc", "i"]]
 iter = ["i", 0, 1]
-multiplicity = 1
+multiplicity = -1
 
 [[constraint_groups]]
 name = "branch"
