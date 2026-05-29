@@ -875,6 +875,8 @@ pub enum MemwConstraintKind {
     MuSumIsBit,
     /// w2 => μ_sum: if accessing 2+ bytes, must be active row
     W2ImpliesMuSum,
+    /// IS_BIT<write2 + write4 + write8>: the width-sum is 0 or 1 (spec assumption).
+    WidthSumIsBit,
 }
 
 /// MEMW table constraint.
@@ -908,6 +910,10 @@ impl MemwConstraint {
                 let mu_sum = compute_mu_sum(step);
                 &w2 * (&one - &mu_sum)
             }
+            MemwConstraintKind::WidthSumIsBit => {
+                let w2 = compute_w2(step);
+                &w2 * (&one - &w2)
+            }
         }
     }
 }
@@ -917,6 +923,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         match self.kind {
             MemwConstraintKind::MuSumIsBit => 2,
             MemwConstraintKind::W2ImpliesMuSum => 2,
+            MemwConstraintKind::WidthSumIsBit => 2,
         }
     }
 
@@ -935,12 +942,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 
 /// Creates all constraints for the MEMW table.
 ///
-/// 11 constraints total:
+/// 15 constraints total:
 /// - IS_BIT<μ_sum> (1)
 /// - w2 => μ_sum (1)
 /// - IS_BIT<μ_read> (1)
 /// - IS_BIT<μ_write> (1)
 /// - IS_BIT for carry[0..6] (7)
+/// - IS_BIT<write2/write4/write8> (3) + IS_BIT<write2+write4+write8> (1) [spec assumption]
 pub fn constraints()
 -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<
@@ -970,6 +978,13 @@ pub fn constraints()
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }
+
+    // IS_BIT on the width flags + their sum (spec defense-in-depth assumption).
+    for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
+        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
+        idx += 1;
+    }
+    constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
 
     constraints
 }

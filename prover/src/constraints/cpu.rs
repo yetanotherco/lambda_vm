@@ -112,6 +112,80 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ProductZeroC
     }
 }
 
+/// `(1 - MEMORY - BRANCH) · read_register2 · imm[i] = 0`: when neither MEMORY nor
+/// BRANCH is set, the `arg2` multiplex needs at most one of `rv2`/`imm` nonzero.
+/// Decoding already guarantees this; a spec defense-in-depth assumption.
+pub struct Arg2ExclusiveConstraint {
+    imm_col: usize,
+    constraint_idx: usize,
+}
+
+impl Arg2ExclusiveConstraint {
+    pub fn new(imm_col: usize, constraint_idx: usize) -> Self {
+        Self {
+            imm_col,
+            constraint_idx,
+        }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2ExclusiveConstraint {
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let one = FieldElement::<F>::one();
+        let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
+        let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
+        let rr2 = step.get_main_evaluation_element(0, cols::READ_REGISTER2);
+        let imm = step.get_main_evaluation_element(0, self.imm_col);
+        (one - memory - branch) * rr2 * imm
+    }
+}
+
+/// `IS_BIT<mem_flags>` on non-MEMORY rows: `(1 - MEMORY) · mem_flags · (1 - mem_flags) = 0`.
+/// On non-memory rows `mem_flags` carries only the JALR bit, so it must be 0/1.
+/// A spec defense-in-depth assumption (the DECODE lookup already enforces it).
+pub struct MemFlagsBitConstraint {
+    constraint_idx: usize,
+}
+
+impl MemFlagsBitConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemFlagsBitConstraint {
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let one = FieldElement::<F>::one();
+        let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
+        let mem_flags = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
+        (one.clone() - memory) * &mem_flags * (one - &mem_flags)
+    }
+}
+
 // =========================================================================
 // mem group: register zero-forcing
 // =========================================================================
@@ -513,7 +587,8 @@ pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 /// - rvd = res: 2
 /// - branch_cond: 1
 /// - next_pc: 2
-pub const NUM_CPU_CONSTRAINTS: usize = 12 + 4 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2;
+/// - assumptions: 4 (MEMORY·BRANCH mutex 1 + arg2 exclusivity 2 + mem_flags IS_BIT 1)
+pub const NUM_CPU_CONSTRAINTS: usize = 12 + 4 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 4;
 
 /// Creates all CPU transition constraints.
 ///
@@ -594,6 +669,18 @@ pub fn create_all_cpu_constraints() -> (
     other.push(next_pc_0.boxed());
     other.push(next_pc_1.boxed());
     next_idx += 2;
+
+    // assumptions (spec defense-in-depth, redundant with the DECODE lookup):
+    // MEMORY/BRANCH mutex, arg2 multiplex exclusivity, and IS_BIT<mem_flags> on
+    // non-memory rows.
+    other.push(ProductZeroConstraint::new(cols::MEMORY, cols::BRANCH, next_idx).boxed());
+    next_idx += 1;
+    for &imm_col in &[cols::IMM_0, cols::IMM_1] {
+        other.push(Arg2ExclusiveConstraint::new(imm_col, next_idx).boxed());
+        next_idx += 1;
+    }
+    other.push(MemFlagsBitConstraint::new(next_idx).boxed());
+    next_idx += 1;
 
     (is_bit, add_constraints, other, next_idx)
 }

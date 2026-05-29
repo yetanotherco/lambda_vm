@@ -604,6 +604,9 @@ pub enum Cpu32ConstraintKind {
     RvdHi,
     /// `(1 - read_col)·value_col = 0` (an unread register half is zero).
     RegZero { read_col: usize, value_col: usize },
+    /// `read_register2·imm[i] = 0` (decoding guarantees at most one is nonzero;
+    /// spec defense-in-depth assumption). `usize` is the `imm` limb column.
+    Arg2Exclusive { imm_col: usize },
 }
 
 impl Cpu32Constraint {
@@ -625,7 +628,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
             // signed·sign (degree 2) and (1-read)·value (degree 2)
             Cpu32ConstraintKind::Arg1Hi
             | Cpu32ConstraintKind::Arg2Hi
-            | Cpu32ConstraintKind::RegZero { .. } => 2,
+            | Cpu32ConstraintKind::RegZero { .. }
+            | Cpu32ConstraintKind::Arg2Exclusive { .. } => 2,
         }
     }
 
@@ -669,6 +673,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
                 read_col,
                 value_col,
             } => (one - get(read_col)) * get(value_col),
+            Cpu32ConstraintKind::Arg2Exclusive { imm_col } => {
+                get(cols::READ_REGISTER2) * get(imm_col)
+            }
         }
     }
 }
@@ -762,6 +769,14 @@ pub fn cpu32_constraints(
         Cpu32ConstraintKind::RvdHi,
     ] {
         constraints.push(Cpu32Constraint::new(kind, idx).boxed());
+        idx += 1;
+    }
+
+    // arg2 multiplex exclusivity (spec assumption): read_register2·imm[i] = 0.
+    for imm_col in [cols::IMM_0, cols::IMM_1] {
+        constraints.push(
+            Cpu32Constraint::new(Cpu32ConstraintKind::Arg2Exclusive { imm_col }, idx).boxed(),
+        );
         idx += 1;
     }
 

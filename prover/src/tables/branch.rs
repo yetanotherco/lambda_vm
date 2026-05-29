@@ -395,6 +395,8 @@ pub enum BranchConstraintKind {
     /// `(1 - JALR) * carry_1_pc * (1 - carry_1_pc) = 0`
     /// where carry_1_pc = (pc[1] + offset[1] + carry_0_pc - next_pc_unmasked[1]) / 2^32
     PcCarry1IsBit,
+    /// `IS_BIT<JALR>`: `JALR * (1 - JALR) = 0` (spec defense-in-depth assumption)
+    JalrIsBit,
     /// `JALR * carry_0_reg * (1 - carry_0_reg) = 0`
     /// where carry_0_reg = (register[0] + offset[0] - next_pc_unmasked[0]) / 2^32
     RegCarry0IsBit,
@@ -494,6 +496,7 @@ impl BranchConstraint {
         let one = FieldElement::<F>::one();
 
         match self.kind {
+            BranchConstraintKind::JalrIsBit => &jalr * (&one - &jalr),
             BranchConstraintKind::PcCarry0IsBit => {
                 let cond = &one - &jalr;
                 let c = Self::compute_carry_0_for(cols::PC_0, step);
@@ -520,8 +523,12 @@ impl BranchConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
     fn degree(&self) -> usize {
-        // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
-        3
+        match self.kind {
+            // JALR * (1 - JALR) = degree 2
+            BranchConstraintKind::JalrIsBit => 2,
+            // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
+            _ => 3,
+        }
     }
 
     fn constraint_idx(&self) -> usize {
@@ -539,11 +546,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
 
 /// Creates all constraints for the BRANCH table.
 ///
-/// Returns 4 constraints (two conditional ADD templates × 2 carries each):
+/// Returns 5 constraints (two conditional ADD templates × 2 carries each, plus
+/// the `IS_BIT<JALR>` defense-in-depth assumption):
 /// - PcCarry0IsBit:  `(1 - JALR) * carry_0 * (1 - carry_0) = 0`  (pc path)
 /// - PcCarry1IsBit:  `(1 - JALR) * carry_1 * (1 - carry_1) = 0`  (pc path)
 /// - RegCarry0IsBit: `JALR * carry_0 * (1 - carry_0) = 0`        (register path)
 /// - RegCarry1IsBit: `JALR * carry_1 * (1 - carry_1) = 0`        (register path)
+/// - JalrIsBit:      `JALR * (1 - JALR) = 0`
 pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>, usize) {
     let mut idx = constraint_idx_start;
     let mut next = || {
@@ -556,6 +565,7 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
         BranchConstraint::new(BranchConstraintKind::PcCarry1IsBit, next()),
         BranchConstraint::new(BranchConstraintKind::RegCarry0IsBit, next()),
         BranchConstraint::new(BranchConstraintKind::RegCarry1IsBit, next()),
+        BranchConstraint::new(BranchConstraintKind::JalrIsBit, next()),
     ];
     (constraints, idx)
 }

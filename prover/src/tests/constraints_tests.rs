@@ -596,10 +596,10 @@ fn test_next_pc_add_constraint() {
 fn test_create_all_cpu_constraints_count() {
     let (is_bit, add, other, total) = create_all_cpu_constraints();
     // IS_BIT: 12, ADD+SUB pairs: 4, other (mutex 4 + arg2 2 + reg-zero 4 + rvd 2
-    // + branch_cond 1 + next_pc 2): 17.
+    // + branch_cond 1 + next_pc 2 + assumptions 4): 21.
     assert_eq!(is_bit.len(), 12);
     assert_eq!(add.len(), 4);
-    assert_eq!(other.len(), 17);
+    assert_eq!(other.len(), 21);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
     assert_eq!(is_bit.len() + add.len() + other.len(), NUM_CPU_CONSTRAINTS);
 }
