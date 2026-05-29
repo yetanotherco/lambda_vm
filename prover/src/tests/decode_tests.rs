@@ -5,14 +5,18 @@ use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 
+use stark::proof::options::GoldilocksCubicProofOptions;
+
 use crate::tables::decode::{
-    DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
-    tables_from_elf, update_multiplicities,
+    DecodeEntry, bus_interactions, cols, commitment_from_elf, generate_decode_trace,
+    instructions_from_elf, tables_from_elf, update_multiplicities,
 };
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, packed_decode as bits};
+use crate::test_utils::asm_elf_bytes;
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
+use crate::{prove, verify_with_options};
 
 // =========================================================================
 // Packed decode tests
@@ -1046,6 +1050,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
 
     let proof = multi_prove_ram(
@@ -1062,6 +1067,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1153,5 +1159,49 @@ fn test_tables_from_elf_empty() {
         tables
             .pc_to_row
             .contains_key(&crate::tables::cpu::CPU_PADDING_PC)
+    );
+}
+
+// =========================================================================
+// verify_with_options: optional decode_commitment parameter
+// =========================================================================
+
+#[test]
+fn decode_commitment_some_matches_default_path() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    let decode_c = commitment_from_elf(&elf, &options).expect("decode commitment");
+
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+        .expect("verify with None should not error");
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(decode_c))
+        .expect("verify with Some(correct) should not error");
+
+    assert!(default_ok, "default path must accept the proof");
+    assert!(
+        explicit_ok,
+        "Some(correct_commitment) must accept the proof"
+    );
+}
+
+#[test]
+fn decode_commitment_wrong_value_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Flip a byte in the correct commitment so the Fiat-Shamir transcripts diverge.
+    let mut wrong = commitment_from_elf(&elf, &options).expect("decode commitment");
+    wrong[0] ^= 0xFF;
+
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "tampered decode commitment must cause Fiat-Shamir rejection",
     );
 }
