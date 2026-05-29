@@ -181,13 +181,8 @@ fn d2h_bytes_via_pinned_hashes(
     stream.memcpy_dtoh(dev_bytes, pinned_bytes)?;
     stream.synchronize()?;
 
-    // Sequential, not `par_chunks_mut`: this runs while the per-worker
-    // pinned_hashes mutex is held. Rayon inside a held mutex risks
-    // recursive stealing-during-wait deadlocks — see
-    // `Backend::pinned_staging` docs. Page-fault parallelism on virgin
-    // destination pages is recovered at the outer level: per-worker
-    // staging buffers let rayon's outer `par_iter` dispatch multiple LDE
-    // calls in parallel, each faulting its own destination pages.
+    // Runs under the pinned_hashes lock, where rayon can deadlock. See
+    // `Backend::pinned_staging`.
     dst.copy_from_slice(pinned_bytes);
     drop(staging);
     Ok(())
