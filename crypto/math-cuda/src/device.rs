@@ -232,8 +232,9 @@ impl Backend {
 
     /// Per-rayon-worker pinned staging buffer. Returns the slot for the
     /// current worker (or slot 0 outside a rayon context). Grows lazily to
-    /// the largest LDE the worker has seen. See the field docs for the
-    /// rationale behind the per-worker split.
+    /// the largest LDE the worker has seen. See [`Backend`]'s
+    /// `pinned_staging` field for the rationale behind the per-worker
+    /// split.
     pub fn pinned_staging(&self) -> &Mutex<PinnedStaging> {
         &self.pinned_staging[self.worker_slot(self.pinned_staging.len())]
     }
