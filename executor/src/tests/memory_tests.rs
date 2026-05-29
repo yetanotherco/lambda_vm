@@ -109,3 +109,33 @@ fn test_commit_public_output_total_cap() {
     let err = memory.commit_public_output(0x1_0000, 1).unwrap_err();
     assert!(matches!(err, MemoryError::CommitSizeExceeded));
 }
+
+#[test]
+fn test_misaligned_load_store_overflow_errors() {
+    let mut memory = Memory::default();
+
+    assert!(matches!(
+        memory.load_half(u64::MAX).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+    assert!(matches!(
+        memory.store_half(u64::MAX, 0).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+    assert!(matches!(
+        memory.load_word(u64::MAX - 1).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+    assert!(matches!(
+        memory.store_word(u64::MAX - 1, 0).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+    assert!(matches!(
+        memory.load_doubleword(u64::MAX - 6).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+    assert!(matches!(
+        memory.store_doubleword(u64::MAX - 6, 0).unwrap_err(),
+        MemoryError::AddressOverflow
+    ));
+}

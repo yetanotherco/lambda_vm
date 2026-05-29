@@ -81,77 +81,105 @@ impl Memory {
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(4) {
+            let bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            Ok(u32::from_le_bytes(bytes))
+        } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+            Ok(u32::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address + 1),
+                self.load_byte(address + 2),
+                self.load_byte(address + 3),
+            ]))
         }
-        let bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        Ok(u32::from_le_bytes(bytes))
     }
 
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
-        }
         let bytes = value.to_le_bytes();
-        self.cells.insert(address, bytes);
+        if address.is_multiple_of(4) {
+            self.cells.insert(address, bytes);
+        } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address + i as u64, *b);
+            }
+        }
         Ok(())
     }
 
     /// Load a doubleword (64-bit) from memory - for LD instruction
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(8) {
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
+            let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
+            let low = u32::from_le_bytes(low_bytes) as u64;
+            let high = u32::from_le_bytes(high_bytes) as u64;
+            Ok(low | (high << 32))
+        } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+            let mut bytes = [0u8; 8];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = self.load_byte(address + i as u64);
+            }
+            Ok(u64::from_le_bytes(bytes))
         }
-        let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
-        let low = u32::from_le_bytes(low_bytes) as u64;
-        let high = u32::from_le_bytes(high_bytes) as u64;
-        Ok(low | (high << 32))
     }
 
     /// Store a doubleword (64-bit) to memory - for SD instruction
     pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(8) {
+            let low = (value & 0xFFFFFFFF) as u32;
+            let high = (value >> 32) as u32;
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
+            self.cells.insert(address, low.to_le_bytes());
+            self.cells.insert(address + 4, high.to_le_bytes());
+        } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+            let bytes = value.to_le_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address + i as u64, *b);
+            }
         }
-        let low = (value & 0xFFFFFFFF) as u32;
-        let high = (value >> 32) as u32;
-        self.cells.insert(address, low.to_le_bytes());
-        self.cells.insert(address + 4, high.to_le_bytes());
         Ok(())
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        if !address.is_multiple_of(2) {
-            unimplemented!(
-                "Unaligned load half memory access at address 0x{:016x}",
-                address
-            );
+        if address.is_multiple_of(2) {
+            let aligned_address = address - address % 4;
+            let bytes = self
+                .cells
+                .get(&aligned_address)
+                .cloned()
+                .unwrap_or_default();
+            let offset = (address % 4) as usize;
+            Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+        } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+            Ok(u16::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address + 1),
+            ]))
         }
-        let aligned_address = address - address % 4;
-        let bytes = self
-            .cells
-            .get(&aligned_address)
-            .cloned()
-            .unwrap_or_default();
-        let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
-        Ok(u16::from_le_bytes(
-            value.try_into().map_err(|_| MemoryError::LoadHalf)?,
-        ))
     }
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(2) {
-            return Err(MemoryError::UnalignedAccess);
-        }
-        let aligned_address = address - address % 4;
-        let entry = self
-            .cells
-            .entry(aligned_address)
-            .or_insert_with(|| [0, 0, 0, 0]);
         let bytes = value.to_le_bytes();
-        entry[(address % 4) as usize] = bytes[0];
-        entry[(address % 4) as usize + 1] = bytes[1];
+        if address.is_multiple_of(2) {
+            let aligned_address = address - address % 4;
+            let entry = self
+                .cells
+                .entry(aligned_address)
+                .or_insert_with(|| [0, 0, 0, 0]);
+            let offset = (address % 4) as usize;
+            entry[offset] = bytes[0];
+            entry[offset + 1] = bytes[1];
+        } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+            self.store_byte(address, bytes[0]);
+            self.store_byte(address + 1, bytes[1]);
+        }
         Ok(())
     }
 
@@ -233,8 +261,6 @@ impl Memory {
 
 #[derive(thiserror::Error, Debug)]
 pub enum MemoryError {
-    #[error("Failed to convert bytes to u16")]
-    LoadHalf,
     #[error("Unaligned memory access")]
     UnalignedAccess,
     #[error("Public output commit size exceeded")]
