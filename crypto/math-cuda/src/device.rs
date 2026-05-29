@@ -250,7 +250,7 @@ impl Backend {
     fn worker_slot(&self, len: usize) -> usize {
         let idx = rayon::current_thread_index().unwrap_or(0);
         // Should be unreachable with rayon's fixed default pool, but if a
-        // larger custom pool sneaks in we still want safety — fall back to
+        // larger custom pool sneaks in we still want safety: Fall back to
         // slot 0 (correctness preserved, just contention).
         debug_assert!(idx < len, "rayon worker {idx} >= staging slots {len}");
         idx.min(len.saturating_sub(1))
