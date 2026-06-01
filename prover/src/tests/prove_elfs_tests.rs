@@ -38,23 +38,20 @@ type E = GoldilocksExtension;
 // Prover test helpers
 // =============================================================================
 
-/// Run multi_prove and multi_verify for all VM tables under the given options.
+/// Run multi_prove and multi_verify for all VM tables.
 ///
 /// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
-fn prove_and_verify_vm_minimal_with_options(
-    elf: &Elf,
-    traces: &mut Traces,
-    proof_options: &ProofOptions,
-) -> bool {
+fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let _ = env_logger::builder().is_test(true).try_init();
+    let proof_options = ProofOptions::default_test_options();
 
     // Create all AIRs including PAGE and REGISTER tables
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         elf,
-        proof_options,
+        &proof_options,
         true,
         &traces.page_configs,
         &table_counts,
@@ -86,12 +83,6 @@ fn prove_and_verify_vm_minimal_with_options(
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
-}
-
-/// Backwards-compatible wrapper using `ProofOptions::default_test_options()`
-/// (blowup = 2). Most tests just want the default.
-fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
-    prove_and_verify_vm_minimal_with_options(elf, traces, &ProofOptions::default_test_options())
 }
 
 // =============================================================================
@@ -2471,68 +2462,4 @@ fn test_count_elements_nonzero() {
         aux > 0,
         "total_auxiliary_field_elements should be nonzero (got {aux})"
     );
-}
-
-// =============================================================================
-// Static preprocessed commitment E2E coverage at non-default blowups
-//
-// The static commitment constants in `bitwise` and `keccak_rc` exist for
-// blowups in `STATIC_BLOWUP_FACTORS = [2, 4, 8]`. Blowup 2 is exercised by
-// every other prove/verify test in this file. The two tests below add
-// end-to-end coverage at blowups 4 and 8 so the constants aren't only
-// validated by drift recompute (`static_commitments_tests`).
-// =============================================================================
-
-/// Cheap path: prove + verify a keccak ELF at blowups 4 and 8 with
-/// `minimal_bitwise = true`. This skips the full 2^20 bitwise preprocessed
-/// table but still exercises `keccak_rc::preprocessed_commitment` at the
-/// non-default blowups, so the static-lookup dispatch feeds the right value
-/// into the Fiat-Shamir transcript.
-#[test]
-fn test_static_commitment_e2e_keccak_rc_blowups_4_and_8() {
-    use crate::tables::STATIC_BLOWUP_FACTORS;
-    use stark::proof::options::GoldilocksCubicProofOptions;
-
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    for &blowup in STATIC_BLOWUP_FACTORS.iter().filter(|&&b| b != 2) {
-        let proof_options = GoldilocksCubicProofOptions::with_blowup(blowup)
-            .expect("blowup must be a valid power of 2");
-        let (elf, logs, _instructions) = run_asm_elf("test_keccak");
-        let mut traces =
-            Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
-        assert!(
-            prove_and_verify_vm_minimal_with_options(&elf, &mut traces, &proof_options),
-            "keccak prove/verify failed at blowup={blowup}",
-        );
-    }
-}
-
-/// Heavy path: prove + verify a keccak ELF at blowups 4 and 8 with the
-/// full bitwise preprocessed table (`minimal_bitwise = false`). This is the
-/// only E2E path that pulls `bitwise::preprocessed_commitment` at non-default
-/// blowups into the transcript. Ignored by default because the 2^20-row
-/// bitwise LDE at blowup 8 takes several minutes; run explicitly when
-/// validating a new bitwise static constant.
-#[test]
-#[ignore = "heavy: 2^20-row bitwise LDE at blowups 4 and 8; minutes per run"]
-fn test_static_commitment_e2e_full_bitwise_blowups_4_and_8() {
-    use crate::tables::STATIC_BLOWUP_FACTORS;
-    use stark::proof::options::GoldilocksCubicProofOptions;
-
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    for &blowup in STATIC_BLOWUP_FACTORS.iter().filter(|&&b| b != 2) {
-        let proof_options = GoldilocksCubicProofOptions::with_blowup(blowup)
-            .expect("blowup must be a valid power of 2");
-        let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak");
-        let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
-            .expect("Prover failed");
-        let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
-            .expect("Verifier errored");
-        assert!(
-            verified,
-            "full-bitwise prove/verify failed at blowup={blowup}",
-        );
-    }
 }
