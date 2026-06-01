@@ -7,6 +7,7 @@ use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsPrimeField;
+use math_cuda::barycentric::{barycentric_base, barycentric_ext3};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -67,15 +68,8 @@ fn barycentric_base_sum_matches_cpu() {
             })
             .collect();
 
-        let gpu = math_cuda::barycentric::barycentric_base(
-            &columns_flat,
-            n,
-            &points_raw,
-            &inv_denoms_raw,
-            n,
-            num_cols,
-        )
-        .unwrap();
+        let gpu =
+            barycentric_base(&columns_flat, n, &points_raw, &inv_denoms_raw, n, num_cols).unwrap();
 
         for (c, col) in cols_fp.iter().enumerate() {
             // CPU reference sum. Force ext3 by embedding the base product.
@@ -129,15 +123,8 @@ fn barycentric_ext3_sum_matches_cpu() {
             })
             .collect();
 
-        let gpu = math_cuda::barycentric::barycentric_ext3(
-            &columns_flat,
-            n,
-            &points_raw,
-            &inv_denoms_raw,
-            n,
-            num_cols,
-        )
-        .unwrap();
+        let gpu =
+            barycentric_ext3(&columns_flat, n, &points_raw, &inv_denoms_raw, n, num_cols).unwrap();
 
         for (c, col) in cols_fp3.iter().enumerate() {
             let mut sum = Fp3::zero();

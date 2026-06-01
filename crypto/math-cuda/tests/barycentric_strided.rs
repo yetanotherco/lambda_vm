@@ -6,6 +6,11 @@ use std::sync::Arc;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
+use math_cuda::barycentric::{
+    barycentric_base, barycentric_base_on_device, barycentric_ext3, barycentric_ext3_on_device,
+};
+use math_cuda::device::backend;
+use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -36,11 +41,11 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
             lde_flat[c * lde_size + r] = *v.value();
         }
     }
-    let be = math_cuda::device::backend().unwrap();
+    let be = backend().unwrap();
     let stream = be.next_stream();
     let lde_dev = stream.clone_htod(&lde_flat).unwrap();
     stream.synchronize().unwrap();
-    let handle = math_cuda::lde::GpuLdeBase {
+    let handle = GpuLdeBase {
         buf: Arc::new(lde_dev),
         m: num_cols,
         lde_size,
@@ -54,7 +59,7 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
         }
     }
 
-    let reference = math_cuda::barycentric::barycentric_base(
+    let reference = barycentric_base(
         &pre_strided,
         n,
         &coset_points,
@@ -64,14 +69,8 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
     )
     .unwrap();
 
-    let strided = math_cuda::barycentric::barycentric_base_on_device(
-        &handle,
-        blowup,
-        &coset_points,
-        &inv_denoms_ext3,
-        n,
-    )
-    .unwrap();
+    let strided =
+        barycentric_base_on_device(&handle, blowup, &coset_points, &inv_denoms_ext3, n).unwrap();
 
     assert_eq!(
         reference, strided,
@@ -98,11 +97,11 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
             lde_flat[(c * 3 + 2) * lde_size + r] = *v.value()[2].value();
         }
     }
-    let be = math_cuda::device::backend().unwrap();
+    let be = backend().unwrap();
     let stream = be.next_stream();
     let lde_dev = stream.clone_htod(&lde_flat).unwrap();
     stream.synchronize().unwrap();
-    let handle = math_cuda::lde::GpuLdeExt3 {
+    let handle = GpuLdeExt3 {
         buf: Arc::new(lde_dev),
         m: num_cols,
         lde_size,
@@ -117,7 +116,7 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
             pre_strided[(c * 3 + 2) * n + i] = lde_flat[(c * 3 + 2) * lde_size + i * blowup];
         }
     }
-    let reference = math_cuda::barycentric::barycentric_ext3(
+    let reference = barycentric_ext3(
         &pre_strided,
         n,
         &coset_points,
@@ -127,14 +126,8 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
     )
     .unwrap();
 
-    let strided = math_cuda::barycentric::barycentric_ext3_on_device(
-        &handle,
-        blowup,
-        &coset_points,
-        &inv_denoms_ext3,
-        n,
-    )
-    .unwrap();
+    let strided =
+        barycentric_ext3_on_device(&handle, blowup, &coset_points, &inv_denoms_ext3, n).unwrap();
 
     assert_eq!(reference, strided, "ext3 strided mismatch");
 }
