@@ -1,5 +1,5 @@
-//! Barycentric evaluation on device. Matches
-//! `math::polynomial::interpolate_coset_eval_*_with_g_n_inv`.
+//! Barycentric evaluation on device. Matches the CPU
+//! [`interpolate_coset_eval_ext_with_g_n_inv`](math::polynomial::interpolate_coset_eval_ext_with_g_n_inv)
 //!
 //! The kernels compute only the unscaled barycentric sum
 //!     S = sum over i of point_i * eval_i * inv_denom_i
