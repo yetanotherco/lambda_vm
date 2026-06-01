@@ -139,13 +139,13 @@ Further clarification is provided in the notes following the table.
   // LUI/AUIPC
   ([`LUI       rd, imm`], [`ADD`], [], [], [], [#ref_note(<note-lui>)]),
   ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [#ref_note(<note-auipc>)]),
-  ([`JAL       rd, imm`], [`ADD`], [], [], [`BRANCH`, `JALR`, `rs1 := x255`], [#ref_note(<note-jal>)]),
+  ([`JAL       rd, imm`], [], [], [], [`BRANCH`, `JALR`, `rs1 := x255`], [#ref_note(<note-jal>)]),
   // Branching
-  ([`JALR      rd, rs1, imm`], [`ADD`], [], [], [`BRANCH`, `JALR`], []),
-  ([`BEQ      rs1, rs2, imm`], [`EQ`], [], [], [], []),
-  ([`BNE      rs1, rs2, imm`], [`EQ`], [], [], [`invert`], []),
-  ([`BLT[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
-  ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`invert`], [#ref_note(<note_signed>)]),
+  ([`JALR      rd, rs1, imm`], [], [], [], [`BRANCH`, `JALR`], []),
+  ([`BEQ      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`], []),
+  ([`BNE      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`, `invert`], []),
+  ([`BLT[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`], [#ref_note(<note_signed>)]),
+  ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`, `invert`], [#ref_note(<note_signed>)]),
   // LOAD
   ([`LD        rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_8B`], []),
   ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_4B`], [#ref_note(<note_signed>)]),
@@ -215,7 +215,7 @@ We note the following about the above decoding table:
   enum.item(
     referenceable_note(
       "note-jal",
-      [`JAL`: this operation stores $#`pc` + 4$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
+      [`JAL`: this operation stores $#`pc` + #`instruction_length`$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
       Note that this can be represented using `JALR rd, x255, imm`.
       As such, *we expect the decoding to take care of writing the immediate in bit range $[1:21]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*]
     )

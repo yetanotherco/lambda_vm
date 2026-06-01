@@ -68,8 +68,7 @@ The other contributions for `arg2` are specific to the (mutually exclusive, @cpu
 `MEMORY` and `BRANCH` flags:
 - For the `MEMORY` path, we want the output of the ALU to be $#`rv1` + #`imm`$, as that is the
   address at which the memory access occurs.
-- For the `BRANCH` path, when we do not have a JALR instruction, we want the ALU output to reflect the branch condition.
-- For the `BRANCH` path, when it is a JALR instruction, we want the ALU output to contain the next instructions PC value, to store into `rd`.
+- For the `BRANCH` path, we want the ALU output to reflect the branch condition (or just be inactive for JALR).
 
 Instructions having the `word_instr` flag set are delegated to the `CPU32` chip, which will do its own decoding and execution of the instruction.
 

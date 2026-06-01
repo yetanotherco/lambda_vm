@@ -394,11 +394,10 @@ prefix = "A"
 
 [[constraints.alu]]
 kind = "arith"
-constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot (1 - #`JALR`) dot #`rv2` + #`BRANCH` dot #`JALR` dot #`instruction_length` + (1 - #`MEMORY`) dot (1 - #`BRANCH`) dot (#`rv2` + #`imm`)$"
+constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot #`rv2` + (1 - #`MEMORY`) dot (1 - #`BRANCH`) dot (#`rv2` + #`imm`)$"
 poly = ["-", ["idx", "arg2", "i"],
     ["*", "MEMORY", ["idx", "imm", "i"]],
-    ["*", "BRANCH", ["not", "JALR"], ["idx", "rv2", "i"]],
-    ["*", "BRANCH", "JALR", ["idx", ["arr", "instruction_length", 0], "i"]],
+    ["*", "BRANCH", ["idx", "rv2", "i"]],
     ["*", ["not", "MEMORY"], ["not", "BRANCH"], ["idx", ["+", "rv2", "imm"], "i"]]
 ]
 iter = ["i", 0, 1]
@@ -472,8 +471,8 @@ multiplicity = "MEMORY"
 
 [[constraints.mem]]
 kind = "arith"
-constraint = "$#`!MEMORY` => #`rvd` = #`res`$"
-poly = ["*", ["not", "MEMORY"], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
+constraint = "$#`!MEMORY` and #`!BRANCH` => #`rvd` = #`res`$"
+poly = ["*", ["not", ["+", "MEMORY", "BRANCH"]], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
 iter = ["i", 0, 1]
 
 [[constraints.mem]]
@@ -527,6 +526,14 @@ input = ["pc", ["arr", "instruction_length", 0]]
 output = "next_pc"
 cond = ["not", "branch_cond"]
 desc = "Increment `pc` to `next_pc` if we're not branching"
+
+[[constraints.branch]]
+kind = "template"
+tag = "ADD"
+input = ["pc", ["arr", "instruction_length", 0]]
+output = "rvd"
+cond = ["BRANCH"]
+desc = "Compute the next instruction address in `rvd` when BRANCH is active to enable JALR"
 
 
 [[constraint_groups]]
