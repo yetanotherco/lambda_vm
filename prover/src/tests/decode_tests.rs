@@ -1205,3 +1205,19 @@ fn decode_commitment_wrong_value_rejects() {
         "tampered decode commitment must cause Fiat-Shamir rejection",
     );
 }
+
+#[test]
+fn decode_commitment_zero_bytes_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // [0u8; 32] is the most plausible accidental default — passing it must
+    // not pass verification.
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "all-zero decode commitment must cause Fiat-Shamir rejection",
+    );
+}

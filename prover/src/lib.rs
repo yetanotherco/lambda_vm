@@ -333,9 +333,9 @@ impl VmAirs {
     /// `decode_commitment` is an optional precomputed DECODE preprocessed
     /// commitment. When `Some`, the supplied value is used directly and the
     /// FFT + Merkle build is skipped — useful for callers who have already
-    /// computed the commitment offline and hardcoded it (e.g. the recursion
-    /// guest, where the in-VM recompute is too expensive). When `None`, the
-    /// commitment is computed from the ELF.
+    /// computed the commitment offline and embedded it as a compile-time
+    /// constant (e.g. the recursion guest, where the in-VM recompute is too
+    /// expensive). When `None`, the commitment is computed from the ELF.
     ///
     /// The trust anchor for `decode_commitment` is the caller's compiled
     /// binary — never accept prover-supplied bytes here. Wrong values
@@ -746,8 +746,8 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// `decode_commitment` is an optional precomputed DECODE preprocessed
 /// commitment. When `Some`, the supplied value is used directly and the
 /// in-verifier FFT + Merkle build for the DECODE preprocessed columns is
-/// skipped — useful for callers (e.g. the recursion guest) that hardcode
-/// the commitment in their compiled binary to avoid the in-VM recompute
+/// skipped — useful for callers (e.g. the recursion guest) that embed the
+/// commitment as a compile-time constant to avoid the in-VM recompute
 /// cost. When `None`, the verifier computes the commitment from the ELF.
 ///
 /// Trust model: `decode_commitment`, when supplied, must come from the

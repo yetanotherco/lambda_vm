@@ -247,10 +247,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// * **Cache once per process**: wrap the call in a `OnceLock` /
 ///   `HashMap<elf_hash, Commitment>` at the caller site. Useful for native
 ///   verifiers that check many proofs of the same ELF in one process.
-/// * **Hardcoded at compile time**: call this function once offline (e.g.
-///   via the `#[ignore]`d `print_decode_commitments_for_basic_program` test
-///   in `static_commitments_tests.rs`, or a one-off test in the consumer
-///   crate), then paste the resulting bytes as a `const` in the caller's
+/// * **Compile-time constant**: call this function once offline (e.g. from
+///   a one-off test in the consumer crate that prints the result), then
+///   store the resulting bytes as a `const [u8; 32]` in the caller's
 ///   source. Useful for the recursion guest where in-VM recomputation is
 ///   too expensive.
 ///
