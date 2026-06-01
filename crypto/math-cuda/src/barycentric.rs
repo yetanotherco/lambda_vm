@@ -30,6 +30,12 @@ pub fn barycentric_base(
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * col_stride);
+    // Kernel reads col_data[0..n] per column, so col_stride must cover at
+    // least n u64s. Smaller strides would read past the column boundary.
+    assert!(
+        col_stride >= n,
+        "col_stride {col_stride} < n {n}: kernel reads col_data[0..n] but stride is shorter"
+    );
     if num_cols == 0 || n == 0 {
         return Ok(vec![0; 3 * num_cols]);
     }
@@ -79,6 +85,12 @@ pub fn barycentric_ext3(
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * 3 * col_stride);
+    // Each ext3 slab is read at indices [0..n), so col_stride must cover at
+    // least n u64s. Smaller strides would read past the slab boundary.
+    assert!(
+        col_stride >= n,
+        "col_stride {col_stride} < n {n}: kernel reads slab[0..n] but stride is shorter"
+    );
     if num_cols == 0 || n == 0 {
         return Ok(vec![0; 3 * num_cols]);
     }

@@ -474,6 +474,11 @@ where
         // 2x15-trial A/B due to stream contention from many concurrent launches.
         let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
 
+        // col_scale[i] = point[i] * inv_denom[i], shared across ALL CPU column
+        // loops below. Computed lazily on first CPU-fallback use so the all-GPU
+        // path pays nothing, while the all-CPU and mixed paths only pay once.
+        let mut col_scale: Option<Vec<FieldElement<E>>> = None;
+
         // GPU fast path: batched strided barycentric over the main-trace LDE
         // already on device. Returns `None` when the GPU R1 path didn't run
         // for this table (handle absent), the size is below threshold, types
@@ -496,14 +501,13 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
-            // Precompute col_scale[i] = point[i] * inv_denom[i], shared across ALL columns.
-            // This eliminates N redundant F*E multiplies per column.
-            let col_scale: Vec<FieldElement<E>> = dc
-                .points
-                .iter()
-                .zip(inv_denoms.iter())
-                .map(|(point, inv_d)| point * inv_d)
-                .collect();
+            let col_scale = col_scale.get_or_insert_with(|| {
+                dc.points
+                    .iter()
+                    .zip(inv_denoms.iter())
+                    .map(|(point, inv_d)| point * inv_d)
+                    .collect()
+            });
             // Evaluate all main columns directly from LDE (no extraction copy).
             // For main columns (base field F): sum = sum over i of col_scale[i] * lde_col[i*bf].
             // lde_col[i*bf] is F, col_scale[i] is E; use F*E -> E mixed arithmetic.
@@ -544,12 +548,13 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
-            let col_scale: Vec<FieldElement<E>> = dc
-                .points
-                .iter()
-                .zip(inv_denoms.iter())
-                .map(|(point, inv_d)| point * inv_d)
-                .collect();
+            let col_scale = col_scale.get_or_insert_with(|| {
+                dc.points
+                    .iter()
+                    .zip(inv_denoms.iter())
+                    .map(|(point, inv_d)| point * inv_d)
+                    .collect()
+            });
             // Evaluate all aux columns directly from LDE (no extraction copy).
             // For aux columns (extension field E): sum = sum over i of col_scale[i] * lde_col[i*bf].
             // Both col_scale and lde_col are in E, so each multiply is E*E -> E.

@@ -58,6 +58,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_MERKLE_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_PARTS_LDE_CALLS.store(0, Ordering::Relaxed);
     GPU_BARY_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -628,6 +629,15 @@ pub fn gpu_bary_calls() -> u64 {
     GPU_BARY_CALLS.load(Ordering::Relaxed)
 }
 
+/// R2 comp-poly tree counter: incremented once per
+/// [`try_build_comp_poly_tree_gpu`] call that actually routed to the GPU.
+/// Distinct from `GPU_MERKLE_TREE_CALLS` (R1 main/aux tree builds) so the
+/// two dispatch sites can be diagnosed independently.
+pub(crate) static GPU_COMP_POLY_TREE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_comp_poly_tree_calls() -> u64 {
+    GPU_COMP_POLY_TREE_CALLS.load(Ordering::Relaxed)
+}
+
 /// Trace-size threshold for the R3 OOD barycentric GPU path. Below this the
 /// rayon CPU path already completes in well under a millisecond and PCIe
 /// round-trip would dominate. Override via `LAMBDA_VM_GPU_BARY_THRESHOLD`.
@@ -680,7 +690,13 @@ where
     type Ext3 = Degree3GoldilocksExtensionField;
 
     assert_eq!(sums_raw.len(), 3 * num_cols);
-    debug_assert_eq!(TypeId::of::<E>(), TypeId::of::<Ext3>());
+    // Hard assert (not debug_assert) because the unsafe `transmute_copy`
+    // below is UB if `E != Ext3`. Cost is one TypeId comparison per call.
+    assert_eq!(
+        TypeId::of::<E>(),
+        TypeId::of::<Ext3>(),
+        "apply_ext3_scalar: E must be Ext3"
+    );
 
     let scalar_e: FieldElement<Ext3> = FieldElement::<Ext3>::new([
         FieldElement::<Gl>::from_raw(scalar[0]),
@@ -868,7 +884,7 @@ where
                 .expect("chunks_exact(32) yields exactly 32 bytes")
         })
         .collect();
-    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
     // Invariant: nodes.len() == 2*num_leaves - 1, so nodes.len() + 1 ==
     // 2*num_leaves which is a power of 2. `from_precomputed_nodes` only
     // returns `None` when that invariant fails or `nodes` is empty.
