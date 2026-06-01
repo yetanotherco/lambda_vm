@@ -88,11 +88,11 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     )
 }
 
-/// Like [`crate::prove_with_options_and_inputs`] but with trimmed bitwise (TEST ONLY).
-///
-/// ~100x faster than the production path. Same unsoundness caveats as
-/// [`Traces::from_elf_and_logs_minimal`]. The full preprocessed bitwise
-/// path is covered by `test_prove_elfs_all_instructions_64_full`.
+  /// Like [`crate::prove_with_options_and_inputs`] but trims the bitwise table to the
+  /// rows the program uses instead of proving the full 2^20-row table (TEST ONLY).
+  ///
+  /// Same unsoundness caveats as [`Traces::from_elf_and_logs_minimal`]. The full
+  /// preprocessed bitwise path is covered by `test_prove_elfs_all_instructions_64_full`.
 fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsConfig) -> VmProof {
     let proof_options = ProofOptions::default_test_options();
     let elf = Elf::load(elf_bytes).expect("ELF load");
