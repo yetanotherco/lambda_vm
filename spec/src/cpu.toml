@@ -472,7 +472,7 @@ multiplicity = "MEMORY"
 [[constraints.mem]]
 kind = "arith"
 constraint = "$#`!MEMORY` and #`!BRANCH` => #`rvd` = #`res`$"
-poly = ["*", ["not", ["+", "MEMORY", "BRANCH"]], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
+poly = ["*", ["-", 1, ["+", "MEMORY", "BRANCH"]], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
 iter = ["i", 0, 1]
 
 [[constraints.mem]]
@@ -532,7 +532,7 @@ kind = "template"
 tag = "ADD"
 input = ["pc", ["arr", "instruction_length", 0]]
 output = "rvd"
-cond = ["BRANCH"]
+cond = "BRANCH"
 desc = "Compute the next instruction address in `rvd` when BRANCH is active to enable JALR"
 
 
