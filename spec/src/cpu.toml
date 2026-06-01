@@ -227,8 +227,7 @@ poly = ["*", "MEMORY", "BRANCH"]
 [[constraints.assumptions]]
 kind = "arith"
 constraint = "$(1 - #`MEMORY` - #`BRANCH`) => (#`read_register2` = 0 or #`imm[i]` = 0)$"
-poly = ["*", ["-", 1, "MEMORY", "BRANCH"], "read_register2", ["idx", "imm", "i"]]
-iter = ["i", 0, 1]
+poly = ["*", ["-", 1, "MEMORY", "BRANCH"], "read_register2", ["+", ["idx", "imm", 0], ["idx", "imm", 1]]]
 
 [[constraints.assumptions]]
 kind = "template"

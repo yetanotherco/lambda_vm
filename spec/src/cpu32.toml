@@ -187,8 +187,7 @@ name = "assumptions"
 [[constraints.assumptions]]
 kind = "arith"
 constraint = "$#`read_register2` = 0 or #`imm[i] = 0`$"
-poly = ["*", "read_register2", ["idx", "imm", "i"]]
-iter = ["i", 0, 1]
+poly = ["*", "read_register2", ["+", ["idx", "imm", 0], ["idx", "imm", 1]]]
 
 [[constraint_groups]]
 name = "decode"
