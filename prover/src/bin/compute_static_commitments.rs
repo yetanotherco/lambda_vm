@@ -1,6 +1,6 @@
-//! Prints hardcoded `(bitwise, keccak_rc)` preprocessed-table commitments for
+//! Prints static `(bitwise, keccak_rc)` preprocessed-table commitments for
 //! a fixed set of `blowup_factor` values. The output is pasted into the
-//! `HARDCODED_PREPROCESSED_COMMITMENTS` constants in
+//! `static_commitment` match bodies in
 //! `prover/src/tables/{bitwise,keccak_rc}.rs`. The
 //! `static_commitments_tests` test suite pins the values so any drift in
 //! the AIR or FFT pipeline is caught at test time.
@@ -8,11 +8,9 @@
 //! Run with:
 //!     cargo run --bin compute_static_commitments --release
 
-use lambda_vm_prover::tables::{bitwise, keccak_rc};
+use lambda_vm_prover::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc};
 use stark::config::Commitment;
 use stark::proof::options::GoldilocksCubicProofOptions;
-
-const BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 
 fn format_commitment(commitment: &Commitment) -> String {
     let mut out = String::from("[\n");
@@ -32,11 +30,11 @@ fn format_commitment(commitment: &Commitment) -> String {
 
 fn main() {
     println!(
-        "// Paste these entries into `HARDCODED_PREPROCESSED_COMMITMENTS`\n\
+        "// Paste these match arms into the `static_commitment` match body\n\
          // in `prover/src/tables/{{bitwise,keccak_rc}}.rs`.\n"
     );
 
-    for &blowup in BLOWUP_FACTORS {
+    for &blowup in STATIC_BLOWUP_FACTORS {
         let options = match GoldilocksCubicProofOptions::with_blowup(blowup) {
             Ok(o) => o,
             Err(e) => {
@@ -50,10 +48,10 @@ fn main() {
 
         println!(
             "// blowup_factor = {blowup}\n\
-             // ---- bitwise:\n    \
-             ({blowup}, {bitwise_fmt}),\n\
-             // ---- keccak_rc:\n    \
-             ({blowup}, {keccak_fmt}),\n",
+             // ---- bitwise:\n        \
+             {blowup} => Some({bitwise_fmt}),\n\
+             // ---- keccak_rc:\n        \
+             {blowup} => Some({keccak_fmt}),\n",
             bitwise_fmt = format_commitment(&bitwise),
             keccak_fmt = format_commitment(&keccak_rc),
         );
