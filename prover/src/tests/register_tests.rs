@@ -1,7 +1,12 @@
 //! Tests for the REGISTER table.
 
+use executor::elf::Elf;
+use stark::proof::options::GoldilocksCubicProofOptions;
+
 use crate::tables::register::*;
 use crate::tables::types::*;
+use crate::test_utils::asm_elf_bytes;
+use crate::{prove, verify_with_options};
 
 #[test]
 fn test_register_base_address() {
@@ -82,4 +87,64 @@ fn test_generate_register_trace_with_access() {
 fn test_bus_interactions() {
     let interactions = bus_interactions();
     assert_eq!(interactions.len(), 2); // C1, C2
+}
+
+// =========================================================================
+// verify_with_options: optional register_commitment parameter
+// =========================================================================
+
+#[test]
+fn register_commitment_some_matches_default_path() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    let register_c = preprocessed_commitment(&options, elf.entry_point);
+
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+        .expect("verify with None should not error");
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(register_c))
+        .expect("verify with Some(correct) should not error");
+
+    assert!(default_ok, "default path must accept the proof");
+    assert!(
+        explicit_ok,
+        "Some(correct_commitment) must accept the proof"
+    );
+}
+
+#[test]
+fn register_commitment_wrong_value_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Flip a byte in the correct commitment so the Fiat-Shamir transcripts diverge.
+    let mut wrong = preprocessed_commitment(&options, elf.entry_point);
+    wrong[0] ^= 0xFF;
+
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "tampered register commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+#[test]
+fn register_commitment_zero_bytes_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // [0u8; 32] is the most plausible accidental default — passing it must
+    // not pass verification.
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "all-zero register commitment must cause Fiat-Shamir rejection",
+    );
 }

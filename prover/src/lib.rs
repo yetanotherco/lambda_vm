@@ -30,6 +30,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
+use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -328,12 +329,26 @@ impl VmAirs {
     ///
     /// `page_configs` provides the page base addresses for creating PAGE AIRs.
     /// `table_counts` specifies how many chunks for each split table.
+    ///
+    /// `register_commitment` is an optional precomputed REGISTER preprocessed
+    /// commitment. When `Some`, the supplied value is used directly and the
+    /// FFT + Merkle build is skipped — useful for callers who have already
+    /// computed the commitment offline and embedded it as a compile-time
+    /// constant (e.g. the recursion guest, where the in-VM recompute is too
+    /// expensive). When `None`, the commitment is computed from the ELF
+    /// entry point.
+    ///
+    /// The trust anchor for `register_commitment` is the caller's compiled
+    /// binary — never accept prover-supplied bytes here. Wrong values
+    /// surface as Fiat-Shamir transcript divergence (proof rejected),
+    /// never as silently-accepted wrong proofs.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        register_commitment: Option<Commitment>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -383,10 +398,10 @@ impl VmAirs {
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register_root = register_commitment
+            .unwrap_or_else(|| register::preprocessed_commitment(proof_options, elf.entry_point));
+        let register = create_register_air(proof_options)
+            .with_preprocessed(register_root, register::NUM_PREPROCESSED_COLS);
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
@@ -646,6 +661,7 @@ pub fn prove_with_options_and_inputs(
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -717,6 +733,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
         vm_proof,
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        None,
     )
 }
 
@@ -725,10 +742,25 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// The verifier enforces its own `proof_options` (security parameters),
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
+///
+/// `register_commitment` is an optional precomputed REGISTER preprocessed
+/// commitment. When `Some`, the supplied value is used directly and the
+/// in-verifier FFT + Merkle build for the REGISTER preprocessed columns is
+/// skipped — useful for callers (e.g. the recursion guest) that embed the
+/// commitment as a compile-time constant to avoid the in-VM recompute
+/// cost. When `None`, the verifier computes the commitment from the ELF
+/// entry point.
+///
+/// Trust model: `register_commitment`, when supplied, must come from the
+/// caller's compiled binary (e.g. a `const [u8; 32]`), never from prover-
+/// supplied bytes. Wrong values surface as Fiat-Shamir transcript
+/// divergence (proof rejected); they cannot cause silently-accepted wrong
+/// proofs.
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
+    register_commitment: Option<Commitment>,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
@@ -774,6 +806,7 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        register_commitment,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.

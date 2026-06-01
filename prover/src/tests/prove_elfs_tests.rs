@@ -58,6 +58,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
 
     // Build air_trace_pairs for all tables
@@ -107,6 +108,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -145,6 +147,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         true,
         &page_configs,
         &vm_proof.table_counts,
+        None,
     );
     let air_refs = airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1160,6 +1163,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1169,8 +1173,14 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &wrong_configs,
+        &table_counts,
+        None,
+    );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -1200,7 +1210,7 @@ fn test_verify_rejects_tampered_public_output() {
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
             .expect("Valid commit proof should verify"),
         "Baseline proof should verify before tampering"
     );
@@ -1212,7 +1222,7 @@ fn test_verify_rejects_tampered_public_output() {
         ..vm_proof
     };
 
-    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options)
+    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None)
         .expect("Verifier should not error on tampered public output");
     assert!(
         !verified,
@@ -1899,6 +1909,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1907,8 +1918,14 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &verifier_configs,
+        &table_counts,
+        None,
+    );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -1956,6 +1973,7 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1964,8 +1982,14 @@ fn test_deep_stack_missing_pages_rejected() {
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &wrong_configs,
+        &table_counts,
+        None,
+    );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -2048,6 +2072,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2056,8 +2081,14 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &verifier_configs,
+        &table_counts,
+        None,
+    );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
@@ -2117,7 +2148,7 @@ fn test_verify_rejects_zero_table_counts() {
         .expect("Prover should succeed on valid program");
 
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
             .expect("Verification should not error on valid proof"),
         "Valid proof should verify"
     );
@@ -2138,7 +2169,7 @@ fn test_verify_rejects_zero_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2159,7 +2190,7 @@ fn test_verify_rejects_zero_cpu_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2180,7 +2211,7 @@ fn test_verify_rejects_zero_memw_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2203,7 +2234,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         branch: 0,
         memw_register: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None);
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 8);
@@ -2307,7 +2338,7 @@ fn test_verify_rejects_inflated_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
     assert!(
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",

@@ -14,7 +14,7 @@
 //! | Column | Type | Description |
 //! |--------|------|-------------|
 //! | offset | RowIndex | Byte offset within register space |
-//! | init | Word | Initial value (0 for all registers at start) |
+//! | init | Word | Initial value (program-dependent: SP=STACK_TOP, x255=entry_point, others=0) |
 //! | fini | Word | Final value after execution |
 //! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
 
@@ -61,7 +61,7 @@ pub mod cols {
     /// offset: Row index / byte address within register space
     pub const OFFSET: usize = 0;
 
-    /// init: Initial byte value (0 for all registers)
+    /// init: Initial value (program-dependent: SP=STACK_TOP, x255=entry_point, others=0)
     pub const INIT: usize = 1;
 
     /// fini: Final byte value after execution
