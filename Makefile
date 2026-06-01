@@ -199,10 +199,13 @@ bench-math-cuda:
 	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
 
 # Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
-# Add `--features stark/cuda` and run on a GPU box to confirm the GPU LDE path.
 bench-prover:
-	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
+      cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
 
+# Single-prove wall-time bench with the GPU LDE path enabled.
+# Needs an NVIDIA GPU + CUDA toolkit/driver.
+bench-prover-cuda:
+      cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
 # Build all
 build:
 	cargo build --workspace
