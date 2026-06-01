@@ -220,6 +220,17 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
+    /// If the main trace was LDE'd on the GPU via the fused pipeline,
+    /// the device buffer is retained here so downstream GPU rounds can
+    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
+    /// for this table (below the size threshold or any CPU fallback:
+    /// preprocessed main, non-Goldilocks, or GPU error).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
+    /// layout on device).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -242,7 +253,35 @@ where
             aux_columns,
             lde_step_size,
             blowup_factor,
+            #[cfg(feature = "cuda")]
+            gpu_main: None,
+            #[cfg(feature = "cuda")]
+            gpu_aux: None,
         }
+    }
+
+    /// Attach an already-populated device LDE handle for the main columns.
+    /// Only set when the GPU fused pipeline produced the LDE. Callers that
+    /// ran the CPU path should leave this alone.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
+        self.gpu_main = Some(h);
+    }
+
+    /// Attach an already-populated device LDE handle for the aux columns.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
+        self.gpu_aux = Some(h);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
+        self.gpu_main.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
+        self.gpu_aux.as_ref()
     }
 
     /// Consume self and return the owned column vectors.
