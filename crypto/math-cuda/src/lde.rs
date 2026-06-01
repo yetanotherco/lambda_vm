@@ -583,11 +583,8 @@ pub fn coset_lde_batch_base_into(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     stream.synchronize()?;
 
-    // Sequential copy pinned → caller outputs (not `par_iter_mut`): runs
-    // inside the held pinned-staging mutex; rayon-inside-mutex risks
-    // recursive stealing-during-wait deadlocks (see
-    // `Backend::pinned_staging`). Fault-cost parallelism is recovered at
-    // the outer level via per-worker staging slots.
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
+    // where rayon can deadlock. See `Backend::pinned_staging`.
     for (c, dst) in outputs.iter_mut().enumerate() {
         dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
     }
@@ -714,9 +711,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    // Sequential pack (not `par_iter`): runs inside the held pinned-staging
-    // mutex (see `Backend::pinned_staging` docs). Per-worker staging slots
-    // give the outer parallelism back.
+    // Pack columns into the pinned buffer. Runs under the pinned-staging
+    // lock, where rayon can deadlock. See `Backend::pinned_staging`.
     for (c, col) in columns.iter().enumerate() {
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
@@ -813,8 +809,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    // Sequential pinned → caller outputs (not `par_iter_mut`): runs inside
-    // the held pinned-staging mutex (see `Backend::pinned_staging` docs).
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
+    // where rayon can deadlock. See `Backend::pinned_staging`.
     for (c, dst) in outputs.iter_mut().enumerate() {
         dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
     }

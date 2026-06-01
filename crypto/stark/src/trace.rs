@@ -222,8 +222,9 @@ where
     pub(crate) blowup_factor: usize,
     /// If the main trace was LDE'd on the GPU via the fused pipeline,
     /// the device buffer is retained here so downstream GPU rounds can
-    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't
-    /// run (small tables, cuda feature off, fallback path).
+    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
+    /// for this table (below the size threshold or any CPU fallback:
+    /// preprocessed main, non-Goldilocks, or GPU error).
     #[cfg(feature = "cuda")]
     pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
     /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
@@ -260,7 +261,7 @@ where
     }
 
     /// Attach an already-populated device LDE handle for the main columns.
-    /// Only set when the GPU fused pipeline produced the LDE — callers that
+    /// Only set when the GPU fused pipeline produced the LDE. Callers that
     /// ran the CPU path should leave this alone.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {

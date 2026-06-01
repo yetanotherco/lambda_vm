@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda bench-math-cuda build check clippy fmt lint
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda bench-math-cuda bench-prover build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -197,6 +197,11 @@ test-math-cuda:
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
 	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
+
+# Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
+# Add `--features stark/cuda` and run on a GPU box to confirm the GPU LDE path.
+bench-prover:
+	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
 
 # Build all
 build:

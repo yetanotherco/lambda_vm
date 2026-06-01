@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 #[cfg(feature = "instruments")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
@@ -170,7 +170,7 @@ where
 }
 
 /// Tuple returned by `commit_main_trace`: the commit, the cached LDE columns,
-/// and — under cuda — the optional device LDE buffer kept alive for downstream
+/// and (under cuda) the optional device LDE buffer kept alive for downstream
 /// rounds when the R1 fused GPU pipeline ran.
 #[cfg(feature = "cuda")]
 type MainCommitTuple<F> = (
@@ -650,8 +650,8 @@ pub trait IsStarkProver<
     }
 
     /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
-    /// with the owned LDE columns (consumed later in Phase D) and — under
-    /// cuda — the optional device LDE buffer kept alive for downstream rounds
+    /// with the owned LDE columns (consumed later in Phase D) and (under
+    /// cuda) the optional device LDE buffer kept alive for downstream rounds
     /// when the R1 fused GPU pipeline ran.
     ///
     /// `precomputed`: if present, the leading `num_cols` columns are committed
@@ -672,7 +672,7 @@ pub trait IsStarkProver<
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
 
-        // Fused GPU path is only wired for non-preprocessed mains today; the
+        // Fused GPU path is only wired for non-preprocessed mains today. The
         // preprocessed split runs the CPU pipeline below.
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
@@ -925,7 +925,7 @@ pub trait IsStarkProver<
         let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
 
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
-        // `cuda` feature and a qualifying size; falls through to CPU when not.
+        // `cuda` feature and a qualifying size. Falls through to CPU when not.
         #[cfg(feature = "cuda")]
         if let Some((lde_h0, lde_h1)) =
             crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
@@ -1653,7 +1653,7 @@ pub trait IsStarkProver<
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
         // R1 fused GPU pipeline produced one. Threaded through Phase D's zip
-        // chain so alignment is compiler-enforced (no `.next().expect()`).
+        // chain so each handle stays paired with its table by construction.
         #[cfg(feature = "cuda")]
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
@@ -1795,9 +1795,9 @@ pub trait IsStarkProver<
             .collect();
 
         // Parallel aux commit in chunks of K. The closure returns a cfg-gated
-        // AuxResult — under cuda it carries the optional ext3 GPU LDE handle
-        // as a third element so the .zip() chain in Phase D stays
-        // compiler-aligned with no side vectors.
+        // AuxResult. Under cuda it carries the optional ext3 GPU LDE handle as
+        // a third element, so Phase D's zip chain keeps it paired with its
+        // table without a separate handle vector.
         #[cfg(feature = "cuda")]
         type AuxResult<FE> = (
             Option<TableCommit<FE>>,
@@ -1829,10 +1829,9 @@ pub trait IsStarkProver<
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
                         let mut columns = trace.extract_columns_aux(lde_size);
 
-                        // GPU combined path: ext3 LDE + Keccak-256 leaf
-                        // hashing + Merkle tree build in one on-device
-                        // pipeline. The fused `_keep` variant also returns
-                        // the device LDE handle for downstream GPU rounds.
+                        // Fused GPU path: ext3 LDE + Keccak-256 leaf hashing + Merkle tree build
+                        // in one on-device pipeline, also retaining the device LDE buffer and
+                        // returning its handle for downstream GPU rounds.
                         #[cfg(feature = "cuda")]
                         {
                             #[cfg(feature = "instruments")]
@@ -1849,11 +1848,12 @@ pub trait IsStarkProver<
                                 #[cfg(feature = "instruments")]
                                 let aux_lde_dur = t_sub.elapsed();
                                 let root = tree.root;
-                                // Fused GPU path: bill merkle equal to LDE so
-                                // the (lde + merkle) sum stays comparable to
-                                // the non-GPU path's combined R1 total.
+                                // Fused GPU path: LDE + leaf hash + tree build run as one pipeline with
+                                // no separate merkle timing, so bill the whole fused duration to the LDE
+                                // bucket and zero to merkle. The (lde + merkle) sum then equals the fused
+                                // time, comparable to the non-GPU path's combined R1 total.
                                 #[cfg(feature = "instruments")]
-                                crate::instruments::accum_r1_aux(aux_lde_dur, aux_lde_dur);
+                                crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
                                     columns,
@@ -1919,8 +1919,8 @@ pub trait IsStarkProver<
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        // Under cuda, fold main_gpu_handles into the zip chain so alignment is
-        // compiler-enforced (M4: no `.next().expect()` plumbing).
+        // Under cuda, fold main_gpu_handles into the zip chain so each handle
+        // stays paired with its table by construction.
         #[cfg(feature = "cuda")]
         let main_iter = main_commits
             .into_iter()
@@ -1983,7 +1983,7 @@ pub trait IsStarkProver<
         let mut table_timings: Vec<(
             String,
             usize,
-            std::time::Duration,
+            Duration,
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
@@ -2224,7 +2224,7 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
-            let zero = std::time::Duration::ZERO;
+            let zero = Duration::ZERO;
             let (r2_constraints, r2_fft, r2_merkle) =
                 crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
             let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
