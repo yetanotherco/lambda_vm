@@ -3,7 +3,7 @@ mod tests {
     use crate::field::element::FieldElement;
     use crate::field::goldilocks::GoldilocksField;
     use crate::field::traits::{IsField, IsPrimeField};
-    use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
+    use crate::polynomial::Polynomial;
     use alloc::string::{String, ToString};
     use alloc::{format, vec::Vec};
 
@@ -83,17 +83,6 @@ mod tests {
     }
 
     #[test]
-    fn pad_with_zero_coefficients_returns_polynomials_with_zeros_until_matching_size() {
-        let p1 = Polynomial::new(&[FE::new(3), FE::new(4)]);
-        let p2 = Polynomial::new(&[FE::new(3)]);
-
-        assert_eq!(p2.coefficients, &[FE::new(3)]);
-        let (pp1, pp2) = pad_with_zero_coefficients(&p1, &p2);
-        assert_eq!(pp1, p1);
-        assert_eq!(pp2.coefficients, &[FE::new(3), FE::new(0)]);
-    }
-
-    #[test]
     fn evaluate_constant_polynomial_returns_constant() {
         let three = FE::new(3);
         let p = Polynomial::new(&[three]);
@@ -109,34 +98,28 @@ mod tests {
     }
 
     #[test]
-    fn create_degree_0_new_monomial() {
-        assert_eq!(
-            Polynomial::new_monomial(FE::new(3), 0),
-            Polynomial::new(&[FE::new(3)])
-        );
-    }
-
-    #[test]
     fn zero_poly_evals_0_in_3() {
         assert_eq!(
-            Polynomial::new_monomial(FE::new(0), 0).evaluate(&FE::new(3)),
+            Polynomial::new(&[FE::new(0)]).evaluate(&FE::new(3)),
             FE::new(0)
         );
     }
 
     #[test]
-    fn evaluate_degree_1_new_monomial() {
+    fn evaluate_degree_1_polynomial() {
         let two = FE::new(2);
         let four = FE::new(4);
-        let p = Polynomial::new_monomial(two, 1);
+        // 2X
+        let p = Polynomial::new(&[FE::new(0), two]);
         assert_eq!(p.evaluate(&two), four);
     }
 
     #[test]
-    fn evaluate_degree_2_monomyal() {
+    fn evaluate_degree_2_polynomial() {
         let two = FE::new(2);
         let eight = FE::new(8);
-        let p = Polynomial::new_monomial(two, 2);
+        // 2X^2
+        let p = Polynomial::new(&[FE::new(0), FE::new(0), two]);
         assert_eq!(p.evaluate(&two), eight);
     }
 
@@ -144,19 +127,6 @@ mod tests {
     fn evaluate_3_term_polynomial() {
         let p = Polynomial::new(&[FE::new(3), -FE::new(2), FE::new(4)]);
         assert_eq!(p.evaluate(&FE::new(2)), FE::new(15));
-    }
-
-    #[test]
-    fn simple_interpolating_polynomial_by_hand_works() {
-        let denominator = Polynomial::new(&[FE::new(1) * (FE::new(2) - FE::new(4)).inv().unwrap()]);
-        let numerator = Polynomial::new(&[-FE::new(4), FE::new(1)]);
-        let interpolating = numerator.mul_with_ref(&denominator);
-        assert_eq!(
-            (FE::new(2) - FE::new(4)) * (FE::new(1) * (FE::new(2) - FE::new(4)).inv().unwrap()),
-            FE::new(1)
-        );
-        assert_eq!(interpolating.evaluate(&FE::new(2)), FE::new(1));
-        assert_eq!(interpolating.evaluate(&FE::new(4)), FE::new(0));
     }
 
     #[test]

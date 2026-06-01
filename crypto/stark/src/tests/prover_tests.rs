@@ -94,7 +94,18 @@ fn test_evaluate_polynomial_on_lde_domain_on_trace_polys() {
 
 #[test]
 fn test_evaluate_polynomial_on_lde_domain_edge_case() {
-    let poly = Polynomial::new_monomial(Felt::one(), 8);
+    // X^8
+    let poly = Polynomial::new(&[
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::zero(),
+        Felt::one(),
+    ]);
     let blowup_factor: usize = 4;
     let domain_size: usize = 8;
     let offset = Felt::from(3);

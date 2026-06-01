@@ -30,13 +30,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         }
     }
 
-    /// Creates a new monomial term coefficient*x^degree
-    pub fn new_monomial(coefficient: FieldElement<F>, degree: usize) -> Self {
-        let mut coefficients = vec![FieldElement::zero(); degree];
-        coefficients.push(coefficient);
-        Self::new(&coefficients)
-    }
-
     /// Creates the null polynomial
     pub fn zero() -> Self {
         Self::new(&[])
@@ -78,26 +71,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Returns the length of the vector of coefficients
     pub fn coeff_len(&self) -> usize {
         self.coefficients().len()
-    }
-
-    pub fn mul_with_ref(&self, factor: &Self) -> Self {
-        let degree = self.degree() + factor.degree();
-        let mut coefficients = vec![FieldElement::zero(); degree + 1];
-
-        if self.coefficients.is_empty() || factor.coefficients.is_empty() {
-            Polynomial::new(&[FieldElement::zero()])
-        } else {
-            for i in 0..=factor.degree() {
-                if factor.coefficients[i] != FieldElement::zero() {
-                    for j in 0..=self.degree() {
-                        if self.coefficients[j] != FieldElement::zero() {
-                            coefficients[i + j] += &factor.coefficients[i] * &self.coefficients[j];
-                        }
-                    }
-                }
-            }
-            Polynomial::new(&coefficients)
-        }
     }
 
     /// Scales the coefficients of a polynomial P by a factor
@@ -149,30 +122,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     }
 }
 
-/// Pads a polynomial with zeros until the desired length
-/// This function can be useful when evaluating polynomials with the FFT
-pub fn pad_with_zero_coefficients_to_length<F: IsField>(
-    pa: &mut Polynomial<FieldElement<F>>,
-    n: usize,
-) {
-    pa.coefficients.resize(n, FieldElement::zero());
-}
-
-/// Pads polynomial representations with minimum number of zeros to match lengths.
-pub fn pad_with_zero_coefficients<L: IsField, F: IsSubFieldOf<L>>(
-    pa: &Polynomial<FieldElement<F>>,
-    pb: &Polynomial<FieldElement<L>>,
-) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<L>>) {
-    let mut pa = pa.clone();
-    let mut pb = pb.clone();
-
-    if pa.coefficients.len() > pb.coefficients.len() {
-        pad_with_zero_coefficients_to_length(&mut pb, pa.coefficients.len());
-    } else {
-        pad_with_zero_coefficients_to_length(&mut pa, pb.coefficients.len());
-    }
-    (pa, pb)
-}
 // ── Barycentric coset interpolation ──────────────────────────────────────
 // Four evaluation variants along two axes:
 //   - eval field: base field (F) or extension field (E)
@@ -502,25 +451,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         Ok(())
     }
-}
-
-#[cfg(test)]
-pub fn compose_fft<F, E>(
-    poly_1: &Polynomial<FieldElement<E>>,
-    poly_2: &Polynomial<FieldElement<E>>,
-) -> Polynomial<FieldElement<E>>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
-
-    let values: Vec<_> = poly_2_evaluations
-        .iter()
-        .map(|value| poly_1.evaluate(value))
-        .collect();
-
-    Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
 fn evaluate_fft_cpu_raw<F, E>(

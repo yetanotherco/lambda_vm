@@ -55,7 +55,6 @@ mod fft_polynomial_tests {
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
-    use crate::polynomial::compose_fft;
     use proptest::{collection, prelude::*};
 
     /// Evaluates a polynomial at a slice of points
@@ -231,16 +230,6 @@ mod fft_polynomial_tests {
                 prop_assert_eq!(poly, new_poly);
             }
 
-        }
-
-        #[test]
-        fn composition_fft_works() {
-            let p = Polynomial::new(&[FE::new(0), FE::new(2)]);
-            let q = Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(1)]);
-            assert_eq!(
-                compose_fft::<F, F>(&p, &q),
-                Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(2)])
-            );
         }
     }
 
