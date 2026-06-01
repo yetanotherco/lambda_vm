@@ -9,10 +9,11 @@
 // columns), and `inv_denom_i = 1 / (z - point_i)` is an ext3 scalar (same for
 // every column sharing the evaluation point `z`).
 //
-// These kernels compute only S. The caller multiplies by the ext3 scalar
-// `vanishing * n_inv * g_n_inv` once per column on the host. That is cheap,
-// and keeping it out of the kernel means we don't need to carry yet another
-// ext3 constant argument.
+// These kernels compute only S. The full OOD value is S scaled by the ext3
+// constant `vanishing * n_inv * g_n_inv`, which is constant across a column, so
+// the caller applies it once per column (one ext3 mul per column, independent
+// of n). Keeping it on the host means the kernel takes no extra ext3 constant
+// argument.
 //
 // Launch: grid = (num_cols, 1, 1), block = (BARY_BLOCK_DIM, 1, 1).
 
@@ -44,13 +45,14 @@ __device__ __forceinline__ ext3::Fe3 block_reduce_ext3(ext3::Fe3 my) {
 
 /// Base-column variant: M base-field columns, each `col_stride` u64 apart.
 /// `inv_denoms` is a flat 3N u64 buffer (ext3, interleaved `[a0,b0,c0,...]`).
+/// Writes `out_ext3_int`: 3M u64, ext3 interleaved, one accumulator per column.
 extern "C" __global__ void barycentric_base_batched(
     const uint64_t *columns,
     uint64_t col_stride,
     const uint64_t *coset_points,
     const uint64_t *inv_denoms,
     uint64_t n,
-    uint64_t *out_ext3_int   // 3M u64, interleaved per column
+    uint64_t *out_ext3_int
 ) {
     uint64_t col = blockIdx.x;
     const uint64_t *col_data = columns + col * col_stride;
@@ -77,10 +79,10 @@ extern "C" __global__ void barycentric_base_batched(
 }
 
 /// Same as `barycentric_base_batched` but reads rows at stride `row_stride`
-/// within each column. Treats the column as an LDE of length
-/// `n * row_stride` and sums over the trace-size coset (every `row_stride`-th
-/// row). Lets R3 OOD run directly against the LDE device handle from R1
-/// without materialising a trace-size slab.
+/// within each column. Treats the column as an LDE of length `n * row_stride`
+/// and sums over the trace-size coset (every `row_stride`-th row). Lets R3 OOD
+/// run directly against the LDE device handle from R1 without copying the
+/// strided rows into a separate trace-size buffer.
 extern "C" __global__ void barycentric_base_batched_strided(
     const uint64_t *columns,
     uint64_t col_stride,
