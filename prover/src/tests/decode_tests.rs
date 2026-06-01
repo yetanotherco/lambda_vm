@@ -1221,3 +1221,46 @@ fn decode_commitment_zero_bytes_rejects() {
         "all-zero decode commitment must cause Fiat-Shamir rejection",
     );
 }
+
+/// DECODE preprocessed commitment for the `sub` asm test ELF at blowup=2,
+/// computed offline once. Mirrors how the recursion guest embeds the
+/// commitment as a compile-time constant for its inner program. If the
+/// AIR or FFT pipeline changes, this drifts and the test fails —
+/// regenerate via the `print_decode_commitment_for_sub` helper below.
+const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
+    0x00, 0x83, 0x59, 0xa3, 0x34, 0x5f, 0x86, 0x79, 0x59, 0x71, 0xc8, 0x71, 0x54, 0x2c, 0xc4, 0xac,
+    0x8b, 0x9c, 0x48, 0x9b, 0x25, 0xa3, 0x6a, 0xc7, 0x48, 0xee, 0x71, 0xe6, 0x77, 0xfb, 0x59, 0xfa,
+];
+
+#[test]
+fn decode_commitment_compile_time_const_accepts() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
+    // workflow where the value lives in the caller's compiled binary.
+    let result = verify_with_options(
+        &vm_proof,
+        &elf_bytes,
+        &options,
+        Some(SUB_DECODE_COMMITMENT_BLOWUP_2),
+    )
+    .expect("verify must not return Err");
+    assert!(
+        result,
+        "verifier must accept the offline-computed decode commitment",
+    );
+}
+
+#[test]
+#[ignore = "prints decode commitment for the sub asm ELF so SUB_DECODE_COMMITMENT_BLOWUP_2 \
+            can be regenerated; run with --ignored --nocapture"]
+fn print_decode_commitment_for_sub() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let c = commitment_from_elf(&elf, &options).expect("decode commitment");
+    eprintln!("SUB_DECODE_COMMITMENT_BLOWUP_2 (sub.elf, blowup=2):");
+    eprintln!("{c:02x?}");
+}
