@@ -262,6 +262,16 @@ poly = ["*", "word_instr", "ECALL"]
 
 [[constraints.decode]]
 kind = "arith"
+constraint = "$#`word_instr` => #`read_register1 = 0`$"
+poly = ["*", "word_instr", "read_register1"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`read_register2 = 0`$"
+poly = ["*", "word_instr", "read_register2"]
+
+[[constraints.decode]]
+kind = "arith"
 constraint = "$#`word_instr` => #`write_register = 0`$"
 poly = ["*", "word_instr", "write_register"]
 
