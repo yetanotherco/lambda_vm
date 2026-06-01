@@ -17,10 +17,11 @@ use math::field::traits::{IsField, IsSubFieldOf};
 
 use crate::domain::Domain;
 
-/// Break-even LDE size. Below this, the CPU `coset_lde_full_expand` completes
-/// in a few hundred microseconds and the GPU's tens of kernel launches plus
-/// H2D/D2H round-trip is a net loss. The check is on **lde size**, not trace
-/// length, because that's what determines the FFT workload.
+/// Break-even LDE size. For LDE sizes smaller than this, the CPU
+/// `coset_lde_full_expand` completes in a few hundred microseconds and the
+/// GPU's tens of kernel launches plus H2D/D2H round-trip is a net loss. The
+/// check is on **lde size**, not trace length, because that's what
+/// determines the FFT workload.
 ///
 /// 2^19 is a conservative default calibrated against a 46-core machine where
 /// rayon-parallel CPU LDE is already fast. Override via env var for tuning
@@ -37,8 +38,11 @@ fn gpu_lde_threshold() -> usize {
     })
 }
 
-/// Atomically counted by `try_expand_column` every time it actually routes a
-/// column to the GPU. Used by benchmarks to confirm the GPU path fired.
+/// Incremented by the `try_expand_*` functions per base-field column handed to
+/// the GPU dispatch (an ext3 column counts as 3, one per base component),
+/// before the GPU call. A failed call returns without decrementing it, so it
+/// counts attempts, not confirmed successes. Used by benchmarks to confirm the
+/// GPU path fired.
 static GPU_LDE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn gpu_lde_calls() -> u64 {
@@ -152,8 +156,9 @@ unsafe fn columns_to_u64_base<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> V
         .collect()
 }
 
-/// Convert ext3 columns to `Vec<Vec<u64>>` (de-interleaved into raw `[u64; 3]`
-/// lanes per element) for the GPU input slice list.
+/// Convert ext3 columns to `Vec<Vec<u64>>`, each column reinterpreted as a flat
+/// `u64` slice with the three coordinates of every element kept contiguous
+/// (`[a0, a1, a2, b0, b1, b2, ...]`), for the GPU input slice list.
 ///
 /// SAFETY: caller must have established `E == Degree3GoldilocksExtensionField`
 /// (e.g. via [`check_ext3_layout`]). Each `FieldElement<E>` is then a
@@ -210,7 +215,7 @@ unsafe fn presize_and_view_base<E: IsField>(
 }
 
 /// Same as [`presize_and_view_base`] but for ext3 columns: each view is
-/// `3 * lde_size` u64s (de-interleaved lanes).
+/// `3 * lde_size` u64s, the three coordinates of every element contiguous.
 ///
 /// SAFETY: caller must have established `E == Degree3GoldilocksExtensionField`.
 unsafe fn presize_and_view_ext3<E: IsField>(
@@ -249,10 +254,11 @@ fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: u
 }
 
 /// Allocate the `[u8; 32]` Merkle node buffer for a tree of `lde_size` leaves
-/// and return both the node `Vec` (length-initialised, contents undefined) and
-/// a `&mut [u8]` byte view of total length `total_nodes * 32`. Returns `None`
-/// if the layout would be invalid (`lde_size < 2` or the byte length
-/// overflows). The caller must overwrite every byte via the GPU D2H below.
+/// and return the node `Vec` (length-initialised, contents undefined) together
+/// with its node count `total_nodes` (`2 * lde_size - 1`). Returns `None` if
+/// the layout would be invalid (`lde_size < 2` or `total_nodes * 32` overflows
+/// `usize`). The caller builds the `&mut [u8]` byte view of length
+/// `total_nodes * 32` and must overwrite every byte via the GPU D2H.
 fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
     if lde_size < 2 {
         return None;
@@ -272,14 +278,15 @@ fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
 
 /// Try to GPU-batch all columns in one pass.
 ///
-/// Only engaged for Goldilocks-base tables whose LDE size is above the
-/// threshold. The prover's `expand_columns_to_lde` hands us every column of
-/// one table at once. Those columns all share twiddles and coset weights so
-/// they can be processed in a single batched pipeline on one stream.
+/// Engaged for Goldilocks-base and ext3 tables whose LDE size is above the
+/// threshold (ext3 is routed to [`try_expand_columns_batched_ext3`]). The
+/// prover's `expand_columns_to_lde` hands us every column of one table at
+/// once. Those columns all share twiddles and coset weights so they can be
+/// processed in a single batched pipeline on one stream.
 ///
-/// Returns `Some(())` if the batch was handled on GPU (and `columns` now
-/// contains the LDE evaluations). Returns `None` to let the caller run the
-/// per-column CPU fallback.
+/// Returns `Some(())` if the batch was handled on GPU and `columns` now holds
+/// the LDE evaluations, or if there were no columns to expand. Returns `None`
+/// to let the caller run the per-column CPU fallback.
 pub(crate) fn try_expand_columns_batched<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -289,10 +296,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    // Ext3 path: decompose each ext3 column into its 3 base components and
-    // dispatch to the base-field batched NTT with 3×M logical columns.
-    // Butterflies with a base-field twiddle act componentwise on ext3, so
-    // this is exactly equivalent to running the NTT in the extension field.
+    // Ext3 columns go through the ext3 specialization.
     if TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
         return try_expand_columns_batched_ext3::<F, E>(columns, blowup_factor, weights);
     }
@@ -555,6 +559,11 @@ where
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
 /// `Degree3GoldilocksExtensionField` by TypeId match at the caller.
+///
+/// The LDE runs over the 3 base-field components of each ext3 column. The
+/// transform uses only base-field twiddles and coset weights, which act
+/// componentwise on ext3, so the per-component result equals the ext3 LDE the
+/// CPU path computes.
 fn try_expand_columns_batched_ext3<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
