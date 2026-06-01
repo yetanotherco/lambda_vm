@@ -129,7 +129,7 @@ pub fn barycentric_ext3(
 /// Run `barycentric_base_batched_strided` over the base LDE already on
 /// device (`main_handle`), summing over the trace-size coset (every
 /// `row_stride = blowup_factor`-th row). H2Ds only the coset points and
-/// inv_denoms; the column data never crosses PCIe.
+/// inv_denoms. The column data never crosses PCIe.
 pub fn barycentric_base_on_device(
     main_handle: &GpuLdeBase,
     row_stride: usize,
