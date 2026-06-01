@@ -166,16 +166,25 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     tree.root
 }
 
+/// Returns the preprocessed commitment for the keccak_rc table.
+///
+/// Looks up `blowup_factor` via [`static_commitment`] when `coset_offset == 3`
+/// (the value every in-tree `ProofOptions` constructor pins, and the offset
+/// the static bytes were generated for); on miss — either a non-3 coset or a
+/// `blowup_factor` outside `STATIC_BLOWUP_FACTORS` — recomputes from scratch.
 #[inline]
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    if let Some(commitment) = static_commitment(options.blowup_factor) {
+    if options.coset_offset == 3
+        && let Some(commitment) = static_commitment(options.blowup_factor)
+    {
         return commitment;
     }
     log::warn!(
-        "keccak_rc preprocessed commitment not static for blowup_factor={}; \
+        "keccak_rc preprocessed commitment not static for (blowup={}, coset={}); \
          falling back to recompute. Add a match arm to `static_commitment` by running \
          `cargo run --bin compute_static_commitments --release`.",
         options.blowup_factor,
+        options.coset_offset,
     );
     compute_preprocessed_commitment(options)
 }
