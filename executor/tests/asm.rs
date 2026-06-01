@@ -1,4 +1,7 @@
-use executor::{elf::Elf, vm::execution::Executor};
+use executor::{
+    elf::Elf,
+    vm::execution::{Executor, ExecutorError},
+};
 
 /// Run a program and verify it exits successfully (exit code 0).
 ///
@@ -424,10 +427,68 @@ fn test_lw_sw_offset() {
     run_program("./program_artifacts/asm/lw_sw_offset.elf");
 }
 
-#[ignore = "Unaligned memory access not properly implemented yet"]
 #[test]
 fn test_lw_sw_offset_odd() {
     run_program("./program_artifacts/asm/lw_sw_offset_odd.elf");
+}
+
+#[test]
+fn test_misalign_lh() {
+    run_program("./program_artifacts/asm/misalign_lh.elf");
+}
+
+#[test]
+fn test_misalign_lhu() {
+    run_program("./program_artifacts/asm/misalign_lhu.elf");
+}
+
+#[test]
+fn test_misalign_lw() {
+    run_program("./program_artifacts/asm/misalign_lw.elf");
+}
+
+#[test]
+fn test_misalign_lwu() {
+    run_program("./program_artifacts/asm/misalign_lwu.elf");
+}
+
+#[test]
+fn test_misalign_ld() {
+    run_program("./program_artifacts/asm/misalign_ld.elf");
+}
+
+#[test]
+fn test_misalign_sh() {
+    run_program("./program_artifacts/asm/misalign_sh.elf");
+}
+
+#[test]
+fn test_misalign_sw() {
+    run_program("./program_artifacts/asm/misalign_sw.elf");
+}
+
+#[test]
+fn test_misalign_sd() {
+    run_program("./program_artifacts/asm/misalign_sd.elf");
+}
+
+#[test]
+fn test_misaligned_pc_traps() {
+    let elf_data = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let err = loop {
+        match executor.resume() {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("expected misaligned PC trap, program halted normally"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(err, ExecutorError::InstructionAddressMisaligned(2)),
+        "expected InstructionAddressMisaligned(2), got {:?}",
+        err
+    );
 }
 
 #[test]
