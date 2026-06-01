@@ -154,18 +154,7 @@ impl FlamegraphGenerator {
 /// Demangle a Rust symbol name using the official rustc-demangle crate.
 ///
 /// Uses the alternate format (`{:#}`) to omit the hash suffix for cleaner output.
-fn demangle(name: &str) -> String {
+pub(crate) fn demangle(name: &str) -> String {
     // Use rustc-demangle with alternate format to omit hash
     format!("{:#}", rustc_demangle(name))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_demangle_simple() {
-        assert_eq!(demangle("main"), "main");
-        assert_eq!(demangle("_start"), "_start");
-    }
 }

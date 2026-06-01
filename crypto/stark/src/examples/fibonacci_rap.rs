@@ -13,9 +13,17 @@ use crate::{
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
-    helpers::resize_to_next_power_of_two,
     traits::ByteConversion,
 };
+
+/// Pads each trace column with zeros up to the next power of two so the
+/// radix-2 FFT can be applied. Local to this example — the production
+/// prover sizes its traces directly.
+fn resize_to_next_power_of_two<F: IsFFTField>(trace_columns: &mut [Vec<FieldElement<F>>]) {
+    for col in trace_columns.iter_mut() {
+        col.resize(col.len().next_power_of_two(), FieldElement::<F>::zero());
+    }
+}
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {

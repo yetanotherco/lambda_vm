@@ -1,13 +1,13 @@
 //! Tests for the DECODE table.
 
-use executor::elf::Elf;
+use executor::elf::{Elf, Segment};
 use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 
 use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
-    update_multiplicities,
+    tables_from_elf, update_multiplicities,
 };
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, packed_decode as bits};
@@ -1064,10 +1064,12 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1080,4 +1082,76 @@ fn test_decode_soundness_same_elf_accepted() {
 
     // With same ELF, verification should SUCCEED
     assert!(result, "Verifier with same ELF should ACCEPT the proof");
+}
+
+#[test]
+fn test_tables_from_elf_single_executable_segment() {
+    // ADDI x1, x0, 42  (opcode: 0x02a00093)
+    // ADDI x2, x1, 10  (opcode: 0x00a08113)
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![Segment {
+            base_addr: 0x1000,
+            values: vec![0x02a00093, 0x00a08113],
+            is_executable: true,
+        }],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // Check DECODE table
+    assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
+    assert!(tables.pc_to_row.contains_key(&0x1000));
+    assert!(tables.pc_to_row.contains_key(&0x1004));
+    assert!(
+        tables
+            .pc_to_row
+            .contains_key(&crate::tables::cpu::CPU_PADDING_PC)
+    );
+}
+
+#[test]
+fn test_tables_from_elf_mixed_segments() {
+    // Executable segment with instructions
+    // Data segment with data (not included in DECODE)
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![
+            Segment {
+                base_addr: 0x1000,
+                values: vec![0x02a00093], // ADDI instruction
+                is_executable: true,
+            },
+            Segment {
+                base_addr: 0x2000,
+                values: vec![0xDEADBEEF, 0xCAFEBABE], // Data
+                is_executable: false,
+            },
+        ],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // DECODE: only executable segment (1 instruction + CPU padding)
+    assert_eq!(tables.pc_to_row.len(), 2);
+    assert!(tables.pc_to_row.contains_key(&0x1000));
+    assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
+}
+
+#[test]
+fn test_tables_from_elf_empty() {
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // DECODE: only CPU padding entry
+    assert_eq!(tables.pc_to_row.len(), 1);
+    assert!(
+        tables
+            .pc_to_row
+            .contains_key(&crate::tables::cpu::CPU_PADDING_PC)
+    );
 }

@@ -67,10 +67,12 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -496,6 +498,217 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 }
 
+// Misaligned load/store regression tests. Each program issues one load or
+// store whose effective address is not naturally aligned to the access width,
+// crossing one or more 4-byte cell boundaries in the executor's memory map.
+#[test]
+fn test_prove_elfs_misalign_lh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lhu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lhu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lhu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lwu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lwu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lwu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_ld() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_ld");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_ld failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sd() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sd");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sd failed"
+    );
+}
+
+// MULW where the 32-bit product overflows past bit 31.
+#[test]
+fn test_prove_elfs_mulw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_overflow failed"
+    );
+}
+
+// DIVUW where the 32-bit unsigned quotient has bit 31 set.
+#[test]
+fn test_prove_elfs_divuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("divuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw_high_bit failed"
+    );
+}
+
+// REMUW where the 32-bit unsigned remainder has bit 31 set.
+#[test]
+fn test_prove_elfs_remuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("remuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw_high_bit failed"
+    );
+}
+
+// MULW base case (no 32-bit overflow).
+#[test]
+fn test_prove_elfs_mulw() {
+    let (elf, logs, instructions) = run_asm_elf("mulw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw failed"
+    );
+}
+
+// DIVW signed-overflow edge case: i32::MIN / -1 returns i32::MIN per RISC-V spec.
+#[test]
+fn test_prove_elfs_divw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("divw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_overflow failed"
+    );
+}
+
+// DIVW divide-by-zero: quotient = -1 (all ones sign-extended).
+#[test]
+fn test_prove_elfs_divw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("divw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_zero failed"
+    );
+}
+
+// REMW signed-overflow edge case: i32::MIN % -1 returns 0 per RISC-V spec.
+#[test]
+fn test_prove_elfs_remw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("remw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_overflow failed"
+    );
+}
+
+// REMW divide-by-zero: remainder = dividend.
+#[test]
+fn test_prove_elfs_remw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("remw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_zero failed"
+    );
+}
+
+// DIVUW base case (no high-bit set in quotient).
+#[test]
+fn test_prove_elfs_divuw() {
+    let (elf, logs, instructions) = run_asm_elf("divuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw failed"
+    );
+}
+
+// REMUW base case (no high-bit set in remainder).
+#[test]
+fn test_prove_elfs_remuw() {
+    let (elf, logs, instructions) = run_asm_elf("remuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_test_shift_8() {
     let (elf, logs, instructions) = run_asm_elf("test_shift_8");
@@ -881,10 +1094,12 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1617,10 +1832,12 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1672,10 +1889,12 @@ fn test_deep_stack_missing_pages_rejected() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1762,10 +1981,12 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
