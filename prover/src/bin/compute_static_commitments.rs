@@ -7,6 +7,10 @@
 //!
 //! Run with:
 //!     cargo run --bin compute_static_commitments --release
+//!
+//! ⚠️  Do not run this just to silence a failing drift test — see the
+//! "Regenerating" section on `static_commitment` in `bitwise.rs` and
+//! `keccak_rc.rs` for when it's actually appropriate to bless new bytes.
 
 use lambda_vm_prover::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc};
 use stark::config::Commitment;

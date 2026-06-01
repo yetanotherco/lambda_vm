@@ -78,6 +78,23 @@ pub const fn generate_row(round: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
 /// pins) and pinned by `keccak_rc_static_matches_recompute_*` tests so any
 /// drift in the AIR or FFT pipeline is caught at test time. The verifier
 /// reads these from its compiled binary — no input data is trusted.
+///
+/// # Regenerating
+///
+/// Only regenerate these match arms after a *deliberate, reviewed* change
+/// to the KECCAK_RC table layout, the AIR's preprocessed column count, or
+/// the FFT / LDE / Merkle pipeline. Run:
+///
+/// ```text
+/// cargo run --bin compute_static_commitments --release
+/// ```
+///
+/// and paste the printed match arms over the ones below.
+///
+/// **If a drift test failed, do not regenerate first.** The drift tests
+/// exist to force a human to ask "why did this change?" before the new
+/// bytes get blessed. Re-pasting on a drift failure silently launders an
+/// unintended table change into the verifier's compiled-in trust anchor.
 fn static_commitment(blowup_factor: u8) -> Option<Commitment> {
     match blowup_factor {
         2 => Some([
