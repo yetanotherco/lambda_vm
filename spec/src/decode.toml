@@ -25,7 +25,7 @@ A list of each variable and the bit(-range) in which it is located:\\
 [10:17] `rs1`, \\
 [18:25] `rs2`, \\
 [26:33] `rd`, \\
-[34:41] `instruction_length`, \\
+[34:41] `half_instruction_length`, \\
 [42:49] `alu_flags`, \\
 [50:57] `mem_flags`, \\
 the remaining bits are set to zero.

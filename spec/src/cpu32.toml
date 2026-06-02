@@ -13,10 +13,10 @@ desc = "The PC at which the instruction occurs"
 pad = 0
 
 [[variables.output]]
-name = "instruction_length"
+name = "half_instruction_length"
 type = "Byte"
 desc = "The length of this instruction"
-pad = 4
+pad = 2
 
 [[variables.auxiliary]]
 name = "rs1"
@@ -160,7 +160,7 @@ def = ["+",
     ["*", ["^", 2, 10], "rs1"],
     ["*", ["^", 2, 18], "rs2"],
     ["*", ["^", 2, 26], "rd"],
-    ["*", ["^", 2, 34], "instruction_length"],
+    ["*", ["^", 2, 34], "half_instruction_length"],
     ["*", ["^", 2, 42], "alu_flags"],
 ]
 
@@ -225,7 +225,7 @@ input = ["write_register"]
 [[constraints.range]]
 kind = "template"
 tag = "IS_BYTE"
-input = ["instruction_length"]
+input = ["half_instruction_length"]
 
 [[constraints.range]]
 kind = "template"
@@ -354,7 +354,7 @@ name = "logup"
 kind = "interaction"
 tag = "CPU32"
 input = ["timestamp", "pc"]
-output = "instruction_length"
+output = "half_instruction_length"
 multiplicity = ["-", "μ"]
 
 [[constraint_groups]]

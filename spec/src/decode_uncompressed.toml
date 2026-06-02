@@ -76,9 +76,9 @@ type = "Bit"
 desc = "Perform an ECALL"
 
 [[variables.output]]
-name = "instruction_length"
+name = "half_instruction_length"
 type = "Byte"
-desc = "How many bytes is this instruction in the program"
+desc = "Half of how many bytes this instruction takes up in the program"
 
 [[variables.auxiliary]]
 name = "alu_op"

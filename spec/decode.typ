@@ -171,8 +171,9 @@ this by having no valid decoding available for when the instruction is encounter
 == C-type instructions
 The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size.
 This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by $2$ rather than $4$.
-As such, we provide the `instruction_length` column that *must take on the value $2$ for compressed instructions and $4$ for regular instructions*.
-This additionally opens the door for future optimizations involving "fused" instructions, where common sequences
+As such, we provide the `half_instruction_length` column that *must take on the value $1$ for compressed instructions and $2$ for regular instructions*.
+It is represented as half the number of bytes in the instruction to make misaligned instructions lengths unrepresentable.
+Additionally, having the variable opens the door for future optimizations involving "fused" instructions, where common sequences
 of instructions are merged into a single decoded version and need only a single CPU row to prove.
 
 // Construct a note that can be referenced through `lbl`
@@ -215,7 +216,7 @@ We note the following about the above decoding table:
   enum.item(
     referenceable_note(
       "note-jal",
-      [`JAL`: this operation stores $#`pc` + #`instruction_length`$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
+      [`JAL`: this operation stores $#`pc` + #`2 * half_instruction_length`$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
       Note that this can be represented using `JALR rd, x255, imm`.
       As such, *we expect the decoding to take care of writing the immediate in bit range $[1:21]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*]
     )

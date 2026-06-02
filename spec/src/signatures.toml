@@ -49,7 +49,7 @@ tag = "DECODE"
 kind = "interaction"
 input = ["DWordWL", "DWordWL", "BaseField"]
 
-# CPU32[instruction_length; timestamp, pc]
+# CPU32[half_instruction_length; timestamp, pc]
 [[signatures]]
 tag = "CPU32"
 kind = "interaction"
