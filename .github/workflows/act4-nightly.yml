@@ -14,7 +14,14 @@ concurrency:
 
 jobs:
   test:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # ACT4 is independent of the benchmark outcome; the workflow_run trigger is
+    # only used to serialize on the shared bench runner. Run on any benchmark
+    # conclusion, skipping only cases where re-running is pointless: 'cancelled'
+    # (a newer bench run is already on its way) and 'skipped' (nothing ran).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion != 'cancelled' &&
+       github.event.workflow_run.conclusion != 'skipped')
     runs-on: [self-hosted, bench]
     timeout-minutes: 360
     permissions:
