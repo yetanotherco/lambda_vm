@@ -325,6 +325,15 @@ pub(crate) struct Round3<F: IsField> {
     composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
 }
 
+/// DEEP composition coefficients derived from the challenge 𝛾, sampled at the end
+/// of Rounds 2-3 so Round 4 only builds the DEEP LDE and runs FRI.
+pub(crate) struct DeepCoeffs<E: IsField> {
+    /// Coefficients for the composition-polynomial-part terms.
+    gammas: Vec<FieldElement<E>>,
+    /// Per-trace-column coefficient chunks for the trace terms.
+    trace_term_coeffs: Vec<Vec<FieldElement<E>>>,
+}
+
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
@@ -1036,29 +1045,24 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the fourth round of the STARK Prove protocol.
-    fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+    /// Sample the DEEP composition challenge 𝛾 and expand it into the per-trace-term
+    /// and per-composition-part coefficients. Done at the end of Rounds 2-3 (from the
+    /// table's fork) so Round 4 only builds the DEEP LDE and runs FRI.
+    fn sample_deep_coeffs(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
         round_2_result: &Round2<FieldExtension>,
-        round_3_result: &Round3<FieldExtension>,
-        z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Round4<Field, FieldExtension>
+    ) -> DeepCoeffs<FieldExtension>
     where
         FieldElement<FieldExtension>: AsBytes,
         FieldElement<Field>: AsBytes,
     {
-        let coset_offset_u64 = air.context().proof_options.coset_offset;
-        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
-
         let gamma = transcript.sample_field_element();
 
         let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
 
-        // <<<< Receive challenges: 𝛾, 𝛾'
         let mut deep_composition_coefficients: Vec<_> =
             core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
                 .take(n_terms_composition_poly + num_terms_trace)
@@ -1071,8 +1075,31 @@ pub trait IsStarkProver<
             .map(|chunk| chunk.to_vec())
             .collect();
 
-        // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
+
+        DeepCoeffs {
+            gammas,
+            trace_term_coeffs,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        deep_coeffs: &DeepCoeffs<FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Round4<Field, FieldExtension>
+    where
+        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes,
+    {
+        let coset_offset_u64 = air.context().proof_options.coset_offset;
+        let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
 
         // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
         #[cfg(feature = "instruments")]
@@ -1084,8 +1111,8 @@ pub trait IsStarkProver<
             z,
             domain,
             &domain.trace_primitive_root,
-            &gammas,
-            &trace_term_coeffs,
+            &deep_coeffs.gammas,
+            &deep_coeffs.trace_term_coeffs,
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
@@ -1884,7 +1911,7 @@ pub trait IsStarkProver<
                         table_transcript.append_field_element(&bpi.table_contribution);
                     }
 
-                    let (round_2_result, round_3_result, z) = Self::prove_rounds_2_to_3(
+                    let (round_2_result, round_3_result, z, deep_coeffs) = Self::prove_rounds_2_to_3(
                         *air,
                         *pub_inputs,
                         &round_1_result,
@@ -1905,9 +1932,9 @@ pub trait IsStarkProver<
                     };
 
                     #[cfg(feature = "instruments")]
-                    return Ok((round_1_result, round_2_result, round_3_result, z, instr1));
+                    return Ok((round_1_result, round_2_result, round_3_result, z, deep_coeffs, instr1));
                     #[cfg(not(feature = "instruments"))]
-                    Ok((round_1_result, round_2_result, round_3_result, z))
+                    Ok((round_1_result, round_2_result, round_3_result, z, deep_coeffs))
                 })
                 .collect()
             };
@@ -1937,9 +1964,9 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
 
                     #[cfg(feature = "instruments")]
-                    let (round_1_result, round_2_result, round_3_result, z, instr1) = intermediate;
+                    let (round_1_result, round_2_result, round_3_result, z, deep_coeffs, instr1) = intermediate;
                     #[cfg(not(feature = "instruments"))]
-                    let (round_1_result, round_2_result, round_3_result, z) = intermediate;
+                    let (round_1_result, round_2_result, round_3_result, z, deep_coeffs) = intermediate;
 
                     #[cfg(feature = "instruments")]
                     let t_pass2 = Instant::now();
@@ -1951,6 +1978,7 @@ pub trait IsStarkProver<
                         round_2_result,
                         round_3_result,
                         &z,
+                        &deep_coeffs,
                         table_transcript,
                         domain,
                     )?;
@@ -2058,6 +2086,7 @@ pub trait IsStarkProver<
             Round2<FieldExtension>,
             Round3<FieldExtension>,
             FieldElement<FieldExtension>,
+            DeepCoeffs<FieldExtension>,
         ),
         ProvingError,
     >
@@ -2141,7 +2170,11 @@ pub trait IsStarkProver<
             transcript.append_field_element(element);
         }
 
-        Ok((round_2_result, round_3_result, z))
+        // <<<< Receive challenge: 𝛾 (DEEP) — sampled here so Round 4 only builds the
+        //      DEEP LDE and runs FRI. Same transcript position as before the split.
+        let deep_coeffs = Self::sample_deep_coeffs(air, &round_2_result, transcript);
+
+        Ok((round_2_result, round_3_result, z, deep_coeffs))
     }
 
 
@@ -2159,6 +2192,7 @@ pub trait IsStarkProver<
         round_2_result: Round2<FieldExtension>,
         round_3_result: Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
+        deep_coeffs: &DeepCoeffs<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
@@ -2181,6 +2215,7 @@ pub trait IsStarkProver<
             &round_2_result,
             &round_3_result,
             z,
+            deep_coeffs,
             transcript,
         );
 
