@@ -6,6 +6,7 @@ use std::time::Instant;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::cpu::two_half_fft::TwoHalfTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
@@ -267,10 +268,12 @@ where
 ///
 /// The `coset_weights` vector stores `[n_inv, n_inv*g, n_inv*g², ..., n_inv*g^{n-1}]`
 /// where `g` is the coset offset and `n_inv = 1/n`. These are used in the iFFT+coset-shift
-/// step of `expand_columns_to_lde`.
+/// step of the row-major LDE. `two_half_inv`/`two_half_fwd` are the precomputed
+/// cache-blocked-FFT twiddles for the size-`n` inverse and size-`n·blowup` forward
+/// transforms, shared across every row-major LDE call on this domain.
 pub struct LdeTwiddles<F: IsFFTField> {
-    inv: LayerTwiddles<F>,
-    fwd: LayerTwiddles<F>,
+    two_half_inv: TwoHalfTwiddles<F>,
+    two_half_fwd: TwoHalfTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
 }
 
@@ -295,10 +298,10 @@ impl<F: IsFFTField> LdeTwiddles<F> {
         };
 
         Self {
-            inv: LayerTwiddles::<F>::new_inverse(domain_size.trailing_zeros() as u64)
-                .expect("valid inverse twiddles"),
-            fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
-                .expect("valid forward twiddles"),
+            two_half_inv: TwoHalfTwiddles::<F>::new(domain_size.trailing_zeros() as usize, true)
+                .expect("valid inverse two-half twiddles"),
+            two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
+                .expect("valid forward two-half twiddles"),
             coset_weights,
         }
     }
@@ -615,10 +618,12 @@ pub trait IsStarkProver<
         Some(commitment)
     }
 
-    /// Compute LDE evaluations with pre-computed twiddle factors and coset weights.
-    ///
-    /// Accepts shared [`LdeTwiddles`] to avoid redundant twiddle generation and weight
-    /// computation across phases (A, C, Rounds 2-4).
+    /// Compute LDE evaluations with pre-computed coset weights, via the
+    /// per-column `coset_lde_full`. Used only by the testing helper
+    /// `compute_precomputed_commitment_for_testing`; the production prover uses
+    /// the row-major `expand_to_lde_row_major`. The per-column `LayerTwiddles`
+    /// are built here (rather than cached on `LdeTwiddles`) so the production
+    /// twiddle cache stays lean.
     fn compute_lde_from_columns_cached<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -633,6 +638,13 @@ pub trait IsStarkProver<
             return Vec::new();
         }
 
+        let domain_size = domain.interpolation_domain_size;
+        let lde_size = domain_size * domain.blowup_factor;
+        let inv = LayerTwiddles::<Field>::new_inverse(domain_size.trailing_zeros() as u64)
+            .expect("valid inverse twiddles");
+        let fwd = LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64)
+            .expect("valid forward twiddles");
+
         #[cfg(not(feature = "parallel"))]
         let columns_iter = columns.iter();
         #[cfg(feature = "parallel")]
@@ -644,8 +656,8 @@ pub trait IsStarkProver<
                     col,
                     domain.blowup_factor,
                     &twiddles.coset_weights,
-                    &twiddles.inv,
-                    &twiddles.fwd,
+                    &inv,
+                    &fwd,
                 )
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
@@ -654,8 +666,10 @@ pub trait IsStarkProver<
 
     /// Expand each column in-place from N evaluations to N×blowup LDE evaluations.
     ///
-    /// Performs iFFT + coset shift + FFT in place. Coset weights are pre-cached in
-    /// `LdeTwiddles` to avoid recomputation across phases.
+    /// Performs iFFT + coset shift + FFT in place via the per-column
+    /// `coset_lde_full_expand`. The production prover uses the row-major
+    /// `expand_to_lde_row_major`; the per-column `LayerTwiddles` are built here
+    /// so the production twiddle cache stays lean.
     fn expand_columns_to_lde<E>(
         columns: &mut [Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -669,6 +683,13 @@ pub trait IsStarkProver<
             return;
         }
 
+        let domain_size = domain.interpolation_domain_size;
+        let lde_size = domain_size * domain.blowup_factor;
+        let inv = LayerTwiddles::<Field>::new_inverse(domain_size.trailing_zeros() as u64)
+            .expect("valid inverse twiddles");
+        let fwd = LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64)
+            .expect("valid forward twiddles");
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
@@ -678,8 +699,8 @@ pub trait IsStarkProver<
                 buf,
                 domain.blowup_factor,
                 &twiddles.coset_weights,
-                &twiddles.inv,
-                &twiddles.fwd,
+                &inv,
+                &fwd,
             )
             .expect("coset LDE expansion");
         });
@@ -721,8 +742,8 @@ pub trait IsStarkProver<
             num_cols,
             domain.blowup_factor,
             &twiddles.coset_weights,
-            &twiddles.inv,
-            &twiddles.fwd,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
         )
         .expect("row-major coset LDE expansion");
 

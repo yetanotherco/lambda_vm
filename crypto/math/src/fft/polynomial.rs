@@ -9,6 +9,7 @@ use alloc::{vec, vec::Vec};
 use super::cpu::{
     bit_reversing::in_place_bit_reverse_permute,
     bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
+    two_half_fft::{TwoHalfTwiddles, fft_batch_two_half},
 };
 
 #[cfg(feature = "parallel")]
@@ -305,13 +306,15 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///   6. bit-reverse rows
     ///
     /// `weights` must be `n` base-field elements in natural row order.
+    /// `inv_twiddles` are the size-`n` inverse two-half twiddles; `fwd_twiddles`
+    /// the size-`n·blowup_factor` forward ones.
     pub fn coset_lde_full_expand_row_major<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         buffer: &mut Vec<FieldElement<E>>,
         num_cols: usize,
         blowup_factor: usize,
         weights: &[FieldElement<F>],
-        inv_twiddles: &LayerTwiddles<F>,
-        fwd_twiddles: &LayerTwiddles<F>,
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
     ) -> Result<(), FFTError>
     where
         E: Send + Sync,
@@ -339,11 +342,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         //    — the 1/n is folded into the coset-weight pass below). Replaces the
         //    flat-Bowers iFFT, which cache-thrashes at large n.
         let prefix_len = n * num_cols;
-        let _ = inv_twiddles;
-        crate::fft::cpu::four_step_fft::ifft_batch_two_half::<F, E>(
-            &mut buffer[..prefix_len],
-            num_cols,
-        )?;
+        fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
 
         // 2. Scale by coset weights — one weight per row, multiply M elements
         //    of that row by it. Each row is independent → parallelizable.
@@ -376,8 +375,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
         //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
-        let _ = fwd_twiddles;
-        crate::fft::cpu::four_step_fft::fft_batch_two_half::<F, E>(buffer, num_cols)?;
+        fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
 
         Ok(())
     }
@@ -564,6 +562,7 @@ mod tests {
     #[test]
     fn coset_lde_full_expand_row_major_matches_single_column_per_column() {
         use crate::fft::cpu::bowers_fft::LayerTwiddles;
+        use crate::fft::cpu::two_half_fft::TwoHalfTwiddles;
 
         for log_n in 2..=8 {
             let n = 1usize << log_n;
@@ -571,6 +570,9 @@ mod tests {
                 let lde_size = n * blowup_factor;
                 let inv_tw = LayerTwiddles::<F>::new_inverse(log_n as u64).unwrap();
                 let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+                let two_inv = TwoHalfTwiddles::<F>::new(log_n, true).unwrap();
+                let two_fwd =
+                    TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false).unwrap();
 
                 // Reproduce the weights from the existing coset test.
                 let offset = FE::from(3u64);
@@ -625,8 +627,8 @@ mod tests {
                         m,
                         blowup_factor,
                         &weights,
-                        &inv_tw,
-                        &fwd_tw,
+                        &two_inv,
+                        &two_fwd,
                     )
                     .unwrap();
                     assert_eq!(row_major.len(), lde_size * m);
