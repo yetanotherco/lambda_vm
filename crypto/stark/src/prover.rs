@@ -1964,22 +1964,31 @@ pub trait IsStarkProver<
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
-    /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
-    /// Warning: the transcript must be safely initializated before passing it to this method.
-    fn prove_rounds_2_to_4(
+    /// Rounds 2-3 (per-table): build the composition polynomial (Round 2) and
+    /// evaluate it plus the trace at the out-of-domain point `z` (Round 3),
+    /// appending the composition root and OOD evaluations to `transcript`.
+    /// No FRI is run here — Round 4 (per-table today, per-chunk batched FRI in
+    /// streaming) consumes the returned `(Round2, Round3, z)`.
+    #[allow(clippy::type_complexity)]
+    fn prove_rounds_2_to_3(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
-    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    ) -> Result<
+        (
+            Round2<FieldExtension>,
+            Round3<FieldExtension>,
+            FieldElement<FieldExtension>,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        info!("Started proof generation...");
-
         // ===================================
         // ==========|   Round 2   |==========
         // ===================================
@@ -2040,7 +2049,7 @@ pub trait IsStarkProver<
             &z,
         );
         #[cfg(feature = "instruments")]
-        let round_3_dur = t_r3.elapsed();
+        crate::instruments::store_r3_ood(t_r3.elapsed());
 
         // >>>> Send values: tⱼ(zgᵏ)
         let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
@@ -2054,6 +2063,29 @@ pub trait IsStarkProver<
         for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
             transcript.append_field_element(element);
         }
+
+        Ok((round_2_result, round_3_result, z))
+    }
+
+
+    /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
+    /// Warning: the transcript must be safely initializated before passing it to this method.
+    fn prove_rounds_2_to_4(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &Round1<Field, FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        domain: &Domain<Field>,
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        info!("Started proof generation...");
+
+        let (round_2_result, round_3_result, z) =
+            Self::prove_rounds_2_to_3(air, pub_inputs, round_1_result, transcript, domain)?;
 
         // ===================================
         // ==========|   Round 4   |==========
@@ -2083,7 +2115,7 @@ pub trait IsStarkProver<
                 constraints: r2_constraints,
                 comp_decompose: r2_fft,
                 comp_commit: r2_merkle,
-                ood: round_3_dur,
+                ood: crate::instruments::take_r3_ood().unwrap_or(zero),
                 deep_comp: r4_deep_comp,
                 deep_extend: r4_fft,
                 fri_commit: r4_merkle,

@@ -86,6 +86,8 @@ thread_local! {
     static R2_SUB: RefCell<Option<(Duration, Duration, Duration)>> = const { RefCell::new(None) };
     /// Round 4 sub-timings: (fft, merkle, deep_comp, queries)
     static R4_SUB: RefCell<Option<(Duration, Duration, Duration, Duration)>> = const { RefCell::new(None) };
+    /// Round 3 OOD evaluation timing.
+    static R3_OOD: RefCell<Option<Duration>> = const { RefCell::new(None) };
     /// Assembled sub-ops from prove_rounds_2_to_4 (without reconstruct_round1 LDE time).
     static ROUND_SUB_OPS: RefCell<Option<TableSubOps>> = const { RefCell::new(None) };
 }
@@ -141,6 +143,9 @@ pub fn reset_all() {
     R4_SUB.with(|cell| {
         cell.borrow_mut().take();
     });
+    R3_OOD.with(|cell| {
+        cell.borrow_mut().take();
+    });
     ROUND_SUB_OPS.with(|cell| {
         cell.borrow_mut().take();
     });
@@ -152,6 +157,14 @@ pub fn store_r2_sub(constraints: Duration, fft: Duration, merkle: Duration) {
 
 pub fn take_r2_sub() -> Option<(Duration, Duration, Duration)> {
     R2_SUB.with(|cell| cell.borrow_mut().take())
+}
+
+pub fn store_r3_ood(d: Duration) {
+    R3_OOD.with(|cell| *cell.borrow_mut() = Some(d));
+}
+
+pub fn take_r3_ood() -> Option<Duration> {
+    R3_OOD.with(|cell| cell.borrow_mut().take())
 }
 
 pub fn store_r4_sub(fft: Duration, merkle: Duration, deep_comp: Duration, queries: Duration) {
