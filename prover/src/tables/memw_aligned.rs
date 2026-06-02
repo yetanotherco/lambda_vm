@@ -181,8 +181,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts.
-    // (shrink-cpu: the dedicated `Lt` bus was removed; every LT lookup goes
-    // through the unified ALU bus with signed=0/invert=0.)
+    // (Every LT lookup goes through the unified ALU bus with
+    // signed=0/invert=0; there is no dedicated `Lt` bus.)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Alu,

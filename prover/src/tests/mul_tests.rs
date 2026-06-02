@@ -254,8 +254,8 @@ fn test_different_signed_flags_separate_rows() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Expected interactions (shrink-cpu: every MUL lookup goes through the
-    // unified ALU bus — CPU MUL/MULH dispatch and dvrm's `d*q` consistency):
+    // Expected interactions (every MUL lookup goes through the unified ALU
+    // bus — CPU MUL/MULH dispatch and dvrm's `d*q` consistency):
     // - 2x MSB16 senders (lhs sign, rhs sign)
     // - 8x IS_HALF senders (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)

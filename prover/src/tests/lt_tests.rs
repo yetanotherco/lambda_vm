@@ -164,7 +164,7 @@ fn test_bus_interactions_count() {
     let interactions = bus_interactions();
     // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1])
     // + ALU receiver x1 (every LT lookup goes through the unified ALU bus
-    // in shrink-cpu — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
+    // — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
     // timestamp / |r|<|d| checks) = 9.
     assert_eq!(interactions.len(), 9);
 }

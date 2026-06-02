@@ -1,4 +1,4 @@
-//! Tests for the reworked `packed_decode` layout (shrink-cpu).
+//! Tests for the `packed_decode` layout.
 //!
 //! These validate the single source of truth (`types::packed_decode_shrunk`,
 //! `build_alu_flags`/`build_mem_flags`, `ShrunkDecode`) before it is wired into
@@ -470,7 +470,7 @@ fn test_from_instruction_branches_set_branch_and_alu() {
 
 #[test]
 fn test_from_instruction_jumps() {
-    // JAL → BRANCH + JALR bit, no ALU op (spec c9540a55), rs1 = x255.
+    // JAL → BRANCH + JALR bit, no ALU op, rs1 = x255.
     let d = ShrunkDecode::from_instruction(Instruction::JumpAndLink { dst: 1, offset: 32 }, 4);
     assert!(d.branch && d.write_register && d.read_register1);
     assert!(!d.add && !d.sub && !d.alu);
@@ -480,7 +480,7 @@ fn test_from_instruction_jumps() {
         build_mem_flags(true, false, false, false, false)
     );
 
-    // JALR → BRANCH + JALR bit, no ALU op (spec c9540a55), rs1 = base.
+    // JALR → BRANCH + JALR bit, no ALU op, rs1 = base.
     let d = ShrunkDecode::from_instruction(
         Instruction::JumpAndLinkRegister {
             base: 9,

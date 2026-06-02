@@ -74,7 +74,7 @@ pub mod cols {
     // Multiplicity
     pub const MU: usize = 25;
 
-    // shrink-cpu rework: the unified ALU bus carries the full (un-reduced) shift
+    // The unified ALU bus carries the full (un-reduced) shift
     // amount `arg2` as in2. This mirrors the spec's `shift : DWordWHBB` layout
     // `[Byte, Byte, Half, Word]`: SHIFT_AMOUNT (col 4) = shift[0] (low byte, used
     // by the computation, which reduces mod 32/64), then SHIFT_B1 = shift[1],
@@ -603,7 +603,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Unified ALU receiver (shrink-cpu): the CPU dispatches SLL/SRL/SRA here.
+    // Unified ALU receiver: the CPU dispatches SLL/SRL/SRA here.
     // ALU[out::DWordWL; in1=in, in2=shift_amount, flags] where
     //   flags = opsel(SHIFT=5, +word_instr→SHIFTW=6) + 32*signed + 64*direction.
     // in2 = the full shift amount: [SHIFT_AMOUNT + 256*SHIFT_B1 + 2^16*SHIFT_H1,

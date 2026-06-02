@@ -1,9 +1,8 @@
-//! CPU table for the 64-bit VM (shrink-cpu rework).
+//! CPU table for the 64-bit VM.
 //!
-//! The CPU table is the central execution table. After the `shrink-cpu` rework
-//! (`spec/src/cpu.toml`) it is much narrower (~39 columns vs. the old ~76): the
-//! 16 one-hot ALU selectors and the `*_ext_bit`/`arg1` columns are gone. Instead
-//! each row carries:
+//! The CPU table is the central execution table. Following `spec/src/cpu.toml`
+//! it is narrow (~39 columns): there are no per-opcode one-hot ALU selectors and
+//! no `*_ext_bit`/`arg1` columns. Instead each row carries:
 //! - top-level flags `ALU/ADD/SUB/MEMORY/BRANCH/ECALL` (+ `word_instr`),
 //! - the packed `alu_flags`/`mem_flags` bytes (the chips unpack them), and
 //! - register indices + read/write flags.
@@ -41,7 +40,7 @@ use stark::trace::TraceTable;
 pub const CPU_PADDING_PC: u64 = 1;
 
 // =========================================================================
-// Column indices for the CPU table (shrink-cpu layout)
+// Column indices for the CPU table
 // =========================================================================
 
 /// Column definitions for the CPU table.
@@ -72,7 +71,7 @@ pub mod cols {
     pub const IMM_1: usize = 10;
 
     /// half_instruction_length: half the bytes consumed (Byte; 1 or 2). The real
-    /// length is `2 * half_instruction_length` (spec `b1b51c9d`).
+    /// length is `2 * half_instruction_length`.
     pub const HALF_INSTRUCTION_LENGTH: usize = 11;
     /// word_instr: `*W` instruction (delegated to CPU32) (Bit).
     pub const WORD_INSTR: usize = 12;
@@ -216,7 +215,7 @@ impl CpuOperation {
     /// Creates a CpuOperation from an executor Log and a DecodeEntry.
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let f = decode.fields;
-        // Real byte length: the column stores half (spec `b1b51c9d`).
+        // Real byte length: the column stores half.
         let instruction_length = 2 * f.half_instruction_length as u64;
 
         // ECALL syscall classification (rv1 = a7 = syscall number).
@@ -264,7 +263,7 @@ impl CpuOperation {
 
         let jalr = f.mem_flags & 1 == 1;
 
-        // arg2 multiplex (CPU-A1), matching `cpu.toml` (spec `c9540a55`):
+        // arg2 multiplex (CPU-A1), matching `cpu.toml`:
         //   MEMORY -> imm
         //   BRANCH -> rv2                 (JAL/JALR read no rs2, so rv2 = 0)
         //   else   -> rv2 + imm           (≤1 nonzero by decode A2)
@@ -306,7 +305,7 @@ impl CpuOperation {
 
         // rvd: loaded value for LOAD; 0 for STORE (output unused); the return
         // address `pc + instruction_length` on every BRANCH row (written to `rd`
-        // only by JAL/JALR — `cpu.toml` branch group, spec `c9540a55`); `res`
+        // only by JAL/JALR — `cpu.toml` branch group); `res`
         // otherwise. The spec computes this `pc + len` via the ADD chip gated on
         // `BRANCH`; we pin it with [`BranchRvdConstraint`] (carry-omitting, like
         // `next_pc`). For conditional branches `rvd` is computed but never
@@ -608,7 +607,7 @@ fn res_cast_wl() -> BusValue {
     }
 }
 
-/// Returns the bus interactions for the CPU table (shrink-cpu layout).
+/// Returns the bus interactions for the CPU table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode_shrunk as pd;
 

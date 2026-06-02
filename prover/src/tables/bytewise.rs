@@ -1,4 +1,4 @@
-//! BYTEWISE ALU table — shrink-cpu rework.
+//! BYTEWISE ALU table.
 //!
 //! Computes a full-word bitwise `AND`/`OR`/`XOR` of two 64-bit values by
 //! decomposing them into bytes and delegating each byte to the `BYTE_ALU`

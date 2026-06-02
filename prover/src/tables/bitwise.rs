@@ -92,11 +92,11 @@ pub mod cols {
     pub const MU_IS_B20: usize = 19;
     /// Multiplicity for HWSL lookups
     pub const MU_HWSL: usize = 20;
-    /// Multiplicity for `BYTE_ALU[opsel=AND]` lookups (shrink-cpu rework)
+    /// Multiplicity for `BYTE_ALU[opsel=AND]` lookups
     pub const MU_BYTE_ALU_AND: usize = 21;
-    /// Multiplicity for `BYTE_ALU[opsel=OR]` lookups (shrink-cpu rework)
+    /// Multiplicity for `BYTE_ALU[opsel=OR]` lookups
     pub const MU_BYTE_ALU_OR: usize = 22;
-    /// Multiplicity for `BYTE_ALU[opsel=XOR]` lookups (shrink-cpu rework)
+    /// Multiplicity for `BYTE_ALU[opsel=XOR]` lookups
     pub const MU_BYTE_ALU_XOR: usize = 23;
     /// Total number of columns
     pub const NUM_COLUMNS: usize = 24;
@@ -487,7 +487,7 @@ pub(crate) fn trim_zero_rows(
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
             // Check all multiplicity columns (MU_AND..=MU_BYTE_ALU_XOR), including
-            // the shrink-cpu BYTE_ALU columns (rows used only by a BYTE_ALU lookup
+            // the BYTE_ALU columns (rows used only by a BYTE_ALU lookup
             // must not be trimmed).
             (cols::MU_AND..=cols::MU_BYTE_ALU_XOR).any(|col| row_data[col] != FE::zero())
         })
@@ -530,7 +530,7 @@ pub enum BitwiseOperationType {
     IsHalf,
     IsB20,
     Hwsl,
-    // shrink-cpu rework: unified `BYTE_ALU` lookups, keyed by opsel.
+    // Unified `BYTE_ALU` lookups, keyed by opsel.
     ByteAluAnd,
     ByteAluOr,
     ByteAluXor,
@@ -822,7 +822,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // BYTE_ALU[opsel, X, Y] -> out (shrink-cpu rework).
+        // BYTE_ALU[opsel, X, Y] -> out.
         // Unifies AND/OR/XOR into one bus keyed by the `alu_op` descriptor.
         // Implemented as one receiver per opsel, reusing the precomputed
         // AND/OR/XOR result columns (the "single 2^20 column" in bitwise.typ is

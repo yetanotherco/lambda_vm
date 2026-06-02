@@ -1,4 +1,4 @@
-//! EQ (equality) comparison table — shrink-cpu rework.
+//! EQ (equality) comparison table.
 //!
 //! Computes `res = (a == b) XOR invert` for 64-bit `a`, `b`. Used by `BEQ`
 //! (`invert = 0`) and `BNE` (`invert = 1`); the CPU dispatches to it on the

@@ -1,4 +1,4 @@
-//! STORE table — shrink-cpu rework.
+//! STORE table.
 //!
 //! Receives the high-level `MEMORY` op from the CPU for store instructions and
 //! emits the low-level `MEMW` write. Spec: `spec/src/store.toml`.
@@ -6,10 +6,9 @@
 //! ## `memory_op` flag bit (spec-faithful)
 //! The `MEMORY` receiver flags are `1 + 4·write2 + 8·write4 + 16·write8`; the
 //! `+1` is `memory_op`, which balances against the CPU's `mem_flags`
-//! (`memory_op = 1` for stores). This matches `store.toml` — the `+1` was added
-//! upstream in PR #624 (`761abbd8`), resolving the former Q7 deviation.
+//! (`memory_op = 1` for stores). This matches `store.toml`.
 //!
-//! Note (Q8): the `MEMW` *write* fingerprint carries no `old` value — the
+//! Note: the `MEMW` *write* fingerprint carries no `old` value — the
 //! previous memory contents are handled inside the MEMW table. So STORE needs
 //! no `old` column (mirrors the current CPU store sender, `cpu.rs:1672-1748`).
 //!

@@ -97,7 +97,7 @@ fn test_zero_check() {
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
     // 10 legacy lookups (one per type; HWSLC merged into HWSL) + 3 BYTE_ALU
-    // receivers (opsel AND/OR/XOR) from the shrink-cpu rework.
+    // receivers (opsel AND/OR/XOR).
     assert_eq!(interactions.len(), 13);
 }
 

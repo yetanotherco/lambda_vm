@@ -605,7 +605,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // ALU receivers (shrink-cpu): every MUL lookup arrives here — CPU
+    // ALU receivers: every MUL lookup arrives here — CPU
     // MUL/MULH/MULHSU/MULHU dispatch and dvrm's internal `d*q` consistency.
     // ALU[lhs, rhs, flags, result] where flags =
     //   opsel(MUL) + 32*lhs_signed + 64*rhs_signed (+128 for the hi result).

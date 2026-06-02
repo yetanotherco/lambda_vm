@@ -1,4 +1,4 @@
-//! Tests for the DECODE table (shrink-cpu layout).
+//! Tests for the DECODE table.
 //!
 //! `decode_layout_tests` covers the `ShrunkDecode` pack/unpack/from_instruction
 //! bit layout in isolation; here we test the `DecodeEntry` wrapper (pc/imm

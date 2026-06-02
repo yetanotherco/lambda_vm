@@ -1,4 +1,4 @@
-//! Tests for the CPU table (shrink-cpu layout).
+//! Tests for the CPU table.
 //!
 //! Unit tests for the reworked `CpuOperation::from_log` (arg2 multiplex, res,
 //! rvd, branch decision, word-instruction delegation), `generate_cpu_trace`

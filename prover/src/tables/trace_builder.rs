@@ -2207,7 +2207,7 @@ pub struct Traces {
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    // shrink-cpu rework chips (split into chunks of their max_rows)
+    // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
     pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -2230,7 +2230,7 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
-    // shrink-cpu rework chips (driven by the CPU ALU/MEMORY dispatch).
+    // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
@@ -2336,7 +2336,7 @@ fn collect_all_ops(
         })
         .collect();
 
-    // Collect the shrink-cpu ALU/MEMORY chip ops (non-word rows).
+    // Collect the ALU/MEMORY chip ops (non-word rows).
     // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
     let eq_ops: Vec<eq::EqOperation> = cpu_ops
         .iter()
@@ -2466,7 +2466,7 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-    // shrink-cpu chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
+    // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
     for op in &bytewise_ops {
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
@@ -2594,8 +2594,8 @@ fn build_traces(
         storage_mode,
     )?;
 
-    // shrink-cpu rework chips. Not yet driven by the CPU dispatch (Phase A of the
-    // wire-up), so they are generated empty — one padded (μ=0) chunk each, which
+    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
+    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
     // contributes nothing to any bus.
     let eqs = chunk_and_generate::<eq::EqOperation>(
         &eq_ops,

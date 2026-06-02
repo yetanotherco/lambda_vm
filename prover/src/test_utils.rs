@@ -594,7 +594,7 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("SHIFT")
 }
 
-/// Create the EQ AIR (shrink-cpu rework).
+/// Create the EQ AIR.
 pub fn create_eq_air(proof_options: &ProofOptions) -> VmAir {
     let (transition_constraints, _) = eq_constraints(0);
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
@@ -610,7 +610,7 @@ pub fn create_eq_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("EQ")
 }
 
-/// Create the BYTEWISE AIR (shrink-cpu rework). No polynomial constraints.
+/// Create the BYTEWISE AIR. No polynomial constraints.
 pub fn create_bytewise_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
@@ -626,7 +626,7 @@ pub fn create_bytewise_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BYTEWISE")
 }
 
-/// Create the STORE AIR (shrink-cpu rework).
+/// Create the STORE AIR.
 pub fn create_store_air(proof_options: &ProofOptions) -> VmAir {
     let (transition_constraints, _) = store_constraints(0);
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
@@ -642,7 +642,7 @@ pub fn create_store_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("STORE")
 }
 
-/// Create the CPU32 AIR (shrink-cpu rework).
+/// Create the CPU32 AIR.
 pub fn create_cpu32_air(proof_options: &ProofOptions) -> VmAir {
     let (transition_constraints, _) = cpu32_constraints(0);
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {

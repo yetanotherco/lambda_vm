@@ -86,7 +86,7 @@ pub mod max_rows {
     pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
     pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
     pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
-    // shrink-cpu rework chips
+    // Auxiliary ALU / memory / CPU32 dispatch chips
     pub const EQ: usize = 1 << 20;
     pub const BYTEWISE: usize = 1 << 20;
     pub const STORE: usize = 1 << 20;

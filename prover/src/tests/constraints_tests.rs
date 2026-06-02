@@ -509,7 +509,7 @@ fn test_dword_bl_repack_formula() {
 }
 
 // =========================================================================
-// CPU Constraints tests (shrink-cpu layout)
+// CPU Constraints tests
 // =========================================================================
 
 use crate::constraints::cpu::{
@@ -558,8 +558,8 @@ fn test_product_zero_constraint_degree() {
 
 #[test]
 fn test_arg2_constraint_degree() {
-    // (1 - MEMORY - BRANCH)·(rv2 + imm): degree 2 (spec `9be4ecd217`, relies on
-    // the live MEMORY·BRANCH = 0 mutex).
+    // (1 - MEMORY - BRANCH)·(rv2 + imm): degree 2 (relies on the live
+    // MEMORY·BRANCH = 0 mutex).
     assert_eq!(Arg2Constraint::new(0, 0).degree(), 2);
     assert_eq!(Arg2Constraint::new(1, 0).degree(), 2);
 }

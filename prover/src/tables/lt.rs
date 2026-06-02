@@ -81,9 +81,9 @@ pub mod cols {
     /// rhs_msb: Bit (MSB of rhs, i.e., bit 63)
     pub const RHS_MSB: usize = 13;
 
-    // shrink-cpu rework: every LT lookup (CPU SLT/BLT/BGE dispatch and the
-    // internal memw/memw_aligned/dvrm comparisons) goes through the unified
-    // `ALU` bus, so one multiplicity column suffices.
+    // Every LT lookup (CPU SLT/BLT/BGE dispatch and the internal
+    // memw/memw_aligned/dvrm comparisons) goes through the unified `ALU` bus,
+    // so one multiplicity column suffices.
     /// invert: Bit — invert the comparison (BGE/BGEU); `out = lt XOR invert`.
     pub const INVERT: usize = 14;
     /// out: the ALU result `lt XOR invert` (the low word; high word is 0).

@@ -218,7 +218,7 @@ fn test_lt_deduplication() {
             && row[lt::cols::SIGNED] == FE::from(1u64)
         {
             // Found our SLT row - verify multiplicity is 3. Every LT lookup
-            // (including SLT) goes through the unified ALU bus (shrink-cpu) and
+            // (including SLT) goes through the unified ALU bus and
             // is counted in the single `MU` column.
             assert_eq!(row[lt::cols::MU], FE::from(3u64));
             found_slt = true;
@@ -270,8 +270,8 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // AND/OR/XOR now go through the BYTEWISE chip on the unified BYTE_ALU bus
-    // (shrink-cpu), so the AND byte (0x12, 0x34) increments MU_BYTE_ALU_AND.
+    // AND/OR/XOR now go through the BYTEWISE chip on the unified BYTE_ALU bus,
+    // so the AND byte (0x12, 0x34) increments MU_BYTE_ALU_AND.
     let row_idx = bitwise::row_index(0x12, 0x34, 0);
     let row = traces.bitwise.main_table.get_row(row_idx);
     assert_eq!(row[bitwise::cols::MU_BYTE_ALU_AND], FE::one());

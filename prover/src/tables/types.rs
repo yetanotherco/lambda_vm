@@ -77,9 +77,8 @@ pub enum BusId {
     // Arithmetic operations (separate tables)
     // =========================================================================
     // The four per-chip ALU buses (LT, MUL, DVRM, SHIFT — IDs 10/11/12/13)
-    // were collapsed into [`Alu`](BusId::Alu) by the shrink-cpu rework. Their
-    // numeric IDs are reserved (not removed) so the live variants below keep
-    // their discriminants stable.
+    // are collapsed into [`Alu`](BusId::Alu). Their numeric IDs are reserved
+    // (not removed) so the live variants below keep their discriminants stable.
 
     // =========================================================================
     // Memory/Control
@@ -112,7 +111,7 @@ pub enum BusId {
     KeccakRc = 23,
 
     // =========================================================================
-    // Byte ALU (BITWISE table provides) — shrink-cpu rework
+    // Byte ALU (BITWISE table provides)
     // =========================================================================
     /// Unified byte-level ALU lookup: `BYTE_ALU[opsel, X, Y] -> out`, where
     /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2). Collapses the
@@ -120,7 +119,7 @@ pub enum BusId {
     ByteAlu = 24,
 
     // =========================================================================
-    // Unified ALU + high-level memory dispatch — shrink-cpu rework
+    // Unified ALU + high-level memory dispatch
     // =========================================================================
     /// Unified ALU lookup: `ALU[out; in1, in2, alu_flags]`. The CPU (sender)
     /// dispatches to the ALU chips (lt/mul/dvrm/shift/eq/bytewise/cpu32) which
@@ -250,7 +249,7 @@ pub const NEG_INV_2_112: u64 = 18446462594437939201;
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
 
 // =========================================================================
-// ALU operation descriptors (shrink-cpu rework)
+// ALU operation descriptors
 // =========================================================================
 
 /// Numerical descriptors for ALU operations, per `spec/decode.typ`.
@@ -272,19 +271,18 @@ pub mod alu_op {
 }
 
 // =========================================================================
-// packed_decode layout — shrink-cpu rework
+// packed_decode layout
 // =========================================================================
 
-/// Bit layout of the reworked `packed_decode` field (58 bits used), per
-/// `spec/shrink-cpu` (`cpu.toml:184-205`, `decode_uncompressed.toml`).
+/// Bit layout of the shrunk `packed_decode` field (58 bits used), per
+/// `cpu.toml:184-205` and `decode_uncompressed.toml`.
 ///
 /// This is the single source of truth shared by the DECODE-table producer and
 /// the CPU's `packed_decode` reconstruction, so the DECODE bus fingerprint
 /// matches on both sides.
 ///
-/// NOTE: not yet wired into the DECODE/CPU tables — those still use the
-/// pre-rework [`packed_decode`] layout. This is consumed once Phase 2+3 of the
-/// CPU rework lands (see `shrink-cpu-spec-questions.md`).
+/// NOTE: not yet wired into the DECODE/CPU tables — those still use the older
+/// [`packed_decode`] layout.
 pub mod packed_decode_shrunk {
     // Top-level flags + register indices.
     pub const READ_REG1: u32 = 0;
@@ -302,7 +300,7 @@ pub mod packed_decode_shrunk {
     pub const RD: u32 = 26;
     /// `half_instruction_length`: bytes/2 (1 for C-type, 2 for regular). The
     /// half-encoding makes odd (misaligned) instruction lengths unrepresentable
-    /// (`spec/src/cpu.toml`, commit `b1b51c9d`).
+    /// (`spec/src/cpu.toml`).
     pub const HALF_INSTRUCTION_LENGTH: u32 = 34;
     pub const ALU_FLAGS: u32 = 42;
     pub const MEM_FLAGS: u32 = 50;
@@ -370,7 +368,7 @@ pub struct ShrunkDecode {
     pub rs2: u8,
     pub rd: u8,
     /// Half the byte length of the instruction (1 for C-type, 2 for regular);
-    /// the real length is `2 * half_instruction_length` (`spec` `b1b51c9d`).
+    /// the real length is `2 * half_instruction_length`.
     pub half_instruction_length: u8,
     pub alu_flags: u8,
     pub mem_flags: u8,
@@ -427,10 +425,10 @@ impl ShrunkDecode {
     /// `spec/decode.typ`. Does NOT include `pc`/`imm` (separate DECODE columns).
     ///
     /// `instruction_length` is the byte length: 2 (RV64C compressed) or 4. It is
-    /// stored as `half_instruction_length = instruction_length / 2` (spec
-    /// `b1b51c9d`); the real length is recovered as `2 * half_instruction_length`.
+    /// stored as `half_instruction_length = instruction_length / 2`; the real
+    /// length is recovered as `2 * half_instruction_length`.
     ///
-    /// Per `spec/decode.typ` (commit `c9540a55`): conditional branches set
+    /// Per `spec/decode.typ`: conditional branches set
     /// `BRANCH=1 ∧ ALU=1` (the EQ/LT chip computes the comparison; `BRANCH`
     /// selects `arg2 = rv2`). JAL/JALR set `BRANCH=1 ∧ JALR=1` with no ALU op —
     /// the return address `pc + instruction_length` is written to `rvd` by the
@@ -761,7 +759,7 @@ pub struct DecodeEntry {
     pub pc: u64,
     /// Fully sign-extended 64-bit immediate.
     pub imm: u64,
-    /// Packed decode flags + register indices (shrink-cpu layout).
+    /// Packed decode flags + register indices.
     pub fields: ShrunkDecode,
 }
 
@@ -773,7 +771,7 @@ impl DecodeEntry {
 
     /// Padding row for the DECODE/CPU tables: an odd PC (never a valid fetch
     /// target, hence unprovable) with all flags zero. Replaces the old
-    /// EBREAK-based padding (EBREAK has no decoding in the shrink-cpu rework).
+    /// EBREAK-based padding (EBREAK has no decoding in this layout).
     pub fn padding_entry() -> Self {
         Self {
             pc: 1,

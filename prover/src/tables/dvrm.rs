@@ -494,8 +494,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // DVRM-C2: ALU[abs_r, abs_d, opsel(LT), 1-div_by_zero, 0]
     // Verify |r| < |d| when d != 0 (the ALU output is 1 iff abs_r < abs_d).
-    // shrink-cpu: the dedicated `Lt` bus was removed; this lookup is now
-    // dispatched on the unified ALU bus with signed=0/invert=0.
+    // This lookup is dispatched on the unified ALU bus with signed=0/invert=0
+    // (there is no dedicated `Lt` bus).
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
@@ -529,9 +529,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // DVRM-C9: ALU[d, q, opsel(MUL)+32*signed+64*sign_q, n_sub_r]
-    // Verify n - r = d * q (lower 64 bits). shrink-cpu: the dedicated `Mul`
-    // bus was removed; the lookup is dispatched on the unified ALU bus with
-    // the lo selector (flags `+0`).
+    // Verify n - r = d * q (lower 64 bits). The lookup is dispatched on the
+    // unified ALU bus with the lo selector (flags `+0`); there is no dedicated
+    // `Mul` bus.
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     let mul_flags = |hi: i64| {
@@ -573,8 +573,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // DVRM-C10: ALU[d, q, opsel(MUL)+32*signed+64*sign_q+128, sign_ext(n_sub_r)]
-    // Verify upper 64 bits of d * q = sign extension of n_sub_r. shrink-cpu:
-    // dispatched on the unified ALU bus with the hi selector (flags `+128`).
+    // Verify upper 64 bits of d * q = sign extension of n_sub_r.
+    // Dispatched on the unified ALU bus with the hi selector (flags `+128`).
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(

@@ -1,4 +1,4 @@
-//! CPU table constraints for the 64-bit VM (shrink-cpu rework).
+//! CPU table constraints for the 64-bit VM.
 //!
 //! Translates the `cpu.toml` constraint groups onto the shrunk CPU layout
 //! (`tables::cpu::cols`). Byte/half range checks (`IS_BYTE`/`IS_HALF`) and all
@@ -233,7 +233,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 // alu group: arg2 multiplex
 // =========================================================================
 
-/// `arg2` multiplex (`cpu.toml` CPU-A1, spec `c9540a55`), for word index
+/// `arg2` multiplex (`cpu.toml` CPU-A1), for word index
 /// `word_idx ∈ {0,1}`:
 ///
 /// ```text
@@ -247,7 +247,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 /// no inter-word carry because decode assumption A2 guarantees at most one of
 /// `rv2`/`imm` is nonzero when `MEMORY+BRANCH = 0`. `MEMORY` and `BRANCH` are
 /// mutually exclusive (enforced by the live `MEMORY·BRANCH = 0` constraint), so
-/// `1−MEMORY−BRANCH ∈ {0,1}` and matches the degree-2 spec form `9be4ecd217`.
+/// `1−MEMORY−BRANCH ∈ {0,1}` and matches the degree-2 spec form.
 pub struct Arg2Constraint {
     /// 0 = low word, 1 = high word.
     word_idx: usize,
@@ -266,7 +266,7 @@ impl Arg2Constraint {
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constraint {
     fn degree(&self) -> usize {
         // (1 - MEMORY - BRANCH) [deg 1] · (rv2 + imm) [deg 1] = 2. The degree-2
-        // form relies on the live MEMORY·BRANCH = 0 mutex (spec `9be4ecd217`).
+        // form relies on the live MEMORY·BRANCH = 0 mutex.
         2
     }
 
@@ -307,8 +307,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
 // mem group: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
 // =========================================================================
 
-/// `(1 − MEMORY − BRANCH) · (rvd[i] − cast(res, WL)[i]) = 0` (`cpu.toml` CPU-M*,
-/// spec `c9540a55`).
+/// `(1 − MEMORY − BRANCH) · (rvd[i] − cast(res, WL)[i]) = 0` (`cpu.toml` CPU-M*).
 ///
 /// On plain ALU rows `rvd = res`. BRANCH rows are exempt: their `rvd` is the
 /// return address `pc + instruction_length`, pinned by [`BranchRvdConstraint`].
@@ -360,7 +359,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResCons
 // =========================================================================
 
 /// `BRANCH · (rvd[i] − cast(pc + instruction_length, WL)[i]) = 0` (`cpu.toml`
-/// branch group, spec `c9540a55`).
+/// branch group).
 ///
 /// On every BRANCH row `rvd` holds the return address `pc + instruction_length`
 /// (written to `rd` only by JAL/JALR; conditional branches compute it but never
@@ -621,7 +620,7 @@ pub fn create_all_cpu_constraints() -> (
     // decode: word_instr mutex with MEMORY / BRANCH / ECALL, plus word_instr ⇒
     // {write,read1,read2}_register = 0 (word instructions are delegated to CPU32
     // and must not touch the main register file — leaving these free is unsound).
-    // The register-read gates are spec `1dee9152` ("out of caution").
+    // The register-read gates are spec-mandated ("out of caution").
     for &col in &[
         cols::MEMORY,
         cols::BRANCH,

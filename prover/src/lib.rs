@@ -84,7 +84,7 @@ pub struct TableCounts {
     pub shift: usize,
     pub branch: usize,
     pub memw_register: usize,
-    // shrink-cpu rework chips
+    // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eq: usize,
     pub bytewise: usize,
     pub store: usize,
@@ -225,7 +225,7 @@ pub(crate) struct VmAirs {
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
-    // shrink-cpu rework chips
+    // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
     pub stores: Vec<VmAir>,

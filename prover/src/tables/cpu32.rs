@@ -1,4 +1,4 @@
-//! CPU32 table — shrink-cpu rework.
+//! CPU32 table.
 //!
 //! Handles all 32-bit word (`*W`) instructions delegated by the main CPU via
 //! the `CPU32[timestamp, pc, half_instruction_length]` interaction. All `*W`
@@ -15,8 +15,7 @@
 //! selects sign- vs zero-extension of the inputs; the output `rvd` is always
 //! sign-extended (RV64 `*W` semantics).
 //!
-//! Register reads use the cast-to-`DWordWL` encoding (Q9, see
-//! `shrink-cpu-spec-questions.md`).
+//! Register reads use the cast-to-`DWordWL` encoding.
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -87,7 +86,7 @@ pub mod cols {
     pub const ALU_FLAGS: usize = 32;
     pub const ADD: usize = 33;
     pub const SUB: usize = 34;
-    /// half the byte length (1 or 2); real length = `2 * half` (spec `b1b51c9d`).
+    /// half the byte length (1 or 2); real length = `2 * half`.
     pub const HALF_INSTRUCTION_LENGTH: usize = 35;
     /// signed: extracted from `alu_flags` bit 5 (via BYTE_ALU[AND, 32, alu_flags]).
     pub const SIGNED: usize = 36;

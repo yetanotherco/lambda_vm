@@ -425,7 +425,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MEMORY receiver (from CPU) — shrink-cpu unified high-level memory op.
+    // MEMORY receiver (from CPU) — unified high-level memory op.
     // -------------------------------------------------------------------------
     // MEMORY[out=res::DWordWL; timestamp, address, value, mem_flags] | -μ
     // The CPU dispatches LOAD here (mem_flags bit 0 = memory_op = 0). The `value`

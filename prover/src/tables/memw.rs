@@ -749,9 +749,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // ALU interactions for timestamp ordering (MEMW-C4 through C7).
-    // shrink-cpu: the dedicated `Lt` bus was removed; each lookup is dispatched
-    // on the unified ALU bus as `[old_ts, ts, opsel(LT), 1, 0]` (signed=0,
-    // invert=0, asserting old_ts < ts).
+    // Each lookup is dispatched on the unified ALU bus as
+    // `[old_ts, ts, opsel(LT), 1, 0]` (signed=0, invert=0, asserting
+    // old_ts < ts); there is no dedicated `Lt` bus.
     // -------------------------------------------------------------------------
 
     // MEMW-C4: old_timestamp[0] < timestamp with μ_sum
