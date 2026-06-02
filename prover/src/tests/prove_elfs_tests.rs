@@ -21,10 +21,13 @@ use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::VmProof;
+use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use executor::elf::Elf;
+use executor::vm::execution::Executor;
 
 // Import shared utilities
 use crate::VmAirs;
@@ -80,6 +83,81 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     Verifier::multi_verify(
         &airs.air_refs(),
         &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
+    )
+}
+
+/// Like [`crate::prove_with_options_and_inputs`] but trims the bitwise table to the
+/// rows the program uses instead of proving the full 2^20-row table (TEST ONLY).
+///
+/// Same unsoundness caveats as [`Traces::from_elf_and_logs_minimal`]. The full
+/// preprocessed bitwise path is covered by `test_prove_elfs_all_instructions_64_full`.
+fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsConfig) -> VmProof {
+    let proof_options = ProofOptions::default_test_options();
+    let elf = Elf::load(elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, private_inputs.to_vec()).expect("executor");
+    let result = executor.run().expect("execution");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, max_rows, private_inputs).unwrap();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let proof = multi_prove_ram(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("prove");
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    VmProof {
+        proof,
+        runtime_page_ranges,
+        table_counts,
+        public_output: traces.public_output_bytes.clone(),
+        num_private_input_pages,
+    }
+}
+
+/// Like [`crate::verify_with_options`] but matches the minimal bitwise AIR.
+///
+/// Must be used to verify proofs from [`prove_vm_minimal`].
+fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+    let elf = Elf::load(elf_bytes).expect("ELF load");
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &elf,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+    );
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &page_configs,
+        &vm_proof.table_counts,
+    );
+    let air_refs = airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &air_refs,
+        &vm_proof.proof,
+        &vm_proof.public_output,
+        &mut replay_transcript,
+    )
+    .expect("fingerprint collision in test");
+    Verifier::multi_verify(
+        &air_refs,
+        &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -159,7 +237,7 @@ fn test_cpu_only_no_bus() {
 fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
-    // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
+    // Use from_elf_and_logs_minimal to get PAGE and REGISTER tables for Memory bus
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
 
@@ -495,6 +573,217 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "sign_ext_edge_cases_8 failed"
+    );
+}
+
+// Misaligned load/store regression tests. Each program issues one load or
+// store whose effective address is not naturally aligned to the access width,
+// crossing one or more 4-byte cell boundaries in the executor's memory map.
+#[test]
+fn test_prove_elfs_misalign_lh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lhu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lhu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lhu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_lwu() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_lwu");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_lwu failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_ld() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_ld");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_ld failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sh() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sh");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sh failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sw() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sw");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sw failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_misalign_sd() {
+    let (elf, logs, _instructions) = run_asm_elf("misalign_sd");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "misalign_sd failed"
+    );
+}
+
+// MULW where the 32-bit product overflows past bit 31.
+#[test]
+fn test_prove_elfs_mulw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_overflow failed"
+    );
+}
+
+// DIVUW where the 32-bit unsigned quotient has bit 31 set.
+#[test]
+fn test_prove_elfs_divuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("divuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw_high_bit failed"
+    );
+}
+
+// REMUW where the 32-bit unsigned remainder has bit 31 set.
+#[test]
+fn test_prove_elfs_remuw_high_bit() {
+    let (elf, logs, instructions) = run_asm_elf("remuw_high_bit");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw_high_bit failed"
+    );
+}
+
+// MULW base case (no 32-bit overflow).
+#[test]
+fn test_prove_elfs_mulw() {
+    let (elf, logs, instructions) = run_asm_elf("mulw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw failed"
+    );
+}
+
+// DIVW signed-overflow edge case: i32::MIN / -1 returns i32::MIN per RISC-V spec.
+#[test]
+fn test_prove_elfs_divw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("divw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_overflow failed"
+    );
+}
+
+// DIVW divide-by-zero: quotient = -1 (all ones sign-extended).
+#[test]
+fn test_prove_elfs_divw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("divw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw_zero failed"
+    );
+}
+
+// REMW signed-overflow edge case: i32::MIN % -1 returns 0 per RISC-V spec.
+#[test]
+fn test_prove_elfs_remw_overflow() {
+    let (elf, logs, instructions) = run_asm_elf("remw_overflow");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_overflow failed"
+    );
+}
+
+// REMW divide-by-zero: remainder = dividend.
+#[test]
+fn test_prove_elfs_remw_zero() {
+    let (elf, logs, instructions) = run_asm_elf("remw_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw_zero failed"
+    );
+}
+
+// DIVUW base case (no high-bit set in quotient).
+#[test]
+fn test_prove_elfs_divuw() {
+    let (elf, logs, instructions) = run_asm_elf("divuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divuw failed"
+    );
+}
+
+// REMUW base case (no high-bit set in remainder).
+#[test]
+fn test_prove_elfs_remuw() {
+    let (elf, logs, instructions) = run_asm_elf("remuw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remuw failed"
     );
 }
 
@@ -1953,11 +2242,9 @@ fn test_crafted_zero_count_proof_must_not_verify() {
 #[test]
 fn test_small_max_rows_splits_tables() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
-    let proof_options = ProofOptions::default_test_options();
     let max_rows = crate::tables::MaxRowsConfig::small();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &max_rows)
-        .expect("Prover should succeed with small max_rows");
+    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &max_rows);
 
     // With 2^5 max rows and 64+ instructions, tables should have multiple chunks.
     assert!(
@@ -1966,9 +2253,10 @@ fn test_small_max_rows_splits_tables() {
         vm_proof.table_counts.cpu
     );
 
-    let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
-        .expect("Verifier should not error");
-    assert!(verified, "Proof with small max_rows should verify");
+    assert!(
+        verify_vm_minimal(&vm_proof, &elf_bytes),
+        "Proof with small max_rows should verify"
+    );
 }
 
 // =============================================================================
@@ -2033,8 +2321,11 @@ fn test_verify_rejects_inflated_table_counts() {
 #[test]
 fn test_prove_wsuffix_64bit() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_wsuffix_64bit");
-    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
-    assert!(result, "W-suffix 64-bit register test should verify");
+    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&vm_proof, &elf_bytes),
+        "W-suffix 64-bit register test should verify"
+    );
 }
 
 /// Proves a minimal Rust std program that uses `init_allocator()` and
@@ -2051,9 +2342,9 @@ fn test_prove_allocator_minimal_reproducer() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
             .expect("allocator.elf not found — run `make compile-programs-rust`");
-    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
-        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        verify_vm_minimal(&proof, &elf_bytes),
         "allocator.elf should verify"
     );
     assert_eq!(proof.public_output, b"Hello World");
@@ -2070,9 +2361,9 @@ fn test_pure_commit_rust() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
             .expect("pure_commit.elf not found — run `make compile-programs-rust`");
-    let proof = crate::prove(&elf_bytes).expect("prove should succeed");
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
-        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        verify_vm_minimal(&proof, &elf_bytes),
         "pure_commit.elf should verify"
     );
     assert_eq!(proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
@@ -2095,12 +2386,8 @@ fn test_prove_with_input_empty() {
 fn test_prove_private_input_xpage() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let proof =
-        crate::prove_with_inputs(&elf_bytes, &input).expect("prove_with_inputs should succeed");
-    assert!(
-        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
-        "proof should verify"
-    );
+    let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
+    assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
 
@@ -2112,11 +2399,8 @@ fn test_prove_private_input_different_values() {
         0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
         0x00,
     ];
-    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
-    assert!(
-        crate::verify(&proof, &elf_bytes).expect("verify"),
-        "proof should verify"
-    );
+    let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
+    assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
 
@@ -2156,9 +2440,9 @@ fn test_prove_commit_sum() {
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/commit_sum.elf"))
             .expect("commit_sum.elf not found — run `make compile-programs-rust`");
     let input = &[3u8, 5u8];
-    let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
+    let proof = prove_vm_minimal(&elf_bytes, input, &Default::default());
     assert!(
-        crate::verify(&proof, &elf_bytes).expect("verify should not error"),
+        verify_vm_minimal(&proof, &elf_bytes),
         "commit_sum should verify"
     );
     assert_eq!(proof.public_output, vec![8u8]);
@@ -2274,7 +2558,7 @@ fn test_verify_rejects_private_input_with_tampered_public_output() {
     let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     assert!(
-        crate::verify(&vm_proof, &elf_bytes).expect("verify"),
+        crate::verify(&vm_proof, &elf_bytes).expect("verify should not error"),
         "Baseline must verify"
     );
 
@@ -2323,8 +2607,11 @@ fn test_proof_does_not_contain_private_input_field() {
 #[test]
 fn test_addiw_neg_immediate() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_addiw_neg");
-    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
-    assert!(result, "addiw with negative immediate should verify");
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "addiw with negative immediate should verify"
+    );
 }
 
 /// Regression test: both main and aux field element counts must be nonzero for any real ELF.

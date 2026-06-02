@@ -44,6 +44,13 @@ pub mod trace_builder;
 
 pub use types::BusId;
 
+/// Blowup factors for which we ship static preprocessed-table commitments
+/// (bitwise and keccak_rc), pinned by the `static_commitments_tests` drift
+/// suite and emitted by the `compute_static_commitments` binary. Shared
+/// between the generator and the drift tests so adding a blowup here cannot
+/// silently skip a test.
+pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
+
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
