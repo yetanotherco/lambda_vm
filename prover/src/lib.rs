@@ -330,18 +330,18 @@ impl VmAirs {
     /// `page_configs` provides the page base addresses for creating PAGE AIRs.
     /// `table_counts` specifies how many chunks for each split table.
     ///
-    /// `register_commitment` is an optional precomputed REGISTER preprocessed
-    /// commitment. When `Some`, the supplied value is used directly and the
-    /// FFT + Merkle build is skipped — useful for callers who have already
-    /// computed the commitment offline and embedded it as a compile-time
-    /// constant (e.g. the recursion guest, where the in-VM recompute is too
-    /// expensive). When `None`, the commitment is computed from the ELF
-    /// entry point.
+    /// `decode_commitment` and `register_commitment` are optional precomputed
+    /// preprocessed commitments for the DECODE and REGISTER tables. When `Some`,
+    /// the supplied value is used directly and the FFT + Merkle build is skipped
+    /// — useful for callers who have already computed the commitment offline and
+    /// embedded it as a compile-time constant (e.g. the recursion guest, where
+    /// the in-VM recompute is too expensive). When `None`, the commitment is
+    /// computed from the ELF.
     ///
-    /// The trust anchor for `register_commitment` is the caller's compiled
-    /// binary — never accept prover-supplied bytes here. Wrong values
-    /// surface as Fiat-Shamir transcript divergence (proof rejected),
-    /// never as silently-accepted wrong proofs.
+    /// The trust anchor for both is the caller's compiled binary — never accept
+    /// prover-supplied bytes here. Wrong values are rejected, never silently
+    /// accepted: they either mismatch the prover's committed precomputed root
+    /// (an explicit verifier check) or yield diverging Fiat-Shamir challenges.
     ///
     /// The REGISTER commitment is a function of `(proof_options, elf.entry_point)`,
     /// so callers that embed it as a compile-time constant must also bind the
@@ -353,6 +353,7 @@ impl VmAirs {
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        decode_commitment: Option<Commitment>,
         register_commitment: Option<Commitment>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
@@ -381,11 +382,12 @@ impl VmAirs {
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
-        let decode = create_decode_air(proof_options).with_preprocessed(
+        let decode_root = decode_commitment.unwrap_or_else(|| {
             decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment"),
-            decode::NUM_PRECOMPUTED_COLS,
-        );
+                .expect("Failed to compute decode commitment")
+        });
+        let decode = create_decode_air(proof_options)
+            .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS);
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
             .collect();
@@ -667,6 +669,7 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -739,6 +742,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         None,
+        None,
     )
 }
 
@@ -748,19 +752,19 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
 ///
-/// `register_commitment` is an optional precomputed REGISTER preprocessed
-/// commitment. When `Some`, the supplied value is used directly and the
-/// in-verifier FFT + Merkle build for the REGISTER preprocessed columns is
-/// skipped — useful for callers (e.g. the recursion guest) that embed the
-/// commitment as a compile-time constant to avoid the in-VM recompute
-/// cost. When `None`, the verifier computes the commitment from the ELF
-/// entry point.
+/// `decode_commitment` and `register_commitment` are optional precomputed
+/// preprocessed commitments for the DECODE and REGISTER tables. When `Some`,
+/// the supplied value is used directly and the in-verifier FFT + Merkle build
+/// for that table's preprocessed columns is skipped — useful for callers (e.g.
+/// the recursion guest) that embed the commitment as a compile-time constant
+/// to avoid the in-VM recompute cost. When `None`, the verifier computes the
+/// commitment from the ELF.
 ///
-/// Trust model: `register_commitment`, when supplied, must come from the
-/// caller's compiled binary (e.g. a `const [u8; 32]`), never from prover-
-/// supplied bytes. Wrong values surface as Fiat-Shamir transcript
-/// divergence (proof rejected); they cannot cause silently-accepted wrong
-/// proofs.
+/// Trust model: when supplied, both values must come from the caller's
+/// compiled binary (e.g. a `const [u8; 32]`), never from prover-supplied
+/// bytes. A wrong value is rejected, never silently accepted: it either
+/// mismatches the prover's committed precomputed root (an explicit verifier
+/// check) or yields diverging Fiat-Shamir challenges.
 ///
 /// The REGISTER commitment is a function of `(proof_options, elf.entry_point)`,
 /// so callers that embed it as a compile-time constant must also bind the
@@ -770,6 +774,7 @@ pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
     register_commitment: Option<Commitment>,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
@@ -816,6 +821,7 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        decode_commitment,
         register_commitment,
     );
 

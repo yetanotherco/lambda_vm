@@ -102,9 +102,9 @@ fn register_commitment_some_matches_default_path() {
 
     let register_c = preprocessed_commitment(&options, elf.entry_point);
 
-    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None, None)
         .expect("verify with None should not error");
-    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(register_c))
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None, Some(register_c))
         .expect("verify with Some(correct) should not error");
 
     assert!(default_ok, "default path must accept the proof");
@@ -125,7 +125,7 @@ fn register_commitment_wrong_value_rejects() {
     let mut wrong = preprocessed_commitment(&options, elf.entry_point);
     wrong[0] ^= 0xFF;
 
-    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, None, Some(wrong))
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(
         !result,
@@ -141,7 +141,7 @@ fn register_commitment_zero_bytes_rejects() {
 
     // [0u8; 32] is the most plausible accidental default — passing it must
     // not pass verification.
-    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, None, Some([0u8; 32]))
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(
         !result,
@@ -161,7 +161,7 @@ fn register_commitment_wrong_entry_point_rejects() {
     // bind the entry point too, not just the ELF text.
     let wrong = preprocessed_commitment(&options, elf.entry_point ^ 0x1000);
 
-    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, None, Some(wrong))
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(
         !result,
