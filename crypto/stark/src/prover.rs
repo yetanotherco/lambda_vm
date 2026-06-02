@@ -263,6 +263,24 @@ impl<F: IsFFTField> LdeTwiddles<F> {
     }
 }
 
+/// Streaming "retire-LDE" mode (Approach 1, Milestone 1).
+///
+/// When `true`, the main/aux LDE columns are dropped immediately after committing
+/// (Phase A / Phase C) instead of being cached, and each table's LDE is recomputed
+/// on demand in Rounds 2-4 via [`reconstruct_round1`]. This trades extra FFT work
+/// (one LDE expansion per table) for a large drop in peak working memory: the
+/// `O(N × cols × lde_size)` cache of all tables' LDE columns is no longer held
+/// simultaneously between Phase A/C and Rounds 2-4 (only the resident traces and
+/// the Merkle trees remain). No re-execution of the VM is involved — the LDE is
+/// rebuilt from the still-resident trace.
+///
+/// Opt-in via `LAMBDA_STREAM_LDE=1` (or `true`). Default: `false` (cache for speed).
+pub fn streaming_retire_lde() -> bool {
+    std::env::var("LAMBDA_STREAM_LDE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
@@ -688,9 +706,9 @@ pub trait IsStarkProver<
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
     ///
-    /// Only used by `run_debug_checks` — Phase D consumes the cached LDE
-    /// directly and does not go through this path.
-    #[cfg(feature = "debug-checks")]
+    /// Used by `run_debug_checks` and by streaming "retire-LDE" mode
+    /// ([`streaming_retire_lde`]), where the cached LDE was dropped after commit
+    /// and is rebuilt on demand from the still-resident trace.
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
@@ -1518,6 +1536,7 @@ pub trait IsStarkProver<
         drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
+        let stream_lde = streaming_retire_lde();
 
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
@@ -1590,7 +1609,9 @@ pub trait IsStarkProver<
                 }
                 transcript.append_bytes(&commit.root);
                 main_commits.push(commit);
-                main_ldes.push(cached_main);
+                // Streaming retire-LDE: drop the main LDE now; Rounds 2-4 recompute
+                // it on demand from the resident trace.
+                main_ldes.push(if stream_lde { Vec::new() } else { cached_main });
             }
         }
 
@@ -1751,7 +1772,7 @@ pub trait IsStarkProver<
                 if let Some(ref c) = aux_commit {
                     table_transcripts[chunk_start + j].append_bytes(&c.root);
                 }
-                aux_results.push((aux_commit, cached_aux));
+                aux_results.push((aux_commit, if stream_lde { Vec::new() } else { cached_aux }));
             }
         }
 
@@ -1839,9 +1860,20 @@ pub trait IsStarkProver<
                     #[cfg(feature = "instruments")]
                     let table_start = Instant::now();
 
-                    // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result =
-                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
+                    // Build Round1 from the cached LDE (consumed by value), or, in
+                    // streaming retire-LDE mode, recompute it from the resident trace.
+                    let round_1_result = if stream_lde {
+                        let _ = lde; // empty placeholder when streaming
+                        Self::reconstruct_round1(
+                            *air,
+                            *trace,
+                            domain,
+                            commitment,
+                            &twiddle_caches[idx],
+                        )?
+                    } else {
+                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor)
+                    };
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
