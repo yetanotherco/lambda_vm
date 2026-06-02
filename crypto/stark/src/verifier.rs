@@ -27,8 +27,6 @@ use math::{
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
-#[cfg(feature = "instruments")]
-use std::time::Instant;
 
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
@@ -49,6 +47,7 @@ impl<
 
 /// A container holding the complete list of challenges sent to the prover along with the seed used
 /// to validate the proof-of-work nonce.
+#[derive(Clone)]
 pub struct Challenges<FieldExtension>
 where
     FieldExtension: Send + Sync + IsField,
@@ -238,55 +237,6 @@ pub trait IsStarkVerifier<
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
     }
 
-    /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
-    /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
-    /// FRI decommitments are valid and correspond to the Deep composition polynomial.
-    fn step_3_verify_fri(
-        proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &VerifierDomain<Field>,
-        challenges: &Challenges<FieldExtension>,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let (deep_poly_evaluations, deep_poly_evaluations_sym) =
-            match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
-                challenges, domain, proof,
-            ) {
-                Some(pair) => pair,
-                None => return false,
-            };
-
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
-            .collect::<Vec<FieldElement<Field>>>();
-        // Any zero evaluation point means a malformed query index, reject.
-        if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
-            return false;
-        }
-
-        proof
-            .query_list
-            .iter()
-            .zip(&challenges.iotas)
-            .zip(evaluation_point_inverse)
-            .enumerate()
-            .all(|(i, ((proof_s, iota_s), eval))| {
-                Self::verify_query_and_sym_openings(
-                    proof,
-                    &challenges.zetas,
-                    *iota_s,
-                    proof_s,
-                    eval,
-                    &deep_poly_evaluations[i],
-                    &deep_poly_evaluations_sym[i],
-                )
-            })
-    }
 
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
     /// Returns the LDE-coset element for FRI query challenge `iota`. The
@@ -458,94 +408,6 @@ pub trait IsStarkVerifier<
         )
     }
 
-    /// Verify a single FRI query
-    /// `zetas`: the vector of all challenges sent by the verifier to the prover at the commit
-    /// phase to fold polynomials.
-    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements 𝜐 and -𝜐
-    /// of the evaluation domain of FRI layer 0.
-    /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
-    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
-    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
-    fn verify_query_and_sym_openings(
-        proof: &StarkProof<Field, FieldExtension, PI>,
-        zetas: &[FieldElement<FieldExtension>],
-        iota: usize,
-        fri_decommitment: &FriDecommitment<FieldExtension>,
-        evaluation_point_inv: FieldElement<Field>,
-        deep_composition_evaluation: &FieldElement<FieldExtension>,
-        deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
-
-        let p0_eval = deep_composition_evaluation;
-        let p0_eval_sym = deep_composition_evaluation_sym;
-
-        // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
-        let mut index = iota;
-
-        // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
-        if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
-        }
-
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
-
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
-
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
-
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
-                    }
-                },
-            )
-    }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
@@ -810,47 +672,14 @@ pub trait IsStarkVerifier<
             }
         }
 
-        // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
-        // =====================================================================
-        // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
-        // the prover's forking and makes per-table verification independent.
-
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Must match prover: fork with domain separator for multi-table,
-            // use original transcript directly for single-table.
-            let num_tables = airs.len();
-            let mut table_transcript = transcript.clone();
-            if num_tables > 1 {
-                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
-            }
-
-            // Phase C: replay aux commitment
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                table_transcript.append_bytes(&root);
-            }
-
-            // Bind table_contribution (L) to transcript, matching prover.
-            if let Some(ref bpi) = proof.bus_public_inputs {
-                table_transcript.append_field_element(&bpi.table_contribution);
-            }
-
-            // Rounds 2-4: verify
-            if !Self::verify_rounds_2_to_4(
-                *air,
-                proof,
-                &mut table_transcript,
-                lookup_challenges.clone(),
-            ) {
-                error!(
-                    "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
-                    idx,
-                    air.context().num_transition_constraints,
-                    air.context().trace_columns
-                );
-                return false;
-            }
+        // Phase C + Rounds 2-3 (no FRI) per table, then Phase D batched FRI.
+        if !Self::verify_chunks_phase_c_d(
+            airs,
+            multi_proof,
+            transcript,
+            &lookup_challenges,
+        ) {
+            return false;
         }
 
         // =====================================================================
@@ -888,10 +717,12 @@ pub trait IsStarkVerifier<
         true
     }
 
-    /// Verify a single STARK proof.
-    /// This is equivalent to calling `multi_verify` with a single-element slice.
+    /// Verify a single-table proof, supplied as a one-element [`MultiProof`]
+    /// (the shape returned by `Prover::prove`). The batched-FRI bucket data
+    /// lives at the multi-proof level, so single-table verification consumes the
+    /// wrapper directly.
     fn verify(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+        proof: &MultiProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
@@ -900,15 +731,16 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
-        let multi_proof = MultiProof {
-            proofs: vec![proof.clone()],
-        };
-        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
+        Self::multi_verify(&[air], proof, transcript, &FieldElement::zero())
     }
 
-    /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
-    /// already been replayed and the RAP challenges are known.
-    fn replay_rounds_after_round_1(
+    /// Replays rounds 2 and 3 of the protocol for a given proof, assuming round 1
+    /// has already been replayed and the RAP challenges are known. Stops right
+    /// after sampling the DEEP gamma coefficients — FRI challenges (zetas, iotas,
+    /// grinding) are NOT derived here; they come from the chunk-shared bucket
+    /// seed in Phase D. The returned `Challenges` has empty `zetas`/`iotas` and a
+    /// zeroed `grinding_seed`, filled in per bucket by the caller.
+    fn replay_rounds_2_to_3(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
@@ -971,8 +803,11 @@ pub trait IsStarkVerifier<
         }
 
         // ===================================
-        // ==========|   Round 4   |==========
+        // ==========|   Round 4 (DEEP coeffs only)   |==========
         // ===================================
+        // Sample the DEEP gamma coefficients. FRI commit/grinding/query sampling
+        // does NOT happen on this per-table fork — it is done per bucket from the
+        // chunk-shared seed in Phase D.
 
         let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
         let num_terms_trace =
@@ -995,158 +830,375 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
-
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
-
-        // Receive grinding value
-        let security_bits = air.context().proof_options.grinding_factor;
-        let mut grinding_seed = [0u8; 32];
-        if security_bits > 0
-            && let Some(nonce_value) = proof.nonce
-        {
-            grinding_seed = transcript.state();
-            transcript.append_bytes(&nonce_value.to_be_bytes());
-        }
-
-        // FRI query phase
-        // <<<< Send challenges 𝜄ₛ (iota_s)
-        let number_of_queries = air.options().fri_number_of_queries;
-        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
-
         Challenges {
             z,
             boundary_coeffs,
             transition_coeffs,
             trace_term_coeffs,
             gammas,
-            zetas,
-            iotas,
+            zetas: Vec::new(),
+            iotas: Vec::new(),
             rap_challenges,
-            grinding_seed,
+            grinding_seed: [0u8; 32],
         }
     }
 
-    /// Verifies a single table after round 1 has been replayed.
-    fn verify_rounds_2_to_4(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        rap_challenges: Vec<FieldElement<FieldExtension>>,
+    fn verify_chunks_phase_c_d(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        transcript: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        lookup_challenges: &[FieldElement<FieldExtension>],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_verifier_domain(air, proof.trace_length);
+        let num_tables = airs.len();
+        let pre_fork_transcript = transcript.clone();
 
-        // Verify there are enough queries
-        if proof.query_list.len() < air.options().fri_number_of_queries {
+        // -- Phase C: per-table Rounds 2-3 (no FRI) --
+        let mut domains: Vec<VerifierDomain<Field>> = Vec::with_capacity(num_tables);
+        let mut table_challenges: Vec<Challenges<FieldExtension>> = Vec::with_capacity(num_tables);
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            let domain = new_verifier_domain(*air, proof.trace_length);
+            let mut table_transcript = transcript.clone();
+            if num_tables > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                table_transcript.append_bytes(&root);
+            }
+            if let Some(ref bpi) = proof.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
+            let challenges = Self::replay_rounds_2_to_3(
+                *air,
+                proof,
+                &domain,
+                &mut table_transcript,
+                lookup_challenges.to_vec(),
+            );
+            domains.push(domain);
+            table_challenges.push(challenges);
+        }
+
+        // -- Phase D: per-(chunk, lde_size) batched FRI --
+        let k = (multi_proof.chunk_size as usize).max(1);
+        let expected_num_chunks = num_tables.div_ceil(k);
+        if multi_proof.fri_chunk_buckets.len() != expected_num_chunks {
+            error!("fri_chunk_buckets chunk count mismatch");
+            return false;
+        }
+        for (chunk_idx, chunk_start) in (0..num_tables).step_by(k).enumerate() {
+            let chunk_end = (chunk_start + k).min(num_tables);
+            let chunk_size = chunk_end - chunk_start;
+            let bucket_seed =
+                Self::build_bucket_seed(&pre_fork_transcript, multi_proof, chunk_start, chunk_size);
+
+            let mut bucket_members: Vec<Vec<usize>> = Vec::new();
+            let mut bucket_lde_sizes: Vec<usize> = Vec::new();
+            for j in 0..chunk_size {
+                let lde_size = domains[chunk_start + j].lde_length;
+                match bucket_lde_sizes.iter().position(|&s| s == lde_size) {
+                    Some(b) => bucket_members[b].push(j),
+                    None => {
+                        bucket_lde_sizes.push(lde_size);
+                        bucket_members.push(vec![j]);
+                    }
+                }
+            }
+
+            let proof_buckets = &multi_proof.fri_chunk_buckets[chunk_idx];
+            if proof_buckets.len() != bucket_members.len() {
+                error!("chunk {chunk_idx}: bucket count mismatch");
+                return false;
+            }
+            for (b, (members, &lde_size)) in
+                bucket_members.iter().zip(bucket_lde_sizes.iter()).enumerate()
+            {
+                if !Self::verify_one_bucket(
+                    airs,
+                    multi_proof,
+                    &domains,
+                    &table_challenges,
+                    &bucket_seed,
+                    chunk_start,
+                    chunk_idx,
+                    b,
+                    members,
+                    lde_size,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Build the chunk-shared `bucket_seed`. Byte order MUST match the prover:
+    /// pre-fork shared state, then for each chunk-local index (ascending):
+    /// table_contribution (if any), then composition_poly_root, then OOD evals
+    /// (all trace_ood columns column-major, then composition_poly_parts_ood).
+    fn build_bucket_seed<T>(
+        pre_fork_transcript: &T,
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        chunk_start: usize,
+        chunk_size: usize,
+    ) -> T
+    where
+        T: IsStarkTranscript<FieldExtension, Field> + Clone,
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let mut bucket_seed = pre_fork_transcript.clone();
+        for j in 0..chunk_size {
+            let proof = &multi_proof.proofs[chunk_start + j];
+            if let Some(ref bpi) = proof.bus_public_inputs {
+                bucket_seed.append_field_element(&bpi.table_contribution);
+            }
+        }
+        for j in 0..chunk_size {
+            let proof = &multi_proof.proofs[chunk_start + j];
+            bucket_seed.append_bytes(&proof.composition_poly_root);
+        }
+        for j in 0..chunk_size {
+            let proof = &multi_proof.proofs[chunk_start + j];
+            for col in proof.trace_ood_evaluations.columns().iter() {
+                for elem in col.iter() {
+                    bucket_seed.append_field_element(elem);
+                }
+            }
+            for elem in proof.composition_poly_parts_ood_evaluation.iter() {
+                bucket_seed.append_field_element(elem);
+            }
+        }
+        bucket_seed
+    }
+
+    /// Verify one (chunk, lde_size) bucket: derive its FRI challenges from the
+    /// chunk-shared `bucket_seed`, reconstruct each member's DEEP evaluations at
+    /// the bucket-shared iotas, combine them with `delta_fri` powers, verify the
+    /// batched FRI fold, and verify each member's per-table openings.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_one_bucket(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        domains: &[VerifierDomain<Field>],
+        table_challenges: &[Challenges<FieldExtension>],
+        bucket_seed: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        chunk_start: usize,
+        chunk_idx: usize,
+        b: usize,
+        members: &[usize],
+        lde_size: usize,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let bucket = &multi_proof.fri_chunk_buckets[chunk_idx][b];
+        if bucket.members != *members || bucket.lde_size as usize != lde_size {
+            error!("chunk {chunk_idx} bucket {b}: members/lde_size mismatch");
             return false;
         }
 
-        #[cfg(feature = "instruments")]
-        println!("- Started step 1: Recover challenges");
-        #[cfg(feature = "instruments")]
-        let timer1 = Instant::now();
+        let leader_idx = chunk_start + members[0];
+        let leader_air = airs[leader_idx];
+        let leader_domain = &domains[leader_idx];
 
-        let challenges =
-            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
+        let mut bt = bucket_seed.clone();
+        bt.append_bytes(&(lde_size as u64).to_le_bytes());
+        let delta_fri: FieldElement<FieldExtension> = bt.sample_field_element();
 
-        // verify grinding
-        let security_bits = air.context().proof_options.grinding_factor;
+        let mut zetas = bucket
+            .layer_roots
+            .iter()
+            .map(|root| {
+                let element = bt.sample_field_element();
+                bt.append_bytes(root);
+                element
+            })
+            .collect::<Vec<FieldElement<FieldExtension>>>();
+        zetas.push(bt.sample_field_element());
+        bt.append_field_element(&bucket.last_value);
+
+        let security_bits = leader_air.context().proof_options.grinding_factor;
         if security_bits > 0 {
-            let nonce_is_valid = proof.nonce.is_some_and(|nonce_value| {
-                grinding::is_valid_nonce(&challenges.grinding_seed, nonce_value, security_bits)
+            let grinding_seed = bt.state();
+            let nonce_is_valid = bucket.nonce.is_some_and(|nonce_value| {
+                grinding::is_valid_nonce(&grinding_seed, nonce_value, security_bits)
             });
-
             if !nonce_is_valid {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("Grinding factor not satisfied");
+                error!("chunk {chunk_idx} bucket {b}: grinding factor not satisfied");
                 return false;
+            }
+            if let Some(nonce_value) = bucket.nonce {
+                bt.append_bytes(&nonce_value.to_be_bytes());
             }
         }
 
-        #[cfg(feature = "instruments")]
-        let elapsed1 = timer1.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed1);
-
-        #[cfg(feature = "instruments")]
-        println!("- Started step 2: Verify claimed polynomial");
-        #[cfg(feature = "instruments")]
-        let timer2 = Instant::now();
-
-        if !Self::step_2_verify_claimed_composition_polynomial(air, proof, &domain, &challenges) {
-            #[cfg(not(feature = "test_fiat_shamir"))]
-            error!("Composition Polynomial verification failed");
+        let number_of_queries = leader_air.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, leader_domain, &mut bt);
+        if bucket.decommitments.len() < number_of_queries {
+            error!("chunk {chunk_idx} bucket {b}: too few FRI decommitments");
             return false;
         }
 
-        #[cfg(feature = "instruments")]
-        let elapsed2 = timer2.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed2);
-        #[cfg(feature = "instruments")]
-        println!("- Started step 3: Verify FRI");
-        #[cfg(feature = "instruments")]
-        let timer3 = Instant::now();
-
-        if !Self::step_3_verify_fri(proof, &domain, &challenges) {
-            #[cfg(not(feature = "test_fiat_shamir"))]
-            error!("FRI verification failed");
+        let mut evaluation_point_inverse = iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, leader_domain))
+            .collect::<Vec<FieldElement<Field>>>();
+        if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
+            error!("chunk {chunk_idx} bucket {b}: zero FRI evaluation point");
             return false;
         }
 
-        #[cfg(feature = "instruments")]
-        let elapsed3 = timer3.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed3);
+        let num_queries = iotas.len();
+        let mut combined_eval: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::zero(); num_queries];
+        let mut combined_eval_sym: Vec<FieldElement<FieldExtension>> =
+            vec![FieldElement::zero(); num_queries];
+        let mut delta_power = FieldElement::<FieldExtension>::one();
+        for (i_local, &j) in members.iter().enumerate() {
+            let idx = chunk_start + j;
+            let air = airs[idx];
+            let proof = &multi_proof.proofs[idx];
+            let domain = &domains[idx];
 
-        #[cfg(feature = "instruments")]
-        println!("- Started step 4: Verify deep composition polynomial");
-        #[cfg(feature = "instruments")]
-        let timer4 = Instant::now();
+            let mut challenges = table_challenges[idx].clone();
+            challenges.iotas = iotas.clone();
+            challenges.zetas = zetas.clone();
 
-        #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
-            #[cfg(not(feature = "test_fiat_shamir"))]
-            error!("DEEP Composition Polynomial verification failed");
-            return false;
+            if !Self::step_2_verify_claimed_composition_polynomial(air, proof, domain, &challenges) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("chunk {chunk_idx} bucket {b}: table {idx} composition poly failed");
+                return false;
+            }
+
+            let (member_eval, member_eval_sym) =
+                match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
+                    &challenges,
+                    domain,
+                    proof,
+                ) {
+                    Some(pair) => pair,
+                    None => {
+                        error!("chunk {chunk_idx} bucket {b}: table {idx} DEEP reconstruct failed");
+                        return false;
+                    }
+                };
+
+            if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("chunk {chunk_idx} bucket {b}: table {idx} openings failed");
+                return false;
+            }
+
+            if i_local == 0 {
+                combined_eval = member_eval;
+                combined_eval_sym = member_eval_sym;
+            } else {
+                for q in 0..num_queries {
+                    combined_eval[q] = &combined_eval[q] + &delta_power * &member_eval[q];
+                    combined_eval_sym[q] =
+                        &combined_eval_sym[q] + &delta_power * &member_eval_sym[q];
+                }
+            }
+            delta_power = &delta_power * &delta_fri;
         }
 
-        #[cfg(feature = "instruments")]
-        let elapsed4 = timer4.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed4);
-
-        #[cfg(feature = "instruments")]
+        for (q, ((iota, decommitment), eval_point_inv)) in iotas
+            .iter()
+            .zip(&bucket.decommitments)
+            .zip(evaluation_point_inverse)
+            .enumerate()
         {
-            let total_time = elapsed1 + elapsed2 + elapsed3 + elapsed4;
-            println!(
-                " Fraction of verifying time per step: {:.4} {:.4} {:.4} {:.4}",
-                elapsed1.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed2.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed3.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed4.as_nanos() as f64 / total_time.as_nanos() as f64
-            );
+            if !Self::verify_bucket_fri_query(
+                &bucket.layer_roots,
+                &bucket.last_value,
+                &zetas,
+                *iota,
+                decommitment,
+                eval_point_inv,
+                &combined_eval[q],
+                &combined_eval_sym[q],
+            ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("chunk {chunk_idx} bucket {b}: FRI query {q} failed");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Verify a single batched-FRI query for a bucket. The combined DEEP
+    /// evaluations `D(𝜐)` / `D(-𝜐)` (already linearly combined across
+    /// bucket-mates with `delta_fri` powers) are folded against the bucket's
+    /// `layer_roots` / `last_value`. MMCS-free port of the per-table FRI query
+    /// verification.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_bucket_fri_query(
+        layer_roots: &[Commitment],
+        last_value: &FieldElement<FieldExtension>,
+        zetas: &[FieldElement<FieldExtension>],
+        iota: usize,
+        fri_decommitment: &FriDecommitment<FieldExtension>,
+        evaluation_point_inv: FieldElement<Field>,
+        deep_composition_evaluation: &FieldElement<FieldExtension>,
+        deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let evaluation_point_vec: Vec<FieldElement<Field>> =
+            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
+                Some(evaluation_point.square())
+            })
+            .take(layer_roots.len())
+            .collect();
+
+        let p0_eval = deep_composition_evaluation;
+        let p0_eval_sym = deep_composition_evaluation_sym;
+
+        let mut v =
+            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+        let mut index = iota;
+
+        if layer_roots.is_empty() {
+            return v == *last_value;
         }
 
-        true
+        layer_roots
+            .iter()
+            .enumerate()
+            .zip(&fri_decommitment.layers_auth_paths)
+            .zip(&fri_decommitment.layers_evaluations_sym)
+            .zip(evaluation_point_vec)
+            .fold(
+                true,
+                |result,
+                 (
+                    (((i, merkle_root), auth_path_sym), evaluation_sym),
+                    evaluation_point_inv,
+                )| {
+                    let openings_ok = Self::verify_fri_layer_openings(
+                        merkle_root,
+                        auth_path_sym,
+                        &v,
+                        evaluation_sym,
+                        index,
+                    );
+                    v = (&v + evaluation_sym)
+                        + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+                    index >>= 1;
+                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
+                        result & openings_ok
+                    } else {
+                        result & (v == *last_value) & openings_ok
+                    }
+                },
+            )
     }
 }

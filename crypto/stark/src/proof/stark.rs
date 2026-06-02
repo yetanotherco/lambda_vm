@@ -30,6 +30,40 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
+/// Per-(chunk, lde_size) batched FRI instance (Approach 1, batched FRI within a
+/// chunk).
+///
+/// One per height bucket inside a chunk: every bucket-mate's individual DEEP
+/// composition polynomial is linearly combined with successive powers of the
+/// bucket's `delta_fri` challenge (sampled from the chunk-shared `bucket_seed`),
+/// and a single FRI commit + grinding + query is run on the combined
+/// polynomial. The `members` list pins the canonical bucket-local order used to
+/// derive `delta_fri^i` on the verifier side; reordering the list rejects the
+/// proof.
+///
+/// `decommitments` length equals `air.options().fri_number_of_queries` (one
+/// decommitment per shared iota). `nonce` is `Some` when the AIR's grinding
+/// factor > 0 (`None` otherwise).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct ChunkBucketFri<E: IsField> {
+    /// LDE size shared by every bucket-mate. Equal to
+    /// `trace_length * blowup_factor` for each member.
+    pub lde_size: u32,
+    /// Chunk-local indices of the bucket-mates, in canonical (chunk-local
+    /// index ascending) order. Index `i` here corresponds to `delta_fri^i`
+    /// in the linear combination.
+    pub members: Vec<usize>,
+    /// `[pₖ]` for the committed FRI layers.
+    pub layer_roots: Vec<Commitment>,
+    /// `pₙ` — the final folded constant.
+    pub last_value: FieldElement<E>,
+    /// One FRI decommitment per shared iota.
+    pub decommitments: Vec<FriDecommitment<E>>,
+    /// Grinding nonce, when `grinding_factor > 0`.
+    pub nonce: Option<u64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
@@ -50,17 +84,14 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub composition_poly_root: Commitment,
     // Hᵢ(z^N)
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
-    // [pₖ]
-    pub fri_layers_merkle_roots: Vec<Commitment>,
-    // pₙ
-    pub fri_last_value: FieldElement<E>,
-    // Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
-    pub query_list: Vec<FriDecommitment<E>>,
     // Open(H₁(D_LDE, 𝜐ᵢ), Open(H₂(D_LDE, 𝜐ᵢ), Open(tⱼ(D_LDE), 𝜐ᵢ)
     // Open(H₁(D_LDE, -𝜐ᵢ), Open(H₂(D_LDE, -𝜐ᵢ), Open(tⱼ(D_LDE), -𝜐ᵢ)
+    //
+    // FRI for this table is no longer per-table: it is run once per
+    // (chunk, lde_size) bucket and lives in
+    // [`MultiProof::fri_chunk_buckets`]. These DEEP openings are evaluated
+    // at the bucket-shared query indices (iotas).
     pub deep_poly_openings: DeepPolynomialOpenings<F, E>,
-    // nonce obtained from grinding
-    pub nonce: Option<u64>,
     // Bus interaction public inputs for the accumulated column.
     // Contains the table contribution (L), used for:
     // 1. Circular constraint offset: L/N per row
@@ -77,4 +108,12 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
+    /// Per-(chunk, lde_size-bucket) batched FRI instances. Outer Vec is indexed
+    /// by chunk (chunks of `chunk_size` tables in proof order); inner Vec lists
+    /// buckets in canonical first-encounter (chunk-local-index ascending) order.
+    pub fri_chunk_buckets: Vec<Vec<ChunkBucketFri<E>>>,
+    /// Pinned chunk size (= the prover's `table_parallelism()` at proving time).
+    /// The verifier uses this to chunk the proof slice into the same per-chunk
+    /// grouping the prover used.
+    pub chunk_size: u32,
 }
