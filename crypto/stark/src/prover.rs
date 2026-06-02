@@ -1835,26 +1835,31 @@ pub trait IsStarkProver<
             let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
                 lde_drain.by_ref().take(chunk_size).collect();
             let chunk_commitments = &commitments[chunk_start..chunk_end];
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
 
-            #[cfg(feature = "parallel")]
-            let iter = chunk_ldes
-                .into_par_iter()
-                .zip(chunk_commitments.par_iter())
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = chunk_ldes
-                .into_iter()
-                .zip(chunk_commitments.iter())
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
+            // ---- Pass 1: per-table Rounds 2-3 ----------------------------------
+            // Advance each table's forked transcript through the OOD evaluations.
+            // No FRI yet: the intermediate results are collected so Round 4 can run
+            // as a separate per-chunk phase (which a later step batches across the
+            // chunk's tables into a single FRI per lde_size bucket).
+            let pass1: Vec<Result<_, ProvingError>> = {
+                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, ((lde, commitment), table_transcript))| {
+                #[cfg(feature = "parallel")]
+                let iter = chunk_ldes
+                    .into_par_iter()
+                    .zip(chunk_commitments.par_iter())
+                    .zip(chunk_transcripts.par_iter_mut())
+                    .enumerate();
+                #[cfg(not(feature = "parallel"))]
+                let iter = chunk_ldes
+                    .into_iter()
+                    .zip(chunk_commitments.iter())
+                    .zip(chunk_transcripts.iter_mut())
+                    .enumerate();
+
+                iter.map(|(j, ((lde, commitment), table_transcript))| {
                     let idx = chunk_start + j;
                     let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let _ = trace; // used by instruments
                     let domain = &domains[idx];
 
                     #[cfg(feature = "instruments")]
@@ -1879,7 +1884,7 @@ pub trait IsStarkProver<
                         table_transcript.append_field_element(&bpi.table_contribution);
                     }
 
-                    let proof = Self::prove_rounds_2_to_4(
+                    let (round_2_result, round_3_result, z) = Self::prove_rounds_2_to_3(
                         *air,
                         *pub_inputs,
                         &round_1_result,
@@ -1888,14 +1893,86 @@ pub trait IsStarkProver<
                     )?;
 
                     #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    let instr1 = {
+                        let zero = std::time::Duration::ZERO;
                         (
                             air.name().to_string(),
                             trace.num_rows(),
                             table_start.elapsed(),
-                            sub_ops,
+                            crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero)),
+                            crate::instruments::take_r3_ood().unwrap_or(zero),
                         )
+                    };
+
+                    #[cfg(feature = "instruments")]
+                    return Ok((round_1_result, round_2_result, round_3_result, z, instr1));
+                    #[cfg(not(feature = "instruments"))]
+                    Ok((round_1_result, round_2_result, round_3_result, z))
+                })
+                .collect()
+            };
+            let intermediates = pass1.into_iter().collect::<Result<Vec<_>, ProvingError>>()?;
+
+            // ---- Pass 2: per-table Round 4 -------------------------------------
+            // Continue each fork through FRI and emit the proof. Still one FRI per
+            // table here, so proofs are byte-identical to the single-pass version;
+            // the batched-per-chunk FRI replaces this loop in a later step.
+            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+
+            #[cfg(feature = "parallel")]
+            let iter2 = intermediates
+                .into_par_iter()
+                .zip(chunk_transcripts.par_iter_mut())
+                .enumerate();
+            #[cfg(not(feature = "parallel"))]
+            let iter2 = intermediates
+                .into_iter()
+                .zip(chunk_transcripts.iter_mut())
+                .enumerate();
+
+            let chunk_results: Vec<Result<_, ProvingError>> = iter2
+                .map(|(j, (intermediate, table_transcript))| {
+                    let idx = chunk_start + j;
+                    let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+
+                    #[cfg(feature = "instruments")]
+                    let (round_1_result, round_2_result, round_3_result, z, instr1) = intermediate;
+                    #[cfg(not(feature = "instruments"))]
+                    let (round_1_result, round_2_result, round_3_result, z) = intermediate;
+
+                    #[cfg(feature = "instruments")]
+                    let t_pass2 = Instant::now();
+
+                    let proof = Self::prove_round_4(
+                        *air,
+                        *pub_inputs,
+                        &round_1_result,
+                        round_2_result,
+                        round_3_result,
+                        &z,
+                        table_transcript,
+                        domain,
+                    )?;
+
+                    #[cfg(feature = "instruments")]
+                    let table_timing = {
+                        let zero = std::time::Duration::ZERO;
+                        let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
+                            crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
+                        let (name, rows, pass1_dur, (r2_constraints, r2_fft, r2_merkle), r3_ood) =
+                            instr1;
+                        let sub_ops = crate::instruments::TableSubOps {
+                            constraints: r2_constraints,
+                            comp_decompose: r2_fft,
+                            comp_commit: r2_merkle,
+                            ood: r3_ood,
+                            deep_comp: r4_deep_comp,
+                            deep_extend: r4_fft,
+                            fri_commit: r4_merkle,
+                            queries: r4_queries,
+                        };
+                        (name, rows, pass1_dur + t_pass2.elapsed(), sub_ops)
                     };
 
                     #[cfg(feature = "instruments")]
@@ -2070,10 +2147,18 @@ pub trait IsStarkProver<
 
     /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initializated before passing it to this method.
-    fn prove_rounds_2_to_4(
+    /// Round 4 (per-table): build the DEEP composition polynomial and run FRI,
+    /// then assemble the `StarkProof`. Consumes the `Round2`/`Round3` produced by
+    /// [`prove_rounds_2_to_3`]. (Instrumentation timing is handled by the caller,
+    /// since Rounds 2-3 and Round 4 may run on different threads.)
+    #[allow(clippy::too_many_arguments)]
+    fn prove_round_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: Round2<FieldExtension>,
+        round_3_result: Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
@@ -2082,11 +2167,6 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        info!("Started proof generation...");
-
-        let (round_2_result, round_3_result, z) =
-            Self::prove_rounds_2_to_3(air, pub_inputs, round_1_result, transcript, domain)?;
-
         // ===================================
         // ==========|   Round 4   |==========
         // ===================================
@@ -2100,30 +2180,9 @@ pub trait IsStarkProver<
             round_1_result,
             &round_2_result,
             &round_3_result,
-            &z,
+            z,
             transcript,
         );
-
-        #[cfg(feature = "instruments")]
-        {
-            let zero = std::time::Duration::ZERO;
-            let (r2_constraints, r2_fft, r2_merkle) =
-                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
-            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
-                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
-            crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
-                constraints: r2_constraints,
-                comp_decompose: r2_fft,
-                comp_commit: r2_merkle,
-                ood: crate::instruments::take_r3_ood().unwrap_or(zero),
-                deep_comp: r4_deep_comp,
-                deep_extend: r4_fft,
-                fri_commit: r4_merkle,
-                queries: r4_queries,
-            });
-        }
-
-        info!("End proof generation");
 
         Ok(StarkProof {
             // [t]
