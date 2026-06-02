@@ -256,29 +256,36 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
-        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
-        let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
-            boundary_constraints
-                .constraints
-                .iter()
-                .map(|bc| {
-                    let point = match boundary_step_points.iter().find(|(s, _)| *s == bc.step) {
-                        Some((_, p)) => p.clone(),
-                        None => {
-                            let p = domain.trace_primitive_root.pow(bc.step as u64);
-                            boundary_step_points.push((bc.step, p.clone()));
-                            p
-                        }
-                    };
+        // Deduplicate the boundary zerofier inverse by step. The inverse
+        // 1/(x − g^step) over the LDE domain depends only on the boundary
+        // *step*, not on which column the constraint pins. The previous code
+        // ran one `inplace_batch_inverse` over the whole LDE domain *per
+        // constraint*; here we compute it once per distinct step and map each
+        // constraint to its step's evals. AIRs that pin many columns at the
+        // same row (e.g. the Fibonacci-pair bench pins every column at step 0)
+        // collapse N_boundary full-domain batch inversions into one.
+        let mut unique_steps: Vec<usize> = Vec::new();
+        let mut step_inverse_evals: Vec<Vec<FieldElement<Field>>> = Vec::new();
+        let constraint_step_idx: Vec<usize> = boundary_constraints
+            .constraints
+            .iter()
+            .map(|bc| {
+                if let Some(idx) = unique_steps.iter().position(|s| *s == bc.step) {
+                    idx
+                } else {
+                    let point = domain.trace_primitive_root.pow(bc.step as u64);
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
                         .map(|v| v - &point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
-                    evals
-                })
-                .collect::<Vec<Vec<FieldElement<Field>>>>();
+                    unique_steps.push(bc.step);
+                    step_inverse_evals.push(evals);
+                    unique_steps.len() - 1
+                }
+            })
+            .collect();
 
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
@@ -312,16 +319,16 @@ where
                 b_constraints
                     .iter()
                     .zip(boundary_coefficients)
-                    .zip(boundary_zerofiers_inverse_evaluations.iter())
+                    .zip(constraint_step_idx.iter())
                     .fold(
                         FieldElement::zero(),
-                        |acc, ((constraint, beta), zerofier_inv)| {
+                        |acc, ((constraint, beta), step_idx)| {
                             let bp = if constraint.is_aux {
                                 lde_trace.get_aux(domain_index, constraint.col) - &constraint.value
                             } else {
                                 lde_trace.get_main(domain_index, constraint.col) - &constraint.value
                             };
-                            acc + &zerofier_inv[domain_index] * beta * bp
+                            acc + &step_inverse_evals[*step_idx][domain_index] * beta * bp
                         },
                     )
             })

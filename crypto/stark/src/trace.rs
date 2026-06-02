@@ -363,6 +363,9 @@ where
     /// Consume self and re-materialize the column vectors. Inverse of
     /// `from_columns` — pays the same O(N · M) transpose cost.
     #[allow(clippy::type_complexity)]
+    // Index used to address two parallel arrays (the column Vec and the flat
+    // row-major buffer), so the range loop is intentional.
+    #[allow(clippy::needless_range_loop)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
         let mut main_columns: Vec<Vec<FieldElement<F>>> = (0..self.num_main_cols)
             .map(|_| Vec::with_capacity(self.num_rows))
@@ -591,28 +594,26 @@ where
         let zero_main = || vec![FieldElement::<E>::zero(); num_main_cols];
         let zero_aux = || vec![FieldElement::<E>::zero(); num_aux_cols];
 
-        let accumulate = |(mut main_sums, mut aux_sums): (
-            Vec<FieldElement<E>>,
-            Vec<FieldElement<E>>,
-        ),
-                          i: usize|
-         -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>) {
-            let lde_row = i * bf;
-            let scale_i = &col_scale[i];
-            if num_main_cols > 0 {
-                let row_slice = lde_trace.main_row_slice(lde_row);
-                for col_idx in 0..num_main_cols {
-                    main_sums[col_idx] = &main_sums[col_idx] + &row_slice[col_idx] * scale_i;
+        let accumulate =
+            |(mut main_sums, mut aux_sums): (Vec<FieldElement<E>>, Vec<FieldElement<E>>),
+             i: usize|
+             -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>) {
+                let lde_row = i * bf;
+                let scale_i = &col_scale[i];
+                if num_main_cols > 0 {
+                    let row_slice = lde_trace.main_row_slice(lde_row);
+                    for col_idx in 0..num_main_cols {
+                        main_sums[col_idx] = &main_sums[col_idx] + &row_slice[col_idx] * scale_i;
+                    }
                 }
-            }
-            if num_aux_cols > 0 {
-                let row_slice = lde_trace.aux_row_slice(lde_row);
-                for col_idx in 0..num_aux_cols {
-                    aux_sums[col_idx] = &aux_sums[col_idx] + scale_i * &row_slice[col_idx];
+                if num_aux_cols > 0 {
+                    let row_slice = lde_trace.aux_row_slice(lde_row);
+                    for col_idx in 0..num_aux_cols {
+                        aux_sums[col_idx] = &aux_sums[col_idx] + scale_i * &row_slice[col_idx];
+                    }
                 }
-            }
-            (main_sums, aux_sums)
-        };
+                (main_sums, aux_sums)
+            };
 
         let combine = |(mut a_main, mut a_aux): (Vec<FieldElement<E>>, Vec<FieldElement<E>>),
                        (b_main, b_aux): (Vec<FieldElement<E>>, Vec<FieldElement<E>>)|

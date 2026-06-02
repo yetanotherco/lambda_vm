@@ -324,7 +324,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             return Ok(());
         }
         let total = buffer.len();
-        if total % num_cols != 0 {
+        if !total.is_multiple_of(num_cols) {
             return Err(FFTError::InputError(total));
         }
         let n = total / num_cols;
@@ -568,8 +568,7 @@ mod tests {
             for &blowup_factor in &[2usize, 4] {
                 let lde_size = n * blowup_factor;
                 let inv_tw = LayerTwiddles::<F>::new_inverse(log_n as u64).unwrap();
-                let fwd_tw =
-                    LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
 
                 // Reproduce the weights from the existing coset test.
                 let offset = FE::from(3u64);
@@ -587,11 +586,7 @@ mod tests {
                         .map(|c| {
                             (0..n)
                                 .map(|i| {
-                                    FE::from(
-                                        (c as u64).wrapping_mul(1_000_003)
-                                            + i as u64
-                                            + 17,
-                                    )
+                                    FE::from((c as u64).wrapping_mul(1_000_003) + i as u64 + 17)
                                 })
                                 .collect()
                         })
@@ -617,9 +612,10 @@ mod tests {
 
                     // Subject under test: row-major batched pipeline.
                     let mut row_major: Vec<FE> = Vec::with_capacity(n * m);
+                    #[allow(clippy::needless_range_loop)]
                     for r in 0..n {
                         for c in 0..m {
-                            row_major.push(cols[c][r].clone());
+                            row_major.push(cols[c][r]);
                         }
                     }
                     Polynomial::<FE>::coset_lde_full_expand_row_major::<F>(

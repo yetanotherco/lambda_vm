@@ -66,8 +66,11 @@ fn dif_fused2_block_row_major<F, E>(
     let (sub1, rest2) = rest1.split_at_mut(q_off);
     let (sub2, sub3) = rest2.split_at_mut(q_off);
 
-    let inner = |j: usize, r0: &mut [FieldElement<E>], r1: &mut [FieldElement<E>],
-                 r2: &mut [FieldElement<E>], r3: &mut [FieldElement<E>]| {
+    let inner = |j: usize,
+                 r0: &mut [FieldElement<E>],
+                 r1: &mut [FieldElement<E>],
+                 r2: &mut [FieldElement<E>],
+                 r3: &mut [FieldElement<E>]| {
         let w0 = &twiddles_l0[j];
         let w1 = &twiddles_l0[j + quarter_rows];
         let w2 = &twiddles_l1[j];
@@ -141,10 +144,14 @@ fn dif_fused3_block_row_major<F, E>(
     let (s6, s7) = r6.split_at_mut(e_off);
 
     let inner = |j: usize,
-                 b0: &mut [FieldElement<E>], b1: &mut [FieldElement<E>],
-                 b2: &mut [FieldElement<E>], b3: &mut [FieldElement<E>],
-                 b4: &mut [FieldElement<E>], b5: &mut [FieldElement<E>],
-                 b6: &mut [FieldElement<E>], b7: &mut [FieldElement<E>]| {
+                 b0: &mut [FieldElement<E>],
+                 b1: &mut [FieldElement<E>],
+                 b2: &mut [FieldElement<E>],
+                 b3: &mut [FieldElement<E>],
+                 b4: &mut [FieldElement<E>],
+                 b5: &mut [FieldElement<E>],
+                 b6: &mut [FieldElement<E>],
+                 b7: &mut [FieldElement<E>]| {
         let w0_0 = &twiddles_l0[j];
         let w0_1 = &twiddles_l0[j + eighth_rows];
         let w0_2 = &twiddles_l0[j + 2 * eighth_rows];
@@ -235,8 +242,11 @@ fn dit_fused2_block_row_major<F, E>(
     let (sub1, rest2) = rest1.split_at_mut(q_off);
     let (sub2, sub3) = rest2.split_at_mut(q_off);
 
-    let inner = |j: usize, r0: &mut [FieldElement<E>], r1: &mut [FieldElement<E>],
-                 r2: &mut [FieldElement<E>], r3: &mut [FieldElement<E>]| {
+    let inner = |j: usize,
+                 r0: &mut [FieldElement<E>],
+                 r1: &mut [FieldElement<E>],
+                 r2: &mut [FieldElement<E>],
+                 r3: &mut [FieldElement<E>]| {
         let w_hi = &twiddles_hi[j];
         let w_lo_0 = &twiddles_lo[j];
         let w_lo_1 = &twiddles_lo[j + quarter_rows];
@@ -305,10 +315,14 @@ fn dit_fused3_block_row_major<F, E>(
     let (s6, s7) = r6.split_at_mut(e_off);
 
     let inner = |j: usize,
-                 b0: &mut [FieldElement<E>], b1: &mut [FieldElement<E>],
-                 b2: &mut [FieldElement<E>], b3: &mut [FieldElement<E>],
-                 b4: &mut [FieldElement<E>], b5: &mut [FieldElement<E>],
-                 b6: &mut [FieldElement<E>], b7: &mut [FieldElement<E>]| {
+                 b0: &mut [FieldElement<E>],
+                 b1: &mut [FieldElement<E>],
+                 b2: &mut [FieldElement<E>],
+                 b3: &mut [FieldElement<E>],
+                 b4: &mut [FieldElement<E>],
+                 b5: &mut [FieldElement<E>],
+                 b6: &mut [FieldElement<E>],
+                 b7: &mut [FieldElement<E>]| {
         let w_hi = &twiddles_hi[j];
         let w_mid_0 = &twiddles_mid[j];
         let w_mid_1 = &twiddles_mid[j + eighth_rows];
@@ -528,7 +542,10 @@ pub fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(buf: &mut [E], num
     if num_cols == 0 || buf.is_empty() {
         return;
     }
-    debug_assert!(buf.len() % num_cols == 0, "buf.len() must be a multiple of num_cols");
+    debug_assert!(
+        buf.len().is_multiple_of(num_cols),
+        "buf.len() must be a multiple of num_cols"
+    );
     let n = buf.len() / num_cols;
     if n <= 1 {
         return;
@@ -603,7 +620,7 @@ where
         return Ok(());
     }
     let total = buf.len();
-    if total % num_cols != 0 {
+    if !total.is_multiple_of(num_cols) {
         return Err(FFTError::InputError(total));
     }
     let n = total / num_cols;
@@ -725,7 +742,7 @@ where
         return Ok(());
     }
     let total = buf.len();
-    if total % num_cols != 0 {
+    if !total.is_multiple_of(num_cols) {
         return Err(FFTError::InputError(total));
     }
     let n = total / num_cols;
@@ -829,7 +846,7 @@ where
 mod tests {
     use super::*;
     use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::bowers_fft::{bowers_fft_opt_fused, bowers_ifft_opt, LayerTwiddles};
+    use crate::fft::cpu::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
     use crate::field::goldilocks::GoldilocksField;
 
     type F = GoldilocksField;
@@ -845,7 +862,7 @@ mod tests {
         let mut row_major = vec![FE::zero(); n * m];
         for r in 0..n {
             for c in 0..m {
-                row_major[r * m + c] = cols[c][r].clone();
+                row_major[r * m + c] = cols[c][r];
             }
         }
         (row_major, m)
@@ -860,7 +877,7 @@ mod tests {
         let mut cols: Vec<Vec<FE>> = (0..m).map(|_| Vec::with_capacity(n)).collect();
         for r in 0..n {
             for c in 0..m {
-                cols[c].push(buf[r * m + c].clone());
+                cols[c].push(buf[r * m + c]);
             }
         }
         cols

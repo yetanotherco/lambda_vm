@@ -19,7 +19,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -494,9 +494,7 @@ pub trait IsStarkProver<
                     let row_start = br_idx * num_cols;
                     let row = &data[row_start..row_start + num_cols];
                     for (col_idx, elem) in row.iter().enumerate() {
-                        elem.write_bytes_be(
-                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
-                        );
+                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
                     }
                     BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
                 },
@@ -511,9 +509,7 @@ pub trait IsStarkProver<
                     let row_start = br_idx * num_cols;
                     let row = &data[row_start..row_start + num_cols];
                     for (col_idx, elem) in row.iter().enumerate() {
-                        elem.write_bytes_be(
-                            &mut buf[col_idx * byte_len..(col_idx + 1) * byte_len],
-                        );
+                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
                     }
                     BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
                 })
@@ -817,13 +813,9 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (precomputed_tree, precomputed_root) = Self::commit_rows_bit_reversed_subset(
-            &lde_data,
-            num_cols,
-            0,
-            num_precomputed_cols,
-        )
-        .ok_or(ProvingError::EmptyCommitment)?;
+        let (precomputed_tree, precomputed_root) =
+            Self::commit_rows_bit_reversed_subset(&lde_data, num_cols, 0, num_precomputed_cols)
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
             &lde_data,
@@ -2047,7 +2039,10 @@ pub trait IsStarkProver<
             Vec::with_capacity(num_airs);
         let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
         for (
-            ((main_commit, (main_data, num_main_cols)), (aux_tree, aux_root, aux_data, num_aux_cols)),
+            (
+                (main_commit, (main_data, num_main_cols)),
+                (aux_tree, aux_root, aux_data, num_aux_cols),
+            ),
             bus_public_inputs,
         ) in main_commits
             .into_iter()
