@@ -12,6 +12,7 @@
     ("PROOF SYSTEM", (
         ("logup.typ", [`LogUp` argument], <logup>),
         ("memory.typ", [Memory argument], <memory>),
+        ("streaming.typ", [Streaming prover], <streaming>),
     )),
     ("OVERVIEW", (
         ("variables.typ", [Variables], <vars>),
