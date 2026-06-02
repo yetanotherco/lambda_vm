@@ -3,10 +3,11 @@
 //! Receives the high-level `MEMORY` op from the CPU for store instructions and
 //! emits the low-level `MEMW` write. Spec: `spec/src/store.toml`.
 //!
-//! ## Deviation (Q7, reported to spec authors)
-//! `store.toml`'s `MEMORY` receiver flags omit the `memory_op` bit, so the bus
-//! would not balance against the CPU's `mem_flags` (which has `memory_op=1` for
-//! stores). We implement the flags as `1 + 4·write2 + 8·write4 + 16·write8`.
+//! ## `memory_op` flag bit (spec-faithful)
+//! The `MEMORY` receiver flags are `1 + 4·write2 + 8·write4 + 16·write8`; the
+//! `+1` is `memory_op`, which balances against the CPU's `mem_flags`
+//! (`memory_op = 1` for stores). This matches `store.toml` — the `+1` was added
+//! upstream in PR #624 (`761abbd8`), resolving the former Q7 deviation.
 //!
 //! Note (Q8): the `MEMW` *write* fingerprint carries no `old` value — the
 //! previous memory contents are handled inside the MEMW table. So STORE needs
@@ -125,7 +126,7 @@ pub fn generate_store_trace(
 
 /// All bus interactions for the STORE table:
 /// - **Sends** the low-level `MEMW` write (16 elements, no `old`).
-/// - **Receives** the high-level `MEMORY` op (with the Q7 `memory_op` fix).
+/// - **Receives** the high-level `MEMORY` op (flags include the `memory_op` bit).
 /// - **Sends** `ARE_BYTES[value[i], 0]` (×8) to range-check the stored bytes.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(10);
@@ -194,8 +195,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // MEMORY[timestamp, base_address, value, flags] -> 0  (receiver, mult μ).
-    // flags = 1 + 4·write2 + 8·write4 + 16·write8 — the `1` (memory_op) is the
-    // Q7 fix vs store.toml.
+    // flags = 1 + 4·write2 + 8·write4 + 16·write8 — the `1` is memory_op
+    // (matches store.toml).
     interactions.push(BusInteraction::receiver(
         BusId::MemoryOp,
         Multiplicity::Column(cols::MU),

@@ -14,7 +14,7 @@
 //!   lt/mul/dvrm/shift/eq/bytewise chips receive on it, keyed by `alu_flags`.
 //! - `MEMORY[timestamp, address, rv2, mem_flags] -> rvd` (mult `MEMORY`): high
 //!   level LOAD/STORE dispatch (the LOAD/STORE chips receive on it).
-//! - `CPU32[timestamp, pc, instruction_length]` (mult `word_instr`): every word
+//! - `CPU32[timestamp, pc, half_instruction_length]` (mult `word_instr`): every word
 //!   (`*W`) instruction is delegated to the CPU32 table, which does its own
 //!   register I/O and sign-extension. On a `word_instr` row the main CPU is a
 //!   pure delegate: all operational flags are 0 and only the PC advances.
@@ -37,7 +37,7 @@ use stark::trace::TraceTable;
 
 /// PC value used for CPU padding rows. Per spec this is an odd address
 /// (unreachable during normal execution); the DECODE table contains a matching
-/// padding entry at this PC (all flags 0, `instruction_length = 0`).
+/// padding entry at this PC (all flags 0, `half_instruction_length = 0`).
 pub const CPU_PADDING_PC: u64 = 1;
 
 // =========================================================================
@@ -71,8 +71,9 @@ pub mod cols {
     pub const IMM_0: usize = 9;
     pub const IMM_1: usize = 10;
 
-    /// instruction_length: bytes consumed by this instruction (Byte; 2 or 4).
-    pub const INSTRUCTION_LENGTH: usize = 11;
+    /// half_instruction_length: half the bytes consumed (Byte; 1 or 2). The real
+    /// length is `2 * half_instruction_length` (spec `b1b51c9d`).
+    pub const HALF_INSTRUCTION_LENGTH: usize = 11;
     /// word_instr: `*W` instruction (delegated to CPU32) (Bit).
     pub const WORD_INSTR: usize = 12;
 
@@ -215,6 +216,8 @@ impl CpuOperation {
     /// Creates a CpuOperation from an executor Log and a DecodeEntry.
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let f = decode.fields;
+        // Real byte length: the column stores half (spec `b1b51c9d`).
+        let instruction_length = 2 * f.half_instruction_length as u64;
 
         // ECALL syscall classification (rv1 = a7 = syscall number).
         let ecall_commit = f.ecall && log.src1_val == SyscallNumbers::Commit as u64;
@@ -234,7 +237,7 @@ impl CpuOperation {
         // zeroes the operational columns on the delegate row.
         if f.word_instr {
             return Self {
-                next_pc: decode.pc.wrapping_add(f.instruction_length as u64),
+                next_pc: decode.pc.wrapping_add(instruction_length),
                 rv1: log.src1_val,
                 rv2: if f.read_register2 { log.src2_val } else { 0 },
                 rvd: log.dst_val,
@@ -261,15 +264,12 @@ impl CpuOperation {
 
         let jalr = f.mem_flags & 1 == 1;
 
-        // arg2 multiplex (CPU-A1), matching `cpu.toml`:
-        //   MEMORY            -> imm
-        //   BRANCH ∧ JALR     -> instruction_length   (JAL/JALR return-addr add)
-        //   BRANCH ∧ ¬JALR    -> rv2                   (conditional branch compare)
-        //   else              -> rv2 + imm             (≤1 nonzero by decode A2)
+        // arg2 multiplex (CPU-A1), matching `cpu.toml` (spec `c9540a55`):
+        //   MEMORY -> imm
+        //   BRANCH -> rv2                 (JAL/JALR read no rs2, so rv2 = 0)
+        //   else   -> rv2 + imm           (≤1 nonzero by decode A2)
         let arg2 = if f.memory {
             decode.imm
-        } else if f.branch && jalr {
-            f.instruction_length as u64
         } else if f.branch {
             rv2
         } else {
@@ -304,21 +304,18 @@ impl CpuOperation {
             0
         };
 
-        // rvd: loaded value for LOAD; 0 for STORE (output unused); res otherwise.
-        // SPECIAL CASE (deviation Q10): for `BRANCH ∧ JALR` rows the return
-        // address is `pc + instruction_length`, not `res = rv1 + arg2`. The
-        // ADD fast-path computes `res = rv1 + arg2` and for JAL it happens
-        // to equal `pc + instruction_length` because the decode forces
-        // `rs1 := x255` → `rv1 = pc`. JALR has no such override (its `rv1`
-        // is the user's rs1_value, needed by the BRANCH bus for target
-        // computation), so `res = rs1_value + 4` ≠ return address. The
-        // RvdEqResConstraint is correspondingly excluded for JALR rows, and
-        // a dedicated `JalrRvdConstraint` pins `rvd` to `pc + len` instead.
+        // rvd: loaded value for LOAD; 0 for STORE (output unused); the return
+        // address `pc + instruction_length` on every BRANCH row (written to `rd`
+        // only by JAL/JALR — `cpu.toml` branch group, spec `c9540a55`); `res`
+        // otherwise. The spec computes this `pc + len` via the ADD chip gated on
+        // `BRANCH`; we pin it with [`BranchRvdConstraint`] (carry-omitting, like
+        // `next_pc`). For conditional branches `rvd` is computed but never
+        // written (`write_register = 0`).
         let store = f.memory && jalr; // under MEMORY, mem_flags bit 0 = memory_op (1 = store)
         let rvd = if f.memory {
             if store { 0 } else { log.dst_val }
-        } else if f.branch && jalr {
-            decode.pc.wrapping_add(f.instruction_length as u64)
+        } else if f.branch {
+            decode.pc.wrapping_add(instruction_length)
         } else {
             res
         };
@@ -327,11 +324,11 @@ impl CpuOperation {
         // ECALL keeps next_pc = pc + len (CO69) even though the executor sets 0
         // to signal halt; the HALT table proves termination separately.
         let next_pc = if f.ecall {
-            decode.pc.wrapping_add(f.instruction_length as u64)
+            decode.pc.wrapping_add(instruction_length)
         } else if branch_cond {
             log.next_pc
         } else {
-            decode.pc.wrapping_add(f.instruction_length as u64)
+            decode.pc.wrapping_add(instruction_length)
         };
 
         Self {
@@ -380,7 +377,7 @@ impl CpuOperation {
 
     /// Collects the BITWISE-table range-check lookups generated by this row, so
     /// the BITWISE table can account for the matching multiplicities:
-    /// 3 `ARE_BYTES` (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
+    /// 3 `ARE_BYTES` (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags) and
     /// 4 `IS_HALF` (the four halves of `res`).
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
@@ -388,7 +385,7 @@ impl CpuOperation {
         let mut ops = Vec::with_capacity(7);
 
         // Must mirror the trace columns exactly. On word delegate rows the CPU
-        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (instruction_length stays);
+        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
         // CPU32 emits its own range checks for the real decoded values.
         let word = f.word_instr;
         let z = |v: u8| if word { 0 } else { v };
@@ -402,7 +399,7 @@ impl CpuOperation {
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.rd),
-            f.instruction_length,
+            f.half_instruction_length,
         ));
         ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
@@ -479,7 +476,7 @@ pub fn generate_cpu_trace(
         data[base + cols::IMM_0] = FE::from(imm & 0xFFFF_FFFF);
         data[base + cols::IMM_1] = FE::from(imm >> 32);
 
-        data[base + cols::INSTRUCTION_LENGTH] = FE::from(f.instruction_length as u64);
+        data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(f.half_instruction_length as u64);
         data[base + cols::WORD_INSTR] = FE::from(word as u64);
 
         data[base + cols::ALU] = FE::from(effective(f.alu));
@@ -524,7 +521,7 @@ pub fn generate_cpu_trace(
         data[base + cols::PREV_PC_TIMESTAMP_BORROW] = FE::from(prev_pc_ts_borrow);
     }
 
-    // Padding rows: pc = next_pc = 1 (odd, unreachable), instruction_length = 0 so
+    // Padding rows: pc = next_pc = 1 (odd, unreachable), half_instruction_length = 0 so
     // next_pc = pc + 0 = pc, all flags 0. The DECODE table has the matching padding
     // entry at pc = 1. Per spec, padding rows participate in the inline-PC `memory`
     // chain: each reads pc=1 at `timestamp - 3` and writes pc=1 at `timestamp + 1`,
@@ -646,7 +643,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 pow2_term(pd::RS1, cols::RS1),
                 pow2_term(pd::RS2, cols::RS2),
                 pow2_term(pd::RD, cols::RD),
-                pow2_term(pd::INSTRUCTION_LENGTH, cols::INSTRUCTION_LENGTH),
+                pow2_term(pd::HALF_INSTRUCTION_LENGTH, cols::HALF_INSTRUCTION_LENGTH),
                 pow2_term(pd::ALU_FLAGS, cols::ALU_FLAGS),
                 pow2_term(pd::MEM_FLAGS, cols::MEM_FLAGS),
             ]),
@@ -678,7 +675,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // CPU32: delegate word (`*W`) instructions (mult = word_instr).
-    // CPU32[timestamp::DWordWL, pc::DWordWL, instruction_length].
+    // CPU32[timestamp::DWordWL, pc::DWordWL, half_instruction_length].
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Cpu32,
@@ -694,7 +691,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::DWordWL,
             },
             BusValue::Packed {
-                start_column: cols::INSTRUCTION_LENGTH,
+                start_column: cols::HALF_INSTRUCTION_LENGTH,
                 packing: Packing::Direct,
             },
         ],
@@ -911,12 +908,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // Range checks: ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags)
+    // Range checks: ARE_BYTES (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags)
     // and IS_HALF on each `res` half. Every row sends (incl. padding: all 0).
     // -------------------------------------------------------------------------
     for (a, b) in [
         (cols::RS1, cols::RS2),
-        (cols::RD, cols::INSTRUCTION_LENGTH),
+        (cols::RD, cols::HALF_INSTRUCTION_LENGTH),
         (cols::ALU_FLAGS, cols::MEM_FLAGS),
     ] {
         interactions.push(BusInteraction::sender(

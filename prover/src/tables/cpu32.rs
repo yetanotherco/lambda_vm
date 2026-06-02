@@ -1,7 +1,7 @@
 //! CPU32 table — shrink-cpu rework.
 //!
 //! Handles all 32-bit word (`*W`) instructions delegated by the main CPU via
-//! the `CPU32[timestamp, pc, instruction_length]` interaction. All `*W`
+//! the `CPU32[timestamp, pc, half_instruction_length]` interaction. All `*W`
 //! instructions are ALU-only, so there is no BRANCH/MEMORY/ECALL path. The chip
 //! does its own DECODE lookup, reads the registers, sign-extends the inputs to
 //! 64 bits, runs the ALU (or the ADD/SUB fast-path) and sign-extends the 32-bit
@@ -87,7 +87,8 @@ pub mod cols {
     pub const ALU_FLAGS: usize = 32;
     pub const ADD: usize = 33;
     pub const SUB: usize = 34;
-    pub const INSTRUCTION_LENGTH: usize = 35;
+    /// half the byte length (1 or 2); real length = `2 * half` (spec `b1b51c9d`).
+    pub const HALF_INSTRUCTION_LENGTH: usize = 35;
     /// signed: extracted from `alu_flags` bit 5 (via BYTE_ALU[AND, 32, alu_flags]).
     pub const SIGNED: usize = 36;
 
@@ -130,7 +131,7 @@ pub struct Cpu32Operation {
     pub alu_flags: u8,
     pub add: bool,
     pub sub: bool,
-    pub instruction_length: u8,
+    pub half_instruction_length: u8,
 }
 
 /// Derived auxiliary values for a CPU32 row.
@@ -241,7 +242,7 @@ pub fn generate_cpu32_trace(
         data[base + cols::ALU_FLAGS] = FE::from(op.alu_flags as u64);
         data[base + cols::ADD] = FE::from(op.add as u64);
         data[base + cols::SUB] = FE::from(op.sub as u64);
-        data[base + cols::INSTRUCTION_LENGTH] = FE::from(op.instruction_length as u64);
+        data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(op.half_instruction_length as u64);
         data[base + cols::SIGNED] = FE::from(aux.signed as u64);
 
         data[base + cols::MU] = FE::one();
@@ -411,8 +412,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RD,
                 },
                 LinearTerm::Column {
-                    coefficient: 1 << pd::INSTRUCTION_LENGTH,
-                    column: cols::INSTRUCTION_LENGTH,
+                    coefficient: 1 << pd::HALF_INSTRUCTION_LENGTH,
+                    column: cols::HALF_INSTRUCTION_LENGTH,
                 },
                 LinearTerm::Column {
                     coefficient: 1 << pd::ALU_FLAGS,
@@ -424,7 +425,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // Byte range checks: ARE_BYTES[x, 0].
     for col in [
-        cols::INSTRUCTION_LENGTH,
+        cols::HALF_INSTRUCTION_LENGTH,
         cols::ALU_FLAGS,
         cols::RS1,
         cols::RS2,
@@ -553,7 +554,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // CPU32[timestamp, pc, instruction_length] (receiver from the main CPU).
+    // CPU32[timestamp, pc, half_instruction_length] (receiver from the main CPU).
     interactions.push(BusInteraction::receiver(
         BusId::Cpu32,
         Multiplicity::Column(cols::MU),
@@ -567,7 +568,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::DWordWL,
             },
             BusValue::Packed {
-                start_column: cols::INSTRUCTION_LENGTH,
+                start_column: cols::HALF_INSTRUCTION_LENGTH,
                 packing: Packing::Direct,
             },
         ],

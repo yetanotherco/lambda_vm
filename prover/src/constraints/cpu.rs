@@ -233,18 +233,21 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
 // alu group: arg2 multiplex
 // =========================================================================
 
-/// `arg2` multiplex (`cpu.toml` CPU-A1), for word index `word_idx ∈ {0,1}`:
+/// `arg2` multiplex (`cpu.toml` CPU-A1, spec `c9540a55`), for word index
+/// `word_idx ∈ {0,1}`:
 ///
 /// ```text
 /// arg2[i] = MEMORY·imm[i]
-///         + BRANCH·(1−JALR)·rv2[i]
-///         + BRANCH·JALR·instruction_length   (i = 0 only)
-///         + (1−MEMORY)·(1−BRANCH)·(rv2[i] + imm[i])
+///         + BRANCH·rv2[i]
+///         + (1−MEMORY−BRANCH)·(rv2[i] + imm[i])
 /// ```
 ///
-/// The final `rv2 + imm` term has no inter-word carry because decode assumption
-/// A2 guarantees at most one of `rv2`/`imm` is nonzero when `MEMORY+BRANCH = 0`.
-/// `JALR` is the `mem_flags` byte (valid as a bit under `BRANCH`).
+/// For BRANCH rows `arg2 = rv2` (JAL/JALR read no rs2, so `rv2 = 0`; conditional
+/// branches feed `rv2` to the EQ/LT comparison). The final `rv2 + imm` term has
+/// no inter-word carry because decode assumption A2 guarantees at most one of
+/// `rv2`/`imm` is nonzero when `MEMORY+BRANCH = 0`. `MEMORY` and `BRANCH` are
+/// mutually exclusive (enforced by the live `MEMORY·BRANCH = 0` constraint), so
+/// `1−MEMORY−BRANCH ∈ {0,1}` and matches the degree-2 spec form `9be4ecd217`.
 pub struct Arg2Constraint {
     /// 0 = low word, 1 = high word.
     word_idx: usize,
@@ -262,7 +265,9 @@ impl Arg2Constraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constraint {
     fn degree(&self) -> usize {
-        3
+        // (1 - MEMORY - BRANCH) [deg 1] · (rv2 + imm) [deg 1] = 2. The degree-2
+        // form relies on the live MEMORY·BRANCH = 0 mutex (spec `9be4ecd217`).
+        2
     }
 
     fn constraint_idx(&self) -> usize {
@@ -286,21 +291,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
         let rv2 = step.get_main_evaluation_element(0, rv2_col).clone();
         let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
         let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
-        let jalr = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
 
         // MEMORY · imm
         let mut expected = &memory * &imm;
-        // BRANCH · (1 - JALR) · rv2
-        expected += &branch * (&one - &jalr) * &rv2;
-        // BRANCH · JALR · instruction_length (low word only)
-        if self.word_idx == 0 {
-            let instr_len = step
-                .get_main_evaluation_element(0, cols::INSTRUCTION_LENGTH)
-                .clone();
-            expected += &branch * &jalr * instr_len;
-        }
-        // (1 - MEMORY) · (1 - BRANCH) · (rv2 + imm)
-        expected += (&one - &memory) * (&one - &branch) * (&rv2 + &imm);
+        // BRANCH · rv2
+        expected += &branch * &rv2;
+        // (1 - MEMORY - BRANCH) · (rv2 + imm)
+        expected += (&one - &memory - &branch) * (&rv2 + &imm);
 
         arg2 - expected
     }
@@ -310,16 +307,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
 // mem group: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
 // =========================================================================
 
-/// `(1 − MEMORY) · (1 − JALR) · (rvd[i] − cast(res, WL)[i]) = 0`.
+/// `(1 − MEMORY − BRANCH) · (rvd[i] − cast(res, WL)[i]) = 0` (`cpu.toml` CPU-M*,
+/// spec `c9540a55`).
 ///
-/// `JALR = mem_flags` under `BRANCH` (Q6 alias). Under `!MEMORY` the
-/// `mem_flags` byte is bit-bounded by the decode (= 0 for non-BRANCH rows,
-/// ∈ {0,1} for BRANCH rows), so multiplying by `(1 − mem_flags)` exempts
-/// only the JAL/JALR rows. Those rows have `rvd` pinned to
-/// `pc + instruction_length` by [`JalrRvdConstraint`] (deviation Q10 — the
-/// spec's `res = rv1 + arg2` yields `rs1_value + 4` for JALR rows because
-/// the decode doesn't override `rs1 := x255` like it does for JAL).
-/// For LOAD/STORE `rvd` comes from the MEMORY bus.
+/// On plain ALU rows `rvd = res`. BRANCH rows are exempt: their `rvd` is the
+/// return address `pc + instruction_length`, pinned by [`BranchRvdConstraint`].
+/// `MEMORY` and `BRANCH` are mutually exclusive (decode assumption), so
+/// `1 − MEMORY − BRANCH ∈ {0,1}`. For LOAD/STORE `rvd` comes from the MEMORY bus.
 pub struct RvdEqResConstraint {
     /// 0 = low word, 1 = high word.
     word_idx: usize,
@@ -337,7 +331,8 @@ impl RvdEqResConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResConstraint {
     fn degree(&self) -> usize {
-        3
+        // (1 - MEMORY - BRANCH) [deg 1] · (rvd - cast(res, WL)) [deg 1] = 2.
+        2
     }
 
     fn constraint_idx(&self) -> usize {
@@ -353,35 +348,39 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResCons
         let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
         let one = FieldElement::<F>::one();
         let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
-        let jalr = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
+        let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
         let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
         let res_w = res_word(step, high);
-        (&one - &memory) * (&one - &jalr) * (rvd - res_w)
+        (&one - &memory - &branch) * (rvd - res_w)
     }
 }
 
 // =========================================================================
-// branch group (Q10 deviation): BRANCH·JALR ⇒ rvd = cast(pc + len, WL)
+// branch group: BRANCH ⇒ rvd = cast(pc + len, WL)
 // =========================================================================
 
-/// `BRANCH · JALR · (rvd[i] − cast(pc + instruction_length, WL)[i]) = 0`.
+/// `BRANCH · (rvd[i] − cast(pc + instruction_length, WL)[i]) = 0` (`cpu.toml`
+/// branch group, spec `c9540a55`).
 ///
-/// Pins JAL/JALR's return-address write to the correct value (`pc + len`)
-/// independently of `res`. See [`RvdEqResConstraint`] for why this exists
-/// and how the two constraints partition the rvd domain.
+/// On every BRANCH row `rvd` holds the return address `pc + instruction_length`
+/// (written to `rd` only by JAL/JALR; conditional branches compute it but never
+/// write it). The spec realizes this with an ADD-chip lookup gated on `BRANCH`;
+/// we pin it with a polynomial constraint, mirroring the project's existing
+/// `next_pc = pc + len` arithmetic. See [`RvdEqResConstraint`] for the
+/// complementary `¬MEMORY ∧ ¬BRANCH ⇒ rvd = res` case.
 ///
 /// **Carry caveat:** the constraint expresses `cast(pc + instruction_length,
 /// DWordWL)` assuming `pc[0] + instruction_length < 2^32`, which holds for
 /// any realistic ELF (text segment lives below 2^31). A fully carry-aware
 /// version would need a borrow column; the project's existing
 /// `next_pc = pc + len` arithmetic relies on the same assumption.
-pub struct JalrRvdConstraint {
+pub struct BranchRvdConstraint {
     /// 0 = low word, 1 = high word.
     word_idx: usize,
     constraint_idx: usize,
 }
 
-impl JalrRvdConstraint {
+impl BranchRvdConstraint {
     pub fn new(word_idx: usize, constraint_idx: usize) -> Self {
         Self {
             word_idx,
@@ -390,10 +389,10 @@ impl JalrRvdConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrRvdConstraint {
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchRvdConstraint {
     fn degree(&self) -> usize {
-        // BRANCH (deg 1) · jalr (deg 1) · (rvd - expected) (deg 1) = 3.
-        3
+        // BRANCH (deg 1) · (rvd - expected) (deg 1) = 2.
+        2
     }
 
     fn constraint_idx(&self) -> usize {
@@ -409,7 +408,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrRvdConst
         let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
         let pc_col = if high { cols::PC_1 } else { cols::PC_0 };
         let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
-        let jalr = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
         let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
         let pc = step.get_main_evaluation_element(0, pc_col).clone();
         // expected = (pc + len) for low word; (pc) for high word.
@@ -417,12 +415,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrRvdConst
         let expected = if high {
             pc
         } else {
-            let il = step
-                .get_main_evaluation_element(0, cols::INSTRUCTION_LENGTH)
+            let half_len = step
+                .get_main_evaluation_element(0, cols::HALF_INSTRUCTION_LENGTH)
                 .clone();
-            pc + il
+            pc + &half_len + &half_len // real byte length = 2 * half
         };
-        branch * jalr * (rvd - expected)
+        branch * (rvd - expected)
     }
 }
 
@@ -503,9 +501,10 @@ impl NextPcAddConstraint {
     {
         let pc_lo = step.get_main_evaluation_element(0, cols::PC_0).clone();
         let next_pc_lo = step.get_main_evaluation_element(0, cols::NEXT_PC_0).clone();
-        let instr_len = step
-            .get_main_evaluation_element(0, cols::INSTRUCTION_LENGTH)
+        let half_len = step
+            .get_main_evaluation_element(0, cols::HALF_INSTRUCTION_LENGTH)
             .clone();
+        let instr_len = &half_len + &half_len; // real byte length = 2 * half
         let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_lo + instr_len - next_pc_lo) * inv_2_32
     }
@@ -580,15 +579,17 @@ pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
 
 /// Total number of CPU transition constraints (excludes bus lookups):
 /// - IS_BIT: 12
-/// - decode mutex: 4 (`word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER}`)
+/// - decode mutex: 6 (`word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
+///   READ_REGISTER1, READ_REGISTER2}`)
 /// - ADD pair: 2, SUB pair: 2
 /// - arg2 multiplex: 2
 /// - register zero-forcing: 4 (`rv1[0..1]`, `rv2[0..1]`)
 /// - rvd = res: 2
+/// - branch rvd (`pc + len`): 2
 /// - branch_cond: 1
 /// - next_pc: 2
 /// - assumptions: 4 (MEMORY·BRANCH mutex 1 + arg2 exclusivity 2 + mem_flags IS_BIT 1)
-pub const NUM_CPU_CONSTRAINTS: usize = 12 + 4 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 4;
+pub const NUM_CPU_CONSTRAINTS: usize = 12 + 6 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 4;
 
 /// Creates all CPU transition constraints.
 ///
@@ -617,14 +618,17 @@ pub fn create_all_cpu_constraints() -> (
         Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
     > = Vec::new();
 
-    // decode: word_instr mutex with MEMORY / BRANCH / ECALL, and word_instr ⇒
-    // write_register = 0 (word instructions are delegated to CPU32 and must not
-    // write the main register file — leaving write_register free is unsound).
+    // decode: word_instr mutex with MEMORY / BRANCH / ECALL, plus word_instr ⇒
+    // {write,read1,read2}_register = 0 (word instructions are delegated to CPU32
+    // and must not touch the main register file — leaving these free is unsound).
+    // The register-read gates are spec `1dee9152` ("out of caution").
     for &col in &[
         cols::MEMORY,
         cols::BRANCH,
         cols::ECALL,
         cols::WRITE_REGISTER,
+        cols::READ_REGISTER1,
+        cols::READ_REGISTER2,
     ] {
         other.push(ProductZeroConstraint::new(cols::WORD_INSTR, col, next_idx).boxed());
         next_idx += 1;
@@ -650,16 +654,16 @@ pub fn create_all_cpu_constraints() -> (
         next_idx += 1;
     }
 
-    // mem: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
+    // mem: ¬MEMORY ∧ ¬BRANCH ⇒ rvd = cast(res, WL)
     other.push(RvdEqResConstraint::new(0, next_idx).boxed());
     next_idx += 1;
     other.push(RvdEqResConstraint::new(1, next_idx).boxed());
     next_idx += 1;
 
-    // branch (Q10 deviation): BRANCH·JALR ⇒ rvd = cast(pc + instruction_length, WL)
-    other.push(JalrRvdConstraint::new(0, next_idx).boxed());
+    // branch: BRANCH ⇒ rvd = cast(pc + instruction_length, WL) (JAL/JALR return)
+    other.push(BranchRvdConstraint::new(0, next_idx).boxed());
     next_idx += 1;
-    other.push(JalrRvdConstraint::new(1, next_idx).boxed());
+    other.push(BranchRvdConstraint::new(1, next_idx).boxed());
     next_idx += 1;
 
     // branch: branch_cond + next_pc

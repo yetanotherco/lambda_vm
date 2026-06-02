@@ -90,11 +90,11 @@ fn test_field_placement() {
     );
     assert_eq!(
         ShrunkDecode {
-            instruction_length: 4,
+            half_instruction_length: 2,
             ..Default::default()
         }
         .pack(),
-        4 << bits::INSTRUCTION_LENGTH
+        2 << bits::HALF_INSTRUCTION_LENGTH
     );
     assert_eq!(
         ShrunkDecode {
@@ -131,7 +131,7 @@ fn test_fields_are_disjoint_and_fit_in_58_bits() {
         rs1: 0xFF,
         rs2: 0xFF,
         rd: 0xFF,
-        instruction_length: 0xFF,
+        half_instruction_length: 0xFF,
         alu_flags: 0xFF,
         mem_flags: 0xFF,
     };
@@ -196,7 +196,7 @@ fn test_fields_are_disjoint_and_fit_in_58_bits() {
             ..Default::default()
         },
         ShrunkDecode {
-            instruction_length: 0xFF,
+            half_instruction_length: 0xFF,
             ..Default::default()
         },
         ShrunkDecode {
@@ -231,7 +231,7 @@ fn test_pack_unpack_round_trip() {
             rs1: 0x11,
             rs2: 0x22,
             rd: 0x33,
-            instruction_length: 4,
+            half_instruction_length: 2,
             ..Default::default()
         },
         // A signed word ALU op going through the ALU bus (e.g. SRAW)
@@ -242,7 +242,7 @@ fn test_pack_unpack_round_trip() {
             alu: true,
             rs1: 7,
             rd: 9,
-            instruction_length: 4,
+            half_instruction_length: 2,
             alu_flags: build_alu_flags(alu_op::SHIFTW, true, true, false),
             ..Default::default()
         },
@@ -253,7 +253,7 @@ fn test_pack_unpack_round_trip() {
             memory: true,
             rs1: 5,
             rd: 6,
-            instruction_length: 4,
+            half_instruction_length: 2,
             mem_flags: build_mem_flags(false, true, false, true, false),
             ..Default::default()
         },
@@ -272,7 +272,7 @@ fn test_pack_unpack_round_trip() {
             rs1: 0xFF,
             rs2: 0xFF,
             rd: 0xFF,
-            instruction_length: 0xFF,
+            half_instruction_length: 0xFF,
             alu_flags: 0xFF,
             mem_flags: 0xFF,
         },
@@ -297,7 +297,10 @@ fn test_from_instruction_arith_ops() {
     );
     assert!(d.add && !d.alu && !d.sub);
     assert!(d.read_register1 && d.read_register2 && d.write_register);
-    assert_eq!((d.rs1, d.rs2, d.rd, d.instruction_length), (1, 2, 3, 4));
+    assert_eq!(
+        (d.rs1, d.rs2, d.rd, d.half_instruction_length),
+        (1, 2, 3, 2)
+    );
     assert_eq!(d.alu_flags, 0);
 
     // AND → ALU path, alu_flags = AND.
@@ -467,16 +470,17 @@ fn test_from_instruction_branches_set_branch_and_alu() {
 
 #[test]
 fn test_from_instruction_jumps() {
-    // JAL → ADD + BRANCH + JALR bit, rs1 = x255.
+    // JAL → BRANCH + JALR bit, no ALU op (spec c9540a55), rs1 = x255.
     let d = ShrunkDecode::from_instruction(Instruction::JumpAndLink { dst: 1, offset: 32 }, 4);
-    assert!(d.add && d.branch && d.write_register && d.read_register1);
+    assert!(d.branch && d.write_register && d.read_register1);
+    assert!(!d.add && !d.sub && !d.alu);
     assert_eq!(d.rs1, 255);
     assert_eq!(
         d.mem_flags,
         build_mem_flags(true, false, false, false, false)
     );
 
-    // JALR → ADD + BRANCH + JALR bit, rs1 = base.
+    // JALR → BRANCH + JALR bit, no ALU op (spec c9540a55), rs1 = base.
     let d = ShrunkDecode::from_instruction(
         Instruction::JumpAndLinkRegister {
             base: 9,
@@ -485,7 +489,8 @@ fn test_from_instruction_jumps() {
         },
         4,
     );
-    assert!(d.add && d.branch);
+    assert!(d.branch);
+    assert!(!d.add && !d.sub && !d.alu);
     assert_eq!(d.rs1, 9);
     assert_eq!(d.mem_flags & 1, 1);
 }
@@ -570,7 +575,7 @@ fn test_from_instruction_system() {
     let d = ShrunkDecode::from_instruction(Instruction::Fence, 4);
     assert!(d.add);
 
-    // Compressed instruction length propagates.
+    // Compressed instruction length (2 bytes) propagates as half = 1.
     let d = ShrunkDecode::from_instruction(
         Instruction::Arith {
             dst: 1,
@@ -580,5 +585,5 @@ fn test_from_instruction_system() {
         },
         2,
     );
-    assert_eq!(d.instruction_length, 2);
+    assert_eq!(d.half_instruction_length, 1);
 }

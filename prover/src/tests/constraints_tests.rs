@@ -558,17 +558,19 @@ fn test_product_zero_constraint_degree() {
 
 #[test]
 fn test_arg2_constraint_degree() {
-    assert_eq!(Arg2Constraint::new(0, 0).degree(), 3);
-    assert_eq!(Arg2Constraint::new(1, 0).degree(), 3);
+    // (1 - MEMORY - BRANCH)·(rv2 + imm): degree 2 (spec `9be4ecd217`, relies on
+    // the live MEMORY·BRANCH = 0 mutex).
+    assert_eq!(Arg2Constraint::new(0, 0).degree(), 2);
+    assert_eq!(Arg2Constraint::new(1, 0).degree(), 2);
 }
 
 #[test]
 fn test_rvd_eq_res_constraint_degree() {
-    // (1 - MEMORY)·(1 - JALR)·(rvd[i] - cast(res, WL)[i]): degree 3.
-    // The extra `(1 - mem_flags)` factor exempts JAL/JALR rows (rvd pinned by
-    // JalrRvdConstraint instead). Stays at degree 3 to fit the blowup=2 budget.
-    assert_eq!(RvdEqResConstraint::new(0, 0).degree(), 3);
-    assert_eq!(RvdEqResConstraint::new(1, 0).degree(), 3);
+    // (1 - MEMORY - BRANCH)·(rvd[i] - cast(res, WL)[i]): degree 2.
+    // BRANCH rows are exempt — their rvd (`pc + len`) is pinned by
+    // BranchRvdConstraint instead. Well within the blowup=2 budget.
+    assert_eq!(RvdEqResConstraint::new(0, 0).degree(), 2);
+    assert_eq!(RvdEqResConstraint::new(1, 0).degree(), 2);
 }
 
 #[test]
@@ -595,11 +597,11 @@ fn test_next_pc_add_constraint() {
 #[test]
 fn test_create_all_cpu_constraints_count() {
     let (is_bit, add, other, total) = create_all_cpu_constraints();
-    // IS_BIT: 12, ADD+SUB pairs: 4, other (mutex 4 + arg2 2 + reg-zero 4 + rvd 2
-    // + branch_cond 1 + next_pc 2 + assumptions 4): 21.
+    // IS_BIT: 12, ADD+SUB pairs: 4, other (mutex 6 + arg2 2 + reg-zero 4 + rvd 2
+    // + branch rvd 2 + branch_cond 1 + next_pc 2 + assumptions 4): 23.
     assert_eq!(is_bit.len(), 12);
     assert_eq!(add.len(), 4);
-    assert_eq!(other.len(), 21);
+    assert_eq!(other.len(), 23);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
     assert_eq!(is_bit.len() + add.len() + other.len(), NUM_CPU_CONSTRAINTS);
 }

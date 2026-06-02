@@ -300,7 +300,10 @@ pub mod packed_decode_shrunk {
     pub const RS1: u32 = 10;
     pub const RS2: u32 = 18;
     pub const RD: u32 = 26;
-    pub const INSTRUCTION_LENGTH: u32 = 34;
+    /// `half_instruction_length`: bytes/2 (1 for C-type, 2 for regular). The
+    /// half-encoding makes odd (misaligned) instruction lengths unrepresentable
+    /// (`spec/src/cpu.toml`, commit `b1b51c9d`).
+    pub const HALF_INSTRUCTION_LENGTH: u32 = 34;
     pub const ALU_FLAGS: u32 = 42;
     pub const MEM_FLAGS: u32 = 50;
 
@@ -366,7 +369,9 @@ pub struct ShrunkDecode {
     pub rs1: u8,
     pub rs2: u8,
     pub rd: u8,
-    pub instruction_length: u8,
+    /// Half the byte length of the instruction (1 for C-type, 2 for regular);
+    /// the real length is `2 * half_instruction_length` (`spec` `b1b51c9d`).
+    pub half_instruction_length: u8,
     pub alu_flags: u8,
     pub mem_flags: u8,
 }
@@ -388,7 +393,7 @@ impl ShrunkDecode {
             | ((self.rs1 as u64) << b::RS1)
             | ((self.rs2 as u64) << b::RS2)
             | ((self.rd as u64) << b::RD)
-            | ((self.instruction_length as u64) << b::INSTRUCTION_LENGTH)
+            | ((self.half_instruction_length as u64) << b::HALF_INSTRUCTION_LENGTH)
             | ((self.alu_flags as u64) << b::ALU_FLAGS)
             | ((self.mem_flags as u64) << b::MEM_FLAGS)
     }
@@ -412,7 +417,7 @@ impl ShrunkDecode {
             rs1: byte(b::RS1),
             rs2: byte(b::RS2),
             rd: byte(b::RD),
-            instruction_length: byte(b::INSTRUCTION_LENGTH),
+            half_instruction_length: byte(b::HALF_INSTRUCTION_LENGTH),
             alu_flags: byte(b::ALU_FLAGS),
             mem_flags: byte(b::MEM_FLAGS),
         }
@@ -421,14 +426,22 @@ impl ShrunkDecode {
     /// Build the reworked packed-decode flags for an instruction, per
     /// `spec/decode.typ`. Does NOT include `pc`/`imm` (separate DECODE columns).
     ///
-    /// `instruction_length` is 2 (RV64C compressed) or 4.
+    /// `instruction_length` is the byte length: 2 (RV64C compressed) or 4. It is
+    /// stored as `half_instruction_length = instruction_length / 2` (spec
+    /// `b1b51c9d`); the real length is recovered as `2 * half_instruction_length`.
     ///
-    /// Q3 deviation: conditional branches set `BRANCH=1 ∧ ALU=1`. `decode.typ`
-    /// currently omits `BRANCH` on `BEQ/BNE/BLT/BGE`, but the `arg2` multiplex
-    /// requires it (only then is `arg2 = rv2`); reported to the spec authors.
+    /// Per `spec/decode.typ` (commit `c9540a55`): conditional branches set
+    /// `BRANCH=1 ∧ ALU=1` (the EQ/LT chip computes the comparison; `BRANCH`
+    /// selects `arg2 = rv2`). JAL/JALR set `BRANCH=1 ∧ JALR=1` with no ALU op —
+    /// the return address `pc + instruction_length` is written to `rvd` by the
+    /// CPU branch group, not the ALU.
     pub fn from_instruction(instruction: Instruction, instruction_length: u8) -> Self {
+        debug_assert!(
+            instruction_length.is_multiple_of(2),
+            "instruction_length must be even (RISC-V instructions are 2 or 4 bytes)"
+        );
         let mut d = Self {
-            instruction_length,
+            half_instruction_length: instruction_length / 2,
             ..Default::default()
         };
         match instruction {
@@ -482,7 +495,6 @@ impl ShrunkDecode {
                 d.rs1 = 255;
                 d.read_register1 = true;
                 d.write_register = dst != 0;
-                d.add = true;
                 d.branch = true;
                 d.mem_flags = build_mem_flags(true, false, false, false, false); // JALR bit
             }
@@ -491,7 +503,6 @@ impl ShrunkDecode {
                 d.rs1 = base as u8;
                 d.read_register1 = base != 0;
                 d.write_register = dst != 0;
-                d.add = true;
                 d.branch = true;
                 d.mem_flags = build_mem_flags(true, false, false, false, false); // JALR bit
             }

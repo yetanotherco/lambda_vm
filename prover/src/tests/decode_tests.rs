@@ -43,7 +43,7 @@ fn test_decode_entry_packed_decode_matches_fields() {
     );
     assert_eq!(d.packed_decode(), d.fields.pack());
     assert!(d.fields.add, "ADD is a fast-path flag");
-    assert_eq!(d.fields.instruction_length, 4);
+    assert_eq!(d.fields.half_instruction_length, 2);
 }
 
 #[test]

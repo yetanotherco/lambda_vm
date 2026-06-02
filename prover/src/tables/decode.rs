@@ -10,25 +10,21 @@
 //! - `imm`: DWordWL (2 cols) - fully extended 64-bit immediate
 //! - `μ`: BaseField (1 col) - multiplicity
 //!
-//! ## packed_decode Format (51 bits)
+//! ## packed_decode Format
+//!
+//! A single base-field element packing the control flags, register indices, and
+//! the `alu_flags`/`mem_flags` bytes. The authoritative bit layout lives in
+//! `packed_decode_shrunk` and is produced by `ShrunkDecode::pack` (both in
+//! `tables/types.rs`) — consult those for the exact bit position of every field.
+//! Summary (low → high bits):
 //!
 //! ```text
-//! Bits [0]:     read_register1
-//! Bits [1]:     read_register2
-//! Bits [2]:     write_register
-//! Bits [3]:     memory_2bytes
-//! Bits [4]:     memory_4bytes
-//! Bits [5]:     memory_8bytes
-//! Bits [6]:     c_type
-//! Bits [7]:     signed
-//! Bits [8]:     mp_selector
-//! Bits [9]:     muldiv_selector
-//! Bits [10]:    word_instr
-//! Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
-//!               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
-//! Bits [27:35]: rs1 (8 bits)
-//! Bits [35:43]: rs2 (8 bits)
-//! Bits [43:51]: rd (8 bits)
+//! Bits [0..10]:  read_register1, read_register2, write_register, word_instr,
+//!                ALU, ADD, SUB, MEMORY, BRANCH, ECALL (one bit each)
+//! Bits [10..34]: rs1, rs2, rd (8 bits each)
+//! Bits [34..42]: half_instruction_length (Byte: byte length / 2)
+//! Bits [42..50]: alu_flags (Byte: alu_op in bits 0-4, then signed / signed2|invert / muldiv)
+//! Bits [50..58]: mem_flags (Byte: JALR|memory_op, signed, 2B, 4B, 8B)
 //! ```
 //!
 //! ## Bus Interactions

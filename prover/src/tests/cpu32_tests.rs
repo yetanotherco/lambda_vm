@@ -104,7 +104,7 @@ fn test_trace_layout() {
         res: 0x42,
         alu: true,
         alu_flags: build_alu_flags(alu_op::SHIFTW, true, true, false),
-        instruction_length: 4,
+        half_instruction_length: 2,
         ..Default::default()
     };
     let trace = generate_cpu32_trace(&[op]);
@@ -119,7 +119,7 @@ fn test_trace_layout() {
     assert_eq!(row[cols::RV1_1], FE::from(0x5566u64));
     assert_eq!(row[cols::RV1_2], FE::from(0x1122_3344u64));
     assert_eq!(row[cols::RD], FE::from(7u64));
-    assert_eq!(row[cols::INSTRUCTION_LENGTH], FE::from(4u64));
+    assert_eq!(row[cols::HALF_INSTRUCTION_LENGTH], FE::from(2u64));
     assert_eq!(row[cols::SIGNED], FE::from(1u64));
     assert_eq!(row[cols::MU], FE::from(1u64));
 }
@@ -145,7 +145,7 @@ fn test_ext_and_regzero_constraints_hold_on_valid_row() {
         write_register: true,
         alu: true,
         alu_flags: build_alu_flags(alu_op::SHIFTW, true, true, false), // signed
-        instruction_length: 4,
+        half_instruction_length: 2,
         ..Default::default()
     };
     let view = view_for(op);
@@ -190,7 +190,7 @@ fn test_constraints_catch_corruption() {
         write_register: true,
         alu: true,
         alu_flags: build_alu_flags(alu_op::SHIFTW, true, true, false),
-        instruction_length: 4,
+        half_instruction_length: 2,
         ..Default::default()
     };
     let trace = generate_cpu32_trace(&[op]);

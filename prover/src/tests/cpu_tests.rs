@@ -275,9 +275,9 @@ fn test_trace_padding_row() {
     assert_eq!(
         pad[cols::NEXT_PC_0],
         CPU_PADDING_PC.into(),
-        "next_pc = pc (instruction_length = 0)"
+        "next_pc = pc (half_instruction_length = 0)"
     );
-    assert_eq!(pad[cols::INSTRUCTION_LENGTH], 0u64.into());
+    assert_eq!(pad[cols::HALF_INSTRUCTION_LENGTH], 0u64.into());
     assert_eq!(pad[cols::WORD_INSTR], 0u64.into());
 }
 
@@ -293,7 +293,7 @@ fn test_trace_word_row_columns_masked() {
     let row = trace.main_table.get_row(0);
     // Delegate row: word_instr set, but all operational columns masked to 0.
     assert_eq!(row[cols::WORD_INSTR], 1u64.into());
-    assert_eq!(row[cols::INSTRUCTION_LENGTH], 4u64.into());
+    assert_eq!(row[cols::HALF_INSTRUCTION_LENGTH], 2u64.into());
     assert_eq!(
         row[cols::RV1_0],
         0u64.into(),
@@ -356,9 +356,9 @@ fn test_collect_bitwise_ops_word_row_zeroed() {
     );
     let ops = op.collect_bitwise_ops();
     // On a word delegate row the CPU zeroes rs1/rs2/rd/alu_flags/mem_flags/res,
-    // but instruction_length stays (it is set unconditionally in the trace).
+    // but half_instruction_length stays (it is set unconditionally in the trace).
     assert_eq!(ops[0].x, 0, "rs1 zeroed");
     assert_eq!(ops[0].y, 0, "rs2 zeroed");
     assert_eq!(ops[1].x, 0, "rd zeroed");
-    assert_eq!(ops[1].y, 4, "instruction_length retained");
+    assert_eq!(ops[1].y, 2, "half_instruction_length retained");
 }

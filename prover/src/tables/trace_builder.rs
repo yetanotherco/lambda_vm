@@ -748,7 +748,7 @@ fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
         alu_flags: f.alu_flags,
         add: f.add,
         sub: f.sub,
-        instruction_length: f.instruction_length,
+        half_instruction_length: f.half_instruction_length,
     };
     let aux = c.compute_aux();
     c.res = cpu32_res(&c, aux.arg1, aux.arg2);
@@ -769,7 +769,7 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
         ));
     };
 
-    for b in [c.instruction_length, c.alu_flags, c.rs1, c.rs2, c.rd] {
+    for b in [c.half_instruction_length, c.alu_flags, c.rs1, c.rs2, c.rd] {
         ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             b,
