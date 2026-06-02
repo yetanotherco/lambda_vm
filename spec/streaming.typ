@@ -13,12 +13,12 @@
 
 We present two potential approaches to reducing the required amount of prover working memory
 when proving larger programs.
-We avoid resorting to a full-blown sharding+recursion approach, and as such avoid the complications
+We avoid resorting to a full-blown sharding+recursion approach, and as such avoid the
 complications for the verifier to deal with cross-shard consistency constraints.
 
 The overarching idea in both is to let the prover build up tables, and once memory-pressure grows
 too much, perform some prover work to allow evicting tables from memory.
-the difference lies in exactly what and how much proving happens, and how much extra computation is needed
+The difference lies in exactly what and how much proving happens, and how much extra computation is needed
 later on.
 
 = Approach 1: Prove-and-retire
@@ -33,7 +33,7 @@ In the first potential approach, we proceed in multiple passes:
   LogUp challenges are sampled.
 - *LogUp re-execution*: The prover restarts execution from zero, performing the reduction to FRI polynomials
   for the LogUp interactions, and batching the polynomials into the batch FRI polynomial from before.
-  Again, this can be optimized for memory usage by only keeping 
+  Again, this can be optimized for memory usage by only instantiating the columns required for the LogUp.
 - *FRI*: At this point, all FRI instances are available in a single batch polynomial,
   and the FRI folding can be performed, resulting in a set of query opening points.
 - *Open*: One final re-execution can now be performed to generate the requested Merkle openings.
@@ -57,7 +57,7 @@ As such, we proceed in "epochs" ---the size of which is again informed by the me
 all table-to-table interactions can be proven within a single epoch.
 
 To deal with cross-epoch memory, we introduce a "local-to-global" table per epoch that, in essence,
-is an epoch-local memory initialiation and finalization mechanism.
+is an epoch-local memory initialization and finalization mechanism.
 It initializes any memory cell that is accessed in the epoch, by claiming its value, originating epoch, and timestamp.
 Similarly, each accessed memory cell is finalized in the epoch-local LogUp, and claims the current value, epoch and last accessed timestamp.
 This both allows frequent access to a small number of addresses within an epoch to have a small cross-epoch footprint,
