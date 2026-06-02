@@ -49,6 +49,8 @@ pub mod register_tests;
 #[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
+pub mod static_commitments_tests;
+#[cfg(test)]
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
