@@ -26,10 +26,14 @@ and convenience functionalities over small domains.
 
 The #bitwise chip is comprised of #nr_variables variables that are expressed using #nr_columns columns.
 Of these, the _input_ and _output_ variables (#nr_precomputed in total) are precomputed.
+
 #render_chip_variable_table(chip, config)
 
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`.
 As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
+
+We use the ALU operation descriptors from @decode to identify the operations in the `BYTE_ALU` interaction.
+Since each of the three columns is only $2^16$ rows long, they can be combined in a single $2^20$ column (with room to spare).
 
 = Lookup
 This chip adds the following interactions to the lookup:

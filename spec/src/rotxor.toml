@@ -161,16 +161,16 @@ name = "xor"
 
 [[constraints.xor]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", "a0", "i"], ["idx", "a1", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", "a0", "i"], ["idx", "a1", "i"]]
 output = ["idx", "a01", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.xor]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", "a01", "i"], ["idx", "a2", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", "a01", "i"], ["idx", "a2", "i"]]
 output = ["idx", "out", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]

@@ -34,6 +34,11 @@ The #memw chip is comprised of #nr_variables variables that are expressed using 
 
 #render_chip_assumptions(chip, config)
 
+Some of the assumptions can be checked with only arithmetic constraints, so we
+provide these below.
+
+#render_constraint_table(chip, config, groups: "assumptions")
+
 Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns,
 as these are not necessary for the correctness of this chip in isolation.
 Still, these properties are necessary for the consistency of the system as a whole, and therefore
@@ -93,6 +98,12 @@ Further logic remains essentially the same, so we briefly present the relevant t
 The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns; it leverages #nr_aligned_interactions interactions.
 #render_chip_variable_table(alignedchip, config)
 #render_chip_assumptions(alignedchip, config)
+
+Some of the assumptions can be checked with only arithmetic constraints, so we
+provide these below.
+
+#render_constraint_table(alignedchip, config, groups: "assumptions")
+
 #render_constraint_table(alignedchip, config)
 
 == Padding

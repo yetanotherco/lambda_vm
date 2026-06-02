@@ -21,12 +21,18 @@ type = "Bit"
 desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
 pad = 0
 
+[[variables.input]]
+name = "invert"
+type = "Bit"
+desc = "Whether to invert the result"
+pad = 0
+
 # Output
 
 [[variables.output]]
-name = "lt"
+name = "res"
 type = "Bit"
-desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
+desc = "The result"
 pad = 0
 
 
@@ -48,6 +54,12 @@ pad = 0
 name = "rhs_msb"
 type = "Bit"
 desc = "The most significant bit of `rhs`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "lt"
+type = "Bit"
+desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
 pad = 0
 
 # Virtual
@@ -85,10 +97,35 @@ ref = "lt:a:range_lhs"
 desc = "`IS_WORD[rhs[0]]`"
 ref = "lt:a:range_rhs"
 
-[[assumptions]]
-desc = "`IS_BIT<signed>`"
-ref = "lt:a:range_signed"
+[[constraint_groups]]
+name = "range"
+desc = "Range-check the inputs"
 
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "lhs", 1]]
+multiplicity = "μ"
+ref = "lt:c:range_lhs"
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "rhs", 1]]
+multiplicity = "μ"
+ref = "lt:c:range_rhs"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["signed"]
+ref = "lt:c:range_signed"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["invert"]
+ref = "lt:c:range_invert"
 
 [[constraint_groups]]
 name = "defs"
@@ -117,6 +154,11 @@ desc = "Where $A = #`lhs_msb`$, $B = #`rhs_msb`$ and $C = #`carry[1]`$"
 poly = ["-", "lt", ["*", "signed", ["+", ["*", "lhs_msb", ["not", "rhs_msb"]], ["*", "lhs_msb", ["idx", "carry", 1]], ["*", ["not", "rhs_msb"], ["idx", "carry", 1]]]], ["*", ["-", 1, "signed"], "unsigned_lt"]]
 ref = "lt:c:lt"
 
+[[constraints.defs]]
+kind = "arith"
+constraint = "$#`res` = #`lt` xor #`invert`$"
+poly = ["-", ["+", "res", ["*", 2, "lt", "invert"]], "lt", "invert"]
+
 
 [[constraint_groups]]
 name = "sub"
@@ -127,20 +169,6 @@ kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
 iter = ["i", 0, 1]
-
-[[constraints.defs]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "lhs", 1]]
-multiplicity = "μ"
-ref = "lt:c:range_lhs"
-
-[[constraints.defs]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "rhs", 1]]
-multiplicity = "μ"
-ref = "lt:c:range_rhs"
 
 [[constraints.sub]]
 kind = "interaction"
@@ -157,7 +185,7 @@ desc = "Each row contributes the following to the LogUp sum"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "LT"
-input = [["cast", "lhs", "DWordWL"], ["cast", "rhs", "DWordWL"], "signed"]
-output = "lt"
+tag = "ALU"
+input = [["cast", "lhs", "DWordWL"], ["cast", "rhs", "DWordWL"], ["+", ["opsel", "LT"], ["*", 32, "signed"], ["*", 64, "invert"]]]
+output = ["arr", "res", 0]
 multiplicity = ["-", "μ"]

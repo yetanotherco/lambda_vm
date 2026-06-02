@@ -27,10 +27,12 @@ The #dvrm chip provides division and remainder functionality, both signed and un
 The #dvrm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
-= Assumptions
-#render_chip_assumptions(chip, config)
 
 = Constraints
+
+First, we range-check all inputs.
+#render_constraint_table(chip, config, groups: "range")
+
 From the ISA, we gather five requirements for the `DIV[U][W]` and `REM[U][W]` instructions:
 #enum(numbering: "R1.",
   enum.item([
@@ -106,7 +108,7 @@ Rewriting R1, we find the constraint $not#`overflow` => #`n` - #`r` = #`qd`$.
 #footnote([Recall that @dvrm:c:sign_q allows to assert this equality even when `overflow`.])
 Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality $mod 2^128$, rather than $mod 2^64$.
 To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that it is equal to $#`qd` mod 2^128$ using constraints @dvrm:c:mul_lower and @dvrm:c:mul_upper;
-@dvrm:c:q_range is included to uphold assumption @mul:a:rhs.
+@dvrm:c:q_range is included to uphold assumption @mul:c:rhs.
 
 #render_constraint_table(chip, config, groups:("equality", ))
 

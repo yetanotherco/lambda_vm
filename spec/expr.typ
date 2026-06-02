@@ -99,6 +99,10 @@
 // Typeset an expression as code
 #let expr_to_code = make_expr_formatter(
   (
+    "opsel": (pp, rec, e) => {
+      assert(type(e.at(1)) == type(""), message: "opsel expects a string")
+      `⧼` + raw(e.at(1)) + `⧽`
+    },
     "arr": (pp, rec, e) => `[` + e.slice(1).map(rec.with(PREC.MAX)).join(`, `) + `]`,
     "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
     "not": (pp, rec, e) => cwrap(rec(PREC.not, 1) + ` - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
@@ -165,6 +169,10 @@
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
+    "opsel": (pp, rec, e) => {
+      assert(type(e.at(1)) == type(""), message: "opsel expects a string")
+      $lr(chevron.l.curly#raw(e.at(1))chevron.r.curly)$
+    },
     "arr": (pp, rec, e) => $[#e.slice(1).map(rec.with(PREC.MAX)).join($, $)]$,
     "idx": (pp, rec, e) => {
       let (val, idxs) = flat_idxs(e)

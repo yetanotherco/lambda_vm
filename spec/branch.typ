@@ -30,6 +30,11 @@ The #branch chip is comprised of #nr_variables variables that are expressed usin
 
 #render_chip_assumptions(chip, config)
 
+Some of the assumptions can be checked with only arithmetic constraints, so we
+provide these below.
+
+#render_constraint_table(chip, config, groups: "assumptions")
+
 = Constraints
 
 We constrain `next_pc` to be $#`base_address` + #`offset`$,

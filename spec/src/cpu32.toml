@@ -1,0 +1,416 @@
+name = "CPU32"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp for the CPU row"
+pad = 0
+
+[[variables.input]]
+name = "pc"
+type = "DWordWL"
+desc = "The PC at which the instruction occurs"
+pad = 0
+
+[[variables.output]]
+name = "half_instruction_length"
+type = "Byte"
+desc = "The length of this instruction"
+pad = 2
+
+[[variables.auxiliary]]
+name = "rs1"
+type = "Byte"
+desc = "Source register 1"
+pad = 0
+
+[[variables.auxiliary]]
+name = "read_register1"
+type = "Bit"
+desc = "Whether to read from `rs1` or not"
+pad = 0
+
+# Note in case we inline register accesses here: We don't need the upper word
+[[variables.auxiliary]]
+name = "rv1"
+type = "DWordWHH"
+desc = "The value in register `rs1`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rv1_sign"
+type = "Bit"
+desc = "The sign bit of the lower word of `rv1`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "arg1"
+type = "DWordWL"
+desc = "The sign-extended version of `rv1`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rs2"
+type = "Byte"
+desc = "Source register 2"
+pad = 0
+
+[[variables.auxiliary]]
+name = "read_register2"
+type = "Bit"
+desc = "Whether to read from `rs2`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rv2"
+type = "DWordWHH"
+desc = "The value in register `rs2`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rv2_sign"
+type = "Bit"
+desc = "The sign bit of the lower word of `rv2`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "imm"
+type = "DWordWL"
+desc = "The fully sign-extended immediate to use"
+pad = 0
+
+[[variables.auxiliary]]
+name = "arg2"
+type = "DWordWL"
+desc = "Either the sign-extended version of `rv2` or all of `imm`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "res"
+type = "DWordHL"
+desc = "The ALU result"
+pad = 0
+
+[[variables.auxiliary]]
+name = "res_sign"
+type = "Bit"
+desc = "The sign bit of the lower word of `res`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rd"
+type = "Byte"
+desc = "Destination register"
+pad = 0
+
+[[variables.auxiliary]]
+name = "write_register"
+type = "Bit"
+desc = "Whether to write back to `rd`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "rvd"
+type = "DWordWL"
+desc = "The value to write back to `rd`, the sign-extended version of `res`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "ALU"
+type = "Bit"
+desc = "Whether the full ALU is active"
+pad = 0
+
+[[variables.auxiliary]]
+name = "alu_flags"
+type = "Byte"
+desc = "The ALU operation + flags"
+pad = 0
+
+[[variables.auxiliary]]
+name = "ADD"
+type = "Bit"
+desc = "Whether the full ALU is active"
+pad = 0
+
+[[variables.auxiliary]]
+name = "SUB"
+type = "Bit"
+desc = "Whether the full ALU is active"
+pad = 0
+
+[[variables.auxiliary]]
+name = "signed"
+type = "Bit"
+desc = "Whether the instruction is signed or not. Extracted from `alu_flags`, used to determine the extension for the inputs"
+pad = 0
+
+[[variables.virtual]]
+name = "packed_decode"
+type = "BaseField"
+desc = "The packed representation of all flags and information from the decode table"
+def = ["+",
+    ["*", ["^", 2, 0], "read_register1"],
+    ["*", ["^", 2, 1], "read_register2"],
+    ["*", ["^", 2, 2], "write_register"],
+    ["*", ["^", 2, 3], 1], # word_instr
+    ["*", ["^", 2, 4], "ALU"],
+    ["*", ["^", 2, 5], "ADD"],
+    ["*", ["^", 2, 6], "SUB"],
+    ["*", ["^", 2, 10], "rs1"],
+    ["*", ["^", 2, 18], "rs2"],
+    ["*", ["^", 2, 26], "rd"],
+    ["*", ["^", 2, 34], "half_instruction_length"],
+    ["*", ["^", 2, 42], "alu_flags"],
+]
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[pc[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`read_register2 = 0` or `imm = 0`, enforced by decoding."
+
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "arith"
+constraint = "$#`read_register2` = 0 or #`imm[i] = 0`$"
+poly = ["*", "read_register2", ["+", ["idx", "imm", 0], ["idx", "imm", 1]]]
+
+[[constraint_groups]]
+name = "decode"
+
+[[constraints.decode]]
+kind = "interaction"
+tag = "DECODE"
+input = ["pc", "imm", "packed_decode"]
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "range"
+prefix = "R"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read_register1"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read_register2"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write_register"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["half_instruction_length"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["ALU"]
+
+# Technically constraint by the BYTE_ALU in `ext`, but this is safer/cleaner
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["alu_flags"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["ADD"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["SUB"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["rs1"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["rs2"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["rd"]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "rv1", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 1]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "rv2", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 1]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "res", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+
+[[constraint_groups]]
+name = "alu"
+prefix = "A"
+
+[[constraints.alu]]
+kind = "template"
+tag = "ADD"
+cond = "ADD"
+input = ["arg1", "arg2"]
+output = ["cast", "res", "DWordWL"]
+
+[[constraints.alu]]
+kind = "template"
+tag = "SUB"
+cond = "SUB"
+input = ["arg1", "arg2"]
+output = ["cast", "res", "DWordWL"]
+
+[[constraints.alu]]
+kind = "interaction"
+tag = "ALU"
+input = ["arg1", "arg2", "alu_flags"]
+output = ["cast", "res", "DWordWL"]
+multiplicity = "ALU"
+
+[[constraint_groups]]
+name = "mem"
+prefix = "M"
+
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0]
+multiplicity = "read_register1"
+
+[[constraints.mem]]
+kind = "arith"
+constraint = "$#`!read_register1` => #`rv1[i]` = 0$"
+poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
+iter = ["i", 0, 2]
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0]
+multiplicity = "read_register2"
+
+[[constraints.mem]]
+kind = "arith"
+constraint = "$#`!read_register2` => #`rv2[i]` = 0$"
+poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
+iter = ["i", 0, 2]
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
+multiplicity = "write_register"
+
+[[constraint_groups]]
+name = "logup"
+
+[[constraints.logup]]
+kind = "interaction"
+tag = "CPU32"
+input = ["timestamp", "pc"]
+output = "half_instruction_length"
+multiplicity = ["-", "μ"]
+
+[[constraint_groups]]
+name = "ext"
+
+[[constraints.ext]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], 32, "alu_flags"]
+output = ["*", 32, "signed"]
+multiplicity = "μ"
+
+[[constraints.ext]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "rv1", 1], "signed"]
+output = "rv1_sign"
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`arg1[0]` = #`rv1[:2]`$"
+poly = ["-", ["idx", "arg1", 0], ["idx", ["cast", "rv1", "DWordWL"], 0]]
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`arg1[1]` = (2^(32) - 1) dot #`rv1_sign`$"
+poly = ["-", ["idx", "arg1", 1], ["*", ["-", ["^", 2, 32], 1], "rv1_sign"]]
+
+[[constraints.ext]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "rv2", 1], "signed"]
+output = "rv2_sign"
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`arg2[0]` = #`rv2[:2]` + #`imm[0]`$"
+poly = ["-", ["idx", "arg2", 0], ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "imm", 0]]
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`arg2[1]` = (2^(32) - 1) dot #`rv2_sign` + #`imm[1]`$"
+poly = ["-", ["idx", "arg2", 1], ["*", ["-", ["^", 2, 32], 1], "rv2_sign"], ["idx", "imm", 1]]
+
+[[constraints.ext]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "res", 1], 1]
+output = "res_sign"
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`rvd[0]` = #`res[:2]`$"
+poly = ["-", ["idx", "rvd", 0], ["idx", ["cast", "res", "DWordWL"], 0]]
+
+[[constraints.ext]]
+kind = "arith"
+constraint = "$#`rvd[1]` = (2^(32) - 1) dot #`res_sign`$"
+poly = ["-", ["idx", "rvd", 1], ["*", ["-", ["^", 2, 32], 1], "res_sign"]]

@@ -4,7 +4,7 @@ name = "DECODE"
 name = "pc"
 type = "DWordWL"
 desc = "value of the program counter this instruction is associated with."
-pad = 7
+pad = 1
 
 [[variables.output]]
 name = "packed_decode"
@@ -15,36 +15,22 @@ A list of each variable and the bit(-range) in which it is located:\\
 [0] `read_register1`, \\
 [1] `read_register2`, \\
 [2] `write_register`, \\
-[3] `memory_2bytes`, \\
-[4] `memory_4bytes`, \\
-[5] `memory_8bytes`, \\
-[6] `c_type`, \\
-[7] `signed`, \\
-[8] `mp_selector`, \\
-[9] `muldiv_selector`, \\
-[10] `word_instr`, \\
-[11] `ADD`, \\
-[12] `SUB`, \\
-[13] `SLT`, \\
-[14] `AND`, \\
-[15] `OR`, \\
-[16] `XOR`, \\
-[17] `SHIFT`, \\
-[18] `JALR`, \\
-[19] `BEQ`, \\
-[20] `BLT`, \\
-[21] `LOAD`, \\
-[22] `STORE`, \\
-[23] `MUL`, \\
-[24] `DIVREM`, \\
-[25] `ECALL`, \\
-[26] `EBREAK`; \\
-[27:35] `rs1`, \\
-[35:43] `rs2`, \\
-[43:51] `rd`, \\
+[3] `word_instr`, \\
+[4] `ALU`, \\
+[5] `ADD`, \\
+[6] `SUB`, \\
+[7] `MEMORY`, \\
+[8] `BRANCH`, \\
+[9] `ECALL`, \\
+[10:17] `rs1`, \\
+[18:25] `rs2`, \\
+[26:33] `rd`, \\
+[34:41] `half_instruction_length`, \\
+[42:49] `alu_flags`, \\
+[50:57] `mem_flags`, \\
 the remaining bits are set to zero.
 """
-pad = ["^", 2, 26]
+pad = 0
 
 [[variables.output]]
 name = "imm"

@@ -121,21 +121,35 @@ type = "BaseField"
 desc = ""
 pad = 0
 
-# Assumptions
-
-[[assumptions]]
-desc = "`IS_HALF[lhs[i]]`"
-iter = ["i", 0, 3]
-
-[[assumptions]]
-desc = "`IS_HALF[rhs[i]]`"
-iter = ["i", 0, 3]
-ref = "mul:a:rhs"
-
 # Constraints
 
 [[constraint_groups]]
 name = "def"
+
+[[constraints.def]]
+kind = "template"
+tag = "IS_BIT"
+input = ["lhs_signed"]
+
+[[constraints.def]]
+kind = "template"
+tag = "IS_BIT"
+input = ["rhs_signed"]
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "lhs", "i"]]
+multiplicity = "μ_sum"
+iter = ["i", 0, 3]
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "rhs", "i"]]
+multiplicity = "μ_sum"
+iter = ["i", 0, 3]
+ref = "mul:c:rhs"
 
 [[constraints.def]]
 kind = "template"
@@ -191,16 +205,16 @@ name = "lookup"
 
 [[constraints.lookup]]
 kind = "interaction"
-tag = "MUL"
-input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 0]
+tag = "ALU"
+input = [["cast", "lhs", "DWordWL"], ["cast", "rhs", "DWordWL"], ["+", ["opsel", "MUL"], ["*", 32, "lhs_signed"], ["*", 64, "rhs_signed"]]]
 output = ["cast", "lo", "DWordWL"]
 multiplicity = ["-", "μ_lo"]
 ref = "mul:c:lookup_lo"
 
 [[constraints.lookup]]
 kind = "interaction"
-tag = "MUL"
-input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 1]
+tag = "ALU"
+input = [["cast", "lhs", "DWordWL"], ["cast", "rhs", "DWordWL"], ["+", ["opsel", "MUL"], ["*", 32, "lhs_signed"], ["*", 64, "rhs_signed"], 128]]
 output = ["cast", "hi", "DWordWL"]
 multiplicity = ["-", "μ_hi"]
 ref = "mul:c:lookup_hi"

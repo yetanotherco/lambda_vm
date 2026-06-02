@@ -17,6 +17,7 @@
 #let lt = raw(chip.name)
 
 The #lt chip constrains an indicator bit for the less-than relation, signed or unsigned.
+If the `invert` flag is set, it inverts the result.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -31,7 +32,7 @@ We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 #render_chip_assumptions(chip, config)
 
 = Constraints
-We first constrain that all variables correspond to their definition.
+We first constrain that all inputs are range checked and all variables correspond to their definition.
 For the defining constraint of `lt`, @lt:c:lt, observe that it is a choice
 between two options, depending on the input flag `signed`.
 In the case of unsigned comparison, we simply need `unsigned_lt`, indicating
@@ -74,7 +75,7 @@ However, the left hand side of this is at least $3 dot 2^31$, as $(A, C) = (1, 1
 and the right hand side is at most $(2^31 - 1) + (2^32 - 1) + 1 = 3 dot 2^31 - 1$.
 Therefore, we can use $Q$ to constrain `lt` when `signed = 1`.
 
-#render_constraint_table(chip, config, groups: "defs")
+#render_constraint_table(chip, config, groups: ("range", "defs"))
 
 And then we constrain the subtraction,
 taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
@@ -90,3 +91,7 @@ The chip contributes the following to the lookup argument.
 The table can be padded to the next power of two with the following value assignments:
 
 #render_chip_padding_table(chip, config)
+
+= Potential optimizations
+
+- Split the chip into a signed and an unsigned chip, making the unsigned version cheaper.
