@@ -21,7 +21,7 @@ use stark::constraints::transition::{TransitionConstraint, TransitionConstraintE
 use stark::table::TableView;
 
 use crate::tables::cpu::cols;
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 use super::templates::{AddConstraint, AddOperand, IsBitConstraint};
 
@@ -66,7 +66,7 @@ where
     } else {
         (cols::RES_0, cols::RES_1)
     };
-    let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+    let shift_16: FieldElement<F> = FieldElement::from(SHIFT_16);
     step.get_main_evaluation_element(0, lo_col)
         + step.get_main_evaluation_element(0, hi_col) * shift_16
 }
