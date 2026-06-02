@@ -34,7 +34,7 @@
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};

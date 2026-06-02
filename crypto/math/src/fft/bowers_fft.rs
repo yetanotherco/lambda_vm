@@ -16,7 +16,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use math::fft::cpu::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused};
+//! use math::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused};
 //!
 //! let order = 10u64; // FFT size = 2^10 = 1024
 //! let layer_twiddles = LayerTwiddles::<F>::new(order).unwrap();

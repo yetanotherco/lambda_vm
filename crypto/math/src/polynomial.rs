@@ -1,18 +1,246 @@
-use crate::fft::errors::FFTError;
-use crate::field::traits::{IsField, IsSubFieldOf};
-use crate::{
-    field::{element::FieldElement, traits::IsFFTField},
-    polynomial::Polynomial,
-};
-use alloc::{vec, vec::Vec};
-
-use super::cpu::{
-    bit_reversing::in_place_bit_reverse_permute,
-    bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
-};
-
+use super::field::element::FieldElement;
+use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
 #[cfg(feature = "parallel")]
-use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+use crate::fft::errors::FFTError;
+use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
+use alloc::{borrow::ToOwned, vec, vec::Vec};
+
+/// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
+/// as a vector of coefficients `[c_0, c_1, ... , c_n]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Polynomial<FE> {
+    pub coefficients: Vec<FE>,
+}
+
+impl<F: IsField> Polynomial<FieldElement<F>> {
+    /// Creates a new polynomial with the given coefficients
+    pub fn new(coefficients: &[FieldElement<F>]) -> Self {
+        // Removes trailing zero coefficients at the end
+        let mut unpadded_coefficients = coefficients
+            .iter()
+            .rev()
+            .skip_while(|x| **x == FieldElement::zero())
+            .cloned()
+            .collect::<Vec<FieldElement<F>>>();
+        unpadded_coefficients.reverse();
+        Polynomial {
+            coefficients: unpadded_coefficients,
+        }
+    }
+
+    /// Creates a new monomial term coefficient*x^degree
+    pub fn new_monomial(coefficient: FieldElement<F>, degree: usize) -> Self {
+        let mut coefficients = vec![FieldElement::zero(); degree];
+        coefficients.push(coefficient);
+        Self::new(&coefficients)
+    }
+
+    /// Creates the null polynomial
+    pub fn zero() -> Self {
+        Self::new(&[])
+    }
+
+    /// Evaluates a polynomial P(t) at a point x, using Horner's algorithm
+    /// Returns y = P(x)
+    pub fn evaluate<E>(&self, x: &FieldElement<E>) -> FieldElement<E>
+    where
+        E: IsField,
+        F: IsSubFieldOf<E>,
+    {
+        self.coefficients
+            .iter()
+            .rev()
+            .fold(FieldElement::zero(), |acc, coeff| {
+                coeff + acc * x.to_owned()
+            })
+    }
+
+    /// Returns the degree of a polynomial, which corresponds to the highest power of x^d
+    /// with non-zero coefficient
+    pub fn degree(&self) -> usize {
+        if self.coefficients.is_empty() {
+            0
+        } else {
+            self.coefficients.len() - 1
+        }
+    }
+
+    /// Returns coefficients of the polynomial as an array
+    /// \[c_0, c_1, c_2, ..., c_n\]
+    /// that represents the polynomial
+    /// c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
+    pub fn coefficients(&self) -> &[FieldElement<F>] {
+        &self.coefficients
+    }
+
+    /// Returns the length of the vector of coefficients
+    pub fn coeff_len(&self) -> usize {
+        self.coefficients().len()
+    }
+
+    pub fn mul_with_ref(&self, factor: &Self) -> Self {
+        let degree = self.degree() + factor.degree();
+        let mut coefficients = vec![FieldElement::zero(); degree + 1];
+
+        if self.coefficients.is_empty() || factor.coefficients.is_empty() {
+            Polynomial::new(&[FieldElement::zero()])
+        } else {
+            for i in 0..=factor.degree() {
+                if factor.coefficients[i] != FieldElement::zero() {
+                    for j in 0..=self.degree() {
+                        if self.coefficients[j] != FieldElement::zero() {
+                            coefficients[i + j] += &factor.coefficients[i] * &self.coefficients[j];
+                        }
+                    }
+                }
+            }
+            Polynomial::new(&coefficients)
+        }
+    }
+
+    /// Scales the coefficients of a polynomial P by a factor
+    /// Returns P(factor * x)
+    pub fn scale<S: IsSubFieldOf<F>>(&self, factor: &FieldElement<S>) -> Self {
+        let scaled_coefficients = self
+            .coefficients
+            .iter()
+            .zip(core::iter::successors(Some(FieldElement::one()), |x| {
+                Some(x * factor)
+            }))
+            .map(|(coeff, power)| power * coeff)
+            .collect();
+        Self {
+            coefficients: scaled_coefficients,
+        }
+    }
+
+    /// Multiplies all coefficients by a factor
+    pub fn scale_coeffs(&self, factor: &FieldElement<F>) -> Self {
+        let scaled_coefficients = self
+            .coefficients
+            .iter()
+            .map(|coeff| factor * coeff)
+            .collect();
+        Self {
+            coefficients: scaled_coefficients,
+        }
+    }
+
+    /// Returns a vector of polynomials [p₀, p₁, ..., p_{d-1}], where d is `number_of_parts`, such that `self` equals
+    /// p₀(Xᵈ) + Xp₁(Xᵈ) + ... + X^(d-1)p_{d-1}(Xᵈ).
+    ///
+    /// Example: if d = 2 and `self` is 3 X^3 + X^2 + 2X + 1, then `poly.break_in_parts(2)`
+    /// returns a vector with two polynomials `(p₀, p₁)`, where p₀ = X + 1 and p₁ = 3X + 2.
+    pub fn break_in_parts(&self, number_of_parts: usize) -> Vec<Self> {
+        let coef = self.coefficients();
+        let mut parts: Vec<Self> = Vec::with_capacity(number_of_parts);
+        for i in 0..number_of_parts {
+            let coeffs: Vec<_> = coef
+                .iter()
+                .skip(i)
+                .step_by(number_of_parts)
+                .cloned()
+                .collect();
+            parts.push(Polynomial::new(&coeffs));
+        }
+        parts
+    }
+}
+
+/// Pads a polynomial with zeros until the desired length
+/// This function can be useful when evaluating polynomials with the FFT
+pub fn pad_with_zero_coefficients_to_length<F: IsField>(
+    pa: &mut Polynomial<FieldElement<F>>,
+    n: usize,
+) {
+    pa.coefficients.resize(n, FieldElement::zero());
+}
+
+/// Pads polynomial representations with minimum number of zeros to match lengths.
+pub fn pad_with_zero_coefficients<L: IsField, F: IsSubFieldOf<L>>(
+    pa: &Polynomial<FieldElement<F>>,
+    pb: &Polynomial<FieldElement<L>>,
+) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<L>>) {
+    let mut pa = pa.clone();
+    let mut pb = pb.clone();
+
+    if pa.coefficients.len() > pb.coefficients.len() {
+        pad_with_zero_coefficients_to_length(&mut pb, pa.coefficients.len());
+    } else {
+        pad_with_zero_coefficients_to_length(&mut pa, pb.coefficients.len());
+    }
+    (pa, pb)
+}
+// ── Barycentric coset interpolation ──────────────────────────────────────
+// Four evaluation variants along two axes:
+//   - eval field: base field (F) or extension field (E)
+//   - g_n_inv:    computed on demand, or precomputed by caller
+// Use `_with_g_n_inv` variants when evaluating multiple columns at the
+// same coset (g_n_inv is constant across columns).
+
+/// Precompute `1/(z - point_i)` for each coset point, using batch inversion.
+///
+/// Given an evaluation point `z` (in extension field E) and coset points in base field F,
+/// returns the vector of inverse denominators needed for barycentric interpolation.
+/// Uses Montgomery's trick: 1 field inversion + O(N) multiplications.
+#[cfg(feature = "alloc")]
+pub fn barycentric_inv_denoms<F, E>(
+    z: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    // z - p where z is in E and p is in F. Since Sub<E> is defined for F: IsSubFieldOf<E>,
+    // we compute -(p - z) which equals z - p.
+    let mut denoms: Vec<FieldElement<E>> = coset_points.iter().map(|p| -(p - z)).collect();
+    FieldElement::inplace_batch_inverse(&mut denoms)
+        .expect("z is sampled to avoid coset points, so z - g*w^i is never zero");
+    denoms
+}
+
+/// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
+///
+/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F.
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<E>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+
+    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            let numerator = point * eval;
+            acc + numerator * inv_d
+        });
+
+    // All scalar factors in base field F; vanishing via sub_subfield.
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
+    let scalar = n_inv * g_n_inv; // F * F → F
+    &scalar * &(vanishing * &sum) // F × E → E
+}
+
+// =============================================================================
+// FFT-based polynomial methods (merged from the former fft/polynomial.rs)
+// =============================================================================
 
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
@@ -77,34 +305,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         coeffs.resize(len, FieldElement::zero());
         // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        evaluate_fft_cpu::<F, E>(&coeffs)
-    }
-
-    /// Same as `evaluate_fft` but returns the evaluations in bit-reversed order,
-    /// skipping the final natural-order permutation. Use when the consumer expects
-    /// bit-reversed input (e.g. FRI commit phase, which pairs consecutive values as
-    /// {f(x), f(-x)}).
-    pub fn evaluate_fft_bit_reversed<F: IsFFTField + IsSubFieldOf<E>>(
-        poly: &Polynomial<FieldElement<E>>,
-        blowup_factor: usize,
-        domain_size: Option<usize>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let domain_size = domain_size.unwrap_or(0);
-        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
-        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
-            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
-        }
-        if poly.coefficients().is_empty() {
-            return Ok(vec![FieldElement::zero(); len]);
-        }
-
-        let mut coeffs = poly.coefficients().to_vec();
-        coeffs.resize(len, FieldElement::zero());
-
-        evaluate_fft_cpu_raw::<F, E>(&coeffs, false)
+        evaluate_fft_cpu_raw::<F, E>(&coeffs, true)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -133,7 +334,22 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     where
         E: Send + Sync,
     {
-        interpolate_fft_cpu::<F, E>(fft_evals)
+        let n = fft_evals.len();
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let order = n.trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order)
+            .ok_or(FFTError::DomainSizeError(order as usize))?;
+
+        let mut coeffs = fft_evals.to_vec();
+        // Bowers iFFT: bit-reverse first (natural -> bit-reversed), then DIT inverse butterflies
+        in_place_bit_reverse_permute(&mut coeffs);
+        dispatch_ifft(&mut coeffs, &inv_twiddles)?;
+
+        // Scale by 1/n
+        let scale_factor = FieldElement::from(n as u64).inv().unwrap();
+        Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -147,7 +363,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         E: Send + Sync,
     {
         let scaled = Polynomial::interpolate_fft::<F>(fft_evals)?;
-        Ok(scaled.scale(&offset.inv().unwrap()))
+        // A zero coset offset has no inverse; report it instead of panicking.
+        let offset_inv = offset.inv().map_err(|_| FFTError::InvalidCosetOffset)?;
+        Ok(scaled.scale(&offset_inv))
     }
 
     /// Compute the coset LDE with pre-computed twiddle factors and pre-computed weights.
@@ -189,7 +407,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
     /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+    pub(crate) fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
@@ -240,7 +458,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// 3. Zero-pad to N * blowup_factor
     /// 4. Forward FFT on the full buffer
     ///
-    /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
+    /// Unlike `coset_lde_full_into`, this skips the `clear + extend_from_slice` step
     /// since data is already in the buffer. Used for transpose elimination: columns are
     /// extracted directly into owned buffers, then expanded in-place.
     pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
@@ -305,14 +523,6 @@ where
     Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
-pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    evaluate_fft_cpu_raw::<F, E>(coeffs, true)
-}
-
 fn evaluate_fft_cpu_raw<F, E>(
     coeffs: &[FieldElement<E>],
     permute_to_natural: bool,
@@ -335,223 +545,4 @@ where
         in_place_bit_reverse_permute(&mut result);
     }
     Ok(result)
-}
-
-pub fn interpolate_fft_cpu<F, E>(
-    fft_evals: &[FieldElement<E>],
-) -> Result<Polynomial<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let n = fft_evals.len();
-    if !n.is_power_of_two() {
-        return Err(FFTError::InputError(n));
-    }
-    let order = n.trailing_zeros() as u64;
-    let inv_twiddles =
-        LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
-
-    let mut coeffs = fft_evals.to_vec();
-    // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
-    in_place_bit_reverse_permute(&mut coeffs);
-    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
-
-    // Scale by 1/n
-    let scale_factor = FieldElement::from(n as u64).inv().unwrap();
-    Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
-}
-
-#[cfg(test)]
-impl<E: IsField> Polynomial<FieldElement<E>> {
-    /// Multiplies two polynomials using FFT.
-    pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
-        &self,
-        other: &Self,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let domain_size = self.degree() + other.degree() + 1;
-        let p = Polynomial::evaluate_fft::<F>(self, 1, Some(domain_size))?;
-        let q = Polynomial::evaluate_fft::<F>(other, 1, Some(domain_size))?;
-        let r = p.into_iter().zip(q).map(|(a, b)| a * b).collect::<Vec<_>>();
-
-        Polynomial::interpolate_fft::<F>(&r)
-    }
-
-    /// Divides two polynomials with remainder using FFT.
-    pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        divisor: &Self,
-    ) -> Result<(Self, Self), FFTError>
-    where
-        E: Send + Sync,
-    {
-        use crate::field::errors::FieldError;
-
-        let n = self.degree();
-        let m = divisor.degree();
-        if divisor.coefficients.is_empty()
-            || divisor
-                .coefficients
-                .iter()
-                .all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        if n < m {
-            return Ok((Self::zero(), self.clone()));
-        }
-        let d = n - m;
-        let a_rev = self.reverse(n);
-        let b_rev = divisor.reverse(m);
-        let inv_b_rev = b_rev.invert_polynomial_mod::<F>(d + 1)?;
-        let q = a_rev
-            .fast_fft_multiplication::<F>(&inv_b_rev)?
-            .truncate(d + 1)
-            .reverse(d);
-
-        let r = self - q.fast_fft_multiplication::<F>(divisor)?;
-        Ok((q, r))
-    }
-
-    /// Computes the inverse of polynomial P modulo x^k using Newton iteration.
-    pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        k: usize,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        use crate::field::errors::FieldError;
-
-        if self.coefficients.is_empty()
-            || self.coefficients.iter().all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        let mut q = Self::new(&[self.coefficients[0].inv()?]);
-        let mut current_precision = 1;
-
-        let two = Self::new(&[FieldElement::<F>::one() + FieldElement::one()]);
-        while current_precision < k {
-            current_precision *= 2;
-            let temp = self
-                .fast_fft_multiplication::<F>(&q)?
-                .truncate(current_precision);
-            let correction = &two - temp;
-            q = q
-                .fast_fft_multiplication::<F>(&correction)?
-                .truncate(current_precision);
-        }
-
-        Ok(q.truncate(k))
-    }
-}
-
-#[cfg(all(test, feature = "alloc"))]
-mod tests {
-    use super::*;
-    use crate::field::goldilocks::GoldilocksField;
-
-    type F = GoldilocksField;
-    type FE = FieldElement<F>;
-
-    #[test]
-    fn coset_lde_full_into_matches_coset_lde_full() {
-        use crate::fft::cpu::bowers_fft::LayerTwiddles;
-
-        let offset = FE::from(3u64);
-        let blowup_factor = 2;
-
-        for order in 1..=10 {
-            let n = 1usize << order;
-            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
-
-            let lde_size = n * blowup_factor;
-            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
-            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
-
-            let n_inv = FE::from(n as u64).inv().unwrap();
-            let mut weights = Vec::with_capacity(n);
-            let mut offset_power = n_inv;
-            for _ in 0..n {
-                weights.push(offset_power);
-                offset_power = &offset_power * &offset;
-            }
-
-            let reference = Polynomial::<FE>::coset_lde_full::<F>(
-                &evals,
-                blowup_factor,
-                &weights,
-                &inv_tw,
-                &fwd_tw,
-            )
-            .unwrap();
-
-            // Test with pre-allocated buffer
-            let mut buffer = Vec::with_capacity(lde_size);
-            Polynomial::<FE>::coset_lde_full_into::<F>(
-                &evals,
-                blowup_factor,
-                &weights,
-                &inv_tw,
-                &fwd_tw,
-                &mut buffer,
-            )
-            .unwrap();
-
-            assert_eq!(reference, buffer, "Mismatch at order {}", order);
-        }
-    }
-
-    #[test]
-    fn coset_lde_full_into_reuses_buffer() {
-        use crate::fft::cpu::bowers_fft::LayerTwiddles;
-
-        let offset = FE::from(5u64);
-        let blowup_factor = 2usize;
-        let n = 16usize;
-        let lde_size = n * blowup_factor;
-
-        let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
-        let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
-
-        let n_inv = FE::from(n as u64).inv().unwrap();
-        let mut weights = Vec::with_capacity(n);
-        let mut offset_power = n_inv;
-        for _ in 0..n {
-            weights.push(offset_power);
-            offset_power = &offset_power * &offset;
-        }
-
-        // Pre-allocate buffer once, reuse for two different inputs
-        let mut buffer = Vec::with_capacity(lde_size);
-
-        for seed in [13u64, 42u64] {
-            let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
-
-            let reference = Polynomial::<FE>::coset_lde_full::<F>(
-                &evals,
-                blowup_factor,
-                &weights,
-                &inv_tw,
-                &fwd_tw,
-            )
-            .unwrap();
-
-            Polynomial::<FE>::coset_lde_full_into::<F>(
-                &evals,
-                blowup_factor,
-                &weights,
-                &inv_tw,
-                &fwd_tw,
-                &mut buffer,
-            )
-            .unwrap();
-
-            assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
-        }
-    }
 }
