@@ -1,4 +1,4 @@
-#import "/book.typ": book-page
+#import "/book.typ": book-page, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -120,3 +120,19 @@ We read `addr_xR` from register `x10` (@ec:c:load_addrR), and subsequently write
 Similar to `addr_xG` and `addr_k`, we require that $#`addr_xR` + 24 < 2^16$ (@ec:c:verify_addrR_alignment).
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
+
+= EC-Scalar
+#let ecscalar_chip = load_chip("src/ec_scalar.toml", config)
+#let ecscalar = raw(ecscalar_chip.name)
+
+== Columns
+#let nr_variables = total_nr_variables(ecscalar_chip)
+#let nr_columns = total_nr_instantiated_columns(ecscalar_chip, config)
+#let nr_interactions = compute_nr_interactions(ecscalar_chip)
+
+The #ecdas chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+#render_chip_variable_table(ecscalar_chip, config)
+
+== Constraints
+
+#render_constraint_table(ecscalar_chip, config)
