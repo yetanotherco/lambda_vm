@@ -342,6 +342,11 @@ impl VmAirs {
     /// binary — never accept prover-supplied bytes here. Wrong values
     /// surface as Fiat-Shamir transcript divergence (proof rejected),
     /// never as silently-accepted wrong proofs.
+    ///
+    /// The REGISTER commitment is a function of `(proof_options, elf.entry_point)`,
+    /// so callers that embed it as a compile-time constant must also bind the
+    /// inner ELF's entry point — otherwise a host could vary `entry_point` while
+    /// keeping the register root pinned.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -756,6 +761,11 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// supplied bytes. Wrong values surface as Fiat-Shamir transcript
 /// divergence (proof rejected); they cannot cause silently-accepted wrong
 /// proofs.
+///
+/// The REGISTER commitment is a function of `(proof_options, elf.entry_point)`,
+/// so callers that embed it as a compile-time constant must also bind the
+/// inner ELF's entry point — otherwise a host could vary `entry_point` while
+/// keeping the register root pinned.
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],

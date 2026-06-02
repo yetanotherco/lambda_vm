@@ -75,7 +75,7 @@ fn test_generate_register_trace_with_access() {
 
     // Row 10 (address 10) should have the final state
     assert_eq!(*trace.main_table.get(10, cols::OFFSET), FE::from(10u64));
-    assert_eq!(*trace.main_table.get(10, cols::INIT), FE::zero()); // init is always 0
+    assert_eq!(*trace.main_table.get(10, cols::INIT), FE::zero()); // init is 0 for x5 (only SP and x255 have non-zero inits)
     assert_eq!(*trace.main_table.get(10, cols::FINI), FE::from(0x42u64));
     assert_eq!(
         *trace.main_table.get(10, cols::TIMESTAMP_LO),
@@ -146,5 +146,25 @@ fn register_commitment_zero_bytes_rejects() {
     assert!(
         !result,
         "all-zero register commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+#[test]
+fn register_commitment_wrong_entry_point_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Same options, wrong entry_point → different commitment. This catches
+    // the per-ELF binding directly: a caller hardcoding the commitment must
+    // bind the entry point too, not just the ELF text.
+    let wrong = preprocessed_commitment(&options, elf.entry_point ^ 0x1000);
+
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "commitment computed from wrong entry_point must cause Fiat-Shamir rejection",
     );
 }
