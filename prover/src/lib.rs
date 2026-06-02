@@ -338,9 +338,10 @@ impl VmAirs {
     /// expensive). When `None`, the commitment is computed from the ELF.
     ///
     /// The trust anchor for `decode_commitment` is the caller's compiled
-    /// binary — never accept prover-supplied bytes here. Wrong values
-    /// surface as Fiat-Shamir transcript divergence (proof rejected),
-    /// never as silently-accepted wrong proofs.
+    /// binary — never accept prover-supplied bytes here. A wrong value is
+    /// rejected, never silently accepted: it either mismatches the prover's
+    /// committed precomputed root (an explicit verifier check) or yields
+    /// diverging Fiat-Shamir challenges.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -752,9 +753,9 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 ///
 /// Trust model: `decode_commitment`, when supplied, must come from the
 /// caller's compiled binary (e.g. a `const [u8; 32]`), never from prover-
-/// supplied bytes. Wrong values surface as Fiat-Shamir transcript
-/// divergence (proof rejected); they cannot cause silently-accepted wrong
-/// proofs.
+/// supplied bytes. A wrong value is rejected, never silently accepted: it
+/// either mismatches the prover's committed precomputed root (an explicit
+/// verifier check) or yields diverging Fiat-Shamir challenges.
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
