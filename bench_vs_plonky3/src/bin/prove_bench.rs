@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use bench_vs_plonky3::p3_breakdown::Collector as P3Collector;
 use bench_vs_plonky3::{lambda_fibonacci_pair, plonky3_config, plonky3_fibonacci};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -293,27 +294,196 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
         eprintln!("warning: stark::instruments::take() returned None");
         return;
     };
-    print_breakdown("lambda", args.log_rows, rows, "prepass", ms(timing.prepass.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "main_commits", ms(timing.main_commits.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "aux_build", ms(timing.aux_build.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "aux_commit", ms(timing.aux_commit.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "rounds_2_4", ms(timing.rounds_2_4.as_secs_f64()), "");
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "prepass",
+        ms(timing.prepass.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "main_commits",
+        ms(timing.main_commits.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "aux_build",
+        ms(timing.aux_build.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "aux_commit",
+        ms(timing.aux_commit.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "rounds_2_4",
+        ms(timing.rounds_2_4.as_secs_f64()),
+        "",
+    );
     let r1 = timing.round1_sub;
-    print_breakdown("lambda", args.log_rows, rows, "r1_main_lde", ms(r1.main_lde.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "r1_main_merkle", ms(r1.main_merkle.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "r1_aux_lde", ms(r1.aux_lde.as_secs_f64()), "");
-    print_breakdown("lambda", args.log_rows, rows, "r1_aux_merkle", ms(r1.aux_merkle.as_secs_f64()), "");
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "r1_main_lde",
+        ms(r1.main_lde.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "r1_main_merkle",
+        ms(r1.main_merkle.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "r1_aux_lde",
+        ms(r1.aux_lde.as_secs_f64()),
+        "",
+    );
+    print_breakdown(
+        "lambda",
+        args.log_rows,
+        rows,
+        "r1_aux_merkle",
+        ms(r1.aux_merkle.as_secs_f64()),
+        "",
+    );
+
+    // --- Normalized, prover-agnostic phases ---
+    // Same `norm_*` names the P3 side emits (see p3_breakdown::Snapshot::canonical),
+    // so Lambda and P3 diff line-for-line in breakdown.tsv (filter by prover).
+    // Lambda has one set of round-2..4 sub-timings per table; sum them.
+    let mut constraint_eval = std::time::Duration::ZERO;
+    let mut quotient_merkle = std::time::Duration::ZERO;
+    let mut quotient_commit = std::time::Duration::ZERO;
+    let mut deep_ood = std::time::Duration::ZERO;
+    let mut fri = std::time::Duration::ZERO;
+    for (_n, _tr, _dur, sub) in &timing.table_timings {
+        constraint_eval += sub.constraints;
+        quotient_merkle += sub.comp_commit;
+        quotient_commit += sub.comp_decompose + sub.comp_commit;
+        deep_ood += sub.ood + sub.deep_comp + sub.deep_extend;
+        fri += sub.fri_commit + sub.queries;
+    }
+    let norm = |phase: &str, d: std::time::Duration| {
+        let v = ms(d.as_secs_f64());
+        let pct = if total_ms > 0.0 {
+            100.0 * v / total_ms
+        } else {
+            0.0
+        };
+        println!(
+            "BREAKDOWN\tworkload=fib_pair\tprover=lambda\tlog_rows={}\trows={rows}\tphase={phase}\tms={v:.3}\tpct={pct:.1}\tkind=norm",
+            args.log_rows
+        );
+    };
+    norm(
+        "norm_prove_total",
+        std::time::Duration::from_secs_f64(total_ms / 1000.0),
+    );
+    norm("norm_trace_commit", timing.main_commits);
+    norm("norm_trace_lde", r1.main_lde);
+    norm("norm_trace_merkle", r1.main_merkle);
+    norm("norm_constraint_eval", constraint_eval);
+    norm("norm_quotient_commit", quotient_commit);
+    norm("norm_quotient_merkle", quotient_merkle);
+    norm("norm_open", deep_ood + fri);
+    norm("norm_fri", fri);
+    norm("norm_deep_ood", deep_ood);
+
     for (name, table_rows, dur, sub) in timing.table_timings {
         let extra = format!("\ttable={name}\ttable_rows={table_rows}");
-        print_breakdown("lambda", args.log_rows, rows, "table_total", ms(dur.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r2_constraints", ms(sub.constraints.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r2_comp_decompose", ms(sub.comp_decompose.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r2_comp_commit", ms(sub.comp_commit.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r3_ood", ms(sub.ood.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r4_deep_comp", ms(sub.deep_comp.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r4_deep_extend", ms(sub.deep_extend.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r4_fri_commit", ms(sub.fri_commit.as_secs_f64()), &extra);
-        print_breakdown("lambda", args.log_rows, rows, "r4_queries", ms(sub.queries.as_secs_f64()), &extra);
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "table_total",
+            ms(dur.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r2_constraints",
+            ms(sub.constraints.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r2_comp_decompose",
+            ms(sub.comp_decompose.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r2_comp_commit",
+            ms(sub.comp_commit.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r3_ood",
+            ms(sub.ood.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r4_deep_comp",
+            ms(sub.deep_comp.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r4_deep_extend",
+            ms(sub.deep_extend.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r4_fri_commit",
+            ms(sub.fri_commit.as_secs_f64()),
+            &extra,
+        );
+        print_breakdown(
+            "lambda",
+            args.log_rows,
+            rows,
+            "r4_queries",
+            ms(sub.queries.as_secs_f64()),
+            &extra,
+        );
     }
 }
 
@@ -321,6 +491,15 @@ fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
 fn emit_lambda_breakdown(args: &Args, rows: usize, total_ms: f64) {
     print_breakdown("lambda", args.log_rows, rows, "prove_total", total_ms, "");
     eprintln!("warning: Lambda phase breakdown requires building with --features instruments");
+}
+
+fn emit_p3_breakdown(args: &Args, rows: usize, total_ms: f64, collector: &P3Collector) {
+    let snapshot = collector.snapshot();
+    if snapshot.nodes.is_empty() {
+        eprintln!("warning: P3 collector captured no spans");
+        return;
+    }
+    bench_vs_plonky3::p3_breakdown::print_breakdown("p3", args.log_rows, rows, total_ms, &snapshot);
 }
 
 fn print_metrics(args: &Args, metrics: &BenchMetrics) {
@@ -358,6 +537,16 @@ fn real_main() -> Result<(), String> {
         return Ok(());
     }
 
+    let p3_collector = if args.prover == ProverKind::P3 {
+        let c = P3Collector::new();
+        if let Err(e) = c.install() {
+            eprintln!("warning: failed to install P3 tracing collector: {e}");
+        }
+        Some(c)
+    } else {
+        None
+    };
+
     let metrics = match args.prover {
         ProverKind::Lambda => run_lambda(&args),
         ProverKind::P3 => run_p3(&args),
@@ -370,6 +559,12 @@ fn real_main() -> Result<(), String> {
     print_metrics(&args, &metrics);
     if args.breakdown && args.prover == ProverKind::Lambda {
         emit_lambda_breakdown(&args, rows(&args), ms(metrics.prove_s));
+    }
+    if args.breakdown
+        && args.prover == ProverKind::P3
+        && let Some(c) = p3_collector.as_ref()
+    {
+        emit_p3_breakdown(&args, rows(&args), ms(metrics.prove_s), c);
     }
     Ok(())
 }

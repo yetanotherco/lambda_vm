@@ -97,6 +97,37 @@ for phase in "${PHASES[@]}"; do
 done
 
 echo
+echo "=== Normalized phase comparison: Lambda vs P3 (median ms over $RUNS runs) ==="
+echo "    NOTE: only fair when P3 ran scalar (AUDIT val_packing_width=1)."
+NORM_PHASES=(norm_prove_total norm_trace_commit norm_trace_lde norm_trace_merkle \
+    norm_constraint_eval norm_quotient_commit norm_quotient_merkle norm_open norm_fri norm_deep_ood)
+
+# median of breakdown.tsv `ms` (col 7) for a given prover (col 3) + phase (col 6)
+norm_median() { # $1=tsv $2=prover $3=phase
+    awk -F'\t' -v pr="$2" -v ph="$3" '$3==pr && $6==ph {print $7}' "$1" | sort -g | awk '
+        { a[NR]=$1+0 }
+        END {
+            if (NR==0) { print "-"; exit }
+            if (NR%2==1) printf "%.1f", a[(NR+1)/2]
+            else printf "%.1f", (a[NR/2]+a[NR/2+1])/2
+        }'
+}
+
+for N in "${NSEQS[@]}"; do
+    TSV="${BASE}_n${N}/breakdown.tsv"
+    [[ -f "$TSV" ]] || continue
+    echo "--- n_seq=$N (main_cols=$((2 * N))) ---"
+    printf "%-22s %12s %12s %8s\n" "phase" "lambda(ms)" "p3(ms)" "L/P3"
+    for ph in "${NORM_PHASES[@]}"; do
+        L=$(norm_median "$TSV" lambda "$ph")
+        P=$(norm_median "$TSV" p3 "$ph")
+        R=$(awk -v a="$L" -v b="$P" 'BEGIN { if (b+0 > 0) printf "%.2f", a/b; else print "-" }')
+        printf "%-22s %12s %12s %8s\n" "$ph" "$L" "$P" "$R"
+    done
+    echo
+done
+
+echo
 echo "Compare against vm5 May 13 baseline (no fix, P3 with vector-lane Keccak):"
 echo "  ~/Documents/lambda_vm5/bench_vs_plonky3/reports/bench_vs_p3_20260513_2033_upstream/breakdown_log21/breakdown.tsv"
 echo "  (only n=16 baseline available there; for n=32/64 see cols_log21_n* dirs)"
