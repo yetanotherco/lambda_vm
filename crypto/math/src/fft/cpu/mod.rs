@@ -7,4 +7,6 @@ pub mod bowers_fft_batch;
 mod bowers_fft_tests;
 pub mod fft;
 #[cfg(feature = "alloc")]
+pub mod four_step_fft;
+#[cfg(feature = "alloc")]
 pub mod roots_of_unity;
