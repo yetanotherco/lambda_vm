@@ -70,8 +70,6 @@ The other contributions for `arg2` are specific to the (mutually exclusive, @cpu
   address at which the memory access occurs.
 - For the `BRANCH` path, we want the ALU output to reflect the branch condition (or just be inactive for JALR).
 
-Instructions having the `word_instr` flag set are delegated to the `CPU32` chip, which will do its own decoding and execution of the instruction.
-
 #render_constraint_table(chip, config, groups: "alu")
 
 == Memory<cpu:memory>

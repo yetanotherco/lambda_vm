@@ -61,7 +61,7 @@ pad = 0
 [[variables.input]]
 name = "half_instruction_length"
 type = "Byte"
-desc = "The number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
+desc = "Half the number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long (= 1) instead of 4 (= 2)"
 pad = 2
 
 [[variables.input]]
@@ -394,11 +394,11 @@ prefix = "A"
 
 [[constraints.alu]]
 kind = "arith"
-constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot #`rv2` + (1 - #`MEMORY`) dot (1 - #`BRANCH`) dot (#`rv2` + #`imm`)$"
+constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot #`rv2` + (1 - #`MEMORY` - #`BRANCH`) dot (#`rv2` + #`imm`)$"
 poly = ["-", ["idx", "arg2", "i"],
     ["*", "MEMORY", ["idx", "imm", "i"]],
     ["*", "BRANCH", ["idx", "rv2", "i"]],
-    ["*", ["not", "MEMORY"], ["not", "BRANCH"], ["idx", ["+", "rv2", "imm"], "i"]]
+    ["*", ["-", 1, "MEMORY", "BRANCH"], ["idx", ["+", "rv2", "imm"], "i"]]
 ]
 iter = ["i", 0, 1]
 
