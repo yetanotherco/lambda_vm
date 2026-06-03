@@ -355,43 +355,74 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResCons
 }
 
 // =========================================================================
-// branch group: BRANCH ⇒ rvd = cast(pc + len, WL)
+// branch group: BRANCH ⇒ rvd = pc + instruction_length
 // =========================================================================
 
-/// `BRANCH · (rvd[i] − cast(pc + instruction_length, WL)[i]) = 0` (`cpu.toml`
-/// branch group).
+/// `BRANCH · carry · (1 − carry) = 0` for the 64-bit addition
+/// `rvd = pc + instruction_length` (the JAL/JALR return address), in two
+/// instances (`carry_0` / `carry_1`). Mirrors [`NextPcAddConstraint`] so the
+/// low→high carry is propagated: the spec computes `rvd` with the same
+/// carry-correct `ADD` template as `next_pc` (`cpu.toml` branch group), so the
+/// high word must include the carry out of `pc[0] + instruction_length`.
 ///
 /// On every BRANCH row `rvd` holds the return address `pc + instruction_length`
 /// (written to `rd` only by JAL/JALR; conditional branches compute it but never
-/// write it). The spec realizes this with an ADD-chip lookup gated on `BRANCH`;
-/// we pin it with a polynomial constraint, mirroring the project's existing
-/// `next_pc = pc + len` arithmetic. See [`RvdEqResConstraint`] for the
-/// complementary `¬MEMORY ∧ ¬BRANCH ⇒ rvd = res` case.
-///
-/// **Carry caveat:** the constraint expresses `cast(pc + instruction_length,
-/// DWordWL)` assuming `pc[0] + instruction_length < 2^32`, which holds for
-/// any realistic ELF (text segment lives below 2^31). A fully carry-aware
-/// version would need a borrow column; the project's existing
-/// `next_pc = pc + len` arithmetic relies on the same assumption.
+/// write it). See [`RvdEqResConstraint`] for the complementary
+/// `¬MEMORY ∧ ¬BRANCH ⇒ rvd = res` case.
 pub struct BranchRvdConstraint {
-    /// 0 = low word, 1 = high word.
-    word_idx: usize,
+    /// 0 = low-word carry, 1 = high-word carry.
+    carry_idx: usize,
     constraint_idx: usize,
 }
 
 impl BranchRvdConstraint {
-    pub fn new(word_idx: usize, constraint_idx: usize) -> Self {
+    pub fn new(carry_idx: usize, constraint_idx: usize) -> Self {
+        assert!(carry_idx <= 1);
         Self {
-            word_idx,
+            carry_idx,
             constraint_idx,
         }
+    }
+
+    pub fn new_pair(constraint_idx_start: usize) -> (Self, Self) {
+        (
+            Self::new(0, constraint_idx_start),
+            Self::new(1, constraint_idx_start + 1),
+        )
+    }
+
+    fn compute_carry_0<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let pc_lo = step.get_main_evaluation_element(0, cols::PC_0).clone();
+        let rvd_lo = step.get_main_evaluation_element(0, cols::RVD_0).clone();
+        let half_len = step
+            .get_main_evaluation_element(0, cols::HALF_INSTRUCTION_LENGTH)
+            .clone();
+        let instr_len = &half_len + &half_len; // real byte length = 2 * half
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
+        (pc_lo + instr_len - rvd_lo) * inv_2_32
+    }
+
+    fn compute_carry_1<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let pc_hi = step.get_main_evaluation_element(0, cols::PC_1).clone();
+        let rvd_hi = step.get_main_evaluation_element(0, cols::RVD_1).clone();
+        let carry_0 = self.compute_carry_0(step);
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
+        (pc_hi + carry_0 - rvd_hi) * inv_2_32
     }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchRvdConstraint {
     fn degree(&self) -> usize {
-        // BRANCH (deg 1) · (rvd - expected) (deg 1) = 2.
-        2
+        // BRANCH (deg 1) · carry · (1 − carry) = 3.
+        3
     }
 
     fn constraint_idx(&self) -> usize {
@@ -403,23 +434,14 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchRvdCon
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let high = self.word_idx == 1;
-        let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
-        let pc_col = if high { cols::PC_1 } else { cols::PC_0 };
+        let one = FieldElement::<F>::one();
         let branch = step.get_main_evaluation_element(0, cols::BRANCH).clone();
-        let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
-        let pc = step.get_main_evaluation_element(0, pc_col).clone();
-        // expected = (pc + len) for low word; (pc) for high word.
-        // The carry from low → high is omitted (pc < 2^31 in practice).
-        let expected = if high {
-            pc
-        } else {
-            let half_len = step
-                .get_main_evaluation_element(0, cols::HALF_INSTRUCTION_LENGTH)
-                .clone();
-            pc + &half_len + &half_len // real byte length = 2 * half
+        let carry = match self.carry_idx {
+            0 => self.compute_carry_0(step),
+            1 => self.compute_carry_1(step),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
-        branch * (rvd - expected)
+        branch * &carry * (&one - &carry)
     }
 }
 
@@ -659,11 +681,11 @@ pub fn create_all_cpu_constraints() -> (
     other.push(RvdEqResConstraint::new(1, next_idx).boxed());
     next_idx += 1;
 
-    // branch: BRANCH ⇒ rvd = cast(pc + instruction_length, WL) (JAL/JALR return)
-    other.push(BranchRvdConstraint::new(0, next_idx).boxed());
-    next_idx += 1;
-    other.push(BranchRvdConstraint::new(1, next_idx).boxed());
-    next_idx += 1;
+    // branch: BRANCH ⇒ rvd = pc + instruction_length (JAL/JALR return), carry-aware
+    let (branch_rvd_0, branch_rvd_1) = BranchRvdConstraint::new_pair(next_idx);
+    other.push(branch_rvd_0.boxed());
+    other.push(branch_rvd_1.boxed());
+    next_idx += 2;
 
     // branch: branch_cond + next_pc
     other.push(BranchCondConstraint::new(next_idx).boxed());
