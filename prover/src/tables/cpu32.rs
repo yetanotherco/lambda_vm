@@ -607,6 +607,11 @@ pub enum Cpu32ConstraintKind {
     /// `read_register2·imm[i] = 0` (decoding guarantees at most one is nonzero;
     /// spec defense-in-depth assumption). `usize` is the `imm` limb column.
     Arg2Exclusive { imm_col: usize },
+    /// `(1 - μ)·flag = 0`: a register flag that gates a `MEMW` bus interaction
+    /// must be 0 on a padding row (`μ = 0`), otherwise a disconnected row could
+    /// emit a forged register read/write token (no DECODE binding, no CPU32
+    /// delegation). Spec `cpu32.toml` (PR #646). `usize` is the flag column.
+    FlagImpliesMu { flag_col: usize },
 }
 
 impl Cpu32Constraint {
@@ -629,7 +634,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
             Cpu32ConstraintKind::Arg1Hi
             | Cpu32ConstraintKind::Arg2Hi
             | Cpu32ConstraintKind::RegZero { .. }
-            | Cpu32ConstraintKind::Arg2Exclusive { .. } => 2,
+            | Cpu32ConstraintKind::Arg2Exclusive { .. }
+            | Cpu32ConstraintKind::FlagImpliesMu { .. } => 2,
         }
     }
 
@@ -675,6 +681,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
             } => (one - get(read_col)) * get(value_col),
             Cpu32ConstraintKind::Arg2Exclusive { imm_col } => {
                 get(cols::READ_REGISTER2) * get(imm_col)
+            }
+            Cpu32ConstraintKind::FlagImpliesMu { flag_col } => {
+                (one - get(cols::MU)) * get(flag_col)
             }
         }
     }
@@ -776,6 +785,21 @@ pub fn cpu32_constraints(
     for imm_col in [cols::IMM_0, cols::IMM_1] {
         constraints.push(
             Cpu32Constraint::new(Cpu32ConstraintKind::Arg2Exclusive { imm_col }, idx).boxed(),
+        );
+        idx += 1;
+    }
+
+    // flag ⇒ μ: a register flag gating a MEMW interaction must be 0 on padding
+    // rows (μ = 0), else a disconnected row injects a forged register access
+    // (spec `cpu32.toml`, PR #646). ALU is not gated: with `write_register = 0`
+    // its ALU-lookup result is never written back, so it has no side effect.
+    for flag_col in [
+        cols::READ_REGISTER1,
+        cols::READ_REGISTER2,
+        cols::WRITE_REGISTER,
+    ] {
+        constraints.push(
+            Cpu32Constraint::new(Cpu32ConstraintKind::FlagImpliesMu { flag_col }, idx).boxed(),
         );
         idx += 1;
     }
