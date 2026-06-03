@@ -11,7 +11,7 @@
 /// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
 /// - `src2_val` = buf_addr (x11) for Commit, 0 otherwise
 /// - `dst_val` = count (x12) for Commit, 0 otherwise
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
     pub current_pc: u64,

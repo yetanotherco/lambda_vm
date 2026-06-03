@@ -30,6 +30,18 @@ pub struct ExecutionResult {
 /// Size of each log chunk - balances memory usage vs callback overhead
 const CHUNK_SIZE: usize = 100_000;
 
+/// A snapshot of the mutable VM state at a cycle boundary: enough to recreate an
+/// [`Executor`] (together with the program ELF) that resumes execution
+/// byte-identically. The immutable instruction cache is rebuilt from the ELF, not
+/// stored. Determinism holds because all nondeterministic input (private inputs)
+/// is pre-loaded into `memory`, so replay reproduces identical logs.
+#[derive(Clone)]
+pub struct VmSnapshot {
+    memory: Memory,
+    registers: Registers,
+    pc: u64,
+}
+
 /// Executor state for chunked execution
 pub struct Executor {
     memory: Memory,
@@ -50,6 +62,31 @@ impl Executor {
             memory,
             registers: Registers::default(),
             pc: program.entry_point,
+            instructions,
+            logs: Vec::with_capacity(CHUNK_SIZE),
+        })
+    }
+
+    /// Capture the current VM state (registers, pc, memory) as a [`VmSnapshot`].
+    /// Cheap apart from the memory clone (a clone of the touched-cells map).
+    pub fn snapshot(&self) -> VmSnapshot {
+        VmSnapshot {
+            memory: self.memory.clone(),
+            registers: self.registers.clone(),
+            pc: self.pc,
+        }
+    }
+
+    /// Recreate an `Executor` positioned at a previously captured [`VmSnapshot`].
+    /// The instruction cache is rebuilt from `program` (the same ELF the snapshot
+    /// was taken under); the snapshot's memory already holds the loaded program
+    /// and execution state, so the program is NOT reloaded.
+    pub fn from_snapshot(program: &Elf, snapshot: VmSnapshot) -> Result<Self, ExecutorError> {
+        let instructions = InstructionCache::new(&program.data)?;
+        Ok(Self {
+            memory: snapshot.memory,
+            registers: snapshot.registers,
+            pc: snapshot.pc,
             instructions,
             logs: Vec::with_capacity(CHUNK_SIZE),
         })
