@@ -726,102 +726,10 @@ where
     out
 }
 
-/// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
-/// coefficient parts). Returns the LDE evaluations as `Vec<Vec<FieldElement<E>>>`
-/// of length `lde_size` per part on success, `None` to fall through to the CPU
-/// path. Used by `round_2_compute_composition_polynomial` in the
-/// `number_of_parts > 2` branch.
-///
-/// Inputs are immutable (`&[&[FieldElement<E>]]`) and outputs are fresh, so
-/// there is no `restore_columns_on_err` needed. `Err` just returns `None`
-/// and the caller's coefficient slices are left untouched.
-pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
-    parts_coefs: &[&[FieldElement<E>]],
-    blowup_factor: usize,
-    domain_size: usize,
-    offset: &FieldElement<F>,
-) -> Option<Vec<Vec<FieldElement<E>>>>
-where
-    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
-{
-    if parts_coefs.is_empty() {
-        return Some(Vec::new());
-    }
-    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
-        return None;
-    }
-    let lde_size = domain_size.checked_mul(blowup_factor)?;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    let m = parts_coefs.len();
-
-    // Weights: `offset^k` for k in 0..domain_size. F is Goldilocks by check above.
-    let mut weights_u64 = Vec::with_capacity(domain_size);
-    let mut w = FieldElement::<F>::one();
-    for _ in 0..domain_size {
-        // SAFETY: F == Goldilocks per TypeId check. FieldElement<Gl> is
-        // #[repr(transparent)] over u64.
-        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
-        weights_u64.push(v);
-        w *= offset;
-    }
-
-    // Pack parts into per-part `3 * domain_size` u64 buffers (zero-padded).
-    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
-    for part in parts_coefs.iter() {
-        let mut buf = vec![0u64; 3 * domain_size];
-        let len = part.len().min(domain_size);
-        // SAFETY: E == Ext3; backing is `[FieldElement<Gl>; 3]` = `[u64; 3]`.
-        let src_ptr = part.as_ptr() as *const u64;
-        let src_len = len.checked_mul(3).expect("part src len overflow");
-        let src = unsafe { from_raw_parts(src_ptr, src_len) };
-        buf[..src_len].copy_from_slice(src);
-        part_bufs.push(buf);
-    }
-    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
-
-    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
-        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
-        .collect();
-    let gpu_result = {
-        let mut out_slices: Vec<&mut [u64]> = outputs
-            .iter_mut()
-            .map(|o| {
-                let ptr = o.as_mut_ptr() as *mut u64;
-                let byte_len = lde_size.checked_mul(3).expect("ext3 out len overflow");
-                // SAFETY: E == Ext3 per TypeId check; Vec<FieldElement<E>> of
-                // length `lde_size` is layout-equivalent to `[u64; 3 * lde_size]`.
-                unsafe { from_raw_parts_mut(ptr, byte_len) }
-            })
-            .collect();
-        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
-            &input_slices,
-            domain_size,
-            blowup_factor,
-            &weights_u64,
-            &mut out_slices,
-        )
-    };
-    if gpu_result.is_err() {
-        // Outputs are local and dropped on return; caller's inputs are
-        // immutable, so no restore is needed.
-        return None;
-    }
-    GPU_PARTS_LDE_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(outputs)
-}
-
 /// R2 GPU dispatch: build the composition-polynomial Merkle tree from the
-/// host-side ext3 LDE eval Vecs produced by [`try_evaluate_parts_on_lde_gpu`]
-/// (or the CPU path). Uses the same row-pair leaf pattern as the CPU
+/// host-side ext3 LDE eval Vecs produced by
+/// [`try_evaluate_parts_on_lde_gpu_keep`] (or the CPU path). Uses the same
+/// row-pair leaf pattern as the CPU
 /// `commit_composition_polynomial`: each leaf hashes 2 consecutive
 /// bit-reversed rows.
 ///
@@ -1232,10 +1140,10 @@ where
         if parts_host.iter().any(|p| p.len() != lde_size) {
             return None;
         }
-    } else if let Some(p) = parts_dev {
-        if p.m != num_parts || p.lde_size != lde_size {
-            return None;
-        }
+    } else if let Some(p) = parts_dev
+        && (p.m != num_parts || p.lde_size != lde_size)
+    {
+        return None;
     }
 
     // Pack host buffers. SAFETY for ext3 transmutes: E == Ext3 by TypeId check.
@@ -1339,6 +1247,8 @@ where
 /// transcript is mutated layer-by-layer, so a mid-flight cudarc failure
 /// panics (CPU restart from the same evals would re-sample zeta_0 against
 /// an already-advanced transcript and produce a different proof).
+// Wired into `fri::commit_phase_from_evaluations` in Step 6 of PR-4.
+#[allow(dead_code, clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E>(
     number_layers: usize,
     evals: &[FieldElement<E>],
@@ -1448,6 +1358,8 @@ where
 /// host-side ext3 evaluation Vec. Used as a CPU-fold / GPU-tree path
 /// alternative to the fused [`try_fri_commit_gpu`]. `B::Node = [u8; 32]`
 /// by construction for `FriLayerMerkleTreeBackend<E>`.
+// Wired into `fri::commit_phase_from_evaluations` in Step 6 of PR-4.
+#[allow(dead_code)]
 pub(crate) fn try_build_fri_layer_tree_gpu<E, B>(evals: &[FieldElement<E>]) -> Option<MerkleTree<B>>
 where
     E: IsField + 'static,
