@@ -18,7 +18,10 @@ use self::fri_functions::{
 /// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
 /// initial FFT. Use this when the caller already has the evaluation vector
 /// (e.g. from a fused LDE pipeline).
-pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
+pub fn commit_phase_from_evaluations<
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
@@ -32,6 +35,24 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    // GPU fast path: drives the entire commit phase device-side (per-layer
+    // fold + Keccak leaves + pair-hash tree, only D2H'ing each layer's root
+    // + evals + nodes for FriLayer construction). Falls back to the CPU
+    // loop below on any precondition miss; a cudarc failure mid-loop panics
+    // since the transcript is already advanced (see `try_fri_commit_gpu`).
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E>(
+            number_layers,
+            &evals,
+            transcript,
+            coset_offset,
+            domain_size,
+        ) {
+            return result;
+        }
+    }
+
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 

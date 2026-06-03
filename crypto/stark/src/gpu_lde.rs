@@ -70,7 +70,6 @@ pub fn reset_all_gpu_call_counters() {
     GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
-    GPU_FRI_TREE_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -622,7 +621,7 @@ pub fn gpu_merkle_tree_calls() -> u64 {
 // ============================================================================
 
 /// R2 dispatch counter: incremented once per
-/// [`try_evaluate_parts_on_lde_gpu`] call that actually routed to the GPU.
+/// [`try_evaluate_parts_on_lde_gpu_keep`] call that actually routed to the GPU.
 pub(crate) static GPU_PARTS_LDE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_parts_lde_calls() -> u64 {
     GPU_PARTS_LDE_CALLS.load(Ordering::Relaxed)
@@ -937,19 +936,10 @@ pub fn gpu_fri_calls() -> u64 {
     GPU_FRI_CALLS.load(Ordering::Relaxed)
 }
 
-/// Standalone FRI per-layer Merkle tree dispatch counter (one per
-/// [`try_build_fri_layer_tree_gpu`] call). The fused
-/// [`try_fri_commit_gpu`] path does not increment this since the tree
-/// build is internal to `FriCommitState::fold_and_commit_layer`.
-pub(crate) static GPU_FRI_TREE_CALLS: AtomicU64 = AtomicU64::new(0);
-pub fn gpu_fri_tree_calls() -> u64 {
-    GPU_FRI_TREE_CALLS.load(Ordering::Relaxed)
-}
-
-/// Keep-handle counterpart of [`try_evaluate_parts_on_lde_gpu`]: returns
-/// both the host LDE eval Vecs (still needed for the R2 Merkle commit and
-/// R3 OOD path) and a device-resident `GpuLdeExt3` handle to the same
-/// de-interleaved buffer, so R4 DEEP can skip the
+/// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
+/// coefficient parts). Returns both the host LDE eval Vecs (needed for the
+/// R2 Merkle commit and R3 OOD path) and a device-resident `GpuLdeExt3`
+/// handle to the same de-interleaved buffer, so R4 DEEP can skip the
 /// `num_parts * 3 * lde_size * 8` byte H2D.
 pub(crate) fn try_evaluate_parts_on_lde_gpu_keep<F, E>(
     parts_coefs: &[&[FieldElement<E>]],
@@ -1247,8 +1237,7 @@ where
 /// transcript is mutated layer-by-layer, so a mid-flight cudarc failure
 /// panics (CPU restart from the same evals would re-sample zeta_0 against
 /// an already-advanced transcript and produce a different proof).
-// Wired into `fri::commit_phase_from_evaluations` in Step 6 of PR-4.
-#[allow(dead_code, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E>(
     number_layers: usize,
     evals: &[FieldElement<E>],
@@ -1352,49 +1341,4 @@ where
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((last_value, fri_layer_list))
-}
-
-/// Standalone GPU dispatch: build the FRI per-layer Merkle tree from a
-/// host-side ext3 evaluation Vec. Used as a CPU-fold / GPU-tree path
-/// alternative to the fused [`try_fri_commit_gpu`]. `B::Node = [u8; 32]`
-/// by construction for `FriLayerMerkleTreeBackend<E>`.
-// Wired into `fri::commit_phase_from_evaluations` in Step 6 of PR-4.
-#[allow(dead_code)]
-pub(crate) fn try_build_fri_layer_tree_gpu<E, B>(evals: &[FieldElement<E>]) -> Option<MerkleTree<B>>
-where
-    E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
-{
-    let n = evals.len();
-    if !n.is_power_of_two() || n < 2 {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if n < gpu_lde_threshold() {
-        return None;
-    }
-
-    // SAFETY: E == Ext3 per TypeId check.
-    let raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
-    let nodes_bytes = match math_cuda::merkle::build_fri_layer_tree_from_evals_ext3(raw) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-
-    // num_leaves = n / 2, tight_total_nodes = 2 * num_leaves - 1 = n - 1.
-    let tight_total_nodes = n - 1;
-    let expected_byte_len = tight_total_nodes
-        .checked_mul(32)
-        .expect("FRI tree node byte length overflow");
-    debug_assert_eq!(nodes_bytes.len(), expected_byte_len);
-
-    let nodes: Vec<[u8; 32]> = nodes_bytes
-        .chunks_exact(32)
-        .map(|c| c.try_into().expect("chunks_exact(32) yields 32 bytes"))
-        .collect();
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
-    GPU_FRI_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(tree)
 }
