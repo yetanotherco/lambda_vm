@@ -52,3 +52,5 @@ pub mod statement_tests;
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+
+pub mod streaming_retire_tests;

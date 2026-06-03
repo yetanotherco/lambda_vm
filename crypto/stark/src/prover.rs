@@ -310,6 +310,42 @@ pub fn streaming_retire_lde() -> bool {
         .unwrap_or(false)
 }
 
+/// On-demand trace source for streaming "retire-traces" mode (C.2b).
+///
+/// In the default (non-streaming) path every table's main+aux trace is resident
+/// in `air_trace_pairs` for the whole of [`IsStarkProver::multi_prove`], and no
+/// provider is used (`None`). In the streaming path (`LAMBDA_STREAM_LDE=1`) the
+/// caller may instead pass a provider that builds the *log-derived* tables'
+/// traces on demand from a compact routed intermediate: the prover asks the
+/// provider for table `idx`'s freshly-built **main-only** trace at each point it
+/// is needed (Phase A main commit, Phase C aux build, Rounds 2-4 reconstruct),
+/// uses it transiently, and drops it. The auxiliary trace is rebuilt by the
+/// prover on top of the freshly-built main via `AIR::build_auxiliary_trace`.
+///
+/// Because the underlying build is deterministic (C.2a), the trace produced for
+/// `idx` is byte-identical across all three phases (and to the pre-built trace
+/// the non-streaming path uses), so the resulting proof is byte-identical.
+///
+/// Tables for which [`TraceProvider::is_retired`] returns `false` (preprocessed
+/// tables, PAGE, etc.) are *not* built on demand: the prover uses the resident
+/// trace borrowed in `air_trace_pairs` exactly as in the non-streaming path.
+pub trait TraceProvider<Field, FieldExtension>: Sync
+where
+    Field: IsSubFieldOf<FieldExtension> + IsField,
+    FieldExtension: IsField,
+{
+    /// Whether table `idx` is retired (built on demand) rather than resident.
+    fn is_retired(&self, idx: usize) -> bool;
+
+    /// Number of rows of the main trace for table `idx`. Cheap; used in the
+    /// pre-pass to size the LDE domain without materializing the trace.
+    fn num_rows(&self, idx: usize) -> usize;
+
+    /// Build the **main-only** trace (no auxiliary columns) for retired table
+    /// `idx`. Must be deterministic: byte-identical across repeated calls.
+    fn build_main(&self, idx: usize) -> TraceTable<Field, FieldExtension>;
+}
+
 /// Number of tables to process concurrently in `multi_prove`.
 /// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
 /// Override with `TABLE_PARALLELISM` env var.
@@ -783,25 +819,56 @@ pub trait IsStarkProver<
     /// Reconstruct Round1 for every table, print the bus balance report, and
     /// validate each trace. Called once after Phase C commits.
     #[cfg(feature = "debug-checks")]
+    #[allow(clippy::too_many_arguments)]
     fn run_debug_checks(
         air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
         commitments: &[Round1Commitments<Field, FieldExtension>],
         domains: &[Arc<Domain<Field>>],
         twiddle_caches: &[Arc<LdeTwiddles<Field>>],
+        provider: Option<&dyn TraceProvider<Field, FieldExtension>>,
+        stream_traces: bool,
+        lookup_challenges: &[FieldElement<FieldExtension>],
     ) where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
+        // For retired tables the resident trace is an empty placeholder; rebuild
+        // each retired table's main+aux trace here so debug checks see the real
+        // data (matching what the proving rounds reconstruct).
+        let rebuilt: Vec<Option<TraceTable<Field, FieldExtension>>> = air_trace_pairs
+            .iter()
+            .enumerate()
+            .map(|(idx, (air, _, _))| {
+                if stream_traces && provider.is_some_and(|p| p.is_retired(idx)) {
+                    let mut t = provider.unwrap().build_main(idx);
+                    if air.has_aux_trace() {
+                        air.build_auxiliary_trace(&mut t, lookup_challenges);
+                    }
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let trace_at = |idx: usize| -> &TraceTable<Field, FieldExtension> {
+            match &rebuilt[idx] {
+                Some(t) => t,
+                None => air_trace_pairs[idx].1,
+            }
+        };
+
         let mut temp_results: Vec<Round1<Field, FieldExtension>> =
             Vec::with_capacity(air_trace_pairs.len());
-        for (((air, trace, _), commitment), (domain, twiddles)) in air_trace_pairs
+        for (idx, (((air, _, _), commitment), (domain, twiddles))) in air_trace_pairs
             .iter()
             .zip(commitments.iter())
             .zip(domains.iter().zip(twiddle_caches.iter()))
+            .enumerate()
         {
-            let result = Self::reconstruct_round1(*air, *trace, domain, commitment, twiddles)
-                .expect("reconstruct_round1 failed in debug-checks");
+            let result =
+                Self::reconstruct_round1(*air, trace_at(idx), domain, commitment, twiddles)
+                    .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
         }
 
@@ -811,15 +878,16 @@ pub trait IsStarkProver<
             .collect();
         print_bus_balance_report(&all_bus_public_inputs);
 
-        for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+        for (idx, (((air, _, pub_inputs), round_1_result), domain)) in air_trace_pairs
             .iter()
             .zip(temp_results.iter())
             .zip(domains.iter())
+            .enumerate()
         {
             validate_trace(
                 *air,
                 *pub_inputs,
-                *trace,
+                trace_at(idx),
                 domain,
                 &round_1_result.rap_challenges,
                 round_1_result.bus_public_inputs.as_ref(),
@@ -1443,7 +1511,41 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        Self::multi_prove_with_provider(
+            air_trace_pairs,
+            None,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Like [`IsStarkProver::multi_prove`], but with an optional on-demand trace
+    /// [`TraceProvider`] for streaming "retire-traces" mode (C.2b).
+    ///
+    /// When `provider` is `None` this is exactly [`IsStarkProver::multi_prove`].
+    /// When `provider` is `Some` *and* [`streaming_retire_lde`] is enabled, the
+    /// log-derived tables (those for which the provider reports `is_retired`) are
+    /// built on demand from the provider at each phase (main commit, aux build,
+    /// reconstruct) and dropped afterwards, so the resident traces in
+    /// `air_trace_pairs` for those indices may be empty placeholders. Tables the
+    /// provider does not retire (preprocessed, PAGE) use their resident traces.
+    fn multi_prove_with_provider(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        provider: Option<&dyn TraceProvider<Field, FieldExtension>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
@@ -1487,8 +1589,22 @@ pub trait IsStarkProver<
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
-        for (air, trace, _pub_inputs) in &*air_trace_pairs {
-            let trace_length = trace.num_rows();
+        // Streaming "retire-traces" is active only when a provider is supplied
+        // AND the streaming env flag is on. Off-path (`provider == None`) every
+        // expression below collapses to today's resident-trace behaviour.
+        let stream_traces = provider.is_some() && streaming_retire_lde();
+        // Returns the main-trace row count for table `idx`, sourced from the
+        // provider for retired tables (whose resident placeholder is empty) and
+        // from the resident trace otherwise.
+        let rows_of = |idx: usize| -> usize {
+            match provider {
+                Some(p) if stream_traces && p.is_retired(idx) => p.num_rows(idx),
+                _ => air_trace_pairs[idx].1.num_rows(),
+            }
+        };
+
+        for (idx, (air, _trace, _pub_inputs)) in air_trace_pairs.iter().enumerate() {
+            let trace_length = rows_of(idx);
             let blowup = air.options().blowup_factor as usize;
             let coset_offset = air.options().coset_offset;
             let key = (trace_length, blowup, coset_offset);
@@ -1568,11 +1684,24 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
+                    // Retire-traces: build this table's main trace on demand and
+                    // commit it, then drop it at the end of this closure. Other
+                    // tables (preprocessed/PAGE, or non-streaming) use the
+                    // resident trace borrowed above.
+                    let retired_main;
+                    let main_trace: &TraceTable<Field, FieldExtension> =
+                        if stream_traces && provider.is_some_and(|p| p.is_retired(idx)) {
+                            retired_main = provider.unwrap().build_main(idx);
+                            &retired_main
+                        } else {
+                            trace
+                        };
+
                     let precomputed = air
                         .is_preprocessed()
                         .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
                     Self::commit_main_trace(
-                        *trace,
+                        main_trace,
                         domain,
                         twiddles,
                         precomputed,
@@ -1633,13 +1762,18 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
+        // For retired tables the aux trace is built on demand inside the Pass-2
+        // loop (so it can be committed and dropped per table); their bus inputs
+        // are filled there. Non-retired tables build aux into their resident
+        // trace here as before.
         #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
+        let aux_iter = air_trace_pairs.par_iter_mut().enumerate();
         #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
+        let aux_iter = air_trace_pairs.iter_mut().enumerate();
+        let mut bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+            .map(|(idx, (air, trace, _))| {
+                let retired = stream_traces && provider.is_some_and(|p| p.is_retired(idx));
+                if air.has_aux_trace() && !retired {
                     air.build_auxiliary_trace(*trace, &lookup_challenges)
                 } else {
                     None
@@ -1721,6 +1855,25 @@ pub trait IsStarkProver<
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
+                    // Retire-traces: rebuild this table's main trace, build its
+                    // aux on top (the resident trace is an empty placeholder), and
+                    // capture the bus inputs that Pass 1 skipped. The owned trace
+                    // (main+aux) is dropped at the end of this closure. Other
+                    // tables read aux columns from their resident trace.
+                    let retired = stream_traces && provider.is_some_and(|p| p.is_retired(idx));
+                    let mut retired_bus: Option<BusPublicInputs<FieldExtension>> = None;
+                    let retired_trace;
+                    let trace: &TraceTable<Field, FieldExtension> = if retired {
+                        let mut t = provider.unwrap().build_main(idx);
+                        if air.has_aux_trace() {
+                            retired_bus = air.build_auxiliary_trace(&mut t, &lookup_challenges);
+                        }
+                        retired_trace = t;
+                        &retired_trace
+                    } else {
+                        trace
+                    };
+
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
                         let mut columns = trace.extract_columns_aux(lde_size);
@@ -1751,18 +1904,22 @@ pub trait IsStarkProver<
                                 ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
                             })?;
                         }
-                        Ok((Some(TableCommit::plain(tree, root, stream_lde)), columns))
+                        Ok((Some(TableCommit::plain(tree, root, stream_lde)), columns, retired_bus))
                     } else {
-                        Ok((None, Vec::new()))
+                        Ok((None, Vec::new(), retired_bus))
                     }
                 })
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_commit, cached_aux) = result?;
+                let (aux_commit, cached_aux, retired_bus) = result?;
                 if let Some(ref c) = aux_commit {
                     table_transcripts[chunk_start + j].append_bytes(&c.root);
+                }
+                // Retired tables compute their bus inputs here (Pass 1 skipped them).
+                if retired_bus.is_some() {
+                    bus_inputs_vec[chunk_start + j] = retired_bus;
                 }
                 aux_results.push((aux_commit, if stream_lde { Vec::new() } else { cached_aux }));
             }
@@ -1799,7 +1956,15 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "debug-checks")]
-        Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
+        Self::run_debug_checks(
+            &air_trace_pairs,
+            &commitments,
+            &domains,
+            &twiddle_caches,
+            provider,
+            stream_traces,
+            &lookup_challenges,
+        );
 
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
@@ -1861,12 +2026,29 @@ pub trait IsStarkProver<
                     let table_start = Instant::now();
 
                     // Build Round1 from the cached LDE (consumed by value), or, in
-                    // streaming retire-LDE mode, recompute it from the resident trace.
+                    // streaming retire-LDE mode, recompute it from the trace. The
+                    // trace is the resident one unless this table is retired, in
+                    // which case it is rebuilt on demand (main + aux) and dropped
+                    // after the reconstruct. Determinism (C.2a) makes this trace
+                    // byte-identical to the Phase A/C builds, so the LDE matches.
                     let round_1_result = if stream_lde {
                         let _ = lde; // empty placeholder when streaming
+                        let retired =
+                            stream_traces && provider.is_some_and(|p| p.is_retired(idx));
+                        let retired_trace;
+                        let recon_trace: &TraceTable<Field, FieldExtension> = if retired {
+                            let mut t = provider.unwrap().build_main(idx);
+                            if air.has_aux_trace() {
+                                air.build_auxiliary_trace(&mut t, &lookup_challenges);
+                            }
+                            retired_trace = t;
+                            &retired_trace
+                        } else {
+                            trace
+                        };
                         Self::reconstruct_round1(
                             *air,
-                            *trace,
+                            recon_trace,
                             domain,
                             commitment,
                             &twiddle_caches[idx],

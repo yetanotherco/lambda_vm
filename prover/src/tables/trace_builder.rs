@@ -2242,6 +2242,107 @@ impl RoutedTraceData<'_> {
             ),
         }
     }
+
+    /// Per-`TableKind` `max_rows` chunk size.
+    fn max_rows_for(which: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+        match which {
+            TableKind::Cpu => max_rows.cpu,
+            TableKind::Lt => max_rows.lt,
+            TableKind::Shift => max_rows.shift,
+            TableKind::Memw => max_rows.memw,
+            TableKind::MemwAligned => max_rows.memw_aligned,
+            TableKind::Load => max_rows.load,
+            TableKind::Mul => max_rows.mul,
+            TableKind::Dvrm => max_rows.dvrm,
+            TableKind::Branch => max_rows.branch,
+            TableKind::MemwRegister => max_rows.memw_register,
+        }
+    }
+
+    /// Number of ops routed to this `TableKind` (drives the chunk count).
+    fn ops_len(&self, which: TableKind) -> usize {
+        match which {
+            TableKind::Cpu => self.cpu_ops.len(),
+            TableKind::Lt => self.lt_ops.len(),
+            TableKind::Shift => self.shift_ops.len(),
+            TableKind::Memw => self.memw_ops.len(),
+            TableKind::MemwAligned => self.memw_aligned_ops.len(),
+            TableKind::Load => self.load_ops.len(),
+            TableKind::Mul => self.mul_ops.len(),
+            TableKind::Dvrm => self.dvrm_ops.len(),
+            TableKind::Branch => self.branch_ops.len(),
+            TableKind::MemwRegister => self.memw_register_ops.len(),
+        }
+    }
+
+    /// Number of `max_rows`-sized chunks this `TableKind` splits into. Matches
+    /// [`build_table`]'s chunking: an empty op-list still yields one chunk.
+    fn num_chunks(&self, which: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+        let len = self.ops_len(which);
+        if len == 0 {
+            1
+        } else {
+            len.div_ceil(Self::max_rows_for(which, max_rows))
+        }
+    }
+
+    /// Build the trace table for a SINGLE chunk of one log-derived table.
+    /// Byte-identical to `build_table(which, ..)[chunk_idx]`, but rebuilds only
+    /// the requested chunk so retired-trace mode never materializes a whole
+    /// table at once.
+    fn build_chunk(
+        &self,
+        which: TableKind,
+        chunk_idx: usize,
+        max_rows: &super::MaxRowsConfig,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
+        let mr = Self::max_rows_for(which, max_rows);
+        match which {
+            TableKind::Cpu => chunk_one(
+                &self.cpu_ops, mr, chunk_idx, cpu::generate_cpu_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Lt => chunk_one(
+                &self.lt_ops, mr, chunk_idx, lt::generate_lt_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Shift => chunk_one(
+                &self.shift_ops, mr, chunk_idx, shift::generate_shift_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Memw => chunk_one(
+                &self.memw_ops, mr, chunk_idx, memw::generate_memw_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::MemwAligned => chunk_one(
+                &self.memw_aligned_ops, mr, chunk_idx,
+                memw_aligned::generate_memw_aligned_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Load => chunk_one(
+                &self.load_ops, mr, chunk_idx, load::generate_load_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Mul => chunk_one(
+                &self.mul_ops, mr, chunk_idx, mul::generate_mul_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Dvrm => chunk_one(
+                &self.dvrm_ops, mr, chunk_idx, dvrm::generate_dvrm_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::Branch => chunk_one(
+                &self.branch_ops, mr, chunk_idx, branch::generate_branch_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+            TableKind::MemwRegister => chunk_one(
+                &self.memw_register_ops, mr, chunk_idx,
+                memw_register::generate_memw_register_trace,
+                #[cfg(feature = "disk-spill")] storage_mode,
+            ),
+        }
+    }
 }
 
 /// PHASES 3-4: from collected/routed ops, finish all cross-table coupling
@@ -2384,6 +2485,35 @@ fn chunk_and_generate<T>(
         tables.push(t);
     }
     Ok(tables)
+}
+
+/// Build the trace table for a single `chunk_idx` of an op-list, matching the
+/// chunking and padding `chunk_and_generate` performs. Used by retired-trace
+/// mode to rebuild exactly one chunk on demand.
+fn chunk_one<T>(
+    ops: &[T],
+    max_rows: usize,
+    chunk_idx: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
+    let chunk: &[T] = if ops.is_empty() {
+        debug_assert_eq!(chunk_idx, 0, "empty table has exactly one chunk");
+        &[]
+    } else {
+        let start = chunk_idx * max_rows;
+        let end = (start + max_rows).min(ops.len());
+        &ops[start..end]
+    };
+    #[allow(unused_mut)]
+    let mut t = generate(chunk);
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        t.main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+    }
+    Ok(t)
 }
 
 /// Phase 2: Collect and route all operations from CPU ops.
@@ -2597,6 +2727,60 @@ fn build_traces(
     )?;
 
     // Fixed-size / preprocessed tables assembled directly from routed data.
+    let pre = build_preprocessed_tables(
+        &routed,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+
+    Ok(Traces {
+        cpus,
+        bitwise: pre.bitwise,
+        lts,
+        shifts,
+        memws,
+        memw_aligneds,
+        loads,
+        decode: pre.decode,
+        muls,
+        dvrms,
+        pages: pre.pages,
+        page_configs: pre.page_configs,
+        register: pre.register,
+        public_output_bytes: routed.public_output_bytes.clone(),
+        branches,
+        halt: pre.halt,
+        commit: pre.commit,
+        keccak: pre.keccak,
+        keccak_rnd: pre.keccak_rnd,
+        keccak_rc: pre.keccak_rc,
+        memw_registers,
+    })
+}
+
+/// Preprocessed / fixed-size / per-page tables assembled from a
+/// [`RoutedTraceData`]. These are program-independent or derived only from the
+/// (compact) routed intermediate, so they stay resident even in retired-trace
+/// mode (only the chunked log-derived tables are retired).
+struct PreprocessedTables {
+    bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode: TraceTable<GoldilocksField, GoldilocksExtension>,
+    commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+    keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
+    keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+    keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    page_configs: Vec<PageConfig>,
+    register: TraceTable<GoldilocksField, GoldilocksExtension>,
+    halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+}
+
+/// Build all preprocessed / fixed-size / per-page tables from routed data.
+/// Byte-identical to the inline assembly the monolithic [`build_traces`] used.
+fn build_preprocessed_tables(
+    routed: &RoutedTraceData<'_>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<PreprocessedTables, Error> {
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &routed.bitwise_ops);
 
@@ -2709,29 +2893,271 @@ fn build_traces(
         }
     }
 
-    Ok(Traces {
-        cpus,
+    Ok(PreprocessedTables {
         bitwise,
-        lts,
-        shifts,
-        memws,
-        memw_aligneds,
-        loads,
         decode,
-        muls,
-        dvrms,
-        pages,
-        page_configs,
-        register: register_trace,
-        public_output_bytes: routed.public_output_bytes.clone(),
-        branches,
-        halt: halt_trace,
         commit: commit_trace,
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
-        memw_registers,
+        pages,
+        page_configs,
+        register: register_trace,
+        halt: halt_trace,
     })
+}
+
+/// Run-length encode the non-ELF (zero-init) page bases of `configs` into
+/// `(base, count)` runtime page ranges. Shared by [`Traces`] and
+/// [`StreamingTraces`].
+fn runtime_page_ranges_from_configs(configs: &[PageConfig]) -> Vec<crate::RuntimePageRange> {
+    let page_size = page::DEFAULT_PAGE_SIZE as u64;
+
+    let runtime_bases: Vec<u64> = configs
+        .iter()
+        .filter(|config| config.init_values.is_none())
+        .map(|config| config.page_base)
+        .collect();
+
+    let mut ranges = Vec::new();
+    if runtime_bases.is_empty() {
+        return ranges;
+    }
+
+    let mut start = runtime_bases[0];
+    let mut count = 1u64;
+
+    for &base in &runtime_bases[1..] {
+        if base == start + count * page_size {
+            count += 1;
+        } else {
+            ranges.push(crate::RuntimePageRange { base: start, count });
+            start = base;
+            count = 1;
+        }
+    }
+    ranges.push(crate::RuntimePageRange { base: start, count });
+
+    ranges
+}
+
+/// One slot in the prover's air ordering: a resident (preprocessed/PAGE) table
+/// or a retired log-derived chunk built on demand from the routed intermediate.
+#[derive(Clone, Copy)]
+enum StreamingSlot {
+    /// Resident table — built once, lives in the air-ordered resident-trace Vec.
+    /// Never built on demand; the prover uses the resident trace borrowed in
+    /// `air_trace_pairs`.
+    Resident,
+    /// Retired log-derived table chunk `(kind, chunk_idx)`, built on demand.
+    Retired(TableKind, usize),
+}
+
+/// The on-demand half of streaming "retire-traces" mode (C.2b): the routed
+/// intermediate plus the air-order slot map. Implements
+/// [`stark::prover::TraceProvider`] so the prover can (re)build each retired
+/// log-derived chunk on demand and drop it. Owns `routed` (lifetime `'a`) but no
+/// materialized log-derived traces.
+pub struct StreamingProvider<'a> {
+    routed: RoutedTraceData<'a>,
+    max_rows: super::MaxRowsConfig,
+    /// Air-order slot map (length = number of AIRs).
+    slots: Vec<StreamingSlot>,
+}
+
+/// The resident half of streaming mode: the air-ordered trace Vec (real
+/// preprocessed / PAGE traces at resident slots, empty placeholders at retired
+/// slots) plus the derived metadata the proving entry point needs. The prover
+/// borrows `traces` mutably to form `air_trace_pairs`.
+pub struct StreamingResident {
+    /// Air-ordered traces: real at resident slots, empty placeholder otherwise.
+    pub traces: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub table_counts: crate::TableCounts,
+    pub page_configs: Vec<PageConfig>,
+    pub public_output_bytes: Vec<u8>,
+}
+
+impl StreamingResident {
+    pub fn runtime_page_ranges(&self) -> Vec<crate::RuntimePageRange> {
+        runtime_page_ranges_from_configs(&self.page_configs)
+    }
+}
+
+/// Run PHASES 0-4 (routing) and build the preprocessed/PAGE tables, then return
+/// the split (`provider`, `resident`) for streaming "retire-traces" proving.
+/// Mirrors [`Traces::from_elf_and_logs`] up to (but not including) the PHASE-5
+/// fill of the chunked log-derived tables.
+///
+/// The air-order slot map MUST match `VmAirs::air_trace_pairs`: 8 preprocessed
+/// tables, then cpus, lts, shifts, memws, memw_aligneds, loads, muls, dvrms,
+/// branches, pages, memw_registers (PAGE is resident, not retired).
+pub fn route_for_streaming<'a>(
+    elf: &'a Elf,
+    logs: &[Log],
+    max_rows: &super::MaxRowsConfig,
+    private_input: &'a [u8],
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<(StreamingProvider<'a>, StreamingResident), Error> {
+    let instructions = decode::instructions_from_elf(elf)
+        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+    let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+
+    let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+
+    let mut memory_state = MemoryState::from_elf(elf);
+    memory_state.add_private_input(private_input);
+    let mut register_state = RegisterState::new(elf.entry_point);
+    let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
+        collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+    let ops = collect_all_ops(
+        cpu_ops,
+        memw_ops,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        &mut register_state,
+    );
+
+    let routed = route(
+        ops,
+        Some(elf),
+        memory_state,
+        elf.entry_point,
+        decode_trace,
+        decode_pc_to_row,
+        register_state,
+        max_rows,
+        private_input,
+    )?;
+
+    let pre = build_preprocessed_tables(
+        &routed,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+
+    let public_output_bytes = routed.public_output_bytes.clone();
+
+    // Per-kind chunk counts (drive table_counts and the slot ranges).
+    let count = |k: TableKind| routed.num_chunks(k, max_rows);
+    let table_counts = crate::TableCounts {
+        cpu: count(TableKind::Cpu),
+        lt: count(TableKind::Lt),
+        shift: count(TableKind::Shift),
+        memw: count(TableKind::Memw),
+        memw_aligned: count(TableKind::MemwAligned),
+        load: count(TableKind::Load),
+        mul: count(TableKind::Mul),
+        dvrm: count(TableKind::Dvrm),
+        branch: count(TableKind::Branch),
+        memw_register: count(TableKind::MemwRegister),
+    };
+
+    // Destructure the preprocessed tables; they move into the resident Vec in
+    // air order, interleaved with empty placeholders for the retired chunks.
+    let PreprocessedTables {
+        bitwise,
+        decode,
+        commit,
+        keccak,
+        keccak_rnd,
+        keccak_rc,
+        pages,
+        page_configs,
+        register,
+        halt,
+    } = pre;
+
+    let mut slots: Vec<StreamingSlot> = Vec::new();
+    let mut traces: Vec<TraceTable<GoldilocksField, GoldilocksExtension>> = Vec::new();
+
+    // 8 preprocessed tables, in air order (bitwise, decode, halt, commit,
+    // keccak, keccak_rnd, keccak_rc, register) — all resident.
+    for t in [bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register] {
+        slots.push(StreamingSlot::Resident);
+        traces.push(t);
+    }
+
+    // Helper: append all retired chunks of a kind (empty placeholder traces).
+    let push_kind = |slots: &mut Vec<StreamingSlot>,
+                         traces: &mut Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+                         kind: TableKind| {
+        for chunk in 0..count(kind) {
+            slots.push(StreamingSlot::Retired(kind, chunk));
+            traces.push(TraceTable::new_main(Vec::new(), 1, 1));
+        }
+    };
+    push_kind(&mut slots, &mut traces, TableKind::Cpu);
+    push_kind(&mut slots, &mut traces, TableKind::Lt);
+    push_kind(&mut slots, &mut traces, TableKind::Shift);
+    push_kind(&mut slots, &mut traces, TableKind::Memw);
+    push_kind(&mut slots, &mut traces, TableKind::MemwAligned);
+    push_kind(&mut slots, &mut traces, TableKind::Load);
+    push_kind(&mut slots, &mut traces, TableKind::Mul);
+    push_kind(&mut slots, &mut traces, TableKind::Dvrm);
+    push_kind(&mut slots, &mut traces, TableKind::Branch);
+    // PAGE tables (resident, one slot per page).
+    for page in pages {
+        slots.push(StreamingSlot::Resident);
+        traces.push(page);
+    }
+    push_kind(&mut slots, &mut traces, TableKind::MemwRegister);
+
+    let provider = StreamingProvider {
+        routed,
+        max_rows: max_rows.clone(),
+        slots,
+    };
+    let resident = StreamingResident {
+        traces,
+        table_counts,
+        page_configs,
+        public_output_bytes,
+    };
+    Ok((provider, resident))
+}
+
+impl stark::prover::TraceProvider<GoldilocksField, GoldilocksExtension>
+    for StreamingProvider<'_>
+{
+    fn is_retired(&self, idx: usize) -> bool {
+        matches!(self.slots[idx], StreamingSlot::Retired(..))
+    }
+
+    fn num_rows(&self, idx: usize) -> usize {
+        match self.slots[idx] {
+            // Several log-derived tables (LT/MUL/DVRM/BRANCH) pad to the count of
+            // their *deduplicated* ops, which a raw op-count cannot predict, so
+            // build the chunk to read its true padded row count (then drop it).
+            // One extra transient chunk build; cheap relative to the LDE work.
+            StreamingSlot::Retired(..) => self.build_main(idx).num_rows(),
+            // For resident slots the prover reads num_rows from the resident
+            // trace directly; this path is unused but kept total.
+            StreamingSlot::Resident => 0,
+        }
+    }
+
+    fn build_main(&self, idx: usize) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        match self.slots[idx] {
+            StreamingSlot::Retired(kind, chunk) => self
+                .routed
+                .build_chunk(
+                    kind,
+                    chunk,
+                    &self.max_rows,
+                    #[cfg(feature = "disk-spill")]
+                    StorageMode::Ram,
+                )
+                .expect("retired chunk build is infallible in RAM mode"),
+            StreamingSlot::Resident => {
+                unreachable!("build_main called on a resident (non-retired) slot {idx}")
+            }
+        }
+    }
 }
 
 /// Padded row count after chunking.
@@ -3257,37 +3683,7 @@ impl Traces {
     /// Runtime (non-ELF) pages are identified by `init_values == None`
     /// (zero-init), avoiding a redundant ELF segment scan.
     pub fn runtime_page_ranges(&self) -> Vec<crate::RuntimePageRange> {
-        let page_size = page::DEFAULT_PAGE_SIZE as u64;
-
-        // Collect sorted non-ELF page bases (zero-init pages are runtime pages)
-        let runtime_bases: Vec<u64> = self
-            .page_configs
-            .iter()
-            .filter(|config| config.init_values.is_none())
-            .map(|config| config.page_base)
-            .collect();
-
-        // Run-length encode contiguous pages into (base, count) ranges
-        let mut ranges = Vec::new();
-        if runtime_bases.is_empty() {
-            return ranges;
-        }
-
-        let mut start = runtime_bases[0];
-        let mut count = 1u64;
-
-        for &base in &runtime_bases[1..] {
-            if base == start + count * page_size {
-                count += 1;
-            } else {
-                ranges.push(crate::RuntimePageRange { base: start, count });
-                start = base;
-                count = 1;
-            }
-        }
-        ranges.push(crate::RuntimePageRange { base: start, count });
-
-        ranges
+        runtime_page_ranges_from_configs(&self.page_configs)
     }
 
     /// Generates all traces from ELF and execution logs using phased collection.

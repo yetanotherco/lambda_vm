@@ -272,6 +272,29 @@ impl VmAirs {
         pairs
     }
 
+    /// Build `(air, trace, public_inputs)` triples by pairing the AIRs (in
+    /// [`Self::air_refs`] order) with an air-ordered trace slice.
+    ///
+    /// Used by streaming "retire-traces" mode, where the trace slice holds the
+    /// resident preprocessed/PAGE traces and empty placeholders for the retired
+    /// log-derived chunks (the prover sources those from a `TraceProvider`). The
+    /// AIR order MUST match the slice order produced by `route_for_streaming`.
+    pub fn air_trace_pairs_from_slice<'a>(
+        &'a self,
+        traces: &'a mut [stark::trace::TraceTable<F, E>],
+    ) -> Vec<AirTracePair<'a>> {
+        let airs = self.air_refs();
+        debug_assert_eq!(
+            airs.len(),
+            traces.len(),
+            "AIR count must match the air-ordered trace slice length"
+        );
+        airs.into_iter()
+            .zip(traces.iter_mut())
+            .map(|(air, trace)| (air, trace, &()))
+            .collect()
+    }
+
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
@@ -616,93 +639,188 @@ pub fn prove_with_options_and_inputs(
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    debug_assert_eq!(
-        traces.public_output_bytes, result.return_values.memory_values,
-        "public output diverged between executor view and trace reconstruction"
-    );
-    drop(result);
+    let stream_traces = stark::prover::streaming_retire_lde();
 
-    #[cfg(feature = "instruments")]
-    let trace_build_elapsed = phase_start.elapsed();
-    #[cfg(feature = "instruments")]
-    let heap_after_trace = stark::instruments::heap_bytes();
-
-    // Phase 3: AIR construction
-    #[cfg(feature = "instruments")]
-    let phase_start = std::time::Instant::now();
-
-    let table_counts = traces.table_counts();
-    let airs = VmAirs::new(
-        &program,
-        proof_options,
-        false,
-        &traces.page_configs,
-        &table_counts,
-    );
-
-    #[cfg(feature = "instruments")]
-    let air_elapsed = phase_start.elapsed();
-    #[cfg(feature = "instruments")]
-    let heap_after_air = stark::instruments::heap_bytes();
-
-    let runtime_page_ranges = traces.runtime_page_ranges();
-
-    let num_private_input_pages = traces
-        .page_configs
-        .iter()
-        .filter(|c| c.is_private_input)
-        .count();
-
-    // Bind the full statement (program, public output, table layout) into the
-    // Fiat-Shamir transcript so every challenge depends on it.
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
-        &mut transcript,
-        elf_bytes,
-        &traces.public_output_bytes,
-        &table_counts,
-        num_private_input_pages,
-        &runtime_page_ranges,
-    );
-
-    // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
-        &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
-
-    #[cfg(feature = "instruments")]
-    {
-        instruments::print_report(
-            execute_elapsed,
-            trace_build_elapsed,
-            air_elapsed,
-            total_start.elapsed(),
-            &stark::instruments::ProveHeapProfile {
-                before: heap_before,
-                after_execute: heap_after_execute,
-                after_trace_build: heap_after_trace,
-                after_air: heap_after_air,
-            },
+    // Streaming "retire-traces" mode: route into a compact intermediate and
+    // build each log-derived table chunk on demand during proving, instead of
+    // materializing a full resident `Traces`. The proof is byte-identical to the
+    // non-streaming path (deterministic trace build, C.2a).
+    let proof;
+    let runtime_page_ranges;
+    let table_counts;
+    let public_output_bytes;
+    let num_private_input_pages;
+    if stream_traces {
+        let (provider, mut resident) = crate::tables::trace_builder::route_for_streaming(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        debug_assert_eq!(
+            resident.public_output_bytes, result.return_values.memory_values,
+            "public output diverged between executor view and trace reconstruction"
         );
+        drop(result);
+
+        #[cfg(feature = "instruments")]
+        let trace_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        let heap_after_trace = stark::instruments::heap_bytes();
+
+        // Phase 3: AIR construction
+        #[cfg(feature = "instruments")]
+        let phase_start = std::time::Instant::now();
+
+        table_counts = resident.table_counts.clone();
+        let airs = VmAirs::new(
+            &program,
+            proof_options,
+            false,
+            &resident.page_configs,
+            &table_counts,
+        );
+
+        #[cfg(feature = "instruments")]
+        let air_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        let heap_after_air = stark::instruments::heap_bytes();
+
+        runtime_page_ranges = resident.runtime_page_ranges();
+        num_private_input_pages = resident
+            .page_configs
+            .iter()
+            .filter(|c| c.is_private_input)
+            .count();
+        public_output_bytes = resident.public_output_bytes.clone();
+
+        let mut transcript = DefaultTranscript::<E>::new(&[]);
+        absorb_statement(
+            &mut transcript,
+            elf_bytes,
+            &public_output_bytes,
+            &table_counts,
+            num_private_input_pages,
+            &runtime_page_ranges,
+        );
+
+        // Phase 4: Prove (multi_prove with on-demand trace provider)
+        let pairs = airs.air_trace_pairs_from_slice(&mut resident.traces);
+        proof = Prover::multi_prove_with_provider(
+            pairs,
+            Some(&provider),
+            &mut transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+        #[cfg(feature = "instruments")]
+        {
+            instruments::print_report(
+                execute_elapsed,
+                trace_build_elapsed,
+                air_elapsed,
+                total_start.elapsed(),
+                &stark::instruments::ProveHeapProfile {
+                    before: heap_before,
+                    after_execute: heap_after_execute,
+                    after_trace_build: heap_after_trace,
+                    after_air: heap_after_air,
+                },
+            );
+        }
+    } else {
+        let mut traces = Traces::from_elf_and_logs(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        debug_assert_eq!(
+            traces.public_output_bytes, result.return_values.memory_values,
+            "public output diverged between executor view and trace reconstruction"
+        );
+        drop(result);
+
+        #[cfg(feature = "instruments")]
+        let trace_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        let heap_after_trace = stark::instruments::heap_bytes();
+
+        // Phase 3: AIR construction
+        #[cfg(feature = "instruments")]
+        let phase_start = std::time::Instant::now();
+
+        table_counts = traces.table_counts();
+        let airs = VmAirs::new(
+            &program,
+            proof_options,
+            false,
+            &traces.page_configs,
+            &table_counts,
+        );
+
+        #[cfg(feature = "instruments")]
+        let air_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        let heap_after_air = stark::instruments::heap_bytes();
+
+        runtime_page_ranges = traces.runtime_page_ranges();
+        num_private_input_pages = traces
+            .page_configs
+            .iter()
+            .filter(|c| c.is_private_input)
+            .count();
+        public_output_bytes = traces.public_output_bytes.clone();
+
+        // Bind the full statement (program, public output, table layout) into the
+        // Fiat-Shamir transcript so every challenge depends on it.
+        let mut transcript = DefaultTranscript::<E>::new(&[]);
+        absorb_statement(
+            &mut transcript,
+            elf_bytes,
+            &public_output_bytes,
+            &table_counts,
+            num_private_input_pages,
+            &runtime_page_ranges,
+        );
+
+        // Phase 4: Prove (multi_prove)
+        proof = Prover::multi_prove(
+            airs.air_trace_pairs(&mut traces),
+            &mut transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+        #[cfg(feature = "instruments")]
+        {
+            instruments::print_report(
+                execute_elapsed,
+                trace_build_elapsed,
+                air_elapsed,
+                total_start.elapsed(),
+                &stark::instruments::ProveHeapProfile {
+                    before: heap_before,
+                    after_execute: heap_after_execute,
+                    after_trace_build: heap_after_trace,
+                    after_air: heap_after_air,
+                },
+            );
+        }
     }
 
     Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
-        public_output: traces.public_output_bytes.clone(),
+        public_output: public_output_bytes,
         num_private_input_pages,
     })
 }
