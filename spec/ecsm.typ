@@ -223,3 +223,101 @@ The #ecdas chip is comprised of #nr_variables variables that are expressed using
 == Constraints
 
 #render_constraint_table(ecscalar_chip, config)
+
+= The "carry-technique"$trademark$ #footnote("this is not actually trademarked")
+To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
+- multiplications are performed limb-by-limb, 
+- a set of carry-limbs is used to exchange the underflow/overflow from one limb to another, and
+- the carry limbs are range constrained to ensure only one output value is possible.
+
+We now explore this carry-technique and provide some proofs.
+
+== Lemma 1
+Let $L in N$. We define
+$
+  r_i &:= sum_(j=1)^i (L-1)^2 = i(L-1)^2 &&#text("for") i >= 1,\
+  v_i &:= r_i + c_(i-1) mod L &&#text("for") i >= 1,\
+  c_i &:= L^(-1) (r_i + c_(i-1) - v_i) &&#text("for") i >= 1\, #text("and")\
+  c_0 &:= 0
+$
+It holds that $c_i = i(L - 1) - 1$.
+
+#emph("Proof:")
+For $i = 0$, we find that $r_1 = (L - 1)^2 = L(L - 2) + 1$, $v_1 = 1$ and 
+$
+c_1 = L^(-1) (L(L - 2) + 1 - 1) = L - 2 = (L-1) - 1
+$
+Suppose the statement to hold for arbitrary $i >= 1$, we show it also holds for $i+1$.
+We find that 
+$
+v_(i+1) 
+&= (i(L-1)^2 + (i-1)(L - 1) - 1) mod L\
+&= (i(L (L-2)+1) + (i-1)L - i) mod L\
+&= (i L (L-2) + (i-1)L) mod L\
+&= 0 mod L\
+$ 
+and subsequently that
+$
+c_(i+1)
+&= L^(-1) dot (i(L-1)^2 + (i-1)(L - 1) - 1)\
+&= L^(-1) dot (i L (L-2) + (i-1)L)\
+&= i(L-2) + i\
+&= i(L-1) - 1\
+$
+$qed$
+
+== Lemma 2
+Let $L in NN$.
+Furthermore, let $k in NN > 2$ be some starting width.
+Let
+$
+  r^((k))_i &:= sum_(j=1)^(k-i) (L-1)^2 = (k-i)(L-1)^2 &&#text("for") i in [1, k],\
+  v^((k))_i &:= r_i + c_(i-1) mod L &&#text("for") i >= 1,\
+  d^((k))_i &:= L^(-1) (r_i + c_(i-1) - v_i) &&#text("for") i >= 1\, #text("and")\
+  d^((k))_0 &:= k(L-1) - 1
+$
+For $i>=1$, it holds that $d^((k))_i = (k-i)(L-1)$.
+
+#emph("Proof:")
+For $i = 1$, we find that $r^((k))_1 = (k-1)(L - 1)^2$, 
+$
+v^((k))_1 
+&= (k-1)(L-1)^2 + k(L-1)-1 &&mod L\
+&= (k-1)(L^2 - 2L + 1) + k L - (k + 1) &&mod L\
+&= (k-1)(L^2 - 2L) + k L - 2 &&mod L\
+&= (k-1)(L^2 - L) + L - 2 &&mod L\
+&= L - 2 &&mod L\
+$ and 
+$
+d^((k))_1 
+&= L^(-1) ((k-1)(L-1)^2 + k(L-1) - 1 - (L-2))\
+&= L^(-1) ((k-1)(L^2 - 2L + 1)^2 + (k-1)(L-1))\
+&= L^(-1) (k-1)(L^2 - L)\
+&= (k-1)(L - 1)
+$
+Suppose the statement to hold for arbitrary $i >= 1$, we show it also holds for $i+1$.
+We find that 
+$
+v^((k))_(i+1) 
+&= (k-(i+1))(L-1)^2 + (k-i)(L-1) &&mod L\
+&= (k-i-1)(L^2 - 2L + 1) + (k-i-1)(L-1) + L-1 &&mod L\
+&= (k-i-1)(L^2 - L) + L-1 &&mod L\
+&= L-1 &&mod L\
+$ 
+and subsequently that
+$
+d^((k))_(i+1)
+&= L^(-1) dot ((k-(i+1))(L-1)^2 + (k-i)(L - 1) - (L-1))\
+&= L^(-1) dot ((k-(i+1))(L^2 - 2L + 1) + (k-(i+1))(L - 1))\
+&= L^(-1) dot (k-(i+1))(L^2 - L)\
+&= (k-(i+1))(L - 1)\
+$
+$qed$
+
+In particular, note that for shared $L>2$, it holds that
+$
+c_1 <= c_2 <= dots <= c_k = k(L-1) - 1 >= (k-1)(L-1) = d^((k))_1 >= dots >= d^((k))_k
+$
+Combining lemmas 1 and 2, we find that the multiplication of two numbers that are both represented using $k$ $b$-bit limbs will have an upper bound on the carry value equal to $k(2^b-1) - 1$.
+
+
