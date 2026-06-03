@@ -7,6 +7,7 @@
 pub mod barycentric;
 pub mod deep;
 pub mod device;
+pub mod fri;
 pub mod inverse;
 pub mod lde;
 pub mod merkle;
