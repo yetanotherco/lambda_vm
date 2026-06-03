@@ -107,7 +107,7 @@ const MASK_254: u64 = 254;
 /// A single BRANCH operation to be added to the trace.
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BranchOperation {
     /// Current program counter (64-bit)
     pub pc: u64,
@@ -166,7 +166,12 @@ pub fn generate_branch_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut unique_ops: Vec<_> = op_map.into_iter().collect();
+    // Deterministic row order: HashMap iteration order is randomized per
+    // instance, so sort by the canonical operation key. This makes repeated
+    // builds (e.g. streaming on-demand trace rebuild) produce byte-identical
+    // traces.
+    unique_ops.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 

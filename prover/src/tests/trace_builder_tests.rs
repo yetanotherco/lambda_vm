@@ -961,3 +961,68 @@ fn test_route_then_build_table_matches_monolithic() {
     assert!(mono.lts[0].main_table.height >= 2, "expected LT rows");
     assert!(mono.branches[0].main_table.height >= 1, "expected BRANCH rows");
 }
+
+/// Two `from_logs` builds of the same input must produce byte-identical traces.
+///
+/// Before the determinism fix, the LT/MUL/DVRM/BRANCH builders emitted
+/// `HashMap::into_iter()` order (randomized per instance), so two back-to-back
+/// builds disagreed on row order. They now sort the deduplicated ops by a
+/// canonical key, which is a prerequisite for streaming on-demand trace rebuild
+/// (Phase-A commit vs Rounds-2-4 rebuild must agree, or the committed root won't
+/// match the reconstructed trace).
+#[test]
+fn trace_build_is_deterministic_across_builds() {
+    type TT = stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >;
+
+    // Several DISTINCT LT and branch ops so each dedup'd `unique_ops` has
+    // multiple elements whose order previously varied per HashMap instance.
+    let mut logs = vec![
+        make_slt_log(0x1000, 5, 10, 1),
+        make_slt_log(0x1004, 200, 7, 0),
+        make_slt_log(0x1008, 42, 42, 0),
+        make_slt_log(0x100c, 1, 999, 1),
+        make_blt_log(0x1010, 3, 4, true),
+        make_blt_log(0x1014, 50, 9, false),
+        make_blt_log(0x1018, 77, 77, false),
+    ];
+    let mut instrs = vec![
+        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
+        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
+        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
+        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
+        Instruction::Branch { src1: 2, src2: 3, cond: Comparison::LessThan, offset: 8 },
+        Instruction::Branch { src1: 2, src2: 3, cond: Comparison::LessThan, offset: 8 },
+        Instruction::Branch { src1: 2, src2: 3, cond: Comparison::LessThan, offset: 8 },
+    ];
+    append_ecall(&mut logs, &mut instrs);
+    let instructions = make_instructions(&logs, &instrs);
+    let max_rows = Default::default();
+
+    let a = Traces::from_logs(&logs, instructions.clone(), &max_rows).unwrap();
+    let b = Traces::from_logs(&logs, instructions, &max_rows).unwrap();
+
+    fn flat(t: &TT) -> Vec<u64> {
+        t.main_table.data.iter().map(|fe| *fe.value()).collect()
+    }
+    fn eq(x: &[TT], y: &[TT], name: &str) {
+        assert_eq!(x.len(), y.len(), "{name}: chunk count differs across builds");
+        for (i, (s, m)) in x.iter().zip(y.iter()).enumerate() {
+            assert_eq!(
+                flat(s),
+                flat(m),
+                "{name} chunk {i}: trace data differs across builds (non-deterministic order)"
+            );
+        }
+    }
+    eq(&a.lts, &b.lts, "LT");
+    eq(&a.muls, &b.muls, "MUL");
+    eq(&a.dvrms, &b.dvrms, "DVRM");
+    eq(&a.branches, &b.branches, "BRANCH");
+    eq(&a.cpus, &b.cpus, "CPU");
+    eq(&a.memws, &b.memws, "MEMW");
+    eq(&a.shifts, &b.shifts, "SHIFT");
+    eq(&a.loads, &b.loads, "LOAD");
+}

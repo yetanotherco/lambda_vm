@@ -156,7 +156,7 @@ const SIGN_FILL: u64 = 0xFFFF;
 /// A single DVRM operation to be added to the trace.
 ///
 /// Derives Hash and Eq for HashMap-based deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DvrmOperation {
     /// Numerator (64-bit)
     pub n: u64,
@@ -299,7 +299,12 @@ pub fn generate_dvrm_trace(
         }
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut unique_ops: Vec<_> = op_map.into_iter().collect();
+    // Deterministic row order: HashMap iteration order is randomized per
+    // instance, so sort by the canonical operation key. This makes repeated
+    // builds (e.g. streaming on-demand trace rebuild) produce byte-identical
+    // traces.
+    unique_ops.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
