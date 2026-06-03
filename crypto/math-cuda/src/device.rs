@@ -94,6 +94,7 @@ const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
 const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
 const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
 const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
+const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -150,6 +151,16 @@ pub struct Backend {
     pub barycentric_base_batched_strided: CudaFunction,
     pub barycentric_ext3_batched_strided: CudaFunction,
 
+    // inverse.ptx
+    pub compute_denoms_ext3: CudaFunction,
+    pub chunk_prefix_scan_ext3: CudaFunction,
+    pub exclusive_scan_of_totals_ext3: CudaFunction,
+    pub apply_scan_offsets_ext3: CudaFunction,
+    pub chunk_suffix_scan_ext3: CudaFunction,
+    pub exclusive_reverse_scan_of_totals_ext3: CudaFunction,
+    pub apply_reverse_scan_offsets_ext3: CudaFunction,
+    pub batch_inverse_combine_ext3: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -168,6 +179,7 @@ impl Backend {
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
         let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
+        let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -226,6 +238,17 @@ impl Backend {
                 .load_function("barycentric_base_batched_strided")?,
             barycentric_ext3_batched_strided: bary
                 .load_function("barycentric_ext3_batched_strided")?,
+            compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
+            chunk_prefix_scan_ext3: inverse.load_function("chunk_prefix_scan_ext3")?,
+            exclusive_scan_of_totals_ext3: inverse
+                .load_function("exclusive_scan_of_totals_ext3")?,
+            apply_scan_offsets_ext3: inverse.load_function("apply_scan_offsets_ext3")?,
+            chunk_suffix_scan_ext3: inverse.load_function("chunk_suffix_scan_ext3")?,
+            exclusive_reverse_scan_of_totals_ext3: inverse
+                .load_function("exclusive_reverse_scan_of_totals_ext3")?,
+            apply_reverse_scan_offsets_ext3: inverse
+                .load_function("apply_reverse_scan_offsets_ext3")?,
+            batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
