@@ -2052,6 +2052,22 @@ pub struct Traces {
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
+/// TEST ONLY: per-table chunk Vecs produced by [`Traces::chunked_tables_via_route`],
+/// in the same field order as the log-derived tables of [`Traces`].
+#[cfg(test)]
+pub(crate) struct ChunkedTablesViaRoute {
+    pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub lts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub shifts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub memws: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub memw_aligneds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub muls: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub dvrms: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+}
+
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
 /// Phases 3-5 (LT extension, bitwise, trace generation).
 struct CollectedOps {
@@ -2070,9 +2086,280 @@ struct CollectedOps {
     keccak_ops: Vec<KeccakOperation>,
 }
 
+/// Fully-routed intermediate produced by [`route`] (PHASES 1-4). Holds every
+/// piece of state that the PHASE-5 per-table fill consumes, so a single table's
+/// trace can be built on demand via [`build_table`] without re-running routing.
+///
+/// All cross-table coupling (op routing in PHASES 1-2, MEMW->LT extension in
+/// PHASE 3, and the accumulated bitwise lookup multiplicities in PHASE 4) is
+/// fully resolved before this struct is returned. In particular `lt_ops` and
+/// `bitwise_ops` here are the FINAL lists: every table's contribution to the
+/// shared bitwise multiplicities has already been folded in, so any per-table
+/// fill that reads them (the BITWISE table itself) sees the complete counts.
+///
+/// `elf`, `memory_state` and `private_input` are retained only so the PAGE
+/// table fill can be performed per-table identically to the monolithic build.
+struct RoutedTraceData<'a> {
+    // --- routed op-lists (PHASE 5 inputs, all extensions applied) ---
+    cpu_ops: Vec<CpuOperation>,
+    memw_ops: Vec<MemwOperation>,
+    memw_aligned_ops: Vec<MemwOperation>,
+    memw_register_ops: Vec<MemwOperation>,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    /// Final accumulated bitwise lookups from every table (incl. padding).
+    bitwise_ops: Vec<BitwiseOperation>,
+    branch_ops: Vec<BranchOperation>,
+    mul_ops: Vec<(MulOperation, bool)>,
+    dvrm_ops: Vec<(DvrmOperation, bool)>,
+    commit_ops: Vec<CommitOperation>,
+    keccak_ops: Vec<KeccakOperation>,
+
+    // --- derived scalars / preprocessed inputs PHASE 5 consumes ---
+    /// Total CPU padding rows across all CPU chunks (drives padding lookups).
+    num_padding_rows: usize,
+    /// Timestamp of the final ECALL (HALT) instruction.
+    halt_timestamp: u64,
+    /// Committed public output bytes recovered during routing.
+    public_output_bytes: Vec<u8>,
+    /// DECODE trace (program-derived) and its pc->row index.
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    /// Finalized register state map for the REGISTER table.
+    register_final_state: FinalRegisterStateMap,
+    entry_point: u64,
+
+    // --- borrowed inputs needed only by the PAGE table fill ---
+    elf: Option<&'a Elf>,
+    memory_state: MemoryState,
+    private_input: &'a [u8],
+}
+
+/// Selector for the log-derived, chunked execution tables built in PHASE 5.
+///
+/// Ordering matches the table ordering used by the prover (see `prover/src/lib.rs`):
+/// CPU, LT, SHIFT, MEMW, MEMW_A, LOAD, MUL, DVRM, BRANCH, MEMW_R.
+///
+/// Program-independent / preprocessed tables (BITWISE 2^20, DECODE, PAGE,
+/// REGISTER, HALT, COMMIT, KECCAK*) are intentionally NOT in this selector;
+/// they are assembled directly in [`Traces::from_elf_and_logs`] as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableKind {
+    Cpu,
+    Lt,
+    Shift,
+    Memw,
+    MemwAligned,
+    Load,
+    Mul,
+    Dvrm,
+    Branch,
+    MemwRegister,
+}
+
+impl RoutedTraceData<'_> {
+    /// Build the chunked trace tables for a SINGLE log-derived execution table
+    /// (PHASE-5 fill for one `chunk_and_generate` call). The returned `Vec`
+    /// contains one `TraceTable` per `max_rows`-sized chunk, byte-identical to
+    /// what the monolithic [`build_traces`] produces for that table.
+    fn build_table(
+        &self,
+        which: TableKind,
+        max_rows: &super::MaxRowsConfig,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+        match which {
+            TableKind::Cpu => chunk_and_generate(
+                &self.cpu_ops,
+                max_rows.cpu,
+                cpu::generate_cpu_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Lt => chunk_and_generate(
+                &self.lt_ops,
+                max_rows.lt,
+                lt::generate_lt_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Shift => chunk_and_generate(
+                &self.shift_ops,
+                max_rows.shift,
+                shift::generate_shift_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Memw => chunk_and_generate(
+                &self.memw_ops,
+                max_rows.memw,
+                memw::generate_memw_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::MemwAligned => chunk_and_generate(
+                &self.memw_aligned_ops,
+                max_rows.memw_aligned,
+                memw_aligned::generate_memw_aligned_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Load => chunk_and_generate(
+                &self.load_ops,
+                max_rows.load,
+                load::generate_load_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Mul => chunk_and_generate(
+                &self.mul_ops,
+                max_rows.mul,
+                mul::generate_mul_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Dvrm => chunk_and_generate(
+                &self.dvrm_ops,
+                max_rows.dvrm,
+                dvrm::generate_dvrm_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::Branch => chunk_and_generate(
+                &self.branch_ops,
+                max_rows.branch,
+                branch::generate_branch_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+            TableKind::MemwRegister => chunk_and_generate(
+                &self.memw_register_ops,
+                max_rows.memw_register,
+                memw_register::generate_memw_register_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            ),
+        }
+    }
+}
+
+/// PHASES 3-4: from collected/routed ops, finish all cross-table coupling
+/// (MEMW->LT extension, accumulated bitwise lookups, padding lookups) and the
+/// remaining derived scalars, producing a [`RoutedTraceData`] from which any
+/// single table can be filled on demand.
+///
+/// This is the routing half of the old [`build_traces`]; the PHASE-5 fill is
+/// done per-table by [`RoutedTraceData::build_table`] (and the fixed/
+/// preprocessed tables are assembled by the caller).
+#[allow(clippy::too_many_arguments)]
+fn route<'a>(
+    ops: CollectedOps,
+    elf: Option<&'a Elf>,
+    memory_state: MemoryState,
+    entry_point: u64,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: HashMap<u64, usize>,
+    register_state: RegisterState,
+    max_rows: &super::MaxRowsConfig,
+    private_input: &'a [u8],
+) -> Result<RoutedTraceData<'a>, Error> {
+    let CollectedOps {
+        cpu_ops,
+        memw_ops,
+        memw_aligned_ops,
+        memw_register_ops,
+        load_ops,
+        mut lt_ops,
+        shift_ops,
+        mut bitwise_ops,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        commit_ops,
+        keccak_ops,
+    } = ops;
+
+    // =====================================================================
+    // PHASE 3: MEMW -> LT (timestamp ordering and overflow checks)
+    // =====================================================================
+    lt_ops.extend(collect_lt_from_memw(&memw_ops));
+    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+
+    // =====================================================================
+    // PHASE 4: All -> Bitwise lookups
+    // =====================================================================
+    bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+    bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+    bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+    bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
+    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+    bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
+    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
+    if let Some(elf) = elf {
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state, private_input));
+    }
+
+    let public_output_bytes: Vec<u8> = commit_ops
+        .iter()
+        .filter(|op| !op.end)
+        .map(|op| op.value)
+        .collect();
+    // COMMIT table sends AreBytes and IsHalfword lookups
+    bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
+    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
+
+    // CPU padding rows send ARE_BYTES with all-zero values.
+    // Add corresponding ops so the bitwise table multiplicities balance.
+    let num_padding_rows: usize = cpu_ops
+        .chunks(max_rows.cpu)
+        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+        .sum();
+    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
+    // Extract halt timestamp from the last ECALL instruction.
+    let halt_timestamp = cpu_ops
+        .iter()
+        .rev()
+        .find(|op| op.decode.op_ecall)
+        .ok_or(Error::MissingHaltEcall)?
+        .timestamp;
+
+    let register_final_state = register_state.to_final_state_map();
+
+    Ok(RoutedTraceData {
+        cpu_ops,
+        memw_ops,
+        memw_aligned_ops,
+        memw_register_ops,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        commit_ops,
+        keccak_ops,
+        num_padding_rows,
+        halt_timestamp,
+        public_output_bytes,
+        decode_trace,
+        decode_pc_to_row,
+        register_final_state,
+        entry_point,
+        elf,
+        memory_state,
+        private_input,
+    })
+}
+
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
-/// is built so peak heap usage stays bounded.
+/// is built so peak heap usage stays bounded
 fn chunk_and_generate<T>(
     ops: &[T],
     max_rows: usize,
@@ -2210,11 +2497,18 @@ fn collect_all_ops(
 ///
 /// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
 /// and PAGE bitwise lookups; `None` produces empty page tables.
+///
+/// This is now a thin orchestrator over [`route`] (PHASES 3-4) and
+/// [`RoutedTraceData::build_table`] (the PHASE-5 fill of each log-derived,
+/// chunked execution table). The fixed-size / preprocessed tables (BITWISE,
+/// DECODE, REGISTER, HALT, COMMIT, KECCAK*, PAGE) are assembled here directly
+/// from the routed data, exactly as before. The produced `Traces` is
+/// byte-identical to the old monolithic build.
 #[allow(clippy::too_many_arguments)]
 fn build_traces(
     ops: CollectedOps,
     elf: Option<&Elf>,
-    memory_state: &MemoryState,
+    memory_state: MemoryState,
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
@@ -2223,167 +2517,108 @@ fn build_traces(
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
 ) -> Result<Traces, Error> {
-    let CollectedOps {
-        cpu_ops,
-        memw_ops,
-        memw_aligned_ops,
-        memw_register_ops,
-        load_ops,
-        mut lt_ops,
-        shift_ops,
-        mut bitwise_ops,
-        branch_ops,
-        mul_ops,
-        dvrm_ops,
-        commit_ops,
-        keccak_ops,
-    } = ops;
+    // PHASES 3-4: finish all cross-table coupling and derived scalars.
+    let routed = route(
+        ops,
+        elf,
+        memory_state,
+        entry_point,
+        decode_trace,
+        decode_pc_to_row,
+        register_state,
+        max_rows,
+        private_input,
+    )?;
 
     // =====================================================================
-    // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
-    // =====================================================================
-    lt_ops.extend(collect_lt_from_memw(&memw_ops));
-    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-
-    // =====================================================================
-    // PHASE 4: All → Bitwise lookups
-    // =====================================================================
-    bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
-    bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-    bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-    bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-    bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
-    if let Some(elf) = elf {
-        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
-    }
-
-    let public_output_bytes: Vec<u8> = commit_ops
-        .iter()
-        .filter(|op| !op.end)
-        .map(|op| op.value)
-        .collect();
-    // COMMIT table sends AreBytes and IsHalfword lookups
-    bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
-    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
-
-    // CPU padding rows send ARE_BYTES with all-zero values.
-    // Add corresponding ops so the bitwise table multiplicities balance.
-    let num_padding_rows: usize = cpu_ops
-        .chunks(max_rows.cpu)
-        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-        .sum();
-    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
-
-    // =====================================================================
-    // PHASE 5: Generate final traces (parallelized)
+    // PHASE 5: Generate final traces.
     // =====================================================================
 
-    // Extract halt timestamp from the last ECALL instruction
-    let halt_op = cpu_ops
-        .iter()
-        .rev()
-        .find(|op| op.decode.op_ecall)
-        .ok_or(Error::MissingHaltEcall)?;
-    let halt_timestamp = halt_op.timestamp;
-
-    let cpus = chunk_and_generate(
-        &cpu_ops,
-        max_rows.cpu,
-        cpu::generate_cpu_trace,
+    // Per-table fill of the log-derived, chunked execution tables.
+    let cpus = routed.build_table(
+        TableKind::Cpu,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let memws = chunk_and_generate(
-        &memw_ops,
-        max_rows.memw,
-        memw::generate_memw_trace,
+    let memws = routed.build_table(
+        TableKind::Memw,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let memw_aligneds = chunk_and_generate(
-        &memw_aligned_ops,
-        max_rows.memw_aligned,
-        memw_aligned::generate_memw_aligned_trace,
+    let memw_aligneds = routed.build_table(
+        TableKind::MemwAligned,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let memw_registers = chunk_and_generate(
-        &memw_register_ops,
-        max_rows.memw_register,
-        memw_register::generate_memw_register_trace,
+    let memw_registers = routed.build_table(
+        TableKind::MemwRegister,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let loads = chunk_and_generate(
-        &load_ops,
-        max_rows.load,
-        load::generate_load_trace,
+    let loads = routed.build_table(
+        TableKind::Load,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let lts = chunk_and_generate(
-        &lt_ops,
-        max_rows.lt,
-        lt::generate_lt_trace,
+    let lts = routed.build_table(
+        TableKind::Lt,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let shifts = chunk_and_generate(
-        &shift_ops,
-        max_rows.shift,
-        shift::generate_shift_trace,
+    let shifts = routed.build_table(
+        TableKind::Shift,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let muls = chunk_and_generate(
-        &mul_ops,
-        max_rows.mul,
-        mul::generate_mul_trace,
+    let muls = routed.build_table(
+        TableKind::Mul,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let dvrms = chunk_and_generate(
-        &dvrm_ops,
-        max_rows.dvrm,
-        dvrm::generate_dvrm_trace,
+    let dvrms = routed.build_table(
+        TableKind::Dvrm,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
-    let branches = chunk_and_generate(
-        &branch_ops,
-        max_rows.branch,
-        branch::generate_branch_trace,
+    let branches = routed.build_table(
+        TableKind::Branch,
+        max_rows,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
 
+    // Fixed-size / preprocessed tables assembled directly from routed data.
     let mut bitwise = bitwise::generate_bitwise_trace();
-    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+    bitwise::update_multiplicities(&mut bitwise, &routed.bitwise_ops);
 
     // Update DECODE multiplicities
     // Each CPU operation looks up the DECODE table once
     // Padding rows also look up pc=1 (the CPU padding entry)
     // When CPU is split, each chunk pads independently
-    let mut decode = decode_trace;
-    let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-    decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-    decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+    let mut decode = routed.decode_trace.clone();
+    let mut decode_lookups: Vec<u64> = routed.cpu_ops.iter().map(|op| op.decode.pc).collect();
+    decode_lookups.extend(std::iter::repeat_n(
+        cpu::CPU_PADDING_PC,
+        routed.num_padding_rows,
+    ));
+    decode::update_multiplicities(&mut decode, &routed.decode_pc_to_row, &decode_lookups);
 
-    // Prepare register final state before scope (needs register_state ownership)
-    let register_final_state = register_state.to_final_state_map();
-
-    // Generate remaining traces in parallel (page, register, halt, commit).
-    // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+    // Generate remaining traces (page, register, halt, commit).
     #[allow(unused_mut)]
-    let mut commit_trace = commit::generate_commit_trace(&commit_ops);
+    let mut commit_trace = commit::generate_commit_trace(&routed.commit_ops);
 
     // Generate keccak traces (core table + per-round table + preprocessed RC)
-    let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
+    let keccak_rnd_ops: Vec<KeccakRoundOperation> = routed
+        .keccak_ops
         .iter()
         .map(|op| KeccakRoundOperation {
             timestamp: op.timestamp,
@@ -2391,10 +2626,10 @@ fn build_traces(
             output: op.output,
         })
         .collect();
-    let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
+    let keccak_trace = keccak::generate_keccak_trace(&routed.keccak_ops);
     let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
     let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-    keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+    keccak_rc::update_multiplicities(&mut keccak_rc_trace, routed.keccak_ops.len());
 
     #[allow(unused_mut)]
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
@@ -2403,14 +2638,21 @@ fn build_traces(
         let ((pages_val, register_val), halt_val) = rayon::join(
             || {
                 rayon::join(
-                    || match elf {
-                        Some(elf) => generate_page_tables(elf, memory_state, private_input),
+                    || match routed.elf {
+                        Some(elf) => {
+                            generate_page_tables(elf, &routed.memory_state, routed.private_input)
+                        }
                         None => (Vec::new(), Vec::new()),
                     },
-                    || register::generate_register_trace(&register_final_state, entry_point),
+                    || {
+                        register::generate_register_trace(
+                            &routed.register_final_state,
+                            routed.entry_point,
+                        )
+                    },
                 )
             },
-            || halt::generate_halt_trace(halt_timestamp),
+            || halt::generate_halt_trace(routed.halt_timestamp),
         );
         let (pages_v, page_configs_v) = pages_val;
         pages = pages_v;
@@ -2420,9 +2662,9 @@ fn build_traces(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        match elf {
+        match routed.elf {
             Some(elf) => {
-                let (p, c) = generate_page_tables(elf, memory_state, private_input);
+                let (p, c) = generate_page_tables(elf, &routed.memory_state, routed.private_input);
                 pages = p;
                 page_configs = c;
             }
@@ -2431,8 +2673,9 @@ fn build_traces(
                 page_configs = Vec::new();
             }
         }
-        register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp);
+        register_trace =
+            register::generate_register_trace(&routed.register_final_state, routed.entry_point);
+        halt_trace = halt::generate_halt_trace(routed.halt_timestamp);
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -2480,7 +2723,7 @@ fn build_traces(
         pages,
         page_configs,
         register: register_trace,
-        public_output_bytes,
+        public_output_bytes: routed.public_output_bytes.clone(),
         branches,
         halt: halt_trace,
         commit: commit_trace,
@@ -3096,7 +3339,7 @@ impl Traces {
         build_traces(
             ops,
             Some(elf),
-            &memory_state,
+            memory_state,
             elf.entry_point,
             decode_trace,
             decode_pc_to_row,
@@ -3148,7 +3391,7 @@ impl Traces {
         build_traces(
             ops,
             None,
-            &memory_state,
+            memory_state,
             entry_point,
             decode_trace,
             decode_pc_to_row,
@@ -3158,6 +3401,75 @@ impl Traces {
             StorageMode::Ram,
             &[],
         )
+    }
+
+    /// TEST ONLY: build every log-derived chunked execution table via the
+    /// `route` + per-table `build_table` split (PHASES 1-4 then per-table
+    /// PHASE-5 fill), returning the per-table chunk Vecs in the same field
+    /// order as [`Traces`]. Used to assert byte-identity against the monolithic
+    /// [`from_logs`]/[`build_traces`] path.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn chunked_tables_via_route(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<ChunkedTablesViaRoute, Error> {
+        // PHASES 1-2 (mirror of `from_logs`).
+        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let mut memory_state = MemoryState::new();
+        let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
+        let mut register_state = RegisterState::new(entry_point);
+        let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        let ops = collect_all_ops(
+            cpu_ops,
+            memw_ops,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            keccak_ops,
+            &mut register_state,
+        );
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+
+        // PHASES 3-4: route once. All cross-table multiplicity coupling is
+        // resolved here before any per-table fill reads it.
+        let routed = route(
+            ops,
+            None,
+            memory_state,
+            entry_point,
+            decode_trace,
+            decode_pc_to_row,
+            register_state,
+            max_rows,
+            &[],
+        )?;
+
+        // PHASE 5: per-table fill, one `build_table` call per table.
+        let build = |which: TableKind| {
+            routed.build_table(
+                which,
+                max_rows,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+        };
+        Ok(ChunkedTablesViaRoute {
+            cpus: build(TableKind::Cpu)?,
+            lts: build(TableKind::Lt)?,
+            shifts: build(TableKind::Shift)?,
+            memws: build(TableKind::Memw)?,
+            memw_aligneds: build(TableKind::MemwAligned)?,
+            loads: build(TableKind::Load)?,
+            muls: build(TableKind::Mul)?,
+            dvrms: build(TableKind::Dvrm)?,
+            branches: build(TableKind::Branch)?,
+            memw_registers: build(TableKind::MemwRegister)?,
+        })
     }
 
     /// Generates all traces with a trimmed bitwise table (TEST ONLY).

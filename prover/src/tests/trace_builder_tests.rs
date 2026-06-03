@@ -822,3 +822,142 @@ mod routing_tests {
         );
     }
 }
+
+
+// =============================================================================
+// route + per-table build_table byte-identity (C.1 trace-retire step)
+// =============================================================================
+
+/// THE invariant for C.1: building each log-derived execution table via
+/// `route` + per-table `build_table` reproduces byte-identical traces to the
+/// monolithic `from_logs`/`build_traces` path.
+#[test]
+fn test_route_then_build_table_matches_monolithic() {
+    // A mixed program touching multiple tables: Add (CPU/MEMW), SLT (LT),
+    // AND (bitwise), BLT (branch+LT), plus the halting ecall.
+    let mut logs = vec![
+        make_add_log(0x1000, 100, 200, 300),
+        make_slt_log(0x1004, 5, 10, 1),
+        make_and_log(0x1008, 0xFF, 0xF0, 0xF0),
+        make_blt_log(0x100c, 1, 2, true),
+        make_add_log(0x1010, 7, 8, 15),
+    ];
+    let mut instrs = vec![
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::And,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    ];
+    append_ecall(&mut logs, &mut instrs);
+    let instructions = make_instructions(&logs, &instrs);
+    let max_rows = Default::default();
+
+    // Monolithic build (reference).
+    let mono = Traces::from_logs(&logs, instructions.clone(), &max_rows).unwrap();
+
+    // route() once, then per-table build_table() for every log-derived table.
+    let split = Traces::chunked_tables_via_route(&logs, instructions, &max_rows).unwrap();
+
+    // Compare each per-table chunk against the monolithic output.
+    //
+    // `TraceTable`'s derived `PartialEq` is not usable here (the extension-field
+    // marker type param does not implement `PartialEq`), so we compare the
+    // underlying flat column data plus dimensions directly.
+    //
+    // NOTE: several `generate_*_trace` fns deduplicate rows via a
+    // `HashMap<Op, multiplicity>` and emit `op_map.into_iter()`, whose order is
+    // randomized per `HashMap` instance. That row ordering is therefore
+    // pre-existing nondeterminism in the monolithic build itself (two
+    // back-to-back `from_logs` calls already disagree on LT row order). Since
+    // the route/build split must reproduce the same ROWS (not a particular
+    // ordering), we compare each table as a multiset of rows: sort the rows of
+    // both sides, then assert byte-equality. This is decisive for "same trace
+    // content" while being immune to the pre-existing ordering nondeterminism.
+    type TT = stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >;
+    fn sorted_rows(t: &TT) -> Vec<Vec<u64>> {
+        let w = t.main_table.width;
+        let mut rows: Vec<Vec<u64>> = t
+            .main_table
+            .data
+            .chunks(w.max(1))
+            .map(|row| row.iter().map(|fe| *fe.value()).collect())
+            .collect();
+        rows.sort();
+        rows
+    }
+    fn assert_tables_eq(split: &[TT], mono: &[TT], name: &str) {
+        assert_eq!(split.len(), mono.len(), "{name}: chunk count differs");
+        for (i, (s, m)) in split.iter().zip(mono.iter()).enumerate() {
+            assert_eq!(
+                s.main_table.width, m.main_table.width,
+                "{name} chunk {i}: width differs"
+            );
+            assert_eq!(
+                s.main_table.height, m.main_table.height,
+                "{name} chunk {i}: height differs"
+            );
+            assert_eq!(
+                s.num_main_columns, m.num_main_columns,
+                "{name} chunk {i}: num_main_columns differs"
+            );
+            assert_eq!(
+                s.num_aux_columns, m.num_aux_columns,
+                "{name} chunk {i}: num_aux_columns differs"
+            );
+            assert_eq!(
+                s.step_size, m.step_size,
+                "{name} chunk {i}: step_size differs"
+            );
+            assert_eq!(
+                sorted_rows(s),
+                sorted_rows(m),
+                "{name} chunk {i}: row multiset differs"
+            );
+        }
+    }
+    assert_tables_eq(&split.cpus, &mono.cpus, "CPU");
+    assert_tables_eq(&split.lts, &mono.lts, "LT");
+    assert_tables_eq(&split.shifts, &mono.shifts, "SHIFT");
+    assert_tables_eq(&split.memws, &mono.memws, "MEMW");
+    assert_tables_eq(&split.memw_aligneds, &mono.memw_aligneds, "MEMW_A");
+    assert_tables_eq(&split.loads, &mono.loads, "LOAD");
+    assert_tables_eq(&split.muls, &mono.muls, "MUL");
+    assert_tables_eq(&split.dvrms, &mono.dvrms, "DVRM");
+    assert_tables_eq(&split.branches, &mono.branches, "BRANCH");
+    assert_tables_eq(&split.memw_registers, &mono.memw_registers, "MEMW_R");
+
+    // Sanity: the program actually populated several of these tables.
+    assert!(!mono.cpus.is_empty());
+    assert!(mono.cpus[0].main_table.height >= 6);
+    assert!(mono.lts[0].main_table.height >= 2, "expected LT rows");
+    assert!(mono.branches[0].main_table.height >= 1, "expected BRANCH rows");
+}
