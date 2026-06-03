@@ -11,8 +11,8 @@
 use lambda_vm_prover::prove;
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_comp_poly_tree_calls, gpu_lde_calls, gpu_parts_lde_calls,
-    reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_comp_poly_tree_calls, gpu_deep_calls, gpu_fri_calls, gpu_lde_calls,
+    gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -46,4 +46,14 @@ fn gpu_path_fires_end_to_end() {
         gpu_comp_poly_tree_calls() > 0,
         "R2 GPU comp-poly tree did not fire"
     );
+
+    // R4 DEEP composition. Reuses the R1 main/aux handles and (when R2
+    // parts LDE took the keep path) the parts handle on Round2. Fires
+    // once per table whose lde_size clears the threshold.
+    assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
+
+    // R4 FRI commit phase. One call per table (per
+    // `commit_phase_from_evaluations`); each call drives all FRI layers
+    // device-side internally.
+    assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
 }
