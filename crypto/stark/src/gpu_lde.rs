@@ -885,13 +885,8 @@ where
         })
         .collect();
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    // Invariant: nodes.len() == 2*num_leaves - 1, so nodes.len() + 1 ==
-    // 2*num_leaves which is a power of 2. `from_precomputed_nodes` only
-    // returns `None` when that invariant fails or `nodes` is empty.
-    Some(
-        crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
-            .expect("from_precomputed_nodes: comp-poly tree invariant violated"),
-    )
+    // Falls back to CPU on `None`, matching the R1 paths (lines 496, 557).
+    crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)
 }
 
 /// R3 GPU dispatch: batched strided barycentric OOD evaluation over the main
