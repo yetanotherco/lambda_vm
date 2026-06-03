@@ -97,6 +97,7 @@ const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx")
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
+
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
