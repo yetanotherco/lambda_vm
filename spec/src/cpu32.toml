@@ -284,6 +284,11 @@ input = [["idx", "res", "i"]]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
 
 [[constraint_groups]]
 name = "alu"
@@ -349,6 +354,21 @@ multiplicity = "write_register"
 
 [[constraint_groups]]
 name = "logup"
+
+[[constraints.logup]]
+kind = "arith"
+constraint = "$#`!μ` => #`read_register1 = 0`$"
+poly = ["*", ["not", "μ"], "read_register1"]
+
+[[constraints.logup]]
+kind = "arith"
+constraint = "$#`!μ` => #`read_register2 = 0`$"
+poly = ["*", ["not", "μ"], "read_register2"]
+
+[[constraints.logup]]
+kind = "arith"
+constraint = "$#`!μ` => #`write_register = 0`$"
+poly = ["*", ["not", "μ"], "write_register"]
 
 [[constraints.logup]]
 kind = "interaction"
