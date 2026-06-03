@@ -6,11 +6,15 @@
 //! the per-instruction rows, the `pc = 1` padding entry, and the `pc_to_row` map.
 
 use crate::tables::cpu::CPU_PADDING_PC;
-use crate::tables::decode::{cols, generate_decode_trace};
+use crate::tables::decode::{cols, commitment_from_elf, generate_decode_trace};
 use crate::tables::types::DecodeEntry;
+use crate::test_utils::asm_elf_bytes;
+use crate::{prove, verify_with_options};
 
+use executor::elf::Elf;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
 use executor::vm::memory::U64HashMap;
+use stark::proof::options::GoldilocksCubicProofOptions;
 
 // =========================================================================
 // DecodeEntry
@@ -170,4 +174,107 @@ fn test_decode_table_is_power_of_two() {
         "decode table is padded to a power of two"
     );
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
+}
+
+// =========================================================================
+// verify_with_options: optional decode_commitment parameter (#640)
+// =========================================================================
+
+#[test]
+fn decode_commitment_some_matches_default_path() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    let decode_c = commitment_from_elf(&elf, &options).expect("decode commitment");
+
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+        .expect("verify with None should not error");
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(decode_c))
+        .expect("verify with Some(correct) should not error");
+
+    assert!(default_ok, "default path must accept the proof");
+    assert!(
+        explicit_ok,
+        "Some(correct_commitment) must accept the proof"
+    );
+}
+
+#[test]
+fn decode_commitment_wrong_value_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Flip a byte in the correct commitment so the Fiat-Shamir transcripts diverge.
+    let mut wrong = commitment_from_elf(&elf, &options).expect("decode commitment");
+    wrong[0] ^= 0xFF;
+
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "tampered decode commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+#[test]
+fn decode_commitment_zero_bytes_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // [0u8; 32] is the most plausible accidental default — passing it must
+    // not pass verification.
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "all-zero decode commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+/// DECODE preprocessed commitment for the `sub` asm test ELF at blowup=2,
+/// computed offline once. Mirrors how the recursion guest embeds the
+/// commitment as a compile-time constant for its inner program. If the
+/// AIR or FFT pipeline changes, this drifts and the test fails —
+/// regenerate via the `print_decode_commitment_for_sub` helper below.
+const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
+    0x60, 0x66, 0x0b, 0x18, 0x0d, 0x41, 0x08, 0xb3, 0x3a, 0x03, 0x99, 0x03, 0x8c, 0x9d, 0x12, 0x57,
+    0x68, 0x8d, 0xed, 0x13, 0x60, 0xeb, 0x1d, 0x2b, 0xa8, 0xea, 0x1c, 0x76, 0xc9, 0xdd, 0x25, 0xaf,
+];
+
+#[test]
+fn decode_commitment_compile_time_const_accepts() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
+    // workflow where the value lives in the caller's compiled binary.
+    let result = verify_with_options(
+        &vm_proof,
+        &elf_bytes,
+        &options,
+        Some(SUB_DECODE_COMMITMENT_BLOWUP_2),
+    )
+    .expect("verify must not return Err");
+    assert!(
+        result,
+        "verifier must accept the offline-computed decode commitment",
+    );
+}
+
+#[test]
+#[ignore = "prints decode commitment for the sub asm ELF so SUB_DECODE_COMMITMENT_BLOWUP_2 \
+            can be regenerated; run with --ignored --nocapture"]
+fn print_decode_commitment_for_sub() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let c = commitment_from_elf(&elf, &options).expect("decode commitment");
+    eprintln!("SUB_DECODE_COMMITMENT_BLOWUP_2 (sub.elf, blowup=2):");
+    eprintln!("{c:02x?}");
 }
