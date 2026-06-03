@@ -213,10 +213,9 @@ output = ["Byte", 8]
 
 # ECSM
 [[signatures]]
-tag = "ECDA"
+tag = "ECDAS"
 kind = "interaction"
-input = ["DWordWL", "U256BL", "U256BL", "Byte", "Bit"]
-output = ["U256BL", 2]
+input = ["DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
 
 [[signatures]]
 tag = "SERVE_K"

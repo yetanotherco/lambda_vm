@@ -585,16 +585,14 @@ multiplicity = ["-", "μ"]
 
 [[constraints.delegate]]
 kind = "interaction"
-tag = "ECDA"
-input = ["timestamp", "xG", "yG", "bitlen_k", 0]
-output = ["arr", "xG", "yG"]
+tag = "ECDAS"
+input = ["timestamp", "xG", "yG", "xG", "yG", "bitlen_k", 0]
 multiplicity = "μ"
 ref = "ec:c:start_double_add"
 
 [[constraints.delegate]]
 kind = "interaction"
-tag = "ECDA"
-input = ["timestamp", "xG", "yG", -1, 0]
-output = ["arr", "xR", "yR"]
+tag = "ECDAS"
+input = ["timestamp", "xR", "yR", "xG", "yG", -1, 0]
 multiplicity = ["-", "μ"]
 ref = "ec:c:receive_double_add"

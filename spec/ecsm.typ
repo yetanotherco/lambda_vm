@@ -121,6 +121,93 @@ Similar to `addr_xG` and `addr_k`, we require that $#`addr_xR` + 24 < 2^16$ (@ec
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
 
+= ECDAS chip <ecdas>
+#let ecdas_chip = load_chip("src/ecdas.toml", config)
+#let ecdas = raw(ecdas_chip.name)
+
+The #ecdas chip (Elliptic Curve Double/Add Sequence) is responsible for accelerating the addition of two curve points, or the doubling of a single curve point. 
+More specifically, given curve points $A$ (accumulator) and $G$ (generator), and selector bit `op`, it performs the mapping
+$
+  (A, G) mapsto cases(
+    (A + A, &G) &text("if") #`op` = 0,
+    (A + G, &G) &text("if") #`op` = 1
+  )
+$
+
+== Doubling and adding
+To add two curve points $A, B in E(0, b, p)$, we must consider three situations.
+When $x_A eq.not x_B$, we construct the sum $R := A + B$ as
+$
+ lambda &:= frac((y_B - y_A), (x_B - x_A), style: "horizontal"), #h(3em)
+  x_R &:= lambda^2 - x_A - x_B, #h(3em)
+  y_R &:= lambda (x_A - x_R) - y_A.
+$
+Second, when $x_A = x_B$ and $y_A eq.not -y_B$, we compute $R := A + B = 2A$ as
+$
+  lambda &:= frac(3x_A^2, 2y_A, style: "horizontal"), #h(3em)
+  x_R &:= lambda^2 - 2x_A, #h(3em)
+  y_R &:= lambda (x_A - x_R) - y_A.
+$
+Lastly, when $x_A = x_B$ and $y_A eq -y_B$, $R$ becomes the 'point at infinity'; a point that has no native representation on the curve. 
+It is, however, ensured by the #ecsm chip that this case cannot occur.
+As such, we do need to consider it.
+
+
+== Columns
+#let nr_variables = total_nr_variables(ecdas_chip)
+#let nr_columns = total_nr_instantiated_columns(ecdas_chip, config)
+#let nr_interactions = compute_nr_interactions(ecdas_chip)
+
+The #ecdas chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+#render_chip_variable_table(ecdas_chip, config)
+
+== Constraints
+First, the chips receives the input for this double/add step:
+#render_constraint_table(ecdas_chip, config, groups: "receive")
+
+The `op`-flag determines whether $R := A + G$ (0) or $R:= 2A$ (1).
+As previously discussed, this flag influences the computations of $lambda$ and $x_R$.
+Rather than computing both potential values and selecting the correct one based on the `op` flag, we merge the relations that have to be checked and "weave" the `op`-flag in this way:
+In particular, we let the prover provide witnesses $lambda$, $x_R$ and $y_R$ and we will prove that
+$
+#`op` dot (lambda (x_G - x_A) - (y_G - y_A)) + (1 - #`op`) dot (2 lambda y_A - 3x_A^2)  &equiv 0 mod p\
+lambda^2 - x_A - (1- #`op` ) dot x_A - #`op` dot x_G  - x_R &equiv 0 mod p\
+lambda (x_A - x_R) - y_A - y_R &equiv 0 mod p
+$
+
+To start, we let the prover provide witness $#`q0` in [-2^255, 2^255)$ and have them prove that
+$
+  #`op` dot (lambda dot x_G - lambda dot x_A + y_A - y_G) + (1 - #`op`) dot (2 lambda dot y_A - 3x_A dot x_A) + #`q0` dot p = 0
+$
+
+#render_constraint_table(ecdas_chip, config, groups: "lambda")
+
+With $lambda$ constrained, we continue with $x_R$.
+Here, we let the prover provide witness $#`q1` in [-2^255, 2^255)$ and have them prove that
+$
+  lambda^2 - x_R - x_A - x_G - #`op` dot (x_A - x_G) - #`q1` dot p = 0
+$
+
+#render_constraint_table(ecdas_chip, config, groups: "xR")
+
+Next, we constrain $y_R$.
+Rewriting the earlier equality, we find that 
+$
+  lambda dot x_A - lambda dot x_R - y_A - y_R + #`q2` dot p = 0
+$
+for some prover-provided witness $#`q2` in [-2^255, 2^255)$.
+
+#render_constraint_table(ecdas_chip, config, groups: "yR")
+
+
+Lastly, the updated accumulator is sent out for the next step to be processed (@ecdas:c:send).
+To determine whether the next step should be an addition or doubling, the `next_op` bit is provided as witness by the prover.
+Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu) and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
+#render_constraint_table(ecdas_chip, config, groups: "send")
+
+
+// #render_constraint_table(ecdas_chip, config)
+
 = EC-Scalar
 #let ecscalar_chip = load_chip("src/ec_scalar.toml", config)
 #let ecscalar = raw(ecscalar_chip.name)
