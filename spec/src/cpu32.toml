@@ -284,11 +284,6 @@ input = [["idx", "res", "i"]]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["μ"]
-
 
 [[constraint_groups]]
 name = "alu"
