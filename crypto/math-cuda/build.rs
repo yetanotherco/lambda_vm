@@ -113,4 +113,5 @@ fn main() {
     compile_ptx("keccak.cu", "keccak.ptx", have_nvcc);
     compile_ptx("barycentric.cu", "barycentric.ptx", have_nvcc);
     compile_ptx("inverse.cu", "inverse.ptx", have_nvcc);
+    compile_ptx("deep.cu", "deep.ptx", have_nvcc);
 }

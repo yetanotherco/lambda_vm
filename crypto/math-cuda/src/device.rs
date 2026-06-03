@@ -95,6 +95,7 @@ const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
 const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
 const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
+const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -161,6 +162,9 @@ pub struct Backend {
     pub apply_reverse_scan_offsets_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
 
+    // deep.ptx
+    pub deep_composition_ext3_row: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -180,6 +184,7 @@ impl Backend {
         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
         let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
+        let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -249,6 +254,7 @@ impl Backend {
             apply_reverse_scan_offsets_ext3: inverse
                 .load_function("apply_reverse_scan_offsets_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
