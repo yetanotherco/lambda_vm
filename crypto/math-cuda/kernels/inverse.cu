@@ -73,7 +73,7 @@ extern "C" __global__ void compute_denoms_ext3(
 //
 // Each thread owns a contiguous chunk of C elements. With K=256 threads
 // per block and a single block, we can handle up to 256*C elements.
-// For N up to ~1M, C ≈ 4096, so one thread does ~4k ext3 multiplies
+// For N up to ~1M, C is around 4096, so one thread does ~4k ext3 multiplies
 // serially in shmem-free fashion. Depth = O(C) + O(K) + O(C); with
 // K=256 threads running in parallel, the `O(C)` phases parallelise
 // perfectly across threads.

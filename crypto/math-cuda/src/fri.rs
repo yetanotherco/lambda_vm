@@ -36,7 +36,7 @@ pub struct FriCommitState {
 impl FriCommitState {
     /// H2D the starting evals (ext3 interleaved, 3 * n0 u64) and the
     /// initial inv_twiddles (base field, n0/2 u64). `n0` must be a power of
-    /// two and ≥ 2.
+    /// two and >= 2.
     pub fn new(evals_host: &[u64], inv_tw_host: &[u64], n0: usize) -> Result<Self> {
         assert!(n0 >= 2 && n0.is_power_of_two());
         assert_eq!(evals_host.len(), 3 * n0);
@@ -76,27 +76,19 @@ impl FriCommitState {
         let be = backend()?;
         let n_in = self.current_n;
         let n_out = n_in / 2;
-        assert!(n_out >= 1, "FRI fold_layer called with current_n = 1");
+        // fold_final handles the n_out == 1 last layer (no Merkle commit).
+        assert!(
+            n_out >= 2,
+            "fold_and_commit_layer requires n_out >= 2; use fold_final"
+        );
 
-        // Allocate the tree buffer. num_leaves = n_out / 2 (row-pair leaves).
+        // Row-pair leaves: each leaf hashes two consecutive ext3 evals.
         let num_leaves = n_out / 2;
-        let tight_total_nodes = if num_leaves >= 1 {
-            2 * num_leaves - 1
-        } else {
-            // Degenerate case: n_out == 1, no further Merkle commit needed.
-            // Caller should use `fold_final` for the final layer, not here.
-            panic!("fold_and_commit_layer requires n_out >= 2 (num_leaves >= 1)");
-        };
+        let tight_total_nodes = 2 * num_leaves - 1;
 
         // H2D zeta.
         let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
 
-        // Select input and output buffers.
-        // Borrow checker requires us to split_borrow; use raw pointers via
-        // slice_mut to pass both into the kernel.
-        // We pass `input` via `&CudaSlice<u64>` and `output` via
-        // `&mut CudaSlice<u64>`. Rust borrow rules require them to be
-        // distinct; `a_is_input` flips between the two owned slices.
         let cfg = LaunchConfig {
             grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
             block_dim: (128, 1, 1),

@@ -920,7 +920,7 @@ where
 }
 
 // ============================================================================
-// PR-4: R2 keep-handle variant, R4 DEEP composition, FRI commit + layer trees
+// R2 keep-handle variant, R4 DEEP composition, FRI commit dispatches
 // ============================================================================
 
 /// R4 DEEP-composition dispatch counter.

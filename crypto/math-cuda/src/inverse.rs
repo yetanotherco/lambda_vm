@@ -21,10 +21,9 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
         return Ok(Vec::new());
     }
     if n == 1 {
-        // Degenerate: one element. Montgomery on CPU is simpler than the
-        // GPU pipeline for a single value. Just invert and return.
-        // Caller is responsible for handling n=1 (unlikely) on CPU.
-        return Ok(vec![0; 3]);
+        // Below GPU break-even (one element). Invert on host via Fermat.
+        let inv = invert_ext3_host([a[0], a[1], a[2]]);
+        return Ok(inv.to_vec());
     }
 
     let be = backend()?;
@@ -370,12 +369,6 @@ fn gl_pow(mut base: u64, mut exp: u64) -> u64 {
 fn gl_inv(a: u64) -> u64 {
     // Fermat: a^{p-2}
     gl_pow(a, GOLDILOCKS_P as u64 - 2)
-}
-
-/// Public re-export of the host ext3 inverse. Used by `logup.rs` for the
-/// single-element total inverse in its inlined batch-inverse flow.
-pub fn invert_ext3_host_pub(x: [u64; 3]) -> [u64; 3] {
-    invert_ext3_host(x)
 }
 
 /// Invert one ext3 element on the host. Used once per batch inverse to
