@@ -55,6 +55,11 @@ pub(crate) struct MmapNodeBacking {
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
+    /// Number of leaves in the tree (always a power of two). Stored explicitly
+    /// so the leaf count is still known after [`MerkleTree::drop_leaves`] frees
+    /// the leaf half (after which `nodes.len() == leaves_len - 1`, so the usual
+    /// `(node_count + 1) / 2` recovery no longer applies).
+    leaves_len: usize,
     #[cfg(feature = "disk-spill")]
     #[cfg_attr(feature = "serde", serde(skip))]
     mmap_backing: Option<MmapNodeBacking>,
@@ -79,13 +84,14 @@ where
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("MerkleTree", 2)?;
+        let mut s = serializer.serialize_struct("MerkleTree", 3)?;
         s.serialize_field("root", &self.root)?;
         if self.mmap_backing.is_some() {
             s.serialize_field("nodes", &MmapNodesSeq(self))?;
         } else {
             s.serialize_field("nodes", &self.nodes)?;
         }
+        s.serialize_field("leaves_len", &self.leaves_len)?;
         s.end()
     }
 }
@@ -154,6 +160,7 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
+            leaves_len,
             #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         })
@@ -209,6 +216,93 @@ where
         };
 
         self.create_proof(merkle_path)
+    }
+
+    /// Number of leaves in the tree (always a power of two). Valid both before
+    /// and after [`drop_leaves`](Self::drop_leaves).
+    pub fn leaves_len(&self) -> usize {
+        self.leaves_len
+    }
+
+    /// Whether the leaf half of the node buffer has been freed by
+    /// [`drop_leaves`](Self::drop_leaves). When `true`, the leaf-level sibling
+    /// must be supplied by the caller to build an opening (see
+    /// [`get_proof_by_pos_with_leaf_sibling`](Self::get_proof_by_pos_with_leaf_sibling)).
+    pub fn leaves_dropped(&self) -> bool {
+        self.node_count() == self.leaves_len - 1
+    }
+
+    /// Free the leaf half of the node buffer, keeping only the inner nodes
+    /// (`nodes[0..leaves_len - 1]`, root at index 0). This roughly halves the
+    /// tree's memory footprint. The root and every inner node are retained, so
+    /// the only path node that must be regenerated at open time is the
+    /// leaf-level sibling — see
+    /// [`get_proof_by_pos_with_leaf_sibling`](Self::get_proof_by_pos_with_leaf_sibling).
+    ///
+    /// Idempotent: a no-op if the leaves were already dropped. A single-leaf
+    /// tree (`leaves_len == 1`) has no leaf half to drop and is left unchanged.
+    pub fn drop_leaves(&mut self) {
+        if self.leaves_len <= 1 {
+            return;
+        }
+        let inner_count = self.leaves_len - 1;
+        // `disk-spill` mmap backing is read-only and never populated together
+        // with leaf-dropping in the prover, so only the heap path is handled.
+        #[cfg(feature = "disk-spill")]
+        if self.mmap_backing.is_some() {
+            return;
+        }
+        if self.nodes.len() > inner_count {
+            self.nodes.truncate(inner_count);
+            self.nodes.shrink_to_fit();
+        }
+    }
+
+    /// Builds the same opening that [`get_proof_by_pos`](Self::get_proof_by_pos)
+    /// would, but sources the leaf-level sibling from `leaf_sibling` instead of
+    /// the (possibly dropped) leaf buffer. All higher levels read the retained
+    /// inner nodes. The resulting [`Proof`] is byte-identical to the full-tree
+    /// `get_proof_by_pos(pos)` provided `leaf_sibling` equals the hash the
+    /// builder stored for the leaf at `sibling_leaf_position(pos)`.
+    ///
+    /// Works whether or not the leaves have been dropped.
+    pub fn get_proof_by_pos_with_leaf_sibling(
+        &self,
+        pos: usize,
+        leaf_sibling: B::Node,
+    ) -> Option<Proof<B::Node>> {
+        let leaf_node = pos + (self.leaves_len - 1);
+        // Single-leaf tree: the leaf is the root, the path is empty.
+        if leaf_node == ROOT {
+            return Some(Proof {
+                merkle_path: Vec::new(),
+            });
+        }
+
+        let tree_depth = self.leaves_len.ilog2() as usize;
+        let mut merkle_path = Vec::with_capacity(tree_depth);
+
+        // Bottom level: the leaf-level sibling, supplied by the caller (its
+        // node lives in the dropped leaf half).
+        merkle_path.push(leaf_sibling);
+
+        // Higher levels: every sibling here is an inner node, still resident.
+        let mut node = parent_index(leaf_node);
+        while node != ROOT {
+            let sibling = self.node_get(sibling_index(node))?;
+            merkle_path.push(sibling.clone());
+            node = parent_index(node);
+        }
+
+        Some(Proof { merkle_path })
+    }
+
+    /// 0-based leaf position of the leaf-level sibling needed to open `pos`.
+    /// The caller regenerates that leaf's hash (e.g. by re-hashing the LDE row)
+    /// to pass into [`get_proof_by_pos_with_leaf_sibling`](Self::get_proof_by_pos_with_leaf_sibling).
+    pub fn sibling_leaf_position(&self, pos: usize) -> usize {
+        let leaf_node = pos + (self.leaves_len - 1);
+        sibling_index(leaf_node) - (self.leaves_len - 1)
     }
 
     /// Creates a proof from a Merkle pasth

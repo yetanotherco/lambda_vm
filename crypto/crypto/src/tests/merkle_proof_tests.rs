@@ -333,3 +333,42 @@ fn batch_proof_verify_sparse_leaves_across_tree() {
         16
     ));
 }
+
+use crate::merkle_tree::traits::IsMerkleTreeBackend;
+use crate::merkle_tree::utils::complete_until_power_of_two;
+
+/// Leaf-drop opener must produce byte-identical proofs to the full-tree opener.
+/// This is the core correctness invariant for the streaming "leaf-drop" mode.
+#[test]
+fn leaf_dropped_opening_is_byte_identical_to_full_tree_opening() {
+    type B = TestBackend<Ecgfp5>;
+    let values: Vec<Ecgfp5FE> = (1..1000).map(Ecgfp5FE::new).collect();
+    let leaves = complete_until_power_of_two(<B as IsMerkleTreeBackend>::hash_leaves(&values));
+
+    let full = TestMerkleTreeEcgfp::build(&values).unwrap();
+    let mut dropped = TestMerkleTreeEcgfp::build(&values).unwrap();
+    dropped.drop_leaves();
+    assert!(dropped.leaves_dropped());
+    assert_eq!(dropped.leaves_len(), leaves.len());
+
+    for pos in [0usize, 1, 2, 7, 9349 % leaves.len(), leaves.len() - 1] {
+        let full_proof = full.get_proof_by_pos(pos).unwrap();
+        let sib_leaf = leaves[dropped.sibling_leaf_position(pos)];
+        let dropped_proof = dropped
+            .get_proof_by_pos_with_leaf_sibling(pos, sib_leaf)
+            .unwrap();
+        assert_eq!(
+            full_proof.merkle_path, dropped_proof.merkle_path,
+            "leaf-dropped proof differs from full-tree proof at pos {pos}"
+        );
+    }
+}
+
+#[test]
+fn drop_leaves_is_idempotent() {
+    let values: Vec<Ecgfp5FE> = (1..100).map(Ecgfp5FE::new).collect();
+    let mut tree = TestMerkleTreeEcgfp::build(&values).unwrap();
+    tree.drop_leaves();
+    tree.drop_leaves();
+    assert!(tree.leaves_dropped());
+}
