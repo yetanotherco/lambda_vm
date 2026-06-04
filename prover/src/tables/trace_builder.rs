@@ -1151,6 +1151,19 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
     for (op, _wants_hi) in mul_ops {
         let (lo, hi) = op.compute_product();
 
+        // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
+        // in mul::bus_interactions).
+        for word in [op.lhs, op.rhs] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+
         // IS_HALF for lo halfwords
         for shift in [0, 16, 32, 48] {
             let half = ((lo >> shift) & 0xFFFF) as u16;
@@ -1223,6 +1236,20 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
     let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
 
     for (op, _wants_remainder) in dvrm_ops {
+        // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
+        // half-limbs so a prover cannot supply non-canonical halves (matches the
+        // n/d IS_HALF senders in dvrm::bus_interactions).
+        for word in [op.n, op.d] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+
         // IS_HALF for r[0..4] (DVRM-C13)
         let r = op.compute_remainder();
         for shift in [0, 16, 32, 48] {

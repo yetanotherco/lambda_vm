@@ -400,6 +400,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
+    // IS_HALF lookups for lhs/rhs INPUT range checks (multiplicity: mu_lo + mu_hi).
+    // The bus binds only the packed 32-bit words, so without these the input
+    // half-limbs are free (non-canonical halves re-packing to the same word).
+    // -------------------------------------------------------------------------
+    for col in [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // -------------------------------------------------------------------------
     // IS_HALF lookups for lo range checks (multiplicity: mu_lo + mu_hi)
     // -------------------------------------------------------------------------
     for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
