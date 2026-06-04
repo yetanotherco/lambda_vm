@@ -321,7 +321,7 @@ ref = "ec:c:c0_i"
 [[constraints.xG2]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], 7948]]
+input = [["+", ["idx", "c0", "i"], 8160]]
 iter = ["i", 0, 63]
 multiplicity = "μ"
 ref = "ec:c:range_c0"
@@ -371,7 +371,7 @@ iter = ["i", 0, 63]
 [[constraints.yG]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], 7948]]
+input = [["+", ["idx", "c1", "i"], 16318]]
 iter = ["i", 0, 63]
 multiplicity = "μ"
 ref = "ec:c:range_c1"

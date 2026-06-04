@@ -296,7 +296,7 @@ constraint = "$#`c0`_63 = 0$"
 [[constraints.lambda]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], 23844]]
+input = [["+", ["idx", "c0", "i"], 24477]]
 iter = ["i", 0, 63]
 multiplicity = "μ"
 ref = "ecda:c:range_c0"
@@ -366,7 +366,7 @@ constraint = "$#`c1`_63 = 0$"
 [[constraints.xR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], "???"]]
+input = [["+", ["idx", "c1", "i"], 8161]]
 iter = ["i", 0, 63]
 multiplicity = "μ"
 
@@ -435,7 +435,7 @@ constraint = "$#`c2`_63 = 0$"
 [[constraints.yR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c2", "i"], "???"]]
+input = [["+", ["idx", "c2", "i"], 8160]]
 iter = ["i", 0, 63]
 multiplicity = "μ"
 

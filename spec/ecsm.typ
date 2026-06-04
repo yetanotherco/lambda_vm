@@ -199,14 +199,11 @@ for some prover-provided witness $#`q2` in [-2^255, 2^255)$.
 
 #render_constraint_table(ecdas_chip, config, groups: "yR")
 
-
 Lastly, the updated accumulator is sent out for the next step to be processed (@ecdas:c:send).
 To determine whether the next step should be an addition or doubling, the `next_op` bit is provided as witness by the prover.
 Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu) and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
 #render_constraint_table(ecdas_chip, config, groups: "send")
 
-
-// #render_constraint_table(ecdas_chip, config)
 
 = EC-Scalar
 #let ecscalar_chip = load_chip("src/ec_scalar.toml", config)
@@ -224,7 +221,7 @@ The #ecdas chip is comprised of #nr_variables variables that are expressed using
 
 #render_constraint_table(ecscalar_chip, config)
 
-= The "carry-technique"$trademark$ #footnote("this is not actually trademarked")
+= Discussing the carries
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
 - multiplications are performed limb-by-limb, 
 - a set of carry-limbs is used to exchange the underflow/overflow from one limb to another, and
@@ -233,91 +230,70 @@ To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, w
 We now explore this carry-technique and provide some proofs.
 
 == Lemma 1
-Let $L in N$. We define
+Let $V in NN$ and $A,M in [0, V)$.
+For $i >= 1$, we define
 $
-  r_i &:= sum_(j=1)^i (L-1)^2 = i(L-1)^2 &&#text("for") i >= 1,\
-  v_i &:= r_i + c_(i-1) mod L &&#text("for") i >= 1,\
-  c_i &:= L^(-1) (r_i + c_(i-1) - v_i) &&#text("for") i >= 1\, #text("and")\
-  c_0 &:= 0
+r_i &:= A (V-1) + M sum_(j=1)^i (V-1)^2 = i M(V-1)^2 + A(V-1),\
+v_i &:= r_i + c_(i-1) mod V,\
+c_i &:= V^(-1) (r_i + c_(i-1) - v_i),\
+c_0 &:= 0
 $
-It holds that $c_i = i(L - 1) - 1$.
+It holds that
+$
+c_i = i M(V-1) + A - M - delta_(M<A)
+$
+where kronecker delta $delta_x$ equals $1$ if $x$ is true, and $0$ otherwise.
 
 #emph("Proof:")
-For $i = 0$, we find that $r_1 = (L - 1)^2 = L(L - 2) + 1$, $v_1 = 1$ and 
+For $i = 1$, we find that 
 $
-c_1 = L^(-1) (L(L - 2) + 1 - 1) = L - 2 = (L-1) - 1
+r_1 
+&= M(V - 1)^2 + A(V-1) \
+&= M(V^2-2V) + (A-delta) V + delta V + M - A \
+v_1 
+&equiv delta V + M - A mod V\
+c_1 
+&= V^(-1) (M(V^2 - 2V) + (A-delta) V)\
+&= M(V-2) + A-delta
 $
-Suppose the statement to hold for arbitrary $i >= 1$, we show it also holds for $i+1$.
+Suppose the statement to hold for arbitrary $i >= 1$.
 We find that 
 $
-v_(i+1) 
-&= (i(L-1)^2 + (i-1)(L - 1) - 1) mod L\
-&= (i(L (L-2)+1) + (i-1)L - i) mod L\
-&= (i L (L-2) + (i-1)L) mod L\
-&= 0 mod L\
-$ 
-and subsequently that
-$
+d_(i+1)
+&= (i+1)M(V-1)^2 + A(V-1)\
+v_(i+1)
+&equiv (i+1)M(V^2 - 2V) + (i+1)M + A V - A + i M(V-2) + (i-1)M + A-delta &&mod V\
+&equiv (i+1)M(V^2 - 2V) + (A + i M - delta)V + delta (V-1) &&mod V\
+&equiv delta (V-1) &&mod V\
 c_(i+1)
-&= L^(-1) dot (i(L-1)^2 + (i-1)(L - 1) - 1)\
-&= L^(-1) dot (i L (L-2) + (i-1)L)\
-&= i(L-2) + i\
-&= i(L-1) - 1\
-$
-$qed$
-
-== Lemma 2
-Let $L in NN$.
-Furthermore, let $k in NN > 2$ be some starting width.
-Let
-$
-  r^((k))_i &:= sum_(j=1)^(k-i) (L-1)^2 = (k-i)(L-1)^2 &&#text("for") i in [1, k],\
-  v^((k))_i &:= r_i + c_(i-1) mod L &&#text("for") i >= 1,\
-  d^((k))_i &:= L^(-1) (r_i + c_(i-1) - v_i) &&#text("for") i >= 1\, #text("and")\
-  d^((k))_0 &:= k(L-1) - 1
-$
-For $i>=1$, it holds that $d^((k))_i = (k-i)(L-1)$.
-
-#emph("Proof:")
-For $i = 1$, we find that $r^((k))_1 = (k-1)(L - 1)^2$, 
-$
-v^((k))_1 
-&= (k-1)(L-1)^2 + k(L-1)-1 &&mod L\
-&= (k-1)(L^2 - 2L + 1) + k L - (k + 1) &&mod L\
-&= (k-1)(L^2 - 2L) + k L - 2 &&mod L\
-&= (k-1)(L^2 - L) + L - 2 &&mod L\
-&= L - 2 &&mod L\
-$ and 
-$
-d^((k))_1 
-&= L^(-1) ((k-1)(L-1)^2 + k(L-1) - 1 - (L-2))\
-&= L^(-1) ((k-1)(L^2 - 2L + 1)^2 + (k-1)(L-1))\
-&= L^(-1) (k-1)(L^2 - L)\
-&= (k-1)(L - 1)
-$
-Suppose the statement to hold for arbitrary $i >= 1$, we show it also holds for $i+1$.
-We find that 
-$
-v^((k))_(i+1) 
-&= (k-(i+1))(L-1)^2 + (k-i)(L-1) &&mod L\
-&= (k-i-1)(L^2 - 2L + 1) + (k-i-1)(L-1) + L-1 &&mod L\
-&= (k-i-1)(L^2 - L) + L-1 &&mod L\
-&= L-1 &&mod L\
+&= V^(-1) dot ((i+1)M(V^2 - 2V) + V(A + i M - delta))\
+&= (i+1)M(V - 2) + A + i M - delta
 $ 
-and subsequently that
-$
-d^((k))_(i+1)
-&= L^(-1) dot ((k-(i+1))(L-1)^2 + (k-i)(L - 1) - (L-1))\
-&= L^(-1) dot ((k-(i+1))(L^2 - 2L + 1) + (k-(i+1))(L - 1))\
-&= L^(-1) dot (k-(i+1))(L^2 - L)\
-&= (k-(i+1))(L - 1)\
-$
 $qed$
 
-In particular, note that for shared $L>2$, it holds that
+== Corollary 1
+Let $L$ be a number of limbs, $b$ be the number of bits per limb, $M in [0, L)$ the number of multiplications in the formula, and $A in [0, L)$ the number of additions.
+The maximum value of the carry is
 $
-c_1 <= c_2 <= dots <= c_k = k(L-1) - 1 >= (k-1)(L-1) = d^((k))_1 >= dots >= d^((k))_k
+  L M (2^b-1) + A - M - delta_(M < A)
 $
-Combining lemmas 1 and 2, we find that the multiplication of two numbers that are both represented using $k$ $b$-bit limbs will have an upper bound on the carry value equal to $k(2^b-1) - 1$.
 
-
+Applying the corollary to the relations
+$
+  x_G dot x_G - (#`q0` dot p + #`x2`) &= 0\
+  y_G dot y_G - (#`x2` dot x_G + #`q1` dot p) &= 0\
+  
+   lambda dot x_G + #`q0` dot p + y_A - (lambda dot x_A + y_G) &= 0\
+   2 lambda dot y_A + #`q0` dot p - 3x_A dot x_A  &= 0\
+  lambda^2 - (#`q1` dot p + x_R + 2x_A) &= 0\
+  lambda^2 - (#`q1` dot p + x_R + x_A + x_G) &= 0\
+  lambda dot x_A + #`q2` dot p - (lambda dot x_R + y_A + y_R)  &= 0\
+$
+We find that the carries for sixteen 8-bit limbs are in the range
+$
+  (1): [-8160, 8159]\
+  (2): [-16318, 8159]\
+  (3): [-24477, 24477]\
+  (4): [-8161, 8159]\
+  (5): [-8160, 16318]\
+$
