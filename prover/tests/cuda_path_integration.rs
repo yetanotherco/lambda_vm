@@ -1,15 +1,15 @@
-//! End-to-end GPU path coverage. Proves a real ELF with the `cuda` feature on
-//! and asserts every dispatch counter introduced by the cuda backend actually
-//! fired. Catches silent CPU-fallback regressions where the prover would still
-//! emit a valid proof but the GPU path got skipped (size below threshold, type
-//! mismatch, handle plumbing broken, etc.).
+//! End-to-end GPU path coverage. Proves a real ELF with the `cuda` feature on,
+//! asserts every dispatch counter introduced by the cuda backend actually
+//! fired, then verifies the produced proof. Catches both silent CPU-fallback
+//! regressions (GPU path skipped while the proof still verifies) and bad-proof
+//! regressions (GPU path fired but produced output that fails verification).
 //!
 //! `#[ignore]`'d so the no-GPU CI path skips it. Run via `make test-cuda-integration`
 //! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture`.
 #![cfg(feature = "cuda")]
 
-use lambda_vm_prover::prove;
 use lambda_vm_prover::test_utils::asm_elf_bytes;
+use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_comp_poly_tree_calls, gpu_deep_calls, gpu_fri_calls, gpu_lde_calls,
     gpu_parts_lde_calls, reset_all_gpu_call_counters,
@@ -25,7 +25,7 @@ fn gpu_path_fires_end_to_end() {
 
     reset_all_gpu_call_counters();
 
-    let _ = prove(&elf).expect("prove");
+    let proof = prove(&elf).expect("prove");
 
     // R1 main + aux fused LDE+Merkle. Fires for every table above the LDE
     // threshold; fib_iterative_1M has plenty.
@@ -56,4 +56,10 @@ fn gpu_path_fires_end_to_end() {
     // `commit_phase_from_evaluations`); each call drives all FRI layers
     // device-side internally.
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
+
+    // Verify the GPU-produced proof. Catches the worst regression class:
+    // GPU dispatches fire but the device path produces a proof that
+    // doesn't satisfy the verifier.
+    let ok = verify(&proof, &elf).expect("verify");
+    assert!(ok, "GPU-produced proof failed verification");
 }
