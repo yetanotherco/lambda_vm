@@ -1052,6 +1052,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
         None,
         true,
+        None,
     );
 
     let proof = multi_prove_ram(
@@ -1070,6 +1071,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
         None,
         true,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);

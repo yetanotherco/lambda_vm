@@ -349,6 +349,7 @@ impl VmAirs {
     /// rejected, never silently accepted: it either mismatches the prover's
     /// committed precomputed root (an explicit verifier check) or yields
     /// diverging Fiat-Shamir challenges.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -357,6 +358,7 @@ impl VmAirs {
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
         include_halt: bool,
+        register_init: Option<&std::collections::HashMap<u64, u32>>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -407,8 +409,11 @@ impl VmAirs {
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
+        let register_init = register_init
+            .cloned()
+            .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
+            register::preprocessed_commitment(proof_options, &register_init),
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs
@@ -673,6 +678,7 @@ pub fn prove_with_options_and_inputs(
         &table_counts,
         None,
         true,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -818,6 +824,7 @@ pub fn verify_with_options(
         &vm_proof.table_counts,
         decode_commitment,
         true,
+        None,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.

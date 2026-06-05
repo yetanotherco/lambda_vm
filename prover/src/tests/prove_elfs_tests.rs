@@ -60,6 +60,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &table_counts,
         None,
         true,
+        None,
     );
 
     // Build air_trace_pairs for all tables
@@ -111,6 +112,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         &table_counts,
         None,
         true,
+        None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -151,6 +153,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &vm_proof.table_counts,
         None,
         true,
+        None,
     );
     let air_refs = airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1168,6 +1171,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1185,6 +1189,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1916,6 +1921,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1932,6 +1938,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1982,6 +1989,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1998,6 +2006,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -2083,6 +2092,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2099,6 +2109,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -2245,7 +2256,16 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         branch: 0,
         memw_register: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, true);
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &[],
+        &zero_counts,
+        None,
+        true,
+        None,
+    );
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 8);
@@ -2700,11 +2720,14 @@ fn test_prove_first_epoch_without_halt() {
         .unwrap();
     assert!(epochs.len() >= 2);
 
-    // Epoch 0's starting memory is the ELF image; it does not halt (is_final=false).
+    // Epoch 0's starting memory/registers are the program-start image; it does
+    // not halt (is_final=false).
     let image = build_initial_image(&elf, &[]);
+    let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
     let mut traces = Traces::from_image_and_logs(
         &elf,
         &image,
+        &register_init,
         &epochs[0].logs,
         &MaxRowsConfig::default(),
         &[],
@@ -2724,6 +2747,7 @@ fn test_prove_first_epoch_without_halt() {
         &table_counts,
         None,
         false,
+        None,
     );
 
     let multi_proof = multi_prove_ram(
@@ -2749,5 +2773,90 @@ fn test_prove_first_epoch_without_halt() {
             &expected_bus_balance,
         ),
         "first epoch (HALT excluded) failed to verify"
+    );
+}
+
+/// Prove and verify a NON-first continuation epoch (epoch 1) in isolation. Its
+/// starting memory and registers come from epoch 0's boundary snapshot, and it
+/// does not terminate (HALT excluded).
+#[test]
+fn test_prove_second_epoch_from_snapshot() {
+    use crate::compute_expected_commit_bus_balance;
+    use crate::tables::register;
+    use crate::test_utils::asm_elf_bytes;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Split so epoch 1 is an intermediate epoch (not first, not last).
+    let total = Executor::new(&elf, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 3, "need an intermediate epoch 1");
+
+    // Epoch 1 starts from epoch 0's ending memory + register snapshot.
+    let image: std::collections::HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
+    let register_init =
+        register::register_init_from_snapshot(&epochs[0].end_registers, epochs[0].end_pc);
+
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[1].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    // The REGISTER commitment is built from this epoch's boundary register init.
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        Some(&register_init),
+    );
+
+    let multi_proof = multi_prove_ram(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("second epoch failed to prove");
+
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance(
+        &airs.air_refs(),
+        &multi_proof,
+        &traces.public_output_bytes,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify(
+            &airs.air_refs(),
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "second epoch (register init from snapshot) failed to verify"
     );
 }

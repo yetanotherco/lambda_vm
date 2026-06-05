@@ -17,7 +17,7 @@ fn test_register_base_address() {
 fn test_generate_register_trace_empty() {
     let entry_point = 0x1000u64;
     let final_state = FinalRegisterStateMap::new();
-    let trace = generate_register_trace(&final_state, entry_point);
+    let trace = generate_register_trace(&final_state, &register_init_from_entry_point(entry_point));
 
     // Should have power-of-2 rows >= 67 (x0-x31, x254, x255)
     assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
@@ -66,7 +66,7 @@ fn test_generate_register_trace_with_access() {
         },
     );
 
-    let trace = generate_register_trace(&final_state, entry_point);
+    let trace = generate_register_trace(&final_state, &register_init_from_entry_point(entry_point));
 
     // Row 10 (address 10) should have the final state
     assert_eq!(*trace.main_table.get(10, cols::OFFSET), FE::from(10u64));

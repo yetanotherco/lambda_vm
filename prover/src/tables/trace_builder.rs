@@ -163,6 +163,24 @@ impl RegisterState {
         }
     }
 
+    /// Seed register state from a register init map (word address -> value), so
+    /// the first access in a continuation epoch reads the epoch's boundary
+    /// register values as `old_value`. All initial timestamps are 1, matching the
+    /// REGISTER table's init token. Mirrors `MemoryState::from_image`.
+    fn from_init_map(init: &HashMap<u64, u32>) -> Self {
+        let word = |addr: u64| init.get(&addr).copied().unwrap_or(0) as u64;
+        let mut regs = [(0u64, 1u64); 32];
+        for reg in 0..32u64 {
+            let base = reg * 2;
+            regs[reg as usize] = (word(base) | (word(base + 1) << 32), 1);
+        }
+        Self {
+            regs,
+            index_register: (init.get(&508).copied().unwrap_or(0), 1),
+            pc_register: (word(510) | (word(511) << 32), 1),
+        }
+    }
+
     /// Read a register. Returns (value, last_write_timestamp).
     fn read(&self, reg: u8) -> RegisterCell {
         self.regs[reg as usize]
@@ -2205,7 +2223,7 @@ fn build_traces(
     ops: CollectedOps,
     initial_image: Option<&HashMap<u64, u8>>,
     memory_state: &MemoryState,
-    entry_point: u64,
+    register_init: &HashMap<u64, u32>,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
     register_state: RegisterState,
@@ -2404,7 +2422,7 @@ fn build_traces(
                         Some(image) => generate_page_tables(image, memory_state, private_input),
                         None => (Vec::new(), Vec::new()),
                     },
-                    || register::generate_register_trace(&register_final_state, entry_point),
+                    || register::generate_register_trace(&register_final_state, register_init),
                 )
             },
             || halt::generate_halt_trace(halt_timestamp),
@@ -2428,7 +2446,7 @@ fn build_traces(
                 page_configs = Vec::new();
             }
         }
-        register_trace = register::generate_register_trace(&register_final_state, entry_point);
+        register_trace = register::generate_register_trace(&register_final_state, register_init);
         halt_trace = halt::generate_halt_trace(halt_timestamp);
     }
 
@@ -3060,9 +3078,11 @@ impl Traces {
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         let initial_image = build_initial_image(elf, private_input);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
         Self::from_image_and_logs(
             elf,
             &initial_image,
+            &register_init,
             logs,
             max_rows,
             private_input,
@@ -3076,15 +3096,19 @@ impl Traces {
     /// initial-memory image (the epoch's starting memory) rather than the ELF
     /// image. `elf` is still used for the program code (DECODE) and entry point.
     ///
+    /// `register_init` is the epoch's starting register image (word address ->
+    /// value): the program-start image for the first epoch, or an epoch's boundary
+    /// register snapshot for later epochs. It seeds both `RegisterState` (for
+    /// first-access old values) and the REGISTER table's init column.
+    ///
     /// `is_final` marks the last epoch: it applies HALT finalization (zeroize
     /// registers, require the terminating ECALL). Intermediate epochs (`false`)
     /// skip HALT and keep their boundary register/memory state.
-    ///
-    /// Note (naive continuations): register init still comes from the entry
-    /// point (zeros). Chaining register state across epochs is not handled here.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_image_and_logs(
         elf: &Elf,
         initial_image: &HashMap<u64, u8>,
+        register_init: &HashMap<u64, u32>,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
@@ -3103,7 +3127,7 @@ impl Traces {
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
-        let mut register_state = RegisterState::new(elf.entry_point);
+        let mut register_state = RegisterState::from_init_map(register_init);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -3125,7 +3149,7 @@ impl Traces {
             ops,
             Some(initial_image),
             &memory_state,
-            elf.entry_point,
+            register_init,
             decode_trace,
             decode_pc_to_row,
             register_state,
@@ -3154,6 +3178,7 @@ impl Traces {
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::new();
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
+        let register_init = register::register_init_from_entry_point(entry_point);
         let mut register_state = RegisterState::new(entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
@@ -3179,7 +3204,7 @@ impl Traces {
             ops,
             None,
             &memory_state,
-            entry_point,
+            &register_init,
             decode_trace,
             decode_pc_to_row,
             register_state,

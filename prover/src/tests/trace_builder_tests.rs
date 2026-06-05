@@ -849,9 +849,12 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
     .unwrap();
 
     let image = build_initial_image(&program, &[]);
+    let register_init =
+        crate::tables::register::register_init_from_entry_point(program.entry_point);
     let from_image = Traces::from_image_and_logs(
         &program,
         &image,
+        &register_init,
         &logs,
         &max_rows,
         &[],
@@ -931,17 +934,27 @@ fn test_build_traces_for_all_epochs() {
     let last = epochs.len() - 1;
 
     for (i, epoch) in epochs.iter().enumerate() {
-        // Epoch 0 starts from the ELF image; later epochs from the previous
-        // epoch's ending memory snapshot.
-        let image: HashMap<u64, u8> = if i == 0 {
-            build_initial_image(&program, &[])
+        // Epoch 0 starts from the program-start image; later epochs from the
+        // previous epoch's ending memory + register snapshot.
+        let (image, register_init): (HashMap<u64, u8>, HashMap<u64, u32>) = if i == 0 {
+            (
+                build_initial_image(&program, &[]),
+                crate::tables::register::register_init_from_entry_point(program.entry_point),
+            )
         } else {
-            epochs[i - 1].end_memory.iter_bytes().collect()
+            (
+                epochs[i - 1].end_memory.iter_bytes().collect(),
+                crate::tables::register::register_init_from_snapshot(
+                    &epochs[i - 1].end_registers,
+                    epochs[i - 1].end_pc,
+                ),
+            )
         };
 
         let traces = Traces::from_image_and_logs(
             &program,
             &image,
+            &register_init,
             &epoch.logs,
             &max_rows,
             &[],
