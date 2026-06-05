@@ -11,14 +11,14 @@ on:
       - 'crypto/**'
       - 'executor/**'
       - 'bin/cli/**'
-  # Uncomment to auto-run on PRs:
-  # pull_request:
-  #   branches: [main]
-  #   paths:
-  #     - 'prover/**'
-  #     - 'crypto/**'
-  #     - 'executor/**'
-  #     - 'bin/cli/**'
+  # TEMP (PR #593 experiment): auto-run on PR pushes to measure target-cpu=native. Revert before merge.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - 'bin/cli/**'
 
 permissions:
   contents: read
@@ -36,6 +36,9 @@ env:
   BENCH_RUNS_BASELINE: 3
   GROWTH_PROGRAMS: "fib_iterative_1M fib_iterative_2M fib_iterative_4M fib_iterative_8M"
   GROWTH_STEPS: "1000000 2000000 4000000 8000000"
+  # TEMP (PR #593 experiment): build PR + baseline-main with native ISA (AVX2/AVX-512 on the EPYC bench box).
+  # Inherited by every cargo build step and survives `git checkout origin/main`. Revert before merge.
+  RUSTFLAGS: "-C target-cpu=native"
 
 jobs:
   benchmark:
@@ -44,6 +47,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench') &&
@@ -142,6 +146,10 @@ jobs:
             TABLE_K="1"
           elif [ "$EVENT_NAME" = "issue_comment" ]; then
             TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # TEMP (PR #593 experiment): serial to match the Mac's 8% measurement, and k=1 has no
+            # cached baseline -> forces a fresh `main` rebuild (also native) for a clean A/B.
+            TABLE_K="1"
           fi
           echo "table_parallelism=${TABLE_K:-}" >> "$GITHUB_OUTPUT"
           echo "k_tag=${TABLE_K:-auto}" >> "$GITHUB_OUTPUT"
