@@ -81,77 +81,105 @@ impl Memory {
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(4) {
+            let bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            Ok(u32::from_le_bytes(bytes))
+        } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+            Ok(u32::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address + 1),
+                self.load_byte(address + 2),
+                self.load_byte(address + 3),
+            ]))
         }
-        let bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        Ok(u32::from_le_bytes(bytes))
     }
 
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
-        }
         let bytes = value.to_le_bytes();
-        self.cells.insert(address, bytes);
+        if address.is_multiple_of(4) {
+            self.cells.insert(address, bytes);
+        } else {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address + i as u64, *b);
+            }
+        }
         Ok(())
     }
 
     /// Load a doubleword (64-bit) from memory - for LD instruction
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(8) {
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
+            let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
+            let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
+            let low = u32::from_le_bytes(low_bytes) as u64;
+            let high = u32::from_le_bytes(high_bytes) as u64;
+            Ok(low | (high << 32))
+        } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+            let mut bytes = [0u8; 8];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = self.load_byte(address + i as u64);
+            }
+            Ok(u64::from_le_bytes(bytes))
         }
-        let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
-        let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
-        let low = u32::from_le_bytes(low_bytes) as u64;
-        let high = u32::from_le_bytes(high_bytes) as u64;
-        Ok(low | (high << 32))
     }
 
     /// Store a doubleword (64-bit) to memory - for SD instruction
     pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(8) {
-            return Err(MemoryError::UnalignedAccess);
+        if address.is_multiple_of(8) {
+            let low = (value & 0xFFFFFFFF) as u32;
+            let high = (value >> 32) as u32;
+            // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
+            self.cells.insert(address, low.to_le_bytes());
+            self.cells.insert(address + 4, high.to_le_bytes());
+        } else {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+            let bytes = value.to_le_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                self.store_byte(address + i as u64, *b);
+            }
         }
-        let low = (value & 0xFFFFFFFF) as u32;
-        let high = (value >> 32) as u32;
-        self.cells.insert(address, low.to_le_bytes());
-        self.cells.insert(address + 4, high.to_le_bytes());
         Ok(())
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        if !address.is_multiple_of(2) {
-            unimplemented!(
-                "Unaligned load half memory access at address 0x{:016x}",
-                address
-            );
+        if address.is_multiple_of(2) {
+            let aligned_address = address - address % 4;
+            let bytes = self
+                .cells
+                .get(&aligned_address)
+                .cloned()
+                .unwrap_or_default();
+            let offset = (address % 4) as usize;
+            Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+        } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+            Ok(u16::from_le_bytes([
+                self.load_byte(address),
+                self.load_byte(address + 1),
+            ]))
         }
-        let aligned_address = address - address % 4;
-        let bytes = self
-            .cells
-            .get(&aligned_address)
-            .cloned()
-            .unwrap_or_default();
-        let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
-        Ok(u16::from_le_bytes(
-            value.try_into().map_err(|_| MemoryError::LoadHalf)?,
-        ))
     }
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(2) {
-            return Err(MemoryError::UnalignedAccess);
-        }
-        let aligned_address = address - address % 4;
-        let entry = self
-            .cells
-            .entry(aligned_address)
-            .or_insert_with(|| [0, 0, 0, 0]);
         let bytes = value.to_le_bytes();
-        entry[(address % 4) as usize] = bytes[0];
-        entry[(address % 4) as usize + 1] = bytes[1];
+        if address.is_multiple_of(2) {
+            let aligned_address = address - address % 4;
+            let entry = self
+                .cells
+                .entry(aligned_address)
+                .or_insert_with(|| [0, 0, 0, 0]);
+            let offset = (address % 4) as usize;
+            entry[offset] = bytes[0];
+            entry[offset + 1] = bytes[1];
+        } else {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+            self.store_byte(address, bytes[0]);
+            self.store_byte(address + 1, bytes[1]);
+        }
         Ok(())
     }
 
@@ -213,7 +241,11 @@ impl Memory {
 
     /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
     /// Should only be used to write to public output and private input where these limitations are not a problem
-    fn set_bytes_aligned(&mut self, mut addr: u64, inputs: &[u8]) -> Result<(), MemoryError> {
+    pub(crate) fn set_bytes_aligned(
+        &mut self,
+        mut addr: u64,
+        inputs: &[u8],
+    ) -> Result<(), MemoryError> {
         if !addr.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
@@ -229,8 +261,6 @@ impl Memory {
 
 #[derive(thiserror::Error, Debug)]
 pub enum MemoryError {
-    #[error("Failed to convert bytes to u16")]
-    LoadHalf,
     #[error("Unaligned memory access")]
     UnalignedAccess,
     #[error("Public output commit size exceeded")]
@@ -241,117 +271,4 @@ pub enum MemoryError {
     AddressOverflow,
     #[error("Failed to allocate memory for load_bytes")]
     AllocationFailed,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Memory;
-
-    #[test]
-    fn test_commit_public_output_single() {
-        let mut memory = Memory::default();
-        memory.store_byte(0x100, b'a');
-        memory.store_byte(0x101, b'b');
-
-        memory
-            .commit_public_output(0x100, 2)
-            .expect("commit should succeed");
-
-        assert_eq!(
-            memory
-                .read_return_value()
-                .expect("public output should be readable"),
-            b"ab".to_vec()
-        );
-    }
-
-    #[test]
-    fn test_commit_public_output_appends() {
-        let mut memory = Memory::default();
-        memory.store_byte(0x100, b'a');
-        memory.store_byte(0x101, b'b');
-        memory.store_byte(0x104, b'c');
-        memory.store_byte(0x105, b'd');
-
-        memory
-            .commit_public_output(0x100, 2)
-            .expect("first commit should succeed");
-        memory
-            .commit_public_output(0x104, 2)
-            .expect("second commit should succeed");
-
-        // Append semantics: calls concatenate (EF zkVM IO interface).
-        assert_eq!(
-            memory
-                .read_return_value()
-                .expect("public output should be readable"),
-            b"abcd".to_vec()
-        );
-    }
-
-    #[test]
-    fn test_commit_public_output_empty_is_ok() {
-        let mut memory = Memory::default();
-        memory
-            .commit_public_output(0, 0)
-            .expect("zero-length commit should succeed");
-        assert!(
-            memory
-                .read_return_value()
-                .expect("public output should be readable")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn test_commit_public_output_address_overflow() {
-        let mut memory = Memory::default();
-        let err = memory
-            .commit_public_output(u64::MAX, 2)
-            .expect_err("address overflow must error, not panic");
-        assert!(matches!(err, super::MemoryError::AddressOverflow));
-    }
-
-    #[test]
-    fn test_load_bytes_huge_len_returns_alloc_error() {
-        let memory = Memory::default();
-        // A multi-petabyte allocation request from a guest must fail cleanly,
-        // not abort the host process via OOM. `addr=0` and `len=1<<50` keep
-        // `checked_add` happy so the path reaches the allocation.
-        let huge = 1u64 << 50;
-        let err = memory
-            .load_bytes(0, huge)
-            .expect_err("huge alloc must error, not abort");
-        assert!(matches!(err, super::MemoryError::AllocationFailed));
-    }
-
-    #[test]
-    fn test_load_bytes_overflow_errors() {
-        let memory = Memory::default();
-        let err = memory
-            .load_bytes(u64::MAX, 2)
-            .expect_err("address overflow must error, not panic");
-        assert!(matches!(err, super::MemoryError::AddressOverflow));
-    }
-
-    #[test]
-    fn test_commit_public_output_total_cap() {
-        let mut memory = Memory::default();
-        // Seed enough source bytes for two 512 KB writes.
-        let chunk = vec![0xAB; 512 * 1024];
-        memory
-            .set_bytes_aligned(0x1_0000, &chunk)
-            .expect("seed should succeed");
-
-        memory
-            .commit_public_output(0x1_0000, 512 * 1024)
-            .expect("first 512 KB commit should succeed");
-        memory
-            .commit_public_output(0x1_0000, 512 * 1024)
-            .expect("second 512 KB commit should succeed (total = 1 MB)");
-
-        // One more byte exceeds the 1 MB total cap.
-        let err = memory.commit_public_output(0x1_0000, 1).unwrap_err();
-        assert!(matches!(err, super::MemoryError::CommitSizeExceeded));
-    }
 }

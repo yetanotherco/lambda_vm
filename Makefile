@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda bench-math-cuda build check clippy fmt lint
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -194,9 +194,24 @@ test-disk-spill:
 test-math-cuda:
 	cargo test -p math-cuda --release
 
+# End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
+# Asserts every R1/R2/R3 GPU counter fired on a real prove.
+test-cuda-integration:
+	cargo test -p lambda-vm-prover --release --features cuda \
+	    --test cuda_path_integration -- --ignored --nocapture
+
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
 	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
+
+# Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
+bench-prover:
+	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
+
+# Single-prove wall-time bench with the GPU LDE path enabled.
+# Needs an NVIDIA GPU + CUDA toolkit/driver.
+bench-prover-cuda:
+	cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
 
 # Build all
 build:

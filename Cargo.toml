@@ -12,6 +12,9 @@ members = [
 
 resolver = "2"
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 # Optimized dev builds: tests run fast without --release.
 # debug = true adds debug symbols for profiling/backtraces.
 [profile.dev]

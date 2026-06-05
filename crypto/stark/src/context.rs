@@ -13,9 +13,3 @@ pub struct AirContext {
     pub transition_offsets: Vec<usize>,
     pub num_transition_constraints: usize,
 }
-
-impl AirContext {
-    pub fn num_transition_constraints(&self) -> usize {
-        self.num_transition_constraints
-    }
-}
