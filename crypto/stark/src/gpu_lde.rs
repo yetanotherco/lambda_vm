@@ -1233,10 +1233,17 @@ where
 /// [`crate::fri::commit_phase_from_evaluations`]: per-layer transcript
 /// ping-pong (sample zeta, fold, build Merkle tree, append root).
 ///
-/// Falls back via `None` only at preconditions; once the loop starts the
-/// transcript is mutated layer-by-layer, so a mid-flight cudarc failure
-/// panics (CPU restart from the same evals would re-sample zeta_0 against
-/// an already-advanced transcript and produce a different proof).
+/// Returns `None` only at preconditions (type mismatch, below threshold,
+/// invalid sizes), before any transcript mutation, so the caller can
+/// safely run the CPU path on the same inputs.
+///
+/// # Panics
+///
+/// Panics if a cudarc call fails after the first layer's `zeta` has been
+/// sampled. By then the transcript is advanced and a CPU restart from the
+/// same evals would re-sample `zeta_0` against the mutated transcript,
+/// producing a different proof. Treat this function as a point of no
+/// return once it has started folding.
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E>(
     number_layers: usize,

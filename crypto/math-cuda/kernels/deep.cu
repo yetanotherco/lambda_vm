@@ -65,8 +65,6 @@ extern "C" __global__ void deep_composition_ext3_row(
         result = ext3::add(result, tmp);
     }
 
-    uint64_t num_total_cols = num_main + num_aux;
-
     // Main trace terms (base column - ext3 OOD)
     for (uint64_t j = 0; j < num_main; ++j) {
         uint64_t t_val = main_lde[j * lde_stride + row];
@@ -112,6 +110,4 @@ extern "C" __global__ void deep_composition_ext3_row(
     deep_out[out_idx + 0] = result.a;
     deep_out[out_idx + 1] = result.b;
     deep_out[out_idx + 2] = result.c;
-    // Suppress unused param warning when num_total_cols not referenced.
-    (void)num_total_cols;
 }

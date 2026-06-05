@@ -1,7 +1,9 @@
 //! Parallel Montgomery batch inverse on the GPU for ext3 elements, plus
 //! the R3 OOD / R4 DEEP `compute-denoms + invert` convenience fn.
 
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use std::sync::Arc;
+
+use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
@@ -28,11 +30,31 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
 
     let be = backend()?;
     let stream = be.next_stream();
-
-    // H2D input.
     let a_dev = stream.clone_htod(a)?;
+    batch_inverse_pipeline(&stream, &a_dev, n)
+}
 
-    // Scratch buffers.
+/// Same as [`batch_inverse_ext3`] but the input is already on device
+/// (typically from `compute_denoms_ext3`). Avoids one H2D round-trip.
+pub fn batch_inverse_ext3_dev(a_dev: &CudaSlice<u64>, n: usize) -> Result<Vec<u64>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let be = backend()?;
+    let stream = be.next_stream();
+    batch_inverse_pipeline(&stream, a_dev, n)
+}
+
+/// Shared Blelloch chunk-scan pipeline: prefix scan, suffix scan,
+/// per-chunk offset application, host inversion of the total, and
+/// combine. Requires `n >= 1`.
+fn batch_inverse_pipeline(
+    stream: &Arc<CudaStream>,
+    a_dev: &CudaSlice<u64>,
+    n: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+
     let mut prefix_dev = stream.alloc_zeros::<u64>(n * 3)?;
     let mut suffix_dev = stream.alloc_zeros::<u64>(n * 3)?;
 
@@ -44,16 +66,17 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     let n_u64 = n as u64;
     let k_u64 = k as u64;
 
-    // Phase 1: chunk prefix scan.
     let cfg_scan = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (k, 1, 1),
         shared_mem_bytes: 0,
     };
+
+    // Phase 1: chunk prefix scan.
     unsafe {
         stream
             .launch_builder(&be.chunk_prefix_scan_ext3)
-            .arg(&a_dev)
+            .arg(a_dev)
             .arg(&n_u64)
             .arg(&c_per_thread)
             .arg(&mut prefix_dev)
@@ -92,7 +115,7 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     unsafe {
         stream
             .launch_builder(&be.chunk_suffix_scan_ext3)
-            .arg(&a_dev)
+            .arg(a_dev)
             .arg(&n_u64)
             .arg(&c_per_thread)
             .arg(&mut suffix_dev)
@@ -132,128 +155,6 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     stream.memcpy_htod(&total, &mut inv_total_dev)?;
 
     // Combine.
-    let mut out_dev = stream.alloc_zeros::<u64>(n * 3)?;
-    let cfg_combine = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(COMBINE_BLOCK), 1, 1),
-        block_dim: (COMBINE_BLOCK, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream
-            .launch_builder(&be.batch_inverse_combine_ext3)
-            .arg(&prefix_dev)
-            .arg(&suffix_dev)
-            .arg(&inv_total_dev)
-            .arg(&n_u64)
-            .arg(&mut out_dev)
-            .launch(cfg_combine)?;
-    }
-
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
-    Ok(out)
-}
-
-/// Same as [`batch_inverse_ext3`] but the input is already on device
-/// (typically from `compute_denoms_ext3`). Avoids one H2D round-trip.
-pub fn batch_inverse_ext3_dev(a_dev: &CudaSlice<u64>, n: usize) -> Result<Vec<u64>> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let be = backend()?;
-    let stream = be.next_stream();
-
-    let mut prefix_dev = stream.alloc_zeros::<u64>(n * 3)?;
-    let mut suffix_dev = stream.alloc_zeros::<u64>(n * 3)?;
-
-    let k: u32 = SCAN_THREADS;
-    let c_per_thread: u64 = (n as u64).div_ceil(k as u64);
-    let mut chunk_totals = stream.alloc_zeros::<u64>((k as usize) * 3)?;
-    let mut chunk_offsets = stream.alloc_zeros::<u64>((k as usize) * 3)?;
-    let n_u64 = n as u64;
-    let k_u64 = k as u64;
-
-    let cfg_scan = LaunchConfig {
-        grid_dim: (1, 1, 1),
-        block_dim: (k, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        stream
-            .launch_builder(&be.chunk_prefix_scan_ext3)
-            .arg(a_dev)
-            .arg(&n_u64)
-            .arg(&c_per_thread)
-            .arg(&mut prefix_dev)
-            .arg(&mut chunk_totals)
-            .launch(cfg_scan)?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.exclusive_scan_of_totals_ext3)
-            .arg(&chunk_totals)
-            .arg(&k_u64)
-            .arg(&mut chunk_offsets)
-            .launch(LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.apply_scan_offsets_ext3)
-            .arg(&mut prefix_dev)
-            .arg(&n_u64)
-            .arg(&c_per_thread)
-            .arg(&chunk_offsets)
-            .launch(cfg_scan)?;
-    }
-
-    let mut suffix_chunk_totals = stream.alloc_zeros::<u64>((k as usize) * 3)?;
-    let mut suffix_chunk_offsets = stream.alloc_zeros::<u64>((k as usize) * 3)?;
-    unsafe {
-        stream
-            .launch_builder(&be.chunk_suffix_scan_ext3)
-            .arg(a_dev)
-            .arg(&n_u64)
-            .arg(&c_per_thread)
-            .arg(&mut suffix_dev)
-            .arg(&mut suffix_chunk_totals)
-            .launch(cfg_scan)?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.exclusive_reverse_scan_of_totals_ext3)
-            .arg(&suffix_chunk_totals)
-            .arg(&k_u64)
-            .arg(&mut suffix_chunk_offsets)
-            .launch(LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    unsafe {
-        stream
-            .launch_builder(&be.apply_reverse_scan_offsets_ext3)
-            .arg(&mut suffix_dev)
-            .arg(&n_u64)
-            .arg(&c_per_thread)
-            .arg(&suffix_chunk_offsets)
-            .launch(cfg_scan)?;
-    }
-
-    let total = {
-        let last_view = prefix_dev.slice((n - 1) * 3..n * 3);
-        let last_host: Vec<u64> = stream.clone_dtoh(&last_view)?;
-        stream.synchronize()?;
-        invert_ext3_host([last_host[0], last_host[1], last_host[2]])
-    };
-    let mut inv_total_dev = stream.alloc_zeros::<u64>(3)?;
-    stream.memcpy_htod(&total, &mut inv_total_dev)?;
-
     let mut out_dev = stream.alloc_zeros::<u64>(n * 3)?;
     let cfg_combine = LaunchConfig {
         grid_dim: ((n as u32).div_ceil(COMBINE_BLOCK), 1, 1),
@@ -412,6 +313,9 @@ fn invert_ext3_host(x: [u64; 3]) -> [u64; 3] {
     let two_ce = gl_add(ce, ce);
     let norm = gl_add(ad, gl_add(two_bf, two_ce));
 
+    // gl_inv(0) = 0^(p-2) = 0 mod p; without this assert we would silently
+    // return [0,0,0] and poison the whole batch inverse.
+    assert!(norm != 0, "invert_ext3_host: input has zero norm");
     let inv_norm = gl_inv(norm);
     [
         gl_mul(d, inv_norm),

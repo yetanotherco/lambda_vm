@@ -141,6 +141,19 @@ fn deep_composition_ext3_impl(
     assert_eq!(inv_h.len(), domain_size * 3);
     assert_eq!(inv_t.len(), num_eval_points * domain_size * 3);
 
+    // Kernel reads `*_lde[c * lde_stride + i * blowup_factor]` for i in
+    // 0..domain_size. Reject inputs that would walk past the LDE buffer.
+    if domain_size > 0 {
+        let max_row = (domain_size - 1)
+            .checked_mul(blowup_factor)
+            .expect("deep composition: (domain_size - 1) * blowup_factor overflow");
+        assert!(
+            max_row < main_lde.lde_size,
+            "deep composition: kernel row {max_row} out of LDE stride {}",
+            main_lde.lde_size
+        );
+    }
+
     let be = backend()?;
     let stream = be.next_stream();
 
