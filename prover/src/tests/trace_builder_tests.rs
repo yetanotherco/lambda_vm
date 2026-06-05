@@ -835,11 +835,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
 
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
-    let logs = Executor::new(&program, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs;
+    let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
     let max_rows = MaxRowsConfig::default();
 
     let from_elf = Traces::from_elf_and_logs(
@@ -859,6 +855,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
         &logs,
         &max_rows,
         &[],
+        true,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -901,4 +898,62 @@ fn test_epoch_end_memory_converts_to_image() {
 
     let image: HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
     assert!(!image.is_empty());
+}
+
+/// Every epoch builds traces: intermediate epochs (`is_final = false`) skip HALT
+/// and start from the previous epoch's memory; the last epoch terminates.
+#[test]
+fn test_build_traces_for_all_epochs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let max_rows = MaxRowsConfig::default();
+    let last = epochs.len() - 1;
+
+    for (i, epoch) in epochs.iter().enumerate() {
+        // Epoch 0 starts from the ELF image; later epochs from the previous
+        // epoch's ending memory snapshot.
+        let image: HashMap<u64, u8> = if i == 0 {
+            build_initial_image(&program, &[])
+        } else {
+            epochs[i - 1].end_memory.iter_bytes().collect()
+        };
+
+        let traces = Traces::from_image_and_logs(
+            &program,
+            &image,
+            &epoch.logs,
+            &max_rows,
+            &[],
+            i == last,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .unwrap_or_else(|e| panic!("epoch {i} (is_final={}) failed to build: {e:?}", i == last));
+
+        assert!(
+            traces.table_counts().cpu > 0,
+            "epoch {i} produced an empty CPU trace"
+        );
+    }
 }

@@ -2098,11 +2098,16 @@ fn collect_all_ops(
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     register_state: &mut RegisterState,
+    is_final: bool,
 ) -> CollectedOps {
     // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
-    let halt_memw_ops = collect_halt_ops(register_state);
-    memw_ops.extend(halt_memw_ops);
+    // Only the final epoch terminates; intermediate epochs keep their boundary
+    // register state (no zeroizing) so it can seed the next epoch.
+    if is_final {
+        let halt_memw_ops = collect_halt_ops(register_state);
+        memw_ops.extend(halt_memw_ops);
+    }
 
     // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
     // Order matters: register ops would also pass is_aligned_op, so check first.
@@ -2207,6 +2212,7 @@ fn build_traces(
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
+    is_final: bool,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -2268,13 +2274,19 @@ fn build_traces(
     // PHASE 5: Generate final traces (parallelized)
     // =====================================================================
 
-    // Extract halt timestamp from the last ECALL instruction
-    let halt_op = cpu_ops
-        .iter()
-        .rev()
-        .find(|op| op.decode.op_ecall)
-        .ok_or(Error::MissingHaltEcall)?;
-    let halt_timestamp = halt_op.timestamp;
+    // Final epoch terminates on the program's ECALL. Intermediate epochs do not
+    // halt, so fall back to the last cycle's timestamp (placeholder: proving an
+    // intermediate epoch needs proper epoch-boundary finalization, not HALT).
+    let halt_timestamp = if is_final {
+        cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(Error::MissingHaltEcall)?
+            .timestamp
+    } else {
+        cpu_ops.last().map(|op| op.timestamp).unwrap_or(0)
+    };
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -3054,6 +3066,7 @@ impl Traces {
             logs,
             max_rows,
             private_input,
+            true,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3063,6 +3076,10 @@ impl Traces {
     /// initial-memory image (the epoch's starting memory) rather than the ELF
     /// image. `elf` is still used for the program code (DECODE) and entry point.
     ///
+    /// `is_final` marks the last epoch: it applies HALT finalization (zeroize
+    /// registers, require the terminating ECALL). Intermediate epochs (`false`)
+    /// skip HALT and keep their boundary register/memory state.
+    ///
     /// Note (naive continuations): register init still comes from the entry
     /// point (zeros). Chaining register state across epochs is not handled here.
     pub fn from_image_and_logs(
@@ -3071,6 +3088,7 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
+        is_final: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
@@ -3099,6 +3117,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             &mut register_state,
+            is_final,
         );
 
         // Phases 3-5
@@ -3114,6 +3133,7 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             storage_mode,
             private_input,
+            is_final,
         )
     }
 
@@ -3148,6 +3168,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             &mut register_state,
+            true,
         );
 
         // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
@@ -3166,6 +3187,7 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
             &[],
+            true,
         )
     }
 
