@@ -59,6 +59,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
 
     // Build air_trace_pairs for all tables
@@ -109,6 +110,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -148,6 +150,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &page_configs,
         &vm_proof.table_counts,
         None,
+        true,
     );
     let air_refs = airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1164,6 +1167,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1180,6 +1184,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &wrong_configs,
         &table_counts,
         None,
+        true,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1910,6 +1915,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1925,6 +1931,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &verifier_configs,
         &table_counts,
         None,
+        true,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -1974,6 +1981,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1989,6 +1997,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &wrong_configs,
         &table_counts,
         None,
+        true,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -2073,6 +2082,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2088,6 +2098,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &verifier_configs,
         &table_counts,
         None,
+        true,
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
@@ -2234,7 +2245,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         branch: 0,
         memw_register: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, true);
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 8);
@@ -2659,5 +2670,84 @@ fn test_count_elements_nonzero() {
     assert!(
         aux > 0,
         "total_auxiliary_field_elements should be nonzero (got {aux})"
+    );
+}
+
+/// Prove and verify the FIRST continuation epoch in isolation. Epoch 0 starts
+/// from the program's initial memory/registers (so its init is correct) and does
+/// not terminate, so it is proven with the HALT table excluded (`include_halt = false`).
+#[test]
+fn test_prove_first_epoch_without_halt() {
+    use crate::compute_expected_commit_bus_balance;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Split so epoch 0 is intermediate (the program spans more than one epoch).
+    let total = Executor::new(&elf, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // Epoch 0's starting memory is the ELF image; it does not halt (is_final=false).
+    let image = build_initial_image(&elf, &[]);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+    );
+
+    let multi_proof = multi_prove_ram(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("first epoch failed to prove");
+
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance(
+        &airs.air_refs(),
+        &multi_proof,
+        &traces.public_output_bytes,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify(
+            &airs.air_refs(),
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "first epoch (HALT excluded) failed to verify"
     );
 }

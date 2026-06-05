@@ -212,6 +212,9 @@ pub(crate) struct VmAirs {
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
+    /// Whether the HALT table participates in this proof. False for intermediate
+    /// continuation epochs, which do not terminate the program.
+    pub include_halt: bool,
 }
 
 impl VmAirs {
@@ -220,13 +223,15 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
-            (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
             (&self.keccak, &mut traces.keccak, &()),
             (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
             (&self.keccak_rc, &mut traces.keccak_rc, &()),
             (&self.register, &mut traces.register, &()),
         ];
+        if self.include_halt {
+            pairs.push((&self.halt, &mut traces.halt, &()));
+        }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
             pairs.push((air, trace, &()));
@@ -278,13 +283,15 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.bitwise,
             &self.decode,
-            &self.halt,
             &self.commit,
             &self.keccak,
             &self.keccak_rnd,
             &self.keccak_rc,
             &self.register,
         ];
+        if self.include_halt {
+            refs.push(&self.halt);
+        }
 
         for air in &self.cpus {
             refs.push(air);
@@ -349,6 +356,7 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
+        include_halt: bool,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -448,6 +456,7 @@ impl VmAirs {
             register,
             pages,
             memw_registers,
+            include_halt,
         }
     }
 }
@@ -663,6 +672,7 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         None,
+        true,
     );
 
     #[cfg(feature = "instruments")]
@@ -807,6 +817,7 @@ pub fn verify_with_options(
         &page_configs,
         &vm_proof.table_counts,
         decode_commitment,
+        true,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
