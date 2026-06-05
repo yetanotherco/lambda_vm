@@ -82,25 +82,16 @@ impl MemoryState {
         }
     }
 
-    /// Initialize memory state from ELF segments.
+    /// Initialize memory state from a pre-built initial-memory image.
     ///
-    /// Pre-populates all ELF bytes with timestamp=0 so that when MEMW first
+    /// Pre-populates all starting bytes with timestamp=0 so that when MEMW first
     /// accesses an address, it gets the correct initial value for `old_value`.
     /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
-    fn from_elf(elf: &Elf) -> Self {
-        let mut cells = HashMap::new();
-        for segment in &elf.data {
-            for (i, &word) in segment.values.iter().enumerate() {
-                let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
-                // Split 32-bit word into 4 bytes (little-endian)
-                for byte_offset in 0..4u64 {
-                    let byte_addr = word_addr.wrapping_add(byte_offset);
-                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                    // Initial state: value from ELF, timestamp=0
-                    cells.insert(byte_addr, (byte_value, 0));
-                }
-            }
-        }
+    fn from_image(image: &HashMap<u64, u8>) -> Self {
+        let cells = image
+            .iter()
+            .map(|(&addr, &value)| (addr, (value, 0)))
+            .collect();
         Self { cells }
     }
 
@@ -114,18 +105,6 @@ impl MemoryState {
         let mask = !(page_size - 1);
         let pages: HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
         pages.len() as u64
-    }
-
-    /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
-    fn add_private_input(&mut self, private_input: &[u8]) {
-        if private_input.is_empty() {
-            return;
-        }
-        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-        let start = PRIVATE_INPUT_START_INDEX;
-        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
-            self.cells.insert(start + i as u64, (b, 0));
-        }
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
@@ -1482,50 +1461,55 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
-    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-    let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+/// Build the initial-memory image (byte address -> value) from the ELF segments
+/// and the private-input region. Single source of "what memory starts as", read
+/// by both `MemoryState` seeding and PAGE/bitwise init.
+fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
+    let mut image: HashMap<u64, u8> = HashMap::new();
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
-            let word_addr = segment.base_addr + (i as u64 * 4);
+            let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
             for byte_offset in 0..4u64 {
-                let byte_addr = word_addr + byte_offset;
+                let byte_addr = word_addr.wrapping_add(byte_offset);
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                let page_base = page::page_base_for_address(byte_addr, page_size);
-                let offset = page::offset_in_page(byte_addr, page_size);
-                let page_data = init_page_data
-                    .entry(page_base)
-                    .or_insert_with(|| vec![0u8; page_size]);
-                page_data[offset] = byte_value;
+                image.insert(byte_addr, byte_value);
             }
         }
     }
     if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
-            let addr = PRIVATE_INPUT_START_INDEX + i as u64;
-            let page_base = page::page_base_for_address(addr, page_size);
-            let offset = page::offset_in_page(addr, page_size);
-            let page_data = init_page_data
-                .entry(page_base)
-                .or_insert_with(|| vec![0u8; page_size]);
-            page_data[offset] = b;
+            image.insert(PRIVATE_INPUT_START_INDEX + i as u64, b);
         }
+    }
+    image
+}
+
+/// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
+fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+    for (&addr, &value) in image {
+        let page_base = page::page_base_for_address(addr, page_size);
+        let offset = page::offset_in_page(addr, page_size);
+        let page_data = init_page_data
+            .entry(page_base)
+            .or_insert_with(|| vec![0u8; page_size]);
+        page_data[offset] = value;
     }
     init_page_data
 }
 
 fn collect_bitwise_from_page(
-    elf: &Elf,
+    image: &HashMap<u64, u8>,
     memory_state: &MemoryState,
-    private_input: &[u8],
 ) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut bitwise_ops = Vec::new();
 
-    let elf_page_data = build_init_page_data(elf, private_input);
+    let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
@@ -1542,7 +1526,7 @@ fn collect_bitwise_from_page(
 
     // For each page and each byte, add ARE_BYTES lookups for init and fini
     for &page_base in &page_bases {
-        let init_data = elf_page_data.get(&page_base);
+        let init_data = init_page_data.get(&page_base);
 
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
@@ -1922,7 +1906,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
 /// every address accessed during execution (ELF init + runtime stores/loads).
 /// ELF pages get their init data from the binary; all others are zero-init.
 fn generate_page_tables(
-    elf: &Elf,
+    image: &HashMap<u64, u8>,
     memory_state: &MemoryState,
     private_input: &[u8],
 ) -> (
@@ -1933,8 +1917,8 @@ fn generate_page_tables(
 
     let page_size = page::DEFAULT_PAGE_SIZE;
 
-    // Collect init data from ELF segments + private input region
-    let init_page_data = build_init_page_data(elf, private_input);
+    // Per-page init bytes from the initial-memory image.
+    let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
@@ -2208,12 +2192,13 @@ fn collect_all_ops(
 
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
-/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
-/// and PAGE bitwise lookups; `None` produces empty page tables.
+/// `initial_image` controls PAGE table generation: `Some(image)` generates real
+/// PAGE tables and PAGE bitwise lookups seeded from the initial-memory image;
+/// `None` produces empty page tables.
 #[allow(clippy::too_many_arguments)]
 fn build_traces(
     ops: CollectedOps,
-    elf: Option<&Elf>,
+    initial_image: Option<&HashMap<u64, u8>>,
     memory_state: &MemoryState,
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -2257,8 +2242,8 @@ fn build_traces(
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
     // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
-    if let Some(elf) = elf {
-        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
+    if let Some(image) = initial_image {
+        bitwise_ops.extend(collect_bitwise_from_page(image, memory_state));
     }
 
     let public_output_bytes: Vec<u8> = commit_ops
@@ -2403,8 +2388,8 @@ fn build_traces(
         let ((pages_val, register_val), halt_val) = rayon::join(
             || {
                 rayon::join(
-                    || match elf {
-                        Some(elf) => generate_page_tables(elf, memory_state, private_input),
+                    || match initial_image {
+                        Some(image) => generate_page_tables(image, memory_state, private_input),
                         None => (Vec::new(), Vec::new()),
                     },
                     || register::generate_register_trace(&register_final_state, entry_point),
@@ -2420,9 +2405,9 @@ fn build_traces(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        match elf {
-            Some(elf) => {
-                let (p, c) = generate_page_tables(elf, memory_state, private_input);
+        match initial_image {
+            Some(image) => {
+                let (p, c) = generate_page_tables(image, memory_state, private_input);
                 pages = p;
                 page_configs = c;
             }
@@ -2547,8 +2532,7 @@ pub fn count_table_lengths(
     let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
 
     // Memory + register state for partition predicates that need timestamps.
-    let mut memory_state = MemoryState::from_elf(elf);
-    memory_state.add_private_input(private_input);
+    let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input));
     let mut register_state = RegisterState::new(elf.entry_point);
 
     // Raw counts (pre-chunking + pre-padding).
@@ -2946,7 +2930,7 @@ impl Traces {
         use std::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
-        let init_page_data = build_init_page_data(elf, &[]);
+        let init_page_data = build_init_page_data(&build_initial_image(elf, &[]));
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
 
@@ -3074,8 +3058,8 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // Phase 2: Collect + route all ops
-        let mut memory_state = MemoryState::from_elf(elf);
-        memory_state.add_private_input(private_input);
+        let initial_image = build_initial_image(elf, private_input);
+        let mut memory_state = MemoryState::from_image(&initial_image);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
@@ -3095,7 +3079,7 @@ impl Traces {
         // Phases 3-5
         build_traces(
             ops,
-            Some(elf),
+            Some(&initial_image),
             &memory_state,
             elf.entry_point,
             decode_trace,
