@@ -36,12 +36,12 @@ type = "Bit"
 desc = "whether to double (0) or add (1)"
 
 [[variables.output]]
-name = "Rx"
+name = "xR"
 type = "U256BL"
 desc = "$x_#`R`$"
 
 [[variables.output]]
-name = "Ry"
+name = "yR"
 type = "U256BL"
 desc = "$y_#`R`$"
 
@@ -95,6 +95,11 @@ name = "c2"
 type = ["BaseField", 64]
 desc = "carries used to constrain `yR`"
 
+[[variables.auxiliary]]
+name = "next_op"
+type = "Bit"
+desc = "`op`-flag for the next iteration"
+
 [[variables.virtual]]
 name = "XG"
 type = "U512BL"
@@ -116,18 +121,18 @@ def = {polys=[
 [[variables.virtual]]
 name = "XA"
 type = "U512BL"
-desc = "zero-extension of `xH`"
+desc = "zero-extension of `xA`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "xH", "i"]},
+    {iter=["i", 0, 31], poly=["idx", "xA", "i"]},
     {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
 name = "YA"
 type = "U512BL"
-desc = "zero-extension of `yH`"
+desc = "zero-extension of `yA`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "yH", "i"]},
+    {iter=["i", 0, 31], poly=["idx", "yA", "i"]},
     {iter=["i", 32, 63], poly=0},
 ]}
 
@@ -190,12 +195,12 @@ name = "P"
 type = "U512BL"
 desc = "zero-extension of `P`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "P", "i"]},
+    {iter=["i", 0, 31], poly=["idx", "p", "i"]},
     {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.constant]]
-name = "P"
+name = "p"
 type = "U256BL"
 desc = "Prime field modulus"
 
@@ -209,7 +214,7 @@ name = "receive"
 
 [[constraints.receive]]
 kind = "interaction"
-tag = "ECDA"
+tag = "ECDAS"
 input = ["timestamp", "xA", "yA", "xG", "yG", "round", "op"]
 multiplicity = ["-", "μ"]
 
@@ -218,18 +223,18 @@ multiplicity = ["-", "μ"]
 name = "lambda"
 
 [[constraints.lambda]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "λ", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.lambda]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q0", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.lambda]]
 kind = "interaction"
@@ -292,6 +297,7 @@ iter = ["i", 1, 63]
 [[constraints.lambda]]
 kind = "arith"
 constraint = "$#`c0`_63 = 0$"
+poly = ["idx", "c0", 63]
 
 [[constraints.lambda]]
 kind = "interaction"
@@ -305,18 +311,18 @@ ref = "ecda:c:range_c0"
 name = "xR"
 
 [[constraints.xR]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "xR", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.xR]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q1", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.xR]]
 kind = "interaction"
@@ -362,6 +368,7 @@ iter = ["i", 1, 63]
 [[constraints.lambda]]
 kind = "arith"
 constraint = "$#`c1`_63 = 0$"
+poly = ["idx", "c1", 63]
 
 [[constraints.xR]]
 kind = "interaction"
@@ -375,18 +382,18 @@ multiplicity = "μ"
 name = "yR"
 
 [[constraints.yR]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "yR", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.yR]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q2", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.yR]]
 kind = "interaction"
@@ -431,6 +438,7 @@ iter = ["i", 1, 63]
 [[constraints.yR]]
 kind = "arith"
 constraint = "$#`c2`_63 = 0$"
+poly = ["idx", "c2", 63]
 
 [[constraints.yR]]
 kind = "interaction"
@@ -464,7 +472,7 @@ ref = "ecdas:c:next_op_implies_mu"
 
 [[constraints.send]]
 kind = "interaction"
-tag = "ECDA"
+tag = "ECDAS"
 input = ["timestamp", "xR", "yR", "xG", "yG", ["-", "round", "op"], "next_op"]
 multiplicity = "μ"
 ref = "ecdas:c:send"

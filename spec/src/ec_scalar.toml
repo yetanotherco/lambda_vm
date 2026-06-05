@@ -80,7 +80,7 @@ iter = ["i", 0, 7]
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "addr_k", ["arr", "limb", 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+input = [0, "addr", ["arr", "limb", 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
 output = ["arr", "limb", 0, 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 

@@ -76,7 +76,7 @@ type = ["BaseField", 64]
 desc = "raw intermediates of $#`yG`^2 - #`xG` dot #`x2` - #`q` dot #`P`$"
 
 [[variables.auxiliary]]
-name = "q1_msb"
+name = "msb_q1"
 type = "Byte"
 desc = "most significant bit of `q1`"
 
@@ -92,7 +92,7 @@ desc = "$#`k`- #`N` mod 2^256$"
 
 [[variables.virtual]]
 name = "c1"
-type = ["Byte", 64]
+type = ["BaseField", 64]
 desc = "carries for computing `yG`"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -8], ["-", ["idx", "raw_yG", "i"], ["idx", "bz", "i"]]]},
@@ -105,7 +105,7 @@ type = ["Bit", 8]
 desc = "carries for computing $#`P` + #`xG_sub_P`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_P", "U256WL"], "i"]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
-    {iter=["i", 0, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_P", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_P", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -114,7 +114,7 @@ type = ["Bit", 8]
 desc = "carries for computing $#`N` + #`k_sub_N`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "k", "U256WL"], "i"]]]},
-    {iter=["i", 0, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "k", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "k", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -123,7 +123,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `xG`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "xG", "i"]},
-    {iter=["i", 32, 63], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
@@ -132,7 +132,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `yG`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "yG", "i"]},
-    {iter=["i", 32, 63], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
@@ -141,7 +141,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `x2`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "x2", "i"]},
-    {iter=["i", 32, 64], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
@@ -150,7 +150,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `q`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "q0", "i"]},
-    {iter=["i", 32, 64], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
@@ -159,7 +159,7 @@ type = ["Byte", 64]
 desc = "extension of `q1`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "q1", "i"]},
-    {iter=["i", 32, 64], poly=["*", 255, "q1_msb"]},
+    {iter=["i", 32, 63], poly=["*", 255, "msb_q1"]},
 ]}
 
 [[variables.virtual]]
@@ -168,7 +168,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `b`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "b", "i"]},
-    {iter=["i", 32, 95], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
@@ -177,7 +177,7 @@ type = ["Byte", 64]
 desc = "zero-extension of `p`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "p", "i"]},
-    {iter=["i", 32, 95], poly="0"},
+    {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.constant]]
@@ -268,6 +268,7 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "xG_sub_P", "i"]]
 iter = ["i", 0, 15]
+multiplicity = "μ"
 ref = "ec:c:range_xG_sub_P"
 
 [[constraints.range_xG]]
@@ -290,19 +291,19 @@ ref = "ec:c:xG_addition_overflows"
 name = "xG2"
 
 [[constraints.xG2]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "x2", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 ref = "ec:c:range_x2"
 
 [[constraints.xG2]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q0", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 ref = "ec:c:range_q0"
 
 [[constraints.xG2]]
@@ -333,19 +334,19 @@ ref = "ec:c:range_c0"
 name = "yG"
 
 [[constraints.yG]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "yG", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 ref = "ec:c:range_yG"
 
 [[constraints.yG]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q1", "i"]]
 iter = ["i", 0, 31]
-multiplicity = "μ"
+cond = "μ"
 ref = "ec:c:range_q1"
 
 [[constraints.yG]]
@@ -359,13 +360,13 @@ ref = "ec:c:msb_q1"
 [[constraints.yG]]
 kind = "arith"
 constraint = "$2^8 dot #`c1`_0 = #`x2z`_0 dot #`xGz`_0 - #`yGz`_0 dot #`yGz`_0 + #`q1z`_0 dot #`pz`_0 - #`b`_0$"
-poly = ["-", ["+", ["*", ["idx", "x2z", 0], ["idx", "xGz", 0]], ["*", ["idx", "q1z", 0], ["idx", "pz", 0]]], ["*", ["idx", "yGz", 0], ["idx", "yGz", 0]], ["idx", "b", 0], ["*", ["^", 2, 8], ["idx", "c1", 0]]]
+poly = ["-", ["+", ["*", ["idx", "x2z", 0], ["idx", "xGz", 0]], ["*", ["idx", "q1z", 0], ["idx", "pz", 0]]], ["*", ["idx", "yGz", 0], ["idx", "yGz", 0]], ["idx", "bz", 0], ["*", ["^", 2, 8], ["idx", "c1", 0]]]
 
 [[constraints.yG]]
 kind = "arith"
 constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`b`_i + sum_(j=0)^i #`x2z`_j dot #`xGz`_(i-j) + #`q1z`_j dot #`pz`_(i-j) - #`yGz`_j dot #`yGz`_(i-j)$"
-poly = ["+", ["-", ["idx", "c1", ["-", "i", 1]], ["idx", "b", "i"], ["*", ["^", 2, 8], ["idx", "c1", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["+", ["*", ["idx", "x2z", "j"], ["idx", "xGz", ["-", "i", "j"]]], ["*", ["idx", "q1z", "j"], ["idx", "pz", ["-", "i", "j"]]]], ["*", ["idx", "yGz", "j"], ["idx", "yGz", ["-", "i", "j"]]]]]]
-iter = ["i", 0, 63]
+poly = ["+", ["-", ["idx", "c1", ["-", "i", 1]], ["idx", "bz", "i"], ["*", ["^", 2, 8], ["idx", "c1", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["+", ["*", ["idx", "x2z", "j"], ["idx", "xGz", ["-", "i", "j"]]], ["*", ["idx", "q1z", "j"], ["idx", "pz", ["-", "i", "j"]]]], ["*", ["idx", "yGz", "j"], ["idx", "yGz", ["-", "i", "j"]]]]]]
+iter = ["i", 1, 63]
 
 
 [[constraints.yG]]
@@ -515,10 +516,10 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 10], "DWordWL"],
-    ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["+", ["idx", "addr_xR", 2], ["*", ["^", 2, 16], ["idx", "addr_xR", 3]]], 0, 0, 0, 0, 0, 0],
+    ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["idx", "addr_xR", 2], 0, 0, 0, 0, 0, 0],
     "timestamp",
     1, 0, 0]
-output = ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["+", ["idx", "addr_xR", 2], ["*", ["^", 2, 16], ["idx", "addr_xR", 3]]], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["idx", "addr_xR", 2], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:load_addrR"
 
@@ -534,7 +535,7 @@ kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["arr", ["+", ["idx", "addr_xR", 0], ["*", 8, "i"]], ["idx", "addr_xR", 1]],
+    ["arr", ["+", ["*", ["^", 2, 16], ["idx", "addr_xR", 1]], ["idx", "addr_xR", 0], ["*", 8, "i"]], ["idx", "addr_xR", 2]],
     ["arr",
         ["idx", "xR", ["+", ["*", 8, "i"], 0]],
         ["idx", "xR", ["+", ["*", 8, "i"], 1]],
@@ -545,7 +546,7 @@ input = [
         ["idx", "xR", ["+", ["*", 8, "i"], 6]],
         ["idx", "xR", ["+", ["*", 8, "i"], 7]],
     ],
-    ["+", "timestamp", 2],
+    ["+", "timestamp", ["cast", 2, "DWordWL"]],
     0, 0, 1
 ]
 iter = ["i", 0, 3]
@@ -574,7 +575,7 @@ name = "delegate"
 [[constraints.delegate]]
 kind = "interaction"
 tag = "SERVE_K"
-input = ["timestamp", "addr_k", 32]
+input = ["timestamp", ["cast", "addr_k", "DWordWL"], 32]
 multiplicity = "μ"
 
 [[constraints.delegate]]

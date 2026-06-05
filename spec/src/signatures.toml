@@ -220,4 +220,9 @@ input = ["DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
 [[signatures]]
 tag = "SERVE_K"
 kind = "interaction"
-input = ["DWordWL", "Byte", "Byte"]
+input = ["DWordWL", "DWordWL", "Byte"]
+
+[[signatures]]
+kind = "interaction"
+tag = "BIT"
+input = ["DWordWL", "Byte"]
