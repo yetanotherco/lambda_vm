@@ -17,30 +17,63 @@
 #let ecsm_chip = load_chip("src/ecsm.toml", config)
 #let ecsm = raw(ecsm_chip.name)
 
-Let $E(a, b, FF)$ with $a^3+27b^2 eq.not 0$ and $FF$ a finite field describe a _short Weierstrass_ elliptic curve, with all points $(x, y) in FF^2$ on the curve satisfying the equation
-$
-y^2 = x^3 + a x + b.
-$
-Combined with definitions for addition and negation, these points form a group; let $N$ to denote its order.
+= Theory behind Elliptic Curves
 
-The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, a, FF_p)$ with prime $p < 2^256$.
-Note that `secp256k1` corresponds to such a curve with $b=7$ and $p = 2^256 - 2^32 - 977$.
-This accelerator leverages the so-called "double-and-add" method: the bit-decomposition of `k` is used to guide a sequence of doubling and adding $G$ to itself.
-The accelerator executes $D_k := ceil.l log_2(k) ceil.r$ doublings and $A_k := w_H (k) - 1$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
+#let inf = math.cal("O")
+An elliptic curve $E(a, b, p)$ in _short Weierstrass_ form has parameters $a,b in FF_p$ for some prime $p$ with $a^3+27b^2 eq.not 0$, and coordinates $(x, y) in FF_p^2$ satisfying the equation 
+$
+  y^2=x^3+a x+b.
+$
+
+#strong("Point at infinity.")
+Additionally, there is the _point at infinity_, $⁠#inf$, which has no native short-Weierstrass representation.
+It acts as the identity element (zero) in the group:
+given non-zero curve point $P$, it holds that
+$
+  #inf + #inf &= #inf\
+  #inf + P &= P\
+$
+
+#strong("Point negation.")
+The negation of curve point $P = (x_P, y_P)$ is constructed as $-P := (x_P, -y_P)$.
+Naturally, $P + (-P) = #inf$.
+
+#strong("Point addition.")
+The addition of points $P, Q$ distinguishes two cases.
+For $x_P eq.not x_Q$, one uses
+$ 
+(x_R, y_R) := (lambda^2 - x_P - x_Q, lambda (x_P - x_R) - y_P)
+$
+with $lambda = frac((y_Q - y_P), (x_Q - x_P), style: "horizontal")$.
+When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2, 2y_P, style: "horizontal")$.
+Note, the remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
+
+#strong("Scalar multiplication.")
+An addition operation gives rise to an algorithm for scalar multiplication.
+Given curve point $A$ and scalar $k$, the multiple $k times A$ can trivially be computed as $A + A + ... + A$.
+This accelerator instead leverages the _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) technique, which utilizes only $O(log(k))$ additions for the full multiplication.
+
+#strong("This accelerator.")
+The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [2^248, 2^256)$.
+In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
+This accelerator leverages _double-and-add_, executing the multiplication in $D_k := ceil.l log_2(k) ceil.r$ doublings and $A_k := w_H (k) - 1$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
 
 = Overview
-The accelerator comprises three components:
-- *`ECSM` (Elliptic Curve Scalar Multiply)*; this chip is responsible for loading inputs $x$ and $k$ from memory, 
-  dispatching a double-and-add sequence request to the `ECDAS` chip, and writing the result point $x$ back to memory.
+The accelerator comprises three chips:
+- *`ECSM` (Elliptic Curve Scalar Multiply)*; this chip is responsible for loading inputs $x_G$ and $k$ from memory,
+  reconstructing $y_G$,
+  dispatching a double-and-add sequence request to the `ECDAS` chip, and writing the result point $x_R$ back to memory.
 - *`ECDAS` (Elliptic Curve Double/Add Sequence)* is responsible for the consecutive doubling/adding the provided point to itself, ultimately arriving at $k times G$.
 - *`LOAD_K`* serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
 
 = ECSM <ecsm-sm>
 
-The #ecsm (Elliptic Curve Scalar Multiply) chip is parametrized by the constants
+The #ecsm (Elliptic Curve Scalar Multiply) chip a generic over the constants
+- $a$, the first curve coefficient,
 - $b$, the second curve coefficient,
 - $p$, the prime field modulus, and
 - $N$, the order of the curve group.
+To support scalar multiplication over different curves, one chip instance should be created for each curve.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -220,6 +253,10 @@ The #ecdas chip is comprised of #nr_variables variables that are expressed using
 == Constraints
 
 #render_constraint_table(ecscalar_chip, config)
+
+= Notes / optimizations
+- To merge the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the curve-constants $a$, $b$, $p$ and $N$, and include them for each scalar multiplication when they're selected.
+The selection procedure could be done through the `ECALL` number; the #ecsm chip would accept multiple numbers, setting an internal "curve-selector" field accordingly.
 
 = Discussing the carries
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
