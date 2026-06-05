@@ -95,8 +95,8 @@ name = "c1"
 type = ["BaseField", 64]
 desc = "carries for computing `yG`"
 def = {polys=[
-    {iter=["i", 0], poly=["*", ["^", 2, -8], ["-", ["idx", "raw_yG", "i"], ["idx", "bz", "i"]]]},
-    {iter=["i", 1, 63], poly=["*", ["^", 2, -8], ["+", ["-", ["idx", "raw_yG", "i"], ["idx", "bz", "i"]], ["idx", "c1", ["-", "i", 1]]]]},
+    {iter=["i", 0], poly=["*", ["^", 2, -8], ["-", ["idx", "raw_yG", "i"], ["idx", "B", "i"]]]},
+    {iter=["i", 1, 63], poly=["*", ["^", 2, -8], ["+", ["-", ["idx", "raw_yG", "i"], ["idx", "B", "i"]], ["idx", "c1", ["-", "i", 1]]]]},
 ]}
 
 [[variables.virtual]]
@@ -118,7 +118,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "xGz"
+name = "XG"
 type = ["Byte", 64]
 desc = "zero-extension of `xG`"
 def = {polys=[
@@ -127,7 +127,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "yGz"
+name = "YG"
 type = ["Byte", 64]
 desc = "zero-extension of `yG`"
 def = {polys=[
@@ -136,7 +136,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "x2z"
+name = "X2"
 type = ["Byte", 64]
 desc = "zero-extension of `x2`"
 def = {polys=[
@@ -145,7 +145,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "q0z"
+name = "Q0"
 type = ["Byte", 64]
 desc = "zero-extension of `q`"
 def = {polys=[
@@ -154,7 +154,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "q1z"
+name = "Q1"
 type = ["Byte", 64]
 desc = "extension of `q1`"
 def = {polys=[
@@ -163,7 +163,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "bz"
+name = "B"
 type = ["Byte", 64]
 desc = "zero-extension of `b`"
 def = {polys=[
@@ -172,7 +172,7 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "pz"
+name = "P"
 type = ["Byte", 64]
 desc = "zero-extension of `p`"
 def = {polys=[
@@ -309,13 +309,13 @@ ref = "ec:c:range_q0"
 [[constraints.xG2]]
 kind = "arith"
 constraint = "$2^8 dot #`c0`_0 = #`xGz`_0 dot #`xGz`_0 - #`q0z`_0 dot #`pz`_0$"
-poly = ["-", ["*", ["idx", "xGz", 0], ["idx", "xGz", 0]], ["*", ["idx", "q0z", 0], ["idx", "pz", 0]], ["*", ["^", 2, 8], ["idx", "c0", 0]]]
+poly = ["-", ["*", ["idx", "XG", 0], ["idx", "XG", 0]], ["*", ["idx", "Q0", 0], ["idx", "P", 0]], ["*", ["^", 2, 8], ["idx", "c0", 0]]]
 ref = "ec:c:c0_0"
 
 [[constraints.xG2]]
 kind = "arith"
 constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + sum_(j=0)^i #`xGz`_j dot #`xGz`_(i-j) - #`q0z`_j dot #`pz`_(i-j)$"
-poly = ["+", ["-", ["idx", "c0", ["-", "i", 1]], ["*", ["^", 2, 8], ["idx", "c0", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["*", ["idx", "xGz", "j"], ["idx", "xGz", ["-", "i", "j"]]], ["*", ["idx", "q0z", "j"], ["idx", "pz", ["-", "i", "j"]]]]]]
+poly = ["+", ["-", ["idx", "c0", ["-", "i", 1]], ["*", ["^", 2, 8], ["idx", "c0", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["*", ["idx", "XG", "j"], ["idx", "XG", ["-", "i", "j"]]], ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]]]]
 iter = ["i", 1, 63]
 ref = "ec:c:c0_i"
 
@@ -360,12 +360,12 @@ ref = "ec:c:msb_q1"
 [[constraints.yG]]
 kind = "arith"
 constraint = "$2^8 dot #`c1`_0 = #`x2z`_0 dot #`xGz`_0 - #`yGz`_0 dot #`yGz`_0 + #`q1z`_0 dot #`pz`_0 - #`b`_0$"
-poly = ["-", ["+", ["*", ["idx", "x2z", 0], ["idx", "xGz", 0]], ["*", ["idx", "q1z", 0], ["idx", "pz", 0]]], ["*", ["idx", "yGz", 0], ["idx", "yGz", 0]], ["idx", "bz", 0], ["*", ["^", 2, 8], ["idx", "c1", 0]]]
+poly = ["-", ["+", ["*", ["idx", "X2", 0], ["idx", "XG", 0]], ["*", ["idx", "Q1", 0], ["idx", "P", 0]]], ["*", ["idx", "YG", 0], ["idx", "YG", 0]], ["idx", "B", 0], ["*", ["^", 2, 8], ["idx", "c1", 0]]]
 
 [[constraints.yG]]
 kind = "arith"
 constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`b`_i + sum_(j=0)^i #`x2z`_j dot #`xGz`_(i-j) + #`q1z`_j dot #`pz`_(i-j) - #`yGz`_j dot #`yGz`_(i-j)$"
-poly = ["+", ["-", ["idx", "c1", ["-", "i", 1]], ["idx", "bz", "i"], ["*", ["^", 2, 8], ["idx", "c1", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["+", ["*", ["idx", "x2z", "j"], ["idx", "xGz", ["-", "i", "j"]]], ["*", ["idx", "q1z", "j"], ["idx", "pz", ["-", "i", "j"]]]], ["*", ["idx", "yGz", "j"], ["idx", "yGz", ["-", "i", "j"]]]]]]
+poly = ["+", ["-", ["idx", "c1", ["-", "i", 1]], ["idx", "B", "i"], ["*", ["^", 2, 8], ["idx", "c1", "i"]]], ["sum", ["=", "j", 0], "i", ["-", ["+", ["*", ["idx", "X2", "j"], ["idx", "XG", ["-", "i", "j"]]], ["*", ["idx", "Q1", "j"], ["idx", "P", ["-", "i", "j"]]]], ["*", ["idx", "YG", "j"], ["idx", "YG", ["-", "i", "j"]]]]]]
 iter = ["i", 1, 63]
 
 
