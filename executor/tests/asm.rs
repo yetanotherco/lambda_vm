@@ -923,3 +923,44 @@ fn test_keccak() {
     assert_eq!(result.return_values.memory_values, expected_bytes);
     assert_eq!(result.return_values.register_values.0, 0);
 }
+
+#[test]
+fn test_run_epochs_splits_execution_into_n_cycle_epochs() {
+    let elf_data = std::fs::read("./program_artifacts/asm/basic_program.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+
+    // Reference: full single-pass run.
+    let full = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    // Pick an epoch size that splits this program into a few epochs, whatever
+    // its exact length.
+    let total_cycles = full.logs.len();
+    assert!(total_cycles >= 2);
+    let epoch_size = (total_cycles / 3).max(1);
+
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+
+    // The program is long enough to span several epochs.
+    assert!(epochs.len() >= 2);
+
+    // Concatenated epoch logs reproduce the full run's instruction stream.
+    let concat: Vec<u64> = epochs
+        .iter()
+        .flat_map(|e| e.logs.iter().map(|l| l.current_pc))
+        .collect();
+    let expected: Vec<u64> = full.logs.iter().map(|l| l.current_pc).collect();
+    assert_eq!(concat, expected);
+
+    // Every epoch except the last runs exactly `epoch_size` cycles.
+    for epoch in &epochs[..epochs.len() - 1] {
+        assert_eq!(epoch.logs.len(), epoch_size);
+    }
+    let last = epochs.last().unwrap();
+    assert!(!last.logs.is_empty() && last.logs.len() <= epoch_size);
+
+    // The program finished, so the final epoch's boundary pc is 0.
+    assert_eq!(last.end_pc, 0);
+}

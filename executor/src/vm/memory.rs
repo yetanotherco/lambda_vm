@@ -50,7 +50,7 @@ pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
     /// Bytes committed to public output via `commit_public_output`. The
