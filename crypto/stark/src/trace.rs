@@ -220,6 +220,17 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
+    /// If the main trace was LDE'd on the GPU via the fused pipeline,
+    /// the device buffer is retained here so downstream GPU rounds can
+    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
+    /// for this table (below the size threshold or any CPU fallback:
+    /// preprocessed main, non-Goldilocks, or GPU error).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
+    /// layout on device).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -242,7 +253,35 @@ where
             aux_columns,
             lde_step_size,
             blowup_factor,
+            #[cfg(feature = "cuda")]
+            gpu_main: None,
+            #[cfg(feature = "cuda")]
+            gpu_aux: None,
         }
+    }
+
+    /// Attach an already-populated device LDE handle for the main columns.
+    /// Only set when the GPU fused pipeline produced the LDE. Callers that
+    /// ran the CPU path should leave this alone.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
+        self.gpu_main = Some(h);
+    }
+
+    /// Attach an already-populated device LDE handle for the aux columns.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
+        self.gpu_aux = Some(h);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
+        self.gpu_main.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
+        self.gpu_aux.as_ref()
     }
 
     /// Consume self and return the owned column vectors.
@@ -397,8 +436,8 @@ pub fn get_trace_evaluations_from_lde<F, E>(
     dc: &DomainConstants<F>,
 ) -> Table<E>
 where
-    F: IsSubFieldOf<E> + IsFFTField,
-    E: IsField,
+    F: IsSubFieldOf<E> + IsFFTField + 'static,
+    E: IsField + 'static,
 {
     let n = domain.interpolation_domain_size;
     let bf = domain.blowup_factor;
@@ -429,58 +468,113 @@ where
         let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
         let vanishing_factor = &n_inv_g_n_inv * &vanishing;
 
-        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
+        // Precompute inv_denoms = 1/(eval_point - coset_point_i), shared across all columns.
+        // Stays on CPU: the batch-invert cost at this scale (n * num_eval_points) is already
+        // rayon-parallelised across tables, and a GPU port regressed wall time in a
+        // 2x15-trial A/B due to stream contention from many concurrent launches.
         let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
 
-        // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
-        // This eliminates N redundant F×E multiplies per column.
-        let col_scale: Vec<FieldElement<E>> = dc
-            .points
-            .iter()
-            .zip(inv_denoms.iter())
-            .map(|(point, inv_d)| point * inv_d)
-            .collect();
+        // col_scale[i] = point[i] * inv_denom[i], shared across ALL CPU column
+        // loops below. Computed lazily on first CPU-fallback use so the all-GPU
+        // path pays nothing, while the all-CPU and mixed paths only pay once.
+        let mut col_scale: Option<Vec<FieldElement<E>>> = None;
 
-        // Evaluate all main columns directly from LDE (no extraction copy).
-        // For main columns (base field F): sum = Σ col_scale[i] * lde_col[i*bf]
-        // lde_col[i*bf] is F, col_scale[i] is E; use F×E → E mixed arithmetic.
-        #[cfg(feature = "parallel")]
-        let main_iter = (0..num_main_cols).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let main_iter = 0..num_main_cols;
-        let main_evals: Vec<FieldElement<E>> = main_iter
-            .map(|col_idx| {
-                let lde_col = &lde_trace.main_columns[col_idx];
-                let sum = col_scale
+        // GPU fast path: batched strided barycentric over the main-trace LDE
+        // already on device. Returns `None` when the GPU R1 path didn't run
+        // for this table (handle absent), the size is below threshold, types
+        // don't match, or the math-cuda call errored. Caller falls through
+        // to the existing rayon CPU loop.
+        #[cfg(feature = "cuda")]
+        let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
+            lde_trace,
+            bf,
+            &dc.points,
+            &dc.offset_pow_n,
+            &dc.size_inv,
+            &dc.offset_pow_n_inv,
+            &z_pow_n,
+            &inv_denoms,
+        );
+        #[cfg(not(feature = "cuda"))]
+        let main_gpu: Option<Vec<FieldElement<E>>> = None;
+
+        let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
+            v
+        } else {
+            let col_scale = col_scale.get_or_insert_with(|| {
+                dc.points
                     .iter()
-                    .enumerate()
-                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + &lde_col[i * bf] * scale
-                    });
-                &vanishing_factor * &sum
-            })
-            .collect();
+                    .zip(inv_denoms.iter())
+                    .map(|(point, inv_d)| point * inv_d)
+                    .collect()
+            });
+            // Evaluate all main columns directly from LDE (no extraction copy).
+            // For main columns (base field F): sum = sum over i of col_scale[i] * lde_col[i*bf].
+            // lde_col[i*bf] is F, col_scale[i] is E; use F*E -> E mixed arithmetic.
+            #[cfg(feature = "parallel")]
+            let main_iter = (0..num_main_cols).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let main_iter = 0..num_main_cols;
+            main_iter
+                .map(|col_idx| {
+                    let lde_col = &lde_trace.main_columns[col_idx];
+                    let sum = col_scale
+                        .iter()
+                        .enumerate()
+                        .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                            acc + &lde_col[i * bf] * scale
+                        });
+                    &vanishing_factor * &sum
+                })
+                .collect()
+        };
         table_data.extend(main_evals);
 
-        // Evaluate all aux columns directly from LDE (no extraction copy).
-        // For aux columns (extension field E): sum = Σ col_scale[i] * lde_col[i*bf]
-        // Both col_scale and lde_col are in E, so each multiply is E×E → E.
-        #[cfg(feature = "parallel")]
-        let aux_iter = (0..num_aux_cols).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = 0..num_aux_cols;
-        let aux_evals: Vec<FieldElement<E>> = aux_iter
-            .map(|col_idx| {
-                let lde_col = &lde_trace.aux_columns[col_idx];
-                let sum = col_scale
+        // GPU fast path for aux columns reading the de-interleaved ext3 LDE handle.
+        #[cfg(feature = "cuda")]
+        let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
+            lde_trace,
+            bf,
+            &dc.points,
+            &dc.offset_pow_n,
+            &dc.size_inv,
+            &dc.offset_pow_n_inv,
+            &z_pow_n,
+            &inv_denoms,
+        );
+        #[cfg(not(feature = "cuda"))]
+        let aux_gpu: Option<Vec<FieldElement<E>>> = None;
+
+        let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
+            v
+        } else {
+            let col_scale = col_scale.get_or_insert_with(|| {
+                dc.points
                     .iter()
-                    .enumerate()
-                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + scale * &lde_col[i * bf]
-                    });
-                &vanishing_factor * &sum
-            })
-            .collect();
+                    .zip(inv_denoms.iter())
+                    .map(|(point, inv_d)| point * inv_d)
+                    .collect()
+            });
+            // Evaluate all aux columns directly from LDE (no extraction copy).
+            // For aux columns (extension field E): sum = sum over i of col_scale[i] * lde_col[i*bf].
+            // Both col_scale and lde_col are in E, so each multiply is E*E -> E.
+            #[cfg(feature = "parallel")]
+            let aux_iter = (0..num_aux_cols).into_par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let aux_iter = 0..num_aux_cols;
+            aux_iter
+                .map(|col_idx| {
+                    let lde_col = &lde_trace.aux_columns[col_idx];
+                    let sum = col_scale
+                        .iter()
+                        .enumerate()
+                        .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                            acc + scale * &lde_col[i * bf]
+                        });
+                    &vanishing_factor * &sum
+                })
+                .collect()
+        };
         table_data.extend(aux_evals);
     }
 

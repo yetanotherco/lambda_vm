@@ -60,6 +60,13 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
     mmap_backing: Option<MmapNodeBacking>,
 }
 
+#[cfg(all(test, feature = "disk-spill"))]
+impl<B: IsMerkleTreeBackend> MerkleTree<B> {
+    pub(crate) fn has_mmap_backing(&self) -> bool {
+        self.mmap_backing.is_some()
+    }
+}
+
 // `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,
 // so the default derive would emit `{root, nodes: []}` and lose the tree.
 //
@@ -121,6 +128,44 @@ where
 
         let hashed_leaves: Vec<B::Node> = B::hash_leaves(unhashed_leaves);
         Self::build_from_hashed_leaves(hashed_leaves)
+    }
+
+    /// Useful for handing a GPU-built tree to the stark prover.
+    /// Performs no hashing, the caller is responsible for the layout's
+    /// cryptographic correctness.
+    ///
+    /// Expected layout (matches [`build_from_hashed_leaves`]):
+    ///   - `nodes.len() == 2 * leaves_len - 1` where `leaves_len` is a power of two
+    ///   - `nodes[0]` is the root
+    ///   - `nodes[leaves_len - 1 .. 2*leaves_len - 1]` are the leaves
+    pub fn from_precomputed_nodes(nodes: Vec<B::Node>) -> Option<Self> {
+        if nodes.is_empty() {
+            return None;
+        }
+        // Validate (cheap) that (nodes.len() + 1) is a power of two: there
+        // must be `leaves_len - 1 + leaves_len = 2*leaves_len - 1` entries.
+        let total = nodes.len();
+        if !(total + 1).is_power_of_two() {
+            return None;
+        }
+        // Debug-only integrity spot-check: the root must equal hash(left, right).
+        // Catches GPU correctness regressions in CI without paying for a full
+        // tree walk on every call.
+        #[cfg(debug_assertions)]
+        if total >= 3 {
+            let expected_root = B::hash_new_parent(&nodes[1], &nodes[2]);
+            debug_assert!(
+                nodes[ROOT] == expected_root,
+                "from_precomputed_nodes: root does not hash from children",
+            );
+        }
+        let root = nodes[ROOT].clone();
+        Some(MerkleTree {
+            root,
+            nodes,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        })
     }
 
     /// Create a Merkle tree from pre-hashed leaf nodes.
@@ -350,41 +395,5 @@ where
         self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
 
         Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "serde", feature = "disk-spill"))]
-mod disk_spill_serde_tests {
-    use super::*;
-    use crate::merkle_tree::backends::field_element::FieldElementBackend;
-    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
-    use sha3::Keccak256;
-
-    type F = GoldilocksField;
-    type FE = FieldElement<F>;
-    type Backend = FieldElementBackend<F, Keccak256, 32>;
-
-    /// Serializing a spilled MerkleTree must produce identical bytes to
-    /// serializing the same tree before spilling, and round-trip back to an
-    /// equal tree.
-    #[test]
-    fn test_serialize_spilled_merkle_tree_matches_unspilled() {
-        let values: Vec<FE> = (1..17).map(FE::from).collect();
-        let unspilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
-
-        let mut spilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        spilled.spill_nodes_to_disk().expect("spill_nodes_to_disk");
-        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
-
-        assert_eq!(
-            spilled_bytes, unspilled_bytes,
-            "spilled and unspilled trees must serialize to identical bytes"
-        );
-
-        let restored: MerkleTree<Backend> =
-            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(restored.mmap_backing.is_none());
-        assert_eq!(restored.root, unspilled.root);
     }
 }

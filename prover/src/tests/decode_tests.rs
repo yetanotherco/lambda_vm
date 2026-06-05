@@ -1,18 +1,22 @@
 //! Tests for the DECODE table.
 
-use executor::elf::Elf;
+use executor::elf::{Elf, Segment};
 use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 
+use stark::proof::options::GoldilocksCubicProofOptions;
+
 use crate::tables::decode::{
-    DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
-    update_multiplicities,
+    DecodeEntry, bus_interactions, cols, commitment_from_elf, generate_decode_trace,
+    instructions_from_elf, tables_from_elf, update_multiplicities,
 };
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, packed_decode as bits};
+use crate::test_utils::asm_elf_bytes;
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
+use crate::{prove, verify_with_options};
 
 // =========================================================================
 // Packed decode tests
@@ -1046,6 +1050,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
 
     let proof = multi_prove_ram(
@@ -1062,12 +1067,15 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
@@ -1080,4 +1088,179 @@ fn test_decode_soundness_same_elf_accepted() {
 
     // With same ELF, verification should SUCCEED
     assert!(result, "Verifier with same ELF should ACCEPT the proof");
+}
+
+#[test]
+fn test_tables_from_elf_single_executable_segment() {
+    // ADDI x1, x0, 42  (opcode: 0x02a00093)
+    // ADDI x2, x1, 10  (opcode: 0x00a08113)
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![Segment {
+            base_addr: 0x1000,
+            values: vec![0x02a00093, 0x00a08113],
+            is_executable: true,
+        }],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // Check DECODE table
+    assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
+    assert!(tables.pc_to_row.contains_key(&0x1000));
+    assert!(tables.pc_to_row.contains_key(&0x1004));
+    assert!(
+        tables
+            .pc_to_row
+            .contains_key(&crate::tables::cpu::CPU_PADDING_PC)
+    );
+}
+
+#[test]
+fn test_tables_from_elf_mixed_segments() {
+    // Executable segment with instructions
+    // Data segment with data (not included in DECODE)
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![
+            Segment {
+                base_addr: 0x1000,
+                values: vec![0x02a00093], // ADDI instruction
+                is_executable: true,
+            },
+            Segment {
+                base_addr: 0x2000,
+                values: vec![0xDEADBEEF, 0xCAFEBABE], // Data
+                is_executable: false,
+            },
+        ],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // DECODE: only executable segment (1 instruction + CPU padding)
+    assert_eq!(tables.pc_to_row.len(), 2);
+    assert!(tables.pc_to_row.contains_key(&0x1000));
+    assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
+}
+
+#[test]
+fn test_tables_from_elf_empty() {
+    let elf = Elf {
+        entry_point: 0x1000,
+        data: vec![],
+    };
+
+    let tables = tables_from_elf(&elf).unwrap();
+
+    // DECODE: only CPU padding entry
+    assert_eq!(tables.pc_to_row.len(), 1);
+    assert!(
+        tables
+            .pc_to_row
+            .contains_key(&crate::tables::cpu::CPU_PADDING_PC)
+    );
+}
+
+// =========================================================================
+// verify_with_options: optional decode_commitment parameter
+// =========================================================================
+
+#[test]
+fn decode_commitment_some_matches_default_path() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    let decode_c = commitment_from_elf(&elf, &options).expect("decode commitment");
+
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+        .expect("verify with None should not error");
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(decode_c))
+        .expect("verify with Some(correct) should not error");
+
+    assert!(default_ok, "default path must accept the proof");
+    assert!(
+        explicit_ok,
+        "Some(correct_commitment) must accept the proof"
+    );
+}
+
+#[test]
+fn decode_commitment_wrong_value_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Flip a byte in the correct commitment so the Fiat-Shamir transcripts diverge.
+    let mut wrong = commitment_from_elf(&elf, &options).expect("decode commitment");
+    wrong[0] ^= 0xFF;
+
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "tampered decode commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+#[test]
+fn decode_commitment_zero_bytes_rejects() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // [0u8; 32] is the most plausible accidental default — passing it must
+    // not pass verification.
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+        .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
+    assert!(
+        !result,
+        "all-zero decode commitment must cause Fiat-Shamir rejection",
+    );
+}
+
+/// DECODE preprocessed commitment for the `sub` asm test ELF at blowup=2,
+/// computed offline once. Mirrors how the recursion guest embeds the
+/// commitment as a compile-time constant for its inner program. If the
+/// AIR or FFT pipeline changes, this drifts and the test fails —
+/// regenerate via the `print_decode_commitment_for_sub` helper below.
+const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
+    0x00, 0x83, 0x59, 0xa3, 0x34, 0x5f, 0x86, 0x79, 0x59, 0x71, 0xc8, 0x71, 0x54, 0x2c, 0xc4, 0xac,
+    0x8b, 0x9c, 0x48, 0x9b, 0x25, 0xa3, 0x6a, 0xc7, 0x48, 0xee, 0x71, 0xe6, 0x77, 0xfb, 0x59, 0xfa,
+];
+
+#[test]
+fn decode_commitment_compile_time_const_accepts() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let vm_proof = prove(&elf_bytes).expect("prove failed");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
+    // workflow where the value lives in the caller's compiled binary.
+    let result = verify_with_options(
+        &vm_proof,
+        &elf_bytes,
+        &options,
+        Some(SUB_DECODE_COMMITMENT_BLOWUP_2),
+    )
+    .expect("verify must not return Err");
+    assert!(
+        result,
+        "verifier must accept the offline-computed decode commitment",
+    );
+}
+
+#[test]
+#[ignore = "prints decode commitment for the sub asm ELF so SUB_DECODE_COMMITMENT_BLOWUP_2 \
+            can be regenerated; run with --ignored --nocapture"]
+fn print_decode_commitment_for_sub() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let c = commitment_from_elf(&elf, &options).expect("decode commitment");
+    eprintln!("SUB_DECODE_COMMITMENT_BLOWUP_2 (sub.elf, blowup=2):");
+    eprintln!("{c:02x?}");
 }

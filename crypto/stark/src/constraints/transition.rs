@@ -1,11 +1,9 @@
-use std::ops::Div;
+use core::ops::Div;
 
 use crate::domain::Domain;
-use crate::prover::evaluate_polynomial_on_lde_domain;
 use crate::traits::TransitionEvaluationContext;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-use math::polynomial::Polynomial;
 
 /// TransitionConstraintEvaluator represents the behaviour that a transition constraint
 /// over the computation that wants to be proven must comply with.
@@ -105,29 +103,56 @@ where
         self.evaluate_verifier(evaluation_context, ext_evals);
     }
 
-    /// Method for calculating the end exemptions polynomial.
+    /// Roots of the end-exemptions polynomial `∏(x - rᵢ)`.
     ///
-    /// This polynomial is used to compute zerofiers of the constraint, and the default
-    /// implementation should normally not be changed.
-    fn end_exemptions_poly(
+    /// The end-exemptions polynomial vanishes on the last `end_exemptions()`
+    /// rows the constraint must skip. This returns its roots `rᵢ` so callers can
+    /// evaluate the product `∏(x - rᵢ)` directly at the points they need — the
+    /// eval-form replacement for the former coefficient-form `end_exemptions_poly`.
+    /// The default implementation should normally not be changed.
+    fn end_exemptions_roots(
         &self,
         trace_primitive_root: &FieldElement<F>,
         trace_length: usize,
-    ) -> Polynomial<FieldElement<F>> {
-        let one_poly = Polynomial::new_monomial(FieldElement::<F>::one(), 0);
-        if self.end_exemptions() == 0 {
-            return one_poly;
+    ) -> Vec<FieldElement<F>> {
+        let end_exemptions = self.end_exemptions();
+        if end_exemptions == 0 {
+            return Vec::new();
         }
+        // Last row in the constraint's evaluation domain is g^(offset + N - period);
+        // walking backward by g^period gives the remaining end-exemption roots.
         let period = self.period();
         let decrement = trace_primitive_root.pow(trace_length - period);
-        let mut current = decrement.clone();
-        // FIXME: CHECK IF WE NEED TO CHANGE THE NEW MONOMIAL'S ARGUMENTS TO trace_root^(offset * trace_length / period) INSTEAD OF ONE!!!!
-        (0..self.end_exemptions()).fold(one_poly, |acc, _| {
-            let next =
-                acc * (Polynomial::new_monomial(FieldElement::<F>::one(), 1) - current.clone());
+        let mut current = trace_primitive_root.pow(self.offset() + trace_length - period);
+        let mut roots = Vec::with_capacity(end_exemptions);
+        for _ in 0..end_exemptions {
+            roots.push(current.clone());
             current = &current * &decrement;
-            next
-        })
+        }
+        roots
+    }
+
+    /// Evaluations of the end-exemptions polynomial `∏(x - rᵢ)` over the LDE
+    /// domain.
+    ///
+    /// Eval-form replacement for FFT-evaluating the coefficient-form polynomial:
+    /// the product has degree `end_exemptions()` (≤ 2 in practice), so the direct
+    /// `O(N · end_exemptions)` product over the precomputed LDE coset is cheaper
+    /// than an `O(N log N)` FFT. With no exemptions this yields all ones.
+    fn end_exemptions_lde_evaluations(&self, domain: &Domain<F>) -> Vec<FieldElement<F>> {
+        let roots = self.end_exemptions_roots(
+            &domain.trace_primitive_root,
+            domain.trace_roots_of_unity.len(),
+        );
+        domain
+            .lde_roots_of_unity_coset
+            .iter()
+            .map(|x| {
+                roots
+                    .iter()
+                    .fold(FieldElement::<F>::one(), |acc, r| acc * (x - r))
+            })
+            .collect()
     }
 
     /// Compute evaluations of the constraints zerofier over a LDE domain.
@@ -139,8 +164,6 @@ where
         let coset_offset = &domain.coset_offset;
         let lde_root_order = u64::from((blowup_factor * trace_length).trailing_zeros());
         let lde_root = F::get_primitive_root_of_unity(lde_root_order).unwrap();
-
-        let end_exemptions_poly = self.end_exemptions_poly(trace_primitive_root, trace_length);
 
         // If there is an exemptions period defined for this constraint, the evaluations are calculated directly
         // by computing P_exemptions(x) / Zerofier(x)
@@ -189,23 +212,23 @@ where
                 .map(|(num, denom_inv)| num * denom_inv)
                 .collect();
 
+            // Mirror the else-branch fast path: with no end exemptions the zerofier stays
+            // cyclic, so return the short period-length vector and let the consumer cycle.
+            if self.end_exemptions() == 0 {
+                return evaluations;
+            }
+
             // FIXME: Instead of computing this evaluations for each constraint, they can be computed
             // once for every constraint with the same end exemptions (combination of end_exemptions()
             // and period).
-            let end_exemption_evaluations = evaluate_polynomial_on_lde_domain(
-                &end_exemptions_poly,
-                blowup_factor,
-                domain.interpolation_domain_size,
-                coset_offset,
-            )
-            .unwrap();
+            let end_exemption_evaluations = self.end_exemptions_lde_evaluations(domain);
 
             let cycled_evaluations = evaluations
                 .iter()
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
 
@@ -227,26 +250,21 @@ where
 
             FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
 
-            // Fast path: when end_exemptions == 0, the end_exemptions_poly is constant 1,
-            // so the multiplication is identity. Skip the expensive FFT evaluation.
+            // Fast path: when end_exemptions == 0 there are no exemption roots, so
+            // the zerofier stays cyclic — return the short period-length vector
+            // directly instead of expanding it over the full LDE domain.
             if self.end_exemptions() == 0 {
                 return evaluations;
             }
 
-            let end_exemption_evaluations = evaluate_polynomial_on_lde_domain(
-                &end_exemptions_poly,
-                blowup_factor,
-                domain.interpolation_domain_size,
-                coset_offset,
-            )
-            .unwrap();
+            let end_exemption_evaluations = self.end_exemptions_lde_evaluations(domain);
 
             let cycled_evaluations = evaluations
                 .iter()
                 .cycle()
                 .take(end_exemption_evaluations.len());
 
-            std::iter::zip(cycled_evaluations, end_exemption_evaluations)
+            core::iter::zip(cycled_evaluations, end_exemption_evaluations)
                 .map(|(eval, exemption_eval)| eval * exemption_eval)
                 .collect()
         }
@@ -261,7 +279,14 @@ where
         trace_primitive_root: &FieldElement<F>,
         trace_length: usize,
     ) -> FieldElement<E> {
-        let end_exemptions_poly = self.end_exemptions_poly(trace_primitive_root, trace_length);
+        let end_exemptions_roots = self.end_exemptions_roots(trace_primitive_root, trace_length);
+        // Factor `z - rᵢ` written as `-(rᵢ - z)`: the field ops only go
+        // subfield − superfield, and `rᵢ ∈ F`, `z ∈ E`.
+        let end_exemptions_eval = end_exemptions_roots
+            .iter()
+            .fold(FieldElement::<E>::one(), |acc, root| {
+                acc * -(root.clone() - z.clone())
+            });
 
         if let Some(exemptions_period) = self.exemptions_period() {
             debug_assert!(exemptions_period.is_multiple_of(self.period()));
@@ -276,16 +301,18 @@ where
             let denominator = -trace_primitive_root
                 .pow(self.offset() * trace_length / self.period())
                 + z.pow(trace_length / self.period());
-            // The denominator isn't zero because z is sampled outside the set of primitive roots.
-            return unsafe { numerator.div(denominator).unwrap_unchecked() }
-                * end_exemptions_poly.evaluate(z);
+            // The denominator is non-zero: z is sampled outside the set of primitive roots.
+            return numerator
+                .div(denominator)
+                .expect("zerofier denominator is non-zero: z is sampled out-of-domain")
+                * &end_exemptions_eval;
         }
 
         (-trace_primitive_root.pow(self.offset() * trace_length / self.period())
             + z.pow(trace_length / self.period()))
         .inv()
         .unwrap()
-            * end_exemptions_poly.evaluate(z)
+            * &end_exemptions_eval
     }
 }
 

@@ -17,6 +17,7 @@ pub mod constraints;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+mod statement;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
@@ -29,12 +30,14 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
+use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::statement::absorb_statement;
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -84,11 +87,7 @@ pub struct TableCounts {
 }
 
 impl TableCounts {
-    /// Validate that all required tables have at least one chunk.
-    ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
-    /// Sum of all chunk counts across split tables.
+    /// Sum of all chunk counts across the split tables.
     pub fn total(&self) -> usize {
         self.cpu
             + self.lt
@@ -330,12 +329,26 @@ impl VmAirs {
     ///
     /// `page_configs` provides the page base addresses for creating PAGE AIRs.
     /// `table_counts` specifies how many chunks for each split table.
+    ///
+    /// `decode_commitment` is an optional precomputed DECODE preprocessed
+    /// commitment. When `Some`, the supplied value is used directly and the
+    /// FFT + Merkle build is skipped — useful for callers who have already
+    /// computed the commitment offline and embedded it as a compile-time
+    /// constant (e.g. the recursion guest, where the in-VM recompute is too
+    /// expensive). When `None`, the commitment is computed from the ELF.
+    ///
+    /// The trust anchor for `decode_commitment` is the caller's compiled
+    /// binary — never accept prover-supplied bytes here. A wrong value is
+    /// rejected, never silently accepted: it either mismatches the prover's
+    /// committed precomputed root (an explicit verifier check) or yields
+    /// diverging Fiat-Shamir challenges.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        decode_commitment: Option<Commitment>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -363,11 +376,12 @@ impl VmAirs {
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
             .collect();
-        let decode = create_decode_air(proof_options).with_preprocessed(
+        let decode_root = decode_commitment.unwrap_or_else(|| {
             decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment"),
-            decode::NUM_PRECOMPUTED_COLS,
-        );
+                .expect("Failed to compute decode commitment")
+        });
+        let decode = create_decode_air(proof_options)
+            .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS);
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
             .collect();
@@ -449,15 +463,13 @@ impl VmAirs {
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
+    transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
     for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-        } else {
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
         }
+        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
@@ -486,15 +498,27 @@ pub(crate) fn compute_commit_bus_offset(
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
     let alpha_sq = alpha * alpha;
 
-    let mut total = FieldElement::<E>::zero();
-    for (i, &value) in public_output.iter().enumerate() {
-        let linear_combination = bus_id
-            + (FieldElement::<E>::from(i as u64) * alpha)
-            + (FieldElement::<E>::from(value as u64) * alpha_sq);
-        let fingerprint = z - linear_combination;
-        total += fingerprint.inv().ok()?;
-    }
-    Some(total)
+    // fingerprint_i = z - (BusId::Commit + i·α + value_i·α²)
+    let mut fingerprints: Vec<FieldElement<E>> = public_output
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let linear_combination = bus_id
+                + (FieldElement::<E>::from(i as u64) * alpha)
+                + (FieldElement::<E>::from(value as u64) * alpha_sq);
+            z - linear_combination
+        })
+        .collect();
+
+    // Batch inversion: 1 inversion + O(3N) muls instead of N field inversions.
+    // `Err` iff some fingerprint is zero (a collision) — treat as failure.
+    FieldElement::inplace_batch_inverse(&mut fingerprints).ok()?;
+
+    Some(
+        fingerprints
+            .iter()
+            .fold(FieldElement::<E>::zero(), |acc, term| acc + term),
+    )
 }
 
 /// Compute the expected COMMIT bus balance for a `MultiProof`.
@@ -506,8 +530,9 @@ pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
+    transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a(airs, proof);
+    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
     compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
 
@@ -637,6 +662,7 @@ pub fn prove_with_options_and_inputs(
         false,
         &traces.page_configs,
         &table_counts,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -646,10 +672,28 @@ pub fn prove_with_options_and_inputs(
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+
+    // Bind the full statement (program, public output, table layout) into the
+    // Fiat-Shamir transcript so every challenge depends on it.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+    );
+
     // Phase 4: Prove (multi_prove)
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -671,12 +715,6 @@ pub fn prove_with_options_and_inputs(
         );
     }
 
-    let num_private_input_pages = traces
-        .page_configs
-        .iter()
-        .filter(|c| c.is_private_input)
-        .count();
-
     Ok(VmProof {
         proof,
         runtime_page_ranges,
@@ -696,6 +734,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
         vm_proof,
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        None,
     )
 }
 
@@ -704,10 +743,24 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// The verifier enforces its own `proof_options` (security parameters),
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
+///
+/// `decode_commitment` is an optional precomputed DECODE preprocessed
+/// commitment. When `Some`, the supplied value is used directly and the
+/// in-verifier FFT + Merkle build for the DECODE preprocessed columns is
+/// skipped — useful for callers (e.g. the recursion guest) that embed the
+/// commitment as a compile-time constant to avoid the in-VM recompute
+/// cost. When `None`, the verifier computes the commitment from the ELF.
+///
+/// Trust model: `decode_commitment`, when supplied, must come from the
+/// caller's compiled binary (e.g. a `const [u8; 32]`), never from prover-
+/// supplied bytes. A wrong value is rejected, never silently accepted: it
+/// either mismatches the prover's committed precomputed root (an explicit
+/// verifier check) or yields diverging Fiat-Shamir challenges.
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
@@ -753,16 +806,36 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        decode_commitment,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
+
+    // Bind the statement into the verifier's transcript. A tampered statement
+    // field makes this diverge from the prover's transcript state, so every
+    // derived challenge differs and verification rejects.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        elf_bytes,
+        &vm_proof.public_output,
+        &vm_proof.table_counts,
+        vm_proof.num_private_input_pages,
+        &vm_proof.runtime_page_ranges,
+    );
+
+    // Fork the post-absorb state: the replay helper advances through Phase A
+    // independently of the multi_verify transcript, but both must start from
+    // the same statement-bound state.
+    let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        &mut transcript_for_replay,
     ) {
         Some(balance) => balance,
         None => return Ok(false),
@@ -771,7 +844,7 @@ pub fn verify_with_options(
     Ok(Verifier::multi_verify(
         &air_refs,
         &vm_proof.proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut transcript,
         &expected_bus_balance,
     ))
 }

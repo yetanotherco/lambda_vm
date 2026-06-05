@@ -1,15 +1,20 @@
-use crate::field::{
-    element::FieldElement,
-    traits::{IsFFTField, RootsConfig},
-};
+use crate::field::{element::FieldElement, traits::IsFFTField};
 use alloc::vec::Vec;
 
 use crate::fft::errors::FFTError;
 
+// `RootsConfig` and the bit-reverse permutation are only used by the test-only
+// `get_powers_of_primitive_root` below.
+#[cfg(test)]
 use super::bit_reversing::in_place_bit_reverse_permute;
+#[cfg(test)]
+use crate::field::traits::RootsConfig;
 
 /// Returns a `Vec` of the powers of a `2^n`th primitive root of unity in some configuration
 /// `config`. For example, in a `Natural` config this would yield: w^0, w^1, w^2...
+///
+/// Test-only: production twiddle generation goes through `bowers_fft::LayerTwiddles`.
+#[cfg(test)]
 pub fn get_powers_of_primitive_root<F: IsFFTField>(
     n: u64,
     count: usize,

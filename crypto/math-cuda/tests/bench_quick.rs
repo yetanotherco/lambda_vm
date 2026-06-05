@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bowers_fft::LayerTwiddles;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
