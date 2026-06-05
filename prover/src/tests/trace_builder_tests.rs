@@ -822,3 +822,83 @@ mod routing_tests {
         );
     }
 }
+
+/// `from_image_and_logs` is a faithful generalization of `from_elf_and_logs`:
+/// fed the ELF-derived image, it must produce identical traces.
+#[test]
+fn test_from_image_and_logs_matches_from_elf_and_logs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+    let logs = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs;
+    let max_rows = MaxRowsConfig::default();
+
+    let from_elf = Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let image = build_initial_image(&program, &[]);
+    let from_image = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    assert_eq!(
+        from_elf.total_field_elements(),
+        from_image.total_field_elements()
+    );
+    assert_eq!(
+        format!("{:?}", from_elf.table_counts()),
+        format!("{:?}", from_image.table_counts())
+    );
+}
+
+/// A memory snapshot at an epoch boundary converts into a non-empty initial
+/// image (the input `from_image_and_logs` consumes for the next epoch).
+#[test]
+fn test_epoch_end_memory_converts_to_image() {
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image: HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
+    assert!(!image.is_empty());
+}

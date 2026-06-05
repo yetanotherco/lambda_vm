@@ -1464,7 +1464,7 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
 /// Build the initial-memory image (byte address -> value) from the ELF segments
 /// and the private-input region. Single source of "what memory starts as", read
 /// by both `MemoryState` seeding and PAGE/bitwise init.
-fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
+pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
     let mut image: HashMap<u64, u8> = HashMap::new();
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
@@ -3047,6 +3047,32 @@ impl Traces {
         private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        let initial_image = build_initial_image(elf, private_input);
+        Self::from_image_and_logs(
+            elf,
+            &initial_image,
+            logs,
+            max_rows,
+            private_input,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Build traces for one execution epoch starting from an explicit
+    /// initial-memory image (the epoch's starting memory) rather than the ELF
+    /// image. `elf` is still used for the program code (DECODE) and entry point.
+    ///
+    /// Note (naive continuations): register init still comes from the entry
+    /// point (zeros). Chaining register state across epochs is not handled here.
+    pub fn from_image_and_logs(
+        elf: &Elf,
+        initial_image: &HashMap<u64, u8>,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
@@ -3058,8 +3084,7 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // Phase 2: Collect + route all ops
-        let initial_image = build_initial_image(elf, private_input);
-        let mut memory_state = MemoryState::from_image(&initial_image);
+        let mut memory_state = MemoryState::from_image(initial_image);
         let mut register_state = RegisterState::new(elf.entry_point);
         let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
@@ -3079,7 +3104,7 @@ impl Traces {
         // Phases 3-5
         build_traces(
             ops,
-            Some(&initial_image),
+            Some(initial_image),
             &memory_state,
             elf.entry_point,
             decode_trace,

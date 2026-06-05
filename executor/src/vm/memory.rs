@@ -80,6 +80,18 @@ impl Memory {
         entry[(address % 4) as usize] = value;
     }
 
+    /// Iterate over all stored bytes as `(address, value)` pairs. Cells are
+    /// stored as 4-byte words; each word expands into its four byte addresses.
+    /// Used to snapshot memory at an epoch boundary.
+    pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.cells.iter().flat_map(|(&addr, bytes)| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(move |(i, &b)| (addr + i as u64, b))
+        })
+    }
+
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
         if address.is_multiple_of(4) {
             let bytes = self.cells.get(&address).cloned().unwrap_or_default();
