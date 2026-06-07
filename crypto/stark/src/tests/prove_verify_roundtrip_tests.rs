@@ -41,13 +41,10 @@ impl From<BusId> for u64 {
 
 /// Test that verifies multi-table LogUp proofs can be serialized, transmitted,
 /// and verified by a verifier who never ran the prover.
-#[test_log::test]
-fn test_verify_serialized_multi_table_proofs() {
-    // =========================================================================
-    // PROVER SIDE - Generate proofs
-    // =========================================================================
-
-    let proofs = {
+/// Builds the deterministic 3-table (CPU/ADD/MUL via LogUp) demo proof shared by
+/// the roundtrip test and the byte-identical-proof oracle.
+fn build_demo_multi_proof() -> MultiProof<F, E, ()> {
+    {
         // CPU Trace (8 rows, 5 main columns)
         let add_column = vec![
             FE::one(),
@@ -138,34 +135,24 @@ fn test_verify_serialized_multi_table_proofs() {
         ];
 
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
-    };
+    }
+}
 
-    // =========================================================================
-    // NETWORK TRANSMISSION - Serialize and deserialize (using CBOR binary format)
-    // =========================================================================
+#[test_log::test]
+fn test_verify_serialized_multi_table_proofs() {
+    // PROVER SIDE - generate the demo proof.
+    let proofs = build_demo_multi_proof();
 
+    // NETWORK TRANSMISSION - serialize/deserialize (CBOR binary format).
     let serialized = serde_cbor::to_vec(&proofs).expect("Failed to serialize proofs");
-
-    // At this point, the prover's data is dropped (out of scope above)
-    // The verifier only has the serialized data
-
     let received_proofs: MultiProof<F, E, ()> =
         serde_cbor::from_slice(&serialized).expect("Failed to deserialize proofs");
 
-    // =========================================================================
-    // VERIFIER SIDE - Reconstruct AIRs and verify
-    // =========================================================================
-    // The verifier knows the AIR structure (columns, interactions) as part of
-    // the protocol definition.
-
+    // VERIFIER SIDE - reconstruct AIRs (the verifier knows the structure) and verify.
     let proof_options = ProofOptions::default_test_options();
-
-    // Reconstruct AIRs - verifier knows the structure
     let cpu_air = create_cpu_air(&proof_options);
     let add_air = create_add_air(&proof_options);
     let mul_air = create_mul_air(&proof_options);
-
-    // Verify the proofs
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
@@ -177,6 +164,37 @@ fn test_verify_serialized_multi_table_proofs() {
             &FieldElement::zero(),
         ),
         "Verification should succeed for valid proofs"
+    );
+}
+
+/// Phase 0 (Track B) — byte-identical-proof oracle.
+///
+/// The deterministic demo proof (Fiat-Shamir) must serialize to a fixed digest.
+/// This is the tripwire for the bit-reversed-LDE wiring: that rework is meant to
+/// be *proof-invariant* (same committed roots/openings, only the prover's
+/// evaluation order changes), so any change that perturbs the committed proof
+/// fails here — flagging an index-map bug. (`test_verify_serialized_multi_table_proofs`
+/// covers that the same proof still verifies.)
+#[test]
+fn track_b_byte_identical_proof_oracle() {
+    let proofs = build_demo_multi_proof();
+
+    // FNV-1a-64 over the CBOR bytes: stable across platforms/Rust versions, no
+    // extra deps. Golden captured on the natural-order baseline (1f2cebbb).
+    let bytes = serde_cbor::to_vec(&proofs).expect("serialize proofs");
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in &bytes {
+        digest ^= *b as u64;
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    const GOLDEN_LEN: usize = 24321;
+    const GOLDEN_DIGEST: u64 = 0xe466_7f95_8994_7065;
+    assert_eq!(
+        (bytes.len(), digest),
+        (GOLDEN_LEN, GOLDEN_DIGEST),
+        "proof changed — len={} digest={:#018x} (update golden ONLY if intentional)",
+        bytes.len(),
+        digest,
     );
 }
 
