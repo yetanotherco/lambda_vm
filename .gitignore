@@ -9,3 +9,6 @@ executor/program_artifacts/
 # Shared cargo target directory for ELF builds
 executor/shared_target/
 
+# bench_vs_plonky3 is its own workspace; its lock (heavy Plonky3 deps) is dev-only
+bench_vs_plonky3/Cargo.lock
+

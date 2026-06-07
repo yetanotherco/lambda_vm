@@ -124,9 +124,9 @@ if $BREAKDOWN; then
     CARGO_FEATURES="--features instruments"
 fi
 # shellcheck disable=SC2086
-cargo build --release -p bench-vs-plonky3 --bin prove_bench --manifest-path "$ROOT_DIR/Cargo.toml" $CARGO_FEATURES
+cargo build --release -p bench-vs-plonky3 --bin prove_bench --manifest-path "$ROOT_DIR/bench_vs_plonky3/Cargo.toml" $CARGO_FEATURES
 
-TARGET_DIR="$(cargo metadata --manifest-path "$ROOT_DIR/Cargo.toml" --format-version 1 --no-deps \
+TARGET_DIR="$(cargo metadata --manifest-path "$ROOT_DIR/bench_vs_plonky3/Cargo.toml" --format-version 1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 BIN="$TARGET_DIR/release/prove_bench"
 

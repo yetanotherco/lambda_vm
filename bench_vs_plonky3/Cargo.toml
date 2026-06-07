@@ -1,3 +1,6 @@
+[workspace]
+resolver = "2"
+
 [package]
 name = "bench-vs-plonky3"
 version = "0.1.0"

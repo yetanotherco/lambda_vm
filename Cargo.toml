@@ -7,8 +7,11 @@ members = [
   "crypto/math",
   "crypto/math-cuda",
   "bin/cli",
-  "bench_vs_plonky3",
 ]
+# bench_vs_plonky3 lives in its own workspace (with its own Cargo.lock) so its
+# heavy Plonky3 git dependencies never enter the main lock. Building the main
+# workspace (e.g. `-p cli`) no longer touches Cargo.lock.
+exclude = ["bench_vs_plonky3"]
 
 resolver = "2"
 
