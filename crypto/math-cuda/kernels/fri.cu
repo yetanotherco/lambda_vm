@@ -46,14 +46,15 @@ extern "C" __global__ void fri_fold_ext3(
     out_p[2] = res.c;
 }
 
-// update_twiddles_in_place: new[j] = old[2j]^2. Writes in-place. Caller
-// must ensure the kernel is not reading the same index concurrently. Since
-// we read `old[2j]` and write `new[j]` with j < 2j, there's no aliasing.
+// update_twiddles: tw_out[j] = tw_in[2j]^2 for j in 0..n_out.
+// Separate input/output buffers: thread j reads tw_in[2j] while thread 2j
+// writes tw_out[2j], so an in-place version would race across threads.
 extern "C" __global__ void fri_update_twiddles(
-    uint64_t *tw,
+    const uint64_t *tw_in,
+    uint64_t *tw_out,
     uint64_t n_out) {
     uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_out) return;
-    uint64_t old = tw[2 * j];
-    tw[j] = goldilocks::mul(old, old);
+    uint64_t old = tw_in[2 * j];
+    tw_out[j] = goldilocks::mul(old, old);
 }

@@ -1233,22 +1233,17 @@ where
 /// [`crate::fri::commit_phase_from_evaluations`]: per-layer transcript
 /// ping-pong (sample zeta, fold, build Merkle tree, append root).
 ///
-/// Returns `None` only at preconditions (type mismatch, below threshold,
-/// invalid sizes), before any transcript mutation, so the caller can
-/// safely run the CPU path on the same inputs.
-///
-/// # Panics
-///
-/// Panics if a cudarc call fails after the first layer's `zeta` has been
-/// sampled. By then the transcript is advanced and a CPU restart from the
-/// same evals would re-sample `zeta_0` against the mutated transcript,
-/// producing a different proof. Treat this function as a point of no
-/// return once it has started folding.
+/// Returns `None` on any failure (precondition miss or cudarc error
+/// mid-loop). On a mid-loop failure the transcript is restored from the
+/// snapshot taken at entry, so the caller's CPU fallback path runs against
+/// a byte-identical pre-GPU transcript state and produces the same proof
+/// it would have produced had the GPU never been tried. This requires the
+/// concrete transcript type to support snapshot semantics via `Clone`.
 #[allow(clippy::type_complexity)]
-pub(crate) fn try_fri_commit_gpu<F, E>(
+pub(crate) fn try_fri_commit_gpu<F, E, T>(
     number_layers: usize,
     evals: &[FieldElement<E>],
-    transcript: &mut impl IsStarkTranscript<E, F>,
+    transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> Option<(
@@ -1260,6 +1255,7 @@ where
     E: IsField + 'static,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
@@ -1295,6 +1291,13 @@ where
         Err(_) => return None,
     };
 
+    // Snapshot the transcript before any sampling. On a cudarc failure
+    // mid-loop we restore from this snapshot and return None, so the CPU
+    // fallback in `commit_phase_from_evaluations` starts from a byte-
+    // identical transcript and produces the same proof it would have
+    // produced had this dispatch never been called.
+    let transcript_snapshot = transcript.clone();
+
     let num_committed_layers = number_layers.saturating_sub(1);
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
         Vec::with_capacity(num_committed_layers);
@@ -1306,9 +1309,13 @@ where
         let zeta_ptr = &zeta as *const FieldElement<E> as *const u64;
         let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-        let (root, layer_evals_u64, nodes_bytes) = state
-            .fold_and_commit_layer(zeta_raw)
-            .expect("FRI commit: GPU fold+tree must not fail mid-phase (transcript advanced)");
+        let (root, layer_evals_u64, nodes_bytes) = match state.fold_and_commit_layer(zeta_raw) {
+            Ok(v) => v,
+            Err(_) => {
+                *transcript = transcript_snapshot.clone();
+                return None;
+            }
+        };
 
         // Build the FriLayer: ext3 evals + Merkle tree from precomputed nodes.
         let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
@@ -1334,9 +1341,13 @@ where
     let zeta_ptr = &zeta_last as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let last_raw = state
-        .fold_final(zeta_raw)
-        .expect("FRI commit: GPU final fold must not fail mid-phase (transcript advanced)");
+    let last_raw = match state.fold_final(zeta_raw) {
+        Ok(v) => v,
+        Err(_) => {
+            *transcript = transcript_snapshot;
+            return None;
+        }
+    };
     let last_vec = u64_to_ext3_vec::<E>(&last_raw);
     let last_value = last_vec
         .into_iter()

@@ -178,9 +178,12 @@ impl FriCommitState {
         }
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
-        // j in 0..n_out/2. (If n_out == 1, skip; no next fold.)
+        // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into
+        // a fresh device buffer to avoid the cross-thread race the in-place
+        // version had (thread j reads old[2j] while thread 2j writes old[2j]).
         let tw_next = n_out / 2;
         if tw_next > 0 {
+            let mut tw_out = unsafe { self.stream.alloc::<u64>(tw_next) }?;
             let grid = (tw_next as u32).div_ceil(128);
             let cfg = LaunchConfig {
                 grid_dim: (grid, 1, 1),
@@ -191,10 +194,12 @@ impl FriCommitState {
             unsafe {
                 self.stream
                     .launch_builder(&be.fri_update_twiddles)
-                    .arg(&mut self.inv_tw)
+                    .arg(&self.inv_tw)
+                    .arg(&mut tw_out)
                     .arg(&tw_next_u64)
                     .launch(cfg)?;
             }
+            self.inv_tw = tw_out;
         }
 
         // Sync and D2H.

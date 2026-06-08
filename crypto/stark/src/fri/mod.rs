@@ -21,10 +21,11 @@ use self::fri_functions::{
 pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
+    T: IsStarkTranscript<E, F> + Clone,
 >(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
-    transcript: &mut impl IsStarkTranscript<E, F>,
+    transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> (
@@ -42,7 +43,7 @@ where
     // since the transcript is already advanced (see `try_fri_commit_gpu`).
     #[cfg(feature = "cuda")]
     {
-        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E>(
+        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
             number_layers,
             &evals,
             transcript,

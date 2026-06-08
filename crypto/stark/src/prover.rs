@@ -1177,7 +1177,7 @@ pub trait IsStarkProver<
         round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Round4<Field, FieldExtension>
     where
         FieldElement<FieldExtension>: AsBytes,
@@ -1237,14 +1237,13 @@ pub trait IsStarkProver<
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (fri_last_value, fri_layers) =
-            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
-                domain.root_order as usize,
-                lde_evals,
-                transcript,
-                &coset_offset,
-                domain_size,
-            );
+        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations(
+            domain.root_order as usize,
+            lde_evals,
+            transcript,
+            &coset_offset,
+            domain_size,
+        );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
 
@@ -2197,7 +2196,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
