@@ -2,6 +2,7 @@ use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 #[cfg(test)]
 use itertools::Itertools;
+use math::fft::bit_reversing::reverse_index;
 #[cfg(test)]
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -654,12 +655,13 @@ where
         let main_iter = 0..num_main_cols;
         let main_evals: Vec<FieldElement<E>> = main_iter
             .map(|col_idx| {
-                let sum = col_scale
-                    .iter()
-                    .enumerate()
-                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + lde_trace.get_main(i * bf, col_idx) * scale
-                    });
+                let sum = col_scale.iter().enumerate().fold(
+                    FieldElement::<E>::zero(),
+                    |acc, (i, scale)| {
+                        acc + lde_trace.get_main(reverse_index(i * bf, (n * bf) as u64), col_idx)
+                            * scale
+                    },
+                );
                 &vanishing_factor * &sum
             })
             .collect();
@@ -674,12 +676,13 @@ where
         let aux_iter = 0..num_aux_cols;
         let aux_evals: Vec<FieldElement<E>> = aux_iter
             .map(|col_idx| {
-                let sum = col_scale
-                    .iter()
-                    .enumerate()
-                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + scale * lde_trace.get_aux(i * bf, col_idx)
-                    });
+                let sum = col_scale.iter().enumerate().fold(
+                    FieldElement::<E>::zero(),
+                    |acc, (i, scale)| {
+                        acc + scale
+                            * lde_trace.get_aux(reverse_index(i * bf, (n * bf) as u64), col_idx)
+                    },
+                );
                 &vanishing_factor * &sum
             })
             .collect();

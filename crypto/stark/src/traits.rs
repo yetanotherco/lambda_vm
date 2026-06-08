@@ -395,6 +395,7 @@ mod zerofier_tests {
         };
         let expanded = ze.bit_reversed_expanded(lde_size);
         for (gi, group) in [g0, g1].iter().enumerate() {
+            #[allow(clippy::needless_range_loop)]
             for p in 0..lde_size {
                 let logical = reverse_index(p, lde_size as u64);
                 assert_eq!(

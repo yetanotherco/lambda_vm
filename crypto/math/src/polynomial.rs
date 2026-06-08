@@ -866,7 +866,10 @@ mod row_major_lde_tests {
                     .unwrap();
                     in_place_bit_reverse_permute_row_major(&mut bitrev, m);
 
-                    assert_eq!(bitrev, natural, "log_n={log_n} blowup={blowup_factor} m={m}");
+                    assert_eq!(
+                        bitrev, natural,
+                        "log_n={log_n} blowup={blowup_factor} m={m}"
+                    );
                 }
             }
         }

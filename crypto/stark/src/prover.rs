@@ -503,8 +503,10 @@ where
     let total_bytes = 2 * num_parts * byte_len;
 
     let hash_leaf_pair = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
-        let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-        let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+        // Composition parts are stored bit-reversed → leaf `leaf_idx` hashes the
+        // adjacent physical pair (2·leaf_idx, 2·leaf_idx+1) directly.
+        let br_0 = 2 * leaf_idx;
+        let br_1 = 2 * leaf_idx + 1;
         let mut offset = 0;
         for part in parts.iter() {
             part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
@@ -614,8 +616,9 @@ pub trait IsStarkProver<
             .map_init(
                 || vec![0u8; row_bytes],
                 |buf, row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
+                    // Buffer is bit-reversed → leaf `row_idx` reads physical row
+                    // `row_idx` directly (= logical reverse_index(row_idx)).
+                    let row_start = row_idx * num_cols;
                     let row = &data[row_start..row_start + num_cols];
                     for (col_idx, elem) in row.iter().enumerate() {
                         elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
@@ -629,8 +632,9 @@ pub trait IsStarkProver<
             let mut buf = vec![0u8; row_bytes];
             (0..num_rows)
                 .map(|row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
+                    // Buffer is bit-reversed → leaf `row_idx` reads physical row
+                    // `row_idx` directly (= logical reverse_index(row_idx)).
+                    let row_start = row_idx * num_cols;
                     let row = &data[row_start..row_start + num_cols];
                     for (col_idx, elem) in row.iter().enumerate() {
                         elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
@@ -685,8 +689,9 @@ pub trait IsStarkProver<
             .map_init(
                 || vec![0u8; row_bytes],
                 |buf, row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
+                    // Buffer is bit-reversed → leaf `row_idx` reads physical row
+                    // `row_idx` directly (= logical reverse_index(row_idx)).
+                    let row_start = row_idx * num_cols;
                     let row = &data[row_start + col_start..row_start + col_end];
                     for (i, elem) in row.iter().enumerate() {
                         elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
@@ -700,8 +705,9 @@ pub trait IsStarkProver<
             let mut buf = vec![0u8; row_bytes];
             (0..num_rows)
                 .map(|row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
+                    // Buffer is bit-reversed → leaf `row_idx` reads physical row
+                    // `row_idx` directly (= logical reverse_index(row_idx)).
+                    let row_start = row_idx * num_cols;
                     let row = &data[row_start + col_start..row_start + col_end];
                     for (i, elem) in row.iter().enumerate() {
                         elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
@@ -894,7 +900,7 @@ pub trait IsStarkProver<
             trace.main_table.advise_drop_cache();
         }
 
-        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major_bitrev::<Field>(
             &mut main_data,
             total_cols,
             domain.blowup_factor,
@@ -1334,26 +1340,31 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain)
+            Self::decompose_and_extend_d2_bitrev(&constraint_evaluations, domain)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
         } else {
-            // Fallback for any future AIR with d > 2.
+            // Fallback for any AIR with d > 2. `constraint_evaluations` is
+            // bit-reversed; the interpolation FFT runs natural-order, so permute
+            // in, then emit each LDE part bit-reversed.
+            let mut natural = constraint_evaluations.clone();
+            in_place_bit_reverse_permute(&mut natural);
             let composition_poly =
-                Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
-                    .unwrap();
+                Polynomial::interpolate_offset_fft(&natural, &domain.coset_offset).unwrap();
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
             composition_poly_parts
                 .iter()
                 .map(|part| {
-                    evaluate_polynomial_on_lde_domain(
+                    let mut lde = evaluate_polynomial_on_lde_domain(
                         part,
                         domain.blowup_factor,
                         domain.interpolation_domain_size,
                         &domain.coset_offset,
                     )
-                    .unwrap()
+                    .unwrap();
+                    in_place_bit_reverse_permute(&mut lde);
+                    lde
                 })
                 .collect()
         };
@@ -1408,9 +1419,13 @@ pub trait IsStarkProver<
             .lde_composition_poly_evaluations
             .iter()
             .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
+                // Extract trace-size evaluations: the parts are stored
+                // bit-reversed, so logical row i·blowup is at physical
+                // reverse_index(i·blowup, lde_size).
                 let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
-                    .map(|i| lde_evals[i * blowup_factor].clone())
+                    .map(|i| {
+                        lde_evals[reverse_index(i * blowup_factor, lde_evals.len() as u64)].clone()
+                    })
                     .collect();
                 math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
@@ -1500,8 +1515,9 @@ pub trait IsStarkProver<
         let domain_size = domain.lde_roots_of_unity_coset.len();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
+        // DEEP evals are already in bit-reversed order (bit-reversed LDE +
+        // bit-reversed denominators produce them directly) → feed FRI as-is.
+        let lde_evals = deep_evals;
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
@@ -1638,6 +1654,14 @@ pub trait IsStarkProver<
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
+        // Bit-reverse each `lde_size` denom block so physical row `i` (read from
+        // the bit-reversed trace + H-part buffers) pairs with the denominator at
+        // its logical point `reverse_index(i)`. The DEEP output is then produced
+        // directly in bit-reversed order (no post-pass permute before FRI).
+        for block in 0..=num_eval_points {
+            in_place_bit_reverse_permute(&mut denoms[block * lde_size..(block + 1) * lde_size]);
+        }
+
         let inv_h = &denoms[0..lde_size];
 
         // OOD evaluations
@@ -1735,10 +1759,9 @@ pub trait IsStarkProver<
         let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
             .iter()
             .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
+                // Composition parts stored bit-reversed → the FRI query position
+                // (index*2, index*2+1) indexes the physical rows directly.
+                vec![part[index * 2].clone(), part[index * 2 + 1].clone()]
             })
             .collect();
 
@@ -1763,7 +1786,7 @@ pub trait IsStarkProver<
     /// supplies a `gather` closure that pulls the row data from the column-major LDE
     /// storage (full main row, ranged main row, or aux row).
     fn open_polys_with<C, G>(
-        domain: &Domain<Field>,
+        _domain: &Domain<Field>,
         tree: &BatchedMerkleTree<C>,
         challenge: usize,
         gather: G,
@@ -1773,14 +1796,15 @@ pub trait IsStarkProver<
         FieldElement<C>: AsBytes + Sync + Send,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
         let index = challenge * 2;
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: gather(reverse_index(index, domain_size)),
-            evaluations_sym: gather(reverse_index(index_sym, domain_size)),
+            // Trace LDE stored bit-reversed → the FRI query position is the
+            // physical row directly (no reverse_index map).
+            evaluations: gather(index),
+            evaluations_sym: gather(index_sym),
         }
     }
 
@@ -2199,7 +2223,7 @@ pub trait IsStarkProver<
                             trace.aux_table.advise_drop_cache();
                         }
 
-                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major_bitrev::<Field>(
                             &mut aux_data,
                             total_cols,
                             domain.blowup_factor,

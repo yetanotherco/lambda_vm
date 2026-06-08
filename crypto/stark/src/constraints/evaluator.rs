@@ -4,6 +4,7 @@ use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compu
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
@@ -49,6 +50,14 @@ where
         let is_uniform = zerofier_data.is_uniform();
         let num_base = air.num_base_transition_constraints();
 
+        // Bit-reversed evaluator: expand the (short, cycled) zerofier groups to the
+        // full LDE size and bit-reverse them once, so physical row `i` indexes
+        // `zerofier_expanded[group][i]` directly (= the zerofier at logical row
+        // reverse_index(i)) — no per-element scatter into the zerofier.
+        let lde_size = boundary_evaluation.len();
+        let zerofier_expanded = zerofier_data.bit_reversed_expanded(lde_size);
+        let constraint_to_group = &zerofier_data.constraint_to_group;
+
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
@@ -83,7 +92,7 @@ where
                         periodic_buf: &mut [FieldElement<Field>],
                         frame: &mut Frame<Field, FieldExtension>|
          -> FieldElement<FieldExtension> {
-            frame.fill_from_lde(lde_trace, i, offsets);
+            frame.fill_from_lde_bitrev(lde_trace, i, offsets);
 
             for (j, col) in lde_periodic_columns.iter().enumerate() {
                 periodic_buf[j] = col[i].clone();
@@ -101,7 +110,7 @@ where
 
             let acc_transition = if is_uniform {
                 // All constraints share one zerofier: factor it out of the sum.
-                let z = zerofier_data.get_uniform(i);
+                let z = &zerofier_expanded[0][i];
                 // F×E inner product for base constraints (3 muls per term)
                 let mut sum = base_buf
                     .iter()
@@ -119,14 +128,14 @@ where
                     .enumerate()
                     .zip(&transition_coefficients[..num_base])
                     .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                        acc + zerofier_data.get(c_idx, i) * eval * beta
+                        acc + &zerofier_expanded[constraint_to_group[c_idx]][i] * eval * beta
                     });
                 sum = transition_buf[num_base..]
                     .iter()
                     .enumerate()
                     .zip(&transition_coefficients[num_base..])
                     .fold(sum, |acc, ((j, eval), beta)| {
-                        acc + zerofier_data.get(num_base + j, i) * eval * beta
+                        acc + &zerofier_expanded[constraint_to_group[num_base + j]][i] * eval * beta
                     });
                 sum
             };
@@ -243,6 +252,10 @@ where
                         .map(|v| v - &point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
+                    // Bit-reverse to align with the bit-reversed LDE: physical row
+                    // p reads `evals[p]` (= the zerofier inv at logical row
+                    // reverse_index(p)), matching `get_main(p, ..)`.
+                    in_place_bit_reverse_permute(&mut evals);
                     evals
                 })
                 .collect::<Vec<Vec<FieldElement<Field>>>>();
@@ -252,12 +265,16 @@ where
             .get_periodic_column_polynomials(trace_length)
             .iter()
             .map(|poly| {
-                evaluate_polynomial_on_lde_domain(
+                let mut col = evaluate_polynomial_on_lde_domain(
                     poly,
                     domain.blowup_factor,
                     domain.interpolation_domain_size,
                     &domain.coset_offset,
-                )
+                )?;
+                // Bit-reverse so physical row p reads `col[p]` (periodic value at
+                // logical row reverse_index(p)), aligned with the bit-reversed LDE.
+                in_place_bit_reverse_permute(&mut col);
+                Ok(col)
             })
             .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
             .unwrap();

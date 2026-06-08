@@ -137,13 +137,18 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
     let lde_evaluations: Vec<Vec<Felt>> = trace_polys
         .iter()
         .map(|poly| {
-            evaluate_polynomial_on_lde_domain(
+            let mut col = evaluate_polynomial_on_lde_domain(
                 poly,
                 domain.blowup_factor,
                 domain.interpolation_domain_size,
                 &domain.coset_offset,
             )
-            .expect("LDE evaluation failed")
+            .expect("LDE evaluation failed");
+            // The production LDE is bit-reversed; mirror it here so the
+            // barycentric path (which now assumes bit-reversed storage) reads
+            // the right rows.
+            math::fft::bit_reversing::in_place_bit_reverse_permute(&mut col);
+            col
         })
         .collect();
 
