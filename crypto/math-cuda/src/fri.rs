@@ -15,6 +15,31 @@ use std::sync::Arc;
 use crate::Result;
 use crate::device::backend;
 
+/// Test-only fault injection. When the `test-faults` feature is on, setting
+/// this to a finite value forces the next `fold_and_commit_layer` /
+/// `fold_final` call to return Err and decrement the counter. Tests use
+/// this to exercise the CPU-fallback path in `try_fri_commit_gpu`. Compiled
+/// out entirely in production builds.
+#[cfg(feature = "test-faults")]
+pub static FAULT_FOLDS_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(feature = "test-faults")]
+fn check_fault_injection() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let v = FAULT_FOLDS_REMAINING_UNTIL_ERR.load(Ordering::Relaxed);
+    if v < 0 {
+        return Ok(());
+    }
+    let new = FAULT_FOLDS_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if new == 0 {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+    }
+    Ok(())
+}
+
 /// Device-side state across FRI commit iterations. Owns two ext3 eval
 /// buffers (flip-flopped as layer input / output) and the inv_twiddles
 /// buffer. Freed when dropped.
@@ -73,6 +98,8 @@ impl FriCommitState {
         &mut self,
         zeta_raw: [u64; 3],
     ) -> Result<(Vec<u8>, Vec<u64>, Vec<u8>)> {
+        #[cfg(feature = "test-faults")]
+        check_fault_injection()?;
         let be = backend()?;
         let n_in = self.current_n;
         let n_out = n_in / 2;
@@ -230,6 +257,8 @@ impl FriCommitState {
     /// Final fold, no Merkle commit. Returns the single ext3 output
     /// element (the FRI last_value).
     pub fn fold_final(&mut self, zeta_raw: [u64; 3]) -> Result<[u64; 3]> {
+        #[cfg(feature = "test-faults")]
+        check_fault_injection()?;
         let be = backend()?;
         let n_in = self.current_n;
         let n_out = n_in / 2;

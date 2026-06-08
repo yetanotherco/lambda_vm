@@ -936,6 +936,15 @@ pub fn gpu_fri_calls() -> u64 {
     GPU_FRI_CALLS.load(Ordering::Relaxed)
 }
 
+/// Test-only: schedule the Nth upcoming FRI fold call (1 = first, 2 =
+/// second, ...) to return Err, exercising the snapshot-restore path in
+/// [`try_fri_commit_gpu`]. Pass -1 to disable. Production default is -1.
+/// Only available with the `test-cuda-faults` feature.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_fri_fold_fault(n_calls_until_err: i64) {
+    math_cuda::fri::FAULT_FOLDS_REMAINING_UNTIL_ERR.store(n_calls_until_err, Ordering::Relaxed);
+}
+
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
 /// coefficient parts). Returns both the host LDE eval Vecs (needed for the
 /// R2 Merkle commit and R3 OOD path) and a device-resident `GpuLdeExt3`
