@@ -24,8 +24,8 @@ later on.
 = Approach 1: Prove-and-retire
 
 In the first potential approach, we proceed in multiple passes:
-- *Commit*: The prover proceeds through execution, witness generation and interpolation as usual
-  once the memory pressure becomes too large, the prover batch commits to all full (or large enough) tables
+- *Commit*: The prover proceeds through execution, witness generation and interpolation as usual.
+  Once the memory pressure becomes too large, the prover batch commits to all full (or large enough) tables
   in memory; then these tables are dropped from memory ("retired").
   All FRI polynomials generated during this phase can already be accumulated in a single batch polynomial,
   by sampling the batching coefficients after commiting to the polynomials they randomize.
