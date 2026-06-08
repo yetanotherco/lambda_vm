@@ -417,35 +417,25 @@ impl VmAirs {
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
+                let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
-                    create_page_air(proof_options, config.page_base)
-                } else if config.init_values.is_none() {
-                    // Zero-init pages: OFFSET + INIT are preprocessed and uniformly zero.
-                    // `preprocessed_commitment` returns the compile-time constant
-                    // for standard `(page_size, blowup_factor)` pairs and recomputes
-                    // otherwise — caller-supplied values aren't useful here because the
-                    // const is already cheaper than reading bytes through the API.
-                    create_page_air(proof_options, config.page_base).with_preprocessed(
-                        page::preprocessed_commitment(config, proof_options),
-                        page::NUM_PREPROCESSED_COLS,
-                    )
+                    air
                 } else {
-                    // ELF data pages: INIT depends on the program's bytes. If the caller
-                    // supplied a matching `(page_base, commitment)` pair via
-                    // `page_commitments`, use it directly and skip the FFT + Merkle build;
-                    // otherwise recompute from the ELF data.
+                    // Preprocessed pages (zero-init + ELF data): OFFSET + INIT are fixed
+                    // before execution. Prefer a caller-supplied `(page_base, commitment)`
+                    // (recursion guest, for ELF data pages — skips the FFT + Merkle build);
+                    // otherwise `preprocessed_commitment` returns the zero-init static
+                    // constant or recomputes from the ELF.
                     let commitment = page_commitments
-                        .and_then(|list| {
-                            list.iter()
-                                .find(|(pb, _)| *pb == config.page_base)
-                                .map(|(_, c)| *c)
-                        })
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|(pb, _)| *pb == config.page_base)
+                        .map(|(_, c)| *c)
                         .unwrap_or_else(|| page::preprocessed_commitment(config, proof_options));
-                    create_page_air(proof_options, config.page_base)
-                        .with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
+                    air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }
             })
             .collect();
