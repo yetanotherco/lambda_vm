@@ -186,7 +186,7 @@ name = "assumptions"
 
 [[constraints.assumptions]]
 kind = "arith"
-constraint = "$#`read_register2` = 0 or #`imm[i] = 0`$"
+constraint = "$#`read_register2` = 0 or #`imm = 0`$"
 poly = ["*", "read_register2", ["+", ["idx", "imm", 0], ["idx", "imm", 1]]]
 
 [[constraint_groups]]
@@ -376,6 +376,11 @@ multiplicity = ["-", "μ"]
 name = "ext"
 
 [[constraints.ext]]
+kind = "arith"
+constraint = "$#`signed` => #`μ`$"
+poly = ["*", "signed", ["not", "μ"]]
+
+[[constraints.ext]]
 kind = "interaction"
 tag = "BYTE_ALU"
 input = [["opsel", "AND"], 32, "alu_flags"]
@@ -417,7 +422,7 @@ poly = ["-", ["idx", "arg2", 1], ["*", ["-", ["^", 2, 32], 1], "rv2_sign"], ["id
 [[constraints.ext]]
 kind = "template"
 tag = "SIGN"
-input = [["idx", "res", 1], 1]
+input = [["idx", "res", 1], "μ"]
 output = "res_sign"
 
 [[constraints.ext]]
