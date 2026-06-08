@@ -3115,6 +3115,14 @@ impl Traces {
         is_final: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        // A non-final epoch must not contain the program-terminating instruction
+        // (next_pc == 0). Otherwise the CPU sends an ECALL bus token with no HALT
+        // table to receive it (HALT is excluded when !is_final), producing an
+        // unverifiable proof. Fail explicitly instead.
+        if !is_final && logs.iter().any(|log| log.next_pc == 0) {
+            return Err(Error::HaltInNonFinalEpoch);
+        }
+
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.

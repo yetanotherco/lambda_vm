@@ -970,3 +970,55 @@ fn test_build_traces_for_all_epochs() {
         );
     }
 }
+
+/// A non-final epoch carrying the program-terminating instruction is rejected
+/// (rather than silently producing an unverifiable proof).
+#[test]
+fn test_terminating_epoch_rejected_when_not_final() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::register::register_init_from_snapshot;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // The last epoch holds the terminating instruction; building it as a
+    // non-final epoch (is_final = false) must error.
+    let last = epochs.len() - 1;
+    let image: HashMap<u64, u8> = epochs[last - 1].end_memory.iter_bytes().collect();
+    let register_init =
+        register_init_from_snapshot(&epochs[last - 1].end_registers, epochs[last - 1].end_pc);
+
+    let result = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &register_init,
+        &epochs[last].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::HaltInNonFinalEpoch)),
+        "expected HaltInNonFinalEpoch error for a non-final terminating epoch"
+    );
+}
