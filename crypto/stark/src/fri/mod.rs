@@ -47,12 +47,12 @@ where
         // Fold evaluations in-place (no FFT needed).
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build the Merkle tree from consecutive pairs.
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-            .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        // Build the Merkle tree from consecutive pairs. After folding, `evals` has
+        // even length, so reinterpret it directly as `&[[E; 2]]` (a `[T; 2]` has the
+        // same layout as two consecutive `T`) instead of cloning every element into a
+        // fresh `Vec` on each layer. Same leaf bytes → identical tree → identical proof.
+        let (leaves, _rem) = evals.as_chunks::<2>();
+        let merkle_tree = FriLayerMerkleTree::build(leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(&evals, merkle_tree));
