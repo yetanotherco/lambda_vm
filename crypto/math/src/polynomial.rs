@@ -4,7 +4,7 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
-use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
+use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half, fft_batch_two_half_bitrev};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -535,6 +535,62 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     where
         E: Send + Sync,
     {
+        Self::coset_lde_full_expand_row_major_impl(
+            buffer,
+            num_cols,
+            blowup_factor,
+            weights,
+            inv_twiddles,
+            fwd_twiddles,
+            false,
+        )
+    }
+
+    /// Bit-reversed-output variant of [`coset_lde_full_expand_row_major`]: the LDE
+    /// rows are left in bit-reversed order (the forward transform skips its final
+    /// natural-order permute — one fewer pass over `2N·M`). The set of evaluations
+    /// is identical; only the row order differs, so
+    /// `in_place_bit_reverse_permute_row_major(output, num_cols)` recovers the
+    /// natural-order LDE. For consumers that read the LDE bit-reversed (the trace
+    /// Merkle commit and FRI already do).
+    pub fn coset_lde_full_expand_row_major_bitrev<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        num_cols: usize,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        Self::coset_lde_full_expand_row_major_impl(
+            buffer,
+            num_cols,
+            blowup_factor,
+            weights,
+            inv_twiddles,
+            fwd_twiddles,
+            true,
+        )
+    }
+
+    /// Shared implementation. When `bit_reversed_output` is true the final forward
+    /// transform leaves the rows bit-reversed (one fewer `2N·M` permute); the iFFT
+    /// stays natural-order so the per-row coset-weight scaling indexes rows correctly.
+    #[allow(clippy::too_many_arguments)]
+    fn coset_lde_full_expand_row_major_impl<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        num_cols: usize,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+        bit_reversed_output: bool,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
         if num_cols == 0 || buffer.is_empty() {
             return Ok(());
         }
@@ -589,9 +645,14 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 3. Zero-pad rows to lde_n.
         buffer.resize(lde_n * num_cols, FieldElement::zero());
 
-        // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
-        //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
-        fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
+        // 4. Forward FFT (cache-blocked two-half). Natural-order output by
+        //    default; bit-reversed output (one fewer permute) when a consumer that
+        //    reads the LDE bit-reversed requests it.
+        if bit_reversed_output {
+            fft_batch_two_half_bitrev::<F, E>(buffer, num_cols, fwd_twiddles)?;
+        } else {
+            fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
+        }
 
         Ok(())
     }
@@ -736,6 +797,76 @@ mod row_major_lde_tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The bit-reversed LDE, bit-reversed back to natural order, equals the
+    /// natural-order LDE — proves `coset_lde_full_expand_row_major_bitrev` only
+    /// permutes rows (proof-invariant by construction).
+    #[test]
+    fn coset_lde_full_expand_row_major_bitrev_recovers_natural() {
+        use crate::fft::bowers_fft_batch::in_place_bit_reverse_permute_row_major;
+        for log_n in 2..=8 {
+            let n = 1usize << log_n;
+            for &blowup_factor in &[2usize, 4] {
+                let lde_size = n * blowup_factor;
+                let two_inv = TwoHalfTwiddles::<F>::new(log_n, true).unwrap();
+                let two_fwd =
+                    TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false).unwrap();
+
+                let offset = FE::from(3u64);
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                for &m in &[1usize, 2, 3, 5, 8] {
+                    let cols: Vec<Vec<FE>> = (0..m)
+                        .map(|c| {
+                            (0..n)
+                                .map(|i| {
+                                    FE::from((c as u64).wrapping_mul(1_000_003) + i as u64 + 17)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let mut input: Vec<FE> = Vec::with_capacity(n * m);
+                    #[allow(clippy::needless_range_loop)]
+                    for r in 0..n {
+                        for c in 0..m {
+                            input.push(cols[c][r]);
+                        }
+                    }
+
+                    let mut natural = input.clone();
+                    Polynomial::<FE>::coset_lde_full_expand_row_major::<F>(
+                        &mut natural,
+                        m,
+                        blowup_factor,
+                        &weights,
+                        &two_inv,
+                        &two_fwd,
+                    )
+                    .unwrap();
+
+                    let mut bitrev = input.clone();
+                    Polynomial::<FE>::coset_lde_full_expand_row_major_bitrev::<F>(
+                        &mut bitrev,
+                        m,
+                        blowup_factor,
+                        &weights,
+                        &two_inv,
+                        &two_fwd,
+                    )
+                    .unwrap();
+                    in_place_bit_reverse_permute_row_major(&mut bitrev, m);
+
+                    assert_eq!(bitrev, natural, "log_n={log_n} blowup={blowup_factor} m={m}");
                 }
             }
         }

@@ -1209,6 +1209,86 @@ pub trait IsStarkProver<
         .expect("LDE evaluation should succeed")
     }
 
+    /// Bit-reversed-order variant of [`decompose_and_extend_d2`]. Input
+    /// `constraint_evaluations` is bit-reversed (physical `p` ↔ logical
+    /// `reverse_index(p, 2N)`); the conjugate pair `(g·ω^L, −g·ω^L)` is the
+    /// ADJACENT physical pair `(2j, 2j+1)` (because `L` and `L+N` differ in the
+    /// top logical bit, which `reverse_index` maps to the bottom physical bit).
+    /// The output composition-poly parts come out bit-reversed-2N — exactly the
+    /// bit-reversal of [`decompose_and_extend_d2`]'s natural output.
+    // Wired into round_2 in Phase C; lives alongside the natural version until then.
+    #[allow(dead_code)]
+    fn decompose_and_extend_d2_bitrev(
+        constraint_evaluations: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
+    ) -> Vec<Vec<FieldElement<FieldExtension>>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let two_n = constraint_evaluations.len();
+        let n = two_n / 2;
+        debug_assert_eq!(two_n, n * 2);
+
+        // inv_2x[j] = 1/(2·g·ω^L), L = reverse_index(2j, 2N) — the domain point of
+        // the physical-2j (low-half) element of the conjugate pair.
+        let two_base = FieldElement::<Field>::from(2u64);
+        let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
+            .map(|j| {
+                let l = reverse_index(2 * j, two_n as u64);
+                &two_base * &domain.lde_roots_of_unity_coset[l]
+            })
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
+
+        // Decompose over the adjacent conjugate pair (2j, 2j+1):
+        // lo = ce[2j] (at g·ω^L), hi = ce[2j+1] (at −g·ω^L).
+        // H0((g·ω^L)²)=(lo+hi)/2, H1=(lo−hi)/(2·g·ω^L). Output in bit-reversed-N.
+        let two_inv = two_base.inv().expect("2 is non-zero in the field");
+        let (h0_evals, h1_evals) = crate::par::map_unzip(n, |j| {
+            let lo = &constraint_evaluations[2 * j];
+            let hi = &constraint_evaluations[2 * j + 1];
+            let sum = lo + hi;
+            let diff = lo - hi;
+            (&two_inv * &sum, &inv_2x[j] * &diff)
+        });
+
+        let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
+        let (lde_h0, lde_h1) = crate::par::join(
+            || Self::extend_half_to_lde_bitrev(&h0_evals, &coset_offset_squared, domain),
+            || Self::extend_half_to_lde_bitrev(&h1_evals, &coset_offset_squared, domain),
+        );
+        vec![lde_h0, lde_h1]
+    }
+
+    /// Bit-reversed variant of [`extend_half_to_lde`]: `half_evals` is in
+    /// bit-reversed-N order, the output LDE in bit-reversed-2N order. The
+    /// interpolation FFT runs in natural order (permute in, permute out).
+    #[allow(dead_code)]
+    fn extend_half_to_lde_bitrev(
+        half_evals_bitrev: &[FieldElement<FieldExtension>],
+        squared_offset: &FieldElement<Field>,
+        domain: &Domain<Field>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let mut natural = half_evals_bitrev.to_vec();
+        in_place_bit_reverse_permute(&mut natural); // bit-reversed-N → natural-N
+        let poly = Polynomial::interpolate_offset_fft(&natural, squared_offset)
+            .expect("iFFT should succeed");
+        let mut lde = evaluate_polynomial_on_lde_domain(
+            &poly,
+            domain.blowup_factor,
+            domain.interpolation_domain_size,
+            &domain.coset_offset,
+        )
+        .expect("LDE evaluation should succeed");
+        in_place_bit_reverse_permute(&mut lde); // natural-2N → bit-reversed-2N
+        lde
+    }
+
     /// Returns the result of the second round of the STARK Prove protocol.
     fn round_2_compute_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,

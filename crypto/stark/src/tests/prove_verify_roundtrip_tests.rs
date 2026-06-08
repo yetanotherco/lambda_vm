@@ -37,6 +37,11 @@ impl From<BusId> for u64 {
     }
 }
 
+/// Golden `(len, FNV-1a-64)` of the serialized demo multi-proof — Track B
+/// tripwire. Captured on the natural-order baseline; the bit-reversed-LDE
+/// rework is proof-invariant, so this must not move.
+const TRACK_B_PROOF_GOLDEN: (usize, u64) = (24321, 16457982168507117669);
+
 /// Test that verifies multi-table LogUp proofs can be serialized, transmitted,
 /// and verified by a verifier who never ran the prover.
 #[test_log::test]
@@ -143,6 +148,23 @@ fn test_verify_serialized_multi_table_proofs() {
     // =========================================================================
 
     let serialized = serde_cbor::to_vec(&proofs).expect("Failed to serialize proofs");
+
+    // Track B tripwire: the bit-reversed-LDE rework is proof-invariant, so the
+    // demo proof must stay byte-identical (same FNV-1a digest). A mismatch flags
+    // an index-map bug — the rollback alone can't catch a "wrong but verifying"
+    // proof, this can.
+    {
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in &serialized {
+            digest ^= *b as u64;
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(
+            (serialized.len(), digest),
+            TRACK_B_PROOF_GOLDEN,
+            "Track B proof digest moved (len, fnv-1a)",
+        );
+    }
 
     // At this point, the prover's data is dropped (out of scope above)
     // The verifier only has the serialized data

@@ -174,10 +174,45 @@ fn dit_second_half_layer<F, E>(
 /// are NOT scaled by `1/n` — that is the caller's responsibility (e.g. folded
 /// into the coset-weight pass of the LDE).
 #[cfg(feature = "alloc")]
+/// Natural-order batched two-half FFT (final bit-reverse to natural order).
 pub fn fft_batch_two_half<F, E>(
     buf: &mut [FieldElement<E>],
     num_cols: usize,
     tw: &TwoHalfTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    fft_batch_two_half_inner(buf, num_cols, tw, true)
+}
+
+/// Bit-reversed-output batched two-half FFT: skips the final bit-reverse pass
+/// (one fewer full-buffer permute). Bit-reversing the output once more yields
+/// [`fft_batch_two_half`]'s natural order. Used by the bit-reversed-layout LDE.
+pub fn fft_batch_two_half_bitrev<F, E>(
+    buf: &mut [FieldElement<E>],
+    num_cols: usize,
+    tw: &TwoHalfTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    fft_batch_two_half_inner(buf, num_cols, tw, false)
+}
+
+/// Core two-half batched FFT. `final_bitrev = true` → natural-order output;
+/// `false` → bit-reversed output (one bit-reversal pass cheaper).
+fn fft_batch_two_half_inner<F, E>(
+    buf: &mut [FieldElement<E>],
+    num_cols: usize,
+    tw: &TwoHalfTwiddles<F>,
+    final_bitrev: bool,
 ) -> Result<(), FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
@@ -239,8 +274,10 @@ where
         }
     });
 
-    // Step 5: final bit-reverse to natural order.
-    in_place_bit_reverse_permute_row_major(buf, m);
+    // Step 5: final bit-reverse to natural order. Skipped for bit-reversed output.
+    if final_bitrev {
+        in_place_bit_reverse_permute_row_major(buf, m);
+    }
 
     Ok(())
 }

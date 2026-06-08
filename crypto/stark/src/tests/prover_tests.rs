@@ -520,3 +520,42 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         );
     }
 }
+
+/// Track B de-risk (highest-risk site): `decompose_and_extend_d2_bitrev` on a
+/// bit-reversed input must produce composition parts equal to the natural-order
+/// `decompose_and_extend_d2` output, bit-reversed. Validates the conjugate-pair
+/// adjacency + the bit-reversed-N ordering before the Phase-C atomic flip.
+#[test]
+fn decompose_and_extend_d2_bitrev_matches_natural() {
+    use math::fft::bit_reversing::in_place_bit_reverse_permute;
+    type E = GoldilocksField;
+
+    let proof_options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 20,
+    };
+    let trace_length = 8;
+    let domain = Domain::new(&FibonacciAIR::<E>::new(&proof_options), trace_length);
+    let lde_size = trace_length * 2; // blowup 2
+
+    // Deterministic constraint evaluations (natural order), length 2N = lde_size.
+    let ce: Vec<FieldElement<E>> = (0..lde_size)
+        .map(|i| FieldElement::<E>::from((i as u64).wrapping_mul(7919) + 3))
+        .collect();
+
+    let natural = Prover::<E, E, FibonacciPublicInputs<E>>::decompose_and_extend_d2(&ce, &domain);
+
+    let mut ce_br = ce.clone();
+    in_place_bit_reverse_permute(&mut ce_br);
+    let bitrev =
+        Prover::<E, E, FibonacciPublicInputs<E>>::decompose_and_extend_d2_bitrev(&ce_br, &domain);
+
+    assert_eq!(natural.len(), bitrev.len());
+    for (k, (nat_part, br_part)) in natural.iter().zip(bitrev.iter()).enumerate() {
+        let mut nat_br = nat_part.clone();
+        in_place_bit_reverse_permute(&mut nat_br);
+        assert_eq!(&nat_br, br_part, "composition part {k} bitrev mismatch");
+    }
+}
