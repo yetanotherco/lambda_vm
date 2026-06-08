@@ -166,7 +166,9 @@ pub fn in_chip_constraint_count(
         vec![],
     )
     .num_transition_constraints();
-    wired - bus_only
+    wired
+        .checked_sub(bus_only)
+        .expect("wired (in-chip + bus constraints) must be >= bus-only constraint count")
 }
 
 /// Collect the `start_column`s of every `IS_HALFWORD` sender in `interactions`.
