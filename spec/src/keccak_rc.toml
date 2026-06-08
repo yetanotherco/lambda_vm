@@ -1,0 +1,28 @@
+name = "KECCAK_RC"
+
+[[variables.input]]
+name = "round"
+type = "BaseField"
+desc = ""
+precomputed = true
+
+[[variables.input]]
+name = "RC"
+type = ["Byte", 8]
+desc = "round constants for the given `round`"
+precomputed = true
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+
+[[constraint_groups]]
+name = "contributions"
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "KECCAK_RC"
+input = ["round"]
+output = "RC"
+multiplicity = ["-", "μ"]

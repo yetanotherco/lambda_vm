@@ -5,7 +5,7 @@ name = "LOAD"
 [[variables.input]]
 name = "base_address"
 type = "DWordWL"
-desc = "The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The base address to read from, gets offset by $[0, 7]$, depending on how big the access is"
 pad = 0
 
 [[variables.input]]
@@ -76,27 +76,37 @@ desc = "`IS_WORD[base_address[i]]`"
 iter = ["i", 0, 1]
 
 [[assumptions]]
-desc = "`IS_BIT<signed>`"
-
-[[assumptions]]
-desc = "`IS_BIT<read2>`"
-
-[[assumptions]]
-desc = "`IS_BIT<read4>`"
-
-[[assumptions]]
-desc = "`IS_BIT<read8>`"
-
-[[assumptions]]
-desc = "`IS_BIT<read2 + read4 + read8>`"
-
-[[assumptions]]
 desc = "`IS_WORD[timestamp[i]]`"
 iter = ["i", 0, 1]
 
 
 [[constraint_groups]]
 name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["signed"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read2"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read4"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read8"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = [["+", "read2", "read4", "read8"]]
 
 [[constraints.all]]
 kind = "arith"
@@ -154,7 +164,7 @@ name = "output"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "LOAD"
-input = ["base_address", "timestamp", "read2", "read4", "read8", "signed"]
+tag = "MEMOP"
+input = ["timestamp", "base_address", ["cast", 0, "DWordWL"], ["+", ["*", 2, "signed"], ["*", 4, "read2"], ["*", 8, "read4"], ["*", 16, "read8"]]]
 output = ["cast", "res", "DWordWL"]
 multiplicity = ["-", "μ"]
