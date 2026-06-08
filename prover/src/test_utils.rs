@@ -20,7 +20,11 @@ use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::debug::validate_trace;
+use stark::domain::Domain;
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover, ProvingError};
@@ -83,7 +87,7 @@ use crate::tables::register::{
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
 };
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
 pub type E = GoldilocksExtension;
@@ -110,6 +114,77 @@ where
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )
+}
+
+// =============================================================================
+// Soundness regression helpers (negative AIR tests)
+// =============================================================================
+
+/// Build a bus-less AIR carrying only the given in-chip transition constraints.
+/// With zero bus interactions, `AirWithBuses::new` appends no LogUp constraints
+/// and allocates no aux columns, so `validate_trace` evaluates exactly the chip's
+/// transition constraints over a main-only trace.
+pub fn busless_air<C: TransitionConstraint<F, E> + 'static>(
+    num_columns: usize,
+    constraints: Vec<C>,
+) -> VmAir {
+    let transition_constraints = constraints.into_iter().map(|c| c.boxed()).collect();
+    AirWithBuses::new(
+        num_columns,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &ProofOptions::default_test_options(),
+        1,
+        transition_constraints,
+    )
+}
+
+/// Run `validate_trace` for a bus-less chip AIR over a main-only trace.
+/// Returns `true` iff every transition constraint holds on every row.
+pub fn validate_busless(air: &VmAir, trace: &TraceTable<F, E>) -> bool {
+    let domain = Domain::new(air, trace.num_rows());
+    validate_trace(air, &(), trace, &domain, &[], None)
+}
+
+/// Number of transition constraints a production builder registers on top of its
+/// bus constraints, as a delta against a bus-only AIR with the same interactions
+/// but no in-chip constraints. Isolates the in-chip count even though
+/// `AirWithBuses::new` also appends LogUp constraints, so a plain count cannot.
+pub fn in_chip_constraint_count(
+    wired: usize,
+    num_columns: usize,
+    buses: Vec<BusInteraction>,
+) -> usize {
+    let bus_only = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+        num_columns,
+        AuxiliaryTraceBuildData {
+            interactions: buses,
+        },
+        &ProofOptions::default_test_options(),
+        1,
+        vec![],
+    )
+    .num_transition_constraints();
+    wired - bus_only
+}
+
+/// Collect the `start_column`s of every `IS_HALFWORD` sender in `interactions`.
+/// Used to assert input/operand half-limbs are range-checked. Scope: only
+/// single-column `Packed` senders (which is how every current IS_HALFWORD sender is
+/// declared); it does not inspect `Linear` senders or sender multiplicities.
+pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize> {
+    let id: u64 = BusId::IsHalfword.into();
+    interactions
+        .iter()
+        .filter(|i| i.is_sender && i.bus_id == id)
+        .flat_map(|i| {
+            i.values.iter().filter_map(|v| match v {
+                BusValue::Packed { start_column, .. } => Some(*start_column),
+                BusValue::Linear(_) => None,
+            })
+        })
+        .collect()
 }
 
 // =============================================================================

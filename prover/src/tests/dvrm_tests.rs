@@ -1,7 +1,16 @@
 //! Tests for the DVRM (Division/Remainder) table.
 
-use crate::tables::dvrm::{DvrmOperation, bus_interactions, cols, generate_dvrm_trace};
+use stark::proof::options::ProofOptions;
+use stark::traits::AIR;
+
+use crate::tables::dvrm::{
+    DvrmOperation, bus_interactions, cols, dvrm_constraints, generate_dvrm_trace,
+};
 use crate::tables::types::FE;
+use crate::test_utils::{
+    busless_air, create_dvrm_air, in_chip_constraint_count, is_halfword_sender_columns,
+    validate_busless,
+};
 
 /// Signed comparison flag
 const SIGNED: bool = true;
@@ -399,4 +408,52 @@ fn test_padding_row() {
     assert_eq!(row[cols::SIGNED], FE::zero());
     assert_eq!(row[cols::MU_Q], FE::zero());
     assert_eq!(row[cols::MU_R], FE::zero());
+}
+
+// Soundness regression: division by zero must return the numerator as the
+// remainder (RISC-V `REM`/`REMU`), and the denominator halves must be range-checked.
+
+/// Enforcement: on a division-by-zero row, forging `r != n` is rejected by
+/// `DivByZeroR`, evaluated in isolation over a bus-less AIR.
+#[test]
+fn test_dvrm_rejects_false_div_by_zero_remainder() {
+    let air = busless_air(cols::NUM_COLUMNS, dvrm_constraints(0).0);
+    // numerator = 20, denominator = 0 => div-by-zero, honest remainder = 20.
+    let mut trace = generate_dvrm_trace(&[(DvrmOperation::new(20, 0, UNSIGNED), true)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest div-by-zero row (r = n = 20) must validate"
+    );
+
+    trace.set_main(0, cols::R_0, FE::from(999u64));
+    assert!(
+        !validate_busless(&air, &trace),
+        "a forged remainder on div-by-zero must be rejected by DivByZeroR"
+    );
+}
+
+/// Presence: the denominator halves are range-checked via IS_HALFWORD senders.
+#[test]
+fn test_dvrm_range_checks_denominator_halves() {
+    let cols_checked = is_halfword_sender_columns(&bus_interactions());
+    for c in [cols::D_0, cols::D_1, cols::D_2, cols::D_3] {
+        assert!(
+            cols_checked.contains(&c),
+            "DVRM must IS_HALF range-check denominator half column {c}"
+        );
+    }
+}
+
+/// Wiring: `create_dvrm_air` registers its in-chip constraints (including
+/// `DivByZeroR`) on top of its bus constraints. Catches a revert to
+/// `transition_constraints = vec![]` or a dropped constraint.
+#[test]
+fn test_dvrm_air_wires_in_chip_constraints() {
+    let air = create_dvrm_air(&ProofOptions::default_test_options());
+    let in_chip = in_chip_constraint_count(
+        air.num_transition_constraints(),
+        cols::NUM_COLUMNS,
+        bus_interactions(),
+    );
+    assert_eq!(in_chip, dvrm_constraints(0).0.len());
 }

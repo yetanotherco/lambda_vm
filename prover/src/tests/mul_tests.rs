@@ -1,7 +1,16 @@
 //! Tests for the MUL (Multiplication) table.
 
-use crate::tables::mul::{MulOperation, bus_interactions, cols, generate_mul_trace};
+use stark::proof::options::ProofOptions;
+use stark::traits::AIR;
+
+use crate::tables::mul::{
+    MulOperation, bus_interactions, cols, generate_mul_trace, mul_constraints,
+};
 use crate::tables::types::FE;
+use crate::test_utils::{
+    busless_air, create_mul_air, in_chip_constraint_count, is_halfword_sender_columns,
+    validate_busless,
+};
 
 #[test]
 fn test_mul_unsigned_basic() {
@@ -295,4 +304,63 @@ fn test_identity_multiplication() {
     let (lo, hi) = op.compute_product();
     assert_eq!(lo, 12345);
     assert_eq!(hi, 0);
+}
+
+// Soundness regression: the output must equal the product of the inputs, and the
+// input halves must be range-checked. The in-chip constraints were dead code until
+// they were wired into `create_mul_air`, so a prover could certify a false product.
+
+/// Enforcement: a forged raw product (`20 * 20` claimed as 999) is rejected by the
+/// `RawProduct` convolution, evaluated in isolation over a bus-less AIR.
+#[test]
+fn test_mul_rejects_false_product() {
+    let air = busless_air(cols::NUM_COLUMNS, mul_constraints(0).0);
+    let mut trace = generate_mul_trace(&[(MulOperation::new(20, false, 20, false), false)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest MUL row (20 * 20 = 400) must validate"
+    );
+
+    trace.set_main(0, cols::RAW_PRODUCT_0, FE::from(999u64));
+    assert!(
+        !validate_busless(&air, &trace),
+        "forged raw product must be rejected by RawProduct"
+    );
+}
+
+/// Wiring: `create_mul_air` registers the in-chip constraints on top of its bus
+/// constraints. Directly catches a revert to `transition_constraints = vec![]`.
+#[test]
+fn test_mul_air_wires_in_chip_constraints() {
+    let air = create_mul_air(&ProofOptions::default_test_options());
+    let in_chip = in_chip_constraint_count(
+        air.num_transition_constraints(),
+        cols::NUM_COLUMNS,
+        bus_interactions(),
+    );
+    assert_eq!(in_chip, mul_constraints(0).0.len());
+    assert_eq!(mul_constraints(0).0.len(), 6);
+}
+
+/// Presence: every input halfword is range-checked via IS_HALFWORD senders, so a
+/// field-wrapping decomposition that keeps the packed word constant cannot change
+/// the product undetected.
+#[test]
+fn test_mul_range_checks_input_halves() {
+    let cols_checked = is_halfword_sender_columns(&bus_interactions());
+    for c in [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+    ] {
+        assert!(
+            cols_checked.contains(&c),
+            "MUL must IS_HALF range-check input half column {c}"
+        );
+    }
 }

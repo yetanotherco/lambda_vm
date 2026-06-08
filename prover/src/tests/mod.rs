@@ -47,7 +47,7 @@ pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
-pub mod soundness_regression_tests;
+pub mod shift_tests;
 #[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
