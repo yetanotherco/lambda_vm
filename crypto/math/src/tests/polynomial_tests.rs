@@ -194,3 +194,104 @@ mod tests {
         assert_eq!(print_as_sage_poly(&p, None), "3*x^2 + 2*x + 1");
     }
 }
+
+#[cfg(test)]
+mod row_major_lde_tests {
+    use crate::fft::bowers_fft::LayerTwiddles;
+    use crate::fft::two_half_fft::TwoHalfTwiddles;
+    use crate::field::element::FieldElement;
+    use crate::field::goldilocks::GoldilocksField;
+    use crate::polynomial::Polynomial;
+    use alloc::vec::Vec;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    /// Differential test: `coset_lde_full_expand_row_major` on a row-major
+    /// buffer holding M columns must produce the same per-cell output as
+    /// running `coset_lde_full_expand` on each of those M columns
+    /// independently, then transposing the M LDE columns back into row order.
+    /// Covers a range of (log_n, M, blowup) to catch off-by-one bugs in the
+    /// M-block bit-reverse and in the row scaling step.
+    #[test]
+    fn coset_lde_full_expand_row_major_matches_single_column_per_column() {
+        for log_n in 2..=8 {
+            let n = 1usize << log_n;
+            for &blowup_factor in &[2usize, 4] {
+                let lde_size = n * blowup_factor;
+                let inv_tw = LayerTwiddles::<F>::new_inverse(log_n as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+                let two_inv = TwoHalfTwiddles::<F>::new(log_n, true).unwrap();
+                let two_fwd =
+                    TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false).unwrap();
+
+                let offset = FE::from(3u64);
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                for &m in &[1usize, 2, 3, 5, 8] {
+                    let cols: Vec<Vec<FE>> = (0..m)
+                        .map(|c| {
+                            (0..n)
+                                .map(|i| {
+                                    FE::from((c as u64).wrapping_mul(1_000_003) + i as u64 + 17)
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    // Reference: single-column coset_lde_full_expand on each column.
+                    let expected_cols: Vec<Vec<FE>> = cols
+                        .iter()
+                        .map(|c| {
+                            let mut buf = c.clone();
+                            Polynomial::<FE>::coset_lde_full_expand::<F>(
+                                &mut buf,
+                                blowup_factor,
+                                &weights,
+                                &inv_tw,
+                                &fwd_tw,
+                            )
+                            .unwrap();
+                            buf
+                        })
+                        .collect();
+
+                    // Subject under test: row-major batched pipeline.
+                    let mut row_major: Vec<FE> = Vec::with_capacity(n * m);
+                    #[allow(clippy::needless_range_loop)]
+                    for r in 0..n {
+                        for c in 0..m {
+                            row_major.push(cols[c][r]);
+                        }
+                    }
+                    Polynomial::<FE>::coset_lde_full_expand_row_major::<F>(
+                        &mut row_major,
+                        m,
+                        blowup_factor,
+                        &weights,
+                        &two_inv,
+                        &two_fwd,
+                    )
+                    .unwrap();
+                    assert_eq!(row_major.len(), lde_size * m);
+
+                    for r in 0..lde_size {
+                        for c in 0..m {
+                            assert_eq!(
+                                row_major[r * m + c],
+                                expected_cols[c][r],
+                                "log_n={log_n} blowup={blowup_factor} m={m} r={r} c={c}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
