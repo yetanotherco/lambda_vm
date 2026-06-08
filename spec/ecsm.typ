@@ -176,24 +176,33 @@ $
   )
 $
 
-== Doubling and adding
-To add two curve points $A, B in E(0, b, p)$, we must consider three situations.
-When $x_A eq.not x_B$, we construct the sum $R := A + B$ as
-$
- lambda &:= frac((y_B - y_A), (x_B - x_A), style: "horizontal"), #h(3em)
-  x_R &:= lambda^2 - x_A - x_B, #h(3em)
-  y_R &:= lambda (x_A - x_R) - y_A.
-$
-Second, when $x_A = x_B$ and $y_A eq.not -y_B$, we compute $R := A + B = 2A$ as
-$
-  lambda &:= frac(3x_A^2, 2y_A, style: "horizontal"), #h(3em)
-  x_R &:= lambda^2 - 2x_A, #h(3em)
-  y_R &:= lambda (x_A - x_R) - y_A.
-$
-Lastly, when $x_A = x_B$ and $y_A eq -y_B$, $R$ becomes the 'point at infinity'; a point that has no native representation on the curve. 
-It is, however, ensured by the #ecsm chip that this case cannot occur.
-As such, we do need to consider it.
+Recall that the addition of two curve points $A, B$ is treated differently based on three cases:
+#enum(indent: 1em, numbering: n => strong(raw("Case "+str(n)+".")),
+  enum.item[$x_A eq.not x_B$],
+  enum.item[$x_A eq x_B$ and $y_A eq.not -y_B$, or],
+  enum.item[$x_A eq x_B$ and $y_A eq -y_B$]
+)
+where _double_ may encounter the last two cases, while _add_ may encounter all three.
+Cases 2 and 3 may, for specific inputs, evaluate to evaluate to $#inf$:
+a point that has no native short-Weierstrass representation.
+Therefore, the #ecsm and #ecdas chips were designed to avoid this case.
+To see how, note that the #ecsm chip
++ is the sole chip that can "activate" the #ecdas chip by issuing an `ECDAS` lookup,
++ it enforces that $G$ and the initial $A$ do not equal $#inf$, and
++ it ensures $k in [1, N)$, where $N$ denotes the order of the curve.
+This combined yields that neither doubling $A$ or adding $A + G$ can produce $#inf$:
 
+*Double.*
+For $2A$ to equal $#inf$, the curve must have _even_ order.
+Since the order of the `secp256k1` curve is _odd_, such a point does not exist.
+
+*Add.*
+If $A + G = #inf$, then $A = -G = #inf - G = r N G - G$ for some $r >= 0$.
+Because #ecsm initializes $A = G eq.not #inf$, it must hold that $r >= 1$.
+Furthermore, the restriction that $k <= N-1$ ensures $r <= 1$.
+Hence, $A = (N-1)G$.
+Since $N-1$ is the maximal value of $k$, the previous round producing $A = (N-1)G$ was the last round of this scalar multiplication;
+this input is never encountered.
 
 == Columns
 #let nr_variables = total_nr_variables(ecdas_chip)
