@@ -5,17 +5,21 @@
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
 
+use core::mem::transmute_copy;
 use std::any::TypeId;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crypto::merkle_tree::merkle::MerkleTree;
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
-use math::field::traits::{IsField, IsSubFieldOf};
+use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 
 use crate::domain::Domain;
+use crate::trace::LDETraceTable;
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
 /// `coset_lde_full_expand` completes in a few hundred microseconds and the
@@ -56,6 +60,9 @@ pub fn reset_all_gpu_call_counters() {
     GPU_EXTEND_HALVES_CALLS.store(0, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.store(0, Ordering::Relaxed);
+    GPU_PARTS_LDE_CALLS.store(0, Ordering::Relaxed);
+    GPU_BARY_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -267,7 +274,10 @@ fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
     // SAFETY: every byte will be overwritten via the GPU D2H before the
     // contents are read. The caller computes the byte-length view from the
     // returned `nodes` Vec using `total_nodes.checked_mul(32)`.
-    unsafe { nodes.set_len(total_nodes) };
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        nodes.set_len(total_nodes)
+    };
     Some((nodes, total_nodes))
 }
 
@@ -342,13 +352,14 @@ where
 ///
 /// Returns `None` when the GPU path doesn't apply (too small, or CPU path
 /// should be used); in that case the caller runs its existing rayon::join.
+#[allow(clippy::type_complexity)]
 pub(crate) fn try_extend_two_halves_gpu<F, E>(
     h0: &[FieldElement<E>],
     h1: &[FieldElement<E>],
     domain: &Domain<F>,
 ) -> Option<(Vec<FieldElement<E>>, Vec<FieldElement<E>>)>
 where
-    F: math::field::traits::IsFFTField + IsField + 'static,
+    F: IsFFTField + IsField + 'static,
     E: IsField + 'static,
     F: IsSubFieldOf<E>,
 {
@@ -391,7 +402,7 @@ where
         // F == GoldilocksField by TypeId check above, so value is u64.
         let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
         weights_u64.push(v);
-        w = w * &g_inv;
+        w *= &g_inv;
     }
 
     // Pre-allocate outputs.
@@ -438,14 +449,11 @@ pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(
-    crypto::merkle_tree::merkle::MerkleTree<B>,
-    math_cuda::lde::GpuLdeBase,
-)>
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeBase)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
     let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
         LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
@@ -486,7 +494,7 @@ where
         }
     };
 
-    let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((tree, handle))
 }
 
@@ -498,14 +506,11 @@ pub(crate) fn try_expand_leaf_and_tree_batched_ext3_keep<F, E, B>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(
-    crypto::merkle_tree::merkle::MerkleTree<B>,
-    math_cuda::lde::GpuLdeExt3,
-)>
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: crypto::merkle_tree::traits::IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
     let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
         LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
@@ -547,7 +552,7 @@ where
         }
     };
 
-    let tree = crypto::merkle_tree::merkle::MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((tree, handle))
 }
 
@@ -602,4 +607,399 @@ where
 static GPU_MERKLE_TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_merkle_tree_calls() -> u64 {
     GPU_MERKLE_TREE_CALLS.load(Ordering::Relaxed)
+}
+
+// ============================================================================
+// PR-3: R2 composition-parts LDE + Merkle commit + R3 OOD barycentric
+// ============================================================================
+
+/// R2 dispatch counter: incremented once per
+/// [`try_evaluate_parts_on_lde_gpu`] call that actually routed to the GPU.
+pub(crate) static GPU_PARTS_LDE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_parts_lde_calls() -> u64 {
+    GPU_PARTS_LDE_CALLS.load(Ordering::Relaxed)
+}
+
+/// R3 dispatch counter: incremented once per `try_barycentric_*_on_handle`
+/// call that actually routed to the GPU.
+pub(crate) static GPU_BARY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_bary_calls() -> u64 {
+    GPU_BARY_CALLS.load(Ordering::Relaxed)
+}
+
+/// R2 comp-poly tree counter: incremented once per
+/// [`try_build_comp_poly_tree_gpu`] call that actually routed to the GPU.
+/// Distinct from `GPU_MERKLE_TREE_CALLS` (R1 main/aux tree builds) so the
+/// two dispatch sites can be diagnosed independently.
+pub(crate) static GPU_COMP_POLY_TREE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_comp_poly_tree_calls() -> u64 {
+    GPU_COMP_POLY_TREE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Trace-size threshold for the R3 OOD barycentric GPU path. Below this the
+/// rayon CPU path is competitive and PCIe round-trip overhead would dominate.
+/// Override via `LAMBDA_VM_GPU_BARY_THRESHOLD`.
+const DEFAULT_GPU_BARY_THRESHOLD: usize = 1 << 14;
+
+fn gpu_bary_threshold() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_BARY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GPU_BARY_THRESHOLD)
+    })
+}
+
+/// One ext3 scalar `(n_inv * g_n_inv) * (z^N - g^N)`. Returned as `[u64;3]`.
+///
+/// The GPU kernels compute only the unscaled barycentric sum per column.
+/// Applying this scalar on the host is one ext3 multiply per column, cheap
+/// next to the trace-size reduction.
+fn ood_ext3_scalar<F, E>(
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+) -> [u64; 3]
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    // (z^N - g^N) in E, via sub_subfield (E - F -> E).
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n);
+    let base_scalar = n_inv * g_n_inv; // F * F -> F
+    let scalar_ext3: FieldElement<E> = &base_scalar * &vanishing; // F * E -> E
+    // SAFETY: TypeId-checked at the caller (`try_barycentric_*_on_handle`).
+    // E == Degree3GoldilocksExtensionField, whose backing is
+    // `[FieldElement<Gl>; 3]`, layout-equivalent to `[u64; 3]`.
+    let ptr = &scalar_ext3 as *const FieldElement<E> as *const u64;
+    unsafe { [*ptr, *ptr.add(1), *ptr.add(2)] }
+}
+
+/// Multiply each raw GPU ext3 sum by the host-computed ext3 scalar. `sums_raw`
+/// is `3 * num_cols` u64s (interleaved). Returns the final OOD evaluations as
+/// `Vec<FieldElement<E>>` of length `num_cols`.
+fn apply_ext3_scalar<E>(sums_raw: &[u64], scalar: [u64; 3], num_cols: usize) -> Vec<FieldElement<E>>
+where
+    E: IsField + 'static,
+{
+    type Gl = GoldilocksField;
+    type Ext3 = Degree3GoldilocksExtensionField;
+
+    assert_eq!(sums_raw.len(), 3 * num_cols);
+    // Avoids the `E != Ext3` path reaching the unsafe `transmute_copy` below
+    // that is UB in that case. Cost is one TypeId comparison per call.
+    assert_eq!(
+        TypeId::of::<E>(),
+        TypeId::of::<Ext3>(),
+        "apply_ext3_scalar: E must be Ext3"
+    );
+
+    let scalar_e: FieldElement<Ext3> = FieldElement::<Ext3>::new([
+        FieldElement::<Gl>::from_raw(scalar[0]),
+        FieldElement::<Gl>::from_raw(scalar[1]),
+        FieldElement::<Gl>::from_raw(scalar[2]),
+    ]);
+
+    let mut out: Vec<FieldElement<E>> = Vec::with_capacity(num_cols);
+    for c in 0..num_cols {
+        let s: FieldElement<Ext3> = FieldElement::<Ext3>::new([
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3]),
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 1]),
+            FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 2]),
+        ]);
+        let final_ext3 = &s * &scalar_e;
+        // SAFETY: TypeId-checked at the caller. E == Ext3, identical layout.
+        let final_e: FieldElement<E> =
+            unsafe { transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&final_ext3) };
+        out.push(final_e);
+    }
+    out
+}
+
+/// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
+/// coefficient parts). Returns the LDE evaluations as `Vec<Vec<FieldElement<E>>>`
+/// of length `lde_size` per part on success, `None` to fall through to the CPU
+/// path. Used by `round_2_compute_composition_polynomial` in the
+/// `number_of_parts > 2` branch.
+///
+/// Inputs are immutable (`&[&[FieldElement<E>]]`) and outputs are fresh, so
+/// there is no `restore_columns_on_err` needed. `Err` just returns `None`
+/// and the caller's coefficient slices are left untouched.
+pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if parts_coefs.is_empty() {
+        return Some(Vec::new());
+    }
+    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
+        return None;
+    }
+    let lde_size = domain_size.checked_mul(blowup_factor)?;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    let m = parts_coefs.len();
+
+    // Weights: `offset^k` for k in 0..domain_size. F is Goldilocks by check above.
+    let mut weights_u64 = Vec::with_capacity(domain_size);
+    let mut w = FieldElement::<F>::one();
+    for _ in 0..domain_size {
+        // SAFETY: F == Goldilocks per TypeId check. FieldElement<Gl> is
+        // #[repr(transparent)] over u64.
+        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
+        weights_u64.push(v);
+        w *= offset;
+    }
+
+    // Pack parts into per-part `3 * domain_size` u64 buffers (zero-padded).
+    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
+    for part in parts_coefs.iter() {
+        let mut buf = vec![0u64; 3 * domain_size];
+        let len = part.len().min(domain_size);
+        // SAFETY: E == Ext3; backing is `[FieldElement<Gl>; 3]` = `[u64; 3]`.
+        let src_ptr = part.as_ptr() as *const u64;
+        let src_len = len.checked_mul(3).expect("part src len overflow");
+        let src = unsafe { from_raw_parts(src_ptr, src_len) };
+        buf[..src_len].copy_from_slice(src);
+        part_bufs.push(buf);
+    }
+    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
+
+    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
+        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+        .collect();
+    let gpu_result = {
+        let mut out_slices: Vec<&mut [u64]> = outputs
+            .iter_mut()
+            .map(|o| {
+                let ptr = o.as_mut_ptr() as *mut u64;
+                let byte_len = lde_size.checked_mul(3).expect("ext3 out len overflow");
+                // SAFETY: E == Ext3 per TypeId check; Vec<FieldElement<E>> of
+                // length `lde_size` is layout-equivalent to `[u64; 3 * lde_size]`.
+                unsafe { from_raw_parts_mut(ptr, byte_len) }
+            })
+            .collect();
+        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
+            &input_slices,
+            domain_size,
+            blowup_factor,
+            &weights_u64,
+            &mut out_slices,
+        )
+    };
+    if gpu_result.is_err() {
+        // Outputs are local and dropped on return; caller's inputs are
+        // immutable, so no restore is needed.
+        return None;
+    }
+    GPU_PARTS_LDE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(outputs)
+}
+
+/// R2 GPU dispatch: build the composition-polynomial Merkle tree from the
+/// host-side ext3 LDE eval Vecs produced by [`try_evaluate_parts_on_lde_gpu`]
+/// (or the CPU path). Uses the same row-pair leaf pattern as the CPU
+/// `commit_composition_polynomial`: each leaf hashes 2 consecutive
+/// bit-reversed rows.
+///
+/// Returns `None` to fall through to the CPU path when the type or size
+/// conditions don't hold; returns `None` on a math-cuda `Err` so the caller
+/// recomputes on CPU.
+pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
+    lde_parts: &[Vec<FieldElement<E>>],
+) -> Option<MerkleTree<B>>
+where
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if lde_parts.is_empty() {
+        return None;
+    }
+    let lde_size = lde_parts[0].len();
+    if !lde_size.is_power_of_two() || lde_size < 2 {
+        return None;
+    }
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    // All parts must have the same LDE length.
+    if lde_parts.iter().any(|p| p.len() != lde_size) {
+        return None;
+    }
+
+    // SAFETY: E == Ext3 per TypeId check. FieldElement<Ext3> backing is
+    // `[FieldElement<Gl>; 3]`, layout-equivalent to `[u64; 3]`.
+    let raw_parts: Vec<&[u64]> = lde_parts
+        .iter()
+        .map(|p| {
+            let byte_len = p.len().checked_mul(3).expect("ext3 part byte len overflow");
+            unsafe { from_raw_parts(p.as_ptr() as *const u64, byte_len) }
+        })
+        .collect();
+
+    let nodes_bytes = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3(&raw_parts) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    // lde_size is an even power of two >= 2, so 2*num_leaves == lde_size and
+    // tight_total_nodes = lde_size - 1 >= 1. No overflow or underflow possible.
+    let tight_total_nodes = lde_size - 1;
+    let expected_byte_len = tight_total_nodes
+        .checked_mul(32)
+        .expect("comp-poly node byte length overflow");
+    debug_assert_eq!(nodes_bytes.len(), expected_byte_len);
+
+    let nodes: Vec<[u8; 32]> = nodes_bytes
+        .chunks_exact(32)
+        .map(|c| {
+            c.try_into()
+                .expect("chunks_exact(32) yields exactly 32 bytes")
+        })
+        .collect();
+    GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    // Falls back to CPU on `None`, matching the R1 paths (lines 496, 557).
+    MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
+/// R3 GPU dispatch: batched strided barycentric OOD evaluation over the main
+/// (base-field) LDE columns kept on device from R1. Operates on the
+/// device-resident LDE in place; only the coset points and inv_denoms are
+/// copied to the device, not the columns. Returns the OOD evaluations
+/// as `Vec<FieldElement<E>>` of length `num_main_cols` (already scaled by
+/// `vanishing * n_inv * g_n_inv`), or `None` if the GPU handle is absent,
+/// types don't match, the trace-size domain is below threshold, or the
+/// math-cuda call returns `Err`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_base_on_handle<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let num_cols = main.m;
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = coset_points.len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if inv_denoms.len() != n || main.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+
+    // SAFETY: F == Goldilocks per TypeId check; FieldElement<Gl> is
+    // #[repr(transparent)] over u64.
+    let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    // SAFETY: E == Ext3 per TypeId check; FieldElement<Ext3> backing is
+    // `[FieldElement<Gl>; 3]` = `[u64; 3]`.
+    let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
+    let inv_denoms_raw: &[u64] =
+        unsafe { from_raw_parts(inv_denoms.as_ptr() as *const u64, inv_denoms_len) };
+
+    let sums_raw = match math_cuda::barycentric::barycentric_base_on_device(
+        main,
+        row_stride,
+        points_raw,
+        inv_denoms_raw,
+        n,
+    ) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+/// Ext3 counterpart of [`try_barycentric_base_on_handle`] for the aux LDE.
+/// Reads `lde_trace.gpu_aux()` (the de-interleaved 3-slab device buffer).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_ext3_on_handle<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let aux = lde_trace.gpu_aux()?;
+    let num_cols = aux.m;
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = coset_points.len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if inv_denoms.len() != n || aux.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+
+    let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
+    let inv_denoms_raw: &[u64] =
+        unsafe { from_raw_parts(inv_denoms.as_ptr() as *const u64, inv_denoms_len) };
+
+    let sums_raw = match math_cuda::barycentric::barycentric_ext3_on_device(
+        aux,
+        row_stride,
+        points_raw,
+        inv_denoms_raw,
+        n,
+    ) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
 }

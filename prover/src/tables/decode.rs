@@ -238,8 +238,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1), matching exactly how the prover
 /// commits to traces.
 ///
-/// Used by both prover (sanity check) and verifier (soundness check). The verifier
-/// computes this from the program and checks that the proof's commitment matches.
+/// Used by both prover (sanity check) and verifier (soundness check). Pure
+/// library function — no caching, no side effects. Callers manage their own
+/// caching, hardcoding, or recomputation policy as needed:
+///
+/// * **Always recompute**: call this function (or [`commitment_from_elf`])
+///   on every verify. Simple and slow.
+/// * **Cache once per process**: wrap the call in a `OnceLock` /
+///   `HashMap<elf_hash, Commitment>` at the caller site. Useful for native
+///   verifiers that check many proofs of the same ELF in one process.
+/// * **Compile-time constant**: call this function once offline (e.g. from
+///   a one-off test in the consumer crate that prints the result), then
+///   store the resulting bytes as a `const [u8; 32]` in the caller's
+///   source. Useful for the recursion guest where in-VM recomputation is
+///   too expensive.
 ///
 /// ## Arguments
 /// * `instructions` - The program's instruction map (PC → Instruction)
@@ -320,7 +332,12 @@ pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, Instr
 
 /// Compute DECODE commitment directly from an ELF.
 ///
-/// This is what the verifier uses - no executor needed.
+/// Thin convenience wrapper around [`instructions_from_elf`] + [`compute_precomputed_commitment`].
+/// Pure library function — no caching, always recomputes. Callers that need
+/// caching, hardcoding, or a different policy should wrap this call at their
+/// site (see [`compute_precomputed_commitment`] for the policy options).
+///
+/// This is what the verifier uses — no executor needed.
 pub fn commitment_from_elf(
     elf: &Elf,
     options: &ProofOptions,
