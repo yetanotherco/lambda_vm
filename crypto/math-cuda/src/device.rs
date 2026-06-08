@@ -93,6 +93,7 @@ impl Drop for PinnedStaging {
 const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
 const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
 const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
+const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -143,6 +144,12 @@ pub struct Backend {
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
 
+    // barycentric.ptx
+    pub barycentric_base_batched: CudaFunction,
+    pub barycentric_ext3_batched: CudaFunction,
+    pub barycentric_base_batched_strided: CudaFunction,
+    pub barycentric_ext3_batched_strided: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -160,6 +167,7 @@ impl Backend {
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
+        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -212,6 +220,12 @@ impl Backend {
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
+            barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
+            barycentric_base_batched_strided: bary
+                .load_function("barycentric_base_batched_strided")?,
+            barycentric_ext3_batched_strided: bary
+                .load_function("barycentric_ext3_batched_strided")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

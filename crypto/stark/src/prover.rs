@@ -1264,28 +1264,66 @@ pub trait IsStarkProver<
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
                     .unwrap();
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
-            composition_poly_parts
-                .iter()
-                .map(|part| {
-                    evaluate_polynomial_on_lde_domain(
-                        part,
-                        domain.blowup_factor,
-                        domain.interpolation_domain_size,
-                        &domain.coset_offset,
-                    )
-                    .unwrap()
-                })
-                .collect()
+
+            let cpu_eval = || -> Vec<Vec<FieldElement<FieldExtension>>> {
+                composition_poly_parts
+                    .iter()
+                    .map(|part| {
+                        evaluate_polynomial_on_lde_domain(
+                            part,
+                            domain.blowup_factor,
+                            domain.interpolation_domain_size,
+                            &domain.coset_offset,
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            };
+
+            // GPU fast path: batched ext3 LDE for all parts in one call.
+            // Non-`_keep` variant. The device buffer is freed at end of
+            // call; downstream R3 reads the host-side evals. PR-4 will
+            // upgrade to the `_keep` variant to retain the handle for R4
+            // DEEP composition.
+            #[cfg(feature = "cuda")]
+            {
+                let parts_slices: Vec<&[FieldElement<FieldExtension>]> = composition_poly_parts
+                    .iter()
+                    .map(|p| p.coefficients.as_slice())
+                    .collect();
+                crate::gpu_lde::try_evaluate_parts_on_lde_gpu::<Field, FieldExtension>(
+                    &parts_slices,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                )
+                .unwrap_or_else(cpu_eval)
+            }
+            #[cfg(not(feature = "cuda"))]
+            cpu_eval()
         };
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let Some((composition_poly_merkle_tree, composition_poly_root)) =
-            Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
-        else {
-            return Err(ProvingError::EmptyCommitment);
+        // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
+        // leaves + device-side inner tree, both wrapping the host eval Vecs.
+        #[cfg(feature = "cuda")]
+        let gpu_tree = crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+            FieldExtension,
+            BatchedMerkleTreeBackend<FieldExtension>,
+        >(&lde_composition_poly_parts_evaluations);
+        #[cfg(not(feature = "cuda"))]
+        let gpu_tree: Option<BatchedMerkleTree<FieldExtension>> = None;
+
+        let (composition_poly_merkle_tree, composition_poly_root) = match gpu_tree {
+            Some(tree) => {
+                let root = tree.root;
+                (tree, root)
+            }
+            None => Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
+                .ok_or(ProvingError::EmptyCommitment)?,
         };
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
