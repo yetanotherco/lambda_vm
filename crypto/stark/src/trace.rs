@@ -12,7 +12,9 @@ use math::polynomial::barycentric_inv_denoms;
 #[cfg(feature = "disk-spill")]
 use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 // `par_iter()` is only used by the test-only `compute_trace_polys_main`.
 #[cfg(all(test, feature = "parallel"))]
 use rayon::prelude::IntoParallelRefIterator;
@@ -202,33 +204,32 @@ where
         self.aux_table.extract_columns(capacity)
     }
 }
-/// Column-major LDE trace table.
+/// Row-major LDE trace table.
 ///
-/// Stores LDE evaluations as separate column vectors rather than a row-major Table.
-/// This eliminates the expensive T2 transpose (col→row) that `Table::from_columns`
-/// performs, significantly reducing allocation and element clones.
-///
-/// Trade-off: row access requires gathering from columns (74 random reads per row),
-/// but this is negligible vs constraint evaluation cost. Column access (used by
-/// `get_main`/`get_aux`, barycentric eval, DEEP poly) is sequential and cache-friendly.
+/// Stores LDE evaluations in flat row-major buffers (`num_rows * num_cols`), so
+/// each row is a contiguous slice. This is the layout the batched row-major FFT
+/// (`coset_lde_full_expand_row_major`) produces directly and that the Merkle
+/// commit consumes without gathering across columns — the win behind the
+/// row-major LDE rework (batched twiddle reuse in the FFT + contiguous leaves).
 pub struct LDETraceTable<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
-    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
+    /// Row-major main-trace buffer of length `num_rows * num_main_cols`.
+    pub(crate) main_data: Vec<FieldElement<F>>,
+    /// Row-major auxiliary-trace buffer of length `num_rows * num_aux_cols`.
+    pub(crate) aux_data: Vec<FieldElement<E>>,
+    pub(crate) num_main_cols: usize,
+    pub(crate) num_aux_cols: usize,
+    pub(crate) num_rows: usize,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// If the main trace was LDE'd on the GPU via the fused pipeline,
-    /// the device buffer is retained here so downstream GPU rounds can
-    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
-    /// for this table (below the size threshold or any CPU fallback:
-    /// preprocessed main, non-Goldilocks, or GPU error).
+    /// If the main trace was LDE'd on the GPU via the fused pipeline, the
+    /// device buffer is retained here so downstream GPU rounds can read the
+    /// LDE without a re-H2D. `None` on any CPU path.
     #[cfg(feature = "cuda")]
     pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
-    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
-    /// layout on device).
     #[cfg(feature = "cuda")]
     pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
@@ -238,19 +239,90 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    /// Creates a column-major LDETraceTable by consuming column vectors directly.
-    /// No transpose is performed — columns are stored as-is.
+    /// Build a row-major LDETraceTable by consuming column vectors and
+    /// transposing them once into the flat buffers. The transpose is the only
+    /// O(N · M) data shuffle the table sees — every subsequent row access is a
+    /// contiguous slice. Used by the preprocessed / column-input path; the
+    /// batched-LDE fast path uses [`Self::from_row_major`] (no transpose).
     pub fn from_columns(
         main_columns: Vec<Vec<FieldElement<F>>>,
         aux_columns: Vec<Vec<FieldElement<E>>>,
         trace_step_size: usize,
         blowup_factor: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        FieldElement<F>: Send + Sync,
+        FieldElement<E>: Send + Sync,
+        Vec<FieldElement<F>>: Sync,
+        Vec<FieldElement<E>>: Sync,
+    {
         let lde_step_size = trace_step_size * blowup_factor;
+        let num_main_cols = main_columns.len();
+        let num_aux_cols = aux_columns.len();
+        let num_rows = if num_main_cols > 0 {
+            main_columns[0].len()
+        } else if num_aux_cols > 0 {
+            aux_columns[0].len()
+        } else {
+            0
+        };
+
+        // Parallel col-major → row-major transpose: each row chunk gathers from
+        // the source columns independently.
+        let mut main_data: Vec<FieldElement<F>> =
+            vec![FieldElement::<F>::zero(); num_rows * num_main_cols];
+        if num_main_cols > 0 {
+            #[cfg(feature = "parallel")]
+            {
+                main_data
+                    .par_chunks_exact_mut(num_main_cols)
+                    .enumerate()
+                    .for_each(|(row, dst)| {
+                        for (col, src_col) in main_columns.iter().enumerate() {
+                            dst[col] = src_col[row].clone();
+                        }
+                    });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (row, dst) in main_data.chunks_exact_mut(num_main_cols).enumerate() {
+                    for (col, src_col) in main_columns.iter().enumerate() {
+                        dst[col] = src_col[row].clone();
+                    }
+                }
+            }
+        }
+
+        let mut aux_data: Vec<FieldElement<E>> =
+            vec![FieldElement::<E>::zero(); num_rows * num_aux_cols];
+        if num_aux_cols > 0 {
+            #[cfg(feature = "parallel")]
+            {
+                aux_data
+                    .par_chunks_exact_mut(num_aux_cols)
+                    .enumerate()
+                    .for_each(|(row, dst)| {
+                        for (col, src_col) in aux_columns.iter().enumerate() {
+                            dst[col] = src_col[row].clone();
+                        }
+                    });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (row, dst) in aux_data.chunks_exact_mut(num_aux_cols).enumerate() {
+                    for (col, src_col) in aux_columns.iter().enumerate() {
+                        dst[col] = src_col[row].clone();
+                    }
+                }
+            }
+        }
 
         Self {
-            main_columns,
-            aux_columns,
+            main_data,
+            aux_data,
+            num_main_cols,
+            num_aux_cols,
+            num_rows,
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
@@ -258,6 +330,54 @@ where
             #[cfg(feature = "cuda")]
             gpu_aux: None,
         }
+    }
+
+    /// Build an LDETraceTable directly from row-major flat buffers. Skips the
+    /// O(N·M) col→row transpose that `from_columns` pays — the caller produces
+    /// the buffers row-major already (e.g. via `coset_lde_full_expand_row_major`).
+    pub fn from_row_major(
+        main_data: Vec<FieldElement<F>>,
+        num_main_cols: usize,
+        aux_data: Vec<FieldElement<E>>,
+        num_aux_cols: usize,
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> Self {
+        let lde_step_size = trace_step_size * blowup_factor;
+        let num_rows = if num_main_cols > 0 {
+            debug_assert_eq!(main_data.len() % num_main_cols, 0);
+            main_data.len() / num_main_cols
+        } else if num_aux_cols > 0 {
+            debug_assert_eq!(aux_data.len() % num_aux_cols, 0);
+            aux_data.len() / num_aux_cols
+        } else {
+            0
+        };
+
+        Self {
+            main_data,
+            aux_data,
+            num_main_cols,
+            num_aux_cols,
+            num_rows,
+            lde_step_size,
+            blowup_factor,
+            #[cfg(feature = "cuda")]
+            gpu_main: None,
+            #[cfg(feature = "cuda")]
+            gpu_aux: None,
+        }
+    }
+
+    /// Borrow the row-major main buffer with its column count. Used by the
+    /// row-major Merkle commit (`commit_rows_bit_reversed`).
+    pub fn main_row_major(&self) -> (&[FieldElement<F>], usize) {
+        (&self.main_data, self.num_main_cols)
+    }
+
+    /// Borrow the row-major aux buffer with its column count.
+    pub fn aux_row_major(&self) -> (&[FieldElement<E>], usize) {
+        (&self.aux_data, self.num_aux_cols)
     }
 
     /// Attach an already-populated device LDE handle for the main columns.
@@ -284,38 +404,71 @@ where
         self.gpu_aux.as_ref()
     }
 
-    /// Consume self and return the owned column vectors.
+    /// Consume self and re-materialize the column vectors. Inverse of
+    /// `from_columns` — pays the same O(N · M) transpose cost.
     #[allow(clippy::type_complexity)]
+    // Index addresses two parallel arrays (column Vec + flat row-major buffer).
+    #[allow(clippy::needless_range_loop)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
-        (self.main_columns, self.aux_columns)
+        let mut main_columns: Vec<Vec<FieldElement<F>>> = (0..self.num_main_cols)
+            .map(|_| Vec::with_capacity(self.num_rows))
+            .collect();
+        for row in 0..self.num_rows {
+            let row_off = row * self.num_main_cols;
+            for col in 0..self.num_main_cols {
+                main_columns[col].push(self.main_data[row_off + col].clone());
+            }
+        }
+
+        let mut aux_columns: Vec<Vec<FieldElement<E>>> = (0..self.num_aux_cols)
+            .map(|_| Vec::with_capacity(self.num_rows))
+            .collect();
+        for row in 0..self.num_rows {
+            let row_off = row * self.num_aux_cols;
+            for col in 0..self.num_aux_cols {
+                aux_columns[col].push(self.aux_data[row_off + col].clone());
+            }
+        }
+
+        (main_columns, aux_columns)
     }
 
     pub fn num_main_cols(&self) -> usize {
-        self.main_columns.len()
+        self.num_main_cols
     }
 
     pub fn num_aux_cols(&self) -> usize {
-        self.aux_columns.len()
+        self.num_aux_cols
     }
 
     pub fn num_rows(&self) -> usize {
-        if self.main_columns.is_empty() {
-            0
-        } else {
-            self.main_columns[0].len()
-        }
+        self.num_rows
     }
 
     /// Get a single main-trace element by (row, col).
     #[inline]
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
-        &self.main_columns[col][row]
+        &self.main_data[row * self.num_main_cols + col]
     }
 
     /// Get a single aux-trace element by (row, col).
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux_columns[col][row]
+        &self.aux_data[row * self.num_aux_cols + col]
+    }
+
+    /// Borrow a full main-trace row as a contiguous slice (zero copy).
+    #[inline]
+    pub fn main_row_slice(&self, row_idx: usize) -> &[FieldElement<F>] {
+        let off = row_idx * self.num_main_cols;
+        &self.main_data[off..off + self.num_main_cols]
+    }
+
+    /// Borrow a full aux-trace row as a contiguous slice (zero copy).
+    #[inline]
+    pub fn aux_row_slice(&self, row_idx: usize) -> &[FieldElement<E>] {
+        let off = row_idx * self.num_aux_cols;
+        &self.aux_data[off..off + self.num_aux_cols]
     }
 
     /// Gather a full main-trace row into an owned Vec.
@@ -489,12 +642,11 @@ where
         let main_iter = 0..num_main_cols;
         let main_evals: Vec<FieldElement<E>> = main_iter
             .map(|col_idx| {
-                let lde_col = &lde_trace.main_columns[col_idx];
                 let sum = col_scale
                     .iter()
                     .enumerate()
                     .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + &lde_col[i * bf] * scale
+                        acc + lde_trace.get_main(i * bf, col_idx) * scale
                     });
                 &vanishing_factor * &sum
             })
@@ -510,12 +662,11 @@ where
         let aux_iter = 0..num_aux_cols;
         let aux_evals: Vec<FieldElement<E>> = aux_iter
             .map(|col_idx| {
-                let lde_col = &lde_trace.aux_columns[col_idx];
                 let sum = col_scale
                     .iter()
                     .enumerate()
                     .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                        acc + scale * &lde_col[i * bf]
+                        acc + scale * lde_trace.get_aux(i * bf, col_idx)
                     });
                 &vanishing_factor * &sum
             })
