@@ -2,7 +2,7 @@ use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
 #[cfg(test)]
 use itertools::Itertools;
-use math::fft::bit_reversing::reverse_index;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 #[cfg(test)]
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -606,7 +606,6 @@ where
     E: IsField,
 {
     let n = domain.interpolation_domain_size;
-    let bf = domain.blowup_factor;
     let num_main_cols = lde_trace.num_main_cols();
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
@@ -639,12 +638,21 @@ where
 
         // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
         // This eliminates N redundant F×E multiplies per column.
-        let col_scale: Vec<FieldElement<E>> = dc
+        //
+        // Bit-reversed LDE: trace point `i` (logical LDE row i·bf) lives at physical row
+        // reverse_index(i·bf, n·bf) = reverse_index(i, n), so the n trace points occupy
+        // physical rows 0..n in bit-reversed order. Bit-reversing col_scale once (a small
+        // per-OOD-point array) lets each column be read sequentially (`get_main(p)`,
+        // p=0..n) instead of gathering at scattered reverse_index positions — restoring
+        // the hardware prefetcher (the scattered per-column gather is a cache miss per
+        // element under row-major layout).
+        let mut col_scale: Vec<FieldElement<E>> = dc
             .points
             .iter()
             .zip(inv_denoms.iter())
             .map(|(point, inv_d)| point * inv_d)
             .collect();
+        in_place_bit_reverse_permute(&mut col_scale);
 
         // Evaluate all main columns directly from LDE (no extraction copy).
         // For main columns (base field F): sum = Σ col_scale[i] * lde_col[i*bf]
@@ -655,13 +663,12 @@ where
         let main_iter = 0..num_main_cols;
         let main_evals: Vec<FieldElement<E>> = main_iter
             .map(|col_idx| {
-                let sum = col_scale.iter().enumerate().fold(
-                    FieldElement::<E>::zero(),
-                    |acc, (i, scale)| {
-                        acc + lde_trace.get_main(reverse_index(i * bf, (n * bf) as u64), col_idx)
-                            * scale
-                    },
-                );
+                let sum = col_scale
+                    .iter()
+                    .enumerate()
+                    .fold(FieldElement::<E>::zero(), |acc, (p, scale)| {
+                        acc + lde_trace.get_main(p, col_idx) * scale
+                    });
                 &vanishing_factor * &sum
             })
             .collect();
@@ -676,13 +683,12 @@ where
         let aux_iter = 0..num_aux_cols;
         let aux_evals: Vec<FieldElement<E>> = aux_iter
             .map(|col_idx| {
-                let sum = col_scale.iter().enumerate().fold(
-                    FieldElement::<E>::zero(),
-                    |acc, (i, scale)| {
-                        acc + scale
-                            * lde_trace.get_aux(reverse_index(i * bf, (n * bf) as u64), col_idx)
-                    },
-                );
+                let sum = col_scale
+                    .iter()
+                    .enumerate()
+                    .fold(FieldElement::<E>::zero(), |acc, (p, scale)| {
+                        acc + scale * lde_trace.get_aux(p, col_idx)
+                    });
                 &vanishing_factor * &sum
             })
             .collect();
