@@ -3,6 +3,7 @@ use crate::fft::bit_reversing::in_place_bit_reverse_permute;
 use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
 use crate::fft::errors::FFTError;
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
@@ -502,6 +503,98 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         Ok(())
     }
+
+    /// Batched row-major coset LDE expansion.
+    ///
+    /// `buffer` is the row-major flat layout of `n * num_cols` elements
+    /// (input trace evaluations on the natural-order domain, all M columns
+    /// interleaved per row). It is expanded in place to length
+    /// `n * blowup_factor * num_cols`, also row-major, holding the LDE
+    /// evaluations on the coset.
+    ///
+    /// Pipeline mirrors [`coset_lde_full_expand`] cell-for-cell, just with
+    /// the row-major batched FFT primitives so the M columns share twiddle
+    /// loads inside each butterfly:
+    ///   1. batched iFFT (DIT) over rows[..n]
+    ///   2. scale rows[..n] by coset weights (one weight per row, applied to
+    ///      all M elements of that row)
+    ///   3. zero-pad rows to `n * blowup_factor`
+    ///   4. batched forward FFT (DIF)
+    ///
+    /// `weights` must be `n` base-field elements in natural row order.
+    /// `inv_twiddles` are the size-`n` inverse two-half twiddles; `fwd_twiddles`
+    /// the size-`n·blowup_factor` forward ones.
+    pub fn coset_lde_full_expand_row_major<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        num_cols: usize,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        if num_cols == 0 || buffer.is_empty() {
+            return Ok(());
+        }
+        let total = buffer.len();
+        if !total.is_multiple_of(num_cols) {
+            return Err(FFTError::InputError(total));
+        }
+        let n = total / num_cols;
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_n = n * blowup_factor;
+        if (lde_n.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_n.trailing_zeros() as usize));
+        }
+        if weights.len() < n {
+            return Err(FFTError::InputError(weights.len()));
+        }
+
+        // 1. iFFT on rows[..n] (cache-blocked two-half; natural→natural, no 1/n
+        //    — the 1/n is folded into the coset-weight pass below). Replaces the
+        //    flat-Bowers iFFT, which cache-thrashes at large n.
+        let prefix_len = n * num_cols;
+        fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
+
+        // 2. Scale by coset weights — one weight per row, multiply M elements
+        //    of that row by it. Each row is independent → parallelizable.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            buffer[..prefix_len]
+                .par_chunks_exact_mut(num_cols)
+                .enumerate()
+                .for_each(|(r, row)| {
+                    let w = &weights[r];
+                    for x in row.iter_mut() {
+                        *x = w * &*x;
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for r in 0..n {
+                let w = &weights[r];
+                let row = &mut buffer[r * num_cols..(r + 1) * num_cols];
+                for x in row.iter_mut() {
+                    *x = w * &*x;
+                }
+            }
+        }
+
+        // 3. Zero-pad rows to lde_n.
+        buffer.resize(lde_n * num_cols, FieldElement::zero());
+
+        // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
+        //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
+        fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -545,4 +638,106 @@ where
         in_place_bit_reverse_permute(&mut result);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod row_major_lde_tests {
+    use super::*;
+    use crate::fft::two_half_fft::TwoHalfTwiddles;
+    use crate::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    /// Differential test: `coset_lde_full_expand_row_major` on a row-major
+    /// buffer holding M columns must produce the same per-cell output as
+    /// running `coset_lde_full_expand` on each of those M columns
+    /// independently, then transposing the M LDE columns back into row
+    /// order. Covers a range of (log_n, M, blowup) so we catch off-by-one
+    /// bugs in the M-block bit-reverse and in the row scaling step.
+    #[test]
+    fn coset_lde_full_expand_row_major_matches_single_column_per_column() {
+        for log_n in 2..=8 {
+            let n = 1usize << log_n;
+            for &blowup_factor in &[2usize, 4] {
+                let lde_size = n * blowup_factor;
+                let inv_tw = LayerTwiddles::<F>::new_inverse(log_n as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+                let two_inv = TwoHalfTwiddles::<F>::new(log_n, true).unwrap();
+                let two_fwd =
+                    TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false).unwrap();
+
+                // Reproduce the weights from the existing coset test.
+                let offset = FE::from(3u64);
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                for &m in &[1usize, 2, 3, 5, 8] {
+                    // Generate M deterministic columns of length n.
+                    let cols: Vec<Vec<FE>> = (0..m)
+                        .map(|c| {
+                            (0..n)
+                                .map(|i| {
+                                    FE::from((c as u64).wrapping_mul(1_000_003) + i as u64 + 17)
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    // Reference: run single-column coset_lde_full_expand on each
+                    // column independently.
+                    let expected_cols: Vec<Vec<FE>> = cols
+                        .iter()
+                        .map(|c| {
+                            let mut buf = c.clone();
+                            Polynomial::<FE>::coset_lde_full_expand::<F>(
+                                &mut buf,
+                                blowup_factor,
+                                &weights,
+                                &inv_tw,
+                                &fwd_tw,
+                            )
+                            .unwrap();
+                            buf
+                        })
+                        .collect();
+
+                    // Subject under test: row-major batched pipeline.
+                    let mut row_major: Vec<FE> = Vec::with_capacity(n * m);
+                    #[allow(clippy::needless_range_loop)]
+                    for r in 0..n {
+                        for c in 0..m {
+                            row_major.push(cols[c][r]);
+                        }
+                    }
+                    Polynomial::<FE>::coset_lde_full_expand_row_major::<F>(
+                        &mut row_major,
+                        m,
+                        blowup_factor,
+                        &weights,
+                        &two_inv,
+                        &two_fwd,
+                    )
+                    .unwrap();
+                    assert_eq!(row_major.len(), lde_size * m);
+
+                    // Transpose row-major back to columns and compare.
+                    for r in 0..lde_size {
+                        for c in 0..m {
+                            assert_eq!(
+                                row_major[r * m + c],
+                                expected_cols[c][r],
+                                "log_n={log_n} blowup={blowup_factor} m={m} r={r} c={c}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
