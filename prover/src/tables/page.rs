@@ -106,9 +106,9 @@ pub type FinalStateMap = HashMap<u64, FinalByteState>;
 pub struct PageConfig {
     /// Base address of this page (must be page-aligned).
     pub page_base: u64,
-    /// Initial values for the page. If None, all bytes are zero-initialized.
-    /// May be shorter than `DEFAULT_PAGE_SIZE`; any missing trailing bytes are
-    /// treated as zero. (All pages are `DEFAULT_PAGE_SIZE`; see that constant.)
+    /// Initial byte values; `None` means an all-zero page.
+    /// `Some(v)` is not padded, so `v.len()` may be smaller than the page
+    /// (`DEFAULT_PAGE_SIZE`); any offset at or past `v.len()` is read as zero.
     pub init_values: Option<Vec<u8>>,
     /// Whether this page holds private input data.
     /// Private-input pages are NOT preprocessed — the verifier does not see
