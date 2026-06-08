@@ -607,10 +607,13 @@ pub enum Cpu32ConstraintKind {
     /// `read_register2·imm[i] = 0` (decoding guarantees at most one is nonzero;
     /// spec defense-in-depth assumption). `usize` is the `imm` limb column.
     Arg2Exclusive { imm_col: usize },
-    /// `(1 - μ)·flag = 0`: a register flag that gates a `MEMW` bus interaction
-    /// must be 0 on a padding row (`μ = 0`), otherwise a disconnected row could
-    /// emit a forged register read/write token (no DECODE binding, no CPU32
-    /// delegation). Spec `cpu32.toml` (PR #646). `usize` is the flag column.
+    /// `(1 - μ)·flag = 0`: a flag that drives a bus interaction or a high-word
+    /// fill must be 0 on a padding row (`μ = 0`). For the register flags this
+    /// prevents a disconnected row from emitting a forged register read/write
+    /// token (no DECODE binding, no CPU32 delegation); for `signed` it closes
+    /// the soundness hole where a free `signed` on padding (the `BYTE_ALU`
+    /// extractor is gated by `μ`) leaks into the `arg1/arg2` high words. Spec
+    /// `cpu32.toml` (PR #646). `usize` is the flag column.
     FlagImpliesMu { flag_col: usize },
 }
 
@@ -789,14 +792,17 @@ pub fn cpu32_constraints(
         idx += 1;
     }
 
-    // flag ⇒ μ: a register flag gating a MEMW interaction must be 0 on padding
-    // rows (μ = 0), else a disconnected row injects a forged register access
-    // (spec `cpu32.toml`, PR #646). ALU is not gated: with `write_register = 0`
-    // its ALU-lookup result is never written back, so it has no side effect.
+    // flag ⇒ μ: a flag must be 0 on padding rows (μ = 0). The register flags
+    // gate MEMW interactions, so a free flag would inject a forged register
+    // access; `signed` (extracted via a μ-gated BYTE_ALU) would otherwise be
+    // free on padding and leak into the `arg1/arg2` high-word fills. Spec
+    // `cpu32.toml`, PR #646. ALU is not gated: with `write_register = 0` its
+    // ALU-lookup result is never written back, so it has no side effect.
     for flag_col in [
         cols::READ_REGISTER1,
         cols::READ_REGISTER2,
         cols::WRITE_REGISTER,
+        cols::SIGNED,
     ] {
         constraints.push(
             Cpu32Constraint::new(Cpu32ConstraintKind::FlagImpliesMu { flag_col }, idx).boxed(),
