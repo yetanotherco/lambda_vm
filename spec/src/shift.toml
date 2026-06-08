@@ -10,7 +10,7 @@ pad = 0
 
 [[variables.input]]
 name = "shift"
-type = "Byte"
+type = "DWordWHBB"
 desc = "Number of bits to shift `in` by."
 pad = 0
 
@@ -137,32 +137,49 @@ type = "Bit"
 desc = ""
 pad = 0
 
-
-
-# Assumptions
-
-[[assumptions]]
-desc = "`IS_HALF[in[i]]`"
-iter = ["i", 0, 3]
-ref = "shift:a:range_in"
-
-[[assumptions]]
-desc = "`IS_BYTE[shift]`"
-ref = "shift:a:range_shift"
-
-[[assumptions]]
-desc = "`IS_BIT<direction>`"
-ref = "shift:a:direction"
-
-[[assumptions]]
-desc = "`IS_BIT<signed>`"
-ref = "shift:a:signed"
-
-[[assumptions]]
-desc = "`IS_BIT<word_instr>`"
-ref = "shift:a:word_instr"
-
 # Constraints
+
+[[constraint_groups]]
+name = "input"
+
+[[constraints.input]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "in", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "shift:c:range_in"
+
+[[constraints.input]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "shift", 2]]
+multiplicity = "μ"
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "shift", "i"]]
+iter = ["i", 0, 1]
+ref = "shift:c:range_shift"
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["direction"]
+ref = "shift:c:direction"
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["signed"]
+ref = "shift:c:signed"
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["word_instr"]
+ref = "shift:c:word_instr"
 
 [[constraint_groups]]
 name = "left_flag"
@@ -192,16 +209,16 @@ name = "bit_shift"
 
 [[constraints.bit_shift]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = ["shift", 0x0F]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "shift", 0], 0x0F]
 output = "bit_shift"
 ref = "shift:c:bit_shift_if_left"
 multiplicity = "left"
 
 [[constraints.bit_shift]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["-", ["^", 2, 8], ["*", 16, "zbs"], "shift"], 0x0F]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["-", ["^", 2, 8], ["*", 16, "zbs"], ["idx", "shift", 0]], 0x0F]
 output = "bit_shift"
 ref = "shift:c:bit_shift_if_right"
 multiplicity = "right"
@@ -268,8 +285,8 @@ ref = "shift:c:limb_shift_is_bit"
 
 [[constraints.limb_shifting]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = ["shift", ["-", 0x30, ["*", 0x20, "word_instr"]]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "shift", 0], ["-", 0x30, ["*", 0x20, "word_instr"]]]
 output = ["+", ["-", 1, ["idx", "limb_shift", 0]], ["*", 15, ["idx", "limb_shift", 1]], ["*", 31, ["idx", "limb_shift", 2]], ["*", 47, ["idx", "limb_shift", 3]]]
 ref = "shift:c:limb_shift_lookup"
 multiplicity = "μ"
@@ -289,8 +306,8 @@ name = "lookups"
 
 [[constraints.lookups]]
 kind = "interaction"
-tag = "SHIFT"
-input = ["in", "shift", "direction", "signed", "word_instr"]
+tag = "ALU"
+input = [["cast", "in", "DWordWL"], ["cast", "shift", "DWordWL"], ["+", ["opsel", "SHIFT"], "word_instr", ["*", 32, "signed"], ["*", 64, "direction"]]]
 output = "out"
 multiplicity = ["-", "μ"]
 ref = "shift:c:lookup"
