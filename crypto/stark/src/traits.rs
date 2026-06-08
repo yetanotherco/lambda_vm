@@ -50,6 +50,28 @@ impl<F: IsField> ZerofierEvaluations<F> {
         let group = &self.groups[0];
         &group[lde_idx % group.len()]
     }
+
+    /// Expand each short cycled group to the full `lde_size` (natural order) and
+    /// bit-reverse it. A consumer reading the bit-reversed LDE at physical row `p`
+    /// then indexes `expanded[group][p]` directly — equal to the natural-order
+    /// zerofier at logical row `reverse_index(p)` (i.e. `group[reverse_index(p) %
+    /// len]`). This trades the short-vector storage for full `lde_size` vectors —
+    /// the cost the bit-reversed evaluator pays to keep its LDE reads sequential.
+    /// `group.len()` (= `blowup·period`) always divides `lde_size` (= `blowup·N`),
+    /// so the cycling is exact.
+    pub fn bit_reversed_expanded(&self, lde_size: usize) -> Vec<Vec<FieldElement<F>>> {
+        use math::fft::bit_reversing::in_place_bit_reverse_permute;
+        self.groups
+            .iter()
+            .map(|group| {
+                let len = group.len();
+                let mut expanded: Vec<FieldElement<F>> =
+                    (0..lde_size).map(|i| group[i % len].clone()).collect();
+                in_place_bit_reverse_permute(&mut expanded);
+                expanded
+            })
+            .collect()
+    }
 }
 
 /// Key identifying a unique zerofier shape — constraints with the same key share
@@ -348,6 +370,39 @@ pub trait AIR: Send + Sync {
         ZerofierEvaluations {
             groups,
             constraint_to_group,
+        }
+    }
+}
+
+#[cfg(test)]
+mod zerofier_tests {
+    use super::ZerofierEvaluations;
+    use math::fft::bit_reversing::reverse_index;
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+
+    type FE = FieldElement<GoldilocksField>;
+
+    /// `bit_reversed_expanded[g][p]` must equal the natural cycled zerofier at
+    /// logical row `reverse_index(p)`: `group[reverse_index(p) % group.len()]`.
+    #[test]
+    fn bit_reversed_expanded_matches_cycled() {
+        let lde_size = 16usize;
+        let g0: Vec<FE> = (1..=4).map(|i| FE::from(i as u64)).collect(); // len 4 | 16
+        let g1: Vec<FE> = (5..=6).map(|i| FE::from(i as u64)).collect(); // len 2 | 16
+        let ze = ZerofierEvaluations {
+            groups: vec![g0.clone(), g1.clone()],
+            constraint_to_group: vec![0, 1],
+        };
+        let expanded = ze.bit_reversed_expanded(lde_size);
+        for (gi, group) in [g0, g1].iter().enumerate() {
+            for p in 0..lde_size {
+                let logical = reverse_index(p, lde_size as u64);
+                assert_eq!(
+                    expanded[gi][p],
+                    group[logical % group.len()],
+                    "group {gi} physical row {p}",
+                );
+            }
         }
     }
 }
