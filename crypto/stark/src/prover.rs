@@ -7,6 +7,7 @@ use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
+use math::fft::two_half_fft::TwoHalfTwiddles;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -20,7 +21,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -175,11 +176,11 @@ where
 #[cfg(feature = "cuda")]
 type MainCommitTuple<F> = (
     TableCommit<F>,
-    Vec<Vec<FieldElement<F>>>,
+    (Vec<FieldElement<F>>, usize),
     Option<math_cuda::lde::GpuLdeBase>,
 );
 #[cfg(not(feature = "cuda"))]
-type MainCommitTuple<F> = (TableCommit<F>, Vec<Vec<FieldElement<F>>>);
+type MainCommitTuple<F> = (TableCommit<F>, (Vec<FieldElement<F>>, usize));
 
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
 /// Borrowed (not consumed) when building `Round1` in Phase D.
@@ -201,8 +202,10 @@ where
 /// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
 /// and Phase D (O(N × cols × lde_size)).
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
-    main: Vec<Vec<FieldElement<Field>>>,
-    aux: Vec<Vec<FieldElement<FieldExtension>>>,
+    /// Row-major main LDE buffer + its column count.
+    main: (Vec<FieldElement<Field>>, usize),
+    /// Row-major aux LDE buffer + its column count (`(vec![], 0)` if no aux).
+    aux: (Vec<FieldElement<FieldExtension>>, usize),
     /// Device-side main LDE buffer, populated only when the R1 GPU fused
     /// pipeline ran for this table. Kept so R2/R3/R4 GPU paths can read
     /// the LDE without re-H2D.
@@ -227,9 +230,17 @@ where
         step_size: usize,
         blowup_factor: usize,
     ) -> Round1<Field, FieldExtension> {
+        let (main_data, num_main_cols) = lde.main;
+        let (aux_data, num_aux_cols) = lde.aux;
         #[allow(unused_mut)]
-        let mut lde_trace =
-            LDETraceTable::from_columns(lde.main, lde.aux, step_size, blowup_factor);
+        let mut lde_trace = LDETraceTable::from_row_major(
+            main_data,
+            num_main_cols,
+            aux_data,
+            num_aux_cols,
+            step_size,
+            blowup_factor,
+        );
         #[cfg(feature = "cuda")]
         {
             if let Some(h) = lde.gpu_main {
@@ -261,6 +272,11 @@ where
 pub(crate) struct LdeTwiddles<F: IsFFTField> {
     inv: LayerTwiddles<F>,
     fwd: LayerTwiddles<F>,
+    /// Cache-blocked two-half twiddles for the batched row-major LDE path
+    /// (`coset_lde_full_expand_row_major`). `two_half_inv` is size-`n` inverse,
+    /// `two_half_fwd` size-`n·blowup` forward.
+    two_half_inv: TwoHalfTwiddles<F>,
+    two_half_fwd: TwoHalfTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
 }
 
@@ -289,6 +305,10 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("valid inverse twiddles"),
             fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
                 .expect("valid forward twiddles"),
+            two_half_inv: TwoHalfTwiddles::<F>::new(domain_size.trailing_zeros() as usize, true)
+                .expect("valid inverse two-half twiddles"),
+            two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
+                .expect("valid forward two-half twiddles"),
             coset_weights,
         }
     }
@@ -538,6 +558,145 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
+    /// Row-major counterpart of [`commit_columns_bit_reversed`]: commit a
+    /// row-major flat buffer (`num_rows * num_cols`) by hashing each leaf from
+    /// the row at `reverse_index(row_idx)`. The leaf bytes are identical to the
+    /// column-major path (same row values), so the Merkle root is identical —
+    /// only the read pattern changes (contiguous row slice, no column gather).
+    fn commit_rows_bit_reversed<E>(
+        data: &[FieldElement<E>],
+        num_cols: usize,
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+        E: IsField,
+    {
+        use math::traits::ByteConversion;
+
+        if num_cols == 0 || data.is_empty() {
+            return None;
+        }
+        debug_assert_eq!(data.len() % num_cols, 0);
+        let num_rows = data.len() / num_cols;
+        if num_rows == 0 {
+            return None;
+        }
+        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+        let row_bytes = num_cols * byte_len;
+
+        debug_assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index"
+        );
+
+        #[cfg(feature = "parallel")]
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0u8; row_bytes],
+                |buf, row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start..row_start + num_cols];
+                    for (col_idx, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+                },
+            )
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut buf = vec![0u8; row_bytes];
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start..row_start + num_cols];
+                    for (col_idx, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+                })
+                .collect()
+        };
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
+    /// Subset variant of [`commit_rows_bit_reversed`]: hash only columns in the
+    /// contiguous range `[col_start..col_end)` of each row. Used for
+    /// preprocessed traces where precomputed cols and multiplicity cols commit
+    /// to separate Merkle trees from the same row-major buffer.
+    fn commit_rows_bit_reversed_subset<E>(
+        data: &[FieldElement<E>],
+        num_cols: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+        E: IsField,
+    {
+        use math::traits::ByteConversion;
+
+        if num_cols == 0 || data.is_empty() || col_end <= col_start {
+            return None;
+        }
+        debug_assert!(col_end <= num_cols);
+        debug_assert_eq!(data.len() % num_cols, 0);
+        let num_rows = data.len() / num_cols;
+        if num_rows == 0 {
+            return None;
+        }
+        let subset_cols = col_end - col_start;
+        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
+        let row_bytes = subset_cols * byte_len;
+
+        debug_assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two for reverse_index"
+        );
+
+        #[cfg(feature = "parallel")]
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0u8; row_bytes],
+                |buf, row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start + col_start..row_start + col_end];
+                    for (i, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+                },
+            )
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut buf = vec![0u8; row_bytes];
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    let row_start = br_idx * num_cols;
+                    let row = &data[row_start + col_start..row_start + col_end];
+                    for (i, elem) in row.iter().enumerate() {
+                        elem.write_bytes_be(&mut buf[i * byte_len..(i + 1) * byte_len]);
+                    }
+                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+                })
+                .collect()
+        };
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
@@ -670,6 +829,8 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        // `mut` is only needed under the cuda fast path (which expands in place).
+        #[allow(unused_mut)]
         let mut columns = trace.extract_columns_main(lde_size);
 
         // Fused GPU path is only wired for non-preprocessed mains today. The
@@ -702,9 +863,48 @@ pub trait IsStarkProver<
         if storage_mode == StorageMode::Disk {
             trace.main_table.advise_drop_cache();
         }
+
+        let total_cols = columns.len();
+        let n = if total_cols > 0 { columns[0].len() } else { 0 };
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        Self::expand_columns_to_lde::<Field>(&mut columns, domain, twiddles);
+
+        // Interleave the N-length trace columns into a natural-order row-major
+        // buffer (cheap — trace-size, not LDE-size), then expand in place to
+        // the LDE with the cache-blocked batched two-half FFT. The LDE stays
+        // row-major end-to-end: no LDE-size transpose, contiguous Merkle leaves.
+        let mut main_data: Vec<FieldElement<Field>> =
+            vec![FieldElement::<Field>::zero(); n * total_cols];
+        {
+            #[cfg(feature = "parallel")]
+            main_data
+                .par_chunks_exact_mut(total_cols)
+                .enumerate()
+                .for_each(|(row, dst)| {
+                    for (col, src) in columns.iter().enumerate() {
+                        dst[col] = src[row].clone();
+                    }
+                });
+            #[cfg(not(feature = "parallel"))]
+            for (row, dst) in main_data.chunks_exact_mut(total_cols).enumerate() {
+                for (col, src) in columns.iter().enumerate() {
+                    dst[col] = src[row].clone();
+                }
+            }
+        }
+        drop(columns);
+
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major coset LDE expansion");
+
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
 
@@ -714,7 +914,7 @@ pub trait IsStarkProver<
         let commit = match precomputed {
             None => {
                 #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                let (mut tree, root) = Self::commit_rows_bit_reversed(&main_data, total_cols)
                     .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
@@ -723,15 +923,24 @@ pub trait IsStarkProver<
                 }
                 TableCommit::plain(tree, root)
             }
-            Some((expected_precomputed_root, num_cols)) => {
+            Some((expected_precomputed_root, num_precomputed)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_columns_bit_reversed(&columns[..num_cols])
-                        .ok_or(ProvingError::EmptyCommitment)?;
+                    Self::commit_rows_bit_reversed_subset(
+                        &main_data,
+                        total_cols,
+                        0,
+                        num_precomputed,
+                    )
+                    .ok_or(ProvingError::EmptyCommitment)?;
                 #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) =
-                    Self::commit_columns_bit_reversed(&columns[num_cols..])
-                        .ok_or(ProvingError::EmptyCommitment)?;
+                let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
+                    &main_data,
+                    total_cols,
+                    num_precomputed,
+                    total_cols,
+                )
+                .ok_or(ProvingError::EmptyCommitment)?;
                 debug_assert_eq!(
                     precomputed_root, expected_precomputed_root,
                     "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
@@ -750,7 +959,7 @@ pub trait IsStarkProver<
                     mult_root,
                     precomputed_tree,
                     precomputed_root,
-                    num_cols,
+                    num_precomputed,
                 )
             }
         };
@@ -759,9 +968,9 @@ pub trait IsStarkProver<
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
         #[cfg(feature = "cuda")]
-        return Ok((commit, columns, None));
+        return Ok((commit, (main_data, total_cols), None));
         #[cfg(not(feature = "cuda"))]
-        Ok((commit, columns))
+        Ok((commit, (main_data, total_cols)))
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -781,15 +990,51 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let mut main = trace.extract_columns_main(lde_size);
-        Self::expand_columns_to_lde::<Field>(&mut main, domain, twiddles);
+
+        // Column LDE then interleave to row-major (debug path: correctness over
+        // speed; the values match the production row-major LDE).
+        let mut main_cols = trace.extract_columns_main(lde_size);
+        Self::expand_columns_to_lde::<Field>(&mut main_cols, domain, twiddles);
+        let num_main_cols = main_cols.len();
+        let main_rows = if num_main_cols > 0 {
+            main_cols[0].len()
+        } else {
+            0
+        };
+        let mut main_data = vec![FieldElement::<Field>::zero(); main_rows * num_main_cols];
+        if num_main_cols > 0 {
+            for (row, dst) in main_data.chunks_exact_mut(num_main_cols).enumerate() {
+                for (col, src) in main_cols.iter().enumerate() {
+                    dst[col] = src[row].clone();
+                }
+            }
+        }
+        let main = (main_data, num_main_cols);
 
         let aux = if air.has_aux_trace() {
-            let mut aux = trace.extract_columns_aux(lde_size);
-            Self::expand_columns_to_lde::<FieldExtension>(&mut aux, domain, twiddles);
-            aux
+            let mut aux_cols = trace.extract_columns_aux(lde_size);
+            Self::expand_columns_to_lde::<FieldExtension>(&mut aux_cols, domain, twiddles);
+            let num_aux_cols = aux_cols.len();
+            let aux_rows = if num_aux_cols > 0 {
+                aux_cols[0].len()
+            } else {
+                0
+            };
+            let mut aux_data =
+                vec![FieldElement::<FieldExtension>::zero(); aux_rows * num_aux_cols];
+            if num_aux_cols > 0 {
+                // clone required (generic conditionally-Copy extension element);
+                // clippy's `clone_on_copy` here is a false positive.
+                #[allow(clippy::clone_on_copy)]
+                for (row, dst) in aux_data.chunks_exact_mut(num_aux_cols).enumerate() {
+                    for (col, src) in aux_cols.iter().enumerate() {
+                        dst[col] = src[row].clone();
+                    }
+                }
+            }
+            (aux_data, num_aux_cols)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         Ok(commitment.build_round1(
@@ -1650,7 +1895,7 @@ pub trait IsStarkProver<
         let phase_start = Instant::now();
 
         let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
-        let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
+        let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
         // R1 fused GPU pipeline produced one. Threaded through Phase D's zip
         // chain so each handle stays paired with its table by construction.
@@ -1801,11 +2046,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         type AuxResult<FE> = (
             Option<TableCommit<FE>>,
-            Vec<Vec<FieldElement<FE>>>,
+            (Vec<FieldElement<FE>>, usize),
             Option<math_cuda::lde::GpuLdeExt3>,
         );
         #[cfg(not(feature = "cuda"))]
-        type AuxResult<FE> = (Option<TableCommit<FE>>, Vec<Vec<FieldElement<FE>>>);
+        type AuxResult<FE> = (Option<TableCommit<FE>>, (Vec<FieldElement<FE>>, usize));
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
 
@@ -1827,6 +2072,8 @@ pub trait IsStarkProver<
 
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+                        // `mut` is only needed under the cuda fast path.
+                        #[allow(unused_mut)]
                         let mut columns = trace.extract_columns_aux(lde_size);
 
                         // Fused GPU path: ext3 LDE + Keccak-256 leaf hashing + Merkle tree build
@@ -1866,19 +2113,58 @@ pub trait IsStarkProver<
                         if storage_mode == StorageMode::Disk {
                             trace.aux_table.advise_drop_cache();
                         }
+
+                        let total_cols = columns.len();
+                        let n = if total_cols > 0 { columns[0].len() } else { 0 };
+
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        Self::expand_columns_to_lde::<FieldExtension>(
-                            &mut columns,
-                            domain,
-                            twiddles,
-                        );
+
+                        // Interleave aux columns → natural-order row-major, then
+                        // expand with the batched two-half FFT (mirrors main).
+                        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+                            vec![FieldElement::<FieldExtension>::zero(); n * total_cols];
+                        {
+                            // clippy reports `clone_on_copy` here, but the borrow
+                            // checker rejects a plain index-copy of the (generic,
+                            // conditionally-Copy) extension element — so the clone
+                            // is required. Suppress the false positive.
+                            #[cfg(feature = "parallel")]
+                            aux_data
+                                .par_chunks_exact_mut(total_cols)
+                                .enumerate()
+                                .for_each(|(row, dst)| {
+                                    #[allow(clippy::clone_on_copy)]
+                                    for (col, src) in columns.iter().enumerate() {
+                                        dst[col] = src[row].clone();
+                                    }
+                                });
+                            #[cfg(not(feature = "parallel"))]
+                            #[allow(clippy::clone_on_copy)]
+                            for (row, dst) in aux_data.chunks_exact_mut(total_cols).enumerate() {
+                                for (col, src) in columns.iter().enumerate() {
+                                    dst[col] = src[row].clone();
+                                }
+                            }
+                        }
+                        drop(columns);
+
+                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+                            &mut aux_data,
+                            total_cols,
+                            domain.blowup_factor,
+                            &twiddles.coset_weights,
+                            &twiddles.two_half_inv,
+                            &twiddles.two_half_fwd,
+                        )
+                        .expect("row-major aux coset LDE expansion");
+
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                        let (mut tree, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
@@ -1890,14 +2176,18 @@ pub trait IsStarkProver<
                             })?;
                         }
                         #[cfg(feature = "cuda")]
-                        return Ok((Some(TableCommit::plain(tree, root)), columns, None));
+                        return Ok((
+                            Some(TableCommit::plain(tree, root)),
+                            (aux_data, total_cols),
+                            None,
+                        ));
                         #[cfg(not(feature = "cuda"))]
-                        Ok((Some(TableCommit::plain(tree, root)), columns))
+                        Ok((Some(TableCommit::plain(tree, root)), (aux_data, total_cols)))
                     } else {
                         #[cfg(feature = "cuda")]
-                        return Ok((None, Vec::new(), None));
+                        return Ok((None, (Vec::new(), 0), None));
                         #[cfg(not(feature = "cuda"))]
-                        Ok((None, Vec::new()))
+                        Ok((None, (Vec::new(), 0)))
                     }
                 })
                 .collect();

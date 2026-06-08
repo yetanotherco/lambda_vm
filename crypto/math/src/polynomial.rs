@@ -3,8 +3,8 @@ use crate::fft::bit_reversing::in_place_bit_reverse_permute;
 use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
-use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
 use crate::fft::errors::FFTError;
+use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
