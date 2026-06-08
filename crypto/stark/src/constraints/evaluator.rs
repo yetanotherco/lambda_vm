@@ -4,7 +4,7 @@ use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compu
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
@@ -50,13 +50,13 @@ where
         let is_uniform = zerofier_data.is_uniform();
         let num_base = air.num_base_transition_constraints();
 
-        // Bit-reversed evaluator: expand the (short, cycled) zerofier groups to the
-        // full LDE size and bit-reverse them once, so physical row `i` indexes
-        // `zerofier_expanded[group][i]` directly (= the zerofier at logical row
-        // reverse_index(i)) — no per-element scatter into the zerofier.
+        // Bit-reversed evaluator: the LDE is read at physical row `i`, whose logical
+        // row is `reverse_index(i)`. The zerofier groups stay in their compact cycled
+        // form (`group[logical % len]`, cache-resident) — indexed with the bit-reversed
+        // logical row, rather than materializing full `lde_size` copies per group (which
+        // would stream hundreds of MB per `evaluate`). `reverse_index(i)` is computed
+        // once per row and shared across all constraints in that row.
         let lde_size = boundary_evaluation.len();
-        let zerofier_expanded = zerofier_data.bit_reversed_expanded(lde_size);
-        let constraint_to_group = &zerofier_data.constraint_to_group;
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
@@ -108,9 +108,12 @@ where
             );
             air.compute_transition_prover(&ctx, base_buf, transition_buf);
 
+            // Logical row for the bit-reversed physical row `i`: zerofier groups are
+            // stored in natural (cycled) order, so we look them up at `reverse_index(i)`.
+            let rev_i = reverse_index(i, lde_size as u64);
             let acc_transition = if is_uniform {
                 // All constraints share one zerofier: factor it out of the sum.
-                let z = &zerofier_expanded[0][i];
+                let z = zerofier_data.get_uniform(rev_i);
                 // F×E inner product for base constraints (3 muls per term)
                 let mut sum = base_buf
                     .iter()
@@ -128,14 +131,14 @@ where
                     .enumerate()
                     .zip(&transition_coefficients[..num_base])
                     .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                        acc + &zerofier_expanded[constraint_to_group[c_idx]][i] * eval * beta
+                        acc + zerofier_data.get(c_idx, rev_i) * eval * beta
                     });
                 sum = transition_buf[num_base..]
                     .iter()
                     .enumerate()
                     .zip(&transition_coefficients[num_base..])
                     .fold(sum, |acc, ((j, eval), beta)| {
-                        acc + &zerofier_expanded[constraint_to_group[num_base + j]][i] * eval * beta
+                        acc + zerofier_data.get(num_base + j, rev_i) * eval * beta
                     });
                 sum
             };
