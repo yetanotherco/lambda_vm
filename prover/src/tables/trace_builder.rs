@@ -1547,8 +1547,9 @@ fn collect_bitwise_from_page(
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
 
-            // Get init value (from ELF or 0)
-            let init = init_data.map_or(0u8, |data| data[offset]);
+            // Get init value (from ELF or 0). `.get().unwrap_or(0)` to match the
+            // relaxed `init_values` contract: a shorter vec reads as trailing zeros.
+            let init = init_data.map_or(0u8, |data| data.get(offset).copied().unwrap_or(0));
 
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
