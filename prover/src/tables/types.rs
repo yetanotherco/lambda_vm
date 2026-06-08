@@ -114,6 +114,13 @@ pub enum BusId {
     Keccak,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
     KeccakRc,
+
+    // =========================================================================
+    // Continuations
+    // =========================================================================
+    /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
+    /// boundary claims, matched across epochs by the final aggregation LogUp.
+    GlobalMemory,
 }
 
 impl BusId {
@@ -144,6 +151,7 @@ impl BusId {
             BusId::Commit => "Commit",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
+            BusId::GlobalMemory => "GlobalMemory",
         }
     }
 }
@@ -177,6 +185,7 @@ impl TryFrom<u64> for BusId {
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
+            24 => Ok(BusId::GlobalMemory),
             other => Err(other),
         }
     }
