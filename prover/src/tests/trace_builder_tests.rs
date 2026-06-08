@@ -1022,3 +1022,66 @@ fn test_terminating_epoch_rejected_when_not_final() {
         "expected HaltInNonFinalEpoch error for a non-final terminating epoch"
     );
 }
+
+/// End to end: extract real per-epoch touched cells from execution, feed them
+/// through the local-to-global boundary logic, and render each epoch's trace.
+#[test]
+fn test_local_to_global_traces_from_real_execution() {
+    use crate::tables::local_to_global::{epoch_boundaries, generate_local_to_global_trace};
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    // A program that exercises memory (loads/stores), so some cells are touched.
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let elf_image = build_initial_image(&program, &[]);
+    let total_memory = elf_image.len();
+
+    // Per-epoch touched cells from real execution (epoch 0 from the ELF image,
+    // later epochs from the previous epoch's ending memory).
+    let mut per_epoch_touches: Vec<Vec<(u64, u64, u64)>> = Vec::new();
+    for (i, epoch) in epochs.iter().enumerate() {
+        let image: HashMap<u64, u8> = if i == 0 {
+            elf_image.clone()
+        } else {
+            epochs[i - 1].end_memory.iter_bytes().collect()
+        };
+        per_epoch_touches.push(epoch_touched_cells(&program, &image, &epoch.logs).unwrap());
+    }
+
+    // The program touches memory somewhere, and every per-epoch touched set is
+    // sparse (far smaller than the whole memory image).
+    let total_touched: usize = per_epoch_touches.iter().map(Vec::len).sum();
+    assert!(total_touched > 0);
+    for touched in &per_epoch_touches {
+        assert!(touched.len() < total_memory);
+    }
+
+    // Boundary claims + rendered L2G trace per epoch.
+    let initial_memory: HashMap<u64, u64> =
+        elf_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries = epoch_boundaries(&initial_memory, &per_epoch_touches);
+
+    for (i, boundary_set) in boundaries.iter().enumerate() {
+        let trace = generate_local_to_global_trace(boundary_set);
+        let expected_rows = per_epoch_touches[i].len().next_power_of_two().max(1);
+        assert_eq!(trace.num_rows(), expected_rows);
+    }
+}

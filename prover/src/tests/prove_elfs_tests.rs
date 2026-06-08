@@ -2860,3 +2860,284 @@ fn test_prove_second_epoch_from_snapshot() {
         "second epoch (register init from snapshot) failed to verify"
     );
 }
+
+/// An epoch proof can COMMIT the local-to-global table inertly — committed
+/// columns, but no GlobalMemory bus and no constraints in the epoch proof — and
+/// still verify, exposing the L2G commitment root that the final proof (Step 4)
+/// will bind to. The cross-epoch GlobalMemory matching is proven separately.
+#[test]
+fn test_epoch_proof_commits_l2g() {
+    use crate::compute_expected_commit_bus_balance;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&elf, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    // Epoch 0's local-to-global trace, committed inertly below.
+    let touched = epoch_touched_cells(&elf, &image, &epochs[0].logs).unwrap();
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[0]);
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        None,
+    );
+
+    // Inert L2G AIR: commits the trace columns, but no bus and no constraints.
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let inert_l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
+        AirWithBuses::new(
+            local_to_global::cols::NUM_COLUMNS,
+            AuxiliaryTraceBuildData {
+                interactions: vec![],
+            },
+            &proof_options,
+            1,
+            transition_constraints,
+        );
+
+    let mut pairs = airs.air_trace_pairs(&mut traces);
+    pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
+
+    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("epoch proof with inert L2G failed to prove");
+
+    let mut refs = airs.air_refs();
+    refs.push(&inert_l2g_air);
+
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance(
+        &refs,
+        &multi_proof,
+        &traces.public_output_bytes,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify(
+            &refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "epoch proof with inert L2G failed to verify"
+    );
+
+    // The L2G table (pushed last) is committed: its Merkle root is exposed and
+    // non-zero — this is the `R_i` the final proof will be bound to in Step 4.
+    let l2g_root = multi_proof
+        .proofs
+        .last()
+        .unwrap()
+        .lde_trace_main_merkle_root;
+    assert_ne!(
+        l2g_root, [0u8; 32],
+        "L2G commitment root should be non-zero"
+    );
+}
+
+/// End-to-end continuation pipeline over a real ELF: split execution into epochs,
+/// prove+verify each epoch (each committing its local-to-global table inertly and
+/// exposing a root R_i), prove the cross-epoch GlobalMemory bus balances over the
+/// real per-epoch boundaries, and finally bind the cross-epoch proof to the REAL
+/// per-epoch roots. The R_i collected from the independent epoch proofs equal the
+/// per-epoch L2G sub-table roots in the cross-epoch proof — that root equality is
+/// the shared-commitment linkage between the epoch proofs and the global memory
+/// argument.
+#[test]
+fn test_continuation_pipeline_end_to_end() {
+    use crate::compute_expected_commit_bus_balance;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Split execution into epochs.
+    let total = Executor::new(&elf, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image0 = build_initial_image(&elf, &[]);
+    let initial_memory: HashMap<u64, u64> = image0.iter().map(|(&a, &v)| (a, v as u64)).collect();
+
+    // Pass 1: each epoch's starting state + the cells it touches. Epoch 0 starts
+    // from the program image; epoch i>0 from epoch i-1's boundary snapshot.
+    let mut images: Vec<HashMap<u64, u8>> = Vec::with_capacity(epochs.len());
+    let mut register_inits: Vec<HashMap<u64, u32>> = Vec::with_capacity(epochs.len());
+    let mut all_touched: Vec<Vec<(u64, u64, u64)>> = Vec::with_capacity(epochs.len());
+    for (i, epoch) in epochs.iter().enumerate() {
+        let (image_i, register_init_i) = if i == 0 {
+            (
+                image0.clone(),
+                register::register_init_from_entry_point(elf.entry_point),
+            )
+        } else {
+            let image_i: HashMap<u64, u8> = epochs[i - 1].end_memory.iter_bytes().collect();
+            let register_init_i = register::register_init_from_snapshot(
+                &epochs[i - 1].end_registers,
+                epochs[i - 1].end_pc,
+            );
+            (image_i, register_init_i)
+        };
+        let touched_i = epoch_touched_cells(&elf, &image_i, &epoch.logs).unwrap();
+        images.push(image_i);
+        register_inits.push(register_init_i);
+        all_touched.push(touched_i);
+    }
+    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &all_touched);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // Pass 2: prove+verify each epoch, committing boundaries[i] inertly, and
+    // collect the L2G commitment root each epoch proof exposes.
+    let mut epoch_roots = Vec::with_capacity(epochs.len());
+    for (i, epoch) in epochs.iter().enumerate() {
+        let is_final = i == epochs.len() - 1;
+        let mut traces = Traces::from_image_and_logs(
+            &elf,
+            &images[i],
+            &register_inits[i],
+            &epoch.logs,
+            &MaxRowsConfig::default(),
+            &[],
+            is_final,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .unwrap();
+
+        let table_counts = traces.table_counts();
+        let register_init_arg = if i == 0 {
+            None
+        } else {
+            Some(&register_inits[i])
+        };
+        let airs = VmAirs::new(
+            &elf,
+            &proof_options,
+            true,
+            &traces.page_configs,
+            &table_counts,
+            None,
+            is_final,
+            register_init_arg,
+        );
+
+        let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+        let inert_l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
+            AirWithBuses::new(
+                local_to_global::cols::NUM_COLUMNS,
+                AuxiliaryTraceBuildData {
+                    interactions: vec![],
+                },
+                &proof_options,
+                1,
+                transition_constraints,
+            );
+
+        let mut pairs = airs.air_trace_pairs(&mut traces);
+        pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
+        let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("epoch proof failed to prove");
+
+        let mut refs = airs.air_refs();
+        refs.push(&inert_l2g_air);
+        let mut replay = DefaultTranscript::<E>::new(&[]);
+        let expected_bus_balance = compute_expected_commit_bus_balance(
+            &refs,
+            &multi_proof,
+            &traces.public_output_bytes,
+            &mut replay,
+        )
+        .expect("fingerprint collision in test");
+        assert!(
+            Verifier::multi_verify(
+                &refs,
+                &multi_proof,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &expected_bus_balance,
+            ),
+            "epoch {i} failed to verify"
+        );
+
+        epoch_roots.push(
+            multi_proof
+                .proofs
+                .last()
+                .unwrap()
+                .lde_trace_main_merkle_root,
+        );
+    }
+
+    // The cross-epoch GlobalMemory bus balances over the real per-epoch boundaries.
+    assert!(
+        crate::tests::local_to_global_bus_tests::prove_and_verify(&boundaries),
+        "final GlobalMemory bus must balance over real epoch data"
+    );
+
+    // The cross-epoch proof is bound to the REAL per-epoch roots: the L2G root each
+    // epoch proof exposed equals the per-epoch L2G sub-table root in the final proof.
+    let final_proof = crate::tests::local_to_global_bus_tests::prove_global(&boundaries);
+    assert!(
+        crate::verify_l2g_commitment_binding(&epoch_roots, &final_proof),
+        "final proof must be bound to the real per-epoch L2G roots"
+    );
+}

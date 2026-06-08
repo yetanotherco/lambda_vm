@@ -559,6 +559,28 @@ pub(crate) fn compute_expected_commit_bus_balance(
     compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
 
+/// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
+///
+/// The final proof commits one local-to-global sub-table per epoch as its first
+/// `N` tables, so `final_proof.proofs[i].lde_trace_main_merkle_root` is epoch
+/// `i`'s L2G commitment. `epoch_l2g_roots[i]` is the same root as committed in
+/// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
+/// the very same L2G tables the epochs committed (shared commitments).
+///
+/// Not yet wired into a production verify entry point (the per-epoch continuation
+/// verifier is forthcoming); exercised by the local-to-global bus tests.
+#[allow(dead_code)]
+pub(crate) fn verify_l2g_commitment_binding(
+    epoch_l2g_roots: &[Commitment],
+    final_proof: &MultiProof<F, E, ()>,
+) -> bool {
+    final_proof.proofs.len() >= epoch_l2g_roots.len()
+        && epoch_l2g_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
+}
+
 // =============================================================================
 // Public API: Prove / Verify
 // =============================================================================

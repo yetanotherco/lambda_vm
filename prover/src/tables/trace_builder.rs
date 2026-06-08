@@ -1503,6 +1503,39 @@ pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u6
     image
 }
 
+/// Return the memory cells (bytes) an epoch touched, as `(address, end_value,
+/// end_timestamp)` — the per-epoch input for the local-to-global table.
+///
+/// The epoch's `MemoryState` is seeded from `initial_image` at timestamp 0, and
+/// the epoch's accesses set real timestamps (which start at 4). So cells with a
+/// non-zero timestamp are exactly the ones this epoch read or wrote. Registers
+/// don't affect which RAM bytes are touched, so register init is irrelevant here.
+///
+/// Reuses the early phases of [`Traces::from_image_and_logs`] read-only; sharing
+/// a single path with it is left to a later step.
+pub fn epoch_touched_cells(
+    elf: &Elf,
+    initial_image: &HashMap<u64, u8>,
+    logs: &[Log],
+) -> Result<Vec<(u64, u64, u64)>, Error> {
+    let instructions = decode::instructions_from_elf(elf)
+        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+    let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+
+    let mut memory_state = MemoryState::from_image(initial_image);
+    let mut register_state = RegisterState::new(elf.entry_point);
+    let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+    let mut touched: Vec<(u64, u64, u64)> = memory_state
+        .cells
+        .iter()
+        .filter(|(_, cell)| cell.1 > 0)
+        .map(|(addr, cell)| (*addr, cell.0 as u64, cell.1))
+        .collect();
+    touched.sort_by_key(|&(addr, _, _)| addr);
+    Ok(touched)
+}
+
 /// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
 fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
     let page_size = page::DEFAULT_PAGE_SIZE;

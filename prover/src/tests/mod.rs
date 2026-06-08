@@ -29,6 +29,8 @@ pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
+pub mod local_to_global_bus_tests;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
