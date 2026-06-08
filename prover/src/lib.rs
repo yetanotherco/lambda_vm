@@ -414,6 +414,26 @@ impl VmAirs {
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
+        // Every production builder uses DEFAULT_PAGE_SIZE; only unit tests use other
+        // sizes, and they bypass VmAirs. Enforce uniformity so the single shared
+        // zero-init commitment below is valid for every zero-init page. page_size is
+        // verifier-derived (never from the proof), so this can't be attacker-tripped.
+        assert!(
+            page_configs
+                .iter()
+                .all(|c| c.page_size == page::DEFAULT_PAGE_SIZE),
+            "VmAirs requires uniform DEFAULT_PAGE_SIZE pages",
+        );
+
+        // Every zero-init page shares one preprocessed commitment: OFFSET is
+        // page-relative and INIT is all-zero, so it depends only on
+        // (page_size, blowup, coset) — all fixed here. Compute it once (static
+        // const when shipped, else a single recompute) rather than per page.
+        let zero_init_commitment = page::preprocessed_commitment(
+            &page::PageConfig::zero_init(0, page::DEFAULT_PAGE_SIZE),
+            proof_options,
+        );
+
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
@@ -423,12 +443,13 @@ impl VmAirs {
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
                     air
+                } else if config.init_values.is_none() {
+                    // Zero-init pages: the shared commitment computed once above.
+                    air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
-                    // Preprocessed pages (zero-init + ELF data): OFFSET + INIT are fixed
-                    // before execution. Prefer a caller-supplied `(page_base, commitment)`
-                    // (recursion guest, for ELF data pages — skips the FFT + Merkle build);
-                    // otherwise `preprocessed_commitment` returns the zero-init static
-                    // constant or recomputes from the ELF.
+                    // ELF data pages: INIT is program-specific, so the commitment is
+                    // per-page. Prefer a caller-supplied `(page_base, commitment)`
+                    // (recursion guest); otherwise recompute from the ELF.
                     let commitment = page_commitments
                         .unwrap_or(&[])
                         .iter()
