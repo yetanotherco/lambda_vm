@@ -203,6 +203,18 @@ where
     pub fn extract_columns_aux(&self, capacity: usize) -> Vec<Vec<FieldElement<E>>> {
         self.aux_table.extract_columns(capacity)
     }
+
+    /// Borrow the row-major main-trace buffer + its width. The trace `Table` is
+    /// already stored row-major, so this is zero-copy — it feeds the batched
+    /// row-major LDE without the col→row transpose `extract_columns_main` pays.
+    pub fn main_data_row_major(&self) -> (&[FieldElement<F>], usize) {
+        (&self.main_table.data, self.main_table.width)
+    }
+
+    /// Row-major aux-trace buffer + its width (empty / width 0 when no aux).
+    pub fn aux_data_row_major(&self) -> (&[FieldElement<E>], usize) {
+        (&self.aux_table.data, self.aux_table.width)
+    }
 }
 /// Row-major LDE trace table.
 ///

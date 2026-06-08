@@ -21,7 +21,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -393,6 +393,25 @@ where
         1 => Ok(evaluations),
         _ => Ok(evaluations.into_iter().step_by(step).collect()),
     }
+}
+
+/// Interleave column-major data into a flat row-major buffer + its column
+/// count. Used only by the cuda fast path to materialize the GPU-expanded
+/// columns in the row-major layout the table expects (CPU paths read the
+/// already-row-major trace directly, with no transpose).
+#[cfg(feature = "cuda")]
+fn columns_to_row_major<E: IsField>(
+    columns: &[Vec<FieldElement<E>>],
+) -> (Vec<FieldElement<E>>, usize) {
+    let num_cols = columns.len();
+    let n = if num_cols > 0 { columns[0].len() } else { 0 };
+    let mut data = Vec::with_capacity(n * num_cols);
+    for row in 0..n {
+        for col in columns {
+            data.push(col[row].clone());
+        }
+    }
+    (data, num_cols)
 }
 
 /// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
@@ -829,14 +848,12 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        // `mut` is only needed under the cuda fast path (which expands in place).
-        #[allow(unused_mut)]
-        let mut columns = trace.extract_columns_main(lde_size);
 
-        // Fused GPU path is only wired for non-preprocessed mains today. The
-        // preprocessed split runs the CPU pipeline below.
+        // Fused GPU path (cuda only): extract columns and try the on-device
+        // pipeline; on success it returns the LDE + tree directly.
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
+            let mut columns = trace.extract_columns_main(lde_size);
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
             if let Some((tree, handle)) =
@@ -849,51 +866,33 @@ pub trait IsStarkProver<
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 let root = tree.root;
-                // Fused GPU path produces LDE + leaves + tree as one pipeline,
-                // so the wall-clock total lands in `main_lde_dur`. Bill the
-                // merkle bucket equal to LDE so the sum (lde + merkle) stays
-                // comparable to the non-GPU path's combined LDE+commit total.
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(main_lde_dur, main_lde_dur);
-                return Ok((TableCommit::plain(tree, root), columns, Some(handle)));
+                let (main_data, total_cols) = columns_to_row_major(&columns);
+                return Ok((
+                    TableCommit::plain(tree, root),
+                    (main_data, total_cols),
+                    Some(handle),
+                ));
             }
         }
+
+        // CPU path: the trace `Table` is already row-major, so copy it directly
+        // (one memcpy — no transpose) and expand in place with the cache-blocked
+        // batched two-half FFT. Row-major end-to-end: no LDE-size transpose,
+        // contiguous Merkle leaves.
+        let (trace_data, total_cols) = trace.main_data_row_major();
+
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
+        main_data.extend_from_slice(trace_data);
 
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             trace.main_table.advise_drop_cache();
         }
-
-        let total_cols = columns.len();
-        let n = if total_cols > 0 { columns[0].len() } else { 0 };
-
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-
-        // Interleave the N-length trace columns into a natural-order row-major
-        // buffer (cheap — trace-size, not LDE-size), then expand in place to
-        // the LDE with the cache-blocked batched two-half FFT. The LDE stays
-        // row-major end-to-end: no LDE-size transpose, contiguous Merkle leaves.
-        let mut main_data: Vec<FieldElement<Field>> =
-            vec![FieldElement::<Field>::zero(); n * total_cols];
-        {
-            #[cfg(feature = "parallel")]
-            main_data
-                .par_chunks_exact_mut(total_cols)
-                .enumerate()
-                .for_each(|(row, dst)| {
-                    for (col, src) in columns.iter().enumerate() {
-                        dst[col] = src[row].clone();
-                    }
-                });
-            #[cfg(not(feature = "parallel"))]
-            for (row, dst) in main_data.chunks_exact_mut(total_cols).enumerate() {
-                for (col, src) in columns.iter().enumerate() {
-                    dst[col] = src[row].clone();
-                }
-            }
-        }
-        drop(columns);
 
         Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
             &mut main_data,
@@ -2072,15 +2071,12 @@ pub trait IsStarkProver<
 
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-                        // `mut` is only needed under the cuda fast path.
-                        #[allow(unused_mut)]
-                        let mut columns = trace.extract_columns_aux(lde_size);
 
-                        // Fused GPU path: ext3 LDE + Keccak-256 leaf hashing + Merkle tree build
-                        // in one on-device pipeline, also retaining the device LDE buffer and
-                        // returning its handle for downstream GPU rounds.
+                        // Fused GPU path (cuda only): extract columns and try the
+                        // on-device ext3 pipeline; on success it returns directly.
                         #[cfg(feature = "cuda")]
                         {
+                            let mut columns = trace.extract_columns_aux(lde_size);
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
                             if let Some((tree, handle)) =
@@ -2095,59 +2091,33 @@ pub trait IsStarkProver<
                                 #[cfg(feature = "instruments")]
                                 let aux_lde_dur = t_sub.elapsed();
                                 let root = tree.root;
-                                // Fused GPU path: LDE + leaf hash + tree build run as one pipeline with
-                                // no separate merkle timing, so bill the whole fused duration to the LDE
-                                // bucket and zero to merkle. The (lde + merkle) sum then equals the fused
-                                // time, comparable to the non-GPU path's combined R1 total.
                                 #[cfg(feature = "instruments")]
                                 crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
+                                let (aux_data, total_cols) = columns_to_row_major(&columns);
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
-                                    columns,
+                                    (aux_data, total_cols),
                                     Some(handle),
                                 ));
                             }
                         }
 
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            trace.aux_table.advise_drop_cache();
-                        }
-
-                        let total_cols = columns.len();
-                        let n = if total_cols > 0 { columns[0].len() } else { 0 };
+                        // CPU path: copy the already-row-major aux trace directly
+                        // (one memcpy — no transpose) and expand with the
+                        // cache-blocked batched two-half FFT.
+                        let (trace_data, total_cols) = trace.aux_data_row_major();
 
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
 
-                        // Interleave aux columns → natural-order row-major, then
-                        // expand with the batched two-half FFT (mirrors main).
                         let mut aux_data: Vec<FieldElement<FieldExtension>> =
-                            vec![FieldElement::<FieldExtension>::zero(); n * total_cols];
-                        {
-                            // clippy reports `clone_on_copy` here, but the borrow
-                            // checker rejects a plain index-copy of the (generic,
-                            // conditionally-Copy) extension element — so the clone
-                            // is required. Suppress the false positive.
-                            #[cfg(feature = "parallel")]
-                            aux_data
-                                .par_chunks_exact_mut(total_cols)
-                                .enumerate()
-                                .for_each(|(row, dst)| {
-                                    #[allow(clippy::clone_on_copy)]
-                                    for (col, src) in columns.iter().enumerate() {
-                                        dst[col] = src[row].clone();
-                                    }
-                                });
-                            #[cfg(not(feature = "parallel"))]
-                            #[allow(clippy::clone_on_copy)]
-                            for (row, dst) in aux_data.chunks_exact_mut(total_cols).enumerate() {
-                                for (col, src) in columns.iter().enumerate() {
-                                    dst[col] = src[row].clone();
-                                }
-                            }
+                            Vec::with_capacity(lde_size * total_cols);
+                        aux_data.extend_from_slice(trace_data);
+
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            trace.aux_table.advise_drop_cache();
                         }
-                        drop(columns);
 
                         Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
                             &mut aux_data,
