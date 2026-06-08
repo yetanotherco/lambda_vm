@@ -170,7 +170,9 @@ fn deep_composition_ext3_impl(
     // populated in the host-parts path.
     let h_lde_host_dev;
 
-    let mut deep_out = stream.alloc_zeros::<u64>(domain_size * 3)?;
+    // SAFETY: the deep_composition kernel writes every output slot before
+    // any read, so uninitialised contents are never observed.
+    let mut deep_out = unsafe { stream.alloc::<u64>(domain_size * 3) }?;
 
     let dummy_aux;
     let aux_slice = if let Some(a) = aux_lde {

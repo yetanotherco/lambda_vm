@@ -18,6 +18,12 @@ use self::fri_functions::{
 /// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
 /// initial FFT. Use this when the caller already has the evaluation vector
 /// (e.g. from a fused LDE pipeline).
+///
+/// The `T: Clone` and `F/E: 'static` bounds are required by the cuda GPU
+/// fast path (`try_fri_commit_gpu` snapshots the transcript and TypeId-
+/// checks the field types). They are present unconditionally — including
+/// in builds without the `cuda` feature — to keep one stable signature.
+/// All real transcript and field types in this crate satisfy them.
 pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
@@ -38,9 +44,11 @@ where
 {
     // GPU fast path: drives the entire commit phase device-side (per-layer
     // fold + Keccak leaves + pair-hash tree, only D2H'ing each layer's root
-    // + evals + nodes for FriLayer construction). Falls back to the CPU
-    // loop below on any precondition miss; a cudarc failure mid-loop panics
-    // since the transcript is already advanced (see `try_fri_commit_gpu`).
+    // + evals + nodes for FriLayer construction). Returns `None` on any
+    // failure: precondition misses skip cleanly, and `try_fri_commit_gpu`
+    // snapshots the transcript before mutating it so a mid-loop cudarc
+    // error restores state and lets the CPU loop below run as if the GPU
+    // had never been tried.
     #[cfg(feature = "cuda")]
     {
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(

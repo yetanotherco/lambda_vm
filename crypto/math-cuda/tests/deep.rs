@@ -69,8 +69,8 @@ fn cpu_deep(
             let mut result = Fp3::zero();
             // H-terms
             for j in 0..num_parts {
-                let num = &h_lde[j][row] - &h_ood[j];
-                result += &gammas_h[j] * &num * &inv_h[i];
+                let num = h_lde[j][row] - h_ood[j];
+                result += gammas_h[j] * num * inv_h[i];
             }
             // Main
             for j in 0..num_main {
@@ -78,7 +78,7 @@ fn cpu_deep(
                     let t_val = &main_lde[j][row];
                     let t_ood = &trace_ood[j][k];
                     let num = t_val - t_ood; // base - ext3 = ext3
-                    result += &gammas_tr[j][k] * &num * &inv_t[k][i];
+                    result += gammas_tr[j][k] * num * inv_t[k][i];
                 }
             }
             // Aux
@@ -88,7 +88,7 @@ fn cpu_deep(
                     let t_val = &aux_col[row];
                     let t_ood = &trace_ood[trace_j][k];
                     let num = t_val - t_ood;
-                    result += &gammas_tr[trace_j][k] * &num * &inv_t[k][i];
+                    result += gammas_tr[trace_j][k] * num * inv_t[k][i];
                 }
             }
             result

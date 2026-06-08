@@ -123,28 +123,24 @@ impl FriCommitState {
         };
         let n_out_u64 = n_out as u64;
 
-        if self.a_is_input {
-            unsafe {
-                self.stream
-                    .launch_builder(&be.fri_fold_ext3)
-                    .arg(&self.evals_a)
-                    .arg(&n_out_u64)
-                    .arg(&self.inv_tw)
-                    .arg(&zeta_dev)
-                    .arg(&mut self.evals_b)
-                    .launch(cfg)?;
-            }
+        // Split the eval buffers into (input, output) based on a_is_input.
+        // Disjoint-field borrow is fine since evals_a and evals_b are
+        // separate fields.
+        let (input_evals, output_evals): (&CudaSlice<u64>, &mut CudaSlice<u64>) = if self.a_is_input
+        {
+            (&self.evals_a, &mut self.evals_b)
         } else {
-            unsafe {
-                self.stream
-                    .launch_builder(&be.fri_fold_ext3)
-                    .arg(&self.evals_b)
-                    .arg(&n_out_u64)
-                    .arg(&self.inv_tw)
-                    .arg(&zeta_dev)
-                    .arg(&mut self.evals_a)
-                    .launch(cfg)?;
-            }
+            (&self.evals_b, &mut self.evals_a)
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&be.fri_fold_ext3)
+                .arg(input_evals)
+                .arg(&n_out_u64)
+                .arg(&self.inv_tw)
+                .arg(&zeta_dev)
+                .arg(output_evals)
+                .launch(cfg)?;
         }
 
         // Keccak leaves + pair-hash tree into fresh device buffer.
@@ -160,49 +156,28 @@ impl FriCommitState {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
-            // Leaves read from the layer's OUTPUT eval buffer.
-            if self.a_is_input {
-                unsafe {
-                    self.stream
-                        .launch_builder(&be.keccak_fri_leaves_ext3)
-                        .arg(&self.evals_b)
-                        .arg(&num_leaves_u64)
-                        .arg(&mut leaves_view)
-                        .launch(kcfg)?;
-                }
+            // Leaves read from the layer's OUTPUT eval buffer (the buffer
+            // we just wrote to above).
+            let output_evals: &CudaSlice<u64> = if self.a_is_input {
+                &self.evals_b
             } else {
-                unsafe {
-                    self.stream
-                        .launch_builder(&be.keccak_fri_leaves_ext3)
-                        .arg(&self.evals_a)
-                        .arg(&num_leaves_u64)
-                        .arg(&mut leaves_view)
-                        .launch(kcfg)?;
-                }
+                &self.evals_a
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&be.keccak_fri_leaves_ext3)
+                    .arg(output_evals)
+                    .arg(&num_leaves_u64)
+                    .arg(&mut leaves_view)
+                    .launch(kcfg)?;
             }
         }
-        {
-            let mut level_begin: u64 = (num_leaves - 1) as u64;
-            while level_begin != 0 {
-                let new_begin = level_begin / 2;
-                let n_pairs = level_begin - new_begin;
-                let grid = (n_pairs as u32).div_ceil(128);
-                let cfg = LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    self.stream
-                        .launch_builder(&be.keccak_merkle_level)
-                        .arg(&mut nodes_dev)
-                        .arg(&new_begin)
-                        .arg(&n_pairs)
-                        .launch(cfg)?;
-                }
-                level_begin = new_begin;
-            }
-        }
+        crate::merkle::build_inner_tree_levels(
+            self.stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+        )?;
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into
@@ -272,28 +247,21 @@ impl FriCommitState {
         };
         let n_out_u64 = n_out as u64;
 
-        if self.a_is_input {
-            unsafe {
-                self.stream
-                    .launch_builder(&be.fri_fold_ext3)
-                    .arg(&self.evals_a)
-                    .arg(&n_out_u64)
-                    .arg(&self.inv_tw)
-                    .arg(&zeta_dev)
-                    .arg(&mut self.evals_b)
-                    .launch(cfg)?;
-            }
+        let (input_evals, output_evals): (&CudaSlice<u64>, &mut CudaSlice<u64>) = if self.a_is_input
+        {
+            (&self.evals_a, &mut self.evals_b)
         } else {
-            unsafe {
-                self.stream
-                    .launch_builder(&be.fri_fold_ext3)
-                    .arg(&self.evals_b)
-                    .arg(&n_out_u64)
-                    .arg(&self.inv_tw)
-                    .arg(&zeta_dev)
-                    .arg(&mut self.evals_a)
-                    .launch(cfg)?;
-            }
+            (&self.evals_b, &mut self.evals_a)
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&be.fri_fold_ext3)
+                .arg(input_evals)
+                .arg(&n_out_u64)
+                .arg(&self.inv_tw)
+                .arg(&zeta_dev)
+                .arg(output_evals)
+                .launch(cfg)?;
         }
 
         self.stream.synchronize()?;

@@ -1,13 +1,15 @@
 // R4 deep composition polynomial evaluations.
 //
-// For each trace-size row i in 0..domain_size, accumulate:
+// For each row i in 0..domain_size, accumulate:
 //   result_i = sum over j of gamma_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]               (H terms)
 //            + sum over j,k of gamma'_{j,k} * (t_j(x_i) - t_j(z*w^k)) * inv_t[k,i]    (trace)
 //
-// where x_i = LDE coset point at stride `blowup_factor` (so the kernel
-// reads LDE column data at `i * blowup_factor`). `j` ranges over
-// num_parts for H-terms and num_total_cols (= num_main + num_aux) for
-// trace terms. `k` ranges over num_eval_points.
+// The kernel reads LDE column data at `i * blowup_factor`. Real R4 callers
+// always pass `blowup_factor = 1` and `domain_size = lde_size` (evaluates
+// every row); the stride parameter is exercised by the parity tests in
+// `tests/deep.rs` so the kernel can also run a trace-coset evaluation.
+// `j` ranges over num_parts for H-terms and num_total_cols (= num_main +
+// num_aux) for trace terms. `k` ranges over num_eval_points.
 //
 // Buffer layouts (ALL on device):
 //   main_lde    base, row-major per column: main_lde[c * lde_stride + r]
