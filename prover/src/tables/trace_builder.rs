@@ -1492,8 +1492,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
             for byte_offset in 0..4u64 {
                 let byte_addr = word_addr + byte_offset;
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                let page_base = page::page_base_for_address(byte_addr, page_size);
-                let offset = page::offset_in_page(byte_addr, page_size);
+                let page_base = page::page_base_for_address(byte_addr);
+                let offset = page::offset_in_page(byte_addr);
                 let page_data = init_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
@@ -1504,8 +1504,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     if !private_input.is_empty() {
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
-            let page_base = page::page_base_for_address(addr, page_size);
-            let offset = page::offset_in_page(addr, page_size);
+            let page_base = page::page_base_for_address(addr);
+            let offset = page::offset_in_page(addr);
             let page_data = init_page_data
                 .entry(page_base)
                 .or_insert_with(|| vec![0u8; page_size]);
@@ -1530,7 +1530,7 @@ fn collect_bitwise_from_page(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr, page_size));
+        page_bases.insert(page::page_base_for_address(addr));
     }
 
     // Build final state map from memory_state
@@ -1931,15 +1931,13 @@ fn generate_page_tables(
 ) {
     use std::collections::BTreeSet;
 
-    let page_size = page::DEFAULT_PAGE_SIZE;
-
     // Collect init data from ELF segments + private input region
     let init_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr, page_size));
+        page_bases.insert(page::page_base_for_address(addr));
     }
 
     // Build final state map from memory_state
@@ -1958,7 +1956,7 @@ fn generate_page_tables(
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let total_bytes = 4 + private_input.len(); // length prefix + data
         (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size))
+            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
             .collect()
     } else {
         std::collections::BTreeSet::new()
@@ -1967,11 +1965,11 @@ fn generate_page_tables(
     for &page_base in &page_bases {
         let config = if private_input_page_bases.contains(&page_base) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
-            PageConfig::with_private_input(page_base, page_size, init_data)
+            PageConfig::with_private_input(page_base, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
-            PageConfig::with_data(page_base, page_size, init_data.clone())
+            PageConfig::with_data(page_base, init_data.clone())
         } else {
-            PageConfig::zero_init(page_base, page_size)
+            PageConfig::zero_init(page_base)
         };
 
         let trace = page::generate_page_trace(&config, &final_state);
@@ -2945,7 +2943,6 @@ impl Traces {
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
-        let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, &[]);
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
@@ -2954,9 +2951,9 @@ impl Traces {
             .into_iter()
             .map(|base| {
                 if let Some(init_data) = init_page_data.get(&base) {
-                    PageConfig::with_data(base, page_size, init_data.clone())
+                    PageConfig::with_data(base, init_data.clone())
                 } else {
-                    PageConfig::zero_init(base, page_size)
+                    PageConfig::zero_init(base)
                 }
             })
             .collect()
@@ -2981,21 +2978,17 @@ impl Traces {
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
             for i in 0..count {
-                configs.push(PageConfig::zero_init(
-                    base + i * page_size as u64,
-                    page_size,
-                ));
+                configs.push(PageConfig::zero_init(base + i * page_size as u64));
             }
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
             use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
+            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
             for i in 0..num_private_input_pages {
                 configs.push(PageConfig {
                     page_base: first_page_base + i as u64 * page_size as u64,
-                    page_size,
                     init_values: None, // Verifier doesn't know these
                     is_private_input: true,
                 });
