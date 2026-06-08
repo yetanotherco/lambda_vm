@@ -612,7 +612,9 @@ pub enum Cpu32ConstraintKind {
     /// prevents a disconnected row from emitting a forged register read/write
     /// token (no DECODE binding, no CPU32 delegation); for `signed` it closes
     /// the soundness hole where a free `signed` on padding (the `BYTE_ALU`
-    /// extractor is gated by `μ`) leaks into the `arg1/arg2` high words. Spec
+    /// extractor is gated by `μ`) leaks into the `arg1/arg2` high words; for
+    /// `res_sign` (gated by the μ-gated `MSB16`) it is the arith half of
+    /// `SIGN(res, μ)`, keeping the `rvd` high word zero on padding. Spec
     /// `cpu32.toml` (PR #646). `usize` is the flag column.
     FlagImpliesMu { flag_col: usize },
 }
@@ -795,14 +797,17 @@ pub fn cpu32_constraints(
     // flag ⇒ μ: a flag must be 0 on padding rows (μ = 0). The register flags
     // gate MEMW interactions, so a free flag would inject a forged register
     // access; `signed` (extracted via a μ-gated BYTE_ALU) would otherwise be
-    // free on padding and leak into the `arg1/arg2` high-word fills. Spec
-    // `cpu32.toml`, PR #646. ALU is not gated: with `write_register = 0` its
-    // ALU-lookup result is never written back, so it has no side effect.
+    // free on padding and leak into the `arg1/arg2` high-word fills; `res_sign`
+    // (from the μ-gated MSB16) would otherwise be free and leak into the `rvd`
+    // high word. This is the arith half of `SIGN(res, μ)`. Spec `cpu32.toml`,
+    // PR #646. ALU is not gated: with `write_register = 0` its ALU-lookup
+    // result is never written back, so it has no side effect.
     for flag_col in [
         cols::READ_REGISTER1,
         cols::READ_REGISTER2,
         cols::WRITE_REGISTER,
         cols::SIGNED,
+        cols::RES_SIGN,
     ] {
         constraints.push(
             Cpu32Constraint::new(Cpu32ConstraintKind::FlagImpliesMu { flag_col }, idx).boxed(),
