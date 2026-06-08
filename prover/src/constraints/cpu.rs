@@ -565,7 +565,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
         let carry = match self.carry_idx {
             0 => self.compute_carry_0(step),
             1 => self.compute_carry_1(step),
-            _ => panic!("Invalid carry index"),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
         not_branch * &carry * (one - carry)
     }
