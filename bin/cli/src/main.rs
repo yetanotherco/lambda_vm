@@ -500,7 +500,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
                     return ExitCode::FAILURE;
                 }
             };
-            prover::verify_with_options(&proof, &elf_data, &opts)
+            prover::verify_with_options(&proof, &elf_data, &opts, None)
         }
         None => prover::verify(&proof, &elf_data),
     };
