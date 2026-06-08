@@ -10,7 +10,8 @@
 #include "goldilocks.cuh"
 #include "ext3.cuh"
 
-// fold_evaluations_in_place:
+// GPU port of fold_evaluations_in_place. Port is out-of-place to avoid
+// races across threads:
 //   out[j] = (lo + hi) + inv_tw[j] * zeta * (lo - hi)
 // where lo = evals[2j], hi = evals[2j+1]. Both lo/hi and zeta are ext3.
 // inv_tw[j] is a base-field twiddle (F * E -> E).

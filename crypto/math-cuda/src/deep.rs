@@ -36,7 +36,7 @@ pub fn deep_composition_ext3(
     num_main: usize,
     num_aux: usize,
     num_eval_points: usize,
-    blowup_factor: usize,
+    row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
     deep_composition_ext3_impl(
@@ -54,7 +54,7 @@ pub fn deep_composition_ext3(
         num_main,
         num_aux,
         num_eval_points,
-        blowup_factor,
+        row_stride,
         domain_size,
     )
 }
@@ -78,7 +78,7 @@ pub fn deep_composition_ext3_with_dev_parts(
     num_main: usize,
     num_aux: usize,
     num_eval_points: usize,
-    blowup_factor: usize,
+    row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
     deep_composition_ext3_impl(
@@ -96,7 +96,7 @@ pub fn deep_composition_ext3_with_dev_parts(
         num_main,
         num_aux,
         num_eval_points,
-        blowup_factor,
+        row_stride,
         domain_size,
     )
 }
@@ -117,7 +117,7 @@ fn deep_composition_ext3_impl(
     num_main: usize,
     num_aux: usize,
     num_eval_points: usize,
-    blowup_factor: usize,
+    row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
     assert_eq!(main_lde.m, num_main);
@@ -141,12 +141,12 @@ fn deep_composition_ext3_impl(
     assert_eq!(inv_h.len(), domain_size * 3);
     assert_eq!(inv_t.len(), num_eval_points * domain_size * 3);
 
-    // Kernel reads `*_lde[c * lde_stride + i * blowup_factor]` for i in
+    // Kernel reads `*_lde[c * lde_stride + i * row_stride]` for i in
     // 0..domain_size. Reject inputs that would walk past the LDE buffer.
     if domain_size > 0 {
         let max_row = (domain_size - 1)
-            .checked_mul(blowup_factor)
-            .expect("deep composition: (domain_size - 1) * blowup_factor overflow");
+            .checked_mul(row_stride)
+            .expect("deep composition: (domain_size - 1) * row_stride overflow");
         assert!(
             max_row < main_lde.lde_size,
             "deep composition: kernel row {max_row} out of LDE stride {}",
@@ -194,7 +194,7 @@ fn deep_composition_ext3_impl(
     let num_aux_u = num_aux as u64;
     let num_parts_u = num_parts as u64;
     let num_eval_points_u = num_eval_points as u64;
-    let blowup_u = blowup_factor as u64;
+    let row_stride_u = row_stride as u64;
     let domain_size_u = domain_size as u64;
 
     let grid = (domain_size as u32).div_ceil(128);
@@ -214,7 +214,7 @@ fn deep_composition_ext3_impl(
             .arg(&num_aux_u)
             .arg(&num_parts_u)
             .arg(&num_eval_points_u)
-            .arg(&blowup_u)
+            .arg(&row_stride_u)
             .arg(&domain_size_u)
             .arg(&h_ood_dev)
             .arg(&trace_ood_dev)

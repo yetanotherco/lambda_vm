@@ -1171,10 +1171,10 @@ where
         unsafe { ext3_slice_to_u64::<E>(&inv_denoms[lde_size..lde_size * (1 + num_eval_points)]) };
 
     // domain_size == lde_size here: R4 DEEP evaluates at every LDE point
-    // (Plonky3-style direct LDE). Calling the kernel with blowup_factor = 1
-    // makes its `row = i * blowup_factor` index every row.
+    // (Plonky3-style direct LDE). Calling the kernel with row_stride = 1
+    // makes its `row = i * row_stride` index every row.
     let domain_size_kernel = lde_size;
-    let blowup_kernel = 1usize;
+    let row_stride_kernel = 1usize;
 
     // Pack parts host path if no device handle.
     let parts_host_packed: Vec<u64>;
@@ -1193,7 +1193,7 @@ where
             num_main,
             num_aux,
             num_eval_points,
-            blowup_kernel,
+            row_stride_kernel,
             domain_size_kernel,
         )
     } else {
@@ -1224,7 +1224,7 @@ where
             num_main,
             num_aux,
             num_eval_points,
-            blowup_kernel,
+            row_stride_kernel,
             domain_size_kernel,
         )
     };

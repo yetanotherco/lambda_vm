@@ -4,15 +4,15 @@
 //   result_i = sum over j of gamma_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]               (H terms)
 //            + sum over j,k of gamma'_{j,k} * (t_j(x_i) - t_j(z*w^k)) * inv_t[k,i]    (trace)
 //
-// The kernel reads LDE column data at `i * blowup_factor`. Real R4 callers
-// always pass `blowup_factor = 1` and `domain_size = lde_size` (evaluates
+// The kernel reads LDE column data at `i * row_stride`. Real R4 callers
+// always pass `row_stride = 1` and `domain_size = lde_size` (evaluates
 // every row); the stride parameter is exercised by the parity tests in
 // `tests/deep.rs` so the kernel can also run a trace-coset evaluation.
 // `j` ranges over num_parts for H-terms and num_total_cols (= num_main +
 // num_aux) for trace terms. `k` ranges over num_eval_points.
 //
 // Buffer layouts (ALL on device):
-//   main_lde    base, row-major per column: main_lde[c * lde_stride + r]
+//   main_lde    base, column-major: main_lde[c * lde_stride + r]
 //   aux_lde     ext3 de-interleaved: aux_lde[(c*3 + k) * lde_stride + r]
 //   h_lde       ext3 de-interleaved: h_lde[(p*3 + k) * lde_stride + r]
 //   h_ood       num_parts * 3  (ext3 interleaved)
@@ -36,7 +36,7 @@ extern "C" __global__ void deep_composition_ext3_row(
     uint64_t num_aux,
     uint64_t num_parts,
     uint64_t num_eval_points,
-    uint64_t blowup_factor,
+    uint64_t row_stride,
     uint64_t domain_size,
     const uint64_t *h_ood,
     const uint64_t *trace_ood,
@@ -47,7 +47,7 @@ extern "C" __global__ void deep_composition_ext3_row(
     uint64_t *deep_out) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= domain_size) return;
-    uint64_t row = i * blowup_factor;
+    uint64_t row = i * row_stride;
 
     ext3::Fe3 result = ext3::zero();
     ext3::Fe3 inv_h_i = {inv_h[i * 3], inv_h[i * 3 + 1], inv_h[i * 3 + 2]};
@@ -67,7 +67,7 @@ extern "C" __global__ void deep_composition_ext3_row(
         result = ext3::add(result, tmp);
     }
 
-    // Main trace terms (base column - ext3 OOD)
+    // Main trace terms: t_val (base) - t_ood (ext3)
     for (uint64_t j = 0; j < num_main; ++j) {
         uint64_t t_val = main_lde[j * lde_stride + row];
         for (uint64_t k = 0; k < num_eval_points; ++k) {
@@ -87,7 +87,7 @@ extern "C" __global__ void deep_composition_ext3_row(
         }
     }
 
-    // Aux trace terms (ext3 column - ext3 OOD)
+    // Aux trace terms: t_val (ext3) - t_ood (ext3)
     for (uint64_t j = 0; j < num_aux; ++j) {
         ext3::Fe3 t_val = {
             aux_lde[(j * 3 + 0) * lde_stride + row],
