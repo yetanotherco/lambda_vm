@@ -621,7 +621,7 @@ name = "delegate"
 kind = "interaction"
 tag = "SERVE_K"
 input = [
-    ["+", "timestamp", ["cast", 1, "DWordWL"]],
+    "timestamp",
     ["cast", "addr_k", "DWordWL"],
     31
 ]

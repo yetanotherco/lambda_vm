@@ -337,6 +337,7 @@ The chip starts by extracting the input information from the bus when its multip
 #render_constraint_table(ecscalar_chip, config, groups: "recv")
 
 Next, it reads `limb` from address $#`ptr` + #`offset`$.
+Note that the read-timestamp is offset by $1$ to prevent a collision with read of $k$ performed by #ecsm.
 Since `limb` is reconstructed from `limb_bits`, it is ensured those are in fact bits.
 #render_constraint_table(ecscalar_chip, config, groups: "read")
 
