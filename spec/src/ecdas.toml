@@ -274,7 +274,7 @@ ref = "ecdas:c:c0_0"
 kind = "arith"
 constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
 poly = ["-", 
-    ["*", ["^", 2, 8], ["idx", "c0", 0]],
+    ["*", ["^", 2, 8], ["idx", "c0", "i"]],
     ["idx", "c0", ["-", "i", 1]],
     ["*", "op", ["-", ["idx", "YA", "i"], ["idx", "YG", "i"]]],
     ["sum", ["=", "j", 0], "i", ["+",
