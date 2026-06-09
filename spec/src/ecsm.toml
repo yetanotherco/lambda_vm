@@ -7,25 +7,25 @@ desc = "timestamp at which this operation is executed"
 
 [[variables.input]]
 name = "addr_xG"
-type = "DWordWHH"
+type = "DWordWL"
 desc = "address at which `x`-coordinate of start point `G` is stored"
 
 [[variables.input]]
 name = "addr_k"
-type = "DWordWHH"
+type = "DWordWL"
 desc = "address at which scalar `k` is stored"
 
 [[variables.input]]
 name = "addr_xR"
-type = "DWordWHH"
-desc = "address at which the `x`-coordinate of result point `R` is to be written"
+type = "DWordWL"
+desc = "address to which the `x`-coordinate of result point `R` is to be written"
 
 [[variables.output]]
 name = "xR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_x$"
 
-[[variables.output]]
+[[variables.auxiliary]]
 name = "yR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_y$"
@@ -81,9 +81,9 @@ type = "U256HL"
 desc = "$#`k`- #`N` mod 2^256$"
 
 [[variables.auxiliary]]
-name = "xR_sub_P"
+name = "xR_sub_p"
 type = "U256HL"
-desc = "$#`xR`- #`P` mod 2^256$"
+desc = "$x_R - #`p` mod 2^256$"
 
 [[variables.virtual]]
 name = "c2"
@@ -97,10 +97,10 @@ def = {polys=[
 [[variables.virtual]]
 name = "c3"
 type = ["Bit", 8]
-desc = "carries for computing $#`P` + #`xR_sub_P`$"
+desc = "carries for computing $#`P` + #`xR_sub_p`$"
 def = {polys=[
-    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_P", "U256WL"], "i"]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_P", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -187,6 +187,18 @@ type = "Bit"
 desc = ""
 
 
+[[assumptions]]
+desc = "$(#`addr_xG` mod 2^32) + 24 < 2^32$"
+ref = "ec:a:addr_xG_alignment"
+
+[[assumptions]]
+desc = "$(#`addr_k` mod 2^32) + 31 < 2^32$"
+ref = "ec:a:addr_k_alignment"
+
+[[assumptions]]
+desc = "$(#`addr_xR` mod 2^32) + 24 < 2^32$"
+ref = "ec:a:addr_xR_alignment"
+
 
 # Load xG from memory
 
@@ -199,34 +211,19 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 11], "DWordWL"],
-    ["arr", ["+", ["idx", "addr_xG", 0], ["*", ["^", 2, 16], ["idx", "addr_xG", 1]]], ["idx", "addr_xG", 2], 0, 0, 0, 0, 0, 0],
+    ["arr", ["idx", "addr_xG", 0], ["idx", "addr_xG", 1], 0, 0, 0, 0, 0, 0],
     "timestamp", 
     1, 0, 0]
-output = ["arr", ["+", ["idx", "addr_xG", 0], ["*", ["^", 2, 16], ["idx", "addr_xG", 1]]], ["idx", "addr_xG", 2], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", "addr_xG", 0], ["idx", "addr_xG", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:read_addr_xG"
-
-[[constraints.read_xG]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "addr_xG", "i"]]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-ref = "ec:c:range_xG"
-
-[[constraints.read_xG]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["+", ["idx", "addr_xG", 0], 24]]
-multiplicity = "μ"
-ref = "ec:c:verify_addr_xG_alignment"
 
 [[constraints.read_xG]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["arr", ["+", ["idx", "addr_xG", 0], ["*", 8, "i"], ["*", ["^", 2, 16], ["idx", "addr_xG", 1]]], ["idx", "addr_xG", 2]],
+    ["+", "addr_xG", ["cast", ["*", 8, "i"], "DWordWL"]],
     ["arr",
         ["idx", "xG", ["+", ["*", 8, "i"], 0]],
         ["idx", "xG", ["+", ["*", 8, "i"], 1]],
@@ -298,7 +295,7 @@ ref = "ec:c:c0_63_is_zero"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["+", ["idx", "c0", "i"], 8160]]
-iter = ["i", 0, 63]
+iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ec:c:range_c0"
 
@@ -350,8 +347,8 @@ constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`B`_i + sum_(j=0)^i (#`YG`_j dot
 poly = ["+", 
     ["-", 
         ["idx", "c1", ["-", "i", 1]], 
-        ["idx", "B", "i"], 
-        ["*", ["^", 2, 8], ["idx", "c1", "i"]]
+        ["*", ["^", 2, 8], ["idx", "c1", "i"]],
+        ["idx", "B", "i"]
     ], 
     ["sum", ["=", "j", 0], "i", 
         ["-", 
@@ -376,18 +373,12 @@ ref = "ec:c:c1_63_is_zero"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["+", ["idx", "c1", "i"], 16318]]
-iter = ["i", 0, 63]
+iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ec:c:range_c1"
 
 
-# send/receive lookups for double/add sequence
-# send lookup for table recursively loading & decomposing k from memory
-
-
-
 # Verifying k
-
 
 [[constraint_groups]]
 name = "verify_k"
@@ -398,34 +389,19 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 12], "DWordWL"],
-    ["arr", ["+", ["idx", "addr_k", 0], ["*", ["^", 2, 16], ["idx", "addr_k", 1]]], ["idx", "addr_k", 2], 0, 0, 0, 0, 0, 0],
+    ["arr", ["idx", "addr_k", 0], ["idx", "addr_k", 1], 0, 0, 0, 0, 0, 0],
     "timestamp", 
     1, 0, 0]
-output = ["arr", ["+", ["idx", "addr_k", 0], ["*", ["^", 2, 16], ["idx", "addr_k", 1]]], ["idx", "addr_k", 2], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", "addr_k", 0], ["idx", "addr_k", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:read_addr_k"
-
-[[constraints.verify_k]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "addr_k", "i"]]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-ref = "ec:c:range_addr_k"
-
-[[constraints.verify_k]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["+", ["idx", "addr_k", 0], 32]]
-multiplicity = "μ"
-ref = "ec:c:verify_addr_k_alignment"
 
 [[constraints.verify_k]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["arr", ["+", ["idx", "addr_k", 0], ["*", 8, "i"], ["*", ["^", 2, 16], ["idx", "addr_k", 1]]], ["idx", "addr_k", 2]],
+    ["+", "addr_k", ["cast", ["*", 8, "i"], "DWordWL"]],
     ["arr",
         ["idx", "k", ["+", ["*", 8, "i"], 0]],
         ["idx", "k", ["+", ["*", 8, "i"], 1]],
@@ -523,10 +499,10 @@ name = "range_xR"
 [[constraints.range_xR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", "xR_sub_P", "i"]]
+input = [["idx", "xR_sub_p", "i"]]
 iter = ["i", 0, 15]
 multiplicity = "μ"
-ref = "ec:c:range_xR_sub_P"
+ref = "ec:c:range_xR_sub_p"
 
 [[constraints.range_xR]]
 kind = "template"
@@ -553,34 +529,19 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 10], "DWordWL"],
-    ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["idx", "addr_xR", 2], 0, 0, 0, 0, 0, 0],
-    "timestamp",
+    ["arr", ["idx", "addr_xR", 0], ["idx", "addr_xR", 1], 0, 0, 0, 0, 0, 0],
+    ["+", "timestamp", ["cast", 1, "DWordWL"]],
     1, 0, 0]
-output = ["arr", ["+", ["idx", "addr_xR", 0], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["idx", "addr_xR", 2], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", "addr_xR", 0], ["idx", "addr_xR", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:load_addrR"
-
-[[constraints.write_xR]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "addr_xR", "i"]]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-ref = "ec:c:range_addr_xR"
-
-[[constraints.write_xR]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["+", ["idx", "addr_xR", 0], 24]]
-multiplicity = "μ"
-ref = "ec:c:verify_addrR_alignment"
 
 [[constraints.write_xR]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["arr", ["+", ["idx", "addr_xR", 0], ["*", 8, "i"], ["*", ["^", 2, 16], ["idx", "addr_xR", 1]]], ["idx", "addr_xR", 2]],
+    ["+", "addr_xR", ["cast", ["*", 8, "i"], "DWordWL"]],
     ["arr",
         ["idx", "xR", ["+", ["*", 8, "i"], 0]],
         ["idx", "xR", ["+", ["*", 8, "i"], 1]],

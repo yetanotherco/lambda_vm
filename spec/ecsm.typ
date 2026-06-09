@@ -30,8 +30,8 @@ Additionally, there is the _point at infinity_, $⁠#inf$, which has no native s
 It acts as the identity element (zero) in the group:
 given non-zero curve point $P$, it holds that
 $
-  #inf + #inf &= #inf\
-  #inf + P &= P\
+  #inf + #inf &= #inf,\
+  #inf + P &= P.\
 $
 
 #strong("Point negation.")
@@ -39,24 +39,24 @@ The negation of curve point $P = (x_P, y_P)$ is constructed as $-P := (x_P, -y_P
 Naturally, $P + (-P) = #inf$.
 
 #strong("Point addition.")
-The addition of points $P, Q$ distinguishes two cases.
+The addition of points $P, Q$ distinguishes three cases.
 For $x_P eq.not x_Q$, one uses
 $ 
 (x_R, y_R) := (lambda^2 - x_P - x_Q, lambda (x_P - x_R) - y_P)
 $
 with $lambda = frac((y_Q - y_P), (x_Q - x_P), style: "horizontal")$.
 When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2, 2y_P, style: "horizontal")$.
-Note, the remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
+The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 #strong("Scalar multiplication.")
 An addition operation gives rise to an algorithm for scalar multiplication.
-Given curve point $A$ and scalar $k$, the multiple $k times A$ can trivially be computed as $A + A + ... + A$.
+Given curve point $P$ and scalar $k$, the multiple $k times P$ can trivially be computed as $P + P + ... + P$.
 This accelerator instead leverages the _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) technique, which utilizes only $O(log(k))$ additions for the full multiplication.
 
 #strong("This accelerator.")
 The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [2^248, 2^256)$.
 In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
-This accelerator leverages _double-and-add_, executing the multiplication in $D_k := ceil.l log_2(k) ceil.r$ doublings and $A_k := w_H (k) - 1$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
+This accelerator leverages _double-and-add_, executing the multiplication in $O(log(k))$ doublings and $O(w_H (k)) = O(log(k))$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
 
 = Overview
 The accelerator comprises three chips:
@@ -64,12 +64,11 @@ The accelerator comprises three chips:
   reconstructing $y_G$,
   dispatching a double-and-add sequence request to the `ECDAS` chip, and writing the result point $x_R$ back to memory.
 - *`ECDAS` (Elliptic Curve Double/Add Sequence)* is responsible for the consecutive doubling/adding the provided point to itself, ultimately arriving at $k times G$.
-- *`LOAD_K`* serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
+- *`EC_SCALAR`* serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
 
 = ECSM <ecsm-sm>
 
-The #ecsm (Elliptic Curve Scalar Multiply) chip a generic over the constants
-- $a$, the first curve coefficient,
+The #ecsm (Elliptic Curve Scalar Multiply) chip is generic over the constants
 - $b$, the second curve coefficient,
 - $p$, the prime field modulus, and
 - $N$, the order of the curve group.
@@ -78,8 +77,9 @@ To support scalar multiplication over different curves, one chip instance should
 The chip is triggered by executing `ECALL`, with the ECALL-number is set to $-3$.
 The chip expects 
 - `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
-- `x11` to contain the address at which the first byte of $x_G$ is to be found,
-- `x12` to contain the address at which the first byte of $k$ is to be found.
+- `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
+- `x12` to contain the address at which the least significant byte of $k$ is to be found,
+where it is assumed that $x_G, x_R$ and $k$ are provided as little-endian.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -89,6 +89,9 @@ The chip expects
 The #ecsm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(ecsm_chip, config)
 
+== Assumptions
+#render_chip_assumptions(ecsm_chip, config)
+
 == Constraints
 
 === Interactions
@@ -97,7 +100,7 @@ This chip is triggered by an `ECALL` with the opcode indicating this chip:
 
 === Read `xG`
 Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently load $x_G$ in (@ec:c:read_xG).
-Note here that @ec:c:verify_addr_xG_alignment enforces the requirement that $#`addr_xG[0]` in [0, 2^16 - 24)$; this is to ensure no overflows happen when incrementing the address in @ec:c:read_xG.
+Assumption @ec:a:addr_xG_alignment ensures no overflows happen when incrementing the address in @ec:c:read_xG.
 Note: `xG` is assumed to be range checked, since they're read from memory.
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
 
@@ -106,29 +109,26 @@ With $x_G$ read and range checked, we direct our attention to $y_G$.
 Rather than reading it from memory, the prover provides it as a witness and proves it to be correct.
 In particular, the chip enforces the relations 
 $
-  x_G^2 - #`x2` - #`q0` dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - b + (p - #`q1`)p &= 0\
+  x_G^2 - #`x2` - q_0 dot p &= 0,\
+  y_G^2 - x_G dot #`x2` - b + (p - q_1)p &= 0\
 $
-where `q0` and `q1` are prover-provided witnesses.
+where non-negative $q_0$ and $q_1$ are prover-provided witnesses.
 Note that these are equivalent to
 $
   #`x2` &equiv x_G^2 mod p,\
   y_G^2 &equiv x_G dot #`x2` + b  mod p\
 $
 which combine to $y_G^2 equiv x_G^3 + b mod p$.
-Rewriting the two statements in terms of the `q`s, we get
+Rewriting the two relations, we get
 $
-  #`q0` &= (x_G^2 - #`x2`) dot p^(-1),\
-  #`q1` &= (y_G^2 - x_G dot #`x2`-b) dot p^(-1) + p.
+  q_0 &= (x_G^2 - #`x2`) dot p^(-1),\
+  q_1 &= (y_G^2 - x_G dot #`x2`-b) dot p^(-1) + p.
 $
-Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that
-$
-  (x_G^2 - #`x2`) dot p^(-1) &in [0, p-2),\
-  (y_G^2 - x_G dot #`x2`-b) dot p^(-1) + p &in [0, 2p-2).
-$
-Hence, we must restrict the choice of quotients to $#`q0` in [0, 2^256)$ and $#`q1` in [0, 2^257)$.
+Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_0 in [0, p)$ and $q_0 in [0, 2p)$.
+We therefore restrict the choice of quotients to $q_0 in [0, 2^256)$ and $q_1 in [0, 2^257)$.
+
 Below, we enforce the first of the two sub-relations.
-We emphasize here that @ec:c:c0_63_is_zero is required to ensure the sum evaluates to $0$, rather than $0 mod 2^256$.
+We emphasize here that @ec:c:c0_63_is_zero is required to ensure the sum evaluates to $0$, rather than just $0 mod 2^256$.
 The constraints @ec:c:c0_0 and @ec:c:c0_i, as well as the magic number $8160$ in @ec:c:range_c0 are discussed in @ecsm-limb_carry.
 #render_constraint_table(ecsm_chip, config, groups: "xG2")
 
@@ -138,36 +138,38 @@ Next, we restrict the witness pair $(y_G, #`q1`)$:
 
 === Read and verify `k`
 After reading `addr_k` from `x12` (@ec:c:read_addr_k), we read `k` from this address (@ec:c:load_k).
-Similar to `addr_xG`, we assume that $#`addr_k[0]` in [0, 2^16 - 24)$ (@ec:c:verify_addr_k_alignment).
+Similar to `addr_xG`, assumption @ec:a:addr_k_alignment ensures the address offsets in @ec:c:load_k do not overflow the lower limb.
 To prevent the point at infinity from showing up during the scalar multiplication, we require that $#`k` < #`N`$.
 This is achieved by requiring that the addition $#`N` + (#`k` - #`N`)$ overflows $mod 2^256$ (@ec:c:k_lt_N).
-Additionally, @ec:c:k_gt_0 ensures that $#`k` > 0$, preventing one case where $#`k` times #`G` = #inf$.
+Additionally, @ec:c:k_gt_0 ensures that $#`k` > 0$, preventing a case where $#`k` times #`G` = #inf$.
 #render_constraint_table(ecsm_chip, config, groups: "verify_k")
 
 === Subroutine
-With point $G$ and scalar $k$ fully constructed, we delegate bit-by-bit serving of the scalar `k` to the `EC-SCALAR` chip.
-Here, we capture the index of the most significant 1-bit of `k` in `len_k`; if the index of a different bit is captured, the logup will not balance, as the skipped bits will not be consumed by the `ECDAS` chip.
-Next, we interact with the `ECDAS` chip, providing `G` both as the accumulator, and increment (@ec:c:start_double_add).
+With point $G$ and scalar $k$ fully constructed, we delegate bit-by-bit serving of the scalar `k` to the `EC_SCALAR` chip.
+Here, we capture the index of the most significant 1-bit of `k` in `len_k`.
+Note: if the prover decides to capture a lesser significant bit here, the LogUp will not balance, as the skipped bits will never taken off the bus.
+Next, we interact with the `ECDAS` chip, providing `G` both as the accumulator, and increment (@ec:c:start_double_add); we specifically instruct the chip to start with a _double_-operation.
 After completing its double-and-add sequence, the result is captured in `R` (@ec:c:receive_double_add).
 #render_constraint_table(ecsm_chip, config, groups: "delegate")
 
 === Range check `xR`
 Before storing $x_R$, it is verified that $x_R in [0, p)$.
-To this end, witness $#`xR_sub_P` := #`xR` - p mod 2^256$ is added to `p`; if the addition sums to `xR` and overflows $mod 2^256$, it must hold that $#`xR` < p$.
+To this end, witness $#`xR_sub_p` := #`xR` - p mod 2^256$ is added to `p`; if the addition sums to `xR` and overflows $mod 2^256$, it must hold that $#`xR` < p$.
 The addition is constrained by requiring that `c3` are bits (@ec:c:range_c3); an overflow occurs if and only if $#`c3[7]` = 1$ (@ec:c:xR_addition_overflows).
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
 === Write `xR`
 We read `addr_xR` from register `x10` (@ec:c:load_addrR), and subsequently write `xR` to this address (@ec:c:write_xR).
-Similar to `addr_xG` and `addr_k`, we require that $#`addr_xR[0]` in [0, 2^16 - 24)$ (@ec:c:verify_addrR_alignment).
+Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` to equal `addr_xG` and thus for $x_R$ to overwrite $x_G$ in memory.
+Similar to `addr_xG` and `addr_k`, it is assumed that the addition of the small offsets will not overflow the lower limb of `addr_xR` (@ec:a:addr_xR_alignment).
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
 = ECDAS chip <ecdas>
 #let ecdas_chip = load_chip("src/ecdas.toml", config)
 #let ecdas = raw(ecdas_chip.name)
 
-The #ecdas chip (Elliptic Curve Double/Add Sequence) is responsible for accelerating the addition of two curve points, or the doubling of a single curve point. 
+The #ecdas chip (_Elliptic Curve Double-and-Add Sequence_) is responsible for accelerating the addition of two curve points, or the doubling of a single curve point. 
 More specifically, given curve points $A$ (accumulator) and $G$ (generator), and selector bit `op`, it performs the mapping
 $
   (A, G) mapsto cases(
@@ -183,13 +185,13 @@ Recall that the addition of two curve points $A, B$ is treated differently based
   enum.item[$x_A eq x_B$ and $y_A eq -y_B$]
 )
 where _double_ may encounter the last two cases, while _add_ may encounter all three.
-Cases 2 and 3 may, for specific inputs, evaluate to evaluate to $#inf$:
+Cases 2 and 3 may, for specific inputs, evaluate to $#inf$:
 a point that has no native short-Weierstrass representation.
 Therefore, the #ecsm and #ecdas chips were designed to avoid this case.
-To see how, note that the #ecsm chip
+To see how, note that #ecsm
 + is the sole chip that can "activate" the #ecdas chip by issuing an `ECDAS` lookup,
-+ it enforces that $G$ and the initial $A$ do not equal $#inf$, and
-+ it ensures $k in [1, N)$, where $N$ denotes the order of the curve.
++ enforces that $G$ and the initial $A$ do not equal $#inf$, and
++ ensures $k in [1, N)$, where $N$ denotes the order of the curve.
 This combined yields that neither doubling $A$ or adding $A + G$ can produce $#inf$:
 
 *Double.*
@@ -201,8 +203,9 @@ If $A + G = #inf$, then $A = -G = #inf - G = r N G - G$ for some $r >= 0$.
 Because #ecsm initializes $A = G eq.not #inf$, it must hold that $r >= 1$.
 Furthermore, the restriction that $k <= N-1$ ensures $r <= 1$.
 Hence, $A = (N-1)G$.
-Since $N-1$ is the maximal value of $k$, the previous round producing $A = (N-1)G$ was the last round of this scalar multiplication;
-this input is never encountered.
+Since $N-1$ is the maximal value of $k$, the previous round producing $A = (N-1)G$ was the last round of this scalar multiplication.
+This means that now `round` is negative, which will fail constraint @ecdas:c:range_round.
+
 
 == Columns
 #let nr_variables = total_nr_variables(ecdas_chip)
@@ -219,7 +222,7 @@ First, the chips receives the input for this double/add step:
 === Operation switching
 The `op`-flag determines whether $R := 2A$ (0) or $R:= A+G$ (1).
 This chip introduces a set of constraints that properly constrains $R$ depending on this flag.
-To illustrate how this is achieve, we split addition up in three relations:
+To illustrate how this is achieved, we split addition up in three relations:
 $
   lambda &equiv (y_G - y_A)/(x_G - x_A) &&mod p,\
   x_R &equiv lambda^2 - x_A - x_G &&mod p,\
@@ -283,7 +286,7 @@ $
   q_1 &= #`r` + p^(-1) dot ((lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A)).\
 $
 with $q_0 in (r-3p, r+2p)$ and $q_1 in (r, r+p)$.
-By selecting $r = 3p$, we ensure $q_0 in (0, 5p), q_1 in (3p, 4p)$ and $q_2 in (2p, 4p)$ are non-negative for all inputs.
+By setting $r := 3p$, we ensure $q_0 in (0, 5p), q_1 in (3p, 4p)$ and $q_2 in (2p, 4p)$ are non-negative for all inputs.
 
 === Constraining $lambda$
 We start by establishing the relation
@@ -302,7 +305,7 @@ $
 #render_constraint_table(ecdas_chip, config, groups: "xR")
 
 === Constraining $y_R$
-Lastly,
+Third,
 $
   lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0
 $

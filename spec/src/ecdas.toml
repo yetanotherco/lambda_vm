@@ -217,6 +217,12 @@ tag = "ECDAS"
 input = ["timestamp", "xA", "yA", "xG", "yG", "round", "op"]
 multiplicity = ["-", "μ"]
 
+[[constraints.receive]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["round"]
+cond = "μ"
+ref = "ecdas:c:range_round"
 
 [[constraint_groups]]
 name = "lambda"
@@ -304,8 +310,8 @@ ref = "ecdas:c:c0_63_is_zero"
 [[constraints.lambda]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], 24477]]
-iter = ["i", 0, 63]
+input = [["+", ["idx", "c0", "i"], 32641]]
+iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ecda:c:range_c0"
 
@@ -371,7 +377,7 @@ poly = ["idx", "c1", 63]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["+", ["idx", "c1", "i"], 8161]]
-iter = ["i", 0, 63]
+iter = ["i", 0, 62]
 multiplicity = "μ"
 
 
@@ -439,7 +445,7 @@ poly = ["idx", "c2", 63]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["+", ["idx", "c2", "i"], 8160]]
-iter = ["i", 0, 63]
+iter = ["i", 0, 62]
 multiplicity = "μ"
 
 
