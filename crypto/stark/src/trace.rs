@@ -208,12 +208,12 @@ where
     /// already stored row-major, so this is zero-copy — it feeds the batched
     /// row-major LDE without the col→row transpose `extract_columns_main` pays.
     pub fn main_data_row_major(&self) -> (&[FieldElement<F>], usize) {
-        (&self.main_table.data, self.main_table.width)
+        (self.main_table.row_major_data(), self.main_table.width)
     }
 
     /// Row-major aux-trace buffer + its width (empty / width 0 when no aux).
     pub fn aux_data_row_major(&self) -> (&[FieldElement<E>], usize) {
-        (&self.aux_table.data, self.aux_table.width)
+        (self.aux_table.row_major_data(), self.aux_table.width)
     }
 }
 /// Row-major LDE trace table.
