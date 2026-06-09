@@ -697,9 +697,10 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
 }
 
 /// The two 256-bit addition-overflow checks (`k < N` and `xR < p`), whose 8 word-carries
-/// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`:
-/// for `k < N` it is `N + k_sub_N = k` (carry out must be 1); for `xR < p` it is
-/// `p + xR_sub_p = xR`.
+/// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition
+/// must overflow `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
+/// `k < N` is `N + k_sub_N = k + 2^256` (with `k_sub_N = k − N mod 2^256`); `xR < p` is
+/// `p + xR_sub_p = xR + 2^256` (with `xR_sub_p = xR − p mod 2^256`).
 #[derive(Clone, Copy)]
 enum OverflowKind {
     KLtN,

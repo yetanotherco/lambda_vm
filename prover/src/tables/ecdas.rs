@@ -454,8 +454,10 @@ pub fn create_constraints(
     > = Vec::new();
     let mut idx = constraint_idx_start;
 
-    // IS_BIT(mu), IS_BIT(next_op).
-    for col in [cols::MU, cols::NEXT_OP] {
+    // IS_BIT(mu), IS_BIT(op), IS_BIT(next_op). `op` is also boolean transitively (it arrives
+    // on the Ecdas bus from a constant-0 seed or a prior IS_BIT'd next_op); the direct check
+    // makes the constraint layer self-contained (the λ relation blends op·add + (1−op)·double).
+    for col in [cols::MU, cols::OP, cols::NEXT_OP] {
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }
@@ -586,6 +588,11 @@ mod tests {
                     FE::zero()
                 );
                 assert_eq!(
+                    IsBitConstraint::unconditional(cols::OP, 0).evaluate(&view),
+                    FE::zero(),
+                    "is_bit(op) k={k} row {row}"
+                );
+                assert_eq!(
                     MulZero {
                         a: cols::OP,
                         b: cols::NEXT_OP,
@@ -634,7 +641,7 @@ mod tests {
     #[test]
     fn create_constraints_count() {
         let (constraints, next) = create_constraints(0);
-        assert_eq!(constraints.len(), 199);
-        assert_eq!(next, 199);
+        assert_eq!(constraints.len(), 200);
+        assert_eq!(next, 200);
     }
 }
