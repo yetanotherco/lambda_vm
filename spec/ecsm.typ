@@ -124,7 +124,7 @@ $
   q_0 &= (x_G^2 - #`x2`) dot p^(-1),\
   q_1 &= (y_G^2 - x_G dot #`x2`-b) dot p^(-1) + p.
 $
-Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_0 in [0, p)$ and $q_0 in [0, 2p)$.
+Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_0 in [0, p)$ and $q_1 in [0, 2p)$.
 We therefore restrict the choice of quotients to $q_0 in [0, 2^256)$ and $q_1 in [0, 2^257)$.
 
 Below, we enforce the first of the two sub-relations.
