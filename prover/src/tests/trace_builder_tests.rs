@@ -859,6 +859,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
         &max_rows,
         &[],
         true,
+        false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -959,6 +960,7 @@ fn test_build_traces_for_all_epochs() {
             &max_rows,
             &[],
             i == last,
+            false,
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )
@@ -1012,6 +1014,7 @@ fn test_terminating_epoch_rejected_when_not_final() {
         &epochs[last].logs,
         &MaxRowsConfig::default(),
         &[],
+        false,
         false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,

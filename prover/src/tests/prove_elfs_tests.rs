@@ -2732,6 +2732,7 @@ fn test_prove_first_epoch_without_halt() {
         &MaxRowsConfig::default(),
         &[],
         false,
+        false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -2815,6 +2816,7 @@ fn test_prove_second_epoch_from_snapshot() {
         &epochs[1].logs,
         &MaxRowsConfig::default(),
         &[],
+        false,
         false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
@@ -2900,6 +2902,7 @@ fn test_epoch_proof_commits_l2g() {
         &epochs[0].logs,
         &MaxRowsConfig::default(),
         &[],
+        false,
         false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
@@ -3058,6 +3061,7 @@ fn test_continuation_pipeline_end_to_end() {
             &MaxRowsConfig::default(),
             &[],
             is_final,
+            false,
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )
@@ -3139,5 +3143,110 @@ fn test_continuation_pipeline_end_to_end() {
     assert!(
         crate::verify_l2g_commitment_binding(&epoch_roots, &final_proof),
         "final proof must be bound to the real per-epoch L2G roots"
+    );
+}
+
+/// A continuation epoch built with `l2g_memory_bookend = true` proves and verifies:
+/// PAGE no longer bookends the touched RAM bytes (they self-cancel), and the
+/// local-to-global table provides their `Memory`-bus init/fini instead. The epoch
+/// `Memory` bus still nets to zero — L2G has replaced PAGE as the bookend.
+#[test]
+fn test_epoch_memory_bus_with_l2g_bookend() {
+    use crate::compute_expected_commit_bus_balance;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&elf, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // Epoch 0 starts from the program image; build it with the L2G memory bookend.
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        None,
+    );
+
+    // L2G air on the epoch-local Memory bus (the bookend that replaces PAGE).
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
+        AirWithBuses::new(
+            local_to_global::cols::NUM_COLUMNS,
+            AuxiliaryTraceBuildData {
+                interactions: local_to_global::memory_bus_interactions(),
+            },
+            &proof_options,
+            1,
+            transition_constraints,
+        );
+
+    // Take the L2G trace out of `traces` so `air_trace_pairs` can borrow the rest.
+    let mut l2g_trace = std::mem::replace(
+        &mut traces.local_to_global,
+        local_to_global::generate_local_to_global_trace(&[]),
+    );
+
+    let mut pairs = airs.air_trace_pairs(&mut traces);
+    pairs.push((&l2g_air, &mut l2g_trace, &()));
+    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("epoch with L2G memory bookend failed to prove");
+
+    let mut refs = airs.air_refs();
+    refs.push(&l2g_air);
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance(
+        &refs,
+        &multi_proof,
+        &traces.public_output_bytes,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify(
+            &refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
 }

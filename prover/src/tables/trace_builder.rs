@@ -48,6 +48,7 @@ use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
+use super::local_to_global;
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
@@ -1554,6 +1555,7 @@ fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
 fn collect_bitwise_from_page(
     image: &HashMap<u64, u8>,
     memory_state: &MemoryState,
+    exclude_touched: bool,
 ) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
@@ -1568,10 +1570,14 @@ fn collect_bitwise_from_page(
         page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
-    // Build final state map from memory_state
+    // Build final state map from memory_state, matching `generate_page_tables`:
+    // when `exclude_touched`, touched cells (timestamp > 0) are dropped so PAGE
+    // emits `fini == init` for them, and the ARE_BYTES multiplicities here must
+    // agree (otherwise the AreBytes bus would not balance).
     let final_state: FinalStateMap = memory_state
         .cells
         .iter()
+        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
         .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
@@ -1960,6 +1966,7 @@ fn generate_page_tables(
     image: &HashMap<u64, u8>,
     memory_state: &MemoryState,
     private_input: &[u8],
+    exclude_touched: bool,
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1977,10 +1984,14 @@ fn generate_page_tables(
         page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
-    // Build final state map from memory_state
+    // Build final state map from memory_state. When `exclude_touched` (continuation
+    // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
+    // cancels them (init == fini, ts == 0) and the local-to-global table owns their
+    // Memory-bus init/fini instead.
     let final_state: FinalStateMap = memory_state
         .cells
         .iter()
+        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
         .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
@@ -2085,6 +2096,10 @@ pub struct Traces {
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// Local-to-global boundary table for continuation epochs. Empty unless the
+    /// epoch is built with `l2g_memory_bookend` (then it bookends the Memory bus
+    /// for touched RAM bytes; see [`local_to_global`]).
+    pub local_to_global: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -2264,6 +2279,7 @@ fn build_traces(
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
     is_final: bool,
+    l2g_memory_bookend: bool,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -2300,7 +2316,11 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
     // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
     if let Some(image) = initial_image {
-        bitwise_ops.extend(collect_bitwise_from_page(image, memory_state));
+        bitwise_ops.extend(collect_bitwise_from_page(
+            image,
+            memory_state,
+            l2g_memory_bookend,
+        ));
     }
 
     let public_output_bytes: Vec<u8> = commit_ops
@@ -2452,7 +2472,12 @@ fn build_traces(
             || {
                 rayon::join(
                     || match initial_image {
-                        Some(image) => generate_page_tables(image, memory_state, private_input),
+                        Some(image) => generate_page_tables(
+                            image,
+                            memory_state,
+                            private_input,
+                            l2g_memory_bookend,
+                        ),
                         None => (Vec::new(), Vec::new()),
                     },
                     || register::generate_register_trace(&register_final_state, register_init),
@@ -2470,7 +2495,8 @@ fn build_traces(
     {
         match initial_image {
             Some(image) => {
-                let (p, c) = generate_page_tables(image, memory_state, private_input);
+                let (p, c) =
+                    generate_page_tables(image, memory_state, private_input, l2g_memory_bookend);
                 pages = p;
                 page_configs = c;
             }
@@ -2514,6 +2540,27 @@ fn build_traces(
         }
     }
 
+    // Local-to-global boundary table. Built only for continuation epochs that use
+    // L2G as the Memory-bus bookend; it claims each touched RAM byte's epoch-start
+    // value (init, at ts 0) and epoch-end value/timestamp (fini), derived from the
+    // SAME `memory_state.cells` (timestamp > 0) that PAGE just excluded.
+    let local_to_global = match (l2g_memory_bookend, initial_image) {
+        (true, Some(image)) => {
+            let mut touched: Vec<(u64, u64, u64)> = memory_state
+                .cells
+                .iter()
+                .filter(|(_, cell)| cell.1 > 0)
+                .map(|(&addr, &(value, ts))| (addr, value as u64, ts))
+                .collect();
+            touched.sort_by_key(|&(addr, _, _)| addr);
+            let initial_memory: HashMap<u64, u64> =
+                image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+            let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
+            local_to_global::generate_local_to_global_trace(&boundaries[0])
+        }
+        _ => local_to_global::generate_local_to_global_trace(&[]),
+    };
+
     Ok(Traces {
         cpus,
         bitwise,
@@ -2536,6 +2583,7 @@ fn build_traces(
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
         memw_registers,
+        local_to_global,
     })
 }
 
@@ -2819,6 +2867,7 @@ impl Traces {
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
+            local_to_global: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -2921,6 +2970,7 @@ impl Traces {
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
+            local_to_global: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -3120,6 +3170,7 @@ impl Traces {
             max_rows,
             private_input,
             true,
+            false,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3146,6 +3197,7 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
         is_final: bool,
+        l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // A non-final epoch must not contain the program-terminating instruction
@@ -3199,6 +3251,7 @@ impl Traces {
             storage_mode,
             private_input,
             is_final,
+            l2g_memory_bookend,
         )
     }
 
@@ -3254,6 +3307,7 @@ impl Traces {
             StorageMode::Ram,
             &[],
             true,
+            false,
         )
     }
 
