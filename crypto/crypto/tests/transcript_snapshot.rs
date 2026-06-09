@@ -11,40 +11,26 @@ use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
 type E = Degree3GoldilocksExtensionField;
 
-/// Clone must be a true snapshot: restoring `*t = snap.clone()` after
-/// arbitrary mutations must put the transcript in a state byte-identical
-/// to a fresh clone of the snapshot.
+/// Clone must be a true snapshot: it must be unaffected by subsequent
+/// mutations of the source transcript, and restoring `*t = snap.clone()`
+/// must put the transcript in a state byte-identical to the moment the
+/// snapshot was taken.
 #[test]
 fn clone_then_restore_is_byte_identical_snapshot() {
     let mut t = DefaultTranscript::<E>::new(b"seed");
+    let _ = t.sample_field_element();
+    t.append_bytes(b"prelude");
+
+    let entry = t.state();
+    // Snapshot from a non-trivial state.
     let snap = t.clone();
 
-    // Arbitrary mutation: sample + append.
-    let _ = t.sample_field_element();
-    t.append_bytes(b"some bytes");
+    // Mutate the source after the snapshot.
     let _ = t.sample_field_element();
     t.append_bytes(b"more bytes");
+    assert_eq!(snap.state(), entry, "snapshot disturbed by source mutation");
 
     // Restore from the snapshot.
     t = snap.clone();
-
-    // A fresh clone of the snapshot must produce the same outputs.
-    let mut reference = snap.clone();
-    assert_eq!(t.state(), reference.state(), "state diverged after restore");
-
-    let a1 = t.sample_field_element();
-    let b1 = reference.sample_field_element();
-    assert_eq!(a1, b1, "sample_field_element diverged after restore");
-
-    t.append_bytes(b"x");
-    reference.append_bytes(b"x");
-    assert_eq!(
-        t.state(),
-        reference.state(),
-        "state diverged after parallel append"
-    );
-
-    let a2 = t.sample_field_element();
-    let b2 = reference.sample_field_element();
-    assert_eq!(a2, b2, "second sample diverged after restore");
+    assert_eq!(t.state(), entry, "restore not byte-identical to entry");
 }

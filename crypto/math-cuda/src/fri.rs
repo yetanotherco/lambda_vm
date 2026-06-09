@@ -1,7 +1,7 @@
 //! Fully-device-resident FRI commit phase orchestration.
 //!
 //! The host loop (in the stark crate) samples each layer's `zeta` from the
-//! transcript and feeds it in; this module keeps the folded evaluations,
+//! transcript and feeds it in. This module keeps the folded evaluations,
 //! twiddles, and per-layer Merkle trees on device, only D2H'ing each
 //! layer's root (to append to the transcript), plus its full evals and
 //! tree nodes (to plug into `FriLayer` for the query phase).
@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::device::backend;
+use crate::merkle::build_inner_tree_levels;
 
 /// Test-only fault injection. When the `test-faults` feature is on, setting
 /// this to a finite value forces the next `fold_and_commit_layer` /
 /// `fold_final` call to return Err and decrement the counter. Tests use
-/// this to exercise the CPU-fallback path in `try_fri_commit_gpu`. Compiled
-/// out entirely in production builds.
+/// this to exercise the CPU-fallback path in `try_fri_commit_gpu`.
 #[cfg(feature = "test-faults")]
 pub static FAULT_FOLDS_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(-1);
@@ -45,14 +45,15 @@ fn check_fault_injection() -> Result<()> {
 /// buffer. Freed when dropped.
 pub struct FriCommitState {
     pub stream: Arc<CudaStream>,
-    // Ping-pong evaluation buffers. Both sized `3 * n0` u64 at init; each
+    // Ping-pong evaluation buffers. Both sized `3 * n0` u64 at init. Each
     // successive fold uses half the space. Cheap to pre-allocate vs. per-
     // layer alloc.
     evals_a: CudaSlice<u64>,
     evals_b: CudaSlice<u64>,
     /// Base-field inv_twiddles; `n0 / 2` u64 at init, halved each layer.
     inv_tw: CudaSlice<u64>,
-    /// Number of ext3 elements currently in the "input" buffer.
+    /// Number of ext3 elements in the buffer currently acting as fold input
+    /// (`evals_a` or `evals_b`, selected by `a_is_input`).
     pub current_n: usize,
     /// Which buffer holds the current layer's input. Toggles each fold.
     a_is_input: bool,
@@ -93,7 +94,7 @@ impl FriCommitState {
     ///   - the new layer's evals (3 * (current_n / 2) u64s)
     ///   - the new layer's Merkle tree nodes (standard layout, byte-packed)
     ///
-    /// Also updates `inv_twiddles` in place to shrink for the next layer.
+    /// Also advances the internal twiddle factors for the next layer.
     pub fn fold_and_commit_layer(
         &mut self,
         zeta_raw: [u64; 3],
@@ -143,7 +144,9 @@ impl FriCommitState {
                 .launch(cfg)?;
         }
 
-        // Keccak leaves + pair-hash tree into fresh device buffer.
+        // SAFETY: keccak_fri_leaves_ext3 writes the leaves [num_leaves-1, 2*num_leaves-1)
+        // and build_inner_tree_levels writes every inner node [0, num_leaves-1), so all
+        // tight_total_nodes * 32 bytes are initialised before the D2H below reads them.
         let mut nodes_dev = unsafe { self.stream.alloc::<u8>(tight_total_nodes * 32) }?;
         let leaves_offset_bytes = (num_leaves - 1) * 32;
         {
@@ -172,12 +175,7 @@ impl FriCommitState {
                     .launch(kcfg)?;
             }
         }
-        crate::merkle::build_inner_tree_levels(
-            self.stream.as_ref(),
-            be,
-            &mut nodes_dev,
-            num_leaves,
-        )?;
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into
