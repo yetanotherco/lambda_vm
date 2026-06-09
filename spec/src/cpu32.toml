@@ -377,7 +377,7 @@ name = "ext"
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`signed` => #`μ`$"
+constraint = "$#`signed` != 0 => #`μ` = 1$"
 poly = ["*", "signed", ["not", "μ"]]
 
 [[constraints.ext]]
