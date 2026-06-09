@@ -313,7 +313,7 @@ tag = "IS_HALF"
 input = [["+", ["idx", "c0", "i"], 32636]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
-ref = "ecda:c:range_c0"
+ref = "ecdas:c:range_c0"
 
 [[constraint_groups]]
 name = "xR"

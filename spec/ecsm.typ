@@ -20,7 +20,7 @@
 = Theory behind Elliptic Curves
 
 #let inf = math.cal("O")
-An elliptic curve $E(a, b, p)$ in _short Weierstrass_ form has parameters $a,b in FF_p$ for some prime $p$ with $a^3+27b^2 eq.not 0$, and coordinates $(x, y) in FF_p^2$ satisfying the equation 
+An elliptic curve $E(a, b, p)$ in _short Weierstrass_ form has parameters $a,b in FF_p$ for some prime $p$ with $4a^3+27b^2 eq.not 0$, and coordinates $(x, y) in FF_p^2$ satisfying the equation 
 $
   y^2=x^3+a x+b.
 $
