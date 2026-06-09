@@ -6,14 +6,14 @@ type = "DWordWL"
 desc = "timestamp at which to read the constant"
 
 [[variables.input]]
-name = "addr"
+name = "ptr"
 type = "DWordWL"
-desc = "address at which the current limb is stored"
+desc = "pointer to the first byte of the scalar"
 
 [[variables.input]]
-name = "len"
+name = "offset"
 type = "Byte"
-desc = "the number of bytes to read after this one"
+desc = "index of limb"
 
 [[variables.auxiliary]]
 name = "limb_bits"
@@ -26,89 +26,86 @@ type = "Bit"
 desc = "whether this is the last limb to read"
 
 [[variables.virtual]]
-name = "next_addr"
-type = "DWordWL"
-desc = "address storing the next byte limb of the scalar"
-def = {polys=[
-    {iter=["i", 0], poly=["-", ["idx", "addr", 0], 1]},
-    {iter=["i", 1], poly=["idx", "addr", 1]},
-]}
-
-[[variables.virtual]]
 name = "limb"
 type = "Byte"
 desc = "limb being read"
-def = {poly=["+",
-        ["*", ["^", 2, 0], ["idx", "limb_bits", 0]],
-        ["*", ["^", 2, 1], ["idx", "limb_bits", 1]],
-        ["*", ["^", 2, 2], ["idx", "limb_bits", 2]],
-        ["*", ["^", 2, 3], ["idx", "limb_bits", 3]],
-        ["*", ["^", 2, 4], ["idx", "limb_bits", 4]],
-        ["*", ["^", 2, 5], ["idx", "limb_bits", 5]],
-        ["*", ["^", 2, 6], ["idx", "limb_bits", 6]],
-        ["*", ["^", 2, 7], ["idx", "limb_bits", 7]],
-]}
+def = {poly=["sum", ["=", "i", 0], 7, ["*", ["^", 2, "i"], ["idx", "limb_bits", "i"]]]}
 
 [[variables.multiplicity]]
 name = "μ"
 type = "Bit"
 desc = ""
 
-
-
+[[assumptions]]
+desc = "$#`ptr` + #`offset`$ does not overflow the bottom limb"
 
 [[constraint_groups]]
-name = "all"
+name = "recv"
 
-[[constraints.all]]
+[[constraints.recv]]
+kind = "interaction"
+tag = "SERVE_K"
+input = ["timestamp", "ptr", "offset"]
+multiplicity = ["-", "μ"]
+
+[[constraints.recv]]
 kind = "template"
 tag = "IS_BIT"
 input = ["μ"]
 
-[[constraints.all]]
+[[constraint_groups]]
+name = "read"
+
+[[constraints.read]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["+", "ptr", ["cast", "offset", "DWordWL"]], ["arr", "limb", 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+output = ["arr", "limb", 0, 0, 0, 0, 0, 0, 0]
+multiplicity = "μ"
+
+[[constraints.read]]
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "limb_bits", "i"]]
 iter = ["i", 0, 7]
 
-[[constraints.all]]
+
+[[constraint_groups]]
+name = "serve"
+
+[[constraints.serve]]
+kind = "interaction"
+tag = "BIT"
+input = ["timestamp", ["+", ["*", 8, "offset"], "i"]]
+iter = ["i", 0, 7]
+multiplicity = ["idx", "limb_bits", "i"]
+
+[[constraints.serve]]
 kind = "arith"
 constraint = "$#`limb_bits`_i = 1 => #`μ` = 1$"
 poly = ["*", ["idx", "limb_bits", "i"], ["not", "μ"]]
 iter = ["i", 0, 7]
 
-[[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [0, "addr", ["arr", "limb", 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
-output = ["arr", "limb", 0, 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+[[constraint_groups]]
+name = "recurse"
 
-[[constraints.all]]
-kind = "interaction"
-tag = "BIT"
-input = ["timestamp", ["+", ["*", 8, "len"], "i"]]
-iter = ["i", 0, 7]
-multiplicity = ["idx", "limb_bits", "i"]
+[[constraints.recurse]]
+kind = "template"
+tag = "IS_BIT"
+input = ["last_limb"]
 
-[[constraints.all]]
+[[constraints.recurse]]
 kind = "arith"
 constraint = "$#`last_limb` = 1 => #`μ` = 1$"
 poly = ["*", "last_limb", ["not", "μ"]]
 
-[[constraints.all]]
+[[constraints.recurse]]
 kind = "arith"
-constraint = "$#`last_limb` = 1 => #`len` = 0$"
-poly = ["*", "last_limb", "len"]
+constraint = "$#`last_limb` = 1 => #`offset` = 0$"
+poly = ["*", "last_limb", "offset"]
 
-[[constraints.all]]
+[[constraints.recurse]]
 kind = "interaction"
 tag = "SERVE_K"
-input = ["timestamp", "addr", "len"]
-multiplicity = ["-", "μ"]
-
-[[constraints.all]]
-kind = "interaction"
-tag = "SERVE_K"
-input = ["timestamp", "next_addr", ["-", "len", 1]]
+input = ["timestamp", "next_addr", ["-", "offset", 1]]
 multiplicity = ["not", "last_limb"]

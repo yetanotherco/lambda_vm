@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, et
+#import "/book.typ": book-page, aside, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -216,43 +216,103 @@ The #ecdas chip is comprised of #nr_variables variables that are expressed using
 First, the chips receives the input for this double/add step:
 #render_constraint_table(ecdas_chip, config, groups: "receive")
 
-The `op`-flag determines whether $R := A + G$ (0) or $R:= 2A$ (1).
-As previously discussed, this flag influences the computations of $lambda$ and $x_R$.
-Rather than computing both potential values and selecting the correct one based on the `op` flag, we merge the relations that have to be checked and "weave" the `op`-flag in this way:
-In particular, we let the prover provide witnesses $lambda$, $x_R$ and $y_R$ and we will prove that
+=== Operation switching
+The `op`-flag determines whether $R := 2A$ (0) or $R:= A+G$ (1).
+This chip introduces a set of constraints that properly constrains $R$ depending on this flag.
+To illustrate how this is achieve, we split addition up in three relations:
 $
-#`op` dot (lambda (x_G - x_A) - (y_G - y_A)) + (1 - #`op`) dot (2 lambda y_A - 3x_A^2)  &equiv 0 mod p\
-lambda^2 - x_A - (1- #`op` ) dot x_A - #`op` dot x_G  - x_R &equiv 0 mod p\
-lambda (x_A - x_R) - y_A - y_R &equiv 0 mod p
+  lambda &equiv (y_G - y_A)/(x_G - x_A) &&mod p,\
+  x_R &equiv lambda^2 - x_A - x_G &&mod p,\
+  y_R &equiv lambda (x_A - x_R) - y_A &&mod p.\
 $
+Introducing the non-negative witnesses $q'_0, q'_1$ and $q_2$, we can convert these relations into
+$
+  (x_G - x_A)lambda - y_G + y_A + (#`r` - q'_0) p &= 0,\
+  lambda^2 - x_A - x_G - x_R + (#`r` - q'_1) p &= 0,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0,\
+$
+for some $r in NN$ to be fixed later.
 
-To start, we let the prover provide witness $#`q0` in [-2^255, 2^255)$ and have them prove that
-$
-  #`op` dot (lambda dot x_G - lambda dot x_A + y_A - y_G) + (1 - #`op`) dot (2 lambda dot y_A - 3x_A dot x_A) + #`q0` dot p = 0
-$
+#aside("The case of " + $x_A = x_G$ + ".")[
+  Special attention should be paid to the first relation: if $x_A = x_G$, $lambda$ can be chosen freely.
+  By design, this situation cannot occur.
 
+  Observe that this would require either $A = G$ or $A = -G$.
+  With the latter situation previously ruled out, only the first remains.
+  For $A = (r N + 1) G$ for some $r in NN$ and $N$ the order of the curve, all cases with $r>0$ can be ruled out since #ecsm verifies that the scalar $k < N$.
+  The remaining case $A=G$ is the intial state pushed onto the LogUp by #ecsm (@ec:c:start_double_add), with `op`-flag set to $0$ (_double_), not `add`.
+  Hence, this situation cannot occur.  
+]
+
+We rewrite the relations to find
+$
+  q'_0 &= #`r` + p^(-1) dot (lambda (x_G - x_A) - y_G + y_A),\
+  q'_1 &= #`r` + p^(-1) dot (lambda^2 - x_A - x_G - x_R),\
+  q_2  &= #`r` + p^(-1) dot (lambda (x_A - x_R) - y_A - y_R)\
+$
+from which we can conclude that $q'_0, q_2 in (#`r`-p, #`r`+p)$ and $q'_1 in (#`r`, #`r` + p)$.
+When doubling, only the formulae for $lambda$ and $x_R$ are different:
+$
+  lambda &equiv (3x_A^2)/(2y_A) &&mod p,\
+  x_R &equiv lambda^2 - 2x_A &&mod p.\
+$
+Introducing non-negative witnesses $q''_0$ and $q''_1$, we convert these into
+$
+  2lambda y_A - 3x_A^2 + (#`r` - q''_0) p &= 0,\
+  lambda^2 - 2x_A - x_G - x_R + (#`r` - q''_1) p &= 0.\
+$
+#aside("The case of " + $y_A = 0$ + ".")[
+  Special attention should be paid to the first relation: if $y_A = 0$, $lambda$ can again be chosen freely.
+  As previously established, $y_A != 0$ for all points on the `secp256k1` curve.
+  Hence, this situation will not occur.
+]
+Reordering yields
+$
+  q''_0 &= #`r` + p^(-1) dot (2lambda y_A - 3x_A^2 ),\
+  q''_1 &= #`r` + p^(-1) dot (lambda^2 - 2x_A - x_G - x_R ).\
+$
+where $q''_0 in (#`r`-3p, #`r` + 2p)$, and $q''_1 = (#`r`, #`r` + p)$.
+We can now leverage the `op`-flag to merge the relations for $lambda$ and $x_R$ into
+$
+  #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0,\
+  lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0\
+$
+which yields
+$
+  q_0 &= #`r` + p^(-1) dot (#`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2)),\
+  q_1 &= #`r` + p^(-1) dot ((lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A)).\
+$
+with $q_0 in (r-3p, r+2p)$ and $q_1 in (r, r+p)$.
+By selecting $r = 3p$, we ensure $q_0 in (0, 5p), q_1 in (3p, 4p)$ and $q_2 in (2p, 4p)$ are non-negative for all inputs.
+
+=== Constraining $lambda$
+We start by establishing the relation
+$
+  #`op` dot (lambda (x_G - x_A) - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0.\
+$
 #render_constraint_table(ecdas_chip, config, groups: "lambda")
 
-With $lambda$ constrained, we continue with $x_R$.
-Here, we let the prover provide witness $#`q1` in [-2^255, 2^255)$ and have them prove that
+
+=== Constraining $x_R$
+Secondly, we establish
 $
-  lambda^2 - x_R - x_A - x_G - #`op` dot (x_A - x_G) - #`q1` dot p = 0
+  lambda^2 - x_A - x_G - x_R - (1-#`op`) (x_A - x_G) + (#`r` - q_1) p &= 0
 $
 
 #render_constraint_table(ecdas_chip, config, groups: "xR")
 
-Next, we constrain $y_R$.
-Rewriting the earlier equality, we find that 
+=== Constraining $y_R$
+Lastly,
 $
-  lambda dot x_A - lambda dot x_R - y_A - y_R + #`q2` dot p = 0
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0
 $
-for some prover-provided witness $#`q2` in [-2^255, 2^255)$.
+is constrained:
 
 #render_constraint_table(ecdas_chip, config, groups: "yR")
 
 Lastly, the updated accumulator is sent out for the next step to be processed (@ecdas:c:send).
 To determine whether the next step should be an addition or doubling, the `next_op` bit is provided as witness by the prover.
-Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu) and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
+Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu), when the current $#`op` = 0$ (double), and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
 #render_constraint_table(ecdas_chip, config, groups: "send")
 
 
@@ -265,16 +325,42 @@ Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_
 #let nr_columns = total_nr_instantiated_columns(ecscalar_chip, config)
 #let nr_interactions = compute_nr_interactions(ecscalar_chip)
 
-The #ecdas chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #ecscalar chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(ecscalar_chip, config)
 
-== Constraints
+== Assumptions
+This chip makes an assumption:
+#render_chip_assumptions(ecscalar_chip, config)
 
-#render_constraint_table(ecscalar_chip, config)
+== Constraints
+The chip starts by extracting the input information from the bus when its multiplicity is set.
+#render_constraint_table(ecscalar_chip, config, groups: "recv")
+
+Next, it reads `limb` from address $#`ptr` + #`offset`$.
+Since `limb` is reconstructed from `limb_bits`, it is ensured those are in fact bits.
+#render_constraint_table(ecscalar_chip, config, groups: "read")
+
+For each `limb_bit` that is set, an `BIT`-interaction is sent on the bus, to inform the double-and-add sequence on the #ecdas chip. 
+To prevent interactions from occurring in padding rows, an active limb bit requires a non-zero multiplicity.
+#render_constraint_table(ecscalar_chip, config, groups: "serve")
+
+Unless this was the `last_limb` (i.e., $#`offset` = 0$), we recurse on serving the previous limb.
+
+#render_constraint_table(ecscalar_chip, config, groups: "recurse")
+`last_limb` is a witness provided by the prover, which, technically, could be kept at $0$ when $#`offset` = 0$.
+However, that would require an additional $2^64$ table entries to balance out the LogUp bus.
+Since this is assumed infeasible, the prover is constrained to set `last_limb` appropriately.
 
 = Notes / optimizations
-- To merge the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the curve-constants $a$, $b$, $p$ and $N$, and include them for each scalar multiplication when they're selected.
-The selection procedure could be done through the `ECALL` number; the #ecsm chip would accept multiple numbers, setting an internal "curve-selector" field accordingly.
+- To utilize the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the
+  curve-constants $a$, $b$, $p$, $r$ and $N$, and look them up when a scalar multiplication selects them.
+  The selection procedure could be done through the `ECALL` number; the #ecsm chip would accept multiple numbers, setting an internal "curve-selector" field accordingly.
+- Transitioning from `U256BL`s to `U256HL`s would roughly halve the number of columns in both the #ecsm and #ecdas chips.
+  This would likely require increasing the sizes of the carries from 16 to 24 bits.
+  Since the carries need to be range checked, one would have to investigate whether
+    - it would be possible to perform a 24-bit range-check lookup,
+    - one could set up a 24-bit range-check table. This could be as narrow as two columns.
+    - have some hybrid version, where there is a native lookup table for x-bits, and a dynamic table for outliers (high carries are not encountered frequently).
 
 = Discussing the carries <ecsm-limb_carry>
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:

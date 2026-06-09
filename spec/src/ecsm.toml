@@ -278,7 +278,7 @@ ref = "ec:c:range_q0"
 [[constraints.xG2]]
 kind = "arith"
 constraint = "$2^8 dot #`c0`_0 = #`XG`_0 dot #`XG`_0 - #`X2`_0 - #`Q0`_0 dot #`P`_0$"
-poly = ["-", ["*", ["idx", "XG", 0], ["idx", "XG", 0]], ["idx", "X2", "0"], ["*", ["idx", "Q0", 0], ["idx", "P", 0]], ["*", ["^", 2, 8], ["idx", "c0", 0]]]
+poly = ["-", ["*", ["idx", "XG", 0], ["idx", "XG", 0]], ["idx", "X2", 0], ["*", ["idx", "Q0", 0], ["idx", "P", 0]], ["*", ["^", 2, 8], ["idx", "c0", 0]]]
 ref = "ec:c:c0_0"
 
 [[constraints.xG2]]
@@ -416,7 +416,7 @@ ref = "ec:c:range_addr_k"
 [[constraints.verify_k]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "addr_k", 0], 24]]
+input = [["+", ["idx", "addr_k", 0], 32]]
 multiplicity = "μ"
 ref = "ec:c:verify_addr_k_alignment"
 
@@ -620,7 +620,11 @@ name = "delegate"
 [[constraints.delegate]]
 kind = "interaction"
 tag = "SERVE_K"
-input = ["timestamp", ["cast", "addr_k", "DWordWL"], 32]
+input = [
+    ["+", "timestamp", ["cast", 1, "DWordWL"]],
+    ["cast", "addr_k", "DWordWL"],
+    31
+]
 multiplicity = "μ"
 
 [[constraints.delegate]]
@@ -632,7 +636,7 @@ multiplicity = ["-", "μ"]
 [[constraints.delegate]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xG", "yG", "xG", "yG", "len_k", 0]
+input = ["timestamp", "xG", "yG", "xG", "yG", ["-", "len_k", 1], 0]
 multiplicity = "μ"
 ref = "ec:c:start_double_add"
 

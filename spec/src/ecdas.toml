@@ -52,13 +52,8 @@ desc = "`λ`"
 
 [[variables.auxiliary]]
 name = "q0"
-type = "U256BL"
+type = ["Byte", 33]
 desc = "quotient used to constrain `λ`"
-
-[[variables.auxiliary]]
-name = "msb_q0"
-type = "Bit"
-desc = "Most significant bit of `q0`"
 
 [[variables.auxiliary]]
 name = "c0"
@@ -67,13 +62,8 @@ desc = "carries used to constrain `λ`"
 
 [[variables.auxiliary]]
 name = "q1"
-type = "U256BL"
+type = ["Byte", 33]
 desc = "quotient used to constrain `xR`"
-
-[[variables.auxiliary]]
-name = "msb_q1"
-type = "Bit"
-desc = "Most significant bit of `q1`"
 
 [[variables.auxiliary]]
 name = "c1"
@@ -82,13 +72,8 @@ desc = "carries used to constrain `xR`"
 
 [[variables.auxiliary]]
 name = "q2"
-type = "U256BL"
+type = ["Byte", 33]
 desc = "quotient used to constrain `yR`"
-
-[[variables.auxiliary]]
-name = "msb_q2"
-type = "Bit"
-desc = "Most significant bit of `q2`"
 
 [[variables.auxiliary]]
 name = "c2"
@@ -166,43 +151,57 @@ def = {polys=[
 [[variables.virtual]]
 name = "Q0"
 type = "U512BL"
-desc = "sign-extension of `q0`"
+desc = "zero-extension of `q0`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "q0", "i"]},
-    {iter=["i", 32, 63], poly=["*", 255, "msb_q0"]},
+    {iter=["i", 0, 32], poly=["idx", "q0", "i"]},
+    {iter=["i", 33, 63], poly=0},
 ]}
 
 [[variables.virtual]]
 name = "Q1"
 type = "U512BL"
-desc = "sign-extension of `q1`"
+desc = "zero-extension of `q1`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "q1", "i"]},
-    {iter=["i", 32, 63], poly=["*", 255, "msb_q1"]},
+    {iter=["i", 0, 32], poly=["idx", "q1", "i"]},
+    {iter=["i", 33, 63], poly=0},
 ]}
 
 [[variables.virtual]]
 name = "Q2"
 type = "U512BL"
-desc = "sign-extension of `q2`"
+desc = "zero-extension of `q2`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "q2", "i"]},
-    {iter=["i", 32, 63], poly=["*", 255, "msb_q2"]},
+    {iter=["i", 0, 32], poly=["idx", "q2", "i"]},
+    {iter=["i", 33, 63], poly=0},
 ]}
 
 [[variables.virtual]]
 name = "P"
 type = "U512BL"
-desc = "zero-extension of `P`"
+desc = "zero-extension of `p`"
 def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "p", "i"]},
     {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "R"
+type = "U512BL"
+desc = "zero-extension of `r`"
+def = {polys=[
+    {iter=["i", 0, 32], poly=["idx", "r", "i"]},
+    {iter=["i", 33, 63], poly=0},
 ]}
 
 [[variables.constant]]
 name = "p"
 type = "U256BL"
 desc = "Prime field modulus"
+
+[[variables.constant]]
+name = "r"
+type = ["Byte", 33]
+desc = "Offset value; equals $3 #`p`$"
 
 [[variables.multiplicity]]
 name = "μ"
@@ -228,27 +227,25 @@ tag = "IS_BYTE"
 input = [["idx", "λ", "i"]]
 iter = ["i", 0, 31]
 cond = "μ"
+ref = "ecdas:c:range_lambda"
 
 [[constraints.lambda]]
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q0", "i"]]
-iter = ["i", 0, 31]
+iter = ["i", 0, 32]
 cond = "μ"
-
-[[constraints.lambda]]
-kind = "interaction"
-tag = "MSB8"
-input = [["idx", "q0", 31]]
-output = "msb_q0"
-multiplicity = "μ"
-ref = "ecda:c:msb_q0"
+ref = "ecdas:c:range_q0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - dot #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0) + #`Q0`_0 dot #`P`_0 = 0$"
-poly = ["-", 
-    ["*", ["^", 2, 8], ["idx", "c0", 0]],
+constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0) + #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
+poly = ["-",
+    ["+", 
+        ["*", ["^", 2, 8], ["idx", "c0", 0]],
+        ["*", ["idx", "Q0", 0], ["idx", "P", 0]]
+    ],
+    ["*", ["idx", "R", 0], ["idx", "P", 0]],
     ["*", "op", 
         ["-", 
             ["+", 
@@ -263,13 +260,13 @@ poly = ["-",
             ["*", 2, ["idx", "Λ", 0], ["idx", "YA", 0]],
             ["*", 3, ["idx", "XA", 0], ["idx", "XA", 0]]
         ]    
-    ],
-    ["*", ["idx", "Q0", 0], ["idx", "P", 0]],
+    ]
 ]
+ref = "ecdas:c:c0_0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YG`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`Q0`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
 poly = ["-", 
     ["*", ["^", 2, 8], ["idx", "c0", 0]],
     ["idx", "c0", ["-", "i", 1]],
@@ -289,15 +286,20 @@ poly = ["-",
                 ["*", 3, ["idx", "XA", "j"], ["idx", "XA", ["-", "i", "j"]]]
             ]
         ],
-        ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]
+        ["-", 
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]
+        ]        
     ]]
 ]
 iter = ["i", 1, 63]
+ref = "ecdas:c:c0_i"
 
 [[constraints.lambda]]
 kind = "arith"
 constraint = "$#`c0`_63 = 0$"
 poly = ["idx", "c0", 63]
+ref = "ecdas:c:c0_63_is_zero"
 
 [[constraints.lambda]]
 kind = "interaction"
@@ -321,51 +323,46 @@ cond = "μ"
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q1", "i"]]
-iter = ["i", 0, 31]
+iter = ["i", 0, 32]
 cond = "μ"
 
 [[constraints.xR]]
-kind = "interaction"
-tag = "MSB8"
-input = [["idx", "q1", 31]]
-output = "msb_q1"
-multiplicity = "μ"
-ref = "ecda:c:msb_q1"
-
-[[constraints.xR]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_0 = #`Λ`_0 dot #`Λ`_0 - #`XR`_0 - #`XA`_0 - #`XG`_0 - #`op` dot (#`XA`_0 + #`XG`_0) - #`Q1`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c1`_0 = #`Λ`_0 dot #`Λ`_0 - #`XA`_0 - #`XG`_0 - #`XR`_0 - (1-#`op`) (#`XA`_0 - #`XG`_0) + #`R`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
 poly = ["-",
-    ["*", ["idx", "Λ", 0], ["idx", "Λ", 0]],
-    ["idx", "XR", 0],
+    ["+",
+        ["*", ["idx", "Λ", 0], ["idx", "Λ", 0]],
+        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ],    
+    ["*", ["idx", "Q1", 0], ["idx", "P", 0]],
     ["idx", "XA", 0],
     ["idx", "XG", 0],
-    ["*", "op", ["-", ["idx", "XA", 0], ["idx", "XG", 0]]],
-    ["*", ["idx", "Q1", 0], ["idx", "P", 0]],
+    ["idx", "XR", 0],
+    ["*", ["not", "op"], ["-", ["idx", "XA", 0], ["idx", "XG", 0]]],
     ["*", ["^", 2, 8], ["idx", "c1", 0]],
 ]
 
-
 [[constraints.xR]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`XR`_i - #`XA`_i - #`XG`_i - #`op` dot (#`XA`_i + #`XG`_i) + sum_(j=0)^i #`Λ`_j dot #`Λ`_(i-j) - #`Q1`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`XA`_i - #`XG`_i - #`XR`_i - (1- #`op`) (#`XA`_i - #`XG`_i) + sum_(j=0)^i #`Λ`_j dot #`Λ`_(i-j) + #`R`_j dot #`P`_(i-j) - #`Q1`_j dot #`P`_(i-j)$"
 poly = ["-",
     ["idx", "c1", ["-", "i", 1]],
-    ["idx", "XR", "i"],
+    ["*", ["^", 2, 8], ["idx", "c1", "i"]],
     ["idx", "XA", "i"],
     ["idx", "XG", "i"],
-    ["*", "op", ["-", ["idx", "XA", "i"], ["idx", "XG", "i"]]],
+    ["idx", "XR", "i"],
+    ["*", ["not", "op"], ["-", ["idx", "XA", "i"], ["idx", "XG", "i"]]],
     ["sum", ["=", "j", 0], "i",
         ["-", 
             ["*", ["idx", "Q1", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
             ["*", ["idx", "Λ", "j"], ["idx", "Λ", ["-", "i", "j"]]],
         ]
     ],    
-    ["*", ["^", 2, 8], ["idx", "c1", "i"]],
 ]
 iter = ["i", 1, 63]
 
-[[constraints.lambda]]
+[[constraints.xR]]
 kind = "arith"
 constraint = "$#`c1`_63 = 0$"
 poly = ["idx", "c1", 63]
@@ -392,46 +389,44 @@ cond = "μ"
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q2", "i"]]
-iter = ["i", 0, 31]
+iter = ["i", 0, 32]
 cond = "μ"
 
 [[constraints.yR]]
-kind = "interaction"
-tag = "MSB8"
-input = [["idx", "q2", 31]]
-output = "msb_q2"
-multiplicity = "μ"
-ref = "ecda:c:msb_q2"
-
-[[constraints.yR]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_0 = #`Λ`_0 dot #`XG`_0 - #`Λ`_0 dot #`XR`_0 - #`YG`_i - #`YR`_i - #`Q2`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c2`_0 = #`Λ`_0 dot (#`XA`_0 - #`XR`_0) - #`YA`_0 - #`YR`_0 + #`R`_0 dot #`P`_0 - #`Q2`_0 dot #`P`_0$"
 poly = ["-", 
-    ["*", ["idx", "Λ", 0], ["idx", "XG", 0]],
-    ["*", ["idx", "Λ", 0], ["idx", "XR", 0]],
-    ["idx", "YG", 0],
+    ["+",
+        ["*", ["idx", "Λ", 0], ["-", ["idx", "XA", 0], ["idx", "XR", 0]]],
+        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ],
+    ["*", ["idx", "Q2", 0], ["idx", "P", 0]],
+    ["idx", "YA", 0],
     ["idx", "YR", 0],
-    ["*", ["idx", "Q0", 0], ["idx", "P", 0]],
     ["*", ["^", 2, 8], ["idx", "c2", 0]]
 ]
 
 [[constraints.yR]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`YG`_i - #`YR`_i + sum_(j=0)^i #`Λ`_j dot #`XG`_(i-j) - #`Λ`_j dot #`XR`_(i-j) - #`Q2`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`YA`_i - #`YR`_i + sum_(j=0)^i #`Λ`_j dot (#`XA`_(i-j) - #`XR`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q2`_j dot #`P`_(i-j)$"
 poly = ["-",
     ["idx", "c2", ["-", "i", 1]],
-    ["idx", "YG", "i"],
+    ["*", ["^", 2, 8], ["idx", "c2", "i"]],
+    ["idx", "YA", "i"],
     ["idx", "YR", "i"],
     ["sum", ["=", "j", 0], "i",
         ["-", 
-            ["+", 
-                ["*", ["idx", "Λ", "i"], ["idx", "XR", ["-", "i", "j"]]],
-                ["*", ["idx", "Q0", "i"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "Q2", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", 
+                ["idx", "Λ", "j"],
+                ["-", 
+                    ["idx", "XA", ["-", "i", "j"]],
+                    ["idx", "XR", ["-", "i", "j"]], 
+                ],
             ],
-            ["*", ["idx", "Λ", "i"], ["idx", "XG", ["-", "i", "j"]]],
         ]
-    ],
-    ["*", ["^", 2, 8], ["idx", "c2", "i"]]
+    ]
 ]
 iter = ["i", 1, 63]
 
@@ -466,6 +461,12 @@ ref = "ecdas:c:receive_next_op"
 
 [[constraints.send]]
 kind = "arith"
+constraint = "$#`op` = 1 => #`next_op` = 0$"
+poly = ["*", "op", "next_op"]
+ref = "ecdas:c:op_implies_not_next_op"
+
+[[constraints.send]]
+kind = "arith"
 constraint = "$#`next_op` = 1 => #`μ` = 1$"
 poly = ["*", "next_op", ["not", "μ"]]
 ref = "ecdas:c:next_op_implies_mu"
@@ -473,6 +474,6 @@ ref = "ecdas:c:next_op_implies_mu"
 [[constraints.send]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xR", "yR", "xG", "yG", ["-", "round", "op"], "next_op"]
+input = ["timestamp", "xR", "yR", "xG", "yG", ["-", "round", ["-", 1, "next_op"]], "next_op"]
 multiplicity = "μ"
 ref = "ecdas:c:send"
