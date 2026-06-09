@@ -1146,6 +1146,40 @@ fn test_prove_elfs_ecsm_multi() {
     );
 }
 
+/// End-to-end via the **Rust-guest path**: the `syscalls::ecsm_mul` wrapper computes 5·G and
+/// commits its x-coordinate. Verifies the wrapper works end-to-end (parity with the asm guest).
+#[test]
+fn test_prove_ecsm_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm.elf"))
+        .expect("ecsm.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "ecsm rust guest should verify"
+    );
+
+    // Committed output must equal x(5·G).
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        proof.public_output,
+        ecsm::scalar_mul_x(&k, &gx).unwrap().to_vec()
+    );
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
@@ -1175,6 +1209,37 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
         "Verifier must reject a forged ECSM result xR"
+    );
+}
+
+/// Verifies SPEC-1 (a spec bug) + deviation D1: `ecdas.toml` omits `IS_BIT(µ)`, but `µ` is the
+/// multiplicity of every ECDAS bus interaction. The implementation adds `IS_BIT(µ)`; this test
+/// confirms it is load-bearing by forging a non-boolean `µ` on a real ECDAS row and asserting
+/// the verifier rejects. (k=5 produces 3 ECDAS rows.)
+#[test]
+fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
+    use crate::tables::ecdas::cols as ecdas_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
+    traces.ecdas.main_table.set(
+        0,
+        ecdas_cols::MU,
+        FieldElement::<GoldilocksField>::from(2u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a non-boolean ECDAS multiplicity (IS_BIT(µ), spec omits it)"
     );
 }
 

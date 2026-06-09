@@ -20,6 +20,10 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
+/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (u64::MAX - 2, = -3).
+#[cfg(target_arch = "riscv64")]
+const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 2;
+
 #[cfg(target_arch = "riscv64")]
 /// This is a template for printing in the vm
 pub fn print_string(s: &str) {
@@ -139,6 +143,27 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator. All values are 32-byte
+/// little-endian. Requires `0 < k < N` and `xG` a valid curve x-coordinate; `xR` may alias `xG`.
+pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") xr.as_mut_ptr(), // x10 = address to write xR
+            in("a1") xg.as_ptr(),     // x11 = address of xG
+            in("a2") k.as_ptr(),      // x12 = address of k
+            in("a7") ECSM_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
+pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

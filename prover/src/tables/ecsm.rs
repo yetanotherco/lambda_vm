@@ -1042,4 +1042,47 @@ mod tests {
         assert_eq!(constraints.len(), 148);
         assert_eq!(next, 148);
     }
+
+    /// Verifies SPEC-2 (a spec bug): `ecsm.toml` states the xG2/yG carry recurrences
+    /// UNCONDITIONALLY, but the yG relation is unsatisfiable on an all-zero (padding) row.
+    /// Its limb-0 residual is `−(P_0² − b) = −(47² − 7) = −2202 ≠ 0` (the `p²` and `−b`
+    /// constants don't cancel with zero witness). This is exactly why the implementation
+    /// µ-gates them (deviation D2). The x2 relation has no standalone constant → clean.
+    ///
+    /// We evaluate the constraint residual on a row with `µ=1` but zero witness (what a
+    /// padding row would be if forced active under the spec's unconditional form).
+    #[test]
+    fn spec2_unconditional_yg_constraint_unsatisfiable_on_padding() {
+        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+        main[cols::MU] = FE::one();
+        let view: TableView<GoldilocksField, GoldilocksExtension> =
+            TableView::new(vec![main], vec![]);
+
+        // x2: no standalone constant → residual is zero (satisfiable by padding).
+        assert_eq!(
+            ConvCarry {
+                relation: Relation::X2,
+                i: 0,
+                constraint_idx: 0,
+            }
+            .evaluate(&view),
+            FE::zero(),
+            "x2 relation IS satisfiable by an all-zero row"
+        );
+
+        // yG: residual = −(P_0² − b) = −2202 ≠ 0 → the spec's unconditional form would
+        // reject the padding row; µ-gating (µ=0 on real padding) is required.
+        let yg = ConvCarry {
+            relation: Relation::Yg,
+            i: 0,
+            constraint_idx: 0,
+        }
+        .evaluate(&view);
+        assert_ne!(
+            yg,
+            FE::zero(),
+            "yG unconditional residual must be NONZERO on a zero row (this is SPEC-2)"
+        );
+        assert_eq!(yg, FE::zero() - FE::from(2202u64), "residual = −(47² − 7)");
+    }
 }
