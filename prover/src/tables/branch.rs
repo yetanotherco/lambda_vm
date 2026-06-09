@@ -33,7 +33,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -158,10 +158,8 @@ impl BranchOperation {
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
     // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
+    let mut op_map: FxHashMap<BranchOperation, u64> = FxHashMap::default();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
