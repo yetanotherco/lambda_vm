@@ -383,7 +383,7 @@ mod tests {
         row: usize,
     ) -> TableView<GoldilocksField, GoldilocksExtension> {
         let main: Vec<FE> = (0..cols::NUM_COLUMNS)
-            .map(|c| trace.main_table.get(row, c).clone())
+            .map(|c| *trace.main_table.get(row, c))
             .collect();
         TableView::new(vec![main], vec![])
     }
