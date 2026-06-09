@@ -11,8 +11,8 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_comp_poly_tree_calls, gpu_deep_calls, gpu_fri_calls, gpu_lde_calls,
-    gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
+    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -56,6 +56,16 @@ fn gpu_path_fires_end_to_end() {
     // `commit_phase_from_evaluations`); each call drives all FRI layers
     // device-side internally.
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
+
+    // GPU batch-invert dispatch. Fires at least twice per table when the
+    // R3 OOD and R4 DEEP inv_denoms both go through the device pipeline
+    // (replaces the CPU `inplace_batch_inverse` + ~tens-of-MB H2D for
+    // each table). A regression where one of R3/R4 silently fell back
+    // to host inv_denoms would drop this below the expected ratio.
+    assert!(
+        gpu_batch_invert_calls() > 0,
+        "GPU batch-invert dispatch did not fire on R3 + R4"
+    );
 
     // Verify the GPU-produced proof. Catches the worst regression class:
     // GPU dispatches fire but the device path produces a proof that

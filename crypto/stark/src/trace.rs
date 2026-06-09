@@ -460,7 +460,34 @@ where
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
-    for eval_point in &evaluation_points {
+    // GPU fast path for inv_denoms: build one device-resident buffer of
+    // length `num_eval_points * trace_size` (ext3) covering every
+    // eval_point's inv_denoms in one fused `compute_denoms + batch
+    // invert` call. The k-th block (3*n u64s) is passed to the
+    // try_barycentric_*_on_handle calls in the loop below.
+    //
+    // Replaces the per-eval-point CPU `barycentric_inv_denoms` work and
+    // the duplicated H2D upload (main + aux paths each used to upload
+    // the same buffer; now neither does).
+    #[cfg(feature = "cuda")]
+    let inv_denoms_dev: Option<(
+        math_cuda::CudaSlice<u64>,
+        std::sync::Arc<math_cuda::CudaStream>,
+    )> = crate::gpu_lde::try_inv_denoms_dev_with_stream::<F, E>(
+        &dc.points,
+        &evaluation_points,
+        math_cuda::inverse::DenomSign::ZMinusX,
+    );
+    #[allow(unused_variables)]
+    #[cfg(not(feature = "cuda"))]
+    let inv_denoms_dev: Option<()> = None;
+
+    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_enumerate_index))]
+    for (eval_point_idx, eval_point) in evaluation_points.iter().enumerate() {
+        // Silence unused warning under non-cuda where eval_point_idx is
+        // only read inside the cuda-only block below.
+        #[cfg(not(feature = "cuda"))]
+        let _ = eval_point_idx;
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
@@ -484,6 +511,12 @@ where
         // for this table (handle absent), the size is below threshold, types
         // don't match, or the math-cuda call errored. Caller falls through
         // to the existing rayon CPU loop.
+        // Per-eval-point block offset into the GPU inv_denoms buffer:
+        // block k starts at u64 index k * 3 * n.
+        #[cfg(feature = "cuda")]
+        let inv_denoms_dev_arg = inv_denoms_dev
+            .as_ref()
+            .map(|(buf, stream)| (buf, eval_point_idx * 3 * n, stream));
         #[cfg(feature = "cuda")]
         let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
             lde_trace,
@@ -494,6 +527,7 @@ where
             &dc.offset_pow_n_inv,
             &z_pow_n,
             &inv_denoms,
+            inv_denoms_dev_arg,
         );
         #[cfg(not(feature = "cuda"))]
         let main_gpu: Option<Vec<FieldElement<E>>> = None;
@@ -532,6 +566,10 @@ where
 
         // GPU fast path for aux columns reading the de-interleaved ext3 LDE handle.
         #[cfg(feature = "cuda")]
+        let inv_denoms_dev_arg_aux = inv_denoms_dev
+            .as_ref()
+            .map(|(buf, stream)| (buf, eval_point_idx * 3 * n, stream));
+        #[cfg(feature = "cuda")]
         let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
             lde_trace,
             bf,
@@ -541,6 +579,7 @@ where
             &dc.offset_pow_n_inv,
             &z_pow_n,
             &inv_denoms,
+            inv_denoms_dev_arg_aux,
         );
         #[cfg(not(feature = "cuda"))]
         let aux_gpu: Option<Vec<FieldElement<E>>> = None;
