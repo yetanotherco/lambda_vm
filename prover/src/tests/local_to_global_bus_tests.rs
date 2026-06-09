@@ -126,6 +126,139 @@ fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
     TraceTable::new_main(data, anchor_cols::NUM_COLUMNS, 1)
 }
 
+/// L2G air on the epoch-LOCAL `Memory` bus (uses `memory_bus_interactions`).
+fn l2g_memory_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: local_to_global::memory_bus_interactions(),
+        },
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Columns of a MEMW-substitute trace: per touched byte, the `Memory` tokens the
+/// real access chain would emit — opposite polarity to L2G's bookend.
+mod memw_sub_cols {
+    pub const ADDR_LO: usize = 0;
+    pub const ADDR_HI: usize = 1;
+    pub const INIT_VAL: usize = 2;
+    pub const FINI_TS_LO: usize = 3;
+    pub const FINI_TS_HI: usize = 4;
+    pub const FINI_VAL: usize = 5;
+    pub const NUM_COLUMNS: usize = 6;
+}
+
+/// MEMW-substitute air: counterpart to `memory_bus_interactions`. Sends each
+/// cell's init token at ts=0 (cancelling L2G's init-receive) and receives each
+/// cell's fini token at the last timestamp (cancelling L2G's fini-send).
+fn memw_sub_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let init_send = BusInteraction::sender(
+        BusId::Memory,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: memw_sub_cols::ADDR_LO,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: memw_sub_cols::ADDR_HI,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: memw_sub_cols::INIT_VAL,
+                packing: Packing::Direct,
+            },
+        ],
+    );
+    let fini_recv = BusInteraction::receiver(
+        BusId::Memory,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: memw_sub_cols::ADDR_LO,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: memw_sub_cols::ADDR_HI,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: memw_sub_cols::FINI_TS_LO,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: memw_sub_cols::FINI_TS_HI,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: memw_sub_cols::FINI_VAL,
+                packing: Packing::Direct,
+            },
+        ],
+    );
+    AirWithBuses::new(
+        memw_sub_cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: vec![init_send, fini_recv],
+        },
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+fn memw_sub_trace(boundary: &[CellBoundary]) -> TraceTable<F, E> {
+    let num_rows = boundary.len().next_power_of_two().max(4);
+    let mut data = vec![FE::zero(); num_rows * memw_sub_cols::NUM_COLUMNS];
+    for (i, b) in boundary.iter().enumerate() {
+        let base = i * memw_sub_cols::NUM_COLUMNS;
+        data[base + memw_sub_cols::ADDR_LO] = FE::from(b.address & 0xFFFF_FFFF);
+        data[base + memw_sub_cols::ADDR_HI] = FE::from(b.address >> 32);
+        data[base + memw_sub_cols::INIT_VAL] = FE::from(b.init.value);
+        data[base + memw_sub_cols::FINI_TS_LO] = FE::from(b.fini.timestamp & 0xFFFF_FFFF);
+        data[base + memw_sub_cols::FINI_TS_HI] = FE::from(b.fini.timestamp >> 32);
+        data[base + memw_sub_cols::FINI_VAL] = FE::from(b.fini.value);
+    }
+    TraceTable::new_main(data, memw_sub_cols::NUM_COLUMNS, 1)
+}
+
+/// Prove + verify the epoch-local `Memory` bus over L2G's bookend (built from
+/// `l2g_boundary`) plus the MEMW-substitute chain (built from `memw_boundary`).
+/// Equal boundaries balance; a mismatch leaves the bus unbalanced.
+fn prove_verify_memory(l2g_boundary: &[CellBoundary], memw_boundary: &[CellBoundary]) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+    let l2g = l2g_memory_air(&proof_options);
+    let memw = memw_sub_air(&proof_options);
+    let mut l2g_trace = generate_local_to_global_trace(l2g_boundary);
+    let mut memw_trace = memw_sub_trace(memw_boundary);
+    let pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&l2g, &mut l2g_trace, &()), (&memw, &mut memw_trace, &())];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&l2g, &memw];
+    Verifier::multi_verify(
+        &airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
+}
+
 /// Inert L2G AIR: commits the trace columns with no bus and no constraints —
 /// the deterministic commitment an epoch proof publishes for its L2G table. The
 /// main-trace Merkle root is over the main columns only, so it matches the L2G
@@ -313,4 +446,28 @@ fn test_l2g_binding_rejects_mismatch() {
     let final_proof = prove_global(&tampered);
 
     assert!(!crate::verify_l2g_commitment_binding(&roots, &final_proof));
+}
+
+#[test]
+fn test_local_memory_bus_balances() {
+    // For each touched byte, L2G's init-receive (ts=0) + fini-send cancel the
+    // MEMW chain's init-send + fini-receive: the epoch-local Memory bus balances.
+    let initial_memory = HashMap::from([(10u64, 5u64)]);
+    let epochs = vec![vec![(10, 7, 3), (20, 9, 4)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+    assert!(prove_verify_memory(&boundaries[0], &boundaries[0]));
+}
+
+#[test]
+fn test_local_memory_bus_rejects_tamper() {
+    // L2G claims the real fini value but the access chain ends on a different
+    // one — the Memory bus no longer balances.
+    let initial_memory = HashMap::from([(10u64, 5u64)]);
+    let epochs = vec![vec![(10, 7, 3)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+    assert!(prove_verify_memory(&boundaries[0], &boundaries[0]));
+
+    let mut tampered = boundaries[0].clone();
+    tampered[0].fini.value = 999;
+    assert!(!prove_verify_memory(&boundaries[0], &tampered));
 }

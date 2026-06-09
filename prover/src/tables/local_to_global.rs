@@ -247,6 +247,70 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ]
 }
 
+/// Epoch-LOCAL memory bus interactions, mirroring PAGE-C3/C4 (`page.rs`).
+///
+/// Inside an epoch proof the L2G table bookends the epoch's `Memory` bus for the
+/// RAM bytes it touches: it receives each cell's initial token at timestamp 0
+/// (the epoch-start seed, matching the first MEMW read's `old_timestamp`) and
+/// sends its final token at the last access timestamp. This replaces PAGE's
+/// init/fini bookend for touched bytes. The `Memory` token layout is
+/// `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`;
+/// RAM only, so `is_register = 0`, and the byte value is the LO column.
+pub fn memory_bus_interactions() -> Vec<BusInteraction> {
+    vec![
+        // init: receive the cell's initial token at the epoch-start seed (ts = 0).
+        BusInteraction::receiver(
+            BusId::Memory,
+            Multiplicity::One,
+            vec![
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: cols::ADDRESS_LO,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::ADDRESS_HI,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: cols::INIT_VALUE_LO,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // fini: send the cell's final token at the last access timestamp.
+        BusInteraction::sender(
+            BusId::Memory,
+            Multiplicity::One,
+            vec![
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: cols::ADDRESS_LO,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::ADDRESS_HI,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::FINI_TIMESTAMP_LO,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::FINI_TIMESTAMP_HI,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::FINI_VALUE_LO,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
