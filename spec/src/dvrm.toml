@@ -182,23 +182,32 @@ desc = ""
 pad = 0
 
 
-# Assumptions
-
-[[assumptions]]
-desc = "`IS_HALF[n[i]]`"
-iter = ["i", 0, 3]
-ref = "lt:a:range_n"
-
-[[assumptions]]
-desc = "`IS_HALF[d[i]]`"
-iter = ["i", 0, 3]
-ref = "lt:a:range_d"
-
-[[assumptions]]
-desc = "`IS_BIT<signed>`"
-ref = "lt:a:range_signed"
-
 # Constraints
+
+[[constraint_groups]]
+name = "range"
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "n", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "lt:c:range_n"
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "d", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "lt:c:range_d"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["signed"]
+ref = "lt:c:range_signed"
 
 [[constraint_groups]]
 name = "sign_equality"
@@ -214,9 +223,9 @@ name = "abs_diff"
 
 [[constraints.abs_diff]]
 kind = "interaction"
-tag = "LT"
-input = ["abs_r", "abs_d", 0]
-output = ["not", "div_by_zero"]
+tag = "ALU"
+input = ["abs_r", "abs_d", ["opsel", "LT"]]
+output = ["arr", ["not", "div_by_zero"], 0]
 multiplicity = "μ_sum"
 ref ="dvrm:c:abs_r_lt_abs_d"
 
@@ -304,16 +313,16 @@ name = "equality"
 
 [[constraints.equality]]
 kind = "interaction"
-tag = "MUL"
-input = ["d", "signed", "q", "sign_q", 0]
+tag = "ALU"
+input = [["cast", "d", "DWordWL"], ["cast", "q", "DWordWL"], ["+", ["opsel", "MUL"], ["*", 32, "signed"], ["*", 64, "sign_q"]]]
 output = ["cast", "n_sub_r", "DWordWL"]
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_lower"
 
 [[constraints.equality]]
 kind = "interaction"
-tag = "MUL"
-input = ["d", "signed", "q", "sign_q", 1]
+tag = "ALU"
+input = [["cast", "d", "DWordWL"], ["cast", "q", "DWordWL"], ["+", ["opsel", "MUL"], ["*", 32, "signed"], ["*", 64, "sign_q"], 128]]
 output = ["cast", "extension_n_sub_r", "DWordWL"]
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_upper"
@@ -375,14 +384,14 @@ desc = "Each row contributes the following to the LogUp sum"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "DVRM"
-input = ["n", "d", "signed", 0]
+tag = "ALU"
+input = [["cast", "n", "DWordWL"], ["cast", "d", "DWordWL"], ["+", ["opsel", "DIVREM"], ["*", 32, "signed"]]]
 output = ["cast", "q", "DWordWL"]
 multiplicity = ["-", "μ_q"]
 
 [[constraints.output]]
 kind = "interaction"
-tag = "DVRM"
-input = ["n", "d", "signed", 1]
+tag = "ALU"
+input = [["cast", "n", "DWordWL"], ["cast", "d", "DWordWL"], ["+", ["opsel", "DIVREM"], ["*", 32, "signed"], 128]]
 output = ["cast", "r", "DWordWL"]
 multiplicity = ["-", "μ_r"]

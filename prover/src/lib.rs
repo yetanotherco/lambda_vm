@@ -446,6 +446,14 @@ impl VmAirs {
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
+        // Every zero-init page shares one preprocessed commitment: OFFSET is
+        // page-relative and INIT is all-zero, so it depends only on the proof
+        // options. Compute it once here rather than once per zero-init page.
+        // Every program has at least one zero-init page (the stack is
+        // zero-initialized), so this commitment is always used.
+        let zero_init_commitment =
+            page::compute_precomputed_commitment(&page::PageConfig::zero_init(0), proof_options);
+
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
@@ -454,11 +462,14 @@ impl VmAirs {
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
                     create_page_air(proof_options, config.page_base)
+                } else if config.init_values.is_none() {
+                    // Zero-init pages: the shared commitment computed once above.
+                    create_page_air(proof_options, config.page_base)
+                        .with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
-                    // ELF and zero-init pages: OFFSET + INIT are preprocessed.
-                    // The verifier independently recomputes the commitment from public data.
+                    // ELF data pages: INIT is program-specific, so recompute per page.
                     create_page_air(proof_options, config.page_base).with_preprocessed(
-                        page::precomputed_commitment_cached(config, proof_options),
+                        page::compute_precomputed_commitment(config, proof_options),
                         page::NUM_PREPROCESSED_COLS,
                     )
                 }

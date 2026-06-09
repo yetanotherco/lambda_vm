@@ -1,20 +1,26 @@
 // Types and array types
 // <type> ::= str
-//          | [str, int]
+//          | [<type>, int]
 
 // Check that a type expression is structurally valid, without validating against a set of known base types
 #let check_array_type(typ) = {
-  assert(type(typ.at(0)) == str, message: "Array types need to have a regular type as base")
-  assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
+  while type(typ) == array {
+    assert(typ.len() == 2, message: "Array types must specify two parameters")
+    assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
+    typ = typ.at(0)
+  }
+  assert(type(typ) == str, message: "Array types need to have a regular type as base")
 }
 
 // Render a type to code
 #let type_to_code(typ) = {
-  if type(typ) == array {
-    check_array_type(typ)
-    return raw(typ.at(0) + "[" + str(typ.at(1)) + "]")
-  } else if type(typ) == str {
-    return raw(typ)
+  let label = ""
+  while type(typ) == array {
+    label += "[" + str(typ.at(1)) + "]"
+    typ = typ.at(0)
+  }
+  if type(typ) == str {
+    return raw(typ + label)
   } else {
     assert(false, message: "Unknown format for type: " + repr(typ))
   }
@@ -54,12 +60,13 @@
   "cast": 3, // cast
   "mul": 4,  // *
   "div": 5,  // /
-  "sum": 6,  // Σ
-  "not": 7,  // not
-  "sub": 8,  // -
-  "add": 9,  // +  
-  "eq": 10,   // = and :=
-  "MAX": 11, // <the void outside every expression>
+  "mod": 6,  // mod
+  "sum": 7,  // Σ
+  "not": 8,  // not
+  "sub": 9,  // -
+  "add": 10,  // +  
+  "eq": 11,   // = and :=
+  "MAX": 12, // <the void outside every expression>
 )
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
@@ -92,11 +99,22 @@
 // Typeset an expression as code
 #let expr_to_code = make_expr_formatter(
   (
+    "opsel": (pp, rec, e) => {
+      assert(type(e.at(1)) == type(""), message: "opsel expects a string")
+      `⧼` + raw(e.at(1)) + `⧽`
+    },
     "arr": (pp, rec, e) => `[` + e.slice(1).map(rec.with(PREC.MAX)).join(`, `) + `]`,
     "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
     "not": (pp, rec, e) => cwrap(rec(PREC.not, 1) + ` - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
+    "mod": (pp, rec, e) => {
+      assert(e.len() == 3 and type(e.at(2)) == int, message: "Invalid mod expr: " + repr(e))
+      cwrap(
+        rec(PREC.mod, e.at(1)) + ` % ` + rec(PREC.mod, e.at(2)), 
+        pp <= PREC.mod
+      ) 
+    },
     "*": (pp, rec, e) => {
       if e.len() == 3 and type(e.at(1)) == int and type(e.at(2)) == str and e.at(2).len() == 1 {
         // multiplication of a constant with one-letter variable. 
@@ -151,6 +169,10 @@
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
+    "opsel": (pp, rec, e) => {
+      assert(type(e.at(1)) == type(""), message: "opsel expects a string")
+      $lr(chevron.l.curly#raw(e.at(1))chevron.r.curly)$
+    },
     "arr": (pp, rec, e) => $[#e.slice(1).map(rec.with(PREC.MAX)).join($, $)]$,
     "idx": (pp, rec, e) => {
       let (val, idxs) = flat_idxs(e)
@@ -163,6 +185,13 @@
       mwrap(
         $sum_(#rec(PREC.MAX, e.at(1)))^#rec(PREC.MAX, e.at(2)) #rec(if pp <= PREC.sub {PREC.MAX} else {PREC.sum}, e.at(3))$, 
         pp <= PREC.sub
+      )
+    },
+    "mod": (pp, rec, e) => {
+      assert(e.len() == 3 and type(e.at(2)) == int, message: "Invalid mod expr: " + repr(e))
+      mwrap(
+        $#rec(PREC.mod, e.at(1)) mod #rec(PREC.mod, e.at(2))$, 
+        pp <= PREC.mod
       )
     },
     "*": (pp, rec, e) => {
