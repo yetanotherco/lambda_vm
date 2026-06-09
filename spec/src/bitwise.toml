@@ -102,6 +102,11 @@ type = "BaseField"
 desc = ""
 
 [[variables.multiplicity]]
+name = "μ_ARE_BYTES"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
 name = "μ_IS_HALF"
 type = "BaseField"
 desc = ""
@@ -122,22 +127,22 @@ name = "contributions"
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], "X", "Y"]
 output = "AND"
 multiplicity = ["-", "μ_AND"]
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "OR_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [["opsel", "OR"], "X", "Y"]
 output = "OR"
 multiplicity = ["-", "μ_OR"]
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = ["X", "Y"]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], "X", "Y"]
 output = "XOR"
 multiplicity = ["-", "μ_XOR"]
 
@@ -164,9 +169,9 @@ multiplicity = ["-", "μ_ZERO"]
 
 [[constraints.contributions]]
 kind = "interaction"
-tag = "IS_BYTE"
-input = ["X"]
-multiplicity = ["-", "μ_IS_BYTE"]
+tag = "ARE_BYTES"
+input = ["X", "Y"]
+multiplicity = ["-", "μ_ARE_BYTES"]
 
 [[constraints.contributions]]
 kind = "interaction"

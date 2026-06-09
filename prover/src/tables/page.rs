@@ -31,7 +31,6 @@
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -106,10 +105,9 @@ pub type FinalStateMap = HashMap<u64, FinalByteState>;
 pub struct PageConfig {
     /// Base address of this page (must be page-aligned).
     pub page_base: u64,
-    /// Size of the page in bytes (must be power of 2).
-    pub page_size: usize,
-    /// Initial values for each byte in the page.
-    /// If None, all bytes are zero-initialized.
+    /// Initial byte values; `None` means an all-zero page.
+    /// `Some(v)` is not padded, so `v.len()` may be smaller than the page
+    /// (`DEFAULT_PAGE_SIZE`); any offset at or past `v.len()` is read as zero.
     pub init_values: Option<Vec<u8>>,
     /// Whether this page holds private input data.
     /// Private-input pages are NOT preprocessed — the verifier does not see
@@ -120,38 +118,32 @@ pub struct PageConfig {
 
 impl PageConfig {
     /// Create a zero-initialized page.
-    pub fn zero_init(page_base: u64, page_size: usize) -> Self {
+    pub fn zero_init(page_base: u64) -> Self {
         Self {
             page_base,
-            page_size,
             init_values: None,
             is_private_input: false,
         }
     }
 
-    /// Create a page with initial values from ELF data.
-    pub fn with_data(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
-        assert!(data.len() <= page_size, "Data exceeds page size");
-        let mut init_values = data;
-        init_values.resize(page_size, 0); // Pad with zeros
+    /// Create a page with initial values from ELF data. `data` may be shorter
+    /// than the page; the trace/commitment math treats trailing bytes as zero.
+    pub fn with_data(page_base: u64, data: Vec<u8>) -> Self {
+        assert!(data.len() <= DEFAULT_PAGE_SIZE, "Data exceeds page size");
         Self {
             page_base,
-            page_size,
-            init_values: Some(init_values),
+            init_values: Some(data),
             is_private_input: false,
         }
     }
 
     /// Create a page with initial values from private input data.
     /// These pages are NOT preprocessed — the verifier never sees the init values.
-    pub fn with_private_input(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
-        assert!(data.len() <= page_size, "Data exceeds page size");
-        let mut init_values = data;
-        init_values.resize(page_size, 0);
+    pub fn with_private_input(page_base: u64, data: Vec<u8>) -> Self {
+        assert!(data.len() <= DEFAULT_PAGE_SIZE, "Data exceeds page size");
         Self {
             page_base,
-            page_size,
-            init_values: Some(init_values),
+            init_values: Some(data),
             is_private_input: true,
         }
     }
@@ -175,11 +167,9 @@ pub fn generate_page_trace(
     config: &PageConfig,
     final_state: &FinalStateMap,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let page_size = config.page_size;
+    let page_size = DEFAULT_PAGE_SIZE;
     let page_base = config.page_base;
 
-    // Page size must be power of 2
-    assert!(page_size.is_power_of_two(), "Page size must be power of 2");
     // Page base must be page-aligned
     assert!(
         page_base.is_multiple_of(page_size as u64),
@@ -196,13 +186,12 @@ pub fn generate_page_trace(
         // Offset (preprocessed) - address is virtual: page_base + offset
         data[base + cols::OFFSET] = FE::from(offset as u64);
 
-        // Initial value
-        // Safety: init_vals.len() == page_size (guaranteed by with_data resize)
-        let init_value = if let Some(ref init_vals) = config.init_values {
-            init_vals[offset]
-        } else {
-            0 // Zero-initialized
-        };
+        // Initial value (init_values may be shorter than the page → trailing zeros)
+        let init_value = config
+            .init_values
+            .as_ref()
+            .and_then(|v| v.get(offset).copied())
+            .unwrap_or(0);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
         // Final state: if accessed use final, otherwise use initial
@@ -225,21 +214,12 @@ pub fn generate_page_trace(
 // Preprocessed commitment
 // =========================================================================
 
-/// Cached commitment for zero-initialized 4KB pages.
-/// All zero-init pages of the same size have identical OFFSET and INIT columns.
-///
-/// INVARIANT: All callers within a process must use identical `ProofOptions`.
-/// The cache is keyed only by page content, not by options.
-static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
-
 /// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
 ///
 /// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
 /// Each page may have different INIT data, producing a different commitment.
 pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
-    let page_size = config.page_size;
-    assert!(page_size.is_power_of_two(), "Page size must be power of 2");
-
+    let page_size = DEFAULT_PAGE_SIZE;
     let num_rows = page_size;
 
     // Precomputed columns: OFFSET and INIT.
@@ -257,11 +237,12 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
 
     for i in 0..page_size {
         offset_col[i] = FE::from(i as u64);
-        init_col[i] = if let Some(ref init_vals) = config.init_values {
-            FE::from(init_vals[i] as u64)
-        } else {
-            FE::zero()
-        };
+        let init_byte = config
+            .init_values
+            .as_ref()
+            .and_then(|v| v.get(i).copied())
+            .unwrap_or(0);
+        init_col[i] = FE::from(init_byte as u64);
     }
 
     let columns = [offset_col, init_col];
@@ -292,18 +273,6 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
         .expect("Failed to build Merkle tree for page LDE");
     tree.root
-}
-
-/// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.
-///
-/// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
-/// ELF data pages compute their commitment fresh.
-pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
-    if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
-        *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
-    } else {
-        compute_precomputed_commitment(config, options)
-    }
 }
 
 // =========================================================================
@@ -414,19 +383,11 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
 // =========================================================================
 
 /// Compute the page base address for a given byte address.
-pub fn page_base_for_address(addr: u64, page_size: usize) -> u64 {
-    debug_assert!(
-        page_size.is_power_of_two(),
-        "page_size must be a power of 2"
-    );
-    addr & !(page_size as u64 - 1)
+pub fn page_base_for_address(addr: u64) -> u64 {
+    addr & !(DEFAULT_PAGE_SIZE as u64 - 1)
 }
 
 /// Compute the offset within a page for a given byte address.
-pub fn offset_in_page(addr: u64, page_size: usize) -> usize {
-    debug_assert!(
-        page_size.is_power_of_two(),
-        "page_size must be a power of 2"
-    );
-    (addr & (page_size as u64 - 1)) as usize
+pub fn offset_in_page(addr: u64) -> usize {
+    (addr & (DEFAULT_PAGE_SIZE as u64 - 1)) as usize
 }

@@ -1,7 +1,6 @@
 #import "/book.typ": book-page, aside, cdsg
 
 #show: book-page("logup")
-#set heading(numbering: "1.")
 #show link: underline
 
 #show "constraint choice": link(<constraint_choices>)[constraint choice]
