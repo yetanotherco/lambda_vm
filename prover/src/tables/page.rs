@@ -31,7 +31,6 @@
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -215,13 +214,6 @@ pub fn generate_page_trace(
 // Preprocessed commitment
 // =========================================================================
 
-/// Cached commitment for zero-initialized 4KB pages.
-/// All zero-init pages of the same size have identical OFFSET and INIT columns.
-///
-/// INVARIANT: All callers within a process must use identical `ProofOptions`.
-/// The cache is keyed only by page content, not by options.
-static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
-
 /// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
 ///
 /// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
@@ -281,18 +273,6 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
         .expect("Failed to build Merkle tree for page LDE");
     tree.root
-}
-
-/// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.
-///
-/// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
-/// ELF data pages compute their commitment fresh.
-pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
-    if config.init_values.is_none() {
-        *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
-    } else {
-        compute_precomputed_commitment(config, options)
-    }
 }
 
 // =========================================================================
