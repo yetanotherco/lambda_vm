@@ -1072,6 +1072,41 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 }
 
+#[test]
+fn test_prove_elfs_ecsm() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest computes 5·G and commits the 32-byte x-coordinate; cross-check it against
+    // the reference scalar multiplication. Gx, little-endian:
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    let expected_xr = ecsm::scalar_mul_x(&k, &gx).unwrap();
+    assert_eq!(
+        result.return_values.memory_values,
+        expected_xr.to_vec(),
+        "committed xR must equal x(5G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM prove/verify failed"
+    );
+}
+
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///
