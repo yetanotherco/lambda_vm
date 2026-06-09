@@ -313,6 +313,15 @@ pub struct CpuOperation {
 
     /// For KeccakPermute ECALLs: state address from x10
     pub keccak_state_addr: u64,
+
+    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
+    pub ecall_ecsm: bool,
+
+    /// For ECSM ECALLs: address of xG from x11
+    pub ecsm_addr_xg: u64,
+
+    /// For ECSM ECALLs: address of the scalar k from x12
+    pub ecsm_addr_k: u64,
 }
 
 impl CpuOperation {
@@ -663,6 +672,15 @@ impl CpuOperation {
         let ecall_keccak = decode.op_ecall
             && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
+        let ecall_ecsm = decode.op_ecall
+            && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        // The executor carries addr_xG in src2_val and addr_k in dst_val; addr_xR (x10) is
+        // recovered from the register state in the trace builder.
+        let (ecsm_addr_xg, ecsm_addr_k) = if ecall_ecsm {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
+        };
         // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
         // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
@@ -687,6 +705,9 @@ impl CpuOperation {
             commit_count,
             ecall_keccak,
             keccak_state_addr,
+            ecall_ecsm,
+            ecsm_addr_xg,
+            ecsm_addr_k,
         };
 
         // Compute runtime-specific values based on instruction type

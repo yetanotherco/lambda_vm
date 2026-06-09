@@ -114,6 +114,14 @@ pub enum BusId {
     Keccak,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
     KeccakRc,
+    /// ECDAS self-referential double/add sequence bus:
+    /// (timestamp, xA, yA, xG, yG, round, op). ECSM seeds and drains it.
+    Ecdas,
+    /// EC_SCALAR self-referential scalar-byte server bus: (timestamp, ptr, offset).
+    ServeK,
+    /// Scalar-bit bus: EC_SCALAR sends one per set bit (timestamp, bit_index);
+    /// ECDAS receives one per add, ECSM receives the MSB.
+    Bit,
 }
 
 impl BusId {
@@ -144,6 +152,9 @@ impl BusId {
             BusId::Commit => "Commit",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
+            BusId::Ecdas => "Ecdas",
+            BusId::ServeK => "ServeK",
+            BusId::Bit => "Bit",
         }
     }
 }
@@ -177,6 +188,9 @@ impl TryFrom<u64> for BusId {
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
+            24 => Ok(BusId::Ecdas),
+            25 => Ok(BusId::ServeK),
+            26 => Ok(BusId::Bit),
             other => Err(other),
         }
     }
