@@ -43,6 +43,9 @@ use super::commit::{self, CommitOperation};
 use super::cpu::{self, CpuOperation};
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
+use super::ec_scalar;
+use super::ecdas;
+use super::ecsm;
 use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
@@ -2048,6 +2051,15 @@ pub struct Traces {
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// ECSM core table (one row per scalar-multiplication ecall)
+    pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// EC_SCALAR table (32 rows per ecall)
+    pub ec_scalar: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// ECDAS double/add table (variable rows per ecall)
+    pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
@@ -2396,6 +2408,12 @@ fn build_traces(
     let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
     keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
 
+    // ECSM accelerator traces. Empty until the ECSM ecall collection is wired; programs
+    // that do not use ECSM produce all-padding tables that balance trivially.
+    let ecsm_trace = ecsm::generate_ecsm_trace(&[]);
+    let ec_scalar_trace = ec_scalar::generate_ec_scalar_trace(&[]);
+    let ecdas_trace = ecdas::generate_ecdas_trace(&[]);
+
     #[allow(unused_mut)]
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
     #[cfg(feature = "parallel")]
@@ -2487,6 +2505,9 @@ fn build_traces(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
+        ecsm: ecsm_trace,
+        ec_scalar: ec_scalar_trace,
+        ecdas: ecdas_trace,
         memw_registers,
     })
 }
@@ -2733,6 +2754,9 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::ec_scalar::cols::NUM_COLUMNS as EC_SCALAR_COLS;
+        use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
+        use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -2769,6 +2793,9 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            ecsm,
+            ec_scalar,
+            ecdas,
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
@@ -2816,6 +2843,9 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
+        total += (ecsm.num_rows() * ECSM_COLS) as u64;
+        total += (ec_scalar.num_rows() * EC_SCALAR_COLS) as u64;
+        total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total
     }
 
@@ -2851,6 +2881,9 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
+        let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
+        let n_ec_scalar = aux_cols(super::ec_scalar::bus_interactions().len());
+        let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -2871,6 +2904,9 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            ecsm,
+            ec_scalar,
+            ecdas,
             memw_registers,
             page_configs: _,
             public_output_bytes: _,
@@ -2918,6 +2954,9 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
+        total += (ecsm.num_rows() * n_ecsm) as u64;
+        total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
+        total += (ecdas.num_rows() * n_ecdas) as u64;
         total
     }
 
