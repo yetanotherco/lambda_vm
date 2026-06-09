@@ -108,4 +108,4 @@ poly = ["*", "last_limb", "offset"]
 kind = "interaction"
 tag = "SERVE_K"
 input = ["timestamp", "ptr", ["-", "offset", 1]]
-multiplicity = ["not", "last_limb"]
+multiplicity = ["-", "μ", "last_limb"]
