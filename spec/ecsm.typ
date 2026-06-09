@@ -230,7 +230,7 @@ $
 $
 Introducing the non-negative witnesses $q'_0, q'_1$ and $q_2$, we can convert these relations into
 $
-  (x_G - x_A)lambda - y_G + y_A + (#`r` - q'_0) p &= 0,\
+  lambda (x_G - x_A) - y_G + y_A + (#`r` - q'_0) p &= 0,\
   lambda^2 - x_A - x_G - x_R + (#`r` - q'_1) p &= 0,\
   lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0,\
 $
@@ -425,20 +425,18 @@ $
 
 Applying the corollary to the relations
 $
-  x_G dot x_G - (#`q0` dot p + #`x2`) &= 0\
-  y_G dot y_G - (#`x2` dot x_G + #`q1` dot p) &= 0\
-  
-   lambda dot x_G + #`q0` dot p + y_A - (lambda dot x_A + y_G) &= 0\
-   2 lambda dot y_A + #`q0` dot p - 3x_A dot x_A  &= 0\
-  lambda^2 - (#`q1` dot p + x_R + 2x_A) &= 0\
-  lambda^2 - (#`q1` dot p + x_R + x_A + x_G) &= 0\
-  lambda dot x_A + #`q2` dot p - (lambda dot x_R + y_A + y_R)  &= 0\
+  x_G^2 - #`x2` - q_0 dot p &= 0,\
+  y_G^2 - x_G dot #`x2` - b + (p - q_1)p &= 0,\
+
+  #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0,\
+  lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0.\
 $
 We find that the carries for sixteen 8-bit limbs are in the range
 $
   (1): [-8160, 8159]\
-  (2): [-16318, 8159]\
-  (3): [-24477, 24477]\
-  (4): [-8161, 8159]\
-  (5): [-8160, 16318]\
+  (2): [-16319, 16318]\
+  (3): [-32636, 24477]\
+  (4): [-8161, 16318]\
+  (5): [-16320, 16318]\
 $

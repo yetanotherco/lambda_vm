@@ -372,7 +372,7 @@ ref = "ec:c:c1_63_is_zero"
 [[constraints.yG]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], 16318]]
+input = [["+", ["idx", "c1", "i"], 16319]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ec:c:range_c1"
