@@ -4,86 +4,103 @@ name = "ECDAS"
 name = "timestamp"
 type = "DWordWL"
 desc = "Timestamp at which the operation is executed."
+pad = 0
 
 [[variables.input]]
 name = "xG"
 type = "U256BL"
 desc = "$x_#`G`$"
+pad = 0
 
 [[variables.input]]
 name = "yG"
 type = "U256BL"
 desc = "$y_#`G`$"
+pad = 0
 
 [[variables.input]]
 name = "xA"
 type = "U256BL"
 desc = "$x_#`A`$"
+pad = 0
 
 [[variables.input]]
 name = "yA"
 type = "U256BL"
 desc = "$y_#`A`$"
+pad = 0
 
 [[variables.input]]
 name = "round"
 type = "Byte"
 desc = "scaling round"
+pad = 0
 
 [[variables.input]]
 name = "op"
 type = "Bit"
 desc = "whether to double (0) or add (1)"
+pad = 0
 
 [[variables.output]]
 name = "xR"
 type = "U256BL"
 desc = "$x_#`R`$"
+pad = 0
 
 [[variables.output]]
 name = "yR"
 type = "U256BL"
 desc = "$y_#`R`$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "λ"
 type = "U256BL"
 desc = "`λ`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "q0"
 type = ["Byte", 33]
 desc = "quotient used to constrain `λ`"
+pad = "r"
 
 [[variables.auxiliary]]
 name = "c0"
 type = ["BaseField", 64]
 desc = "carries used to constrain `λ`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "q1"
 type = ["Byte", 33]
 desc = "quotient used to constrain `xR`"
+pad = "r"
 
 [[variables.auxiliary]]
 name = "c1"
 type = ["BaseField", 64]
 desc = "carries used to constrain `xR`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "q2"
 type = ["Byte", 33]
 desc = "quotient used to constrain `yR`"
+pad = "r"
 
 [[variables.auxiliary]]
 name = "c2"
 type = ["BaseField", 64]
 desc = "carries used to constrain `yR`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "next_op"
 type = "Bit"
 desc = "`op`-flag for the next iteration"
+pad = 0
 
 [[variables.virtual]]
 name = "XG"
@@ -207,6 +224,7 @@ desc = "Offset value; equals $3 #`p`$"
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 [[constraint_groups]]
 name = "receive"

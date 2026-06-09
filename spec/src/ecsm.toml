@@ -4,86 +4,103 @@ name = "ECSM"
 name = "timestamp"
 type = "DWordWL"
 desc = "timestamp at which this operation is executed"
+pad = 0
 
 [[variables.input]]
 name = "addr_xG"
 type = "DWordWL"
 desc = "address at which `x`-coordinate of start point `G` is stored"
+pad = 0
 
 [[variables.input]]
 name = "addr_k"
 type = "DWordWL"
 desc = "address at which scalar `k` is stored"
+pad = 0
 
 [[variables.input]]
 name = "addr_xR"
 type = "DWordWL"
 desc = "address to which the `x`-coordinate of result point `R` is to be written"
+pad = 0
 
 [[variables.output]]
 name = "xR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_x$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "yR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_y$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "k"
 type = "U256BL"
 desc = "`k`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "len_k"
 type = "Byte"
 desc = "Position of `k`'s most significant 1-bit"
+pad = 0
 
 [[variables.auxiliary]]
 name = "xG"
 type = "U256BL"
 desc = "$x_G$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "yG"
 type = "U256BL"
 desc = "$y_G$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "x2"
 type = "U256BL"
 desc = "$x_G^2$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "q0"
 type = "U256BL"
 desc = "quotient for computing `x2`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "c0"
 type = ["BaseField", 64]
 desc = "carries for computing `x2`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "q1"
 type = ["Byte", 33]
 desc = "quotient for computing `yG`"
+pad = "p"
 
 [[variables.auxiliary]]
 name = "c1"
 type = ["BaseField", 64]
 desc = "carries for computing `yG`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "k_sub_N"
 type = "U256HL"
 desc = "$#`k`- #`N` mod 2^256$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "xR_sub_p"
 type = "U256HL"
 desc = "$x_R - #`p` mod 2^256$"
+pad = 0
 
 [[variables.virtual]]
 name = "c2"
@@ -185,6 +202,7 @@ desc = "Curve order"
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 
 [[assumptions]]
@@ -442,12 +460,13 @@ kind = "template"
 tag = "IS_BIT"
 input = [["idx", "c2", "i"]]
 iter = ["i", 0, 6]
+cond = "μ"
 ref = "ec:c:range_c2"
 
 [[constraints.verify_k]]
 kind = "arith"
-constraint = "$#`c2`_7 = 1$"
-poly = ["not", ["idx", "c2", 7]]
+constraint = "$#`μ` => #`c2`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c2", 7]]]
 ref = "ec:c:k_lt_N"
 
 [[constraints.verify_k]]
@@ -509,12 +528,13 @@ kind = "template"
 tag = "IS_BIT"
 input = [["idx", "c3", "i"]]
 iter = ["i", 0, 6]
+cond = "μ"
 ref = "ec:c:range_c3"
 
 [[constraints.range_xR]]
 kind = "arith"
-constraint = "$#`c3`_7 = 1$"
-poly = ["not", ["idx", "c3", 7]]
+constraint = "$#`μ` => #`c3`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
 ref = "ec:c:xR_addition_overflows"
 
 

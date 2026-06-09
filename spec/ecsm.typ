@@ -165,6 +165,10 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 Similar to `addr_xG` and `addr_k`, it is assumed that the addition of the small offsets will not overflow the lower limb of `addr_xR` (@ec:a:addr_xR_alignment).
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
+== Padding
+#render_chip_padding_table(ecsm_chip, config)
+
+
 = ECDAS chip <ecdas>
 #let ecdas_chip = load_chip("src/ecdas.toml", config)
 #let ecdas = raw(ecdas_chip.name)
@@ -318,6 +322,9 @@ To determine whether the next step should be an addition or doubling, the `next_
 Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu), when the current $#`op` = 0$ (double), and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
 #render_constraint_table(ecdas_chip, config, groups: "send")
 
+== Padding
+#render_chip_padding_table(ecdas_chip, config)
+
 
 = EC-Scalar
 #let ecscalar_chip = load_chip("src/ec_scalar.toml", config)
@@ -354,6 +361,9 @@ Unless this was the `last_limb` (i.e., $#`offset` = 0$), we recurse on serving t
 `last_limb` is a witness provided by the prover, which, technically, could be kept at $0$ when $#`offset` = 0$.
 However, that would require an additional $2^64$ table entries to balance out the LogUp bus.
 Since this is assumed infeasible, the prover is constrained to set `last_limb` appropriately.
+
+== Padding
+#render_chip_padding_table(ecscalar_chip, config)
 
 = Notes / optimizations
 - To utilize the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the

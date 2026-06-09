@@ -4,26 +4,31 @@ name = "EC_SCALAR"
 name = "timestamp"
 type = "DWordWL"
 desc = "timestamp at which to serve the constant"
+pad = 0
 
 [[variables.input]]
 name = "ptr"
 type = "DWordWL"
 desc = "pointer to the first byte of the scalar"
+pad = 0
 
 [[variables.input]]
 name = "offset"
 type = "Byte"
 desc = "index of limb"
+pad = 0
 
 [[variables.auxiliary]]
 name = "limb_bits"
 type = ["Bit", 8]
 desc = "bit-decomposition of the limb being read"
+pad = ["arr", 0, 0, 0, 0, 0, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "last_limb"
 type = "Bit"
 desc = "whether this is the last limb to read"
+pad = 0
 
 [[variables.virtual]]
 name = "limb"
@@ -35,6 +40,7 @@ def = {poly=["sum", ["=", "i", 0], 7, ["*", ["^", 2, "i"], ["idx", "limb_bits", 
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 [[assumptions]]
 desc = "$#`ptr` + #`offset`$ does not overflow the bottom limb"
