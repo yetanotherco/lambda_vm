@@ -32,7 +32,7 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
 // Column indices for LT table
@@ -128,10 +128,8 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
+    let mut op_map: FxHashMap<LtOperation, u64> = FxHashMap::default();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }

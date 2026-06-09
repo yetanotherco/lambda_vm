@@ -29,8 +29,6 @@
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
 //! - Receiver: DVRM (×2 for quotient and remainder results)
 
-use std::collections::HashMap;
-
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -39,8 +37,8 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16,
+    BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32,
+    NEG_INV_2_48, NEG_INV_2_64, SHIFT_16,
 };
 
 // =========================================================================
@@ -288,7 +286,7 @@ pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
-    let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
+    let mut op_map: FxHashMap<DvrmOperation, DvrmMultiplicities> = FxHashMap::default();
 
     for (op, wants_remainder) in operations {
         let entry = op_map.entry(op.clone()).or_default();

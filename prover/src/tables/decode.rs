@@ -89,10 +89,8 @@ pub const NUM_PRECOMPUTED_COLS: usize = 5;
 // Trace generation
 // =========================================================================
 
-use std::collections::HashMap;
-
 /// Map from PC to row index in the DECODE trace table.
-pub type PcToRow = HashMap<u64, usize>;
+pub type PcToRow = U64HashMap<usize>;
 
 /// Generates the DECODE trace table from the instructions map.
 ///
@@ -107,7 +105,8 @@ pub fn generate_decode_trace(
     instructions: &U64HashMap<Instruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
     // Build entries and PC-to-row mapping
-    let mut pc_to_row = HashMap::with_capacity(instructions.len());
+    let mut pc_to_row = PcToRow::default();
+    pc_to_row.reserve(instructions.len() + 1);
     let entries: Vec<_> = instructions
         .iter()
         .enumerate()
@@ -368,7 +367,8 @@ pub struct ElfTables {
 /// Table has multiplicities initialized to 0.
 pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     let mut decode_entries = Vec::new();
-    let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
+    let mut pc_to_row = PcToRow::default();
+    pc_to_row.reserve(elf.data.iter().map(|s| s.values.len()).sum());
 
     // Process all ELF segments for DECODE (only executable segments)
     for segment in &elf.data {

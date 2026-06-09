@@ -33,6 +33,8 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
@@ -394,8 +396,7 @@ fn collect_ops_from_cpu(
         }
 
         // Collect register operations (M1, M3, M5)
-        let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
-        memw_ops.extend(reg_memw_ops);
+        collect_register_ops_from_cpu(op, register_state, &mut memw_ops);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -599,14 +600,13 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
-/// Collects register read/write operations (M1, M3, M5) from CpuOperation.
-///
-/// Returns: Vec of MEMW operations for register accesses
+/// Collects register read/write operations (M1, M3, M5) from CpuOperation,
+/// pushing them into `memw_ops`.
 fn collect_register_ops_from_cpu(
     op: &CpuOperation,
     register_state: &mut RegisterState,
-) -> Vec<MemwOperation> {
-    let mut memw_ops = Vec::with_capacity(4);
+    memw_ops: &mut Vec<MemwOperation>,
+) {
     let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
@@ -665,8 +665,6 @@ fn collect_register_ops_from_cpu(
     // PC register state update (needed for M1 reads when rs1=255, i.e. AUIPC/JAL).
     // The actual PC read/write is now inline in the CPU via memory bus interactions.
     register_state.write_pc(op.next_pc, op.timestamp + 1);
-
-    memw_ops
 }
 
 /// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
@@ -2072,10 +2070,10 @@ struct CollectedOps {
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
-fn chunk_and_generate<T>(
+fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -2083,18 +2081,24 @@ fn chunk_and_generate<T>(
     } else {
         ops.chunks(max_rows).collect()
     };
-    let mut tables = Vec::with_capacity(op_chunks.len());
-    for chunk in op_chunks {
-        #[allow(unused_mut)]
-        let mut t = generate(chunk);
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
+    // Disk mode generates one chunk at a time so each spills before the next
+    // allocates, keeping trace memory bounded.
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        let mut tables = Vec::with_capacity(op_chunks.len());
+        for chunk in op_chunks {
+            let mut t = generate(chunk);
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+            tables.push(t);
         }
-        tables.push(t);
+        return Ok(tables);
     }
+    #[cfg(feature = "parallel")]
+    let tables = op_chunks.into_par_iter().map(generate).collect();
+    #[cfg(not(feature = "parallel"))]
+    let tables = op_chunks.into_iter().map(generate).collect();
     Ok(tables)
 }
 
@@ -2216,7 +2220,7 @@ fn build_traces(
     memory_state: &MemoryState,
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
+    decode_pc_to_row: decode::PcToRow,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -2290,149 +2294,234 @@ fn build_traces(
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
 
-    let cpus = chunk_and_generate(
-        &cpu_ops,
-        max_rows.cpu,
-        cpu::generate_cpu_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memws = chunk_and_generate(
-        &memw_ops,
-        max_rows.memw,
-        memw::generate_memw_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memw_aligneds = chunk_and_generate(
-        &memw_aligned_ops,
-        max_rows.memw_aligned,
-        memw_aligned::generate_memw_aligned_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memw_registers = chunk_and_generate(
-        &memw_register_ops,
-        max_rows.memw_register,
-        memw_register::generate_memw_register_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let loads = chunk_and_generate(
-        &load_ops,
-        max_rows.load,
-        load::generate_load_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let lts = chunk_and_generate(
-        &lt_ops,
-        max_rows.lt,
-        lt::generate_lt_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let shifts = chunk_and_generate(
-        &shift_ops,
-        max_rows.shift,
-        shift::generate_shift_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let muls = chunk_and_generate(
-        &mul_ops,
-        max_rows.mul,
-        mul::generate_mul_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let dvrms = chunk_and_generate(
-        &dvrm_ops,
-        max_rows.dvrm,
-        dvrm::generate_dvrm_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let branches = chunk_and_generate(
-        &branch_ops,
-        max_rows.branch,
-        branch::generate_branch_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-
-    let mut bitwise = bitwise::generate_bitwise_trace();
-    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-    // Update DECODE multiplicities
-    // Each CPU operation looks up the DECODE table once
-    // Padding rows also look up pc=1 (the CPU padding entry)
-    // When CPU is split, each chunk pads independently
-    let mut decode = decode_trace;
-    let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-    decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-    decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
-
-    // Prepare register final state before scope (needs register_state ownership)
     let register_final_state = register_state.to_final_state_map();
 
-    // Generate remaining traces in parallel (page, register, halt, commit).
-    // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-    #[allow(unused_mut)]
-    let mut commit_trace = commit::generate_commit_trace(&commit_ops);
+    // Each build below reads disjoint op lists and writes its own table, so
+    // they all run in one rayon scope. Disk-spill stays sequential: its
+    // generate→spill order keeps trace memory bounded.
+    let cpu_ops_ref = &cpu_ops;
+    let gen_cpus = || {
+        chunk_and_generate(
+            cpu_ops_ref,
+            max_rows.cpu,
+            cpu::generate_cpu_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memws = || {
+        chunk_and_generate(
+            &memw_ops,
+            max_rows.memw,
+            memw::generate_memw_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memw_aligneds = || {
+        chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memw_registers = || {
+        chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_loads = || {
+        chunk_and_generate(
+            &load_ops,
+            max_rows.load,
+            load::generate_load_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_lts = || {
+        chunk_and_generate(
+            &lt_ops,
+            max_rows.lt,
+            lt::generate_lt_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_shifts = || {
+        chunk_and_generate(
+            &shift_ops,
+            max_rows.shift,
+            shift::generate_shift_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_muls = || {
+        chunk_and_generate(
+            &mul_ops,
+            max_rows.mul,
+            mul::generate_mul_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_dvrms = || {
+        chunk_and_generate(
+            &dvrm_ops,
+            max_rows.dvrm,
+            dvrm::generate_dvrm_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_branches = || {
+        chunk_and_generate(
+            &branch_ops,
+            max_rows.branch,
+            branch::generate_branch_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_bitwise = || {
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        bitwise
+    };
+    // Each CPU operation looks up the DECODE table once; padding rows look up
+    // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
+    // independently.
+    let gen_decode = move || {
+        let mut decode = decode_trace;
+        let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+        decode
+    };
+    let gen_commit = || commit::generate_commit_trace(&commit_ops);
+    let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
+    let gen_keccak_rnd = || {
+        let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect();
+        keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
+    };
+    let gen_keccak_rc = || {
+        let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+        keccak_rc_trace
+    };
+    let gen_pages = || match elf {
+        Some(elf) => generate_page_tables(elf, memory_state, private_input),
+        None => (Vec::new(), Vec::new()),
+    };
+    let gen_register = || register::generate_register_trace(&register_final_state, entry_point);
+    let gen_halt = || halt::generate_halt_trace(halt_timestamp);
 
-    // Generate keccak traces (core table + per-round table + preprocessed RC)
-    let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
-        .iter()
-        .map(|op| KeccakRoundOperation {
-            timestamp: op.timestamp,
-            input: op.input,
-            output: op.output,
-        })
-        .collect();
-    let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
-    let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
-    let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-    keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+    let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
+        (None, None, None, None);
+    let (mut loads_slot, mut lts_slot, mut shifts_slot, mut muls_slot) = (None, None, None, None);
+    let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
+        (None, None, None, None);
+    let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
+        (None, None, None, None);
+    let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
 
+    #[cfg(feature = "disk-spill")]
+    let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
+    #[cfg(not(feature = "disk-spill"))]
+    let sequential = cfg!(not(feature = "parallel"));
+
+    if !sequential {
+        #[cfg(feature = "parallel")]
+        rayon::scope(|s| {
+            macro_rules! spawn_into {
+                ($slot:ident, $gen:ident) => {{
+                    let slot = &mut $slot;
+                    s.spawn(move |_| *slot = Some($gen()));
+                }};
+            }
+            // Heaviest builds first so the scheduler overlaps them with the rest.
+            spawn_into!(memw_registers_slot, gen_memw_registers);
+            spawn_into!(cpus_slot, gen_cpus);
+            spawn_into!(memws_slot, gen_memws);
+            spawn_into!(lts_slot, gen_lts);
+            spawn_into!(decode_slot, gen_decode);
+            spawn_into!(branches_slot, gen_branches);
+            spawn_into!(bitwise_slot, gen_bitwise);
+            spawn_into!(muls_slot, gen_muls);
+            spawn_into!(memw_aligneds_slot, gen_memw_aligneds);
+            spawn_into!(loads_slot, gen_loads);
+            spawn_into!(shifts_slot, gen_shifts);
+            spawn_into!(dvrms_slot, gen_dvrms);
+            spawn_into!(pages_slot, gen_pages);
+            spawn_into!(keccak_slot, gen_keccak);
+            spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
+            spawn_into!(keccak_rc_slot, gen_keccak_rc);
+            spawn_into!(commit_slot, gen_commit);
+            spawn_into!(register_slot, gen_register);
+            spawn_into!(halt_slot, gen_halt);
+        });
+    } else {
+        cpus_slot = Some(gen_cpus());
+        memws_slot = Some(gen_memws());
+        memw_aligneds_slot = Some(gen_memw_aligneds());
+        memw_registers_slot = Some(gen_memw_registers());
+        loads_slot = Some(gen_loads());
+        lts_slot = Some(gen_lts());
+        shifts_slot = Some(gen_shifts());
+        muls_slot = Some(gen_muls());
+        dvrms_slot = Some(gen_dvrms());
+        branches_slot = Some(gen_branches());
+        bitwise_slot = Some(gen_bitwise());
+        decode_slot = Some(gen_decode());
+        commit_slot = Some(gen_commit());
+        keccak_slot = Some(gen_keccak());
+        keccak_rnd_slot = Some(gen_keccak_rnd());
+        keccak_rc_slot = Some(gen_keccak_rc());
+        pages_slot = Some(gen_pages());
+        register_slot = Some(gen_register());
+        halt_slot = Some(gen_halt());
+    }
+
+    const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
+    let cpus = cpus_slot.expect(PHASE5_RAN)?;
+    let memws = memws_slot.expect(PHASE5_RAN)?;
+    let memw_aligneds = memw_aligneds_slot.expect(PHASE5_RAN)?;
+    let memw_registers = memw_registers_slot.expect(PHASE5_RAN)?;
+    let loads = loads_slot.expect(PHASE5_RAN)?;
+    let lts = lts_slot.expect(PHASE5_RAN)?;
+    let shifts = shifts_slot.expect(PHASE5_RAN)?;
+    let muls = muls_slot.expect(PHASE5_RAN)?;
+    let dvrms = dvrms_slot.expect(PHASE5_RAN)?;
+    let branches = branches_slot.expect(PHASE5_RAN)?;
     #[allow(unused_mut)]
-    let (mut pages, page_configs, mut register_trace, mut halt_trace);
-    #[cfg(feature = "parallel")]
-    {
-        let ((pages_val, register_val), halt_val) = rayon::join(
-            || {
-                rayon::join(
-                    || match elf {
-                        Some(elf) => generate_page_tables(elf, memory_state, private_input),
-                        None => (Vec::new(), Vec::new()),
-                    },
-                    || register::generate_register_trace(&register_final_state, entry_point),
-                )
-            },
-            || halt::generate_halt_trace(halt_timestamp),
-        );
-        let (pages_v, page_configs_v) = pages_val;
-        pages = pages_v;
-        page_configs = page_configs_v;
-        register_trace = register_val;
-        halt_trace = halt_val;
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        match elf {
-            Some(elf) => {
-                let (p, c) = generate_page_tables(elf, memory_state, private_input);
-                pages = p;
-                page_configs = c;
-            }
-            None => {
-                pages = Vec::new();
-                page_configs = Vec::new();
-            }
-        }
-        register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp);
-    }
+    let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut decode = decode_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut commit_trace = commit_slot.expect(PHASE5_RAN);
+    let keccak_trace = keccak_slot.expect(PHASE5_RAN);
+    let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
+    let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut register_trace = register_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut halt_trace = halt_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -2585,6 +2674,7 @@ pub fn count_table_lengths(
         }
     };
 
+    let mut reg_memw_scratch: Vec<MemwOperation> = Vec::with_capacity(4);
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
@@ -2616,8 +2706,9 @@ pub fn count_table_lengths(
         }
 
         // Register accesses.
-        let reg_memw_ops = collect_register_ops_from_cpu(&cpu_op, &mut register_state);
-        for memw_op in &reg_memw_ops {
+        reg_memw_scratch.clear();
+        collect_register_ops_from_cpu(&cpu_op, &mut register_state, &mut reg_memw_scratch);
+        for memw_op in &reg_memw_scratch {
             partition_memw(
                 memw_op,
                 &mut memw_by_width,
