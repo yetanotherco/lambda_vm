@@ -28,7 +28,6 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
-#[cfg(test)]
 use executor::vm::registers::Registers;
 
 use super::page::STACK_TOP;
@@ -151,8 +150,8 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> HashMap<u64, u
 /// executor `Registers` (x1-x31, including SP) plus the program counter (x255).
 /// x0 and the synthetic commit index (x254) are zero in the naive version.
 ///
-/// Only used by tests until a production per-epoch prover wires it in.
-#[cfg(test)]
+/// Used by the continuation prover to start a non-first epoch from the previous
+/// epoch's boundary register snapshot.
 pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> HashMap<u64, u32> {
     let mut init = HashMap::new();
     for reg in 0u8..32 {
