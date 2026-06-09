@@ -1,12 +1,10 @@
 //! GPU error-path coverage. Forces math-cuda dispatches to return Err at
 //! chosen points and asserts the CPU fallback inside the dispatchers
 //! still produces a verifying proof. Distinct from
-//! `cuda_path_integration` (the happy-path GPU coverage); this file is
-//! exclusively about the error/fallback semantics.
+//! `cuda_path_integration`, which covers the happy path.
 //!
 //! Requires the `test-cuda-faults` feature, which compiles the fault-
-//! injection hook into math-cuda. Production builds leave that hook out
-//! entirely. Run with:
+//! injection hook into math-cuda. Run with:
 //!
 //! ```text
 //! cargo test -p lambda-vm-prover --release --features test-cuda-faults \
