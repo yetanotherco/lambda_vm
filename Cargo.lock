@@ -951,6 +951,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecsm"
+version = "0.1.0"
+dependencies = [
+ "num-bigint 0.4.6",
+ "num-traits",
+]
+
+[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1306,6 +1314,7 @@ dependencies = [
 name = "executor"
 version = "0.1.0"
 dependencies = [
+ "ecsm",
  "guest_program",
  "rkyv",
  "rustc-demangle",
@@ -1955,6 +1964,7 @@ dependencies = [
  "bincode",
  "criterion 0.5.1",
  "crypto",
+ "ecsm",
  "env_logger",
  "executor",
  "log",
