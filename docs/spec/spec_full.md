@@ -144,6 +144,33 @@ We present here a set of constraints on the `PAGE` table that
 
 For zero-initialized pages, `init` can be a constant `0`, and hence doesn't need a column, nor a range check.
 
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `offset` | `RowIndex` | The offset from the page base address. |
+| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
+| `fini` | `Byte` | The final value this address took |
+| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
+
+**Definition of `address`:**
+```
+address := page + offset * 1::DWordWL
+```
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `PAGE-C1` | `IS_BYTE<init>` |  |
+| `PAGE-C2` | `IS_BYTE<fini>` |  |
+| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
+| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |
+
 We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
 
 _"Free-zero" initialization_
@@ -240,6 +267,34 @@ It takes only one constraint to enforce that `X` must be either `0` or `1` whene
 ### Correctness argument
 
 If `cond` is `0`, [isbit:c:isbit] is trivially satisfied: `X` can assume any value and the polynomial constraint will evaluate to `0` regardless. When ``cond` eq.not 0`, it follows that the statement can only be proven when ``X` (1-`X`) equiv 0 mod p`, with `p` the modulus of the field. Because `BaseField` is a prime field, this equality is only satisfied if either ``X` equiv 0 mod p` or `1-`X` equiv 0 mod p`. Hence, it is proven that when ``cond` eq.not 0`, [isbit:c:isbit] is only satisfied if ``X` in {0, 1}`.
+
+---
+
+# IS_BYTE Template
+
+When a chip leverages this template twice or more, implementors are encouraged to merge pairs of  interactions with identical conditions into `ARE_BYTES` interactions; the  template is included for convenience of notation, and to complete the specification of chips that use an odd number of  range checks.
+
+## Variables
+
+The  template leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `X` | `BaseField` | Value for which to assert that it lies in the range $[0, 255]$. |
+
+### Condition
+
+| Name | Type | Description |
+|------|------|-------------|
+| `cond` | `BaseField` |  |
+
+## Constraints
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `IS_BYTE-C1` | `ARE_BYTES[0, X]` | cond |
 
 ---
 
@@ -417,342 +472,6 @@ It is worth noting that this construction does _not_ require the limbs of `neg` 
 
 ---
 
-# MEMW Chip
-
-The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
-
-## Variables
-
-The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `is_register` | `Bit` | Whether the address represents a register index |
-| `base_address` | `DWordWL` | The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access |
-| `value` | `BaseField[8]` | The values to store in memory. For RAM, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s |
-| `timestamp` | `DWordWL` | The timestamp at which this memory access occurs |
-| `write2` | `Bit` | Whether to write exactly 2 values |
-| `write4` | `Bit` | Whether to write exactly 4 values |
-| `write8` | `Bit` | Whether to write exactly 8 values |
-
-### Output
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old` | `BaseField[8]` | The old value written at `base_address`. See `value` for information about representation. Only the elements corresponding to the `writeN` bits are guaranteed |
-
-### Auxiliary
-
-| Name | Type | Description |
-|------|------|-------------|
-| `carry` | `Bit[7]` | Whether `base_address[0] + i + 1` $>= 2^32$ |
-| `old_timestamp` | `DWordWL[8]` | The timestamp at which address `base_address + i` was last accessed |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `w2` | `Bit` | writing at least 2 bytes |
-| `w4` | `Bit` | writing at least 4 bytes |
-| `address_add` | `DWordWL[7]` | `address_add[i] = base_address + i + 1` |
-| `μ_sum` | `Bit` |  |
-
-**Definition of `w2`:**
-```
-w2 := write2 + write4 + write8
-```
-
-**Definition of `w4`:**
-```
-w4 := write4 + write8
-```
-
-**Definition of `address_add`:**
-```
-address_add := ['arr', ['-', ['+', ['idx', 'base_address', 0], 'i', 1], ['*', ['^', 2, 32], ['idx', 'carry', 'i']]], ['+', ['idx', 'base_address', 1], ['idx', 'carry', 'i']]]
-```
-
-**Definition of `μ_sum`:**
-```
-μ_sum := μ_read + μ_write
-```
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
-| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
-
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
-| `MEMW-A2` |  | `IS_BIT<write2>` |
-| `MEMW-A3` |  | `IS_BIT<write4>` |
-| `MEMW-A4` |  | `IS_BIT<write8>` |
-| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
-| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns, as these are not necessary for the correctness of this chip in isolation. Still, these properties are necessary for the consistency of the system as a whole, and therefore we document it here, keeping the type information as a reading help.
-
-## Constraints
-
-Depending on the values of `write2`, `write4` and `write8`, the addresses following `base_address` need to be constructed. Rather than computing these in full (which would require the later addresses to be instantiated), it suffices to know the `carry`: the bit indicating whether ``base_address`_0 + t >= 2^32`, i.e., whether adding `t in [1, 7]` to `base_address` requires a carry from the lower to the upper limb. Note that it is safe for the prover to chose these bits: additions for which this bit is not correctly set will yield an address where either the lower or upper limb is out of bounds. As such, the constructed address will not match any existing memory tokens, which are only initialized for correctly formatted and range-checked doublewords (see [memory]).
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `MEMW-C1` |  | `IS_BIT<μ_read>` |  |
-| `MEMW-C2` |  | `IS_BIT<μ_write>` |  |
-| `MEMW-C3` |  | `IS_BIT<μ_sum>` |  |
-| `MEMW-C4` |  | `w2` => `μ_sum` |  |
-| | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C5.i` | i ∈ [0, 6] | `IS_BIT<carry[i]>` |  |
-| `MEMW-C6` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
-| `MEMW-C7` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
-| `MEMW-C8.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
-| `MEMW-C9.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
-
-As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures it is appropriately range checked (this assumes no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
-
-There is no need to check that the additions do not overflow, as our address calculations are not performed modulo `2^64` here, and any overflow will result in an address without matching initialization.
-
-The chip adds the following tuples to the lookup argument, to effectuate that part of the memory argument.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `MEMW-CM10` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
-| `MEMW-CM11` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM12` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM13` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM14.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM15.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM16.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM17.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
-
-This chip contributes the following to the lookup argument:
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW-CO18` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_read |
-| `MEMW-CO19` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_write |
-
-## Padding
-
-The table can be padded to the next power of two with the following value assignments:
-
-## Read-size aligned fast path
-
-When a memory access happens at an address with proper alignment for its access size (i.e., adding the access size to `base_address`'s lowest limb does not overflow), and all accessed elements were last accessed at the same timestamp, we can instead use the  chip to save on total column count. The saving comes from only requiring a single old timestamp to be stored, as well as being able to guarantee that all values of `add_limb_overflow` would be zero. A minor extra cost is introduced in the form of a check that the alignment is indeed correct, and the corresponding decomposition of the `base_address`.
-
-Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
-
-The  chip only needs  variables, expressed through  columns; it leverages  interactions.
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `is_register` | `Bit` | Whether the address represents a register index |
-| `base_address` | `DWordWHH` | The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access |
-| `value` | `BaseField[8]` | The values to store in memory. For regular memory, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s |
-| `timestamp` | `DWordWL` | The timestamp at which this memory access is said to occur |
-| `write2` | `Bit` | Whether to write exactly 2 values |
-| `write4` | `Bit` | Whether to write exactly 4 values |
-| `write8` | `Bit` | Whether to write exactly 8 values |
-
-### Output
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old` | `BaseField[8]` | The old value written at `base_address + i`. See `value` for information about representation. Only the elements corresponding to the `writeN` bits are guaranteed |
-
-### Auxiliary
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old_timestamp` | `DWordWL` | The timestamp at which the address was last accessed |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `w2` | `Bit` | writing at least 2 bytes |
-| `w4` | `Bit` | writing at least 4 bytes |
-| `μ_sum` | `Bit` |  |
-
-**Definition of `w2`:**
-```
-w2 := write2 + write4 + write8
-```
-
-**Definition of `w4`:**
-```
-w4 := write4 + write8
-```
-
-**Definition of `μ_sum`:**
-```
-μ_sum := μ_read + μ_write
-```
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
-| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MEMW_A-A1.i` | i ∈ [0, 1] | `IS_HALF[base_address[i]]` |
-| `MEMW_A-A2` |  | `IS_WORD[base_address[2]]` |
-| `MEMW_A-A3` |  | `IS_BIT<write2>` |
-| `MEMW_A-A4` |  | `IS_BIT<write4>` |
-| `MEMW_A-A5` |  | `IS_BIT<write8>` |
-| `MEMW_A-A6` |  | `IS_BIT<write2 + write4 + write8>` |
-| `MEMW_A-A7.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW_A-C1` | `IS_HALF[base_address[0] + write2 + 3 * write4 + 7 * write8]` | μ_sum |
-| `MEMW_A-C2` | `IS_BIT<μ_read>` |  |
-| `MEMW_A-C3` | `IS_BIT<μ_write>` |  |
-| `MEMW_A-C4` | `IS_BIT<μ_sum>` |  |
-| `MEMW_A-C5` | `w2` => `μ_sum` |  |
-| | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW_A-C6` | `LT[1; old_timestamp, timestamp, 0]` | μ_sum |
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `MEMW_A-CM7` |  | `memory[is_register, base_address::DWordWL, old_timestamp, old[0]]` | μ_sum |
-| `MEMW_A-CM8` |  | `memory[is_register, base_address::DWordWL, timestamp, value[0]]` | -μ_sum |
-| `MEMW_A-CM9` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, old_timestamp, old[1]]` | w2 |
-| `MEMW_A-CM10` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, timestamp, value[1]]` | -w2 |
-| `MEMW_A-CM11.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | w4 |
-| `MEMW_A-CM12.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -w4 |
-| `MEMW_A-CM13.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | write8 |
-| `MEMW_A-CM14.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -write8 |
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW_A-CO15` | `MEMW[old; is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_read |
-| `MEMW_A-CO16` | `MEMW[is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_write |
-
-### Padding
-
-The table can be padded to the next power of two with the following value assignments:
-
-## Register fast-path
-
-The  chip provides a fast-path for accessing registers. This fast-path leverages that registers + can be addressed using a `Byte`, rather than a full `DWord`, + are constantly accessed, i.e., ``timestamp` - `old_timestamp`` is small, and + have a fixed access pattern to achieve a footprint that is significantly smaller than both  and .
-
-Note: as a result of hard optimization, this chip can only be used for register accesses for which + ``timestamp` - `old_timestamp` in [1, 2^16]`, and + ``timestamp[0]` > `old_timestamp[0]`` If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
-
-Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide `2 dot `address`` in the lookup.
-
-### Variables
-
-The  chip is comprised of  variables that are expressed using  columns and leverages  interactions:
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `address` | `Byte` | address of the register being accessed |
-| `timestamp` | `DWordWL` | timestamp at which the access takes place |
-| `val` | `DWordWL` | value being written to this register |
-
-### Output
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old` | `DWordWL` | value of this register at `old_timestamp`. |
-
-### Auxiliary
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old_timestamp_lo` | `Word` | the lower limb of `old_timestamp` |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `old_timestamp` | `DWordWL` | timestamp at which this register was last accessed |
-| `μ_sum` | `Bit` |  |
-
-**Definition of `old_timestamp`:**
-```
-old_timestamp := ['arr', 'old_timestamp_lo', ['idx', 'timestamp', 1]]::DWordWL
-```
-
-**Definition of `μ_sum`:**
-```
-μ_sum := μ_read + μ_write
-```
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
-| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
-
-### Assumptions
-
-The following range checks are assumed to be performed/enforced outside of this chip:
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MEMW_R-A1.i` | i ∈ [0, 1] | `IS_WORD[val[i]]` |
-| `MEMW_R-A2.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-### Constraints
-
-Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
-
-Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW_R-C1` | `IS_HALF[timestamp[0] - old_timestamp[0] - 1]` | μ_sum |
-
-With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `MEMW_R-C2.i` | i ∈ [0, 1] | `memory[1, ['arr', ['cast', ['+', ['*', 2, 'address'], 'i'], 'Word'], 0], old_timestamp, old[i]]` | μ_sum |
-| `MEMW_R-C3.i` | i ∈ [0, 1] | `memory[1, ['arr', ['cast', ['+', ['*', 2, 'address'], 'i'], 'Word'], 0], timestamp, val[i]]` | -μ_sum |
-
-This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
-
-| Tag | Description |
-|-----|-------------|
-| `MEMW_R-C4` | `IS_BIT<μ_read>` |
-| `MEMW_R-C5` | `IS_BIT<μ_write>` |
-| `MEMW_R-C6` | `IS_BIT<μ_sum>` |
-
-Lastly, this chip contributes the following interactions to the logup:
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW_R-C7` | `MEMW[['arr', ['idx', 'old', 0], ['idx', 'old', 1], 0, 0, 0, 0, 0, 0]; 1, ['arr', ['cast', ['*', 2, 'address'], 'Word'], 0], ['arr', ['idx', 'val', 0], ['idx', 'val', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_read |
-| `MEMW_R-C8` | `MEMW[1, ['arr', ['cast', ['*', 2, 'address'], 'Word'], 0], ['arr', ['idx', 'val', 0], ['idx', 'val', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_write |
-
-### Padding
-
-The table can be padded to the next power of two with the following value assignments:
-
-## Notes/optimizations
-
-The following ideas may prove to be optimizations for the // chip: - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
-
----
-
 # DECODE Table
 
 All `RV64IMC` instruction are to be decoded to a format that can be interpreted by the VM. This section outlines the decoding table being used in the VM. For reasons of efficiency, data in this table is significantly compressed. Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it. Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
@@ -766,7 +485,7 @@ The  table is comprised of  variables that are expressed using  columns:
 | Name | Type | Description |
 |------|------|-------------|
 | `pc` | `DWordWL` | value of the program counter this instruction is associated with. |
-| `packed_decode` | `BaseField` | Ordered concatenation of several small variables. The `decode (uncompressed)` section explains the purpose of each variable.\ A list of each variable and the bit(-range) in which it is located:\ [0] `read_register1`, \ [1] `read_register2`, \ [2] `write_register`, \ [3] `memory_2bytes`, \ [4] `memory_4bytes`, \ [5] `memory_8bytes`, \ [6] `c_type`, \ [7] `signed`, \ [8] `mp_selector`, \ [9] `muldiv_selector`, \ [10] `word_instr`, \ [11] `ADD`, \ [12] `SUB`, \ [13] `SLT`, \ [14] `AND`, \ [15] `OR`, \ [16] `XOR`, \ [17] `SHIFT`, \ [18] `JALR`, \ [19] `BEQ`, \ [20] `BLT`, \ [21] `LOAD`, \ [22] `STORE`, \ [23] `MUL`, \ [24] `DIVREM`, \ [25] `ECALL`, \ [26] `EBREAK`; \ [27:35] `rs1`, \ [35:43] `rs2`, \ [43:51] `rd`, \ the remaining bits are set to zero.  |
+| `packed_decode` | `BaseField` | Ordered concatenation of several small variables. The `decode (uncompressed)` section explains the purpose of each variable.\ A list of each variable and the bit(-range) in which it is located:\ [0] `read_register1`, \ [1] `read_register2`, \ [2] `write_register`, \ [3] `word_instr`, \ [4] `ALU`, \ [5] `ADD`, \ [6] `SUB`, \ [7] `MEMORY`, \ [8] `BRANCH`, \ [9] `ECALL`, \ [10:17] `rs1`, \ [18:25] `rs2`, \ [26:33] `rd`, \ [34:41] `half_instruction_length`, \ [42:49] `alu_flags`, \ [50:57] `mem_flags`, \ the remaining bits are set to zero.  |
 | `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
 
 ### Multiplicity
@@ -779,11 +498,18 @@ The  table is comprised of  variables that are expressed using  columns:
 
 The  table must be padded to a length that is a power of two. Empty rows with the following content can be added to achieve this:
 
-Note that this row sets the `EBREAK` flag. Given that `CPU` asserts that `EBREAK = 0` (see [cpu:c:ebreak_traps]), using this "padding-instruction" would immediately make the CPU table unprovable. Note moreover that the `pc` is set to `7`. This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _`4`_ (i.e., the max `pc`-increment) greater than _`1`_ (i.e., the `pc`-value used in the [additional instruction] referred to by `CPU`-padding lines).
+| Column | Padding value |
+|--------|---------------|
+| `pc` | `1` |
+| `packed_decode` | `0` |
+| `imm` | `0` |
+| `μ` | `0` |
+
+This is simultaneously the row that is used for padding rows in the CPU, if the multiplicity is nonzero, so we need to ensure that this table has at least one row of padding.
 
 ## Decoding<decode:decoding-overview>
 
-For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
+For the purposes of explaining decoding, we decompress 's `packed_decode` variable into its constituent variables. Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation. The construction of the `alu_flags` and `mem_flags` columns is given here through virtual columns.
 
 ### Output
 
@@ -795,32 +521,49 @@ For the purposes of explaining decoding, we decompress 's `packed_decode` variab
 | `rd` | `Byte` | index of destination register. |
 | `read_register1` | `Bit` | whether to load the contents of address `rs1` (1) or `0` (0) into `rv1`. |
 | `read_register2` | `Bit` | whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`. |
-| `write_register` | `Bit` | whether the result should be written to `rd` ($=0$ for memory write and when $`rd` = `x0`$. |
+| `write_register` | `Bit` | whether the result should be written to `rd` ($=0$ for memory write and when $`rd` = `x0`)$. |
+| `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
+| `word_instr` | `Bit` | Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended. |
+| `ALU` | `Bit` | Enable the ALU |
+| `ADD` | `Bit` | ALU does an ADD |
+| `SUB` | `Bit` | ALU does a SUB |
+| `BRANCH` | `Bit` | The instruction is a branch |
+| `MEMORY` | `Bit` | The instruction is a memory access |
+| `ECALL` | `Bit` | Perform an ECALL |
+| `half_instruction_length` | `Byte` | Half of how many bytes this instruction takes up in the program |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `alu_op` | `B4` | Operation selector value for the ALU |
+| `signed` | `Bit` | selector used to indicate signed or unsigned input interpretation. |
+| `signed2` | `Bit` | A second signed bit, useful for MUL instructions |
+| `muldiv_selector` | `Bit` | selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted. |
+| `invert` | `Bit` | Instructs the EQ or LT chip to invert its result, or inverts the direction of the SHIFT chip (right instead of left) |
+| `memory_op` | `Bit` | Selects whether to LOAD (0) or STORE (1) |
 | `mem_2B` | `Bit` | whether the memory access (read or write) touches exactly $2$ bytes. |
 | `mem_4B` | `Bit` | whether the memory access (read or write) touches exactly $4$ bytes. |
 | `mem_8B` | `Bit` | whether the memory access (read or write) touches exactly $8$ bytes. |
-| `c_type` | `Bit` | Whether the instruction is of type `C`, i.e., whether it is $2$ bytes long instead of $4$. |
-| `imm` | `DWordWL` | the *fully extended (!)* 64-bit version of the immediate. |
-| `signed` | `Bit` | selector used to indicate signed or unsigned input interpretation. |
-| `mp_selector` | `Bit` | Multi-purpose selector used by the CPU to to configure several ALU operations in different ways.            See the `CPU` chip for more details. |
-| `muldiv_selector` | `Bit` | selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted. |
-| `word_instr` | `Bit` | Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended. |
-| `ADD` | `Bit` | ALU selector flag |
-| `SUB` | `Bit` | ALU selector flag |
-| `SLT` | `Bit` | ALU selector flag |
-| `AND` | `Bit` | ALU selector flag |
-| `OR` | `Bit` | ALU selector flag |
-| `XOR` | `Bit` | ALU selector flag |
-| `SHIFT` | `Bit` | ALU selector flag |
-| `JALR` | `Bit` | ALU selector flag |
-| `BEQ` | `Bit` | ALU selector flag |
-| `BLT` | `Bit` | ALU selector flag |
-| `LOAD` | `Bit` | ALU selector flag |
-| `STORE` | `Bit` | ALU selector flag |
-| `MUL` | `Bit` | ALU selector flag |
-| `DIVREM` | `Bit` | ALU selector flag |
-| `ECALL` | `Bit` | ALU selector flag |
-| `EBREAK` | `Bit` | ALU selector flag |
+| `mem_signed` | `Bit` | Whether the memory operation is a signed one, this is distinct from `signed` to enable the `JALR` flag to alias `mem_flags` |
+| `JALR` | `Bit` | The branch is a JAL(R) |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `alu_flags` | `Byte` | The combined ALU flags |
+| `mem_flags` | `Byte` | The combined memory flags (or JALR when BRANCHing) |
+
+**Definition of `alu_flags`:**
+```
+alu_flags := alu_op + 32 * signed + 64 * (signed2 + invert) + 128 * muldiv_selector
+```
+
+**Definition of `mem_flags`:**
+```
+mem_flags := JALR + memory_op + 2 * mem_signed + 4 * mem_2B + 8 * mem_4B + 16 * mem_8B
+```
 
 ### Multiplicity
 
@@ -828,9 +571,13 @@ For the purposes of explaining decoding, we decompress 's `packed_decode` variab
 |------|------|-------------|
 | `μ` | `BaseField` | The multiplicity with which this instruction is looked up in the `CPU` table. |
 
-We will illustrate how each instruction should be expressed in this (uncompressed) decoding table. The columns of the accompanying table represent the following: - *`operation`*: the assembly operation being encoded. - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one. - *`w_instr`*, *`signed`*: whether to set the `word_instr` and `signed` flags, respectively. - *other*: the other flags that should be set or variables that should be given specific values.
+First, we provide a mapping from an an ALU operation "descriptor" to the numerical value as used for the `alu_op` column. This is the table used to find the value for the ) notation when performing `ALU` or `BYTE_ALU` interactions.
 
-For the purpose of brevity and readability, the table uses the following rules-of-thumb: + `rd`, `rs1`, `rs2`, and `imm` are mapped to the values provided by the instruction; when a value is not specified by an instruction it defaults to `0`. + `read_register1`, `read_register2` and `write_register` are set to `1` when respectively ``rs1` != 0`, ``rs2` != 0`, or  ``rd` != 0`. + Any flag that is not listed is set to `0`, with the exception of the `c_type` flag. *The `c_type` flag is set independently of the below table*, as explained next.
+table(columns: (auto, auto), stroke: 0pt, inset: (right: .5em), align: (left, left), table.header[*Descriptor*][*value*], table.hline(stroke: 1.5pt))[ *AND*][0][ *OR*][1][ *XOR*][2][ *EQ*][3][ *LT*][4][ *SHIFT*][5][ *SHIFTW*][6][ *MUL*][7][ *DIVREM*][8]
+
+We will illustrate how each instruction should be expressed in this (uncompressed) decoding table. The columns of the accompanying table represent the following: - *`operation`*: the assembly operation being encoded. - *`alu`*: Set to the descriptor of the ALU operation to be used for `alu_op`. If listed as `ADD` or `SUB`, the corresponding flag should be set, otherwise set `ALU = 1` when this column is not empty. - *`w_instr`*, *`signed`*: whether to set the `word_instr` and `signed` flags, respectively. - *other*: the other flags that should be set or variables that should be given specific values.
+
+For the purpose of brevity and readability, the table uses the following rules-of-thumb: + `rd`, `rs1`, `rs2`, and `imm` are mapped to the values provided by the instruction; when a value is not specified by an instruction it defaults to `0`. + `read_register1`, `read_register2` and `write_register` are set to `1` when respectively ``rs1` != 0`, ``rs2` != 0`, or  ``rd` != 0`.
 
 Further clarification is provided in the notes following the table.
 
@@ -840,13 +587,15 @@ super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
 
 show figure: set block(breakable: true)
 
-figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), )) }
+figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*alu*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*alu*], [*`w_instr`*], [*`signed`*], [*other*]), )) }
 
-// OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
+// OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`LT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [`invert`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`LT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [`invert`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`signed2`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`signed2`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [], [], [], [`BRANCH`, `JALR`, `rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [], [], [], [`BRANCH`, `JALR`], []), ([`BEQ      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`], []), ([`BNE      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`, `invert`], []), ([`BLT[U]   rs1, rs2, imm`], [`LT`], [], [.not`[U]`], [`BRANCH`], []), ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [.not`[U]`], [`BRANCH`, `invert`], []), // LOAD ([`LD        rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `.not`[U]`, `mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `.not`[U]`, `mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `.not`[U]`], []), // STORE ([`SD       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_8B`], []), ([`SW       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_4B`], []), ([`SH       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_2B`], []), ([`SB       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`], []), // ECALL/EBREAK ([`ECALL`], [], [], [], [`ECALL`, ``rs1` := `x17``], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
+
+Note that the above table has no entry for the `EBREAK` instruction. We treat `EBREAK` as an unprovable trap, and its absence from the table enables this by having no valid decoding available for when the instruction is encountered.
 
 ### C-type instructions
 
-The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
+The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. As such, we provide the `half_instruction_length` column that *must take on the value `1` for compressed instructions and `2` for regular instructions*. It is represented as half the number of bytes in the instruction to make misaligned instructions lengths unrepresentable. Additionally, having the variable opens the door for future optimizations involving "fused" instructions, where common sequences of instructions are merged into a single decoded version and need only a single CPU row to prove.
 
 // Construct a note that can be referenced through `lbl`
 
@@ -856,19 +605,13 @@ show figure: (it) => align(left, []) [ ] }
 
 We note the following about the above decoding table:
 
-enum.item( referenceable_note( "note_word_instr", [`word_instr`: `[W]` indicates that ``word_instr` = 1` for the `W`-variant of the operation, and `0` for the non-`W`-variant.] ), enum.item( referenceable_note( "note_signed", [`signed`: .not`[U]` indicates that ``signed` = 1` for the *non-`U`*-variant of the operation, and `0` for the `U`-variant.] ), enum.item( referenceable_note( "note-lui", [`LUI`: this operation loads the 20-bit `imm` in the upper bits of `rd`. Observe that this can be represented using `ADDI rd, x0, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-auipc", [`AUIPC`: this operation adds the 20-bit immediate to the upper bits of `pc` and stores the result in `rd`. Given that the `pc` is stored in `x255`, this operation can be represented using `ADDI rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-jal", [`JAL`: this operation stores ``pc` + 4` in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`. Note that this can be represented using `JALR rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[1:21]` of `imm` and extending it to 64 bits; the least significant bit should always be 0.*] ), enum.item( referenceable_note( "note-ecall", [`ECALL`: "On RISC-V a system call has its own instruction: `ECALL`. [...] A7 [= register `x17`] contains the system call number." [[source]] ] ), enum.item( referenceable_note( "note-fence", [`FENCE`: currently, the VM interprets this operation as `ADDI x0 x0 0`; a no-op.]
-
-### One more instruction <cpu-padding-decode-row>
-
-In addition to decoding all instructions provided in the ELF and adding a corresponding entry to the  table, one must include an entry that has ``pc` = 1` and every other variable set to `0`. Note that this will never conflict with any entry in the ELF, since it has an odd `pc` value.
-
-This entry is used to pad the `CPU` table. More details on this matter are provided in the `CPU` chip.
+enum.item( referenceable_note( "note_word_instr", [`word_instr`: `[W]` indicates that ``word_instr` = 1` for the `W`-variant of the operation, and `0` for the non-`W`-variant. Similarly, `SHIFT[W]` indicates the `SHIFTW` operation for the `W`-variant, and `SHIFT` otherwise.] ), enum.item( referenceable_note( "note_signed", [`signed`: .not`[U]` indicates that ``signed` = 1` for the *non-`U`*-variant of the operation, and `0` for the `U`-variant.] ), enum.item( referenceable_note( "note-lui", [`LUI`: this operation loads the 20-bit `imm` in the upper bits of `rd`. Observe that this can be represented using `ADDI rd, x0, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-auipc", [`AUIPC`: this operation adds the 20-bit immediate to the upper bits of `pc` and stores the result in `rd`. Given that the `pc` is stored in `x255`, this operation can be represented using `ADDI rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[12:32]` of `imm` and extending it to 64 bits.*] ), enum.item( referenceable_note( "note-jal", [`JAL`: this operation stores ``pc` + `2 * half_instruction_length`` in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`. Note that this can be represented using `JALR rd, x255, imm`. As such, *we expect the decoding to take care of writing the immediate in bit range `[1:21]` of `imm` and extending it to 64 bits; the least significant bit should always be 0.*] ), enum.item( referenceable_note( "note-ecall", [`ECALL`: "On RISC-V a system call has its own instruction: `ECALL`. [...] A7 [= register `x17`] contains the system call number." [[source]] ] ), enum.item( referenceable_note( "note-fence", [`FENCE`: currently, the VM interprets this operation as `ADDI x0 x0 0`; a no-op.]
 
 ---
 
 # CPU Chip
 
-The  chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations. It bases its decisions on the entry of the `DECODE` table ([decode]) corresponding the the current program counter (PC).
+The  chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations. It bases its decisions on the entry of the `DECODE` table ([decode]) corresponding the current program counter (PC).
 
 ## Variables
 
@@ -878,7 +621,7 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 
 | Name | Type | Description |
 |------|------|-------------|
-| `timestamp` | `Timestamp` | A preprocessed timestamp to coordinate the memory argument. Since we have at most 3 non-disjoint memory accesses (`(rs1, rs2, rd)`, `(rs1, pc, pc)`, `(LOAD)` or `(STORE)`) a maximum of 4 slots is enough. |
+| `timestamp` | `Timestamp` | A preprocessed timestamp to coordinate the memory argument. Since we have at most 3 non-disjoint memory accesses (`(rs1, rs2, rd)`, `(rs1, pc, pc)`, `MEMORY`) a maximum of 4 slots is enough. |
 | `pc` | `DWordWL` | The program counter |
 | `rs1` | `Byte` | Source register 1 index |
 | `rs2` | `Byte` | Source register 2 index |
@@ -886,31 +629,17 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 | `read_register1` | `Bit` | Whether to read from `rs1` (1) or to place a 0 in `rv1` (0) |
 | `read_register2` | `Bit` | Whether to read from `rs2` (1) or to place a 0 in `rv2` (0) |
 | `write_register` | `Bit` | Whether to write back to the destination register |
-| `memory_2bytes` | `Bit` | Whether the memory access (read or write) touches exactly 2 bytes |
-| `memory_4bytes` | `Bit` | Whether the memory access (read or write) touches exactly 4 bytes |
-| `memory_8bytes` | `Bit` | Whether the memory access (read or write) touches exactly 8 bytes |
-| `c_type_instruction` | `Bit` | Whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4 |
 | `imm` | `DWordWL` | The fully extended 64-bit version of the immediate |
-| `signed` | `Bit` | Indicates whether we're dealing with a signed or unsigned instruction |
-| `mp_selector` | `Bit` | Multi-purpose selector used by different ALU operations for different purposes. Currently, it is used     - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and     - as flag for inverting the condition of conditional branches (see `branch_cond`)     - as direction (left or right) for `SHIFT` |
-| `muldiv_selector` | `Bit` | Selects which output of `MUL` (lo/hi) or `DIV` (quo/rem) is wanted |
+| `half_instruction_length` | `Byte` | Half the number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long (= 1) instead of 4 (= 2) |
 | `word_instr` | `Bit` | Whether the instruction is a \*W instruction, requiring the inputs and outputs to be (sign) extended |
-| `ADD` | `Bit` | One-hot ALU selector flag |
-| `SUB` | `Bit` | One-hot ALU selector flag |
-| `SLT` | `Bit` | One-hot ALU selector flag |
-| `AND` | `Bit` | One-hot ALU selector flag |
-| `OR` | `Bit` | One-hot ALU selector flag |
-| `XOR` | `Bit` | One-hot ALU selector flag |
-| `SHIFT` | `Bit` | One-hot ALU selector flag |
-| `JALR` | `Bit` | One-hot ALU selector flag |
-| `BEQ` | `Bit` | One-hot ALU selector flag |
-| `BLT` | `Bit` | One-hot ALU selector flag |
-| `LOAD` | `Bit` | One-hot ALU selector flag |
-| `STORE` | `Bit` | One-hot ALU selector flag |
-| `MUL` | `Bit` | One-hot ALU selector flag |
-| `DIVREM` | `Bit` | One-hot ALU selector flag |
-| `ECALL` | `Bit` | One-hot ALU selector flag |
-| `EBREAK` | `Bit` | One-hot ALU selector flag |
+| `ALU` | `Bit` | Whether to use the ALU for this instruction |
+| `alu_flags` | `Byte` | The ALU operation + flags (interpreting things as signed/unsigned, choosing the MUL/DVRM output, ...) to pass to the ALU |
+| `ADD` | `Bit` | Addition fast-path bypassing the ALU |
+| `SUB` | `Bit` | Subtraction fast-path bypassing the ALU |
+| `MEMORY` | `Bit` | Whether this instruction touches memory (LOAD/STORE) |
+| `mem_flags` | `Byte` | The flags to pass for MEMORY operations (LOAD vs STORE, number of bytes touched, signed) |
+| `BRANCH` | `Bit` | Whether this instruction is a conditional branch (BLT, BEQ) |
+| `ECALL` | `Bit` | Whether this instruction is an ECALL |
 
 ### Output
 
@@ -925,190 +654,376 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 |------|------|-------------|
 | `prev_pc_timestamp_borrow` | `Bit` | The borrow bit for computing the previous timestamp the PC was accessed |
 | `pc_double_read` | `Bit` | Whether the PC is being read as a general purpose register (`rs1`) this cycle |
-| `rv1` | `DWordWHH` | The value of register `rs1` |
-| `rv2` | `DWordWHH` | The value of register `rs2` |
-| `rv1_ext_bit` | `Bit` | The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr` |
-| `arg1` | `DWordBL` | The extended version of `rv1`, depending on `word_instr` |
-| `rv2_ext_bit` | `Bit` | The sign bit of `rv2` if seen as a 32-bit word, used for sign extension with `word_instr` |
-| `arg2` | `DWordBL` | A multiplexed version of `rv2` and `imm`, to be used as second argument to ALU calls |
-| `res_ext_bit` | `Bit` | The sign bit of `res`, if seen as a 32-bit word, used for sign extension with `word_instr` |
-| `res` | `DWordBL` | The ALU result |
-| `is_equal` | `Bit` | Whether `rv1` and `arg2` are equal |
-| `branch_cond` | `Bit` | Whether a branch is taken, i.e., the branch condition |
+| `rv1` | `DWordWL` | The value of register `rs1` |
+| `rv2` | `DWordWL` | The value of register `rs2` |
+| `arg2` | `DWordWL` | A multiplexed version of `rv2` and `imm`, to be used as second argument to ALU calls |
+| `res` | `DWordHL` | The ALU result |
+| `branch_cond` | `Bit` | Whether a branch is taken: the branch condition evaluates to true, or we are doing an unconditional jump |
 
 ### Virtual
 
 | Name | Type | Description |
 |------|------|-------------|
+| `JALR` | `Bit` | Read whether our BRANCH corresponds to a JAL(R) instruction from `mem_flags`, as `MEMORY` and `BRANCH` are mutually exclusive |
 | `packed_decode` | `BaseField` | A packed representation of all bit flags and register indices obtained from the decoding |
-| `pad` | `Bit` | When no flags are set, we must be in a padding row. |
+
+**Definition of `JALR`:**
+```
+JALR := mem_flags
+```
 
 **Definition of `packed_decode`:**
 ```
-packed_decode := 2^0 * read_register1 + 2^1 * read_register2 + 2^2 * write_register + 2^3 * memory_2bytes + 2^4 * memory_4bytes + 2^5 * memory_8bytes + 2^6 * c_type_instruction + 2^7 * signed + 2^8 * mp_selector + 2^9 * muldiv_selector + 2^10 * word_instr + 2^11 * ADD + 2^12 * SUB + 2^13 * SLT + 2^14 * AND + 2^15 * OR + 2^16 * XOR + 2^17 * SHIFT + 2^18 * JALR + 2^19 * BEQ + 2^20 * BLT + 2^21 * LOAD + 2^22 * STORE + 2^23 * MUL + 2^24 * DIVREM + 2^25 * ECALL + 2^26 * EBREAK + 2^27 * rs1 + 2^35 * rs2 + 2^43 * rd
-```
-
-**Definition of `pad`:**
-```
-pad := 1 - ADD - SUB - SLT - AND - OR - XOR - SHIFT - JALR - BEQ - BLT - LOAD - STORE - MUL - DIVREM - ECALL - EBREAK
+packed_decode := 2^0 * read_register1 + 2^1 * read_register2 + 2^2 * write_register + 2^3 * word_instr + 2^4 * ALU + 2^5 * ADD + 2^6 * SUB + 2^7 * MEMORY + 2^8 * BRANCH + 2^9 * ECALL + 2^10 * rs1 + 2^18 * rs2 + 2^26 * rd + 2^34 * half_instruction_length + 2^42 * alu_flags + 2^50 * mem_flags
 ```
 
 ## Assumptions
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `CPU-A1` |  | At most one ALU selector flag is 1 by the decoding, and every other flag is 0. |
-| `CPU-A2` |  | When `STORE + LOAD + BEQ + BLT = 0`, either `rs2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`. |
+| `CPU-A1` |  | `MEMORY` and `BRANCH` are mutually exclusive |
+| `CPU-A2` |  | When `MEMORY + BRANCH = 0`, either `read_register2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`. |
+| `CPU-A3` |  | $#`!MEMORY` => #`IS_BIT<mem_flags>`$ |
 
-## Constraints
-
-First, we perform a decoding lookup for the current PC.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `CPU-C1` | `DECODE[pc, imm, packed_decode]` | 1 |
-
-### Range checks
-
-> **Note:** Make sure we argue for every column here
-
-> **Note:** is `rvd` still sufficiently constrained? (can also be done through the memory argument like `pc`?)
-
-We constrain all columns to have the appropriate ranges. The flags and register indices looked up from the decoding need to be checked, as they are communicated through the interaction in a packed form. In contrast, we know ahead of time that decoding will ensure proper range checks for `pc` and `imm`. Similarly, since `next_pc` will propagate through the memory argument and be looked up in the instruction decoding on the next cycle, it is forced to be in the correct range. For the auxiliary columns, we need to check the limbs of `arg1`, `arg2`, and `res`. The ranges of the other auxiliary columns are enforced through later constraints.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `CPU-CR2` |  | `IS_BIT<read_register1>` |  |
-| `CPU-CR3` |  | `IS_BIT<read_register2>` |  |
-| `CPU-CR4` |  | `IS_BIT<write_register>` |  |
-| `CPU-CR5` |  | `IS_BIT<memory_2bytes>` |  |
-| `CPU-CR6` |  | `IS_BIT<memory_4bytes>` |  |
-| `CPU-CR7` |  | `IS_BIT<memory_8bytes>` |  |
-| `CPU-CR8` |  | `IS_BIT<c_type_instruction>` |  |
-| `CPU-CR9` |  | `IS_BIT<signed>` |  |
-| `CPU-CR10` |  | `IS_BIT<mp_selector>` |  |
-| `CPU-CR11` |  | `IS_BIT<muldiv_selector>` |  |
-| `CPU-CR12` |  | `IS_BIT<word_instr>` |  |
-| `CPU-CR13` |  | `IS_BIT<ADD>` |  |
-| `CPU-CR14` |  | `IS_BIT<SUB>` |  |
-| `CPU-CR15` |  | `IS_BIT<SLT>` |  |
-| `CPU-CR16` |  | `IS_BIT<AND>` |  |
-| `CPU-CR17` |  | `IS_BIT<OR>` |  |
-| `CPU-CR18` |  | `IS_BIT<XOR>` |  |
-| `CPU-CR19` |  | `IS_BIT<SHIFT>` |  |
-| `CPU-CR20` |  | `IS_BIT<JALR>` |  |
-| `CPU-CR21` |  | `IS_BIT<BEQ>` |  |
-| `CPU-CR22` |  | `IS_BIT<BLT>` |  |
-| `CPU-CR23` |  | `IS_BIT<LOAD>` |  |
-| `CPU-CR24` |  | `IS_BIT<STORE>` |  |
-| `CPU-CR25` |  | `IS_BIT<MUL>` |  |
-| `CPU-CR26` |  | `IS_BIT<DIVREM>` |  |
-| `CPU-CR27` |  | `IS_BIT<ECALL>` |  |
-| `CPU-CR28` |  | `IS_BIT<EBREAK>` |  |
-| `CPU-CR29` |  | `IS_BYTE[rs1]` | 1 |
-| `CPU-CR30` |  | `IS_BYTE[rs2]` | 1 |
-| `CPU-CR31` |  | `IS_BYTE[rd]` | 1 |
-| `CPU-CR32.i` | i ∈ [0, 7] | `IS_BYTE[arg1[i]]` | 1 |
-| `CPU-CR33.i` | i ∈ [0, 7] | `IS_BYTE[arg2[i]]` | 1 |
-| `CPU-CR34.i` | i ∈ [0, 7] | `IS_BYTE[res[i]]` | 1 |
-
-### ALU
-
-The ALU functionality is then obtained through judicious dispatching to the corresponding chips.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `CPU-CA35` |  | ADD + LOAD ⇒ `ADD<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
-| `CPU-CA36` |  | STORE ⇒ `ADD<res::DWordWL; arg1::DWordWL, imm>` |  |
-| `CPU-CA37` |  | SUB + BEQ ⇒ `SUB<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
-| `CPU-CA38` |  | `LT[res[0]; arg1::DWordWL, arg2::DWordWL, signed]` | SLT + BLT |
-| `CPU-CA39.i` | i ∈ [1, 7] | `SLT` + `BLT` => `res[i]` = 0 |  |
-| | | _polynomial:_ `(SLT + BLT) * res[i] = 0` | |
-| `CPU-CA40.i` | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
-| `CPU-CA41.i` | i ∈ [0, 7] | `OR_BYTE[res[i]; arg1[i], arg2[i]]` | OR |
-| `CPU-CA42.i` | i ∈ [0, 7] | `XOR_BYTE[res[i]; arg1[i], arg2[i]]` | XOR |
-| `CPU-CA43` |  | `SHIFT[res::DWordWL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
-| `CPU-CA44` |  | JALR ⇒ `ADD<res::DWordWL; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
-| `CPU-CA45` |  | `MUL[res::DWordWL; arg1::DWordHL, signed, arg2::DWordHL, mp_selector, muldiv_selector]` | MUL |
-| `CPU-CA46` |  | `DVRM[res::DWordWL; arg1::DWordHL, arg2::DWordHL, signed, muldiv_selector]` | DIVREM |
-
-### Memory<cpu:memory>
-
-The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled. Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs. The `pc` register behaves very predictably with respect to its timestamps and when it is being read, so for performance reasons, we inline its memory interactions directly into the  chip.
-
-Potentially overlapping memory accesses are ensured to have disjoint timestamps. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction (see [cpu:c:read_rv1] and [decode]:decoding-overview). Constraints regarding whether `pc_double_read` corresponds to an `AUIPC` instruction are not necessary, as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp, and the integrity of the memory argument therefore ensures the correctness of this bit.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `CPU-CM47` |  | `MEMW[['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs1, ['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
-| `CPU-CM48.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
-| | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
-| `CPU-CM49` |  | `MEMW[['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs2, ['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
-| `CPU-CM50.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
-| | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
-| `CPU-CM51` |  | `MEMW[1, 2::DWordWL * rd, ['arr', ['idx', 'rvd', 0], ['idx', 'rvd', 1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
-| `CPU-CM52` |  | `LOAD[rvd; res::DWordWL, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
-| `CPU-CM53` |  | `MEMW[0, res::DWordWL, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM54` |  | `IS_BIT<pc_double_read>` |  |
-| `CPU-CM55` |  | `IS_BIT<prev_pc_timestamp_borrow>` |  |
-| `CPU-CM56.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], ['arr', ['+', ['-', ['idx', 'timestamp', 0], ['*', 3, ['not', 'pc_double_read']]], ['*', ['^', 2, 32], 'prev_pc_timestamp_borrow']], ['-', ['idx', 'timestamp', 1], 'prev_pc_timestamp_borrow']], pc[i]]` | 1 - pad |
-| `CPU-CM57.i` | i ∈ [0, 1] | `memory[1, ['arr', ['+', ['*', 2, 255], 'i'], 0], timestamp + 1::DWordWL, next_pc[i]]` | -(1 - pad) |
-
-#### Potential optimizations
-
-- `double_pc_read` could be integrated into decoding, so that `AUIPC` could set `read_register1 = 0` and no extra MEMW access for `rv1` is needed at this point.
-
-### System
-
-The interactions with the wider system.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `CPU-CS58` | `!EBREAK` |  |
-| | _polynomial:_ `1 - EBREAK = 0` | |
-| `CPU-CS59` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
-
-### Input and output to the ALU
-
-We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values, including the appropriate sign/zero extension, depending on `word_instr`.
+Additionally, the following constraints can be used to provide defense-in-depth validation of the assumptions.
 
 | Tag | Description |
 |-----|-------------|
-| `CPU-CE60` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
-| `CPU-CE61` | `arg1[:4]` = `rv1[:2]` |
-| | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` |
-| `CPU-CE62` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
-| | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_ext_bit * (2^32 - 1) = 0` |
-| `CPU-CE63` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
-| `CPU-CE64` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
-| | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` |
-| `CPU-CE65` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
-| | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * rv2_ext_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` |
-| `CPU-CE66` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
-| `CPU-CE67` | `!LOAD` => `rvd[0]` = `res[:4]` |
-| | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` |
-| `CPU-CE68` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
-| | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_ext_bit * (2^32 - 1)) = 0` |
+| `CPU-C1` | not (`MEMORY` and `BRANCH`) |
+| | _polynomial:_ `MEMORY * BRANCH = 0` |
+| `CPU-C2` | (1 - `MEMORY` - `BRANCH`) => (`read_register2` = 0 or `imm[i]` = 0) |
+| | _polynomial:_ `(1 - MEMORY - BRANCH) * read_register2 * (imm[0] + imm[1]) = 0` |
+| `CPU-C3` | 1 - MEMORY ⇒ `IS_BIT<mem_flags>` |
 
-### Other constraints
+## Constraints
 
-For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference between `arg1` and `arg2` whenever `BEQ` is `1`. Given that this difference is `0` when both are equal, [cpu:c:is_equal] ensures `is_equal` is set to `1` if and only if ``arg1` = `arg2`` and `BEQ` is set.
+First, we perform a decoding lookup for the current PC. Instructions having the `word_instr` flag set are not decoded here, as they are delegated to the `CPU32` chip. In that case, we ensure that the current row of the CPU cannot have any other observable effects.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CO69` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
-| `CPU-CO70` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
-| | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO71` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
-| `CPU-CO72` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
+| `CPU-C4` | `DECODE[pc, imm, packed_decode]` | 1 - word_instr |
+| `CPU-C5` | `word_instr` => `MEMORY = 0` |  |
+| | _polynomial:_ `word_instr * MEMORY = 0` | |
+| `CPU-C6` | `word_instr` => `BRANCH = 0` |  |
+| | _polynomial:_ `word_instr * BRANCH = 0` | |
+| `CPU-C7` | `word_instr` => `ECALL = 0` |  |
+| | _polynomial:_ `word_instr * ECALL = 0` | |
+| `CPU-C8` | `word_instr` => `read_register1 = 0` |  |
+| | _polynomial:_ `word_instr * read_register1 = 0` | |
+| `CPU-C9` | `word_instr` => `read_register2 = 0` |  |
+| | _polynomial:_ `word_instr * read_register2 = 0` | |
+| `CPU-C10` | `word_instr` => `write_register = 0` |  |
+| | _polynomial:_ `word_instr * write_register = 0` | |
+| `CPU-C11` | `CPU32[half_instruction_length; timestamp, pc]` | word_instr |
 
-> **Note:** Document the choice to not have a multiplicity column here for padding
+### Range checks
+
+We constrain all columns to have the appropriate ranges. All values in `packed_decode` need to be checked to ensure the packing is correct for the interaction. In contrast, we know ahead of time that decoding will ensure proper range checks for `pc` and `imm`. Similarly, since `next_pc` will propagate through the memory argument and be looked up in the instruction decoding on the next cycle, it is forced to be in the correct range; the final value for `next_pc` is similarly fixed by the memory finalization. For the auxiliary columns, we need to check the limbs of `res`, since `rv1` and `rv2` are enforced by the memory argument, and `rvd` is correct by the correctness of the dependent chips. The ranges of the other auxiliary columns are enforced through later constraints.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU-CR12` |  | `IS_BIT<read_register1>` |  |
+| `CPU-CR13` |  | `IS_BIT<read_register2>` |  |
+| `CPU-CR14` |  | `IS_BIT<write_register>` |  |
+| `CPU-CR15` |  | `IS_BYTE<half_instruction_length>` |  |
+| `CPU-CR16` |  | `IS_BIT<word_instr>` |  |
+| `CPU-CR17` |  | `IS_BIT<ALU>` |  |
+| `CPU-CR18` |  | `IS_BYTE<alu_flags>` |  |
+| `CPU-CR19` |  | `IS_BIT<ADD>` |  |
+| `CPU-CR20` |  | `IS_BIT<SUB>` |  |
+| `CPU-CR21` |  | `IS_BIT<MEMORY>` |  |
+| `CPU-CR22` |  | `IS_BYTE<mem_flags>` |  |
+| `CPU-CR23` |  | `IS_BIT<BRANCH>` |  |
+| `CPU-CR24` |  | `IS_BIT<ECALL>` |  |
+| `CPU-CR25` |  | `IS_BYTE<rs1>` |  |
+| `CPU-CR26` |  | `IS_BYTE<rs2>` |  |
+| `CPU-CR27` |  | `IS_BYTE<rd>` |  |
+| `CPU-CR28.i` | i ∈ [0, 3] | `IS_HALF[res[i]]` | 1 |
+
+### ALU
+
+The ALU functionality is then obtained through delegation to the `ALU` signature, backed by the various ALU chips, or by using the appropriate template. For the pure ALU path, `arg2` is computed as `rv2 + imm`, which relies on [cpu:a:arg2]-multiplex to be either `rv2` or `imm`, depending on the instruction. The other contributions for `arg2` are specific to the (mutually exclusive, [cpu:a:mem]-branch-mutex) `MEMORY` and `BRANCH` flags: - For the `MEMORY` path, we want the output of the ALU to be ``rv1` + `imm``, as that is the address at which the memory access occurs. - For the `BRANCH` path, we want the ALU output to reflect the branch condition (or just be inactive for JALR).
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU-CA29.i` | i ∈ [0, 1] | `arg2` = `MEMORY` dot `imm` + `BRANCH` dot `rv2` + (1 - `MEMORY` - `BRANCH`) dot (`rv2` + `imm`) |  |
+| | | _polynomial:_ `arg2[i] - MEMORY * imm[i] - BRANCH * rv2[i] - (1 - MEMORY - BRANCH) * (rv2 + imm)[i] = 0` | |
+| `CPU-CA30` |  | ADD ⇒ `ADD<res::DWordWL; rv1, arg2>` |  |
+| `CPU-CA31` |  | SUB ⇒ `SUB<res::DWordWL; rv1, arg2>` |  |
+| `CPU-CA32` |  | `ALU[res::DWordWL; rv1, arg2, alu_flags]` | ALU |
+
+### Memory<cpu:memory>
+
+Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs, simultaneously ensuring that register reads are properly range checked as long as all writes are. The `pc` register behaves very predictably with respect to its timestamps and when it is being read, so for performance reasons, we inline its memory interactions directly into the  chip.
+
+Potentially overlapping memory accesses are ensured to have disjoint timestamps. One consequence of that is that `next_pc` is written at `timestamp + 1` to ensure the access is disjoint with the `pc` read into `rv1` as part of the `AUIPC` instruction (see [cpu:c:read_rv1] and [decode]:decoding-overview). Constraints regarding whether `pc_double_read` corresponds to an `AUIPC` instruction are not necessary, as regardless of its value, the old timestamp is guaranteed smaller than the new timestamp, and the integrity of the memory argument therefore ensures the correctness of this bit.
+
+The memory interaction itself is handled by the `MEMORY` signature, which will read the `mem_flags` argument to perform either a `LOAD` or a `STORE`. We refer to the previous section's description of `arg2` for how the address is computed.
+
+The value to (potentially) be written back to `rd` is stored in `rvd`, which can either come from the ALU --- in case of an ALU operation or a JALR branch --- or from the MEMORY interaction.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU-CM33` |  | `MEMW[[rv1[0], rv1[1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs1, [rv1[0], rv1[1], 0, 0, 0, 0, 0, 0], timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
+| `CPU-CM34.i` | i ∈ [0, 1] | `!read_register1` => `rv1[i]` = 0 |  |
+| | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
+| `CPU-CM35` |  | `MEMW[[rv2[0], rv2[1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs2, [rv2[0], rv2[1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
+| `CPU-CM36.i` | i ∈ [0, 1] | `!read_register2` => `rv2[i]` = 0 |  |
+| | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
+| `CPU-CM37` |  | `MEMW[1, 2::DWordWL * rd, [rvd[0], rvd[1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
+| `CPU-CM38` |  | `MEMOP[rvd; timestamp, res::DWordWL, rv2, mem_flags]` | MEMORY |
+| `CPU-CM39.i` | i ∈ [0, 1] | `!MEMORY` and `!BRANCH` => `rvd` = `res` |  |
+| | | _polynomial:_ `(1 - MEMORY - BRANCH) * (rvd[i] - (res::DWordWL)[i]) = 0` | |
+| `CPU-CM40` |  | `IS_BIT<pc_double_read>` |  |
+| `CPU-CM41` |  | `IS_BIT<prev_pc_timestamp_borrow>` |  |
+| `CPU-CM42.i` | i ∈ [0, 1] | `memory[1, [2 * 255 + i, 0], [(timestamp[0] - 3 * (1 - pc_double_read)) + 2^32 * prev_pc_timestamp_borrow, timestamp[1] - prev_pc_timestamp_borrow], pc[i]]` | 1 |
+| `CPU-CM43.i` | i ∈ [0, 1] | `memory[1, [2 * 255 + i, 0], timestamp + 1::DWordWL, next_pc[i]]` | -1 |
+
+### Branching
+
+A branch is expressed by having the `BRANCH` flag set to 1. Since `BRANCH` and `MEMORY` are mutually exclusive ([cpu:a:mem]-branch-mutex), we can repurpose the `mem_flags` field to indicate a JALR instruction. When JALR is not set, we have a conditional branch that is decided upon by the result of the ALU instructions, as set in the `res` variable. As such, we can set `branch_cond` appropriately as multiplicity flag for the `BRANCH` chip.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU-CB44` | `branch_cond` = `BRANCH` and (`JALR` or `res`) |  |
+| | _polynomial:_ `branch_cond - BRANCH * JALR - BRANCH * (1 - JALR) * res[0] = 0` | |
+| `CPU-CB45` | `BRANCH[next_pc; pc, imm, rv1, JALR]` | branch_cond |
+| `CPU-CB46` | 1 - branch_cond ⇒ `ADD<next_pc; pc, [2 * half_instruction_length, 0]>` |  |
+| `CPU-CB47` | BRANCH ⇒ `ADD<rvd; pc, [2 * half_instruction_length, 0]>` |  |
+
+### System
+
+The interactions with the wider system go through the `ECALL` interface. Since we treat `EBREAK` instructions as unprovable traps, we avoid emitting `DECODE` rows for these, and do not need any further handling in the CPU.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU-CS48` | `ECALL[timestamp, rv1]` | ECALL |
 
 ## Padding
 
 The CPU can be padded with the following values, which have a corresponding row in the DECODE table, at the _odd_ address 1, only reachable through a HALT ecall.
 
-This approach minimizes the number of dependent lookups, increasing only multiplicities in the DECODE table and the IS_BYTE lookup.
+| Column | Padding value |
+|--------|---------------|
+| `pc` | `1` |
+| `rs1` | `0` |
+| `rs2` | `0` |
+| `rd` | `0` |
+| `read_register1` | `0` |
+| `read_register2` | `0` |
+| `write_register` | `0` |
+| `imm` | `0` |
+| `half_instruction_length` | `2` |
+| `word_instr` | `0` |
+| `ALU` | `0` |
+| `alu_flags` | `0` |
+| `ADD` | `0` |
+| `SUB` | `0` |
+| `MEMORY` | `0` |
+| `mem_flags` | `0` |
+| `BRANCH` | `0` |
+| `ECALL` | `0` |
+| `next_pc` | `1` |
+| `rvd` | `0` |
+| `prev_pc_timestamp_borrow` | `0` |
+| `pc_double_read` | `0` |
+| `rv1` | `0` |
+| `rv2` | `0` |
+| `arg2` | `0` |
+| `res` | `0` |
+| `branch_cond` | `0` |
+
+This approach minimizes the number of dependent lookups, increasing only multiplicities in the `DECODE` table and the `IS_BYTE` and `IS_HALF` lookups.
+
+---
+
+# CPU32 Chip
+
+The  chip is used to delegate the 32-bit instructions of the RV64I instruction set from the main CPU table ([cpu]). All 32-bit instructions are ALU-only instructions, so the BRANCH, MEMORY and ECALL paths need no elaboration. The timestamp and PC have already been read by the CPU table at this point, and need no further checking; the PC for the next instruction will also already be handled by CPU.
+
+The structure follows the regular ALU path, with some extra variables and constraints to contain the required sign extensions.
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `DWordWL` | The timestamp for the CPU row |
+| `pc` | `DWordWL` | The PC at which the instruction occurs |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `half_instruction_length` | `Byte` | The length of this instruction |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `rs1` | `Byte` | Source register 1 |
+| `read_register1` | `Bit` | Whether to read from `rs1` or not |
+| `rv1` | `DWordWHH` | The value in register `rs1` |
+| `rv1_sign` | `Bit` | The sign bit of the lower word of `rv1` |
+| `arg1` | `DWordWL` | The sign-extended version of `rv1` |
+| `rs2` | `Byte` | Source register 2 |
+| `read_register2` | `Bit` | Whether to read from `rs2` |
+| `rv2` | `DWordWHH` | The value in register `rs2` |
+| `rv2_sign` | `Bit` | The sign bit of the lower word of `rv2` |
+| `imm` | `DWordWL` | The fully sign-extended immediate to use |
+| `arg2` | `DWordWL` | Either the sign-extended version of `rv2` or all of `imm` |
+| `res` | `DWordHL` | The ALU result |
+| `res_sign` | `Bit` | The sign bit of the lower word of `res` |
+| `rd` | `Byte` | Destination register |
+| `write_register` | `Bit` | Whether to write back to `rd` |
+| `rvd` | `DWordWL` | The value to write back to `rd`, the sign-extended version of `res` |
+| `ALU` | `Bit` | Whether the full ALU is active |
+| `alu_flags` | `Byte` | The ALU operation + flags |
+| `ADD` | `Bit` | Whether the full ALU is active |
+| `SUB` | `Bit` | Whether the full ALU is active |
+| `signed` | `Bit` | Whether the instruction is signed or not. Extracted from `alu_flags`, used to determine the extension for the inputs |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `packed_decode` | `BaseField` | The packed representation of all flags and information from the decode table |
+
+**Definition of `packed_decode`:**
+```
+packed_decode := 2^0 * read_register1 + 2^1 * read_register2 + 2^2 * write_register + 2^3 * 1 + 2^4 * ALU + 2^5 * ADD + 2^6 * SUB + 2^10 * rs1 + 2^18 * rs2 + 2^26 * rd + 2^34 * half_instruction_length + 2^42 * alu_flags
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `CPU32-A1.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+| `CPU32-A2.i` | i ∈ [0, 1] | `IS_WORD[pc[i]]` |
+| `CPU32-A3` |  | `read_register2 = 0` or `imm = 0`, enforced by decoding. |
+
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `CPU32-C1` | `read_register2` = 0 or `imm = 0` |
+| | _polynomial:_ `read_register2 * (imm[0] + imm[1]) = 0` |
+
+## Constraints
+
+Most constraints correspond to those already present in the CPU, and we present them here first, including some updates to the range checking corresponding to the differing types. We also need to make sure that for padding rows (`mu = 0`), no side effects can occur.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU32-C2` | `DECODE[pc, imm, packed_decode]` | μ |
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU32-CR3` |  | `IS_BIT<μ>` |  |
+| `CPU32-CR4` |  | `IS_BIT<read_register1>` |  |
+| `CPU32-CR5` |  | `IS_BIT<read_register2>` |  |
+| `CPU32-CR6` |  | `IS_BIT<write_register>` |  |
+| `CPU32-CR7` |  | `IS_BYTE<half_instruction_length>` |  |
+| `CPU32-CR8` |  | `IS_BIT<ALU>` |  |
+| `CPU32-CR9` |  | `IS_BYTE<alu_flags>` |  |
+| `CPU32-CR10` |  | `IS_BIT<ADD>` |  |
+| `CPU32-CR11` |  | `IS_BIT<SUB>` |  |
+| `CPU32-CR12` |  | `IS_BYTE<rs1>` |  |
+| `CPU32-CR13` |  | `IS_BYTE<rs2>` |  |
+| `CPU32-CR14` |  | `IS_BYTE<rd>` |  |
+| `CPU32-CR15.i` | i ∈ [0, 1] | `IS_HALF[rv1[i]]` | μ |
+| `CPU32-CR16.i` | i ∈ [0, 1] | `IS_HALF[rv2[i]]` | μ |
+| `CPU32-CR17.i` | i ∈ [0, 3] | `IS_HALF[res[i]]` | μ |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU32-CA18` | ADD ⇒ `ADD<res::DWordWL; arg1, arg2>` |  |
+| `CPU32-CA19` | SUB ⇒ `SUB<res::DWordWL; arg1, arg2>` |  |
+| `CPU32-CA20` | `ALU[res::DWordWL; arg1, arg2, alu_flags]` | ALU |
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU32-CM21` |  | `MEMW[[(rv1::DWordWL)[0], rv1[2], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs1, [(rv1::DWordWL)[0], rv1[2], 0, 0, 0, 0, 0, 0], timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
+| `CPU32-CM22.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
+| | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
+| `CPU32-CM23` |  | `MEMW[[(rv2::DWordWL)[0], rv2[2], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs2, [(rv2::DWordWL)[0], rv2[2], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
+| `CPU32-CM24.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
+| | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
+| `CPU32-CM25` |  | `MEMW[1, 2::DWordWL * rd, [rvd[0], rvd[1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU32-C26` | `!μ` => `read_register1 = 0` |  |
+| | _polynomial:_ `(1 - μ) * read_register1 = 0` | |
+| `CPU32-C27` | `!μ` => `read_register2 = 0` |  |
+| | _polynomial:_ `(1 - μ) * read_register2 = 0` | |
+| `CPU32-C28` | `!μ` => `write_register = 0` |  |
+| | _polynomial:_ `(1 - μ) * write_register = 0` | |
+| `CPU32-C29` | `CPU32[half_instruction_length; timestamp, pc]` | -μ |
+
+Then, we have the constraints corresponding to the sign-extension and definition of `arg1`, `arg2` and `rd`. This includes a step where we extract the `signed` bit from the `alu_flags`, as this determines whether to sign extend the inputs or not.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU32-C30` | `signed` != 0 => `μ` = 1 |  |
+| | _polynomial:_ `signed * (1 - μ) = 0` | |
+| `CPU32-C31` | `BYTE_ALU[32 * signed; ⧼AND⧽, 32, alu_flags]` | μ |
+| `CPU32-C32` | `SIGN<rv1_sign; rv1[1], signed>` |  |
+| `CPU32-C33` | `arg1[0]` = `rv1[:2]` |  |
+| | _polynomial:_ `arg1[0] - (rv1::DWordWL)[0] = 0` | |
+| `CPU32-C34` | `arg1[1]` = (2^(32) - 1) dot `rv1_sign` |  |
+| | _polynomial:_ `arg1[1] - (2^32 - 1) * rv1_sign = 0` | |
+| `CPU32-C35` | `SIGN<rv2_sign; rv2[1], signed>` |  |
+| `CPU32-C36` | `arg2[0]` = `rv2[:2]` + `imm[0]` |  |
+| | _polynomial:_ `arg2[0] - (rv2::DWordWL)[0] - imm[0] = 0` | |
+| `CPU32-C37` | `arg2[1]` = (2^(32) - 1) dot `rv2_sign` + `imm[1]` |  |
+| | _polynomial:_ `arg2[1] - (2^32 - 1) * rv2_sign - imm[1] = 0` | |
+| `CPU32-C38` | `SIGN<res_sign; res[1], μ>` |  |
+| `CPU32-C39` | `rvd[0]` = `res[:2]` |  |
+| | _polynomial:_ `rvd[0] - (res::DWordWL)[0] = 0` | |
+| `CPU32-C40` | `rvd[1]` = (2^(32) - 1) dot `res_sign` |  |
+| | _polynomial:_ `rvd[1] - (2^32 - 1) * res_sign = 0` | |
+
+## Padding
+
+The table can be padded with the following values:
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `pc` | `0` |
+| `half_instruction_length` | `2` |
+| `rs1` | `0` |
+| `read_register1` | `0` |
+| `rv1` | `0` |
+| `rv1_sign` | `0` |
+| `arg1` | `0` |
+| `rs2` | `0` |
+| `read_register2` | `0` |
+| `rv2` | `0` |
+| `rv2_sign` | `0` |
+| `imm` | `0` |
+| `arg2` | `0` |
+| `res` | `0` |
+| `res_sign` | `0` |
+| `rd` | `0` |
+| `write_register` | `0` |
+| `rvd` | `0` |
+| `ALU` | `0` |
+| `alu_flags` | `0` |
+| `ADD` | `0` |
+| `SUB` | `0` |
+| `signed` | `0` |
+| `μ` | `0` |
 
 ---
 
@@ -1129,7 +1044,7 @@ The `SHIFT` chip is comprised of  variables that are expressed using  columns an
 | Name | Type | Description |
 |------|------|-------------|
 | `in` | `DWordHL` | The value being shifted |
-| `shift` | `Byte` | Number of bits to shift `in` by. |
+| `shift` | `DWordWHBB` | Number of bits to shift `in` by. |
 | `direction` | `Bit` | Whether to shift left (0) or right (1). |
 | `signed` | `Bit` | Whether to interpret `in` as a signed integer. |
 | `word_instr` | `Bit` | Whether this is a Word-instruction (1) or not (0). |
@@ -1206,16 +1121,6 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 |------|------|-------------|
 | `μ` | `Bit` |  |
 
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` |
-| `SHIFT-A2` |  | `IS_BYTE[shift]` |
-| `SHIFT-A3` |  | `IS_BIT<direction>` |
-| `SHIFT-A4` |  | `IS_BIT<signed>` |
-| `SHIFT-A5` |  | `IS_BIT<word_instr>` |
-
 ## Explanation
 
 This chip has a rather complex design as a result of designing it to fit in as few columns possible. We briefly discuss the intricacies of the design, attempting to illustrate its correctness.
@@ -1248,13 +1153,24 @@ Lastly, we discuss the case of performing the _arithmetic_ right shift. Here, `e
 
 ## Constraints
 
-First, we constrain `bit_shift` based on whether we are left or right-shifting. [shift:c:zbs] makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. This flag is used to indicate the special case that ``right` = 1` and ``shift` = 0 mod 16`.
+First, we range check our inputs appropriately.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `SHIFT-C1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` | μ |
+| `SHIFT-C2` |  | `IS_HALF[shift[2]]` | μ |
+| `SHIFT-C3.i` | i ∈ [0, 1] | `IS_BYTE<shift[i]>` |  |
+| `SHIFT-C4` |  | `IS_BIT<direction>` |  |
+| `SHIFT-C5` |  | `IS_BIT<signed>` |  |
+| `SHIFT-C6` |  | `IS_BIT<word_instr>` |  |
+
+Then, we constrain `bit_shift` based on whether we are left or right-shifting. [shift:c:zbs] makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. This flag is used to indicate the special case that ``right` = 1` and ``shift` = 0 mod 16`.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C1` | `AND_BYTE[bit_shift; shift, 15]` | left |
-| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - 16 * zbs - shift, 15]` | right |
-| `SHIFT-C3` | `ZERO[zbs; bit_shift]` | μ |
+| `SHIFT-C7` | `BYTE_ALU[bit_shift; ⧼AND⧽, shift[0], 15]` | left |
+| `SHIFT-C8` | `BYTE_ALU[bit_shift; ⧼AND⧽, 2^8 - 16 * zbs - shift[0], 15]` | right |
+| `SHIFT-C9` | `ZERO[zbs; bit_shift]` | μ |
 
 Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively. When `zbs = 1`, the output cannot be used to compose ``in >>/>>> shift` mod 16`. To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
 
@@ -1262,13 +1178,13 @@ The case of `left`-shifting and ``bit_shift` = 0` will be used for padding rows.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[['arr', ['idx', 'X', 'i'], ['idx', 'Y', 'i']]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C5.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
+| `SHIFT-C10.i` | i ∈ [0, 3] | `HWSL[[X[i], Y[i]]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C11.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
 | | | _polynomial:_ `zbs * (X[i] - in[i] * left) = 0` | |
-| `SHIFT-C6.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
+| `SHIFT-C12.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
 | | | _polynomial:_ `zbs * (Y[i] - in[i] * right) = 0` | |
-| `SHIFT-C7` |  | `HWSL[['arr', ['idx', 'X', 4], ['-', 'extension', ['idx', 'X', 4]]]; extension, bit_shift]` | 1 - zbs |
-| `SHIFT-C8` |  | `zbs` => `X[4]` = 0 |  |
+| `SHIFT-C13` |  | `HWSL[[X[4], extension - X[4]]; extension, bit_shift]` | 1 - zbs |
+| `SHIFT-C14` |  | `zbs` => `X[4]` = 0 |  |
 | | | _polynomial:_ `zbs * X[4] = 0` | |
 
 ### Full-limb shifting
@@ -1279,21 +1195,21 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C9.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
-| `SHIFT-C10` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
-| `SHIFT-C11.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
+| `SHIFT-C15.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
+| `SHIFT-C16` |  | `BYTE_ALU[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; ⧼AND⧽, shift[0], 48 - 32 * word_instr]` | μ |
+| `SHIFT-C17.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
 | | | _polynomial:_ `out[i] - (shifted::DWordWL)[i] = 0` | |
 
 ### Miscellaneous
 
 | Tag | Description |
 |-----|-------------|
-| `SHIFT-C12` | `direction` => `μ` = 1 |
+| `SHIFT-C18` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C13` | `MSB16[is_negative; in[3]]` | signed |
+| `SHIFT-C19` | `MSB16[is_negative; in[3]]` | signed |
 
 *Note*: `is_negative` is not used when `signed = 0`. As such, there is no problem with it being unconstrained in this case.
 
@@ -1303,11 +1219,27 @@ This chip adds the following interaction to the lookup.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C14` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
+| `SHIFT-C20` | `ALU[out; in::DWordWL, shift::DWordWL, ⧼SHIFT⧽ + word_instr + 32 * signed + 64 * direction]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `in` | `0` |
+| `shift` | `0` |
+| `direction` | `0` |
+| `signed` | `0` |
+| `word_instr` | `0` |
+| `out` | `0` |
+| `is_negative` | `0` |
+| `bit_shift` | `0` |
+| `zbs` | `1` |
+| `X` | `[0, 0, 0, 0, 0]` |
+| `Y` | `[0, 0, 0, 0]` |
+| `limb_shift_raw` | `[0, 0, 0]` |
+| `μ` | `0` |
 
 ---
 
@@ -1375,6 +1307,12 @@ next_pc (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 | `BRANCH-A3.i` | i ∈ [0, 1] | `register` is range checked, `IS_WORD[register[i]]` |
 | `BRANCH-A4` |  | `IS_BIT<JALR>` |
 
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `BRANCH-C1` | `IS_BIT<JALR>` |
+
 ## Constraints
 
 We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
@@ -1383,27 +1321,38 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
-| `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
-| `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
-| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
-| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
+| `BRANCH-C2` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
+| `BRANCH-C3` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
+| `BRANCH-C4` |  | μ ⇒ `IS_BYTE<next_pc_low[1]>` |  |
+| `BRANCH-C5` |  | `BYTE_ALU[next_pc_low[0]; ⧼AND⧽, unmasked_low_byte, 254]` | μ |
+| `BRANCH-C6.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `BRANCH-C6` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
+| `BRANCH-C7` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
 
+| Column | Padding value |
+|--------|---------------|
+| `pc` | `0` |
+| `offset` | `0` |
+| `register` | `0` |
+| `JALR` | `0` |
+| `next_pc_high` | `[0, 0, 0]` |
+| `next_pc_low` | `0` |
+| `unmasked_low_byte` | `0` |
+| `μ` | `0` |
+
 ---
 
 # LT Chip
 
-The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
+The  chip constrains an indicator bit for the less-than relation, signed or unsigned. If the `invert` flag is set, it inverts the result.
 
 ## Variables
 
@@ -1416,12 +1365,13 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 | `lhs` | `DWordHHW` | The left operand |
 | `rhs` | `DWordHHW` | The right operand |
 | `signed` | `Bit` | whether to interpret `lhs` and `rhs` as signed integers (1) or not (0) |
+| `invert` | `Bit` | Whether to invert the result |
 
 ### Output
 
 | Name | Type | Description |
 |------|------|-------------|
-| `lt` | `Bit` | Whether $`lhs` < `rhs`$, taking `signed` into account |
+| `res` | `Bit` | The result |
 
 ### Auxiliary
 
@@ -1430,6 +1380,7 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 | `lhs_sub_rhs` | `DWordHL` | $`lhs` - `rhs`$ |
 | `lhs_msb` | `Bit` | The most significant bit of `lhs` |
 | `rhs_msb` | `Bit` | The most significant bit of `rhs` |
+| `lt` | `Bit` | Whether $`lhs` < `rhs`$, taking `signed` into account |
 
 ### Virtual
 
@@ -1463,11 +1414,10 @@ We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 |-----|-------|-------------|
 | `LT-A1` |  | `IS_WORD[lhs[0]]` |
 | `LT-A2` |  | `IS_WORD[rhs[0]]` |
-| `LT-A3` |  | `IS_BIT<signed>` |
 
 ## Constraints
 
-We first constrain that all variables correspond to their definition. For the defining constraint of `lt`, [lt:c:lt], observe that it is a choice between two options, depending on the input flag `signed`. In the case of unsigned comparison, we simply need `unsigned_lt`, indicating that a wraparound (carry bit) modulo `2^64` is needed to go from `rhs` to `lhs` via addition. For the case of signed comparison, we first need some case analysis.
+We first constrain that all inputs are range checked and all variables correspond to their definition. For the defining constraint of `lt`, [lt:c:lt], observe that it is a choice between two options, depending on the input flag `signed`. In the case of unsigned comparison, we simply need `unsigned_lt`, indicating that a wraparound (carry bit) modulo `2^64` is needed to go from `rhs` to `lhs` via addition. For the case of signed comparison, we first need some case analysis.
 
 We split `a < b` into four disjoint cases, conditioned on the sign of `a` and `b`. Recall that the sign of a number in two's complement can be read off from the MSB, being `1` for a negative number and `0` for a positive one. For this analysis, we denote the MSB of `a` as `A` and the MSB of `b` as `B`. The four disjoint cases then become:
 
@@ -1481,29 +1431,123 @@ The polynomial `P` can be simplified to a total degree of two. We claim that the
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `LT-C1` | `MSB16[lhs_msb; lhs[2]]` | μ |
-| `LT-C2` | `MSB16[rhs_msb; rhs[2]]` | μ |
-| `LT-C3` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
+| `LT-C1` | `IS_HALF[lhs[1]]` | μ |
+| `LT-C2` | `IS_HALF[rhs[1]]` | μ |
+| `LT-C3` | `IS_BIT<signed>` |  |
+| `LT-C4` | `IS_BIT<invert>` |  |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `LT-C5` | `MSB16[lhs_msb; lhs[2]]` | μ |
+| `LT-C6` | `MSB16[rhs_msb; rhs[2]]` | μ |
+| `LT-C7` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
 | | _polynomial:_ `lt - signed * (lhs_msb * (1 - rhs_msb) + lhs_msb * carry[1] + (1 - rhs_msb) * carry[1]) - (1 - signed) * unsigned_lt = 0` | |
-| `LT-C4` | `IS_HALF[lhs[1]]` | μ |
-| `LT-C5` | `IS_HALF[rhs[1]]` | μ |
+| `LT-C8` | `res` = `lt` xor `invert` |  |
+| | _polynomial:_ `res + 2 * lt * invert - lt - invert = 0` | |
 
 And then we constrain the subtraction, taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `LT-C6.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
-| `LT-C7.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
+| `LT-C9.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
+| `LT-C10.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
 
 The chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `LT-C8` | `LT[lt; lhs::DWordWL, rhs::DWordWL, signed]` | -μ |
+| `LT-C11` | `ALU[[res, 0]; lhs::DWordWL, rhs::DWordWL, ⧼LT⧽ + 32 * signed + 64 * invert]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `lhs` | `0` |
+| `rhs` | `0` |
+| `signed` | `0` |
+| `invert` | `0` |
+| `res` | `0` |
+| `lhs_sub_rhs` | `0` |
+| `lhs_msb` | `0` |
+| `rhs_msb` | `0` |
+| `lt` | `0` |
+| `μ` | `0` |
+
+## Potential optimizations
+
+- Split the chip into a signed and an unsigned chip, making the unsigned version cheaper.
+
+---
+
+# EQ Chip
+
+The  chip is an ALU chip that compares two values and outputs a bit indicating whether they are equal or not. It optionally inverts the result if the `invert` flag is set.
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `a` | `DWordWL` | The first input |
+| `b` | `DWordWL` | The second input |
+| `invert` | `Bit` | Whether to invert the result |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `res` | `Bit` | The result |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `diff` | `DWordHL` | The difference `a - b` |
+| `eq` | `Bit` | The bit indicating `a == b` |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `BaseField` |  |
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `EQ-A1.i` | i ∈ [0, 1] | `IS_WORD[a[i]]` |
+| `EQ-A2.i` | i ∈ [0, 1] | `IS_WORD[b[i]]` |
+
+## Constraints
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `EQ-C1.i` | i ∈ [0, 3] | `IS_HALF[diff[i]]` | μ |
+| `EQ-C2` |  | `IS_BIT<invert>` |  |
+| `EQ-C3` |  | `SUB<diff::DWordWL; a, b>` |  |
+| `EQ-C4` |  | `ZERO[eq; diff[0] + diff[1] + diff[2] + diff[3]]` | μ |
+| `EQ-C5` |  | `res` = `eq` xor `invert` |  |
+| | | _polynomial:_ `res + 2 * eq * invert - eq - invert = 0` | |
+| `EQ-C6` |  | `ALU[[res, 0]; a, b, ⧼EQ⧽ + 64 * invert]` | -μ |
+
+## Padding
+
+The chip can be padded with the following values:
+
+| Column | Padding value |
+|--------|---------------|
+| `a` | `0` |
+| `b` | `0` |
+| `invert` | `0` |
+| `res` | `0` |
+| `diff` | `0` |
+| `eq` | `0` |
+| `μ` | `0` |
 
 ---
 
@@ -1587,15 +1631,6 @@ carry (when iter=[1, 3]) := 2^-32 * (raw_product[i] + carry[i - 1] - res[i])
 
 `mat(delim: , top; bottom)` }
 
-## Assumptions
-
-The following range checks are assumed to be performed/enforced outside of this chip:
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MUL-A1.i` | i ∈ [0, 3] | `IS_HALF[lhs[i]]` |
-| `MUL-A2.i` | i ∈ [0, 3] | `IS_HALF[rhs[i]]` |
-
 ## Constraints
 
 ### Overview
@@ -1616,11 +1651,15 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MUL-C1` |  | `SIGN<lhs_is_negative; lhs[3], lhs_signed>` |  |
-| `MUL-C2` |  | `SIGN<rhs_is_negative; rhs[3], rhs_signed>` |  |
-| `MUL-C3.i` | i ∈ [0, 3] | `IS_HALF[lo[i]]` | μ_sum |
-| `MUL-C4.i` | i ∈ [0, 3] | `IS_HALF[hi[i]]` | μ_sum |
-| `MUL-C5.i` | i ∈ [0, 3] | `IS_B20[carry[i]]` | μ_sum |
+| `MUL-C1` |  | `IS_BIT<lhs_signed>` |  |
+| `MUL-C2` |  | `IS_BIT<rhs_signed>` |  |
+| `MUL-C3.i` | i ∈ [0, 3] | `IS_HALF[lhs[i]]` | μ_sum |
+| `MUL-C4.i` | i ∈ [0, 3] | `IS_HALF[rhs[i]]` | μ_sum |
+| `MUL-C5` |  | `SIGN<lhs_is_negative; lhs[3], lhs_signed>` |  |
+| `MUL-C6` |  | `SIGN<rhs_is_negative; rhs[3], rhs_signed>` |  |
+| `MUL-C7.i` | i ∈ [0, 3] | `IS_HALF[lo[i]]` | μ_sum |
+| `MUL-C8.i` | i ∈ [0, 3] | `IS_HALF[hi[i]]` | μ_sum |
+| `MUL-C9.i` | i ∈ [0, 3] | `IS_B20[carry[i]]` | μ_sum |
 
 ### Product
 
@@ -1628,7 +1667,7 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `MUL-C6.i` | i ∈ [0, 3] | `raw_product[i]` = sum_(`k`=0)^1 2^(16k) sum_(`j`=0)^(2i+k) `lhs_ext[j]` dot `rhs_ext[2i+k-j]` |
+| `MUL-C10.i` | i ∈ [0, 3] | `raw_product[i]` = sum_(`k`=0)^1 2^(16k) sum_(`j`=0)^(2i+k) `lhs_ext[j]` dot `rhs_ext[2i+k-j]` |
 | | | _polynomial:_ `Σ_k = 0^1 2^(16 * k) * Σ_j = 0^2 * i + k lhs_ext[j] * rhs_ext[2 * i + k - j] - raw_product[i] = 0` |
 
 ### Lookup
@@ -1637,12 +1676,26 @@ The  chip contributes the following to the lookup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MUL-C7` | `MUL[lo::DWordWL; lhs, lhs_signed, rhs, rhs_signed, 0]` | -μ_lo |
-| `MUL-C8` | `MUL[hi::DWordWL; lhs, lhs_signed, rhs, rhs_signed, 1]` | -μ_hi |
+| `MUL-C11` | `ALU[lo::DWordWL; lhs::DWordWL, rhs::DWordWL, ⧼MUL⧽ + 32 * lhs_signed + 64 * rhs_signed]` | -μ_lo |
+| `MUL-C12` | `ALU[hi::DWordWL; lhs::DWordWL, rhs::DWordWL, ⧼MUL⧽ + 32 * lhs_signed + 64 * rhs_signed + 128]` | -μ_hi |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `lhs` | `0` |
+| `lhs_signed` | `0` |
+| `rhs` | `0` |
+| `rhs_signed` | `0` |
+| `lo` | `0` |
+| `hi` | `0` |
+| `lhs_is_negative` | `0` |
+| `rhs_is_negative` | `0` |
+| `raw_product` | `0` |
+| `μ_lo` | `0` |
+| `μ_hi` | `0` |
 
 ## Notes/optimizations
 
@@ -1740,15 +1793,15 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `μ_q` | `BaseField` |  |
 | `μ_r` | `BaseField` |  |
 
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `DVRM-A1.i` | i ∈ [0, 3] | `IS_HALF[n[i]]` |
-| `DVRM-A2.i` | i ∈ [0, 3] | `IS_HALF[d[i]]` |
-| `DVRM-A3` |  | `IS_BIT<signed>` |
-
 ## Constraints
+
+First, we range-check all inputs.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C1.i` | i ∈ [0, 3] | `IS_HALF[n[i]]` | μ_sum |
+| `DVRM-C2.i` | i ∈ [0, 3] | `IS_HALF[d[i]]` | μ_sum |
+| `DVRM-C3` |  | `IS_BIT<signed>` |  |
 
 From the ISA, we gather five requirements for the `DIV[U][W]` and `REM[U][W]` instructions:
 
@@ -1760,7 +1813,7 @@ We start with R3, which is straightforwardly asserted by constraint [dvrm:c:sign
 
 | Tag | Description |
 |-----|-------------|
-| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
+| `DVRM-C4` | `r` eq.not 0 => `sign_r` = `sign_n` |
 | | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
 
 ### R2: rounding towards zero
@@ -1773,12 +1826,12 @@ Focusing on the first statement, we observe that this trivially holds when ``sig
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `DVRM-C2` |  | `LT[1 - div_by_zero; abs_r, abs_d, 0]` | μ_sum |
-| `DVRM-C3` |  | sign_r ⇒ `NEG<abs_r; r>` |  |
-| `DVRM-C4.i` | i ∈ [0, 1] | not`sign_r` => `abs_r` = `r` |  |
+| `DVRM-C5` |  | `ALU[[1 - div_by_zero, 0]; abs_r, abs_d, ⧼LT⧽]` | μ_sum |
+| `DVRM-C6` |  | sign_r ⇒ `NEG<abs_r; r>` |  |
+| `DVRM-C7.i` | i ∈ [0, 1] | not`sign_r` => `abs_r` = `r` |  |
 | | | _polynomial:_ `(1 - sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0` | |
-| `DVRM-C5` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
-| `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
+| `DVRM-C8` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
+| `DVRM-C9.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
 | | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
 
 ### R5: overflow
@@ -1791,9 +1844,9 @@ In summary, in case of overflow R2 enforces that ``r` = 0`. Moreover it suffices
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `DVRM-C7` | `sign_q` = `signed` dot (1- `overflow`) |  |
+| `DVRM-C10` | `sign_q` = `signed` dot (1- `overflow`) |  |
 | | _polynomial:_ `signed * (1 - overflow) - sign_q = 0` | |
-| `DVRM-C8` | `ZERO[overflow; n[0] + n[1] + n[2] + (n[3] - 2^15 * sign_n) + (1 - sign_n) + (65535 - d[0]) + (65535 - d[1]) + (65535 - d[2]) + (65535 - d[3])]` | μ_sum |
+| `DVRM-C11` | `ZERO[overflow; n[0] + n[1] + n[2] + (n[3] - 2^15 * sign_n) + (1 - sign_n) + (65535 - d[0]) + (65535 - d[1]) + (65535 - d[2]) + (65535 - d[3])]` | μ_sum |
 
 We highlight [dvrm:c:overflow]. Recall that the `overflow` flag should be set if and only if (i) ``signed` = 1`, (ii) ``n` = `0x80...00``, and (iii) ``d` = `0xFF...FF``. These requirements are equivalent to the state where: $ forall i in [0, 3]:&& 65535 - `d`_i &= 0,\ forall i in [0, 2]:&& `n`_i &= 0,\ && `n`_3 - 2^15 dot `sign_n` &= 0,\ && 1 - `sign_n` &= 0,\ $ where ``signed` = 1` follows from the last equality. The requirement is phrased in this way, because the left-hand sides of the above expressions are `>= 0` by construction. Given that the sum of these expressions does not exceed `2^19` (and thus never wraps in the field), we can now say that the `overflow` bit should be set to `1` if and only if their sum evaluates to `0`. The `ZERO` lookup guarantees this to be the case.
 
@@ -1801,13 +1854,13 @@ We highlight [dvrm:c:overflow]. Recall that the `overflow` flag should be set if
 
 Rewriting R1, we find the constraint `not`overflow` => `n` - `r` = `qd``.
 
-Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality `mod 2^128`, rather than `mod 2^64`. To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that it is equal to ``qd` mod 2^128` using constraints [dvrm:c:mul_lower] and [dvrm:c:mul_upper]; [dvrm:c:q_range] is included to uphold assumption [mul:a:rhs].
+Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality `mod 2^128`, rather than `mod 2^64`. To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that it is equal to ``qd` mod 2^128` using constraints [dvrm:c:mul_lower] and [dvrm:c:mul_upper]; [dvrm:c:q_range] is included to uphold assumption [mul:c:rhs].
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `DVRM-C9` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C10` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
+| `DVRM-C12` |  | `ALU[n_sub_r::DWordWL; d::DWordWL, q::DWordWL, ⧼MUL⧽ + 32 * signed + 64 * sign_q]` | μ_sum |
+| `DVRM-C13` |  | `ALU[extension_n_sub_r::DWordWL; d::DWordWL, q::DWordWL, ⧼MUL⧽ + 32 * signed + 64 * sign_q + 128]` | μ_sum |
+| `DVRM-C14.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
 
 It now remains to enforce that `extended_n_sub_r` is the _signed_ 128-bit representation of ``n`-`r``. Here, we introduce `extended_n` and `extended_r`. By their definition, these variables contain the signed 128-bit representations of `n` and `r`. The `carry` variable has been defined such that it mimics those in the `ADD` chip, except that here we add two `QuadHL`s rather than two `DWordHL`, thus needing four carry bits instead of two. With this in place, [dvrm:c:n_sub_r] (mimicking [add:c:carry]) ensures `extended_n_sub_r` must contain the correct value.
 
@@ -1815,10 +1868,10 @@ Lastly, observe that ``n` - `r` in (-2^64, 2^64)`, _regardless_ of the value of 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `DVRM-C12.i` | i ∈ [0, 3] | `IS_BIT<carry[i]>` |  |
-| `DVRM-C13.i` | i ∈ [0, 3] | `IS_HALF[r[i]]` | μ_sum |
-| `DVRM-C14.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
-| `DVRM-C15` |  | `IS_BIT<sign_n_sub_r>` |  |
+| `DVRM-C15.i` | i ∈ [0, 3] | `IS_BIT<carry[i]>` |  |
+| `DVRM-C16.i` | i ∈ [0, 3] | `IS_HALF[r[i]]` | μ_sum |
+| `DVRM-C17.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
+| `DVRM-C18` |  | `IS_BIT<sign_n_sub_r>` |  |
 
 ### R4: division-by-zero
 
@@ -1826,9 +1879,9 @@ R4 requires that ``q` = 2^64-1` (unsigned) or `-1` (signed) and ``r` = n` when `
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `DVRM-C16.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
+| `DVRM-C19.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
 | | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
-| `DVRM-C17` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
+| `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
 
 ### Other
 
@@ -1836,9 +1889,9 @@ The following constraints are included to enforce the values of `sign_n`, `sign_
 
 | Tag | Description |
 |-----|-------------|
-| `DVRM-C18` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C19` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C20` | `SIGN<sign_d; d[3], signed>` |
+| `DVRM-C21` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C22` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C23` | `SIGN<sign_d; d[3], signed>` |
 
 ### Output
 
@@ -1846,103 +1899,32 @@ Lastly, this chip contributes the following to the lookup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
-| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
+| `DVRM-C24` | `ALU[q::DWordWL; n::DWordWL, d::DWordWL, ⧼DIVREM⧽ + 32 * signed]` | -μ_q |
+| `DVRM-C25` | `ALU[r::DWordWL; n::DWordWL, d::DWordWL, ⧼DIVREM⧽ + 32 * signed + 128]` | -μ_r |
 
 ## Padding
 
 To pad the  table, we use the following data, representing the unsigned division `frac(0, 0, style: "horizontal")`:
 
----
-
-# LOAD Chip
-
-The  chip provides functionality to read values from memory and sign-extend them where appropriate. It delegates low-level memory handling to the `MEMW` chip ([memw]).
-
-## Variables
-
-The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
-
-### Input
-
-| Name | Type | Description |
-|------|------|-------------|
-| `base_address` | `DWordWL` | The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is |
-| `timestamp` | `DWordWL` | The timestamp at which this memory access is said to occur |
-| `read2` | `Bit` | Whether to read exactly 2 bytes |
-| `read4` | `Bit` | Whether to read exactly 4 bytes |
-| `read8` | `Bit` | Whether to read exactly 8 bytes |
-| `signed` | `Bit` | Whether to sign-extend (1) or zero-extend (0) |
-
-### Output
-
-| Name | Type | Description |
-|------|------|-------------|
-| `res` | `DWordBL` | The result of reading (up to) 8 bytes from `base_address`, extended corresponding to `signed`. |
-
-### Auxiliary
-
-| Name | Type | Description |
-|------|------|-------------|
-| `sign_bit` | `Bit` | The sign bit extracted from the bytes retrieved from memory |
-
-### Virtual
-
-| Name | Type | Description |
-|------|------|-------------|
-| `read1` | `Bit` | Whether to read exactly 1 byte |
-
-**Definition of `read1`:**
-```
-read1 := μ - read2 - read4 - read8
-```
-
-### Multiplicity
-
-| Name | Type | Description |
-|------|------|-------------|
-| `μ` | `Bit` |  |
-
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `LOAD-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
-| `LOAD-A2` |  | `IS_BIT<signed>` |
-| `LOAD-A3` |  | `IS_BIT<read2>` |
-| `LOAD-A4` |  | `IS_BIT<read4>` |
-| `LOAD-A5` |  | `IS_BIT<read8>` |
-| `LOAD-A6` |  | `IS_BIT<read2 + read4 + read8>` |
-| `LOAD-A7.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
-
-## Constraints
-
-The chip delegates the actual memory interaction to the `MEMW` chip, and ensures correctness of the requested sign/zero extension. The output `res` is correctly range-checked as long as the memory contents are.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `LOAD-C1` |  | `read2` + `read4` + `read8` => `μ` |  |
-| | | _polynomial:_ `(read2 + read4 + read8) * (1 - μ) = 0` | |
-| `LOAD-C2` |  | `MEMW[res; 0, base_address, res::BaseField[8], timestamp, read2, read4, read8]` | μ |
-| `LOAD-C3` |  | `MSB8[sign_bit; res[0]]` | read1 |
-| `LOAD-C4` |  | `MSB8[sign_bit; res[1]]` | read2 |
-| `LOAD-C5` |  | `MSB8[sign_bit; res[3]]` | read4 |
-| `LOAD-C6.i` | i ∈ [4, 7] | !`read8` => `res`_i = `signed` dot `sign_bit` dot 255 |  |
-| | | _polynomial:_ `(1 - read8) * (res[i] - signed * sign_bit * 255) = 0` | |
-| `LOAD-C7.i` | i ∈ [2, 3] | !(`read4` + `read8`) => `res`_i = `signed` dot `sign_bit` dot 255 |  |
-| | | _polynomial:_ `(1 - read4 - read8) * (res[i] - signed * sign_bit * 255) = 0` | |
-| `LOAD-C8` |  | !(`read2` + `read4` + `read8`) => `res`_1 = `signed` dot `sign_bit` dot 255 |  |
-| | | _polynomial:_ `(1 - read2 - read4 - read8) * (res[1] - signed * sign_bit * 255) = 0` | |
-
-The chip contributes the following to the lookup argument.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `LOAD-C9` | `LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8, signed]` | -μ |
-
-## Padding
-
-The table can be padded to the next power of two with the following value assignments:
+| Column | Padding value |
+|--------|---------------|
+| `n` | `0` |
+| `d` | `0` |
+| `signed` | `0` |
+| `q` | `0` |
+| `r` | `0` |
+| `div_by_zero` | `1` |
+| `overflow` | `0` |
+| `abs_r` | `0` |
+| `abs_d` | `0` |
+| `n_sub_r` | `0` |
+| `sign_n_sub_r` | `0` |
+| `sign_n` | `0` |
+| `sign_d` | `0` |
+| `sign_q` | `0` |
+| `sign_r` | `0` |
+| `μ_q` | `0` |
+| `μ_r` | `0` |
 
 ---
 
@@ -1986,11 +1968,14 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `μ_MSB16` | `BaseField` |  |
 | `μ_ZERO` | `BaseField` |  |
 | `μ_IS_BYTE` | `BaseField` |  |
+| `μ_ARE_BYTES` | `BaseField` |  |
 | `μ_IS_HALF` | `BaseField` |  |
 | `μ_IS_B20` | `BaseField` |  |
 | `μ_HWSL` | `BaseField` |  |
 
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`. As such, it has length `2^8 dot 2^8 dot 2^4 = 2^(20)`.
+
+We use the ALU operation descriptors from [decode] to identify the operations in the `BYTE_ALU` interaction. Since each of the three columns is only `2^16` rows long, they can be combined in a single `2^20` column (with room to spare).
 
 ## Lookup
 
@@ -1998,20 +1983,646 @@ This chip adds the following interactions to the lookup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `BITWISE-C1` | `AND_BYTE[AND; X, Y]` | -μ_AND |
-| `BITWISE-C2` | `OR_BYTE[OR; X, Y]` | -μ_OR |
-| `BITWISE-C3` | `XOR_BYTE[XOR; X, Y]` | -μ_XOR |
+| `BITWISE-C1` | `BYTE_ALU[AND; ⧼AND⧽, X, Y]` | -μ_AND |
+| `BITWISE-C2` | `BYTE_ALU[OR; ⧼OR⧽, X, Y]` | -μ_OR |
+| `BITWISE-C3` | `BYTE_ALU[XOR; ⧼XOR⧽, X, Y]` | -μ_XOR |
 | `BITWISE-C4` | `MSB8[MSB8; X]` | -μ_MSB8 |
 | `BITWISE-C5` | `MSB16[MSB16; X + 256 * Y]` | -μ_MSB16 |
 | `BITWISE-C6` | `ZERO[ZERO; X + 256 * Y + 65536 * Z]` | -μ_ZERO |
-| `BITWISE-C7` | `IS_BYTE[X]` | -μ_IS_BYTE |
+| `BITWISE-C7` | `ARE_BYTES[X, Y]` | -μ_ARE_BYTES |
 | `BITWISE-C8` | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
 | `BITWISE-C9` | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
-| `BITWISE-C10` | `HWSL[['arr', 'SLL', 'SLLC']; X + 256 * Y, Z]` | -μ_HWSL |
+| `BITWISE-C10` | `HWSL[[SLL, SLLC]; X + 256 * Y, Z]` | -μ_HWSL |
 
 ## Notes/Optimizations
 
-The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
+The following ideas may prove to be optimizations for the  chip: + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
+
+---
+
+# BYTEWISE Chip
+
+The  chip is an ALU chip that decomposes the input `DWordWL` values into bytes and performs a `BITWISE` operation pairwise (AND, OR, XOR). The `BITWISE` lookup inherently performs a range check, so no further constraints are necessary.
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `a` | `DWordBL` | The first input |
+| `b` | `DWordBL` | The second input |
+| `op` | `Byte` | The operation to perform |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `res` | `DWordBL` | The result |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `BaseField` |  |
+
+## Constraints
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `BYTEWISE-C1.i` | i ∈ [0, 7] | `BYTE_ALU[res[i]; op, a[i], b[i]]` | μ |
+| `BYTEWISE-C2` |  | `ALU[res::DWordWL; a::DWordWL, b::DWordWL, op]` | -μ |
+
+## Padding
+
+The chip can be padded with the following values:
+
+| Column | Padding value |
+|--------|---------------|
+| `a` | `0` |
+| `b` | `0` |
+| `op` | `0` |
+| `res` | `0` |
+| `μ` | `0` |
+
+---
+
+# MEMW Chip
+
+The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `is_register` | `Bit` | Whether the address represents a register index |
+| `base_address` | `DWordWL` | The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access |
+| `value` | `BaseField[8]` | The values to store in memory. For RAM, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s |
+| `timestamp` | `DWordWL` | The timestamp at which this memory access occurs |
+| `write2` | `Bit` | Whether to write exactly 2 values |
+| `write4` | `Bit` | Whether to write exactly 4 values |
+| `write8` | `Bit` | Whether to write exactly 8 values |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old` | `BaseField[8]` | The old value written at `base_address`. See `value` for information about representation. Only the elements corresponding to the `writeN` bits are guaranteed |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `carry` | `Bit[7]` | Whether `base_address[0] + i + 1` $>= 2^32$ |
+| `old_timestamp` | `DWordWL[8]` | The timestamp at which address `base_address + i` was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `w2` | `Bit` | writing at least 2 bytes |
+| `w4` | `Bit` | writing at least 4 bytes |
+| `address_add` | `DWordWL[7]` | `address_add[i] = base_address + i + 1` |
+| `μ_sum` | `Bit` |  |
+
+**Definition of `w2`:**
+```
+w2 := write2 + write4 + write8
+```
+
+**Definition of `w4`:**
+```
+w4 := write4 + write8
+```
+
+**Definition of `address_add`:**
+```
+address_add := [base_address[0] + i + 1 - 2^32 * carry[i], base_address[1] + carry[i]]
+```
+
+**Definition of `μ_sum`:**
+```
+μ_sum := μ_read + μ_write
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
+| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `MEMW-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
+| `MEMW-A2` |  | `IS_BIT<write2>` |
+| `MEMW-A3` |  | `IS_BIT<write4>` |
+| `MEMW-A4` |  | `IS_BIT<write8>` |
+| `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
+| `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `MEMW-C1` | `IS_BIT<write2>` |
+| `MEMW-C2` | `IS_BIT<write4>` |
+| `MEMW-C3` | `IS_BIT<write8>` |
+| `MEMW-C4` | `IS_BIT<write2 + write4 + write8>` |
+
+Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns, as these are not necessary for the correctness of this chip in isolation. Still, these properties are necessary for the consistency of the system as a whole, and therefore we document it here, keeping the type information as a reading help.
+
+## Constraints
+
+Depending on the values of `write2`, `write4` and `write8`, the addresses following `base_address` need to be constructed. Rather than computing these in full (which would require the later addresses to be instantiated), it suffices to know the `carry`: the bit indicating whether ``base_address`_0 + t >= 2^32`, i.e., whether adding `t in [1, 7]` to `base_address` requires a carry from the lower to the upper limb. Note that it is safe for the prover to chose these bits: additions for which this bit is not correctly set will yield an address where either the lower or upper limb is out of bounds. As such, the constructed address will not match any existing memory tokens, which are only initialized for correctly formatted and range-checked doublewords (see [memory]).
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `MEMW-C5` |  | `IS_BIT<μ_read>` |  |
+| `MEMW-C6` |  | `IS_BIT<μ_write>` |  |
+| `MEMW-C7` |  | `IS_BIT<μ_sum>` |  |
+| `MEMW-C8` |  | `w2` => `μ_sum` |  |
+| | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
+| `MEMW-C9.i` | i ∈ [0, 6] | `IS_BIT<carry[i]>` |  |
+| `MEMW-C10` |  | `ALU[[1, 0]; old_timestamp[0], timestamp, ⧼LT⧽]` | μ_sum |
+| `MEMW-C11` |  | `ALU[[1, 0]; old_timestamp[1], timestamp, ⧼LT⧽]` | w2 |
+| `MEMW-C12.i` | i ∈ [2, 3] | `ALU[[1, 0]; old_timestamp[i], timestamp, ⧼LT⧽]` | w4 |
+| `MEMW-C13.i` | i ∈ [4, 7] | `ALU[[1, 0]; old_timestamp[i], timestamp, ⧼LT⧽]` | write8 |
+
+As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures it is appropriately range checked (this assumes no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
+
+There is no need to check that the additions do not overflow, as our address calculations are not performed modulo `2^64` here, and any overflow will result in an address without matching initialization.
+
+The chip adds the following tuples to the lookup argument, to effectuate that part of the memory argument.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `MEMW-CM14` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
+| `MEMW-CM15` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
+| `MEMW-CM16` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM17` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
+| `MEMW-CM18.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM19.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
+| `MEMW-CM20.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM21.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+
+This chip contributes the following to the lookup argument:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `MEMW-CO22` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_read |
+| `MEMW-CO23` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_write |
+
+## Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `is_register` | `0` |
+| `base_address` | `0` |
+| `value` | `0` |
+| `timestamp` | `0` |
+| `write2` | `0` |
+| `write4` | `0` |
+| `write8` | `0` |
+| `old` | `0` |
+| `carry` | `0` |
+| `old_timestamp` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
+
+## Read-size aligned fast path
+
+When a memory access happens at an address with proper alignment for its access size (i.e., adding the access size to `base_address`'s lowest limb does not overflow), and all accessed elements were last accessed at the same timestamp, we can instead use the  chip to save on total column count. The saving comes from only requiring a single old timestamp to be stored, as well as being able to guarantee that all values of `add_limb_overflow` would be zero. A minor extra cost is introduced in the form of a check that the alignment is indeed correct, and the corresponding decomposition of the `base_address`.
+
+Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
+
+The  chip only needs  variables, expressed through  columns; it leverages  interactions.
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `is_register` | `Bit` | Whether the address represents a register index |
+| `base_address` | `DWordWHH` | The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access |
+| `value` | `BaseField[8]` | The values to store in memory. For regular memory, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s |
+| `timestamp` | `DWordWL` | The timestamp at which this memory access is said to occur |
+| `write2` | `Bit` | Whether to write exactly 2 values |
+| `write4` | `Bit` | Whether to write exactly 4 values |
+| `write8` | `Bit` | Whether to write exactly 8 values |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old` | `BaseField[8]` | The old value written at `base_address + i`. See `value` for information about representation. Only the elements corresponding to the `writeN` bits are guaranteed |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old_timestamp` | `DWordWL` | The timestamp at which the address was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `w2` | `Bit` | writing at least 2 bytes |
+| `w4` | `Bit` | writing at least 4 bytes |
+| `μ_sum` | `Bit` |  |
+
+**Definition of `w2`:**
+```
+w2 := write2 + write4 + write8
+```
+
+**Definition of `w4`:**
+```
+w4 := write4 + write8
+```
+
+**Definition of `μ_sum`:**
+```
+μ_sum := μ_read + μ_write
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
+| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `MEMW_A-A1.i` | i ∈ [0, 1] | `IS_HALF[base_address[i]]` |
+| `MEMW_A-A2` |  | `IS_WORD[base_address[2]]` |
+| `MEMW_A-A3` |  | `IS_BIT<write2>` |
+| `MEMW_A-A4` |  | `IS_BIT<write4>` |
+| `MEMW_A-A5` |  | `IS_BIT<write8>` |
+| `MEMW_A-A6` |  | `IS_BIT<write2 + write4 + write8>` |
+| `MEMW_A-A7.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `MEMW_A-C1` | `IS_BIT<write2>` |
+| `MEMW_A-C2` | `IS_BIT<write4>` |
+| `MEMW_A-C3` | `IS_BIT<write8>` |
+| `MEMW_A-C4` | `IS_BIT<write2 + write4 + write8>` |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `MEMW_A-C9` | `IS_HALF[base_address[0] + write2 + 3 * write4 + 7 * write8]` | μ_sum |
+| `MEMW_A-C10` | `IS_BIT<μ_read>` |  |
+| `MEMW_A-C11` | `IS_BIT<μ_write>` |  |
+| `MEMW_A-C12` | `IS_BIT<μ_sum>` |  |
+| `MEMW_A-C13` | `w2` => `μ_sum` |  |
+| | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
+| `MEMW_A-C14` | `ALU[[1, 0]; old_timestamp, timestamp, ⧼LT⧽]` | μ_sum |
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `MEMW_A-CM15` |  | `memory[is_register, base_address::DWordWL, old_timestamp, old[0]]` | μ_sum |
+| `MEMW_A-CM16` |  | `memory[is_register, base_address::DWordWL, timestamp, value[0]]` | -μ_sum |
+| `MEMW_A-CM17` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, old_timestamp, old[1]]` | w2 |
+| `MEMW_A-CM18` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, timestamp, value[1]]` | -w2 |
+| `MEMW_A-CM19.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | w4 |
+| `MEMW_A-CM20.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -w4 |
+| `MEMW_A-CM21.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | write8 |
+| `MEMW_A-CM22.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -write8 |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `MEMW_A-CO23` | `MEMW[old; is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_read |
+| `MEMW_A-CO24` | `MEMW[is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_write |
+
+### Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `is_register` | `0` |
+| `base_address` | `0` |
+| `value` | `0` |
+| `timestamp` | `0` |
+| `write2` | `0` |
+| `write4` | `0` |
+| `write8` | `0` |
+| `old` | `0` |
+| `old_timestamp` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
+
+## Register fast-path
+
+The  chip provides a fast-path for accessing registers. This fast-path leverages that registers + can be addressed using a `Byte`, rather than a full `DWord`, + are constantly accessed, i.e., ``timestamp` - `old_timestamp`` is small, and + have a fixed access pattern to achieve a footprint that is significantly smaller than both  and .
+
+Note: as a result of hard optimization, this chip can only be used for register accesses for which + ``timestamp` - `old_timestamp` in [1, 2^16]`, and + ``timestamp[0]` > `old_timestamp[0]`` If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
+
+Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide `2 dot `address`` in the lookup.
+
+### Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interactions:
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | `Byte` | address of the register being accessed |
+| `timestamp` | `DWordWL` | timestamp at which the access takes place |
+| `val` | `DWordWL` | value being written to this register |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old` | `DWordWL` | value of this register at `old_timestamp`. |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old_timestamp_lo` | `Word` | the lower limb of `old_timestamp` |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `old_timestamp` | `DWordWL` | timestamp at which this register was last accessed |
+| `μ_sum` | `Bit` |  |
+
+**Definition of `old_timestamp`:**
+```
+old_timestamp := [old_timestamp_lo, timestamp[1]]::DWordWL
+```
+
+**Definition of `μ_sum`:**
+```
+μ_sum := μ_read + μ_write
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ_read` | `Bit` | Whether we are performing a read (and hence return `out`) |
+| `μ_write` | `Bit` | Whether we are performing a write (and hence not return `out`) |
+
+### Assumptions
+
+The following range checks are assumed to be performed/enforced outside of this chip:
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `MEMW_R-A1.i` | i ∈ [0, 1] | `IS_WORD[val[i]]` |
+| `MEMW_R-A2.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+### Constraints
+
+Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times. Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that ``old_timestamp[1]` = `timestamp[1]``;  can be used for accesses where this is not the case.
+
+Verifying that ``timestamp` > `old_timestamp`` now simplifies to verifying that ``timestamp[0]` - `old_timestamp[0]` > 0`. For most accesses, this value will be small enough to fit in a `Half`. This chip thus enforces this by means of the following constraint:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `MEMW_R-C1` | `IS_HALF[timestamp[0] - old_timestamp[0] - 1]` | μ_sum |
+
+With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([regw:c:read_old]) and `val` is written back ([regw:c:write_val]).
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `MEMW_R-C2.i` | i ∈ [0, 1] | `memory[1, [(2 * address + i)::Word, 0], old_timestamp, old[i]]` | μ_sum |
+| `MEMW_R-C3.i` | i ∈ [0, 1] | `memory[1, [(2 * address + i)::Word, 0], timestamp, val[i]]` | -μ_sum |
+
+This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
+
+| Tag | Description |
+|-----|-------------|
+| `MEMW_R-C4` | `IS_BIT<μ_read>` |
+| `MEMW_R-C5` | `IS_BIT<μ_write>` |
+| `MEMW_R-C6` | `IS_BIT<μ_sum>` |
+
+Lastly, this chip contributes the following interactions to the logup:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `MEMW_R-C7` | `MEMW[[old[0], old[1], 0, 0, 0, 0, 0, 0]; 1, [(2 * address)::Word, 0], [val[0], val[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_read |
+| `MEMW_R-C8` | `MEMW[1, [(2 * address)::Word, 0], [val[0], val[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_write |
+
+### Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `address` | `0` |
+| `timestamp` | `0` |
+| `val` | `0` |
+| `old` | `0` |
+| `old_timestamp_lo` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
+
+## Notes/optimizations
+
+The following ideas may prove to be optimizations for the // chip: - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes. - For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
+
+---
+
+# LOAD Chip
+
+The  chip provides functionality to read values from memory and sign-extend them where appropriate. It delegates low-level memory handling to the `MEMW` chip ([memw]).
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `base_address` | `DWordWL` | The base address to read from, gets offset by $[0, 7]$, depending on how big the access is |
+| `timestamp` | `DWordWL` | The timestamp at which this memory access is said to occur |
+| `read2` | `Bit` | Whether to read exactly 2 bytes |
+| `read4` | `Bit` | Whether to read exactly 4 bytes |
+| `read8` | `Bit` | Whether to read exactly 8 bytes |
+| `signed` | `Bit` | Whether to sign-extend (1) or zero-extend (0) |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `res` | `DWordBL` | The result of reading (up to) 8 bytes from `base_address`, extended corresponding to `signed`. |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `sign_bit` | `Bit` | The sign bit extracted from the bytes retrieved from memory |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `read1` | `Bit` | Whether to read exactly 1 byte |
+
+**Definition of `read1`:**
+```
+read1 := μ - read2 - read4 - read8
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `LOAD-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
+| `LOAD-A2.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+## Constraints
+
+The chip delegates the actual memory interaction to the `MEMW` chip, and ensures correctness of the requested sign/zero extension. The output `res` is correctly range-checked as long as the memory contents are.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `LOAD-C1` |  | `IS_BIT<signed>` |  |
+| `LOAD-C2` |  | `IS_BIT<read2>` |  |
+| `LOAD-C3` |  | `IS_BIT<read4>` |  |
+| `LOAD-C4` |  | `IS_BIT<read8>` |  |
+| `LOAD-C5` |  | `IS_BIT<read2 + read4 + read8>` |  |
+| `LOAD-C6` |  | `read2` + `read4` + `read8` => `μ` |  |
+| | | _polynomial:_ `(read2 + read4 + read8) * (1 - μ) = 0` | |
+| `LOAD-C7` |  | `MEMW[res; 0, base_address, res::BaseField[8], timestamp, read2, read4, read8]` | μ |
+| `LOAD-C8` |  | `MSB8[sign_bit; res[0]]` | read1 |
+| `LOAD-C9` |  | `MSB8[sign_bit; res[1]]` | read2 |
+| `LOAD-C10` |  | `MSB8[sign_bit; res[3]]` | read4 |
+| `LOAD-C11.i` | i ∈ [4, 7] | !`read8` => `res`_i = `signed` dot `sign_bit` dot 255 |  |
+| | | _polynomial:_ `(1 - read8) * (res[i] - signed * sign_bit * 255) = 0` | |
+| `LOAD-C12.i` | i ∈ [2, 3] | !(`read4` + `read8`) => `res`_i = `signed` dot `sign_bit` dot 255 |  |
+| | | _polynomial:_ `(1 - read4 - read8) * (res[i] - signed * sign_bit * 255) = 0` | |
+| `LOAD-C13` |  | !(`read2` + `read4` + `read8`) => `res`_1 = `signed` dot `sign_bit` dot 255 |  |
+| | | _polynomial:_ `(1 - read2 - read4 - read8) * (res[1] - signed * sign_bit * 255) = 0` | |
+
+The chip contributes the following to the lookup argument.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `LOAD-C14` | `MEMOP[res::DWordWL; timestamp, base_address, 0::DWordWL, 2 * signed + 4 * read2 + 8 * read4 + 16 * read8]` | -μ |
+
+## Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `base_address` | `0` |
+| `timestamp` | `0` |
+| `read2` | `0` |
+| `read4` | `0` |
+| `read8` | `0` |
+| `signed` | `0` |
+| `res` | `0` |
+| `sign_bit` | `0` |
+| `μ` | `0` |
+
+---
+
+# STORE Chip
+
+The  chip provides functionality to store a value to memory. It decomposes a `DWord` into bytes and delegates low-level memory handling to the `MEMW` chip ([memw]).
+
+## Variables
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `base_address` | `DWordWL` | The base address to write to, gets offset by $[0, 7]$, depending on how big the access is |
+| `timestamp` | `DWordWL` | The timestamp at which this memory access is said to occur |
+| `write2` | `Bit` | Whether to write exactly 2 bytes |
+| `write4` | `Bit` | Whether to write exactly 4 bytes |
+| `write8` | `Bit` | Whether to write exactly 8 bytes |
+| `value` | `DWordBL` | The value to store |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `write1` | `Bit` | Whether to write exactly 1 byte |
+
+**Definition of `write1`:**
+```
+write1 := μ - write2 - write4 - write8
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
+## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `STORE-A1.i` | i ∈ [0, 1] | `IS_WORD[base_address[i]]` |
+| `STORE-A2.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
+
+## Constraints
+
+The chip delegates the actual memory interaction to the `MEMW` chip, and ensures the values are proper bytes.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `STORE-C1` |  | `IS_BIT<μ>` |  |
+| `STORE-C2` |  | `IS_BIT<write2>` |  |
+| `STORE-C3` |  | `IS_BIT<write4>` |  |
+| `STORE-C4` |  | `IS_BIT<write8>` |  |
+| `STORE-C5` |  | `IS_BIT<write2 + write4 + write8>` |  |
+| `STORE-C6` |  | `write2` + `write4` + `write8` => `μ` = 1 |  |
+| | | _polynomial:_ `(write2 + write4 + write8) * (1 - μ) = 0` | |
+| `STORE-C7.i` | i ∈ [0, 7] | μ ⇒ `IS_BYTE<value[i]>` |  |
+| `STORE-C8` |  | `MEMW[0, base_address, value, timestamp, write2, write4, write8]` | μ |
+
+The chip contributes the following to the lookup argument.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `STORE-C9` | `MEMOP[0::DWordWL; timestamp, base_address, value::DWordWL, 1 + 4 * write2 + 8 * write4 + 16 * write8]` | -μ |
+
+## Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `base_address` | `0` |
+| `timestamp` | `0` |
+| `write2` | `0` |
+| `write4` | `0` |
+| `write8` | `0` |
+| `value` | `0` |
+| `μ` | `0` |
 
 ---
 
@@ -2043,6 +2654,12 @@ The  chip leverages  variable, spanning  columns and leverages  interactions:
 |------|------|-------------|
 | `timestamp` | `DWordWL` | timestamp at which to halt the program |
 
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `pc` | `DWordWL` | The `next_pc` value the CPU wrote during the instruction HALT was invoked |
+
 ## Assumptions
 
 It is assumed the input is range checked:
@@ -2053,14 +2670,15 @@ It is assumed the input is range checked:
 
 ## Constraints
 
-The  chip: + makes sure register `x10` (containing the exit code) equals `0` ([halt:c:read_zero_exit_code]), + writes `0` to all other registers ([halt:c:zeroize_registers_lo]/[halt:c:zeroize_registers_hi]), and + sets `pc` equal to `1` ([halt:c:pc]). Note that the writes performed by all these interactions are accompanied by the timestamp `2^64-1`; the maximum timestamp. This prevents any other operation involving memory from being executed hereafter.
+The  chip: + makes sure register `x10` (containing the exit code) equals `0` ([halt:c:read_zero_exit_code]), + writes `0` to all other registers ([halt:c:zeroize_registers_lo]/[halt:c:zeroize_registers_hi]), and + sets `pc` equal to `1` ([halt:c:consume_pc], [halt:c:emit_pc]). Note that the writes performed by all these interactions --- except for the `pc` --- are accompanied by the timestamp `2^64-1`; the maximum timestamp. This prevents any other operation involving memory from being executed hereafter. The `pc` is consumed and re-emitted at the same timestamp to enable padding rows for the CPU. This means that the verifier will have to know the final timestamp at which a CPU padding `pc` was written to be able to balance the final LogUp.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
 | `HALT-C1.i` | i ∈ [1, 9] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
 | `HALT-C2` |  | `MEMW[0::BaseField[8]; 1, (2 * 10)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
 | `HALT-C3.i` | i ∈ [11, 31] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
-| `HALT-C4` |  | `MEMW[1, (2 * 255)::DWordWL, ['arr', 1, 0, 0, 0, 0, 0, 0, 0], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
+| `HALT-C4.i` | i ∈ [0, 1] | `memory[1, [2 * 255 + i, 0], [timestamp[0] + 1, timestamp[1]], pc[i]]` | 1 |
+| `HALT-C5.i` | i ∈ [0, 1] | `memory[1, [2 * 255 + i, 0], [timestamp[0] + 1, timestamp[1]], [1, 0][i]]` | -1 |
 
 [ Observe that --- in its current state --- this solution puts the burden of verifying the register cleanup on the verifier inside of the lookup argument. Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there. ])
 
@@ -2072,7 +2690,7 @@ The HALT chip therefore contributes the following interaction to the lookup-argu
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `HALT-C5` | `ECALL[timestamp, 93::DWordWL]` | -1 |
+| `HALT-C6` | `ECALL[timestamp, 93::DWordWL]` | -1 |
 
 ## Padding
 
@@ -2133,10 +2751,10 @@ we assert that `x10` contains `1` in [commit:c:read_fd_write_count]. Note that t
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `COMMIT-C2` | `MEMW[['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C3` | `MEMW[['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C4` | `MEMW[['arr', 1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C5` | `MEMW[['arr', 'index', 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, ['arr', ['+', 'index', ['cast', 'count', 'BaseField']], 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
+| `COMMIT-C2` | `MEMW[[address[0], address[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, [address[0], address[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C3` | `MEMW[[count[0], count[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, [count[0], count[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C4` | `MEMW[[1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, [count[0], count[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C5` | `MEMW[[index, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, [index + count::BaseField, 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
 
 *Note*: the observant reader will notice that [commit:c:read_index] casts `count` to a `BaseField`, potentiallly losing information. This is indeed correct. However, since it is practically impossible to commit more than `2^64-2^32` bytes in a single VM execution, it was decided to permit this.
 
@@ -2144,7 +2762,7 @@ Next, we read the `value` located at buffer address `address` and commit to it u
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `COMMIT-C6` | `MEMW[['arr', 'value', 0, 0, 0, 0, 0, 0, 0]; 0, address, ['arr', 'value', 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
+| `COMMIT-C6` | `MEMW[[value, 0, 0, 0, 0, 0, 0, 0]; 0, address, [value, 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
 | `COMMIT-C7` | `COMMIT[index, value]` | μ - end |
 
 In parallel, we compute ``address_incr` = `address` + 1` ([commit:c:address_incr]) as address of the next byte to commit, and ``count_decr` = `count` - 1` ([commit:c:count_decr]) as the number of bytes that still has to be committed after committing this byte. [commit:c:range_address_incr] and [commit:c:range_count_decr] are included to satisfy [add:a:sum] respectively [add:a:rhs].
@@ -2184,6 +2802,19 @@ Lastly, we must make sure `first`, `end` and `μ` are bits ([commit:c:range_firs
 ## Padding
 
 To pad this chip, use the below data.
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `index` | `0` |
+| `address` | `[0, 0, 0, 0]` |
+| `address_incr` | `[1, 0, 0, 0]` |
+| `count` | `[1, 0, 0, 0]` |
+| `count_decr` | `[0, 0, 0, 0]` |
+| `first` | `0` |
+| `end` | `0` |
+| `value` | `0` |
+| `μ` | `0` |
 
 ## Notes/optimizations
 
@@ -2239,14 +2870,14 @@ The first responsibility of the chip is to read the current state and message ch
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHA256-C1` |  | `MEMW[['arr', ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
+| `SHA256-C1` |  | `MEMW[[(m_addr[0]::DWordWL)[0], (m_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, [(m_addr[0]::DWordWL)[0], (m_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
 | `SHA256-C2.i` | i ∈ [0, 7], j ∈ [0, 3] | `IS_HALF[m_addr[i][j]]` | μ |
 | `SHA256-C3.i` | i ∈ [1, 7] | `ADD<m_addr[i]::DWordWL; m_addr[0]::DWordWL, (8 * i)::DWordWL>` |  |
-| `SHA256-C4.i` | i ∈ [0, 7] | `MEMW[['arr', ['idx', 'm', ['+', ['*', 8, 'i'], 3]], ['idx', 'm', ['+', ['*', 8, 'i'], 2]], ['idx', 'm', ['+', ['*', 8, 'i'], 1]], ['idx', 'm', ['+', ['*', 8, 'i'], 0]], ['idx', 'm', ['+', ['*', 8, 'i'], 7]], ['idx', 'm', ['+', ['*', 8, 'i'], 6]], ['idx', 'm', ['+', ['*', 8, 'i'], 5]], ['idx', 'm', ['+', ['*', 8, 'i'], 4]]]; 0, m_addr[i]::DWordWL, ['arr', ['idx', 'm', ['+', ['*', 8, 'i'], 3]], ['idx', 'm', ['+', ['*', 8, 'i'], 2]], ['idx', 'm', ['+', ['*', 8, 'i'], 1]], ['idx', 'm', ['+', ['*', 8, 'i'], 0]], ['idx', 'm', ['+', ['*', 8, 'i'], 7]], ['idx', 'm', ['+', ['*', 8, 'i'], 6]], ['idx', 'm', ['+', ['*', 8, 'i'], 5]], ['idx', 'm', ['+', ['*', 8, 'i'], 4]]], timestamp, 0, 0, 1]` | μ |
-| `SHA256-C5` |  | `MEMW[['arr', ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
+| `SHA256-C4.i` | i ∈ [0, 7] | `MEMW[[m[8 * i + 3], m[8 * i + 2], m[8 * i + 1], m[8 * i + 0], m[8 * i + 7], m[8 * i + 6], m[8 * i + 5], m[8 * i + 4]]; 0, m_addr[i]::DWordWL, [m[8 * i + 3], m[8 * i + 2], m[8 * i + 1], m[8 * i + 0], m[8 * i + 7], m[8 * i + 6], m[8 * i + 5], m[8 * i + 4]], timestamp, 0, 0, 1]` | μ |
+| `SHA256-C5` |  | `MEMW[[(h_addr[0]::DWordWL)[0], (h_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, [(h_addr[0]::DWordWL)[0], (h_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
 | `SHA256-C6.i` | i ∈ [0, 3], j ∈ [0, 3] | `IS_HALF[h_addr[i][j]]` | μ |
 | `SHA256-C7.i` | i ∈ [1, 3] | `ADD<h_addr[i]::DWordWL; h_addr[0]::DWordWL, 8 * i::DWordWL>` |  |
-| `SHA256-C8.i` | i ∈ [0, 3] | `MEMW[['arr', ['idx', 'h', ['+', ['*', 8, 'i'], 3]], ['idx', 'h', ['+', ['*', 8, 'i'], 2]], ['idx', 'h', ['+', ['*', 8, 'i'], 1]], ['idx', 'h', ['+', ['*', 8, 'i'], 0]], ['idx', 'h', ['+', ['*', 8, 'i'], 7]], ['idx', 'h', ['+', ['*', 8, 'i'], 6]], ['idx', 'h', ['+', ['*', 8, 'i'], 5]], ['idx', 'h', ['+', ['*', 8, 'i'], 4]]]; 0, h_addr[i]::DWordWL, ['arr', ['idx', 'out', ['+', ['*', 8, 'i'], 3]], ['idx', 'out', ['+', ['*', 8, 'i'], 2]], ['idx', 'out', ['+', ['*', 8, 'i'], 1]], ['idx', 'out', ['+', ['*', 8, 'i'], 0]], ['idx', 'out', ['+', ['*', 8, 'i'], 7]], ['idx', 'out', ['+', ['*', 8, 'i'], 6]], ['idx', 'out', ['+', ['*', 8, 'i'], 5]], ['idx', 'out', ['+', ['*', 8, 'i'], 4]]], timestamp + 1::DWordWL, 0, 0, 1]` | μ |
+| `SHA256-C8.i` | i ∈ [0, 3] | `MEMW[[h[8 * i + 3], h[8 * i + 2], h[8 * i + 1], h[8 * i + 0], h[8 * i + 7], h[8 * i + 6], h[8 * i + 5], h[8 * i + 4]]; 0, h_addr[i]::DWordWL, [out[8 * i + 3], out[8 * i + 2], out[8 * i + 1], out[8 * i + 0], out[8 * i + 7], out[8 * i + 6], out[8 * i + 5], out[8 * i + 4]], timestamp + 1::DWordWL, 0, 0, 1]` | μ |
 
 Then we prepare the message schedule, by emitting the input chunk with multiplicities corresponding to the number of times it will be read during a compression evaluation. The  chip itself is implicitly invoked by itself and , setting the `amount` column appropriately for the number of times the `w` value is required.
 
@@ -2261,19 +2892,30 @@ And finally, we provide the boundaries for the  chip and the final addition of t
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHA256-C13` |  | `SHA256ROUND[timestamp, ['arr', ['+', ['*', ['^', 2, 0], ['idx', 'h', 3]], ['*', ['^', 2, 8], ['idx', 'h', 2]], ['*', ['^', 2, 16], ['idx', 'h', 1]], ['*', ['^', 2, 24], ['idx', 'h', 0]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 7]], ['*', ['^', 2, 8], ['idx', 'h', 6]], ['*', ['^', 2, 16], ['idx', 'h', 5]], ['*', ['^', 2, 24], ['idx', 'h', 4]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 11]], ['*', ['^', 2, 8], ['idx', 'h', 10]], ['*', ['^', 2, 16], ['idx', 'h', 9]], ['*', ['^', 2, 24], ['idx', 'h', 8]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 15]], ['*', ['^', 2, 8], ['idx', 'h', 14]], ['*', ['^', 2, 16], ['idx', 'h', 13]], ['*', ['^', 2, 24], ['idx', 'h', 12]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 19]], ['*', ['^', 2, 8], ['idx', 'h', 18]], ['*', ['^', 2, 16], ['idx', 'h', 17]], ['*', ['^', 2, 24], ['idx', 'h', 16]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 23]], ['*', ['^', 2, 8], ['idx', 'h', 22]], ['*', ['^', 2, 16], ['idx', 'h', 21]], ['*', ['^', 2, 24], ['idx', 'h', 20]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 27]], ['*', ['^', 2, 8], ['idx', 'h', 26]], ['*', ['^', 2, 16], ['idx', 'h', 25]], ['*', ['^', 2, 24], ['idx', 'h', 24]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 31]], ['*', ['^', 2, 8], ['idx', 'h', 30]], ['*', ['^', 2, 16], ['idx', 'h', 29]], ['*', ['^', 2, 24], ['idx', 'h', 28]]]], 0]` | μ |
+| `SHA256-C13` |  | `SHA256ROUND[timestamp, [2^0 * h[3] + 2^8 * h[2] + 2^16 * h[1] + 2^24 * h[0], 2^0 * h[7] + 2^8 * h[6] + 2^16 * h[5] + 2^24 * h[4], 2^0 * h[11] + 2^8 * h[10] + 2^16 * h[9] + 2^24 * h[8], 2^0 * h[15] + 2^8 * h[14] + 2^16 * h[13] + 2^24 * h[12], 2^0 * h[19] + 2^8 * h[18] + 2^16 * h[17] + 2^24 * h[16], 2^0 * h[23] + 2^8 * h[22] + 2^16 * h[21] + 2^24 * h[20], 2^0 * h[27] + 2^8 * h[26] + 2^16 * h[25] + 2^24 * h[24], 2^0 * h[31] + 2^8 * h[30] + 2^16 * h[29] + 2^24 * h[28]], 0]` | μ |
 | `SHA256-C14` |  | `SHA256ROUND[timestamp, last_round_out, 64]` | -μ |
-| `SHA256-C15.i` | i ∈ [0, 31] | `IS_BYTE[out[i]]` | μ |
-| `SHA256-C16.i` | i ∈ [0, 7] | `ADD<['arr', 0, ['+', ['*', ['^', 2, 0], ['idx', 'out', ['+', ['*', 4, 'i'], 3]]], ['*', ['^', 2, 8], ['idx', 'out', ['+', ['*', 4, 'i'], 2]]], ['*', ['^', 2, 16], ['idx', 'out', ['+', ['*', 4, 'i'], 1]]], ['*', ['^', 2, 24], ['idx', 'out', ['+', ['*', 4, 'i'], 0]]]]]; ['arr', 0, ['idx', 'last_round_out', 'i']], ['arr', 0, ['+', ['*', ['^', 2, 0], ['idx', 'h', ['+', ['*', 4, 'i'], 3]]], ['*', ['^', 2, 8], ['idx', 'h', ['+', ['*', 4, 'i'], 2]]], ['*', ['^', 2, 16], ['idx', 'h', ['+', ['*', 4, 'i'], 1]]], ['*', ['^', 2, 24], ['idx', 'h', ['+', ['*', 4, 'i'], 0]]]]]>` |  |
+| `SHA256-C15.i` | i ∈ [0, 31] | μ ⇒ `IS_BYTE<out[i]>` |  |
+| `SHA256-C16.i` | i ∈ [0, 7] | `ADD<[0, 2^0 * out[4 * i + 3] + 2^8 * out[4 * i + 2] + 2^16 * out[4 * i + 1] + 2^24 * out[4 * i + 0]]; [0, last_round_out[i]], [0, 2^0 * h[4 * i + 3] + 2^8 * h[4 * i + 2] + 2^16 * h[4 * i + 1] + 2^24 * h[4 * i + 0]]>` |  |
 
 In this VM, we assign syscall number -1 to the  accelerator. The chip therefore contributes the following interaction to the lookup-argument:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `SHA256-C17` | `IS_BIT<μ>` |  |
-| `SHA256-C18` | `ECALL[timestamp, ['arr', ['-', ['^', 2, 32], 1], ['-', ['^', 2, 32], 1]]]` | -μ |
+| `SHA256-C18` | `ECALL[timestamp, (2^64 - 1)::DWordWL]` | -μ |
 
 ### Padding
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `h` | `0` |
+| `h_addr` | `[0, 8, 16, 24]` |
+| `m` | `0` |
+| `m_addr` | `[0, 8, 16, 24, 32, 40, 48, 56]` |
+| `out` | `0` |
+| `last_round_out` | `0` |
+| `μ` | `0` |
 
 ## `SHA256`msgsched chip
 
@@ -2335,7 +2977,7 @@ First, we gather the dependencies from earlier in the message schedule.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHA256MSGSCHED-C1` | `IS_BYTE[index - 16]` | μ |
+| `SHA256MSGSCHED-C1` | μ ⇒ `IS_BYTE<index - 16>` |  |
 | `SHA256MSGSCHED-C2` | `SHA256_M[back2; timestamp, index - 2]` | μ |
 | `SHA256MSGSCHED-C3` | `SHA256_M[back7; timestamp, index - 7]` | μ |
 | `SHA256MSGSCHED-C4` | `SHA256_M[back15; timestamp, index - 15]` | μ |
@@ -2347,7 +2989,7 @@ Then, we calculate the result. It suffices to check that the carry of adding fou
 |-----|-------|-------------|--------------|
 | `SHA256MSGSCHED-C6` |  | `ROTXOR[s0; back15, 2, 11, 3, 0]` | μ |
 | `SHA256MSGSCHED-C7` |  | `ROTXOR[s1; back2, 3, 2, 10, 0]` | μ |
-| `SHA256MSGSCHED-C8` |  | `IS_BYTE[carry]` | μ |
+| `SHA256MSGSCHED-C8` |  | μ ⇒ `IS_BYTE<carry>` |  |
 | `SHA256MSGSCHED-C9.i` | i ∈ [0, 1] | `IS_HALF[out[i]]` | μ |
 
 Finally, we contribute to the LogUp.
@@ -2462,11 +3104,11 @@ To compute `maj`, observe that ` (a bitand b) xor (a bitand c) xor (b bitand c) 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHA256ROUND-C1.i` | i ∈ [0, 3] | `AND_BYTE[a_and_b[i]; a[i], b[i]]` | μ |
-| `SHA256ROUND-C2.i` | i ∈ [0, 3] | `XOR_BYTE[a_xor_b[i]; a[i], b[i]]` | μ |
-| `SHA256ROUND-C3.i` | i ∈ [0, 3] | `AND_BYTE[c_and_a_xor_b[i]; c[i], a_xor_b[i]]` | μ |
-| `SHA256ROUND-C4.i` | i ∈ [0, 3] | `AND_BYTE[e_and_f[i]; e[i], f[i]]` | μ |
-| `SHA256ROUND-C5.i` | i ∈ [0, 3] | `AND_BYTE[not_e_and_g[i]; 255 - e[i], g[i]]` | μ |
+| `SHA256ROUND-C1.i` | i ∈ [0, 3] | `BYTE_ALU[a_and_b[i]; ⧼AND⧽, a[i], b[i]]` | μ |
+| `SHA256ROUND-C2.i` | i ∈ [0, 3] | `BYTE_ALU[a_xor_b[i]; ⧼XOR⧽, a[i], b[i]]` | μ |
+| `SHA256ROUND-C3.i` | i ∈ [0, 3] | `BYTE_ALU[c_and_a_xor_b[i]; ⧼AND⧽, c[i], a_xor_b[i]]` | μ |
+| `SHA256ROUND-C4.i` | i ∈ [0, 3] | `BYTE_ALU[e_and_f[i]; ⧼AND⧽, e[i], f[i]]` | μ |
+| `SHA256ROUND-C5.i` | i ∈ [0, 3] | `BYTE_ALU[not_e_and_g[i]; ⧼AND⧽, 255 - e[i], g[i]]` | μ |
 | `SHA256ROUND-C6` |  | `SHA256_K[kval; index]` | μ |
 | `SHA256ROUND-C7` |  | `SHA256_M[wval; timestamp, index]` | μ |
 | `SHA256ROUND-C8` |  | `ROTXOR[S0; a::Word, 6, 9, 2, 1]` | μ |
@@ -2477,18 +3119,43 @@ Then we constrain the addition for the new state, constraining additions with th
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
 | `SHA256ROUND-C10.i` | i ∈ [0, 1] | `IS_HALF[out_a[i]]` | μ |
-| `SHA256ROUND-C11` |  | `IS_BYTE[carry_a]` | μ |
+| `SHA256ROUND-C11` |  | μ ⇒ `IS_BYTE<carry_a>` |  |
 | `SHA256ROUND-C12.i` | i ∈ [0, 1] | `IS_HALF[out_e[i]]` | μ |
-| `SHA256ROUND-C13` |  | `IS_BYTE[carry_e]` | μ |
+| `SHA256ROUND-C13` |  | μ ⇒ `IS_BYTE<carry_e>` |  |
 
 Finally, we chain the rounds together through the interactions.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHA256ROUND-C14` | `SHA256ROUND[timestamp, ['arr', ['cast', 'a', 'Word'], ['cast', 'b', 'Word'], ['cast', 'c', 'Word'], 'd', ['cast', 'e', 'Word'], ['cast', 'f', 'Word'], ['cast', 'g', 'Word'], 'h'], index]` | -μ |
-| `SHA256ROUND-C15` | `SHA256ROUND[timestamp, ['arr', ['cast', 'out_a', 'Word'], ['cast', 'a', 'Word'], ['cast', 'b', 'Word'], ['cast', 'c', 'Word'], ['cast', 'out_e', 'Word'], ['cast', 'e', 'Word'], ['cast', 'f', 'Word'], ['cast', 'g', 'Word']], index + 1]` | μ |
+| `SHA256ROUND-C14` | `SHA256ROUND[timestamp, [a::Word, b::Word, c::Word, d, e::Word, f::Word, g::Word, h], index]` | -μ |
+| `SHA256ROUND-C15` | `SHA256ROUND[timestamp, [out_a::Word, a::Word, b::Word, c::Word, out_e::Word, e::Word, f::Word, g::Word], index + 1]` | μ |
 
 ### Padding
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `a` | `0` |
+| `b` | `0` |
+| `c` | `0` |
+| `d` | `0` |
+| `e` | `0` |
+| `f` | `0` |
+| `g` | `0` |
+| `h` | `0` |
+| `index` | `0` |
+| `out_a` | `0` |
+| `out_e` | `0` |
+| `a_and_b` | `0` |
+| `a_xor_b` | `0` |
+| `c_and_a_xor_b` | `0` |
+| `e_and_f` | `0` |
+| `not_e_and_g` | `0` |
+| `kval` | `0` |
+| `S0` | `0` |
+| `S1` | `0` |
+| `wval` | `0` |
+| `μ` | `0` |
 
 ## `ROTXOR` chip
 
@@ -2549,9 +3216,9 @@ We first compute all rotations (or shifts) of `a`. `a1` is computed as a left ro
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `ROTXOR-C1.i` | i ∈ [0, 1] | `HWSL[['arr', ['idx', 'a0_left', 'i'], ['idx', 'a0_right', 'i']]; a[i], 16 - r0]` | μ |
-| `ROTXOR-C2.i` | i ∈ [0, 1] | `HWSL[['arr', ['idx', 'a1_left', 'i'], ['idx', 'a1_right', 'i']]; (a0::WordHL)[i], r1]` | μ |
-| `ROTXOR-C3.i` | i ∈ [0, 1] | `HWSL[['arr', ['idx', 'a2_left', 'i'], ['idx', 'a2_right', 'i']]; a[i], 16 - r2]` | μ |
+| `ROTXOR-C1.i` | i ∈ [0, 1] | `HWSL[[a0_left[i], a0_right[i]]; a[i], 16 - r0]` | μ |
+| `ROTXOR-C2.i` | i ∈ [0, 1] | `HWSL[[a1_left[i], a1_right[i]]; (a0::WordHL)[i], r1]` | μ |
+| `ROTXOR-C3.i` | i ∈ [0, 1] | `HWSL[[a2_left[i], a2_right[i]]; a[i], 16 - r2]` | μ |
 | `ROTXOR-C4.i` | i ∈ [0, 1] | `a0[i]` = `a0_left[i]` + `a0_right[1 - i]` |  |
 | | | _polynomial:_ `(a0::WordHL)[i] - a0_left[i] - a0_right[1 - i] = 0` | |
 | `ROTXOR-C5.i` | i ∈ [0, 1] | `a1[i]` = `a1_left[i]` + `a1_right[1 - i]` |  |
@@ -2559,14 +3226,14 @@ We first compute all rotations (or shifts) of `a`. `a1` is computed as a left ro
 | `ROTXOR-C6` |  | `a2[0]` = `a2_left[1]` + `a2_right[0]` |  |
 | | | _polynomial:_ `(a2::WordHL)[0] - a2_left[1] - a2_right[0] = 0` | |
 | `ROTXOR-C7` |  | `a2[1]` = `last_rot` dot `a2_left[0]` + `a2_right[1]` |  |
-| | | _polynomial:_ `(a2::WordHL)[0] - last_rot * a2_left[0] - a2_right[1] = 0` | |
+| | | _polynomial:_ `(a2::WordHL)[1] - last_rot * a2_left[0] - a2_right[1] = 0` | |
 
 Then the bitwise XOR of the results.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `ROTXOR-C8.i` | i ∈ [0, 3] | `XOR_BYTE[a01[i]; a0[i], a1[i]]` | μ |
-| `ROTXOR-C9.i` | i ∈ [0, 3] | `XOR_BYTE[out[i]; a01[i], a2[i]]` | μ |
+| `ROTXOR-C8.i` | i ∈ [0, 3] | `BYTE_ALU[a01[i]; ⧼XOR⧽, a0[i], a1[i]]` | μ |
+| `ROTXOR-C9.i` | i ∈ [0, 3] | `BYTE_ALU[out[i]; ⧼XOR⧽, a01[i], a2[i]]` | μ |
 
 And finally contribute to the lookup argument.
 
@@ -2575,6 +3242,26 @@ And finally contribute to the lookup argument.
 | `ROTXOR-C10` | `ROTXOR[out::Word; a::Word, r0, r1, r2, last_rot]` | -μ |
 
 ### Padding
+
+| Column | Padding value |
+|--------|---------------|
+| `a` | `0` |
+| `r0` | `0` |
+| `r1` | `0` |
+| `r2` | `0` |
+| `last_rot` | `0` |
+| `out` | `0` |
+| `a0_left` | `0` |
+| `a0_right` | `0` |
+| `a1_left` | `0` |
+| `a1_right` | `0` |
+| `a2_left` | `0` |
+| `a2_right` | `0` |
+| `a0` | `0` |
+| `a1` | `0` |
+| `a2` | `0` |
+| `a01` | `0` |
+| `μ` | `0` |
 
 ## Constant lookup
 
@@ -2637,14 +3324,14 @@ As mentioned, we provide the round constants through a short precomputed lookup 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHA256-C1` |  | `MEMW[['arr', ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'm_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
+| `SHA256-C1` |  | `MEMW[[(m_addr[0]::DWordWL)[0], (m_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, [(m_addr[0]::DWordWL)[0], (m_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
 | `SHA256-C2.i` | i ∈ [0, 7], j ∈ [0, 3] | `IS_HALF[m_addr[i][j]]` | μ |
 | `SHA256-C3.i` | i ∈ [1, 7] | `ADD<m_addr[i]::DWordWL; m_addr[0]::DWordWL, (8 * i)::DWordWL>` |  |
-| `SHA256-C4.i` | i ∈ [0, 7] | `MEMW[['arr', ['idx', 'm', ['+', ['*', 8, 'i'], 3]], ['idx', 'm', ['+', ['*', 8, 'i'], 2]], ['idx', 'm', ['+', ['*', 8, 'i'], 1]], ['idx', 'm', ['+', ['*', 8, 'i'], 0]], ['idx', 'm', ['+', ['*', 8, 'i'], 7]], ['idx', 'm', ['+', ['*', 8, 'i'], 6]], ['idx', 'm', ['+', ['*', 8, 'i'], 5]], ['idx', 'm', ['+', ['*', 8, 'i'], 4]]]; 0, m_addr[i]::DWordWL, ['arr', ['idx', 'm', ['+', ['*', 8, 'i'], 3]], ['idx', 'm', ['+', ['*', 8, 'i'], 2]], ['idx', 'm', ['+', ['*', 8, 'i'], 1]], ['idx', 'm', ['+', ['*', 8, 'i'], 0]], ['idx', 'm', ['+', ['*', 8, 'i'], 7]], ['idx', 'm', ['+', ['*', 8, 'i'], 6]], ['idx', 'm', ['+', ['*', 8, 'i'], 5]], ['idx', 'm', ['+', ['*', 8, 'i'], 4]]], timestamp, 0, 0, 1]` | μ |
-| `SHA256-C5` |  | `MEMW[['arr', ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 0], ['idx', ['cast', ['idx', 'h_addr', 0], 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
+| `SHA256-C4.i` | i ∈ [0, 7] | `MEMW[[m[8 * i + 3], m[8 * i + 2], m[8 * i + 1], m[8 * i + 0], m[8 * i + 7], m[8 * i + 6], m[8 * i + 5], m[8 * i + 4]]; 0, m_addr[i]::DWordWL, [m[8 * i + 3], m[8 * i + 2], m[8 * i + 1], m[8 * i + 0], m[8 * i + 7], m[8 * i + 6], m[8 * i + 5], m[8 * i + 4]], timestamp, 0, 0, 1]` | μ |
+| `SHA256-C5` |  | `MEMW[[(h_addr[0]::DWordWL)[0], (h_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, [(h_addr[0]::DWordWL)[0], (h_addr[0]::DWordWL)[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | μ |
 | `SHA256-C6.i` | i ∈ [0, 3], j ∈ [0, 3] | `IS_HALF[h_addr[i][j]]` | μ |
 | `SHA256-C7.i` | i ∈ [1, 3] | `ADD<h_addr[i]::DWordWL; h_addr[0]::DWordWL, 8 * i::DWordWL>` |  |
-| `SHA256-C8.i` | i ∈ [0, 3] | `MEMW[['arr', ['idx', 'h', ['+', ['*', 8, 'i'], 3]], ['idx', 'h', ['+', ['*', 8, 'i'], 2]], ['idx', 'h', ['+', ['*', 8, 'i'], 1]], ['idx', 'h', ['+', ['*', 8, 'i'], 0]], ['idx', 'h', ['+', ['*', 8, 'i'], 7]], ['idx', 'h', ['+', ['*', 8, 'i'], 6]], ['idx', 'h', ['+', ['*', 8, 'i'], 5]], ['idx', 'h', ['+', ['*', 8, 'i'], 4]]]; 0, h_addr[i]::DWordWL, ['arr', ['idx', 'out', ['+', ['*', 8, 'i'], 3]], ['idx', 'out', ['+', ['*', 8, 'i'], 2]], ['idx', 'out', ['+', ['*', 8, 'i'], 1]], ['idx', 'out', ['+', ['*', 8, 'i'], 0]], ['idx', 'out', ['+', ['*', 8, 'i'], 7]], ['idx', 'out', ['+', ['*', 8, 'i'], 6]], ['idx', 'out', ['+', ['*', 8, 'i'], 5]], ['idx', 'out', ['+', ['*', 8, 'i'], 4]]], timestamp + 1::DWordWL, 0, 0, 1]` | μ |
+| `SHA256-C8.i` | i ∈ [0, 3] | `MEMW[[h[8 * i + 3], h[8 * i + 2], h[8 * i + 1], h[8 * i + 0], h[8 * i + 7], h[8 * i + 6], h[8 * i + 5], h[8 * i + 4]]; 0, h_addr[i]::DWordWL, [out[8 * i + 3], out[8 * i + 2], out[8 * i + 1], out[8 * i + 0], out[8 * i + 7], out[8 * i + 6], out[8 * i + 5], out[8 * i + 4]], timestamp + 1::DWordWL, 0, 0, 1]` | μ |
 
 ### sched
 
@@ -2659,14 +3346,246 @@ As mentioned, we provide the round constants through a short precomputed lookup 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHA256-C13` |  | `SHA256ROUND[timestamp, ['arr', ['+', ['*', ['^', 2, 0], ['idx', 'h', 3]], ['*', ['^', 2, 8], ['idx', 'h', 2]], ['*', ['^', 2, 16], ['idx', 'h', 1]], ['*', ['^', 2, 24], ['idx', 'h', 0]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 7]], ['*', ['^', 2, 8], ['idx', 'h', 6]], ['*', ['^', 2, 16], ['idx', 'h', 5]], ['*', ['^', 2, 24], ['idx', 'h', 4]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 11]], ['*', ['^', 2, 8], ['idx', 'h', 10]], ['*', ['^', 2, 16], ['idx', 'h', 9]], ['*', ['^', 2, 24], ['idx', 'h', 8]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 15]], ['*', ['^', 2, 8], ['idx', 'h', 14]], ['*', ['^', 2, 16], ['idx', 'h', 13]], ['*', ['^', 2, 24], ['idx', 'h', 12]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 19]], ['*', ['^', 2, 8], ['idx', 'h', 18]], ['*', ['^', 2, 16], ['idx', 'h', 17]], ['*', ['^', 2, 24], ['idx', 'h', 16]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 23]], ['*', ['^', 2, 8], ['idx', 'h', 22]], ['*', ['^', 2, 16], ['idx', 'h', 21]], ['*', ['^', 2, 24], ['idx', 'h', 20]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 27]], ['*', ['^', 2, 8], ['idx', 'h', 26]], ['*', ['^', 2, 16], ['idx', 'h', 25]], ['*', ['^', 2, 24], ['idx', 'h', 24]]], ['+', ['*', ['^', 2, 0], ['idx', 'h', 31]], ['*', ['^', 2, 8], ['idx', 'h', 30]], ['*', ['^', 2, 16], ['idx', 'h', 29]], ['*', ['^', 2, 24], ['idx', 'h', 28]]]], 0]` | μ |
+| `SHA256-C13` |  | `SHA256ROUND[timestamp, [2^0 * h[3] + 2^8 * h[2] + 2^16 * h[1] + 2^24 * h[0], 2^0 * h[7] + 2^8 * h[6] + 2^16 * h[5] + 2^24 * h[4], 2^0 * h[11] + 2^8 * h[10] + 2^16 * h[9] + 2^24 * h[8], 2^0 * h[15] + 2^8 * h[14] + 2^16 * h[13] + 2^24 * h[12], 2^0 * h[19] + 2^8 * h[18] + 2^16 * h[17] + 2^24 * h[16], 2^0 * h[23] + 2^8 * h[22] + 2^16 * h[21] + 2^24 * h[20], 2^0 * h[27] + 2^8 * h[26] + 2^16 * h[25] + 2^24 * h[24], 2^0 * h[31] + 2^8 * h[30] + 2^16 * h[29] + 2^24 * h[28]], 0]` | μ |
 | `SHA256-C14` |  | `SHA256ROUND[timestamp, last_round_out, 64]` | -μ |
-| `SHA256-C15.i` | i ∈ [0, 31] | `IS_BYTE[out[i]]` | μ |
-| `SHA256-C16.i` | i ∈ [0, 7] | `ADD<['arr', 0, ['+', ['*', ['^', 2, 0], ['idx', 'out', ['+', ['*', 4, 'i'], 3]]], ['*', ['^', 2, 8], ['idx', 'out', ['+', ['*', 4, 'i'], 2]]], ['*', ['^', 2, 16], ['idx', 'out', ['+', ['*', 4, 'i'], 1]]], ['*', ['^', 2, 24], ['idx', 'out', ['+', ['*', 4, 'i'], 0]]]]]; ['arr', 0, ['idx', 'last_round_out', 'i']], ['arr', 0, ['+', ['*', ['^', 2, 0], ['idx', 'h', ['+', ['*', 4, 'i'], 3]]], ['*', ['^', 2, 8], ['idx', 'h', ['+', ['*', 4, 'i'], 2]]], ['*', ['^', 2, 16], ['idx', 'h', ['+', ['*', 4, 'i'], 1]]], ['*', ['^', 2, 24], ['idx', 'h', ['+', ['*', 4, 'i'], 0]]]]]>` |  |
+| `SHA256-C15.i` | i ∈ [0, 31] | μ ⇒ `IS_BYTE<out[i]>` |  |
+| `SHA256-C16.i` | i ∈ [0, 7] | `ADD<[0, 2^0 * out[4 * i + 3] + 2^8 * out[4 * i + 2] + 2^16 * out[4 * i + 1] + 2^24 * out[4 * i + 0]]; [0, last_round_out[i]], [0, 2^0 * h[4 * i + 3] + 2^8 * h[4 * i + 2] + 2^16 * h[4 * i + 1] + 2^24 * h[4 * i + 0]]>` |  |
 
 ### lookup
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `SHA256-C17` | `IS_BIT<μ>` |  |
-| `SHA256-C18` | `ECALL[timestamp, ['arr', ['-', ['^', 2, 32], 1], ['-', ['^', 2, 32], 1]]]` | -μ |
+| `SHA256-C18` | `ECALL[timestamp, (2^64 - 1)::DWordWL]` | -μ |
+
+---
+
+# KECCAK Accelerator
+
+The  chip applies the keccak permutation `kappa` to a given memory range; other aspects of keccak hashing (such as repeated permutation invocation, input padding and state initialization) fall outside the scope of this accelerator.
+
+This permutation `kappa: FF_2^1600 -> FF_2^1600` operates on 1600 bits and is composed of 24 applications of round-permutation `Lambda: FF_2^1600 times NN -> FF_2^1600`, where the additional parameter is the round constant. `Lambda` is defined as the composition `iota compose chi compose pi compose rho compose theta`, where only `iota` depends on the round constant.
+
+The keccak accelerator comprises two chips: a core chip that interacts with the memory --- loading the input and writing the output, and a round chip that applies the round permutation.
+
+## Core chip
+
+### Columns
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `DWordWL` | timestamp at which the permutation is performed |
+| `addr` | `DWordBL` | memory address storing the first bit of the state |
+| `input_state` | `[['Byte', 8], 5][5]` | state at the start of executing the permutation |
+
+### Output
+
+| Name | Type | Description |
+|------|------|-------------|
+| `output_state` | `[['Byte', 8], 5][5]` | state after executing the permutation |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `state_ptr` | `['DWordHL', 5][5]` | memory addresses storing the entire state |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
+### Constraints
+
+In this VM, we assign syscall number -2 to the  accelerator. The chip therefore contributes the following interaction to the lookup-argument:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `KECCAK-C1` | `ECALL[timestamp, (2^64 - 2)::DWordWL]` | -μ |
+
+The address containing the state to be permuted is passed in as argument `A0 = x10`. The following constraints describe that this address is read into `addr` ([keccak:c:read_addr]), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is derived ([keccak:c:state_ptr]). The state is then read into `input_state`, while the `output_state` is written back to the indicated address ([keccak:c:load_store_state]).
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `KECCAK-C2` |  | `MEMW[addr; 1, (2 * 10)::DWordWL, addr, timestamp, 1, 0, 0]` | μ |
+| `KECCAK-C3.i` | x ∈ [0, 4], y ∈ [0, 4] | `ADD<state_ptr[x][y]::DWordWL; addr::DWordWL, (8 * (5 * y + x))::DWordWL>` |  |
+| `KECCAK-C4.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 3] | `IS_HALF[state_ptr[x][y][z]]` | μ |
+| `KECCAK-C5.i` | x ∈ [0, 4], y ∈ [0, 4] | `MEMW[input_state[x][y]; 0, state_ptr[x][y]::DWordWL, output_state[x][y], timestamp, 0, 0, 1]` | μ |
+
+Lastly, the input state is pushed to the Keccak-round function, while the output after 24 rounds is taken off the bus:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `KECCAK-C6` | `KECCAK[timestamp, 0, input_state]` | μ |
+| `KECCAK-C7` | `KECCAK[timestamp, 24, output_state]` | -μ |
+
+### Padding
+
+The  table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `addr` | `0` |
+| `input_state` | `0` |
+| `output_state` | `0` |
+| `state_ptr` | `8 * [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24]]` |
+| `μ` | `0` |
+
+## Round chip
+
+### Columns
+
+The  chip is comprised of  variables that are expressed using  columns and leverages  interaction(s):
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `DWordWL` | timestamp at which the permutation is performed |
+| `round` | `BaseField` | index of the permutation round |
+| `start` | `[['Byte', 8], 5][5]` | state at the start of executing the permutation |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `Cxz` | `[['Byte', 8], 4][5]` | $xor_(i=0)^(y+2) `start[x,i,z]`$ |
+| `Cxz_left` | `['Byte', 8][5]` | the left-rotated component of `rotated_Cxz` |
+| `Cxz_right` | `['Bit', 4][5]` | the right-rotated component of `rotated_Cxz` (which is a single bit) |
+| `Dxz` | `['Byte', 8][5]` | $`Cxz[`\(`x` - 1) mod 5`,y,z]` xor `rotated_Cxz[`\(`x` + 1) mod 5`,y,z]`$ |
+| `theta` | `[['Byte', 8], 5][5]` | $theta(`start`)$, the state after applying $theta$. |
+| `rot_left` | `[['Byte', 8], 5][5]` | the left-rotated component of $`theta[x,y]` <<< `rnc`$ |
+| `rot_right` | `[['Byte', 8], 5][5]` | the right-rotated component of $`theta[x,y]` <<< `rnc`$ |
+| `chi_ANDs` | `[['Byte', 8], 5][5]` | $(`pi[`\(x+1) mod 5`,y,z]` xor 255) times.o `pi[`\(x + 2) mod 5`,y,z]`$ |
+| `chi` | `[['Byte', 8], 5][5]` | $(chi compose pi compose rho compose theta)(`start`)$; the state after applying $chi$ |
+| `rc` | `Byte[8]` | round constants |
+| `iota` | `Byte[8]` | state update following from step $iota$. |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `rotated_Cxz` | `['Byte', 8][5]` | $`Cxz[x,`3`,z]` <<< 1$ |
+| `out` | `[['Byte', 8], 5][5]` | state at the end of executing the permutation |
+| `rho` | `[['Byte', 8], 5][5]` | $(rho compose theta)(`start`)$; the state after applying $rho$ |
+| `pi` | `[['Byte', 8], 5][5]` | $(pi compose rho compose theta)(`start`)$; the state after applying $pi$ |
+
+**Definition of `rotated_Cxz`:**
+```
+rotated_Cxz := Cxz_left[x][z] + Cxz_right[x][3]
+rotated_Cxz := Cxz_left[x][z]
+rotated_Cxz := Cxz_left[x][z] + Cxz_right[x][0]
+rotated_Cxz := Cxz_left[x][z]
+rotated_Cxz := Cxz_left[x][z] + Cxz_right[x][1]
+rotated_Cxz := Cxz_left[x][z]
+rotated_Cxz := Cxz_left[x][z] + Cxz_right[x][2]
+rotated_Cxz := Cxz_left[x][z]
+```
+
+**Definition of `out`:**
+```
+out := iota[z]
+out := chi[x][y][z]
+out := chi[x][y][z]
+out := chi[x][y][z]
+```
+
+**Definition of `rho`:**
+```
+rho := (1 - rbc[x][y][0]) * (1 - rbc[x][y][1]) * (rot_left[x][y][z] + rot_right[x][y][(z - 2) mod 8]) + rbc[x][y][0] * (1 - rbc[x][y][1]) * (rot_left[x][y][(z - 2) mod 8] + rot_right[x][y][(z - 4) mod 8]) + (1 - rbc[x][y][0]) * rbc[x][y][1] * (rot_left[x][y][(z - 4) mod 8] + rot_right[x][y][(z - 6) mod 8]) + rbc[x][y][0] * rbc[x][y][1] * (rot_left[x][y][(z - 6) mod 8] + rot_right[x][y][z])
+```
+
+**Definition of `pi`:**
+```
+pi := rho[(x + 3 * y) mod 5][x][z]
+```
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
+`start` contains the state to which the permutation should be applied. Its three-dimensional array mimics the specification's three-dimensional state
+
+and orders the bits as prescribed.
+
+Rho rotates every lane by a rotation offset in `[0, 64)`. These offsets are identical for every round.
+
+We decompose each offset in three components: the lower nibble (4 bits) are represented by `rnc`, while the upper two bits are represented by as `Bit`s in `rbc`. That is, ``rho_offset[x][y]` = `rnc[x][y]` + 16 dot `rbc[x][y][0]` + 32 dot `rbc[x][y][1]``.
+
+### Constraints
+
+The following constraints ensure that `theta` captures the state after applying the first subpermutation of the round-permutation: `theta`. Note here that `Cxz_left` and `Cxz_right` do have to be range-checked; it cannot be assumed that this implicitly follows from [keccak:c:Dxz] combined with `rotated_Cxz`'s definition.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `KECCAK_RND-C1.i` | x ∈ [0, 4], z ∈ [0, 7] | `BYTE_ALU[Cxz[x][0][z]; ⧼XOR⧽, start[x][0][z], start[x][1][z]]` | μ |
+| `KECCAK_RND-C2.i` | x ∈ [0, 4], y ∈ [2, 4], z ∈ [0, 7] | `BYTE_ALU[Cxz[x][y - 1][z]; ⧼XOR⧽, Cxz[x][y - 2][z], start[x][y][z]]` | μ |
+| `KECCAK_RND-C3.i` | x ∈ [0, 4], z ∈ [0, 3] | `HWSL[[(Cxz_left[x]::DWordHL)[z], Cxz_right[x][z]::Half]; (Cxz[x][3]::DWordHL)[z], 1]` | μ |
+| `KECCAK_RND-C4.i` | x ∈ [0, 4], z ∈ [0, 7] | μ ⇒ `IS_BYTE<Cxz_left[x][z]>` |  |
+| `KECCAK_RND-C5.i` | x ∈ [0, 4], z ∈ [0, 3] | `IS_BIT<Cxz_right[x][z]>` |  |
+| `KECCAK_RND-C6.i` | x ∈ [0, 4], z ∈ [0, 7] | `BYTE_ALU[Dxz[x][z]; ⧼XOR⧽, Cxz[(x - 1) mod 5][3][z], rotated_Cxz[(x + 1) mod 5][z]]` | μ |
+| `KECCAK_RND-C7.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 7] | `BYTE_ALU[theta[x][y][z]; ⧼XOR⧽, start[x][y][z], Dxz[x][z]]` | μ |
+
+Next, we constrain that `rho` captures the state after applying subpermutation `rho`. Note here as well that `rot_left` and `rot_right` do have to be range-checked; it cannot be assumed that this implicitly follows from later constraints.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `KECCAK_RND-C8.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 3] | `HWSL[[(rot_left[x][y]::DWordHL)[z], (rot_right[x][y]::DWordHL)[z]]; (theta[x][y]::DWordHL)[z], rnc[x][y]]` | μ |
+| `KECCAK_RND-C9.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 7] | μ ⇒ `IS_BYTE<rot_left[x][y][z]>` |  |
+| `KECCAK_RND-C10.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 7] | μ ⇒ `IS_BYTE<rot_right[x][y][z]>` |  |
+
+Observe that the lane-permutation performed by `pi` is absorbed in `pi`'s definition. The next permutation that is constrained in `chi`:
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `KECCAK_RND-C11.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 7] | `BYTE_ALU[chi_ANDs[x][y][z]; ⧼AND⧽, 255 - pi[(x + 1) mod 5][y][z], pi[(x + 2) mod 5][y][z]]` | μ |
+| `KECCAK_RND-C12.i` | x ∈ [0, 4], y ∈ [0, 4], z ∈ [0, 7] | `BYTE_ALU[chi[x][y][z]; ⧼XOR⧽, pi[x][y][z], chi_ANDs[x][y][z]]` | μ |
+
+Lastly, the round constants are added to one of the lanes in the state. `iota` contains the updated lane. In the definition of `out`, the output of `chi` and `iota` is combined to construct the output of the permutation.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `KECCAK_RND-C13.i` | z ∈ [0, 7] | `BYTE_ALU[iota[z]; ⧼XOR⧽, chi[0][0][z], rc[z]]` | μ |
+
+Lastly, the round chip contributes the following interactions to the lookup:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `KECCAK_RND-C14` | `KECCAK[timestamp, round, start]` | -μ |
+| `KECCAK_RND-C15` | `KECCAK[timestamp, round + 1, out]` | μ |
+| `KECCAK_RND-C16` | `KECCAK_RC[rc; round]` | -μ |
+
+### Notes/potential optimizations
+
+- one does not have to repeat `addr` in `state_ptr`; this saves 4 columns and 4 `IS_HALF` checks. - step `rho` does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions. - when the output of `HWSL` are `Byte`s mapped as `Half`s, we find that out of every four output bytes, at least one is zero. Since `rnc` is constant, [keccak:c:rho_rotation] makes those zero-bytes show up in `rot_left` and `rot_right` at constant locations. This means 96 columns can be removed from the chip at no cost. Likewise, 96 `IS_BYTE` interactions can be dropped from [keccak:c:range_rot_left] and [keccak:c:range_rot_right]. - the shift-constants are equivalent to `1 mod 16` for `(`x`, `y`) = (1, 0)` and `-1 mod 16` for `(2, 3)`. This means that for those lanes it suffices to constrain `rot_left`/`rot_right` as `Bit`s rather than `Byte`s, saving an additional 8 `IS_BYTE` interactions. - ``rc[2]` = `rc[4]` = `rc[5]` = `rc[6]` = 0`. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the `iota`-step. This saves 8 columns and 4 `XOR_BYTE` interactions. - when executed in large volumnes, `KECCAK_RND` could benefit from having a three-way XOR lookup table. With this in place, the 80 interactions in [keccak:c:theta_cxz_start] and [keccak:c:theta_cxz] could be dropped. Likewise, 80 columns could be removed from the chip (a \~5% savings).
+
+## Round constant lookup
+
+### Columns
+
+We provide the round constants through a short precomputed lookup table: .
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `round` | `BaseField` |  |
+| `RC` | `Byte[8]` | round constants for the given `round` |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `BaseField` |  |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `KECCAK_RC-C1` | `KECCAK_RC[RC; round]` | -μ |

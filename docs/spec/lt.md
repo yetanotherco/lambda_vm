@@ -1,6 +1,6 @@
 # LT Chip
 
-The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
+The  chip constrains an indicator bit for the less-than relation, signed or unsigned. If the `invert` flag is set, it inverts the result.
 
 ## Variables
 
@@ -13,12 +13,13 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 | `lhs` | `DWordHHW` | The left operand |
 | `rhs` | `DWordHHW` | The right operand |
 | `signed` | `Bit` | whether to interpret `lhs` and `rhs` as signed integers (1) or not (0) |
+| `invert` | `Bit` | Whether to invert the result |
 
 ### Output
 
 | Name | Type | Description |
 |------|------|-------------|
-| `lt` | `Bit` | Whether $`lhs` < `rhs`$, taking `signed` into account |
+| `res` | `Bit` | The result |
 
 ### Auxiliary
 
@@ -27,6 +28,7 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 | `lhs_sub_rhs` | `DWordHL` | $`lhs` - `rhs`$ |
 | `lhs_msb` | `Bit` | The most significant bit of `lhs` |
 | `rhs_msb` | `Bit` | The most significant bit of `rhs` |
+| `lt` | `Bit` | Whether $`lhs` < `rhs`$, taking `signed` into account |
 
 ### Virtual
 
@@ -60,11 +62,10 @@ We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 |-----|-------|-------------|
 | `LT-A1` |  | `IS_WORD[lhs[0]]` |
 | `LT-A2` |  | `IS_WORD[rhs[0]]` |
-| `LT-A3` |  | `IS_BIT<signed>` |
 
 ## Constraints
 
-We first constrain that all variables correspond to their definition. For the defining constraint of `lt`, [lt:c:lt], observe that it is a choice between two options, depending on the input flag `signed`. In the case of unsigned comparison, we simply need `unsigned_lt`, indicating that a wraparound (carry bit) modulo `2^64` is needed to go from `rhs` to `lhs` via addition. For the case of signed comparison, we first need some case analysis.
+We first constrain that all inputs are range checked and all variables correspond to their definition. For the defining constraint of `lt`, [lt:c:lt], observe that it is a choice between two options, depending on the input flag `signed`. In the case of unsigned comparison, we simply need `unsigned_lt`, indicating that a wraparound (carry bit) modulo `2^64` is needed to go from `rhs` to `lhs` via addition. For the case of signed comparison, we first need some case analysis.
 
 We split `a < b` into four disjoint cases, conditioned on the sign of `a` and `b`. Recall that the sign of a number in two's complement can be read off from the MSB, being `1` for a negative number and `0` for a positive one. For this analysis, we denote the MSB of `a` as `A` and the MSB of `b` as `B`. The four disjoint cases then become:
 
@@ -78,26 +79,50 @@ The polynomial `P` can be simplified to a total degree of two. We claim that the
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `LT-C1` | `MSB16[lhs_msb; lhs[2]]` | μ |
-| `LT-C2` | `MSB16[rhs_msb; rhs[2]]` | μ |
-| `LT-C3` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
+| `LT-C1` | `IS_HALF[lhs[1]]` | μ |
+| `LT-C2` | `IS_HALF[rhs[1]]` | μ |
+| `LT-C3` | `IS_BIT<signed>` |  |
+| `LT-C4` | `IS_BIT<invert>` |  |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `LT-C5` | `MSB16[lhs_msb; lhs[2]]` | μ |
+| `LT-C6` | `MSB16[rhs_msb; rhs[2]]` | μ |
+| `LT-C7` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
 | | _polynomial:_ `lt - signed * (lhs_msb * (1 - rhs_msb) + lhs_msb * carry[1] + (1 - rhs_msb) * carry[1]) - (1 - signed) * unsigned_lt = 0` | |
-| `LT-C4` | `IS_HALF[lhs[1]]` | μ |
-| `LT-C5` | `IS_HALF[rhs[1]]` | μ |
+| `LT-C8` | `res` = `lt` xor `invert` |  |
+| | _polynomial:_ `res + 2 * lt * invert - lt - invert = 0` | |
 
 And then we constrain the subtraction, taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `LT-C6.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
-| `LT-C7.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
+| `LT-C9.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
+| `LT-C10.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
 
 The chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `LT-C8` | `LT[lt; lhs::DWordWL, rhs::DWordWL, signed]` | -μ |
+| `LT-C11` | `ALU[[res, 0]; lhs::DWordWL, rhs::DWordWL, ⧼LT⧽ + 32 * signed + 64 * invert]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `lhs` | `0` |
+| `rhs` | `0` |
+| `signed` | `0` |
+| `invert` | `0` |
+| `res` | `0` |
+| `lhs_sub_rhs` | `0` |
+| `lhs_msb` | `0` |
+| `rhs_msb` | `0` |
+| `lt` | `0` |
+| `μ` | `0` |
+
+## Potential optimizations
+
+- Split the chip into a signed and an unsigned chip, making the unsigned version cheaper.

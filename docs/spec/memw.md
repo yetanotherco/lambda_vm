@@ -52,7 +52,7 @@ w4 := write4 + write8
 
 **Definition of `address_add`:**
 ```
-address_add := ['arr', ['-', ['+', ['idx', 'base_address', 0], 'i', 1], ['*', ['^', 2, 32], ['idx', 'carry', 'i']]], ['+', ['idx', 'base_address', 1], ['idx', 'carry', 'i']]]
+address_add := [base_address[0] + i + 1 - 2^32 * carry[i], base_address[1] + carry[i]]
 ```
 
 **Definition of `μ_sum`:**
@@ -78,6 +78,15 @@ address_add := ['arr', ['-', ['+', ['idx', 'base_address', 0], 'i', 1], ['*', ['
 | `MEMW-A5` |  | `IS_BIT<write2 + write4 + write8>` |
 | `MEMW-A6.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
 
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `MEMW-C1` | `IS_BIT<write2>` |
+| `MEMW-C2` | `IS_BIT<write4>` |
+| `MEMW-C3` | `IS_BIT<write8>` |
+| `MEMW-C4` | `IS_BIT<write2 + write4 + write8>` |
+
 Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns, as these are not necessary for the correctness of this chip in isolation. Still, these properties are necessary for the consistency of the system as a whole, and therefore we document it here, keeping the type information as a reading help.
 
 ## Constraints
@@ -86,16 +95,16 @@ Depending on the values of `write2`, `write4` and `write8`, the addresses follow
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW-C1` |  | `IS_BIT<μ_read>` |  |
-| `MEMW-C2` |  | `IS_BIT<μ_write>` |  |
-| `MEMW-C3` |  | `IS_BIT<μ_sum>` |  |
-| `MEMW-C4` |  | `w2` => `μ_sum` |  |
+| `MEMW-C5` |  | `IS_BIT<μ_read>` |  |
+| `MEMW-C6` |  | `IS_BIT<μ_write>` |  |
+| `MEMW-C7` |  | `IS_BIT<μ_sum>` |  |
+| `MEMW-C8` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C5.i` | i ∈ [0, 6] | `IS_BIT<carry[i]>` |  |
-| `MEMW-C6` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
-| `MEMW-C7` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
-| `MEMW-C8.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
-| `MEMW-C9.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
+| `MEMW-C9.i` | i ∈ [0, 6] | `IS_BIT<carry[i]>` |  |
+| `MEMW-C10` |  | `ALU[[1, 0]; old_timestamp[0], timestamp, ⧼LT⧽]` | μ_sum |
+| `MEMW-C11` |  | `ALU[[1, 0]; old_timestamp[1], timestamp, ⧼LT⧽]` | w2 |
+| `MEMW-C12.i` | i ∈ [2, 3] | `ALU[[1, 0]; old_timestamp[i], timestamp, ⧼LT⧽]` | w4 |
+| `MEMW-C13.i` | i ∈ [4, 7] | `ALU[[1, 0]; old_timestamp[i], timestamp, ⧼LT⧽]` | write8 |
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures it is appropriately range checked (this assumes no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
 
@@ -105,25 +114,40 @@ The chip adds the following tuples to the lookup argument, to effectuate that pa
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW-CM10` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
-| `MEMW-CM11` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM12` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM13` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM14.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM15.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM16.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM17.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+| `MEMW-CM14` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
+| `MEMW-CM15` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
+| `MEMW-CM16` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM17` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
+| `MEMW-CM18.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM19.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
+| `MEMW-CM20.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM21.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CO18` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_read |
-| `MEMW-CO19` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_write |
+| `MEMW-CO22` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_read |
+| `MEMW-CO23` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | -μ_write |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `is_register` | `0` |
+| `base_address` | `0` |
+| `value` | `0` |
+| `timestamp` | `0` |
+| `write2` | `0` |
+| `write4` | `0` |
+| `write8` | `0` |
+| `old` | `0` |
+| `carry` | `0` |
+| `old_timestamp` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
 
 ## Read-size aligned fast path
 
@@ -197,35 +221,58 @@ w4 := write4 + write8
 | `MEMW_A-A6` |  | `IS_BIT<write2 + write4 + write8>` |
 | `MEMW_A-A7.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
 
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `MEMW_A-C1` | `IS_BIT<write2>` |
+| `MEMW_A-C2` | `IS_BIT<write4>` |
+| `MEMW_A-C3` | `IS_BIT<write8>` |
+| `MEMW_A-C4` | `IS_BIT<write2 + write4 + write8>` |
+
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW_A-C1` | `IS_HALF[base_address[0] + write2 + 3 * write4 + 7 * write8]` | μ_sum |
-| `MEMW_A-C2` | `IS_BIT<μ_read>` |  |
-| `MEMW_A-C3` | `IS_BIT<μ_write>` |  |
-| `MEMW_A-C4` | `IS_BIT<μ_sum>` |  |
-| `MEMW_A-C5` | `w2` => `μ_sum` |  |
+| `MEMW_A-C9` | `IS_HALF[base_address[0] + write2 + 3 * write4 + 7 * write8]` | μ_sum |
+| `MEMW_A-C10` | `IS_BIT<μ_read>` |  |
+| `MEMW_A-C11` | `IS_BIT<μ_write>` |  |
+| `MEMW_A-C12` | `IS_BIT<μ_sum>` |  |
+| `MEMW_A-C13` | `w2` => `μ_sum` |  |
 | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW_A-C6` | `LT[1; old_timestamp, timestamp, 0]` | μ_sum |
+| `MEMW_A-C14` | `ALU[[1, 0]; old_timestamp, timestamp, ⧼LT⧽]` | μ_sum |
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW_A-CM7` |  | `memory[is_register, base_address::DWordWL, old_timestamp, old[0]]` | μ_sum |
-| `MEMW_A-CM8` |  | `memory[is_register, base_address::DWordWL, timestamp, value[0]]` | -μ_sum |
-| `MEMW_A-CM9` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, old_timestamp, old[1]]` | w2 |
-| `MEMW_A-CM10` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, timestamp, value[1]]` | -w2 |
-| `MEMW_A-CM11.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | w4 |
-| `MEMW_A-CM12.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -w4 |
-| `MEMW_A-CM13.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | write8 |
-| `MEMW_A-CM14.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -write8 |
+| `MEMW_A-CM15` |  | `memory[is_register, base_address::DWordWL, old_timestamp, old[0]]` | μ_sum |
+| `MEMW_A-CM16` |  | `memory[is_register, base_address::DWordWL, timestamp, value[0]]` | -μ_sum |
+| `MEMW_A-CM17` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, old_timestamp, old[1]]` | w2 |
+| `MEMW_A-CM18` |  | `memory[is_register, base_address::DWordWL + 1::DWordWL, timestamp, value[1]]` | -w2 |
+| `MEMW_A-CM19.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | w4 |
+| `MEMW_A-CM20.i` | i ∈ [2, 3] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -w4 |
+| `MEMW_A-CM21.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, old_timestamp, old[i]]` | write8 |
+| `MEMW_A-CM22.i` | i ∈ [4, 7] | `memory[is_register, base_address::DWordWL + i::DWordWL, timestamp, value[i]]` | -write8 |
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW_A-CO15` | `MEMW[old; is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_read |
-| `MEMW_A-CO16` | `MEMW[is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_write |
+| `MEMW_A-CO23` | `MEMW[old; is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_read |
+| `MEMW_A-CO24` | `MEMW[is_register, base_address::DWordWL, value, timestamp, write2, write4, write8]` | -μ_write |
 
 ### Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `is_register` | `0` |
+| `base_address` | `0` |
+| `value` | `0` |
+| `timestamp` | `0` |
+| `write2` | `0` |
+| `write4` | `0` |
+| `write8` | `0` |
+| `old` | `0` |
+| `old_timestamp` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
 
 ## Register fast-path
 
@@ -268,7 +315,7 @@ The  chip is comprised of  variables that are expressed using  columns and lever
 
 **Definition of `old_timestamp`:**
 ```
-old_timestamp := ['arr', 'old_timestamp_lo', ['idx', 'timestamp', 1]]::DWordWL
+old_timestamp := [old_timestamp_lo, timestamp[1]]::DWordWL
 ```
 
 **Definition of `μ_sum`:**
@@ -306,8 +353,8 @@ With ``old_timestamp`<`timestamp`` asserted, `old` is read from the register ([r
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW_R-C2.i` | i ∈ [0, 1] | `memory[1, ['arr', ['cast', ['+', ['*', 2, 'address'], 'i'], 'Word'], 0], old_timestamp, old[i]]` | μ_sum |
-| `MEMW_R-C3.i` | i ∈ [0, 1] | `memory[1, ['arr', ['cast', ['+', ['*', 2, 'address'], 'i'], 'Word'], 0], timestamp, val[i]]` | -μ_sum |
+| `MEMW_R-C2.i` | i ∈ [0, 1] | `memory[1, [(2 * address + i)::Word, 0], old_timestamp, old[i]]` | μ_sum |
+| `MEMW_R-C3.i` | i ∈ [0, 1] | `memory[1, [(2 * address + i)::Word, 0], timestamp, val[i]]` | -μ_sum |
 
 This chip can either just write (``μ_write` = 1`), or both read and write (``μ_read` = 1`) in the same cycle. It must be asserted that at most one of these two options is selected:
 
@@ -321,12 +368,22 @@ Lastly, this chip contributes the following interactions to the logup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW_R-C7` | `MEMW[['arr', ['idx', 'old', 0], ['idx', 'old', 1], 0, 0, 0, 0, 0, 0]; 1, ['arr', ['cast', ['*', 2, 'address'], 'Word'], 0], ['arr', ['idx', 'val', 0], ['idx', 'val', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_read |
-| `MEMW_R-C8` | `MEMW[1, ['arr', ['cast', ['*', 2, 'address'], 'Word'], 0], ['arr', ['idx', 'val', 0], ['idx', 'val', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_write |
+| `MEMW_R-C7` | `MEMW[[old[0], old[1], 0, 0, 0, 0, 0, 0]; 1, [(2 * address)::Word, 0], [val[0], val[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_read |
+| `MEMW_R-C8` | `MEMW[1, [(2 * address)::Word, 0], [val[0], val[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | -μ_write |
 
 ### Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `address` | `0` |
+| `timestamp` | `0` |
+| `val` | `0` |
+| `old` | `0` |
+| `old_timestamp_lo` | `0` |
+| `μ_read` | `0` |
+| `μ_write` | `0` |
 
 ## Notes/optimizations
 

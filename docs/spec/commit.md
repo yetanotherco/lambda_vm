@@ -51,10 +51,10 @@ we assert that `x10` contains `1` in [commit:c:read_fd_write_count]. Note that t
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `COMMIT-C2` | `MEMW[['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C3` | `MEMW[['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C4` | `MEMW[['arr', 1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
-| `COMMIT-C5` | `MEMW[['arr', 'index', 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, ['arr', ['+', 'index', ['cast', 'count', 'BaseField']], 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
+| `COMMIT-C2` | `MEMW[[address[0], address[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, [address[0], address[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C3` | `MEMW[[count[0], count[1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, [count[0], count[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C4` | `MEMW[[1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, [count[0], count[1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C5` | `MEMW[[index, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, [index + count::BaseField, 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
 
 *Note*: the observant reader will notice that [commit:c:read_index] casts `count` to a `BaseField`, potentiallly losing information. This is indeed correct. However, since it is practically impossible to commit more than `2^64-2^32` bytes in a single VM execution, it was decided to permit this.
 
@@ -62,7 +62,7 @@ Next, we read the `value` located at buffer address `address` and commit to it u
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `COMMIT-C6` | `MEMW[['arr', 'value', 0, 0, 0, 0, 0, 0, 0]; 0, address, ['arr', 'value', 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
+| `COMMIT-C6` | `MEMW[[value, 0, 0, 0, 0, 0, 0, 0]; 0, address, [value, 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
 | `COMMIT-C7` | `COMMIT[index, value]` | μ - end |
 
 In parallel, we compute ``address_incr` = `address` + 1` ([commit:c:address_incr]) as address of the next byte to commit, and ``count_decr` = `count` - 1` ([commit:c:count_decr]) as the number of bytes that still has to be committed after committing this byte. [commit:c:range_address_incr] and [commit:c:range_count_decr] are included to satisfy [add:a:sum] respectively [add:a:rhs].
@@ -102,6 +102,19 @@ Lastly, we must make sure `first`, `end` and `μ` are bits ([commit:c:range_firs
 ## Padding
 
 To pad this chip, use the below data.
+
+| Column | Padding value |
+|--------|---------------|
+| `timestamp` | `0` |
+| `index` | `0` |
+| `address` | `[0, 0, 0, 0]` |
+| `address_incr` | `[1, 0, 0, 0]` |
+| `count` | `[1, 0, 0, 0]` |
+| `count_decr` | `[0, 0, 0, 0]` |
+| `first` | `0` |
+| `end` | `0` |
+| `value` | `0` |
+| `μ` | `0` |
 
 ## Notes/optimizations
 

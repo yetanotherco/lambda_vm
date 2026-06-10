@@ -62,6 +62,12 @@ next_pc (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 | `BRANCH-A3.i` | i ∈ [0, 1] | `register` is range checked, `IS_WORD[register[i]]` |
 | `BRANCH-A4` |  | `IS_BIT<JALR>` |
 
+Some of the assumptions can be checked with only arithmetic constraints, so we provide these below.
+
+| Tag | Description |
+|-----|-------------|
+| `BRANCH-C1` | `IS_BIT<JALR>` |
+
 ## Constraints
 
 We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
@@ -70,18 +76,29 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
-| `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
-| `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
-| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
-| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
+| `BRANCH-C2` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
+| `BRANCH-C3` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
+| `BRANCH-C4` |  | μ ⇒ `IS_BYTE<next_pc_low[1]>` |  |
+| `BRANCH-C5` |  | `BYTE_ALU[next_pc_low[0]; ⧼AND⧽, unmasked_low_byte, 254]` | μ |
+| `BRANCH-C6.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `BRANCH-C6` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
+| `BRANCH-C7` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `pc` | `0` |
+| `offset` | `0` |
+| `register` | `0` |
+| `JALR` | `0` |
+| `next_pc_high` | `[0, 0, 0]` |
+| `next_pc_low` | `0` |
+| `unmasked_low_byte` | `0` |
+| `μ` | `0` |

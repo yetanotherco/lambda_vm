@@ -78,15 +78,6 @@ carry (when iter=[1, 3]) := 2^-32 * (raw_product[i] + carry[i - 1] - res[i])
 
 `mat(delim: , top; bottom)` }
 
-## Assumptions
-
-The following range checks are assumed to be performed/enforced outside of this chip:
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `MUL-A1.i` | i ∈ [0, 3] | `IS_HALF[lhs[i]]` |
-| `MUL-A2.i` | i ∈ [0, 3] | `IS_HALF[rhs[i]]` |
-
 ## Constraints
 
 ### Overview
@@ -107,11 +98,15 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MUL-C1` |  | `SIGN<lhs_is_negative; lhs[3], lhs_signed>` |  |
-| `MUL-C2` |  | `SIGN<rhs_is_negative; rhs[3], rhs_signed>` |  |
-| `MUL-C3.i` | i ∈ [0, 3] | `IS_HALF[lo[i]]` | μ_sum |
-| `MUL-C4.i` | i ∈ [0, 3] | `IS_HALF[hi[i]]` | μ_sum |
-| `MUL-C5.i` | i ∈ [0, 3] | `IS_B20[carry[i]]` | μ_sum |
+| `MUL-C1` |  | `IS_BIT<lhs_signed>` |  |
+| `MUL-C2` |  | `IS_BIT<rhs_signed>` |  |
+| `MUL-C3.i` | i ∈ [0, 3] | `IS_HALF[lhs[i]]` | μ_sum |
+| `MUL-C4.i` | i ∈ [0, 3] | `IS_HALF[rhs[i]]` | μ_sum |
+| `MUL-C5` |  | `SIGN<lhs_is_negative; lhs[3], lhs_signed>` |  |
+| `MUL-C6` |  | `SIGN<rhs_is_negative; rhs[3], rhs_signed>` |  |
+| `MUL-C7.i` | i ∈ [0, 3] | `IS_HALF[lo[i]]` | μ_sum |
+| `MUL-C8.i` | i ∈ [0, 3] | `IS_HALF[hi[i]]` | μ_sum |
+| `MUL-C9.i` | i ∈ [0, 3] | `IS_B20[carry[i]]` | μ_sum |
 
 ### Product
 
@@ -119,7 +114,7 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `MUL-C6.i` | i ∈ [0, 3] | `raw_product[i]` = sum_(`k`=0)^1 2^(16k) sum_(`j`=0)^(2i+k) `lhs_ext[j]` dot `rhs_ext[2i+k-j]` |
+| `MUL-C10.i` | i ∈ [0, 3] | `raw_product[i]` = sum_(`k`=0)^1 2^(16k) sum_(`j`=0)^(2i+k) `lhs_ext[j]` dot `rhs_ext[2i+k-j]` |
 | | | _polynomial:_ `Σ_k = 0^1 2^(16 * k) * Σ_j = 0^2 * i + k lhs_ext[j] * rhs_ext[2 * i + k - j] - raw_product[i] = 0` |
 
 ### Lookup
@@ -128,12 +123,26 @@ The  chip contributes the following to the lookup:
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MUL-C7` | `MUL[lo::DWordWL; lhs, lhs_signed, rhs, rhs_signed, 0]` | -μ_lo |
-| `MUL-C8` | `MUL[hi::DWordWL; lhs, lhs_signed, rhs, rhs_signed, 1]` | -μ_hi |
+| `MUL-C11` | `ALU[lo::DWordWL; lhs::DWordWL, rhs::DWordWL, ⧼MUL⧽ + 32 * lhs_signed + 64 * rhs_signed]` | -μ_lo |
+| `MUL-C12` | `ALU[hi::DWordWL; lhs::DWordWL, rhs::DWordWL, ⧼MUL⧽ + 32 * lhs_signed + 64 * rhs_signed + 128]` | -μ_hi |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `lhs` | `0` |
+| `lhs_signed` | `0` |
+| `rhs` | `0` |
+| `rhs_signed` | `0` |
+| `lo` | `0` |
+| `hi` | `0` |
+| `lhs_is_negative` | `0` |
+| `rhs_is_negative` | `0` |
+| `raw_product` | `0` |
+| `μ_lo` | `0` |
+| `μ_hi` | `0` |
 
 ## Notes/optimizations
 

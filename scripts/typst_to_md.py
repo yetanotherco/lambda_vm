@@ -69,7 +69,7 @@ def expr_to_text(expr, parent_prec: int = 100) -> str:
     """
     PREC = {
         "idx": 0, "pow": 1, "neg": 2, "cast": 3, "mul": 4,
-        "div": 5, "sum": 6, "not": 7, "add": 8, "sub": 9, "eq": 10,
+        "div": 5, "mod": 6, "sum": 7, "not": 8, "add": 9, "sub": 10, "eq": 11,
     }
 
     def wrap(s: str, prec: int) -> str:
@@ -89,6 +89,15 @@ def expr_to_text(expr, parent_prec: int = 100) -> str:
             base = expr_to_text(expr[1], PREC["idx"])
             idx = expr_to_text(expr[2], 100)
             return f"{base}[{idx}]"
+        elif op == "arr":
+            parts = [expr_to_text(e, 100) for e in expr[1:]]
+            return "[" + ", ".join(parts) + "]"
+        elif op == "opsel":
+            return f"⧼{expr[1]}⧽"
+        elif op == "mod":
+            lhs = expr_to_text(expr[1], PREC["mod"])
+            rhs = expr_to_text(expr[2], PREC["mod"])
+            return wrap(f"{lhs} mod {rhs}", PREC["mod"])
         elif op == "not":
             inner = expr_to_text(expr[1], PREC["not"])
             return wrap(f"1 - {inner}", PREC["not"])
@@ -164,23 +173,29 @@ CHAPTERS = [
     ("variables", "Variables"),
     ("signatures", "Signatures"),
     ("is_bit", "IS_BIT Template"),
+    ("is_byte", "IS_BYTE Template"),
     ("sign", "SIGN Template"),
     ("add", "ADD/SUB Template"),
     ("neg", "NEG Template"),
-    ("memw", "MEMW Chip"),
     ("decode", "DECODE Table"),
     ("cpu", "CPU Chip"),
+    ("cpu32", "CPU32 Chip"),
     ("shift", "SHIFT Chip"),
     ("branch", "BRANCH Chip"),
     ("lt", "LT Chip"),
+    ("eq", "EQ Chip"),
     ("mul", "MUL Chip"),
     ("dvrm", "DVRM Chip"),
-    ("load", "LOAD Chip"),
     ("bitwise", "BITWISE Chips"),
+    ("bytewise", "BYTEWISE Chip"),
+    ("memw", "MEMW Chip"),
+    ("load", "LOAD Chip"),
+    ("store", "STORE Chip"),
     ("about_ecalls", "About ECALL"),
     ("halt", "HALT Chip"),
     ("commit", "COMMIT Chip"),
     ("sha256", "SHA256 Accelerator"),
+    ("keccak", "KECCAK Accelerator"),
 ]
 
 
@@ -587,17 +602,39 @@ def render_assumptions_table(chip: dict, config: dict) -> str:
 
 
 def render_padding_table(chip: dict, config: dict) -> str:
-    """Render padding data as Markdown table."""
-    padding = chip.get("padding", {})
-    if not padding:
+    """Render padding data as Markdown table.
+
+    Padding values live on each variable as a `pad` attribute (mirrors
+    `render_chip_padding_table` in spec/chip.typ): instantiated,
+    non-preprocessed variables only.
+    """
+    var_cfg = config.get("variables", {})
+    instantiated = var_cfg.get("categories", {}).get("instantiated", [])
+    preprocessed_labels = {
+        t["label"] for t in var_cfg.get("types", []) if t.get("preprocessed", False)
+    }
+
+    rows = []
+    for category in instantiated:
+        for var in chip.get("variables", {}).get(category, []):
+            var_type = var.get("type")
+            if isinstance(var_type, str) and var_type in preprocessed_labels:
+                continue
+            if "pad" in var:
+                rows.append((var["name"], expr_to_text(var["pad"])))
+
+    # Legacy schema fallback: top-level `padding` table.
+    for col_name, value in chip.get("padding", {}).items():
+        rows.append((col_name, str(value)))
+
+    if not rows:
         return ""
 
     lines = []
-    lines.append("| Column | Value |")
-    lines.append("|--------|-------|")
-
-    for col_name, value in padding.items():
-        lines.append(f"| `{col_name}` | `{value}` |")
+    lines.append("| Column | Padding value |")
+    lines.append("|--------|---------------|")
+    for name, value in rows:
+        lines.append(f"| `{name}` | `{value}` |")
 
     lines.append("")
     return "\n".join(lines)

@@ -15,7 +15,7 @@ The `SHIFT` chip is comprised of  variables that are expressed using  columns an
 | Name | Type | Description |
 |------|------|-------------|
 | `in` | `DWordHL` | The value being shifted |
-| `shift` | `Byte` | Number of bits to shift `in` by. |
+| `shift` | `DWordWHBB` | Number of bits to shift `in` by. |
 | `direction` | `Bit` | Whether to shift left (0) or right (1). |
 | `signed` | `Bit` | Whether to interpret `in` as a signed integer. |
 | `word_instr` | `Bit` | Whether this is a Word-instruction (1) or not (0). |
@@ -92,16 +92,6 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 |------|------|-------------|
 | `μ` | `Bit` |  |
 
-## Assumptions
-
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` |
-| `SHIFT-A2` |  | `IS_BYTE[shift]` |
-| `SHIFT-A3` |  | `IS_BIT<direction>` |
-| `SHIFT-A4` |  | `IS_BIT<signed>` |
-| `SHIFT-A5` |  | `IS_BIT<word_instr>` |
-
 ## Explanation
 
 This chip has a rather complex design as a result of designing it to fit in as few columns possible. We briefly discuss the intricacies of the design, attempting to illustrate its correctness.
@@ -134,13 +124,24 @@ Lastly, we discuss the case of performing the _arithmetic_ right shift. Here, `e
 
 ## Constraints
 
-First, we constrain `bit_shift` based on whether we are left or right-shifting. [shift:c:zbs] makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. This flag is used to indicate the special case that ``right` = 1` and ``shift` = 0 mod 16`.
+First, we range check our inputs appropriately.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `SHIFT-C1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` | μ |
+| `SHIFT-C2` |  | `IS_HALF[shift[2]]` | μ |
+| `SHIFT-C3.i` | i ∈ [0, 1] | `IS_BYTE<shift[i]>` |  |
+| `SHIFT-C4` |  | `IS_BIT<direction>` |  |
+| `SHIFT-C5` |  | `IS_BIT<signed>` |  |
+| `SHIFT-C6` |  | `IS_BIT<word_instr>` |  |
+
+Then, we constrain `bit_shift` based on whether we are left or right-shifting. [shift:c:zbs] makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. This flag is used to indicate the special case that ``right` = 1` and ``shift` = 0 mod 16`.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C1` | `AND_BYTE[bit_shift; shift, 15]` | left |
-| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - 16 * zbs - shift, 15]` | right |
-| `SHIFT-C3` | `ZERO[zbs; bit_shift]` | μ |
+| `SHIFT-C7` | `BYTE_ALU[bit_shift; ⧼AND⧽, shift[0], 15]` | left |
+| `SHIFT-C8` | `BYTE_ALU[bit_shift; ⧼AND⧽, 2^8 - 16 * zbs - shift[0], 15]` | right |
+| `SHIFT-C9` | `ZERO[zbs; bit_shift]` | μ |
 
 Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively. When `zbs = 1`, the output cannot be used to compose ``in >>/>>> shift` mod 16`. To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
 
@@ -148,13 +149,13 @@ The case of `left`-shifting and ``bit_shift` = 0` will be used for padding rows.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[['arr', ['idx', 'X', 'i'], ['idx', 'Y', 'i']]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C5.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
+| `SHIFT-C10.i` | i ∈ [0, 3] | `HWSL[[X[i], Y[i]]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C11.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
 | | | _polynomial:_ `zbs * (X[i] - in[i] * left) = 0` | |
-| `SHIFT-C6.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
+| `SHIFT-C12.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
 | | | _polynomial:_ `zbs * (Y[i] - in[i] * right) = 0` | |
-| `SHIFT-C7` |  | `HWSL[['arr', ['idx', 'X', 4], ['-', 'extension', ['idx', 'X', 4]]]; extension, bit_shift]` | 1 - zbs |
-| `SHIFT-C8` |  | `zbs` => `X[4]` = 0 |  |
+| `SHIFT-C13` |  | `HWSL[[X[4], extension - X[4]]; extension, bit_shift]` | 1 - zbs |
+| `SHIFT-C14` |  | `zbs` => `X[4]` = 0 |  |
 | | | _polynomial:_ `zbs * X[4] = 0` | |
 
 ### Full-limb shifting
@@ -165,21 +166,21 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C9.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
-| `SHIFT-C10` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
-| `SHIFT-C11.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
+| `SHIFT-C15.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
+| `SHIFT-C16` |  | `BYTE_ALU[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; ⧼AND⧽, shift[0], 48 - 32 * word_instr]` | μ |
+| `SHIFT-C17.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
 | | | _polynomial:_ `out[i] - (shifted::DWordWL)[i] = 0` | |
 
 ### Miscellaneous
 
 | Tag | Description |
 |-----|-------------|
-| `SHIFT-C12` | `direction` => `μ` = 1 |
+| `SHIFT-C18` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C13` | `MSB16[is_negative; in[3]]` | signed |
+| `SHIFT-C19` | `MSB16[is_negative; in[3]]` | signed |
 
 *Note*: `is_negative` is not used when `signed = 0`. As such, there is no problem with it being unconstrained in this case.
 
@@ -189,8 +190,24 @@ This chip adds the following interaction to the lookup.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C14` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
+| `SHIFT-C20` | `ALU[out; in::DWordWL, shift::DWordWL, ⧼SHIFT⧽ + word_instr + 32 * signed + 64 * direction]` | -μ |
 
 ## Padding
 
 The table can be padded to the next power of two with the following value assignments:
+
+| Column | Padding value |
+|--------|---------------|
+| `in` | `0` |
+| `shift` | `0` |
+| `direction` | `0` |
+| `signed` | `0` |
+| `word_instr` | `0` |
+| `out` | `0` |
+| `is_negative` | `0` |
+| `bit_shift` | `0` |
+| `zbs` | `1` |
+| `X` | `[0, 0, 0, 0, 0]` |
+| `Y` | `[0, 0, 0, 0]` |
+| `limb_shift_raw` | `[0, 0, 0]` |
+| `μ` | `0` |
