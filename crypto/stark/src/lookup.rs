@@ -1482,7 +1482,9 @@ where
         let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(n * chunk_len);
         for (k, interaction) in interactions.iter().enumerate() {
             for row in chunk_start..chunk_start + chunk_len {
-                let mut lc = &bus_ids[k] * &alpha_powers[0];
+                // alpha_powers[0] is always 1, so the bus_id term is just the
+                // embedded bus id — skip the base×ext multiply.
+                let mut lc = bus_ids[k].clone().to_extension::<E>();
                 let mut alpha_offset = 1;
                 for bv in &interaction.values {
                     alpha_offset += bv.accumulate_fingerprint(
@@ -1677,8 +1679,10 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     alpha_powers: &[FieldElement<B>],
     shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
+    // alpha_powers[0] is always 1, so the bus_id term is just the embedded bus
+    // id — skip the base×ext multiply.
     let bus_id_f: FieldElement<A> = FieldElement::from(interaction.bus_id);
-    let mut linear_combination = bus_id_f * &alpha_powers[0];
+    let mut linear_combination = bus_id_f.to_extension::<B>();
     let mut alpha_idx = 1;
     for bv in &interaction.values {
         alpha_idx += bv.accumulate_fingerprint_from_step(
