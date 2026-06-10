@@ -92,6 +92,8 @@ type Expr = (
     | DummyExpr
 )
 
+OPSEL = ["AND", "OR", "XOR", "EQ", "LT", "SHIFT", "SHIFTW", "MUL", "DIVREM"]
+
 
 @dataclass
 class Environment:
@@ -256,6 +258,30 @@ class SubExpr:
 
 
 @dataclass
+class ModExpr:
+    elt: Expr
+    modulus: Expr
+
+    def typecheck(self, env: Environment) -> Type:
+        elt = self.elt.typecheck(env)
+        modulus = self.modulus.typecheck(env)
+
+        if isinstance(modulus, list) or not modulus.is_const():
+            reporter.error(f"Invalid non-constant modulus: {self.modulus!r}")
+            return Range.const(0)
+        modulus = modulus.get_const()
+        if modulus <= 0:
+            reporter.error(f"Invalid non-positive modulus: {self.modulus!r}")
+            return Range.const(0)
+
+        if elt.is_const():
+            elt = elt.get_const()
+            return Range.const(elt % modulus)
+        else:
+            return Range(0, modulus-1)
+
+
+@dataclass
 class PowExpr:
     base: Expr
     exp: Expr
@@ -327,6 +353,11 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
                 x.isidentifier(), f"Invalid identifier name for variable {x!r}"
             )
             return VarExpr(x)
+        case ["opsel", str(x)]:
+            if x not in OPSEL:
+                reporter.error(f"Unknown operation selector: {x!r}")
+                return LitExpr(0)
+            return LitExpr(OPSEL.index(x))
         case ["arr", *elems]:
             return ArrExpr([build_expr(config, e) for e in elems])
         case ["idx", x, y]:
@@ -343,6 +374,8 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return SubExpr(
                 build_expr(config, head), [build_expr(config, s) for s in subs]
             )
+        case ["mod", elt, modulus]:
+            return ModExpr(build_expr(config, elt), build_expr(config, modulus))
         case ["^", base, exp]:
             return PowExpr(build_expr(config, base), build_expr(config, exp))
         case ["sum", ["=", str(var), start], stop, terms]:

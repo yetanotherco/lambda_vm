@@ -1,0 +1,49 @@
+name = "BYTEWISE"
+
+[[variables.input]]
+name = "a"
+type = "DWordBL"
+desc = "The first input"
+pad = 0
+
+[[variables.input]]
+name = "b"
+type = "DWordBL"
+desc = "The second input"
+pad = 0
+
+[[variables.input]]
+name = "op"
+type = "Byte"
+desc = "The operation to perform"
+pad = 0
+
+[[variables.output]]
+name = "res"
+type = "DWordBL"
+desc = "The result"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = ["op", ["idx", "a", "i"], ["idx", "b", "i"]]
+output = ["idx", "res", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 7]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ALU"
+input = [["cast", "a", "DWordWL"], ["cast", "b", "DWordWL"], "op"]
+output = ["cast", "res", "DWordWL"]
+multiplicity = ["-", "μ"]

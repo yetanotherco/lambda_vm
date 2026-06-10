@@ -32,9 +32,6 @@ The #mul chip is comprised of #nr_variables variables that are expressed using #
  $mat(delim: #none, top; bottom)$
 }
 
-= Assumptions
-The following range checks are assumed to be performed/enforced outside of this chip:
-#render_chip_assumptions(chip, config)
 
 = Constraints
 == Overview

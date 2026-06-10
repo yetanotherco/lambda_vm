@@ -1721,7 +1721,7 @@ fn test_debug_memory_tokens_sb_sh() {
         .enumerate()
     {
         let page_base = page_config.page_base;
-        let page_size = page_config.page_size;
+        let page_size = crate::tables::page::DEFAULT_PAGE_SIZE;
         let page_lo = page_base & 0xFFFF_FFFF;
         let page_hi = page_base >> 32;
         let trace_rows = page_trace.num_rows();
@@ -1800,8 +1800,8 @@ fn test_debug_memory_tokens_sb_sh() {
     println!("\n=== ARE_BYTES Lookup Counts (from PAGE tables) ===");
     let mut page_pair_counts: HashMap<(u8, u8), u64> = HashMap::new();
     let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
-    for (page_idx, page_trace) in traces.pages.iter().enumerate() {
-        let page_size = traces.page_configs[page_idx].page_size;
+    for page_trace in traces.pages.iter() {
+        let page_size = crate::tables::page::DEFAULT_PAGE_SIZE;
         for row in 0..page_trace.num_rows().min(page_size) {
             let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as u8;
             let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as u8;

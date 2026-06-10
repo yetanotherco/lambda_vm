@@ -14,12 +14,15 @@
   .map(pair => pair.at(1))
   .flatten()
   .map(var => {
-    let (label, factor) = if type(var.type) == array {
-      (var.type.at(0), var.type.at(1))
-    } else {
-      (var.type, 1)
+    let (factor, var_type) = (1, var.type)
+    while type(var_type) == array {
+      assert(var_type.len() == 2, message: "invalid var (sub)type length: " + repr(var.type))
+      assert(type(var_type.at(1)) == int, message: "invalid var (sub)type length: " + repr(var.type))
+      factor *= var_type.at(1)
+      var_type = var_type.at(0)
     }
-    config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor
+    
+    config.variables.types.filter(type => type.label == var_type).first().subtypes.len() * factor
   })
   .sum()
 }
@@ -48,14 +51,19 @@
 // store it as metadata under the `<interaction_count>` label
 // with tag `chip.name`. This tag is overwritten by `name` when specified.
 #let set_nr_interactions(chip, name: none) = {
+  // Skip when building shiroa, since the web/chapter structure fails to converge properly
+  import "book.typ": is-shiroa
+  if is-shiroa {
+    return
+  }
   if name == none {
-      name = chip.name
-    }
+    name = chip.name
+  }
 
   let constraints = chip
     .constraints
     .values()
-    .flatten()
+    .sum(default: ())
 
   // nr. of direct interactions
   let nr-direct-interactions = constraints
@@ -290,7 +298,7 @@
   } else if type(groups) == str {
     groups = (groups,)
   }
-  assert(groups.all(group => group in all_groups), message: "unknown group")
+  assert(groups.all(group => group in all_groups), message: "unknown group: " + repr(groups))
   let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
   // Find the group definition in the constraint_groups
