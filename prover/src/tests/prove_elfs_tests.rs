@@ -2501,12 +2501,19 @@ fn test_prove_ethrex_empty_block() {
 }
 
 /// Full prove → verify of a stateless ethrex block with one plain ETH-transfer
-/// transaction. Heavy: with main's software-keccak `ethrex.elf` this block is
-/// ~4.4M executed instructions (vs ~184k for the empty block), so proving needs
-/// a large-memory machine. Run explicitly with
-/// `cargo test -p prover --release test_prove_ethrex_simple_tx -- --ignored`.
+/// transaction (~4.4M executed instructions vs ~184k for the empty block).
+///
+/// CURRENTLY FAILS at verification, not proving: the proof generates fine
+/// (chunked prover, ~55s, fits in 36 GB) but `verify` reports
+/// "LogUp bus does not balance" — a prover bus-balance bug on the crypto-heavy
+/// transaction path (ecrecover / secp256k1 + keccak). The empty-block prove
+/// test verifies cleanly, so the imbalance is specific to what a transaction
+/// adds. Tracked alongside the ecrecover LogUp-imbalance debugging. Keep
+/// ignored until that bus balances; do NOT mark passing.
+/// Run with `cargo test -p lambda-vm-prover --release --lib \
+/// test_prove_ethrex_simple_tx -- --ignored --nocapture`.
 #[test]
-#[ignore = "takes too long / high memory (software keccak, ~4.4M instructions)"]
+#[ignore = "FAILS: LogUp bus imbalance on the tx (ecrecover/keccak) path — prover bug, not a resource limit"]
 fn test_prove_ethrex_simple_tx() {
     let _ = env_logger::builder().is_test(true).try_init();
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
