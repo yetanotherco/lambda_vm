@@ -68,38 +68,54 @@ pub fn epoch_boundaries(
     epochs: &[EpochTouches],
 ) -> Vec<Vec<CellBoundary>> {
     // provenance[addr] = (last_writer_epoch, value, timestamp)
-    let mut provenance: HashMap<u64, (u64, u64, u64)> = initial_memory
-        .iter()
-        .map(|(&addr, &value)| (addr, (GENESIS_EPOCH, value, 0)))
-        .collect();
+    let mut provenance = genesis_provenance(initial_memory);
 
     let mut result = Vec::with_capacity(epochs.len());
     for (epoch, touched) in epochs.iter().enumerate() {
-        let epoch = epoch as u64;
-        let mut boundaries = Vec::with_capacity(touched.len());
-        for &(address, end_value, end_timestamp) in touched {
-            let (originating_epoch, init_value, init_timestamp) = provenance
-                .get(&address)
-                .copied()
-                .unwrap_or((GENESIS_EPOCH, 0, 0));
-            boundaries.push(CellBoundary {
-                address,
-                init: InitClaim {
-                    value: init_value,
-                    originating_epoch,
-                    timestamp: init_timestamp,
-                },
-                fini: FiniClaim {
-                    value: end_value,
-                    epoch,
-                    timestamp: end_timestamp,
-                },
-            });
-            provenance.insert(address, (epoch, end_value, end_timestamp));
-        }
-        result.push(boundaries);
+        result.push(epoch_boundary(&mut provenance, epoch as u64, touched));
     }
     result
+}
+
+/// One epoch's boundaries, taking `init` from the running `provenance` (the cell's
+/// last writer) and updating `provenance` with this epoch's `fini`. This is the
+/// per-epoch step of [`epoch_boundaries`], exposed so the streaming continuation
+/// prover can build each epoch's table incrementally without all epochs at once.
+pub fn epoch_boundary(
+    provenance: &mut HashMap<u64, (u64, u64, u64)>,
+    epoch: u64,
+    touched: &[(u64, u64, u64)],
+) -> Vec<CellBoundary> {
+    let mut boundaries = Vec::with_capacity(touched.len());
+    for &(address, end_value, end_timestamp) in touched {
+        let (originating_epoch, init_value, init_timestamp) = provenance
+            .get(&address)
+            .copied()
+            .unwrap_or((GENESIS_EPOCH, 0, 0));
+        boundaries.push(CellBoundary {
+            address,
+            init: InitClaim {
+                value: init_value,
+                originating_epoch,
+                timestamp: init_timestamp,
+            },
+            fini: FiniClaim {
+                value: end_value,
+                epoch,
+                timestamp: end_timestamp,
+            },
+        });
+        provenance.insert(address, (epoch, end_value, end_timestamp));
+    }
+    boundaries
+}
+
+/// Seed the provenance map from the program's initial memory (genesis cells).
+pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> HashMap<u64, (u64, u64, u64)> {
+    initial_memory
+        .iter()
+        .map(|(&addr, &value)| (addr, (GENESIS_EPOCH, value, 0)))
+        .collect()
 }
 
 // =========================================================================

@@ -74,9 +74,24 @@ impl Executor {
         self.resume_with_limit(CHUNK_SIZE)
     }
 
+    /// Current program counter (0 once the program has halted).
+    pub fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    /// Current register state.
+    pub fn registers(&self) -> &Registers {
+        &self.registers
+    }
+
+    /// Current memory state.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
     /// Resume execution, running at most `limit` cycles, and return the logs
     /// produced. Returns None when the program is finished.
-    fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
+    pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
         if self.pc == 0 {
             return Ok(None);
         }

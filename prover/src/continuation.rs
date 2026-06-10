@@ -335,64 +335,68 @@ fn verify_global(
 /// local-to-global table the global proof used. Returns `Ok(true)` iff all hold.
 pub fn prove_and_verify_continuation(elf_bytes: &[u8], epoch_size: usize) -> Result<bool, Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let epochs = Executor::new(&elf, vec![])
-        .map_err(|e| Error::Execution(format!("{e}")))?
-        .run_epochs(epoch_size)
-        .map_err(|e| Error::Execution(format!("{e}")))?;
-    if epochs.is_empty() {
-        return Ok(false);
-    }
+    let mut executor = Executor::new(&elf, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
 
-    // Each epoch's starting state: epoch 0 from the program image, later epochs
-    // from the previous epoch's boundary snapshot.
     let program_image = build_initial_image(&elf, &[]);
-    let mut starts: Vec<EpochStart> = Vec::with_capacity(epochs.len());
-    let mut all_touched: Vec<Vec<(u64, u64, u64)>> = Vec::with_capacity(epochs.len());
-    for (i, epoch) in epochs.iter().enumerate() {
-        let start = if i == 0 {
-            EpochStart {
-                image: program_image.clone(),
-                register_init: register::register_init_from_entry_point(elf.entry_point),
-                is_first: true,
-            }
-        } else {
-            EpochStart {
-                image: epochs[i - 1].end_memory.iter_bytes().collect(),
-                register_init: register::register_init_from_snapshot(
-                    &epochs[i - 1].end_registers,
-                    epochs[i - 1].end_pc,
-                ),
-                is_first: false,
-            }
-        };
-        all_touched.push(epoch_touched_cells(&elf, &start.image, &epoch.logs)?);
-        starts.push(start);
-    }
-
     let initial_memory: HashMap<u64, u64> =
         program_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
-    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &all_touched);
 
+    // Running cross-epoch provenance (the L2G init source). Only the sparse
+    // boundaries and the per-epoch roots are kept — everything else is dropped
+    // after each epoch is proven (the streaming/eviction the spec describes).
+    let mut provenance = local_to_global::genesis_provenance(&initial_memory);
+    let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
+    let mut epoch_roots: Vec<Commitment> = Vec::new();
     let opts = ProofOptions::default_test_options();
 
-    let mut epoch_roots = Vec::with_capacity(epochs.len());
-    for (i, epoch) in epochs.iter().enumerate() {
-        let is_final = i == epochs.len() - 1;
-        match prove_verify_epoch(
-            &elf,
-            &starts[i],
-            &epoch.logs,
-            is_final,
-            &boundaries[i],
-            &opts,
-        )? {
+    let mut index: u64 = 0;
+    loop {
+        // Capture the epoch's starting state BEFORE running it.
+        let start_pc = executor.pc();
+        if start_pc == 0 {
+            break;
+        }
+        let start_image: HashMap<u64, u8> = executor.memory().iter_bytes().collect();
+        let register_init = if index == 0 {
+            register::register_init_from_entry_point(elf.entry_point)
+        } else {
+            register::register_init_from_snapshot(executor.registers(), start_pc)
+        };
+
+        // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
+        let logs = match executor
+            .resume_with_limit(epoch_size)
+            .map_err(|e| Error::Execution(format!("{e}")))?
+        {
+            Some(logs) => logs.to_vec(),
+            None => break,
+        };
+        let is_final = executor.pc() == 0;
+
+        let touched = epoch_touched_cells(&elf, &start_image, &logs)?;
+        let boundary = local_to_global::epoch_boundary(&mut provenance, index, &touched);
+
+        let start = EpochStart {
+            image: start_image,
+            register_init,
+            is_first: index == 0,
+        };
+        match prove_verify_epoch(&elf, &start, &logs, is_final, &boundary, &opts)? {
             Some(root) => epoch_roots.push(root),
             None => return Ok(false),
         }
+        all_boundaries.push(boundary);
+        // `start`, `logs`, and this epoch's traces are dropped here.
+
+        if is_final {
+            break;
+        }
+        index += 1;
     }
 
-    let global_proof = prove_global(&boundaries, &opts)?;
-    if !verify_global(&boundaries, &global_proof, &opts) {
+    // One global LogUp over all the (kept) local-to-global tables.
+    let global_proof = prove_global(&all_boundaries, &opts)?;
+    if !verify_global(&all_boundaries, &global_proof, &opts) {
         return Ok(false);
     }
 
