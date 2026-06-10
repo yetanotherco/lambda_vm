@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "profile_vm_prover"
 harness = false
+
+[[bench]]
+name = "bench_continuation"
+harness = false
