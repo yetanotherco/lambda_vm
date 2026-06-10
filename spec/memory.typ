@@ -136,6 +136,8 @@ The initialization will need to correspond to a fixed initial register state for
 as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover.
 The contribution of initialization with static data from the ELF executable and the initial register state to the sum
 can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven.
+To enable the loading of the PC in @cpu:memory, register initialization happens at timestamp 1.
+Register finalization is made possible for the verifier by having a known state from the HALT chip (@halt).
 This leaves only zero-initialization and prover input as prover-side concerns for initialization,
 alongside the finalization of the entire used memory.
 
