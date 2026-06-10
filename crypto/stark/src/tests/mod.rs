@@ -1,5 +1,6 @@
 pub mod air_tests;
 pub mod bus_tests;
+pub mod dispatch_bench_tests;
 pub mod domain_cache_stats;
 pub mod fri_tests;
 pub mod proof_options_tests;

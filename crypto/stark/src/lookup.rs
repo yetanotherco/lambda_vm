@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraintEvaluator,
+        transition::{ConstraintGroupEvaluator, TransitionConstraintEvaluator},
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -814,6 +814,12 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Optional grouped evaluators for the base (domain) constraints: one
+    /// dynamic dispatch per group per LDE point instead of one per constraint.
+    /// Must cover exactly the `num_base_constraints` constraints passed to
+    /// `new`; the LogUp constraints appended there keep their boxed path.
+    /// `None` keeps the flat per-constraint evaluation.
+    eval_groups: Option<Vec<Box<dyn ConstraintGroupEvaluator<F, E>>>>,
 }
 
 impl<
@@ -911,7 +917,25 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            eval_groups: None,
         }
+    }
+
+    /// Replace the per-constraint evaluation of the base (domain) constraints
+    /// with grouped evaluators. The groups must evaluate exactly the same
+    /// constraints (same `constraint_idx` targets) as the flat list passed to
+    /// `new` — the flat list stays authoritative for degrees and zerofiers.
+    pub fn with_eval_groups(
+        mut self,
+        eval_groups: Vec<Box<dyn ConstraintGroupEvaluator<F, E>>>,
+    ) -> Self {
+        let covered: usize = eval_groups.iter().map(|g| g.num_constraints()).sum();
+        assert_eq!(
+            covered, self.num_base_constraints,
+            "eval groups must cover exactly the base constraints",
+        );
+        self.eval_groups = Some(eval_groups);
+        self
     }
 
     /// Marks this AIR as a preprocessed table with a hardcoded commitment.
@@ -1013,6 +1037,44 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &crate::traits::TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    ) {
+        let Some(groups) = &self.eval_groups else {
+            // No groups: identical to the trait default.
+            for e in base_evals.iter_mut() {
+                *e = FieldElement::zero();
+            }
+            let num_base = base_evals.len();
+            for e in ext_evals[num_base..].iter_mut() {
+                *e = FieldElement::zero();
+            }
+            self.transition_constraints
+                .iter()
+                .for_each(|c| c.evaluate_prover(evaluation_context, base_evals, ext_evals));
+            return;
+        };
+
+        for e in base_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        let num_base = base_evals.len();
+        for e in ext_evals[num_base..].iter_mut() {
+            *e = FieldElement::zero();
+        }
+        // Base (domain) constraints via the grouped evaluators; the LogUp
+        // constraints appended by `new` keep their boxed path.
+        for g in groups {
+            g.evaluate_prover_all(evaluation_context, base_evals, ext_evals);
+        }
+        for c in &self.transition_constraints[self.num_base_constraints..] {
+            c.evaluate_prover(evaluation_context, base_evals, ext_evals);
+        }
     }
 
     fn build_auxiliary_trace(

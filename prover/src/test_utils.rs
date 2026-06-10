@@ -19,7 +19,10 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::transition::{
+    ConstraintGroupEvaluator, DynGroup, StaticGroup, TransitionConstraint,
+    TransitionConstraintAdapter, TransitionConstraintEvaluator,
+};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
@@ -508,6 +511,27 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints.push(c);
     }
 
+    // Grouped evaluators for the hot loop: the homogeneous IS_BIT and
+    // ADD-family groups dispatch statically (one virtual call per group per
+    // LDE point); the heterogeneous rest stays boxed. Same constraint
+    // instances as above — the flat list keeps degrees/zerofier metadata.
+    let (is_bit_g, add_g, other_g, _) = create_all_cpu_constraints();
+    let eval_groups: Vec<Box<dyn ConstraintGroupEvaluator<F, E>>> = vec![
+        Box::new(StaticGroup(
+            is_bit_g
+                .into_iter()
+                .map(TransitionConstraintAdapter)
+                .collect::<Vec<_>>(),
+        )),
+        Box::new(StaticGroup(
+            add_g
+                .into_iter()
+                .map(TransitionConstraintAdapter)
+                .collect::<Vec<_>>(),
+        )),
+        Box::new(DynGroup(other_g)),
+    ];
+
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: cpu_bus_interactions(),
     };
@@ -519,6 +543,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_eval_groups(eval_groups)
     .with_name("CPU")
 }
 

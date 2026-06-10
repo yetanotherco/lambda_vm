@@ -457,3 +457,75 @@ where
         }
     }
 }
+
+/// A group of transition constraints evaluated with one dynamic dispatch per
+/// GROUP per LDE point instead of one per constraint. A homogeneous
+/// [`StaticGroup`] gets a static (inlinable) inner loop — the win for tables
+/// whose constraint list is dominated by a few concrete types.
+pub trait ConstraintGroupEvaluator<F, E>: Send + Sync
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn evaluate_prover_all(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    );
+
+    fn num_constraints(&self) -> usize;
+}
+
+/// Homogeneous group: the inner loop dispatches statically.
+pub struct StaticGroup<C>(pub Vec<C>);
+
+impl<F, E, C> ConstraintGroupEvaluator<F, E> for StaticGroup<C>
+where
+    C: TransitionConstraintEvaluator<F, E>,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn evaluate_prover_all(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    ) {
+        for c in &self.0 {
+            c.evaluate_prover(ctx, base_evals, ext_evals);
+        }
+    }
+
+    fn num_constraints(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Heterogeneous leftovers: boxed constraints, dispatched dynamically as
+/// before (no win, just completeness so a table can group everything).
+pub struct DynGroup<F, E>(pub Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>)
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync;
+
+impl<F, E> ConstraintGroupEvaluator<F, E> for DynGroup<F, E>
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn evaluate_prover_all(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evals: &mut [FieldElement<F>],
+        ext_evals: &mut [FieldElement<E>],
+    ) {
+        for c in &self.0 {
+            c.evaluate_prover(ctx, base_evals, ext_evals);
+        }
+    }
+
+    fn num_constraints(&self) -> usize {
+        self.0.len()
+    }
+}

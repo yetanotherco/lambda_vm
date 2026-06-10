@@ -665,3 +665,103 @@ fn test_cpu_constraint_indices_are_unique() {
         assert_eq!(idx, i, "Expected index {} but got {}", i, idx);
     }
 }
+
+/// The grouped-dispatch CPU AIR (`with_eval_groups`) must produce exactly the
+/// same transition evaluations as the flat boxed list, on random frames that
+/// exercise both the base constraints and the LogUp tail.
+#[test]
+fn test_cpu_air_grouped_eval_matches_flat() {
+    use crate::tables::cpu::{bus_interactions as cpu_bus_interactions, cols as cpu_cols};
+    use crate::tables::types::{FEE, GoldilocksExtension, GoldilocksField};
+    use crate::test_utils::create_cpu_air;
+    use stark::constraints::transition::TransitionConstraintEvaluator;
+    use stark::frame::Frame;
+    use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, PackingShifts};
+    use stark::proof::options::ProofOptions;
+    use stark::table::TableView;
+    use stark::traits::{AIR, TransitionEvaluationContext};
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // AIR with grouped evaluation (what production builds now).
+    let grouped_air = create_cpu_air(&proof_options);
+
+    // Twin without groups: same constraints, flat per-constraint dispatch.
+    let (is_bit, add, other, _) = super::super::constraints::cpu::create_all_cpu_constraints();
+    let mut flat: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = Vec::new();
+    for c in is_bit {
+        flat.push(c.boxed());
+    }
+    for c in add {
+        flat.push(c.boxed());
+    }
+    for c in other {
+        flat.push(c);
+    }
+    let flat_air: crate::test_utils::VmAir = AirWithBuses::new(
+        cpu_cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: cpu_bus_interactions(),
+        },
+        &proof_options,
+        1,
+        flat,
+    )
+    .with_name("CPU");
+
+    let num_base = grouped_air.num_base_transition_constraints();
+    let num_total = grouped_air.context().num_transition_constraints;
+    assert_eq!(num_base, flat_air.num_base_transition_constraints());
+    assert_eq!(num_total, flat_air.context().num_transition_constraints);
+
+    let (num_main, num_aux) = grouped_air.trace_layout();
+    let packing_shifts = PackingShifts::<F>::new();
+    let logup_table_offset = FEE::from(11u64);
+    let rap_challenges: Vec<FEE> = vec![FEE::from(98765u64), FEE::from(43210u64)];
+    let alpha_powers: Vec<FEE> = (0..64).map(|i| FEE::from(3u64).pow(i as u64)).collect();
+
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 8) % bound
+    };
+
+    for _ in 0..16 {
+        // Two steps (offsets [0,1]) of random main + aux values. Bit-flag
+        // columns get random bits half the time to also hit "valid" shapes.
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            let main_row: Vec<FE> = (0..num_main).map(|_| FE::from(next(1 << 20))).collect();
+            let aux_row: Vec<FEE> = (0..num_aux).map(|_| FEE::from(next(1 << 20))).collect();
+            steps.push(TableView::new(vec![main_row], vec![aux_row]));
+        }
+        let frame = Frame::<F, E>::new(steps);
+        let ctx = TransitionEvaluationContext::new_prover(
+            &frame,
+            &[],
+            &rap_challenges,
+            &alpha_powers,
+            &logup_table_offset,
+            &packing_shifts,
+        );
+
+        let mut base_a = vec![FE::zero(); num_base];
+        let mut ext_a = vec![FEE::zero(); num_total];
+        grouped_air.compute_transition_prover(&ctx, &mut base_a, &mut ext_a);
+
+        let mut base_b = vec![FE::zero(); num_base];
+        let mut ext_b = vec![FEE::zero(); num_total];
+        flat_air.compute_transition_prover(&ctx, &mut base_b, &mut ext_b);
+
+        assert_eq!(
+            base_a, base_b,
+            "base evals diverge between grouped and flat"
+        );
+        assert_eq!(ext_a, ext_b, "ext evals diverge between grouped and flat");
+    }
+}
