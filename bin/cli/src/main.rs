@@ -261,7 +261,7 @@ fn cmd_execute(
         FlamegraphGenerator::new(symbols, program.entry_point)
     });
 
-    // Execute in chunks, processing logs only if generating flamegraph
+    // Execute in chunks, counting cycles and (if requested) feeding the flamegraph.
     let mut cycle_count: u64 = 0;
     loop {
         let logs = match executor.resume() {
