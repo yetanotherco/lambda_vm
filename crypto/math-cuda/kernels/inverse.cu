@@ -15,8 +15,7 @@
 //   Phase 3: each block reads its offset (the inclusive prefix of all
 //            preceding block sums) and multiplies it into every element.
 //
-// Forward and backward kernels are mirrors of each other (separate kernels
-// for clarity; commutativity of Goldilocks would let them share code).
+// Forward and backward kernels are mirrors of each other.
 //
 // Buffer layouts: all ext3 buffers are interleaved [a0,b0,c0, a1,b1,c1, ...]
 // with one u64 per coordinate. `BLOCK_SIZE = 256` ext3 elements per block

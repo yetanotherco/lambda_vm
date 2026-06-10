@@ -118,7 +118,7 @@ pub fn deep_composition_ext3_with_dev_parts(
 /// `inv_denoms_dev` is `3 * (1 + num_eval_points) * domain_size` u64s:
 /// the first `3 * domain_size` u64s are `inv_h` (H-term denominators),
 /// followed by `num_eval_points` blocks of `3 * domain_size` for the
-/// trace terms — same layout `compute_and_invert_denoms_ext3_dev`
+/// trace terms. Same layout `compute_and_invert_denoms_ext3_dev`
 /// produces when called with `z_scalars = [z_power, z_shifted[0..]]`.
 #[allow(clippy::too_many_arguments)]
 pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(

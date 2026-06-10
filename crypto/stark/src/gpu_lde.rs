@@ -720,7 +720,7 @@ where
             FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 1]),
             FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 2]),
         ]);
-        let final_ext3 = &s * &scalar_e;
+        let final_ext3 = s * scalar_e;
         // SAFETY: TypeId-checked at the caller. E == Ext3, identical layout.
         let final_e: FieldElement<E> =
             unsafe { transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&final_ext3) };
@@ -1001,6 +1001,15 @@ pub fn gpu_batch_invert_calls() -> u64 {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_fri_fold_fault(n_calls_until_err: i64) {
     math_cuda::fri::FAULT_FOLDS_REMAINING_UNTIL_ERR.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `compute_and_invert_denoms_ext3_dev`
+/// call to return Err, exercising the CPU-fallback path in
+/// [`try_compute_and_invert_inv_denoms_dev`]. Pass -1 to disable.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_inverse_fault(n_calls_until_err: i64) {
+    math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
 }
 
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
@@ -1396,8 +1405,8 @@ where
 /// a device-resident `inv_denoms` buffer plus the stream that owns it.
 /// The caller passes the tuple through to the downstream dispatch
 /// functions (`try_barycentric_*_on_handle`, `try_deep_composition_gpu`)
-/// so every kernel touching the buffer runs on the same stream — no
-/// cross-stream race.
+/// so every kernel touching the buffer runs on the same stream (no
+/// cross-stream race).
 ///
 /// Returns `None` on type / threshold mismatch, backend init failure, or
 /// any cudarc error; the caller falls back to its CPU

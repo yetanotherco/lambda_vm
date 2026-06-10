@@ -495,11 +495,20 @@ where
         let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
         let vanishing_factor = &n_inv_g_n_inv * &vanishing;
 
-        // Precompute inv_denoms = 1/(eval_point - coset_point_i), shared across all columns.
-        // Stays on CPU: the batch-invert cost at this scale (n * num_eval_points) is already
-        // rayon-parallelised across tables, and a GPU port regressed wall time in a
-        // 2x15-trial A/B due to stream contention from many concurrent launches.
-        let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
+        // CPU inv_denoms = 1/(eval_point - coset_point_i). Materialised
+        // eagerly only when the GPU dispatcher will need to H2D it (no
+        // device-side inv_denoms buffer available). On the all-GPU happy
+        // path it stays None and the `barycentric_inv_denoms` call is
+        // skipped entirely (the GPU buffer covers every eval point).
+        #[cfg(feature = "cuda")]
+        let mut inv_denoms: Option<Vec<FieldElement<E>>> = if inv_denoms_dev.is_some() {
+            None
+        } else {
+            Some(barycentric_inv_denoms(eval_point, &dc.points))
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mut inv_denoms: Option<Vec<FieldElement<E>>> =
+            Some(barycentric_inv_denoms(eval_point, &dc.points));
 
         // col_scale[i] = point[i] * inv_denom[i], shared across ALL CPU column
         // loops below. Computed lazily on first CPU-fallback use so the all-GPU
@@ -526,7 +535,7 @@ where
             &dc.size_inv,
             &dc.offset_pow_n_inv,
             &z_pow_n,
-            &inv_denoms,
+            inv_denoms.as_deref().unwrap_or(&[]),
             inv_denoms_dev_arg,
         );
         #[cfg(not(feature = "cuda"))]
@@ -535,10 +544,12 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
+            let inv_denoms_v = inv_denoms
+                .get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
-                    .zip(inv_denoms.iter())
+                    .zip(inv_denoms_v.iter())
                     .map(|(point, inv_d)| point * inv_d)
                     .collect()
             });
@@ -578,7 +589,7 @@ where
             &dc.size_inv,
             &dc.offset_pow_n_inv,
             &z_pow_n,
-            &inv_denoms,
+            inv_denoms.as_deref().unwrap_or(&[]),
             inv_denoms_dev_arg_aux,
         );
         #[cfg(not(feature = "cuda"))]
@@ -587,10 +598,12 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
+            let inv_denoms_v = inv_denoms
+                .get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
-                    .zip(inv_denoms.iter())
+                    .zip(inv_denoms_v.iter())
                     .map(|(point, inv_d)| point * inv_d)
                     .collect()
             });

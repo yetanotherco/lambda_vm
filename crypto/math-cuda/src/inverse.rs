@@ -23,6 +23,30 @@ use crate::device::backend;
 
 const BLOCK_SIZE: u32 = 256;
 
+/// Test-only fault injection. When the `test-faults` feature is on, setting
+/// this to a finite value forces the next `compute_and_invert_denoms_ext3_dev`
+/// call to return Err and decrement the counter. Tests use this to exercise
+/// the CPU-fallback path in `try_compute_and_invert_inv_denoms_dev`.
+#[cfg(feature = "test-faults")]
+pub static FAULT_INVERSE_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(feature = "test-faults")]
+fn check_inverse_fault_injection() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let v = FAULT_INVERSE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed);
+    if v < 0 {
+        return Ok(());
+    }
+    let new = FAULT_INVERSE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if new == 0 {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+    }
+    Ok(())
+}
+
 /// Host-input batch inverse. Returns a fresh `Vec<u64>` of length `3 * n`
 /// containing the inverses. Used by the parity-test suite; production
 /// callers should prefer `batch_inverse_ext3_dev` to avoid the D2H.
@@ -125,7 +149,7 @@ pub enum DenomSign {
 /// Compute `denoms[k*n + i] = sign-dependent (z, x) combination` on
 /// device, then batch-invert. Returns a fresh `CudaSlice<u64>` of length
 /// `3 * k_scalars * n` holding the inverted denominators. Entire pipeline
-/// stays on device — no PCIe traffic beyond the small `z_scalars` upload.
+/// stays on device (no PCIe traffic beyond the small `z_scalars` upload).
 pub fn compute_and_invert_denoms_ext3_dev(
     x_lde_dev: &CudaSlice<u64>,
     z_scalars_host: &[u64],
@@ -134,6 +158,8 @@ pub fn compute_and_invert_denoms_ext3_dev(
     sign: DenomSign,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    #[cfg(feature = "test-faults")]
+    check_inverse_fault_injection()?;
     assert_eq!(z_scalars_host.len(), k_scalars * 3);
     assert!(n >= 1 && k_scalars >= 1);
 
@@ -252,17 +278,9 @@ fn scan_inplace_fwd(
         shared_mem_bytes: 0,
     };
 
-    // Phase 1: `buf` serves as both input and output. The kernel reads
-    // input[gid] into shmem before any writes, so aliasing is safe.
-    // Borrow `buf` immutably for the read arg, then drop that borrow and
-    // re-borrow mutably for the write arg by splitting into two unsafe
-    // blocks would require duplicating logic; instead we use the raw
-    // device pointer pattern: pass `&*buf` and `&mut *buf` and trust the
-    // borrow checker (the immutable view is dropped by the time `arg()`
-    // chains the mutable one — but Rust doesn't know that). To satisfy
-    // the checker we copy the pointer into a local `inout_ptr`. cudarc
-    // does not expose `*CudaSlice` directly, so we fall back to
-    // allocating a separate scratch buffer for the in-place scan.
+    // Scratch buffer + memcpy_dtod: cudarc's `launch_builder` chains a
+    // `&buf` read arg and a `&mut buf` write arg, which the borrow checker
+    // rejects even though the kernel is safe in place.
     let mut scratch = unsafe { stream.alloc::<u64>(3 * n) }?;
     unsafe {
         stream
@@ -420,4 +438,58 @@ fn invert_ext3_host(x: [u64; 3]) -> [u64; 3] {
         gl_mul(e, inv_norm),
         gl_mul(f, inv_norm),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invert_ext3_host;
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+    use math::field::traits::IsPrimeField;
+
+    type Fp = FieldElement<GoldilocksField>;
+    type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
+
+    fn canon3(a: [u64; 3]) -> [u64; 3] {
+        [
+            GoldilocksField::canonical(&a[0]),
+            GoldilocksField::canonical(&a[1]),
+            GoldilocksField::canonical(&a[2]),
+        ]
+    }
+
+    /// Parity: our adjugate-based ext3 inverse must match
+    /// `Degree3GoldilocksExtensionField::inv`. This catches a regression if
+    /// either implementation diverges from the other (e.g., adjugate sign
+    /// or normalisation drift). Runs without a GPU.
+    #[test]
+    fn invert_ext3_host_matches_lambdaworks() {
+        let cases: [[u64; 3]; 8] = [
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 1, 1],
+            [2, 3, 5],
+            [7, 11, 13],
+            [u64::MAX - 5, 1234567, 89],
+            [0xdead_beef, 0xface_feed, 0x1234_5678_9abc_def0],
+        ];
+        for raw in cases {
+            let lw = Fp3::new([
+                Fp::from_raw(raw[0]),
+                Fp::from_raw(raw[1]),
+                Fp::from_raw(raw[2]),
+            ])
+            .inv()
+            .expect("non-zero norm");
+            let lw_raw = canon3([
+                *lw.value()[0].value(),
+                *lw.value()[1].value(),
+                *lw.value()[2].value(),
+            ]);
+            let ours = canon3(invert_ext3_host(raw));
+            assert_eq!(ours, lw_raw, "mismatch for input {raw:?}");
+        }
+    }
 }
