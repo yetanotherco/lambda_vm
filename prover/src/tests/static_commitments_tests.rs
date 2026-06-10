@@ -1,18 +1,21 @@
 //! Drift-detection and lookup-dispatch tests for the static preprocessed-table
-//! commitments shipped in `bitwise` and `keccak_rc`.
+//! commitments shipped in `bitwise`, `keccak_rc`, and `page` (the shared
+//! zero-init page commitment).
 //!
 //! - The drift tests recompute the commitment for every blowup in
 //!   `STATIC_BLOWUP_FACTORS` (the list shared with the generator binary) and
-//!   compare against the value the table-module's `preprocessed_commitment`
-//!   wrapper returns. This catches AIR or FFT-pipeline drift AND confirms the
-//!   wrapper dispatches through `static_commitment` for the static blowups.
-//! - The non-static-blowup fallback test picks a blowup not in
-//!   `STATIC_BLOWUP_FACTORS` and asserts the wrapper still returns the correct
+//!   compare against the value the table-module's wrapper returns
+//!   (`preprocessed_commitment` for `bitwise`/`keccak_rc`,
+//!   `zero_init_preprocessed_commitment` for `page`). This catches AIR or
+//!   FFT-pipeline drift; the page test additionally pins the static bytes
+//!   against the recompute directly.
+//! - The non-static-blowup fallback tests pick a blowup not in
+//!   `STATIC_BLOWUP_FACTORS` and assert the wrapper still returns the correct
 //!   value via recompute.
 //! - The coset-mismatch tests use `coset_offset != 3` and assert the wrapper
 //!   takes the recompute path (rather than silently returning the coset-3
 //!   static bytes); they're the regression test for the
-//!   `options.coset_offset == 3` gate in `preprocessed_commitment`.
+//!   `options.coset_offset == 3` gate in the wrappers.
 //!
 //! If a drift test fails, regenerate the constants via
 //! `cargo run --bin compute_static_commitments --release`.
@@ -76,23 +79,35 @@ fn keccak_rc_static_matches_recompute_for_all_blowups() {
 /// Drift / dispatch test for the zero-init PAGE static commitments. For every
 /// blowup in `STATIC_BLOWUP_FACTORS`, builds a synthetic zero-init page at
 /// `DEFAULT_PAGE_SIZE` (page_base = 0 — the value doesn't affect the
-/// commitment since OFFSET is page-relative and INIT is uniformly zero) and
-/// asserts that `preprocessed_commitment` returns the same value as a
-/// direct `compute_precomputed_commitment`. Catches AIR / FFT-pipeline drift
-/// AND confirms the wrapper dispatches through `static_zero_page_commitment`
-/// for the static blowups.
+/// commitment since OFFSET is page-relative and INIT is uniformly zero),
+/// recomputes the commitment from scratch, and checks two things:
+///
+/// - the static bytes equal the recompute, read directly from
+///   `static_zero_page_commitment` (panicking if the match arm is missing) —
+///   so byte drift can't be masked by a broken dispatch gate;
+/// - `zero_init_preprocessed_commitment` equals the recompute — the wrapper
+///   returns a correct value whichever path it takes. (The coset-3 gate
+///   itself is covered by the ignored
+///   `page_non_three_coset_recomputes_and_differs_from_static` test.)
 #[test]
 fn zero_page_static_matches_recompute_for_all_blowups() {
     let zero_page_config = page::PageConfig::zero_init(0);
     for &blowup in STATIC_BLOWUP_FACTORS {
         let options = options_for(blowup);
-        let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
         let recomputed = page::compute_precomputed_commitment(&zero_page_config, &options);
+        let Some(static_bytes) = page::static_zero_page_commitment(blowup) else {
+            panic!("no static zero-page match arm shipped for blowup={blowup}");
+        };
+        assert_eq!(
+            static_bytes, recomputed,
+            "static zero-init page commitment drifted for blowup={blowup}; \
+             regenerate constants via \
+             `cargo run --bin compute_static_commitments --release`",
+        );
+        let from_wrapper = page::zero_init_preprocessed_commitment(&options);
         assert_eq!(
             from_wrapper, recomputed,
-            "zero-init page commitment drifted (or wrapper dispatch broke) for \
-             blowup={blowup}; regenerate constants via \
-             `cargo run --bin compute_static_commitments --release`",
+            "zero_init_preprocessed_commitment returned a wrong value for blowup={blowup}",
         );
     }
 }
@@ -111,7 +126,7 @@ fn page_non_static_blowup_recomputes_via_fallback() {
     );
     let zero_page_config = page::PageConfig::zero_init(0);
     let options = options_for(NON_STATIC_BLOWUP);
-    let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
+    let from_wrapper = page::zero_init_preprocessed_commitment(&options);
     let recomputed = page::compute_precomputed_commitment(&zero_page_config, &options);
     assert_eq!(
         from_wrapper, recomputed,
@@ -120,8 +135,8 @@ fn page_non_static_blowup_recomputes_via_fallback() {
 }
 
 /// Regression test for the `options.coset_offset == 3` gate in
-/// `page::preprocessed_commitment`. With a non-3 coset offset, the wrapper
-/// must NOT return a static value — it must recompute (matching direct
+/// `page::zero_init_preprocessed_commitment`. With a non-3 coset offset, the
+/// wrapper must NOT return a static value — it must recompute (matching direct
 /// compute) and must NOT equal the coset-3 static commitment. Ignored by
 /// default: each blowup at DEFAULT_PAGE_SIZE builds a 2^19-row × 2-col page
 /// LDE, multiple seconds per blowup. Run explicitly when validating the
@@ -134,9 +149,9 @@ fn page_non_three_coset_recomputes_and_differs_from_static() {
         let opts_coset3 = options_with_coset(blowup, STANDARD_COSET);
         let opts_coset7 = options_with_coset(blowup, NON_STANDARD_COSET);
 
-        let from_wrapper_7 = page::preprocessed_commitment(&zero_page_config, &opts_coset7);
+        let from_wrapper_7 = page::zero_init_preprocessed_commitment(&opts_coset7);
         let recomputed_7 = page::compute_precomputed_commitment(&zero_page_config, &opts_coset7);
-        let from_wrapper_3 = page::preprocessed_commitment(&zero_page_config, &opts_coset3);
+        let from_wrapper_3 = page::zero_init_preprocessed_commitment(&opts_coset3);
 
         assert_eq!(
             from_wrapper_7, recomputed_7,

@@ -244,7 +244,7 @@ pub fn generate_page_trace(
 /// exist to force a human to ask "why did this change?" before the new
 /// bytes get blessed. Re-pasting on a drift failure silently launders an
 /// unintended table change into the verifier's compiled-in trust anchor.
-fn static_zero_page_commitment(blowup_factor: u8) -> Option<Commitment> {
+pub(crate) fn static_zero_page_commitment(blowup_factor: u8) -> Option<Commitment> {
     match blowup_factor {
         2 => Some([
             0xf9, 0x80, 0x0e, 0x45, 0x72, 0x5a, 0x8e, 0x8e, 0x5e, 0xd7, 0x5b, 0x60, 0xce, 0xd0,
@@ -270,11 +270,9 @@ fn static_zero_page_commitment(blowup_factor: u8) -> Option<Commitment> {
 /// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
 /// Each page may have different INIT data, producing a different commitment.
 ///
-/// Exposed for the `compute_static_commitments` binary and the
-/// drift-detection tests in `static_commitments_tests`. Production callers
-/// should go through [`preprocessed_commitment`] so the static const-table
-/// shortcut is used when applicable.
-#[doc(hidden)]
+/// For zero-init pages, prefer [`zero_init_preprocessed_commitment`], which
+/// returns a compile-time constant for the standard proof options instead
+/// of rebuilding the FFT + Merkle tree.
 pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
     let page_size = DEFAULT_PAGE_SIZE;
     let num_rows = page_size;
@@ -332,31 +330,29 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     tree.root
 }
 
-/// Returns the preprocessed commitment for a PAGE table.
+/// Returns the zero-init PAGE preprocessed commitment.
 ///
-/// For zero-init pages, looks up `blowup_factor` in
-/// [`static_zero_page_commitment`] when `coset_offset == 3` (the value the
-/// static bytes were generated for); on miss — either a non-3 coset or a
-/// `blowup_factor` outside the shipped match arms — logs a warning and
-/// recomputes from scratch. ELF data pages always recompute (no warning):
-/// their INIT column is program-dependent.
-pub fn preprocessed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
-    if config.init_values.is_none() {
-        if options.coset_offset == 3
-            && let Some(commitment) = static_zero_page_commitment(options.blowup_factor)
-        {
-            return commitment;
-        }
-        log::warn!(
-            "zero-init page preprocessed commitment not static for \
-             (blowup={}, coset={}); falling back to recompute. Add a match \
-             arm to `static_zero_page_commitment` by running \
-             `cargo run --bin compute_static_commitments --release`.",
-            options.blowup_factor,
-            options.coset_offset,
-        );
+/// Looks up `blowup_factor` in [`static_zero_page_commitment`] when
+/// `coset_offset == 3` (the value the static bytes were generated for); on
+/// miss — either a non-3 coset or a `blowup_factor` outside the shipped
+/// match arms — logs a warning and recomputes from scratch. ELF data pages
+/// have program-dependent INIT columns and no static entry; compute their
+/// commitments with [`compute_precomputed_commitment`] directly.
+pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    if options.coset_offset == 3
+        && let Some(commitment) = static_zero_page_commitment(options.blowup_factor)
+    {
+        return commitment;
     }
-    compute_precomputed_commitment(config, options)
+    log::warn!(
+        "zero-init page preprocessed commitment not static for \
+         (blowup={}, coset={}); falling back to recompute. Add a match \
+         arm to `static_zero_page_commitment` by running \
+         `cargo run --bin compute_static_commitments --release`.",
+        options.blowup_factor,
+        options.coset_offset,
+    );
+    compute_precomputed_commitment(&PageConfig::zero_init(0), options)
 }
 
 // =========================================================================
