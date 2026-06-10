@@ -108,6 +108,10 @@ enum Commands {
         /// Generate flamegraph folded stacks to file
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
+
+        /// Print the dynamic instruction (cycle) count
+        #[arg(long)]
+        cycles: bool,
     },
 
     /// Generate a proof for an ELF program
@@ -182,7 +186,8 @@ fn main() -> ExitCode {
             elf,
             private_input,
             flamegraph,
-        } => cmd_execute(elf, private_input, flamegraph),
+            cycles,
+        } => cmd_execute(elf, private_input, flamegraph, cycles),
         Commands::Prove {
             elf,
             output,
@@ -216,6 +221,7 @@ fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
     flamegraph_path: Option<PathBuf>,
+    cycles: bool,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -255,7 +261,8 @@ fn cmd_execute(
         FlamegraphGenerator::new(symbols, program.entry_point)
     });
 
-    // Execute in chunks, processing logs only if generating flamegraph
+    // Execute in chunks, counting cycles and (if requested) feeding the flamegraph.
+    let mut cycle_count: u64 = 0;
     loop {
         let logs = match executor.resume() {
             Ok(logs) => logs,
@@ -266,6 +273,7 @@ fn cmd_execute(
         };
         match logs {
             Some(logs) => {
+                cycle_count += logs.len() as u64;
                 if let Some(ref mut fg) = generator {
                     let logs: Vec<_> = logs.to_vec();
                     if let Err(e) = fg.process_logs(&logs, &executor.instructions) {
@@ -303,6 +311,10 @@ fn cmd_execute(
             output_path,
             generator.total_instructions()
         );
+    }
+
+    if cycles {
+        println!("Cycles: {}", cycle_count);
     }
 
     ExitCode::SUCCESS
