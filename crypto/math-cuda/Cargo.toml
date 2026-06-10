@@ -17,6 +17,11 @@ cudarc = { version = "0.19", default-features = false, features = [
 math = { path = "../math" }
 rayon = "1.7"
 
+[features]
+# Test-only fault injection in FriCommitState. Production builds leave this
+# off so the fault check is fully elided at compile time.
+test-faults = []
+
 [dev-dependencies]
 crypto = { path = "../crypto" }
 rand = { version = "0.8.5", features = ["std"] }
