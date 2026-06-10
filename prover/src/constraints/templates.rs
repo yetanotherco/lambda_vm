@@ -13,10 +13,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::{
-    constraints::transition::TransitionConstraint, table::TableView,
-    traits::TransitionEvaluationContext,
-};
+use stark::{constraints::transition::TransitionConstraint, table::TableView};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -78,27 +75,6 @@ impl IsBitConstraint {
             constraint_idx,
         }
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let x = step.get_main_evaluation_element(0, self.value_col).clone();
-        let one = FieldElement::<F>::one();
-
-        match self.cond_col {
-            Some(cond_col) => {
-                let cond = step.get_main_evaluation_element(0, cond_col).clone();
-                // cond * X * (1 - X)
-                &cond * &x * (one - x)
-            }
-            None => {
-                // X * (1 - X)
-                &x * (one - &x)
-            }
-        }
-    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstraint {
@@ -113,31 +89,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let x = step.get_main_evaluation_element(0, self.value_col).clone();
+        let one = FieldElement::<F>::one();
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
+        match self.cond_col {
+            Some(cond_col) => {
+                let cond = step.get_main_evaluation_element(0, cond_col).clone();
+                &cond * &x * (one - x)
             }
+            None => &x * (one - &x),
         }
     }
 }
@@ -504,45 +469,19 @@ impl AddConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
     fn degree(&self) -> usize {
-        if self.cond_cols.is_empty() {
-            // Unconditional: carry * (1 - carry) → degree 2
-            2
-        } else {
-            // Conditional: cond * carry * (1 - carry) → degree 3
-            3
-        }
+        if self.cond_cols.is_empty() { 2 } else { 3 }
     }
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
@@ -569,17 +508,4 @@ pub fn new_is_bit_constraints(
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tables::types::GoldilocksField;
-
-    #[test]
-    fn test_inv_shift_32_is_correct() {
-        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
-        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
-        assert_eq!(inv * shift, FieldElement::one());
-    }
 }

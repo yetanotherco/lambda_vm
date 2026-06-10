@@ -114,12 +114,47 @@ fn bench_inv(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_inplace_batch_inverse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("goldilocks_inplace_batch_inverse");
+
+    // 2^14: below the parallel threshold (sequential path).
+    // 2^16: at the parallel threshold.
+    // 2^20: well above the threshold (parallel path with full chunking).
+    const BATCH_SIZES: [usize; 3] = [1 << 14, 1 << 16, 1 << 20];
+
+    for size in BATCH_SIZES {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(9001);
+        let data: Vec<NativeFE> = (0..size)
+            .map(|_| {
+                let mut v = rng.next_u64();
+                if v == 0 {
+                    v = 1;
+                }
+                NativeFE::from(v)
+            })
+            .collect();
+
+        group.bench_with_input(BenchmarkId::new("native", size), &data, |b, data| {
+            b.iter_batched(
+                || data.clone(),
+                |mut buf| {
+                    NativeFE::inplace_batch_inverse(black_box(&mut buf)).unwrap();
+                    black_box(buf);
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
     bench_sub,
     bench_mul,
     bench_square,
-    bench_inv
+    bench_inv,
+    bench_inplace_batch_inverse
 );
 criterion_main!(benches);

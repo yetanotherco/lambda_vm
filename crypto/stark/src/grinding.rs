@@ -12,12 +12,16 @@ const PREFIX: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xed];
 ///
 /// * `seed`: the input seed,
 /// * `nonce`: the value to be tested,
-/// * `grinding_factor`: the number of leading zeros needed.
+/// * `grinding_factor`: the number of leading zeros needed; must be in `1..=64`.
 ///
 /// # Returns
 ///
 /// `true` if the number of leading zeros is at least `grinding_factor`, and `false` otherwise.
 pub fn is_valid_nonce(seed: &[u8; 32], nonce: u64, grinding_factor: u8) -> bool {
+    debug_assert!(
+        (1..=64).contains(&grinding_factor),
+        "grinding_factor must be in 1..=64, got {grinding_factor}"
+    );
     let inner_hash = get_inner_hash(seed, grinding_factor);
     let limit = 1 << (64 - grinding_factor);
     is_valid_nonce_for_inner_hash(&inner_hash, nonce, limit)
@@ -32,12 +36,16 @@ pub fn is_valid_nonce(seed: &[u8; 32], nonce: u64, grinding_factor: u8) -> bool 
 /// # Parameters
 ///
 /// * `seed`: the input seed,
-/// * `grinding_factor`: the number of leading zeros needed.
+/// * `grinding_factor`: the number of leading zeros needed; must be in `1..=64`.
 ///
 /// # Returns
 ///
 /// A `nonce` satisfying the required condition.
 pub fn generate_nonce(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    debug_assert!(
+        (1..=64).contains(&grinding_factor),
+        "grinding_factor must be in 1..=64, got {grinding_factor}"
+    );
     let inner_hash = get_inner_hash(seed, grinding_factor);
     let limit = 1 << (64 - grinding_factor);
 

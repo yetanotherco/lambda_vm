@@ -5,6 +5,13 @@ kind = "template"
 input = ["BaseField"]
 cond = "BaseField"
 
+# IS_BYTE<X, μ>
+[[signatures]]
+tag = "IS_BYTE"
+kind = "template"
+input = ["BaseField"]
+cond = "BaseField"
+
 # cond => ADD<sum; lhs, rhs>
 [[signatures]]
 tag = "ADD"
@@ -42,11 +49,25 @@ tag = "DECODE"
 kind = "interaction"
 input = ["DWordWL", "DWordWL", "BaseField"]
 
-# SHIFT[out; in, shift, direction, signed, word_instr]
+# CPU32[half_instruction_length; timestamp, pc]
 [[signatures]]
-tag = "SHIFT"
+tag = "CPU32"
 kind = "interaction"
-input = ["DWordHL", "Byte", "Bit", "Bit", "Bit"]
+input = ["DWordWL", "DWordWL"]
+output = "Byte"
+
+# ALU[out; in1, in2, flags]
+[[signatures]]
+tag = "ALU"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "Byte"]
+output = "DWordWL"
+
+# MEMOP[out; timestamp, address, value, flags]
+[[signatures]]
+tag = "MEMOP"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "DWordWL", "Byte"]
 output = "DWordWL"
 
 # BRANCH[next_pc; pc, offset, register, JALR]
@@ -69,32 +90,11 @@ tag = "MEMW"
 kind = "interaction"
 input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
 
-# LT[lt; lhs, rhs, signed]
-[[signatures]]
-tag = "LT"
-kind = "interaction"
-input = ["DWordWL", "DWordWL", "Bit"]
-output = "Bit"
-
-# MUL[lo/hi; lhs, lhs_signed, rhs, rhs_signed, 0/1]
-[[signatures]]
-tag = "MUL"
-kind = "interaction"
-input = ["DWordHL", "Bit", "DWordHL", "Bit", "Bit"]
-output = "DWordWL"
-
-# DVRM[q/r; n, d, signed, 0/1]
-[[signatures]]
-tag = "DVRM"
-kind = "interaction"
-input = ["DWordHL", "DWordHL", "Bit", "Bit"]
-output = "DWordWL"
-
-# LOAD[res; base_address, timestamp, read2, read4, read8, signed]
+# LOAD[res; base_address, timestamp, flags]
 [[signatures]]
 tag = "LOAD"
 kind = "interaction"
-input = ["DWordWL", "DWordWL", "Bit", "Bit", "Bit", "Bit"]
+input = ["DWordWL", "DWordWL", "Byte"]
 output = "DWordWL"
 
 # ECALL[timestamp, syscallnr]
@@ -115,25 +115,11 @@ tag = "COMMIT"
 kind = "interaction"
 input = ["BaseField", "Byte"]
 
-# AND_BYTE[res; X, Y]
+# BYTE_ALU[res; selector, X, Y]
 [[signatures]]
-tag = "AND_BYTE"
+tag = "BYTE_ALU"
 kind = "interaction"
-input = ["Byte", "Byte"]
-output = "Byte"
-
-# OR_BYTE[res; X, Y]
-[[signatures]]
-tag = "OR_BYTE"
-kind = "interaction"
-input = ["Byte", "Byte"]
-output = "Byte"
-
-# XOR_BYTE[res; X, Y]
-[[signatures]]
-tag = "XOR_BYTE"
-kind = "interaction"
-input = ["Byte", "Byte"]
+input = ["Byte", "Byte", "Byte"]
 output = "Byte"
 
 # MSB8[msb; X]
@@ -157,11 +143,11 @@ kind = "interaction"
 input = ["B20"]
 output = "Bit"
 
-# IS_BYTE[X]
+# ARE_BYTES[X, Y]
 [[signatures]]
-tag = "IS_BYTE"
+tag = "ARE_BYTES"
 kind = "interaction"
-input = ["Byte"]
+input = ["Byte", "Byte"]
 
 # IS_HALF[X]
 [[signatures]]

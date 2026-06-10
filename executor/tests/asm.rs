@@ -1,4 +1,7 @@
-use executor::{elf::Elf, vm::execution::Executor};
+use executor::{
+    elf::Elf,
+    vm::execution::{Executor, ExecutorError},
+};
 
 /// Run a program and verify it exits successfully (exit code 0).
 ///
@@ -19,6 +22,19 @@ fn run_program(elf_path: &str) {
         "Program {} exited with non-zero exit code: {}",
         elf_path, result.register_values.0
     );
+}
+
+/// Test that the memory-mapped private input region is readable by guest programs.
+/// The ASM program reads from 0xFF000000 and commits 8 bytes of data.
+#[test]
+fn test_private_input_memory_mapped() {
+    let elf_data = std::fs::read("./program_artifacts/asm/test_private_input_xpage.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let input: Vec<u8> = (0u8..16).collect();
+    let executor = Executor::new(&program, input.clone()).unwrap();
+    let result = executor.run().unwrap();
+    // Committed bytes are at 0xFF000008 = data bytes [4..12]
+    assert_eq!(result.return_values.memory_values, input[4..12].to_vec());
 }
 
 #[test]
@@ -411,10 +427,68 @@ fn test_lw_sw_offset() {
     run_program("./program_artifacts/asm/lw_sw_offset.elf");
 }
 
-#[ignore = "Unaligned memory access not properly implemented yet"]
 #[test]
 fn test_lw_sw_offset_odd() {
     run_program("./program_artifacts/asm/lw_sw_offset_odd.elf");
+}
+
+#[test]
+fn test_misalign_lh() {
+    run_program("./program_artifacts/asm/misalign_lh.elf");
+}
+
+#[test]
+fn test_misalign_lhu() {
+    run_program("./program_artifacts/asm/misalign_lhu.elf");
+}
+
+#[test]
+fn test_misalign_lw() {
+    run_program("./program_artifacts/asm/misalign_lw.elf");
+}
+
+#[test]
+fn test_misalign_lwu() {
+    run_program("./program_artifacts/asm/misalign_lwu.elf");
+}
+
+#[test]
+fn test_misalign_ld() {
+    run_program("./program_artifacts/asm/misalign_ld.elf");
+}
+
+#[test]
+fn test_misalign_sh() {
+    run_program("./program_artifacts/asm/misalign_sh.elf");
+}
+
+#[test]
+fn test_misalign_sw() {
+    run_program("./program_artifacts/asm/misalign_sw.elf");
+}
+
+#[test]
+fn test_misalign_sd() {
+    run_program("./program_artifacts/asm/misalign_sd.elf");
+}
+
+#[test]
+fn test_misaligned_pc_traps() {
+    let elf_data = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let err = loop {
+        match executor.resume() {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("expected misaligned PC trap, program halted normally"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(err, ExecutorError::InstructionAddressMisaligned(2)),
+        "expected InstructionAddressMisaligned(2), got {:?}",
+        err
+    );
 }
 
 #[test]
@@ -570,6 +644,11 @@ fn test_mulw_neg() {
 }
 
 #[test]
+fn test_mulw_overflow() {
+    run_program("./program_artifacts/asm/mulw_overflow.elf");
+}
+
+#[test]
 fn test_divw() {
     run_program("./program_artifacts/asm/divw.elf");
 }
@@ -595,6 +674,11 @@ fn test_divuw() {
 }
 
 #[test]
+fn test_divuw_high_bit() {
+    run_program("./program_artifacts/asm/divuw_high_bit.elf");
+}
+
+#[test]
 fn test_remw() {
     run_program("./program_artifacts/asm/remw.elf");
 }
@@ -617,6 +701,11 @@ fn test_remuw_zero() {
 #[test]
 fn test_remuw() {
     run_program("./program_artifacts/asm/remuw.elf");
+}
+
+#[test]
+fn test_remuw_high_bit() {
+    run_program("./program_artifacts/asm/remuw_high_bit.elf");
 }
 
 // ==================== 64-bit Load/Store ====================
@@ -787,4 +876,50 @@ fn test_sub_64bit() {
 #[test]
 fn test_sub_underflow() {
     run_program("./program_artifacts/asm/sub_underflow.elf");
+}
+
+// ==================== Keccak Precompile ====================
+
+#[test]
+fn test_keccak() {
+    // Runs keccak-f[1600] on a zeroed state and commits the 200-byte result.
+    // Expected output is the FIPS-202 zero-input KAT.
+    let elf_data = std::fs::read("./program_artifacts/asm/test_keccak.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    let expected_state: [u64; 25] = [
+        0xF1258F7940E1DDE7,
+        0x84D5CCF933C0478A,
+        0xD598261EA65AA9EE,
+        0xBD1547306F80494D,
+        0x8B284E056253D057,
+        0xFF97A42D7F8E6FD4,
+        0x90FEE5A0A44647C4,
+        0x8C5BDA0CD6192E76,
+        0xAD30A6F71B19059C,
+        0x30935AB7D08FFC64,
+        0xEB5AA93F2317D635,
+        0xA9A6E6260D712103,
+        0x81A57C16DBCF555F,
+        0x43B831CD0347C826,
+        0x01F22F1A11A5569F,
+        0x05E5635A21D9AE61,
+        0x64BEFEF28CC970F2,
+        0x613670957BC46611,
+        0xB87C5A554FD00ECB,
+        0x8C3EE88A1CCF32C8,
+        0x940C7922AE3A2614,
+        0x1841F924A2C509E4,
+        0x16F53526E70465C2,
+        0x75F644E97F30A13B,
+        0xEAF1FF7B5CECA249,
+    ];
+    let mut expected_bytes = Vec::with_capacity(200);
+    for lane in expected_state {
+        expected_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+    assert_eq!(result.return_values.memory_values, expected_bytes);
+    assert_eq!(result.return_values.register_values.0, 0);
 }

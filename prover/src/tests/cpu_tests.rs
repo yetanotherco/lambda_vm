@@ -19,7 +19,7 @@ fn ops4(op: CpuOperation) -> Vec<CpuOperation> {
     (0..4)
         .map(|i| {
             let mut new_op = op.clone();
-            new_op.timestamp = (i as u64) * 4;
+            new_op.timestamp = (i as u64) * 4 + 4;
             new_op.decode.pc = op.decode.pc + (i as u64) * 4;
             new_op.next_pc = op.decode.pc + (i as u64) * 4 + 4;
             new_op
@@ -177,7 +177,7 @@ fn test_trace_generation_basic() {
 
     // Check first row values
     let row0 = trace.main_table.get_row(0);
-    assert_eq!(row0[cols::TIMESTAMP], FE::from(0u64));
+    assert_eq!(row0[cols::TIMESTAMP], FE::from(4u64));
     assert_eq!(row0[cols::PC_0], FE::from(0x1000u64));
     assert_eq!(row0[cols::PC_1], FE::zero());
     assert_eq!(row0[cols::RS1], FE::from(1u64));
@@ -322,21 +322,24 @@ fn test_bus_interactions_count() {
     // - 1 M5 (MEMW write rd register)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
-    // - 1 CM54 (MEMW PC register read-write)
+    // - 4 inline PC (2 reads + 2 writes to Memory bus for x255)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (single shared bus for HALT and COMMIT, mult = ECALL)
-    // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 68
-    assert_eq!(interactions.len(), 68);
+    // - 1 ECALL (shared bus for HALT, COMMIT, and KECCAK, mult = ECALL)
+    // - 1 ARE_BYTES for (RS1, RS2) paired
+    // - 1 ARE_BYTES for (RD, 0)
+    // - 12 ARE_BYTES (ARG1/ARG2/RES byte pairs: 4 pairs × 3 arrays)
+    // Inline PC replaces CM54: -1 CM54, +4 inline PC → net +3 vs pre-PR main.
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 12 = 58
+    assert_eq!(interactions.len(), 58);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 74);
+    assert_eq!(cols::NUM_COLUMNS, 76);
 }
 
 #[test]

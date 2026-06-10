@@ -7,7 +7,7 @@ name = "CPU"
 [[variables.input]]
 name = "timestamp"
 type = "Timestamp"
-desc = "A preprocessed timestamp to coordinate the memory argument. Since we have at most 3 non-disjoint memory accesses (`(rs1, rs2, rd)`, `(rs1, pc, pc)`, `(LOAD)` or `(STORE)`) a maximum of 4 slots is enough."
+desc = "A preprocessed timestamp to coordinate the memory argument. Since we have at most 3 non-disjoint memory accesses (`(rs1, rs2, rd)`, `(rs1, pc, pc)`, `MEMORY`) a maximum of 4 slots is enough."
 
 [[variables.input]]
 name = "pc"
@@ -51,58 +51,18 @@ type = "Bit"
 desc = "Whether to write back to the destination register"
 pad = 0
 
-# TODO: can we compress this to a single value? (1: is it worth it, 2: does it work)
-[[variables.input]]
-name = "memory_2bytes"
-type = "Bit"
-desc = "Whether the memory access (read or write) touches exactly 2 bytes"
-pad = 0
-
-[[variables.input]]
-name = "memory_4bytes"
-type = "Bit"
-desc = "Whether the memory access (read or write) touches exactly 4 bytes"
-pad = 0
-
-[[variables.input]]
-name = "memory_8bytes"
-type = "Bit"
-desc = "Whether the memory access (read or write) touches exactly 8 bytes"
-pad = 0
-
-# TODO: Are there usecases where it's nicer to just have this as a length constant?
-[[variables.input]]
-name = "c_type_instruction"
-type = "Bit"
-desc = "Whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
-pad = 0
-
 [[variables.input]]
 name = "imm"
 type = "DWordWL"
 desc = "The fully extended 64-bit version of the immediate"
 pad = 0
 
+# We encode C-type instructions with a length of 2, as this generality allows fusing common instruction combos
 [[variables.input]]
-name = "signed"
-type = "Bit"
-desc = "Indicates whether we're dealing with a signed or unsigned instruction"
-pad = 0
-
-[[variables.input]]
-name = "mp_selector"
-type = "Bit"
-desc = """Multi-purpose selector used by different ALU operations for different purposes. Currently, it is used
-    - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and
-    - as flag for inverting the condition of conditional branches (see `branch_cond`)
-    - as direction (left or right) for `SHIFT`"""
-pad = 0
-
-[[variables.input]]
-name = "muldiv_selector"
-type = "Bit"
-desc = "Selects which output of `MUL` (lo/hi) or `DIV` (quo/rem) is wanted"
-pad = 0
+name = "half_instruction_length"
+type = "Byte"
+desc = "Half the number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long (= 1) instead of 4 (= 2)"
+pad = 2
 
 [[variables.input]]
 name = "word_instr"
@@ -111,108 +71,59 @@ desc = "Whether the instruction is a \\*W instruction, requiring the inputs and 
 pad = 0
 
 [[variables.input]]
+name = "ALU"
+type = "Bit"
+desc = "Whether to use the ALU for this instruction"
+pad = 0
+
+[[variables.input]]
+name = "alu_flags"
+type = "Byte"
+desc = "The ALU operation + flags (interpreting things as signed/unsigned, choosing the MUL/DVRM output, ...) to pass to the ALU"
+pad = 0
+
+[[variables.input]]
 name = "ADD"
 type = "Bit"
-desc = "One-hot ALU selector flag"
+desc = "Addition fast-path bypassing the ALU"
 pad = 0
 
 [[variables.input]]
 name = "SUB"
 type = "Bit"
-desc = "One-hot ALU selector flag"
+desc = "Subtraction fast-path bypassing the ALU"
 pad = 0
 
 [[variables.input]]
-name = "SLT"
+name = "MEMORY"
 type = "Bit"
-desc = "One-hot ALU selector flag"
+desc = "Whether this instruction touches memory (LOAD/STORE)"
 pad = 0
 
 [[variables.input]]
-name = "AND"
-type = "Bit"
-desc = "One-hot ALU selector flag"
+name = "mem_flags"
+type = "Byte"
+desc = "The flags to pass for MEMORY operations (LOAD vs STORE, number of bytes touched, signed)"
 pad = 0
 
 [[variables.input]]
-name = "OR"
+name = "BRANCH"
 type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "XOR"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "SHIFT"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "JALR"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "BEQ"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "BLT"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "LOAD"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "STORE"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "MUL"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
-[[variables.input]]
-name = "DIVREM"
-type = "Bit"
-desc = "One-hot ALU selector flag"
+desc = "Whether this instruction is a conditional branch (BLT, BEQ)"
 pad = 0
 
 [[variables.input]]
 name = "ECALL"
 type = "Bit"
-desc = "One-hot ALU selector flag"
+desc = "Whether this instruction is an ECALL"
 pad = 0
-
-[[variables.input]]
-name = "EBREAK"
-type = "Bit"
-desc = "One-hot ALU selector flag"
-pad = 0
-
 
 # Output
 [[variables.output]]
 name = "next_pc"
 type = "DWordWL"
 desc = "The program counter for the next instruction"
-pad = 5
+pad = 1
 
 [[variables.output]]
 name = "rvd"
@@ -235,65 +146,41 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "rv1"
-type = "DWordWHH"
+type = "DWordWL"
 desc = "The value of register `rs1`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "rv2"
-type = "DWordWHH"
+type = "DWordWL"
 desc = "The value of register `rs2`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "rv1_ext_bit"
-type = "Bit"
-desc = "The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "arg1"
-type = "DWordBL"
-desc = "The extended version of `rv1`, depending on `word_instr`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "rv2_ext_bit"
-type = "Bit"
-desc = "The sign bit of `rv2` if seen as a 32-bit word, used for sign extension with `word_instr`"
-pad = 0
-
-[[variables.auxiliary]]
 name = "arg2"
-type = "DWordBL"
+type = "DWordWL"
 desc = "A multiplexed version of `rv2` and `imm`, to be used as second argument to ALU calls"
 pad = 0
 
 [[variables.auxiliary]]
-name = "res_ext_bit"
-type = "Bit"
-desc = "The sign bit of `res`, if seen as a 32-bit word, used for sign extension with `word_instr`"
-pad = 0
-
-[[variables.auxiliary]]
 name = "res"
-type = "DWordBL"
+type = "DWordHL"
 desc = "The ALU result"
-pad = 0
-
-[[variables.auxiliary]]
-name = "is_equal"
-type = "Bit"
-desc = "Whether `rv1` and `arg2` are equal"
 pad = 0
 
 [[variables.auxiliary]]
 name = "branch_cond"
 type = "Bit"
-desc = "Whether a branch is taken, i.e., the branch condition"
+desc = "Whether a branch is taken: the branch condition evaluates to true, or we are doing an unconditional jump"
 pad = 0
 
 # Virtual
+[[variables.virtual]]
+name = "JALR"
+type = "Bit"
+desc = "Read whether our BRANCH corresponds to a JAL(R) instruction from `mem_flags`, as `MEMORY` and `BRANCH` are mutually exclusive"
+def = "mem_flags"
+
 [[variables.virtual]]
 name = "packed_decode"
 type = "BaseField"
@@ -302,49 +189,52 @@ def = ["+",
     ["*", ["^", 2, 0], "read_register1"],
     ["*", ["^", 2, 1], "read_register2"],
     ["*", ["^", 2, 2], "write_register"],
-    ["*", ["^", 2, 3], "memory_2bytes"],
-    ["*", ["^", 2, 4], "memory_4bytes"],
-    ["*", ["^", 2, 5], "memory_8bytes"],
-    ["*", ["^", 2, 6], "c_type_instruction"],
-    ["*", ["^", 2, 7], "signed"],
-    ["*", ["^", 2, 8], "mp_selector"],
-    ["*", ["^", 2, 9], "muldiv_selector"],
-    ["*", ["^", 2, 10], "word_instr"],
-    ["*", ["^", 2, 11], "ADD"],
-    ["*", ["^", 2, 12], "SUB"],
-    ["*", ["^", 2, 13], "SLT"],
-    ["*", ["^", 2, 14], "AND"],
-    ["*", ["^", 2, 15], "OR"],
-    ["*", ["^", 2, 16], "XOR"],
-    ["*", ["^", 2, 17], "SHIFT"],
-    ["*", ["^", 2, 18], "JALR"],
-    ["*", ["^", 2, 19], "BEQ"],
-    ["*", ["^", 2, 20], "BLT"],
-    ["*", ["^", 2, 21], "LOAD"],
-    ["*", ["^", 2, 22], "STORE"],
-    ["*", ["^", 2, 23], "MUL"],
-    ["*", ["^", 2, 24], "DIVREM"],
-    ["*", ["^", 2, 25], "ECALL"],
-    ["*", ["^", 2, 26], "EBREAK"],
-    ["*", ["^", 2, 27], "rs1"],
-    ["*", ["^", 2, 35], "rs2"],
-    ["*", ["^", 2, 43], "rd"],
+    ["*", ["^", 2, 3], "word_instr"],
+    ["*", ["^", 2, 4], "ALU"],
+    ["*", ["^", 2, 5], "ADD"],
+    ["*", ["^", 2, 6], "SUB"],
+    ["*", ["^", 2, 7], "MEMORY"],
+    ["*", ["^", 2, 8], "BRANCH"],
+    ["*", ["^", 2, 9], "ECALL"],
+    ["*", ["^", 2, 10], "rs1"],
+    ["*", ["^", 2, 18], "rs2"],
+    ["*", ["^", 2, 26], "rd"],
+    ["*", ["^", 2, 34], "half_instruction_length"],
+    ["*", ["^", 2, 42], "alu_flags"],
+    ["*", ["^", 2, 50], "mem_flags"],
 ]
 
-[[variables.virtual]]
-name = "pad"
-type = "Bit"
-desc = "When no flags are set, we must be in a padding row."
-def = ["-", 1, "ADD", "SUB", "SLT", "AND", "OR", "XOR", "SHIFT", "JALR", "BEQ", "BLT", "LOAD", "STORE", "MUL", "DIVREM", "ECALL", "EBREAK"]
-
 
 [[assumptions]]
-desc = "At most one ALU selector flag is 1 by the decoding, and every other flag is 0."
-ref = "cpu:a:one-hot"
+desc = "`MEMORY` and `BRANCH` are mutually exclusive"
+ref = "cpu:a:mem-branch-mutex"
 
 [[assumptions]]
-desc = "When `STORE + LOAD + BEQ + BLT = 0`, either `rs2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`."
+desc = "When `MEMORY + BRANCH = 0`, either `read_register2 = 0` or `imm = 0` should be enforced by the decoding. This is needed for `arg2`."
 ref = "cpu:a:arg2-multiplex"
+
+[[assumptions]]
+desc = "$#`!MEMORY` => #`IS_BIT<mem_flags>`$"
+
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "arith"
+constraint = "$not (#`MEMORY` and #`BRANCH`)$"
+poly = ["*", "MEMORY", "BRANCH"]
+
+[[constraints.assumptions]]
+kind = "arith"
+constraint = "$(1 - #`MEMORY` - #`BRANCH`) => (#`read_register2` = 0 or #`imm[i]` = 0)$"
+poly = ["*", ["-", 1, "MEMORY", "BRANCH"], "read_register2", ["+", ["idx", "imm", 0], ["idx", "imm", 1]]]
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["mem_flags"]
+cond = ["not", "MEMORY"]
+
 
 [[constraint_groups]]
 name = "decode"
@@ -353,7 +243,44 @@ name = "decode"
 kind = "interaction"
 tag = "DECODE"
 input = ["pc", "imm", "packed_decode"]
-multiplicity = 1
+multiplicity = ["not", "word_instr"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`MEMORY = 0`$"
+poly = ["*", "word_instr", "MEMORY"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`BRANCH = 0`$"
+poly = ["*", "word_instr", "BRANCH"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`ECALL = 0`$"
+poly = ["*", "word_instr", "ECALL"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`read_register1 = 0`$"
+poly = ["*", "word_instr", "read_register1"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`read_register2 = 0`$"
+poly = ["*", "word_instr", "read_register2"]
+
+[[constraints.decode]]
+kind = "arith"
+constraint = "$#`word_instr` => #`write_register = 0`$"
+poly = ["*", "word_instr", "write_register"]
+
+[[constraints.decode]]
+kind = "interaction"
+tag = "CPU32"
+input = ["timestamp", "pc"]
+output = "half_instruction_length"
+multiplicity = "word_instr"
 
 
 [[constraint_groups]]
@@ -380,51 +307,27 @@ ref = "cpu:c:range_write_register"
 
 [[constraints.range]]
 kind = "template"
-tag = "IS_BIT"
-input = ["memory_2bytes"]
-ref = "cpu:c:range_memory_2bytes"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["memory_4bytes"]
-ref = "cpu:c:range_memory_4bytes"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["memory_8bytes"]
-ref = "cpu:c:range_memory_8bytes"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["c_type_instruction"]
+tag = "IS_BYTE"
+input = ["half_instruction_length"]
 ref = "cpu:c:range_c_type_instruction"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["signed"]
-ref = "cpu:c:range_signed"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["mp_selector"]
-ref = "cpu:c:range_mp_selector"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["muldiv_selector"]
-ref = "cpu:c:range_muldiv_selector"
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
 input = ["word_instr"]
 ref = "cpu:c:range_word_instr"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["ALU"]
+ref = "cpu:c:range_ALU"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["alu_flags"]
+ref = "cpu:c:range_alu_flags"
 
 [[constraints.range]]
 kind = "template"
@@ -441,74 +344,20 @@ ref = "cpu:c:range_SUB"
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
-input = ["SLT"]
-ref = "cpu:c:range_SLT"
+input = ["MEMORY"]
+ref = "cpu:c:range_MEMORY"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["mem_flags"]
+ref = "cpu:c:range_mem_flags"
 
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
-input = ["AND"]
-ref = "cpu:c:range_AND"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["OR"]
-ref = "cpu:c:range_OR"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["XOR"]
-ref = "cpu:c:range_XOR"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["SHIFT"]
-ref = "cpu:c:range_SHIFT"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["JALR"]
-ref = "cpu:c:range_JALR"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["BEQ"]
-ref = "cpu:c:range_BEQ"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["BLT"]
-ref = "cpu:c:range_BLT"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["LOAD"]
-ref = "cpu:c:range_LOAD"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["STORE"]
-ref = "cpu:c:range_STORE"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["MUL"]
-ref = "cpu:c:range_MUL"
-
-[[constraints.range]]
-kind = "template"
-tag = "IS_BIT"
-input = ["DIVREM"]
-ref = "cpu:c:range_DIVREM"
+input = ["BRANCH"]
+ref = "cpu:c:range_BRANCH"
 
 [[constraints.range]]
 kind = "template"
@@ -518,48 +367,25 @@ ref = "cpu:c:range_ECALL"
 
 [[constraints.range]]
 kind = "template"
-tag = "IS_BIT"
-input = ["EBREAK"]
-ref = "cpu:c:range_EBREAK"
-
-[[constraints.range]]
-kind = "interaction"
 tag = "IS_BYTE"
 input = ["rs1"]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["rs2"]
-multiplicity = 1
 
 [[constraints.range]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["rd"]
-multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
-tag = "IS_BYTE"
-input = [["idx", "arg1", "i"]]
-iter = ["i", 0, 7]
-multiplicity = 1
-
-[[constraints.range]]
-kind = "interaction"
-tag = "IS_BYTE"
-input = [["idx", "arg2", "i"]]
-iter = ["i", 0, 7]
-multiplicity = 1
-
-[[constraints.range]]
-kind = "interaction"
-tag = "IS_BYTE"
+tag = "IS_HALF"
 input = [["idx", "res", "i"]]
-iter = ["i", 0, 7]
 multiplicity = 1
+iter = ["i", 0, 3]
 
 
 [[constraint_groups]]
@@ -567,91 +393,36 @@ name = "alu"
 prefix = "A"
 
 [[constraints.alu]]
-kind = "template"
-tag = "ADD"
-cond = ["+", "ADD", "LOAD"]
-input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"]]
-output = ["cast", "res", "DWordWL"]
+kind = "arith"
+constraint = "$#`arg2` = #`MEMORY` dot #`imm` + #`BRANCH` dot #`rv2` + (1 - #`MEMORY` - #`BRANCH`) dot (#`rv2` + #`imm`)$"
+poly = ["-", ["idx", "arg2", "i"],
+    ["*", "MEMORY", ["idx", "imm", "i"]],
+    ["*", "BRANCH", ["idx", "rv2", "i"]],
+    ["*", ["-", 1, "MEMORY", "BRANCH"], ["idx", ["+", "rv2", "imm"], "i"]]
+]
+iter = ["i", 0, 1]
 
 [[constraints.alu]]
 kind = "template"
 tag = "ADD"
-cond = "STORE"
-input = [["cast", "arg1", "DWordWL"], "imm"]
+cond = "ADD"
+input = ["rv1", "arg2"]
 output = ["cast", "res", "DWordWL"]
 
 [[constraints.alu]]
 kind = "template"
 tag = "SUB"
-cond = ["+", "SUB", "BEQ"]
-input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"]]
+cond = "SUB"
+input = ["rv1", "arg2"]
 output = ["cast", "res", "DWordWL"]
 ref = "cpu:c:sub"
 
 [[constraints.alu]]
 kind = "interaction"
-tag = "LT"
-input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"], "signed"]
-output = ["idx", "res", 0]
-multiplicity = ["+", "SLT", "BLT"]
-
-[[constraints.alu]]
-kind = "arith"
-constraint = "$#`SLT` + #`BLT` => #`res[i]` = 0$"
-poly = ["*", ["+", "SLT", "BLT"], ["idx", "res", "i"]]
-iter = ["i", 1, 7]
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
-output = ["idx", "res", "i"]
-multiplicity = "AND"
-iter = ["i", 0, 7]
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "OR_BYTE"
-input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
-output = ["idx", "res", "i"]
-multiplicity = "OR"
-iter = ["i", 0, 7]
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
-output = ["idx", "res", "i"]
-multiplicity = "XOR"
-iter = ["i", 0, 7]
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "SHIFT"
-input = [["cast", "arg1", "DWordHL"], ["idx", "arg2", 0], "mp_selector", "signed", "word_instr"]
+tag = "ALU"
+input = ["rv1", "arg2", "alu_flags"]
 output = ["cast", "res", "DWordWL"]
-multiplicity = "SHIFT"
-
-[[constraints.alu]]
-kind = "template"
-tag = "ADD"
-input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
-output = ["cast", "res", "DWordWL"]
-cond = "JALR"
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "MUL"
-input = [["cast", "arg1", "DWordHL"], "signed", ["cast", "arg2", "DWordHL"], "mp_selector", "muldiv_selector"]
-output = ["cast", "res", "DWordWL"]
-multiplicity = "MUL"
-
-[[constraints.alu]]
-kind = "interaction"
-tag = "DVRM"
-input = [["cast", "arg1", "DWordHL"], ["cast", "arg2", "DWordHL"], "signed", "muldiv_selector"]
-output = ["cast", "res", "DWordWL"]
-multiplicity = "DIVREM"
+multiplicity = "ALU"
 
 
 [[constraint_groups]]
@@ -661,8 +432,8 @@ prefix = "M"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
-output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", "rv1", 0], ["idx", "rv1", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", "rv1", 0], ["idx", "rv1", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register1"
 ref = "cpu:c:read_rv1"
 
@@ -670,20 +441,20 @@ ref = "cpu:c:read_rv1"
 kind = "arith"
 constraint = "$#`!read_register1` => #`rv1[i]` = 0$"
 poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
-iter = ["i", 0, 2]
+iter = ["i", 0, 1]
 
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", ["cast", "rv2", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
-output = ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", ["cast", "rv2", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", "rv2", 0], ["idx", "rv2", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", "rv2", 0], ["idx", "rv2", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register2"
 
 [[constraints.mem]]
 kind = "arith"
 constraint = "$#`!read_register2` => #`rv2[i]` = 0$"
 poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
-iter = ["i", 0, 2]
+iter = ["i", 0, 1]
 
 [[constraints.mem]]
 kind = "interaction"
@@ -693,16 +464,16 @@ multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
-tag = "LOAD"
-input = [["cast", "res", "DWordWL"], ["+", "timestamp", ["cast", 0, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
+tag = "MEMOP"
+input = ["timestamp", ["cast", "res", "DWordWL"], "rv2", "mem_flags"]
 output = "rvd"
-multiplicity = "LOAD"
+multiplicity = "MEMORY"
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [0, ["cast", "res", "DWordWL"], ["cast", "arg2", ["Byte", 8]], ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
-multiplicity = "STORE"
+kind = "arith"
+constraint = "$#`!MEMORY` and #`!BRANCH` => #`rvd` = #`res`$"
+poly = ["*", ["-", 1, "MEMORY", "BRANCH"], ["-", ["idx", "rvd", "i"], ["idx", ["cast", "res", "DWordWL"], "i"]]]
+iter = ["i", 0, 1]
 
 [[constraints.mem]]
 kind = "template"
@@ -718,15 +489,51 @@ input = ["prev_pc_timestamp_borrow"]
 kind = "interaction"
 tag = "memory"
 input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["arr", ["+", ["-", ["idx", "timestamp", 0], ["*", 3, ["not", "pc_double_read"]]], ["*", ["^", 2, 32], "prev_pc_timestamp_borrow"]], ["-", ["idx", "timestamp", 1], "prev_pc_timestamp_borrow"]], ["idx", "pc", "i"]]
-multiplicity = ["not", "pad"]
 iter = ["i", 0, 1]
+multiplicity = 1
 
 [[constraints.mem]]
 kind = "interaction"
 tag = "memory"
 input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], ["idx", "next_pc", "i"]]
-multiplicity = ["-", ["not", "pad"]]
 iter = ["i", 0, 1]
+multiplicity = -1
+
+[[constraint_groups]]
+name = "branch"
+prefix = "B"
+
+[[constraints.branch]]
+kind = "arith"
+constraint = "$#`branch_cond` = #`BRANCH` and (#`JALR` or #`res`)$"
+poly = ["-",
+        "branch_cond",
+        ["*", "BRANCH", "JALR"],
+        ["*", "BRANCH", ["-", 1, "JALR"], ["idx", "res", 0]]
+    ]
+
+[[constraints.branch]]
+kind = "interaction"
+tag = "BRANCH"
+input = ["pc", "imm", "rv1", "JALR"]
+output = "next_pc"
+multiplicity = "branch_cond"
+
+[[constraints.branch]]
+kind = "template"
+tag = "ADD"
+input = ["pc", ["arr", ["*", 2, "half_instruction_length"], 0]]
+output = "next_pc"
+cond = ["not", "branch_cond"]
+desc = "Increment `pc` to `next_pc` if we're not branching"
+
+[[constraints.branch]]
+kind = "template"
+tag = "ADD"
+input = ["pc", ["arr", ["*", 2, "half_instruction_length"], 0]]
+output = "rvd"
+cond = "BRANCH"
+desc = "Compute the next instruction address in `rvd` when BRANCH is active to enable JALR"
 
 
 [[constraint_groups]]
@@ -734,108 +541,7 @@ name = "sys"
 prefix = "S"
 
 [[constraints.sys]]
-kind = "arith"
-constraint = "`!EBREAK`"
-desc = "We treat `EBREAK` as an unprovable trap"
-poly = ["not", "EBREAK"]
-ref = "cpu:c:ebreak_traps"
-
-[[constraints.sys]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["cast", "rv1", "DWordWL"]]
+input = ["timestamp", "rv1"]
 multiplicity = "ECALL"
-
-
-[[constraint_groups]]
-name = "ext"
-prefix = "E"
-
-[[constraints.ext]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "rv1", 1], "word_instr"]
-output = "rv1_ext_bit"
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`arg1[:4]` = #`rv1[:2]`$"
-poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 0]]
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instr`) + (2^(32) - 1) dot #`rv1_ext_bit` dot #`signed`$"
-poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instr"], ["idx", "rv1", 2]], ["*", "signed", "rv1_ext_bit", ["-", ["^", 2, 32], 1]]]
-
-[[constraints.ext]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "rv2", 1], "word_instr"]
-output = "rv2_ext_bit"
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`arg2[:4]` = (1 - #`LOAD`) dot #`rv2[:2]` + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[0]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["not", "LOAD"], ["idx", ["cast", "rv2", "DWordWL"], 0]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 0]]]
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`rv2_ext_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[1]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "rv2_ext_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
-
-[[constraints.ext]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", ["cast", "res", "DWordHL"], 1],  "word_instr"]
-output = "res_ext_bit"
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`!LOAD` => #`rvd[0]` = #`res[:4]`$"
-poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 0], ["idx", ["cast", "res", "DWordWL"], 0]]]
-
-[[constraints.ext]]
-kind = "arith"
-constraint = "$#`!LOAD` => #`rvd[1]` = (1 - #`word_instr`) dot #`res[4:]` + #`res_ext_bit` dot (2^(32) - 1)$"
-desc = "_Sign_ extend the output if it wasn't a `LOAD`. Only `LOAD` has both `write_register = 1` and `rvd ≠ res`. `LOAD` and `word_instr` are disjoint"
-poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 1], ["*", ["not", "word_instr"], ["idx", ["cast", "res", "DWordWL"], 1]], ["*", "res_ext_bit", ["-", ["^", 2, 32], 1]]]]
-
-
-[[constraint_groups]]
-name = "misc"
-prefix = "O"
-
-[[constraints.misc]]
-kind = "interaction"
-tag = "ZERO"
-input = [["+", ["idx", "res", 0], ["idx", "res", 1], ["idx", "res", 2], ["idx", "res", 3], ["idx", "res", 4], ["idx", "res", 5], ["idx", "res", 6], ["idx", "res", 7]]]
-output = "is_equal"
-multiplicity = "BEQ"
-ref = "cpu:c:is_equal"
-
-[[constraints.misc]]
-kind = "arith"
-constraint = "$#`branch_cond` = #`JALR` or (#`BLT` and (#`res` xor #`invert`)) or (#`BEQ` and (#`is_equal` xor #`invert`))$"
-desc = "where `invert` is represented by `mp_selector`"
-poly = ["+",
-        ["-", "branch_cond"],
-        "JALR",
-        ["*", ["idx", "res", 0], ["not", "mp_selector"], "BLT"],
-        ["*", ["-", 1, ["idx", "res", 0]], "mp_selector", "BLT"],
-        ["*", "is_equal", ["not", "mp_selector"], "BEQ"],
-        ["*", ["not", "is_equal"], "mp_selector", "BEQ"]
-    ]
-
-[[constraints.misc]]
-kind = "interaction"
-tag = "BRANCH"
-input = ["pc", "imm", ["cast", "arg1", "DWordWL"], "JALR"]
-output = "next_pc"
-multiplicity = "branch_cond"
-
-[[constraints.misc]]
-kind = "template"
-tag = "ADD"
-input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
-output = "next_pc"
-desc = "Increment `pc` to `next_pc` if we're not branching"

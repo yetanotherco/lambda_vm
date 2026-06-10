@@ -144,6 +144,7 @@ jobs:
             TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
           fi
           echo "table_parallelism=${TABLE_K:-}" >> "$GITHUB_OUTPUT"
+          echo "k_tag=${TABLE_K:-auto}" >> "$GITHUB_OUTPUT"
 
           if [ -n "$TABLE_K" ]; then
             echo "Using $RUNS iterations, TABLE_PARALLELISM=$TABLE_K"
@@ -297,7 +298,7 @@ jobs:
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-metrics-${{ steps.pr-ref.outputs.sha || github.sha }}
+          name: benchmark-metrics-${{ steps.pr-ref.outputs.sha || github.sha }}-k${{ steps.config.outputs.k_tag }}
           path: /tmp/metrics.txt
           retention-days: 90
 
@@ -308,6 +309,7 @@ jobs:
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+          K_TAG: ${{ steps.config.outputs.k_tag }}
         run: |
           RUN_ID=$(gh run list \
             -w benchmark-pr.yml -b main -s completed \
@@ -315,7 +317,7 @@ jobs:
             -q '[.[] | select(.conclusion=="success" and (.event=="push" or .event=="workflow_dispatch"))][0].databaseId')
 
           if [ -n "$RUN_ID" ]; then
-            if gh run download "$RUN_ID" -D baseline/ -p "benchmark-metrics-*"; then
+            if gh run download "$RUN_ID" -D baseline/ -p "benchmark-metrics-*-k${K_TAG}"; then
               BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
               if [ -n "$BASELINE_FILE" ]; then
                 echo "found=true" >> "$GITHUB_OUTPUT"
@@ -631,6 +633,7 @@ jobs:
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
           GROWTH_SLOPE_PCT: ${{ steps.compare.outputs.growth_slope_pct }}
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
           script: |
             const peak = process.env.PR_PEAK;
@@ -670,8 +673,10 @@ jobs:
 
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
+            const tableParallelism = process.env.TABLE_PARALLELISM;
+            const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
             let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
-            body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
+            body += `<sub>Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;

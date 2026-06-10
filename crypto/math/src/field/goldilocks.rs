@@ -434,6 +434,14 @@ impl GoldilocksElement {
 // =====================================================
 
 impl ByteConversion for FieldElement<GoldilocksField> {
+    const BYTE_LEN: usize = 8;
+
+    #[inline(always)]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= 8);
+        buf[..8].copy_from_slice(&self.canonical_u64().to_be_bytes());
+    }
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         self.canonical_u64().to_be_bytes().to_vec()

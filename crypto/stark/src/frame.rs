@@ -10,11 +10,7 @@ use math::field::traits::{IsField, IsSubFieldOf};
 /// Owns its row data so it can be built from either row-major Tables
 /// (verifier) or column-major LDE data (prover) without lifetime issues.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Frame<F: IsSubFieldOf<E>, E: IsField>
-where
-    E: IsField,
-    F: IsSubFieldOf<E>,
-{
+pub struct Frame<F: IsSubFieldOf<E>, E: IsField> {
     steps: Vec<TableView<F, E>>,
 }
 
@@ -31,7 +27,7 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
     ///
     /// Each step gathers elements from columns into owned Vecs. For the typical
     /// case (2 offsets, step_size=1), this gathers 2 rows of ~74 main + aux elements.
-    pub fn read_from_lde(lde_trace: &LDETraceTable<F, E>, row: usize, offsets: &[usize]) -> Self {
+    fn read_from_lde(lde_trace: &LDETraceTable<F, E>, row: usize, offsets: &[usize]) -> Self {
         let blowup_factor = lde_trace.blowup_factor;
         let num_rows = lde_trace.num_rows();
         let step_size = lde_trace.lde_step_size;

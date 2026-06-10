@@ -1,0 +1,79 @@
+name: Bench Vs Nightly
+
+on:
+  schedule:
+    # 03:00 America/Argentina/Buenos_Aires = 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-vs-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-vs:
+    runs-on: [self-hosted, bench]
+    timeout-minutes: 720
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Add SP1 to PATH
+        run: echo "$HOME/.sp1/bin" >> "$GITHUB_PATH"
+
+      - name: Install SP1 toolchain
+        run: |
+          export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
+          if ! cargo prove --version 2>/dev/null | grep -qE '\b6\.0\.1\b'; then
+            curl -L https://sp1up.succinct.xyz | bash
+            export PATH="$HOME/.sp1/bin:$PATH"
+            sp1up --version v6.0.1
+          fi
+          cargo prove --version
+
+      - name: Run nightly benchmark
+        run: |
+          bash ./bench_vs/run.sh \
+            --steps 1000000 2000000 4000000 8000000 16000000 \
+            --report-dir bench_vs_artifacts \
+            --no-color
+
+      - name: Restore cached ethrex.elf (TEMPORARY — until /opt/lambda-vm-sysroot is provisioned on the bench runner)
+        continue-on-error: true
+        run: |
+          mkdir -p executor/program_artifacts/rust
+          cp /home/app/cached_artifacts/ethrex.elf executor/program_artifacts/rust/ethrex.elf
+          ls -la executor/program_artifacts/rust/ethrex.elf
+          sha256sum executor/program_artifacts/rust/ethrex.elf
+
+      - name: Run ethrex empty block benchmark
+        continue-on-error: true
+        run: |
+          bash ./bench_vs/run_ethrex.sh \
+            --report-dir bench_vs_artifacts \
+            --no-color
+
+      - name: Upload nightly benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-vs-nightly-${{ github.run_number }}-${{ github.sha }}
+          path: bench_vs_artifacts
+          retention-days: 90
+
+      - name: Publish summary
+        run: cat bench_vs_artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post results to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"

@@ -9,12 +9,18 @@ mod report;
 
 const EXCLUDED: &[&str] = &[
     "tooling",
+    "bench_vs",
     "*target*",
     "*tests*",
     "*test_utils*",
     "*bench*",
     "*benches*",
     "*examples*",
+    // Non-production code: fuzz harnesses and the RISC-V guest programs
+    // executed/proven by the zkVM (test fixtures, not the zkVM itself).
+    "*fuzz*",
+    "*programs*",
+    "*program_artifacts*",
 ];
 
 /// Directories counted separately (not as crates).

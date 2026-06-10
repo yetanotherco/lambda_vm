@@ -56,7 +56,7 @@ name = "memory"
 kind = "interaction"
 tag = "MEMW"
 input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 
 [[constraints.memory]]
@@ -232,11 +232,11 @@ input = ["timestamp", "last_round_out", 64]
 multiplicity = ["-", "μ"]
 
 [[constraints.compress]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "out", "i"]]
-multiplicity = "μ"
 iter = ["i", 0, 31]
+cond = "μ"
 
 [[constraints.compress]]
 kind = "template"
@@ -266,5 +266,5 @@ input = ["μ"]
 [[constraints.lookup]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 1], ["-", ["^", 2, 32], 1]]]
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 1], "DWordWL"]]
 multiplicity = ["-", "μ"]

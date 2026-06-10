@@ -1,0 +1,362 @@
+//! GPU Keccak-256 leaf hashing for Merkle commits.
+//!
+//! Matches `FieldElementVectorBackend<F, Keccak256, 32>::hash_data` in
+//! `crypto/crypto/src/merkle_tree/backends/field_element_vector.rs`, combined
+//! with the `reverse_index` row read pattern used in
+//! `commit_columns_bit_reversed` at `crypto/stark/src/prover.rs`.
+//!
+//! Caller supplies base-field column slabs already laid out as
+//! `[col * col_stride + row]` (the same layout `coset_lde_batch_base_into`
+//! writes to the pinned staging buffer). The kernel bit-reverses `row_idx`,
+//! reads each column's canonical u64 at that row, byte-swaps it into a
+//! Keccak lane, absorbs lane-by-lane, and squeezes 32 bytes per leaf.
+//!
+//! For ext3 columns the layout is `[col*3*col_stride + k*col_stride + row]`,
+//! three base-field components per ext3 column, indexed by `k ∈ {0,1,2}`,
+//! and the kernel reads three u64s per column in component order 0,1,2
+//! to match `FieldElement::<Ext3>::write_bytes_be`.
+
+use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
+
+use crate::Result;
+use crate::device::{Backend, backend};
+use crate::lde::pack_ext3_to_pinned_slabs;
+
+/// Run GPU Keccak-256 leaf hashing on a base-field column buffer.
+///
+/// `columns` must hold `num_cols * col_stride` u64s with column `c`'s data
+/// at `[c*col_stride .. c*col_stride + num_rows]`. Returns `num_rows * 32`
+/// hash bytes in natural (non-bit-reversed) row order.
+pub fn keccak_leaves_base(
+    columns: &[u64],
+    col_stride: usize,
+    num_cols: usize,
+    num_rows: usize,
+) -> Result<Vec<u8>> {
+    assert!(num_rows.is_power_of_two());
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(col_stride)
+        .expect("num_cols * col_stride overflows usize");
+    assert!(columns.len() >= total);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
+    launch_keccak_base(
+        stream.as_ref(),
+        &cols_dev,
+        col_stride as u64,
+        num_cols as u64,
+        num_rows as u64,
+        &mut out_dev.as_view_mut(),
+    )?;
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Ext3 variant. Columns interleaved as three base slabs per ext3 column.
+/// `columns.len() >= num_cols * 3 * col_stride`.
+pub fn keccak_leaves_ext3(
+    columns: &[u64],
+    col_stride: usize,
+    num_cols: usize,
+    num_rows: usize,
+) -> Result<Vec<u8>> {
+    assert!(num_rows.is_power_of_two());
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(3)
+        .and_then(|v| v.checked_mul(col_stride))
+        .expect("num_cols * 3 * col_stride overflows usize");
+    assert!(columns.len() >= total);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
+    launch_keccak_ext3(
+        stream.as_ref(),
+        &cols_dev,
+        col_stride as u64,
+        num_cols as u64,
+        num_rows as u64,
+        &mut out_dev.as_view_mut(),
+    )?;
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Block size for Keccak kernels. Per-thread register footprint is ~60 regs
+/// (25-lane state + auxiliaries). The default 256 threads/block pushes the
+/// block register file past the hardware limit on sm_120 (Blackwell). 128
+/// keeps us inside the budget with some head-room.
+const KECCAK_BLOCK_DIM: u32 = 128;
+
+pub(crate) fn keccak_launch_cfg(num_rows: u64) -> LaunchConfig {
+    debug_assert!(
+        num_rows <= u32::MAX as u64,
+        "keccak_launch_cfg: num_rows ({num_rows}) exceeds u32 grid range",
+    );
+    let grid = (num_rows as u32).div_ceil(KECCAK_BLOCK_DIM);
+    LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (KECCAK_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Walk the inner Merkle tree on device. `nodes_dev` already has the
+/// `leaves_len` hashed leaves written into the tail; this loops
+/// `log2(leaves_len)` times invoking `keccak_merkle_level` to fill in the
+/// inner nodes from the bottom up. Mirrors the CPU `build(nodes, leaves_len)`
+/// scan in `crypto/crypto/src/merkle_tree/merkle.rs`.
+pub(crate) fn build_inner_tree_levels(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+) -> Result<()> {
+    let mut level_begin: u64 = (leaves_len - 1) as u64;
+    while level_begin != 0 {
+        let new_begin = level_begin / 2;
+        let n_pairs = level_begin - new_begin;
+        let cfg = keccak_launch_cfg(n_pairs);
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_merkle_level)
+                .arg(&mut *nodes_dev)
+                .arg(&new_begin)
+                .arg(&n_pairs)
+                .launch(cfg)?;
+        }
+        level_begin = new_begin;
+    }
+    Ok(())
+}
+
+pub(crate) fn launch_keccak_base(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
+    // for `log_num_rows == 0` (single-row trees are degenerate anyway).
+    debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    let cfg = keccak_launch_cfg(num_rows);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Given `hashed_leaves` of length `leaves_len * 32`, build the full Merkle
+/// tree on device and return the complete node buffer `(2*leaves_len - 1) *
+/// 32` bytes in the standard layout:
+///
+///   `nodes[0..leaves_len - 1]` are inner nodes (root at index 0), and
+///   `nodes[leaves_len - 1..]` are the leaves themselves.
+///
+/// Matches the CPU `crypto/crypto/src/merkle_tree/merkle.rs` construction so
+/// the resulting `nodes` Vec plugs straight into `MerkleTree { root, nodes }`
+/// for downstream proof generation.
+///
+/// `leaves_len` must be a power of two and >= 2.
+pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
+    assert!(hashed_leaves.len().is_multiple_of(32));
+    let leaves_len = hashed_leaves.len() / 32;
+    assert!(leaves_len >= 2, "tree needs at least two leaves");
+    assert!(
+        leaves_len.is_power_of_two(),
+        "leaves_len must be a power of two"
+    );
+
+    let total_nodes = 2 * leaves_len - 1;
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // Allocate the full node buffer without zero-fill. We overwrite the
+    // leaf half via H2D immediately, and every inner node is written by the
+    // pair-hash kernel below.
+    // SAFETY: every byte is written before it is read: leaves are filled by
+    // the H2D below; inner nodes are filled by the level loop that follows.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
+    let leaves_offset_bytes = (leaves_len - 1) * 32;
+    // SAFETY: target slice `nodes_dev[leaves_offset_bytes..]` has exactly
+    // `leaves_len * 32 == hashed_leaves.len()` bytes capacity.
+    {
+        let mut slice =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + hashed_leaves.len());
+        stream.memcpy_htod(hashed_leaves, &mut slice)?;
+    }
+
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
+
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Row-pair Keccak leaf + Merkle tree build for R2 composition-polynomial
+/// commit. `parts_interleaved` is `num_parts` slices, each holding an ext3
+/// LDE column interleaved as `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`.
+///
+/// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
+/// layout (root at byte offset 0, leaves in the tail).
+pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Result<Vec<u8>> {
+    assert!(!parts_interleaved.is_empty());
+    let m = parts_interleaved.len();
+    let ext3_elems = parts_interleaved[0].len() / 3;
+    assert_eq!(
+        parts_interleaved[0].len(),
+        3 * ext3_elems,
+        "ext3 buffer length must be 3 * lde_size"
+    );
+    for p in parts_interleaved.iter() {
+        assert_eq!(p.len(), 3 * ext3_elems);
+    }
+    let lde_size = ext3_elems;
+    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    // Stage: de-interleave each part into 3 base slabs in pinned memory.
+    let mb = 3 * m;
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+
+    pack_ext3_to_pinned_slabs(parts_interleaved, pinned, lde_size);
+
+    // H2D the de-interleaved parts.
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+
+    // Leaves into tail of a tight node buffer.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let col_stride_u64 = lde_size as u64;
+        let num_parts_u64 = m as u64;
+        let num_rows_u64 = lde_size as u64;
+        let log_num_rows = lde_size.trailing_zeros() as u64;
+        let cfg = keccak_launch_cfg(num_leaves as u64);
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .arg(&buf)
+                .arg(&col_stride_u64)
+                .arg(&num_parts_u64)
+                .arg(&num_rows_u64)
+                .arg(&log_num_rows)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    drop(staging);
+    Ok(out)
+}
+
+/// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval
+/// vector. Each leaf hashes two consecutive ext3 values. `num_leaves =
+/// evals.len() / 6` (since each ext3 is 3 u64s).
+///
+/// Returns the `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
+pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
+    assert!(
+        evals.len().is_multiple_of(6),
+        "evals must hold whole pair-leaves"
+    );
+    let num_evals = evals.len() / 3;
+    let num_leaves = num_evals / 2;
+    assert!(num_leaves.is_power_of_two() && num_leaves >= 2);
+    let tight_total_nodes = 2 * num_leaves - 1;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let evals_dev = stream.clone_htod(evals)?;
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+
+    // Leaf kernel: num_leaves threads, one leaf each.
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let num_leaves_u64 = num_leaves as u64;
+        let cfg = keccak_launch_cfg(num_leaves as u64);
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_fri_leaves_ext3)
+                .arg(&evals_dev)
+                .arg(&num_leaves_u64)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+pub(crate) fn launch_keccak_ext3(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
+    // for `log_num_rows == 0` (single-row trees are degenerate anyway).
+    debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    let cfg = keccak_launch_cfg(num_rows);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_ext3_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}

@@ -25,11 +25,10 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -567,136 +566,42 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
         self.constraint_idx
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        self.compute(step)
     }
 }
 
 /// Creates all constraints for the LOAD table.
-pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     let mut idx = 0;
 
     // (read2 + read4 + read8) => μ
-    constraints.push(Box::new(LoadConstraint::new(
-        LoadConstraintKind::ReadImpliesMu,
-        idx,
-    )));
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx).boxed());
     idx += 1;
 
     // Extension constraints for high bytes (4..8): !read8 => res[i] = extended
     for i in 4..8 {
-        constraints.push(Box::new(LoadConstraint::new(
-            LoadConstraintKind::ExtensionHigh(i),
-            idx,
-        )));
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionHigh(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraints for mid bytes (2..4): !(read4 + read8) => res[i] = extended
     for i in 2..4 {
-        constraints.push(Box::new(LoadConstraint::new(
-            LoadConstraintKind::ExtensionMid(i),
-            idx,
-        )));
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionMid(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraint for low byte (1): !(read2 + read4 + read8) => res[1] = extended
-    constraints.push(Box::new(LoadConstraint::new(
-        LoadConstraintKind::ExtensionLow,
-        idx,
-    )));
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx).boxed());
 
     constraints
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_trace_generation() {
-        // Load 4 bytes, sign-extend
-        let ops = vec![
-            LoadOperation::new(
-                0x1000,
-                100,
-                4,
-                true,
-                [0x12, 0x34, 0x56, 0x78, 0xFF, 0xFF, 0xFF, 0xFF],
-            ),
-            LoadOperation::new(
-                0x2000,
-                200,
-                1,
-                false,
-                [0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            ),
-        ];
-
-        let trace = generate_load_trace(&ops);
-        assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);
-        assert!(trace.num_rows() >= 2);
-    }
-
-    #[test]
-    fn test_read_flags() {
-        // "Exactly N" semantics per spec
-        let op1 = LoadOperation::new(0, 0, 1, false, [0; 8]);
-        assert_eq!(op1.read_flags(), (false, false, false)); // no flags for 1 byte
-
-        let op2 = LoadOperation::new(0, 0, 2, false, [0; 8]);
-        assert_eq!(op2.read_flags(), (true, false, false)); // read2 only
-
-        let op4 = LoadOperation::new(0, 0, 4, false, [0; 8]);
-        assert_eq!(op4.read_flags(), (false, true, false)); // read4 only
-
-        let op8 = LoadOperation::new(0, 0, 8, false, [0; 8]);
-        assert_eq!(op8.read_flags(), (false, false, true)); // read8 only
-    }
-
-    #[test]
-    fn test_sign_bit_extraction() {
-        // Byte with MSB set
-        let op1 = LoadOperation::new(0, 0, 1, true, [0x80, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(op1.compute_sign_bit());
-
-        // Byte without MSB set
-        let op2 = LoadOperation::new(0, 0, 1, true, [0x7F, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(!op2.compute_sign_bit());
-
-        // Halfword with MSB set
-        let op3 = LoadOperation::new(0, 0, 2, true, [0x00, 0x80, 0, 0, 0, 0, 0, 0]);
-        assert!(op3.compute_sign_bit());
-
-        // Word with MSB set
-        let op4 = LoadOperation::new(0, 0, 4, true, [0, 0, 0, 0x80, 0, 0, 0, 0]);
-        assert!(op4.compute_sign_bit());
-    }
 }

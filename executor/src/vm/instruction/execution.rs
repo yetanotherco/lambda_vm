@@ -8,12 +8,19 @@ use crate::vm::{
 const REGULAR_PC_UPDATE: u64 = 4;
 
 pub enum SyscallNumbers {
+    // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
+    KeccakPermute = 0,
     Print = 1,
     Panic = 2,
-    GetPrivateInputs = 4,
     Commit = 64,
     Halt = 93,
 }
+
+/// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
+///
+/// Cannot be an enum discriminant because it exceeds isize::MAX.
+pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
+const KECCAK_STATE_BYTES: u64 = 25 * 8;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -21,9 +28,9 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
-            4 => Ok(SyscallNumbers::GetPrivateInputs),
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
+            v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             _ => Err(()),
         }
     }
@@ -66,8 +73,12 @@ impl Instruction {
                 }
             }
             Instruction::ArithImmW { dst, src, imm, op } => {
-                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits
-                let op1 = registers.read(src)? as i32;
+                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits.
+                // Log must store the RAW register value in src1_val (full 64 bits)
+                // for the prover's MEMW register chain. The truncation to i32 is only
+                // for the ALU computation.
+                let raw_src = registers.read(src)?;
+                let op1 = raw_src as i32;
                 if matches!(op, ArithOp::Sub) {
                     return Err(ExecutionError::SubImmNotSupported);
                 }
@@ -77,7 +88,7 @@ impl Instruction {
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
-                    src1_val: op1 as u64,
+                    src1_val: raw_src,
                     src2_val: 0,
                     dst_val: res,
                 }
@@ -247,17 +258,21 @@ impl Instruction {
                 src2,
                 op,
             } => {
-                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits
-                let a = registers.read(src1)? as i32;
-                let b = registers.read(src2)? as i32;
+                // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits.
+                // Log must store RAW register values (full 64 bits) for the prover's
+                // MEMW register chain. Truncation to i32 is only for ALU computation.
+                let raw_src1 = registers.read(src1)?;
+                let raw_src2 = registers.read(src2)?;
+                let a = raw_src1 as i32;
+                let b = raw_src2 as i32;
                 let res32 = op.apply_word(a, b)?;
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
-                    src1_val: a as u64,
-                    src2_val: b as u64,
+                    src1_val: raw_src1,
+                    src2_val: raw_src2,
                     dst_val: res,
                 }
             }
@@ -289,7 +304,7 @@ impl Instruction {
                         // It is not the correct implementation of ecall/ebreak
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
-                        let bytes = memory.load_bytes(pointer, len);
+                        let bytes = memory.load_bytes(pointer, len)?;
                         let value =
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         println!("PRINT VM: {}", value);
@@ -298,7 +313,7 @@ impl Instruction {
                         // panic
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
-                        let bytes = memory.load_bytes(pointer, len);
+                        let bytes = memory.load_bytes(pointer, len)?;
                         let value =
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         return Err(ExecutionError::Panic(value.to_owned()));
@@ -318,13 +333,31 @@ impl Instruction {
                         src2_val = buf_addr;
                         dst_val = count;
                     }
-                    SyscallNumbers::GetPrivateInputs => {
-                        // get private inputs
-                        let pointer = registers.read(10)?;
-                        let private_inputs = memory.load_private_inputs()?;
-                        for (i, byte) in private_inputs.iter().enumerate() {
-                            memory.store_byte(pointer + i as u64, *byte);
+                    SyscallNumbers::KeccakPermute => {
+                        // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10
+                        let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedKeccakStateAddress(state_addr));
                         }
+                        state_addr
+                            .checked_add(KECCAK_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+
+                        let mut state = [0u64; 25];
+                        for (i, lane) in state.iter_mut().enumerate() {
+                            let lane_addr = state_addr
+                                .checked_add((i as u64) * 8)
+                                .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+                            *lane = memory.load_doubleword(lane_addr)?;
+                        }
+                        keccak_f1600(&mut state);
+                        for (i, &lane) in state.iter().enumerate() {
+                            let lane_addr = state_addr
+                                .checked_add((i as u64) * 8)
+                                .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
+                            memory.store_doubleword(lane_addr, lane)?;
+                        }
+                        src2_val = state_addr;
                     }
                     SyscallNumbers::Halt => {
                         // halt
@@ -498,4 +531,90 @@ pub enum ExecutionError {
     InvalidWSuffixOperation(ArithOp),
     #[error("Invalid commit fd: expected 1 (stdout), got {0}")]
     InvalidCommitFd(u64),
+    #[error("Unaligned Keccak state address: {0:#018x}")]
+    UnalignedKeccakStateAddress(u64),
+    #[error("Keccak state address range overflows: {0:#018x}")]
+    KeccakStateAddressOverflow(u64),
+}
+
+// =============================================================================
+// Keccak-f[1600] permutation
+// =============================================================================
+
+/// Round constants for Keccak-f[1600] (24 rounds).
+pub const KECCAK_RC: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808A,
+    0x8000000080008000,
+    0x000000000000808B,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008A,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000A,
+    0x000000008000808B,
+    0x800000000000008B,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800A,
+    0x800000008000000A,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+
+/// Rotation offsets R[x][y] for the rho step of Keccak-f[1600].
+pub const KECCAK_RHO: [[u32; 5]; 5] = [
+    [0, 36, 3, 41, 18],
+    [1, 44, 10, 45, 2],
+    [62, 6, 43, 15, 61],
+    [28, 55, 25, 21, 56],
+    [27, 20, 39, 8, 14],
+];
+
+/// Apply the Keccak-f[1600] permutation (24 rounds) to a 25-word state.
+///
+/// The state is indexed as `state[x + 5*y]` where `x, y ∈ {0..4}`.
+pub fn keccak_f1600(state: &mut [u64; 25]) {
+    for &rc in &KECCAK_RC {
+        // θ (theta)
+        let mut c = [0u64; 5];
+        for x in 0..5 {
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        let mut d = [0u64; 5];
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        for x in 0..5 {
+            for y in 0..5 {
+                state[x + 5 * y] ^= d[x];
+            }
+        }
+
+        // ρ (rho) and π (pi)
+        let mut b = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = state[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+            }
+        }
+
+        // χ (chi)
+        for x in 0..5 {
+            for y in 0..5 {
+                state[x + 5 * y] =
+                    b[x + 5 * y] ^ (!b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
+            }
+        }
+
+        // ι (iota)
+        state[0] ^= rc;
+    }
 }

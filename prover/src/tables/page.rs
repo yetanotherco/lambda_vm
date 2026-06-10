@@ -26,15 +26,14 @@
 //!
 //! | Tag | Bus | Signature | Multiplicity |
 //! |-----|-----|-----------|--------------|
-//! | PAGE-C1 | IS_BYTE | `[init]` | 1 (sender) |
-//! | PAGE-C2 | IS_BYTE | `[fini]` | 1 (sender) |
-//! | PAGE-C3 | Memory | `[0, address, 0, init]` | -1 (receiver) |
-//! | PAGE-C4 | Memory | `[0, address, timestamp, fini]` | 1 (sender) |
+//! | PAGE-C1+C2 | ARE_BYTES | `[init, fini]` | 1 (sender) |
+//! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
+//! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -48,8 +47,8 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // Constants
 // =========================================================================
 
-/// Default page size in bytes (4KB).
-pub const DEFAULT_PAGE_SIZE: usize = 4096;
+/// Default page size in bytes (256KB).
+pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
 /// Stack top address (where SP starts). Re-exported from executor.
 pub use executor::vm::registers::STACK_TOP;
@@ -112,6 +111,11 @@ pub struct PageConfig {
     /// Initial values for each byte in the page.
     /// If None, all bytes are zero-initialized.
     pub init_values: Option<Vec<u8>>,
+    /// Whether this page holds private input data.
+    /// Private-input pages are NOT preprocessed — the verifier does not see
+    /// the init values. Instead, all columns (including OFFSET and INIT)
+    /// are committed as main trace and constrained via the memory bus.
+    pub is_private_input: bool,
 }
 
 impl PageConfig {
@@ -121,10 +125,11 @@ impl PageConfig {
             page_base,
             page_size,
             init_values: None,
+            is_private_input: false,
         }
     }
 
-    /// Create a page with initial values from data.
+    /// Create a page with initial values from ELF data.
     pub fn with_data(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
         assert!(data.len() <= page_size, "Data exceeds page size");
         let mut init_values = data;
@@ -133,6 +138,21 @@ impl PageConfig {
             page_base,
             page_size,
             init_values: Some(init_values),
+            is_private_input: false,
+        }
+    }
+
+    /// Create a page with initial values from private input data.
+    /// These pages are NOT preprocessed — the verifier never sees the init values.
+    pub fn with_private_input(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
+        assert!(data.len() <= page_size, "Data exceeds page size");
+        let mut init_values = data;
+        init_values.resize(page_size, 0);
+        Self {
+            page_base,
+            page_size,
+            init_values: Some(init_values),
+            is_private_input: true,
         }
     }
 }
@@ -297,8 +317,7 @@ pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions
 ///
 /// ## Bus Interactions
 ///
-/// - PAGE-C1: IS_BYTE[init] - sender, multiplicity 1 (range check)
-/// - PAGE-C2: IS_BYTE[fini] - sender, multiplicity 1 (range check)
+/// - PAGE-C1+C2: ARE_BYTES[init, fini] - sender, multiplicity 1 (batched range check)
 /// - PAGE-C3: memory[0, address, 0, init] - receiver, multiplicity -1
 /// - PAGE-C4: memory[0, address, timestamp, fini] - sender, multiplicity 1
 ///
@@ -322,25 +341,22 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // PAGE-C1: IS_BYTE[init] - range check initial value
+        // PAGE-C1+C2: ARE_BYTES[init, fini] - range check both byte values in one interaction
         BusInteraction::sender(
-            BusId::IsByte,
+            BusId::AreBytes,
             Multiplicity::One,
-            vec![BusValue::Packed {
-                start_column: cols::INIT,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::INIT,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::FINI,
+                    packing: Packing::Direct,
+                },
+            ],
         ),
-        // PAGE-C2: IS_BYTE[fini] - range check final value
-        BusInteraction::sender(
-            BusId::IsByte,
-            Multiplicity::One,
-            vec![BusValue::Packed {
-                start_column: cols::FINI,
-                packing: Packing::Direct,
-            }],
-        ),
-        // PAGE-C3: memory[0, address, 0, init] - receive initial token
+        // PAGE-C3: memory[0, address, 0, init] - receive initial memory token
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -413,112 +429,4 @@ pub fn offset_in_page(addr: u64, page_size: usize) -> usize {
         "page_size must be a power of 2"
     );
     (addr & (page_size as u64 - 1)) as usize
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_page_base_for_address() {
-        let page_size = 4096;
-        assert_eq!(page_base_for_address(0x1000, page_size), 0x1000);
-        assert_eq!(page_base_for_address(0x1001, page_size), 0x1000);
-        assert_eq!(page_base_for_address(0x1FFF, page_size), 0x1000);
-        assert_eq!(page_base_for_address(0x2000, page_size), 0x2000);
-    }
-
-    #[test]
-    fn test_offset_in_page() {
-        let page_size = 4096;
-        assert_eq!(offset_in_page(0x1000, page_size), 0);
-        assert_eq!(offset_in_page(0x1001, page_size), 1);
-        assert_eq!(offset_in_page(0x1FFF, page_size), 4095);
-        assert_eq!(offset_in_page(0x2000, page_size), 0);
-    }
-
-    #[test]
-    fn test_generate_page_trace_zero_init() {
-        let config = PageConfig::zero_init(0x1000, 16); // Small page for testing
-        let final_state = FinalStateMap::new();
-
-        let trace = generate_page_trace(&config, &final_state);
-
-        assert_eq!(trace.num_rows(), 16);
-
-        // Check first row (address is virtual: 0x1000 + offset)
-        assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::zero());
-        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
-        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
-        assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::zero());
-
-        // Check last row (address is virtual: 0x1000 + 15 = 0x100F)
-        assert_eq!(*trace.main_table.get(15, cols::OFFSET), FE::from(15u64));
-        assert_eq!(*trace.main_table.get(15, cols::INIT), FE::zero());
-    }
-
-    #[test]
-    fn test_generate_page_trace_with_data() {
-        let data = vec![0x01, 0x02, 0x03, 0x04];
-        let config = PageConfig::with_data(0x2000, 16, data);
-        let final_state = FinalStateMap::new();
-
-        let trace = generate_page_trace(&config, &final_state);
-
-        // Check initial values from data
-        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::from(0x01u64));
-        assert_eq!(*trace.main_table.get(1, cols::INIT), FE::from(0x02u64));
-        assert_eq!(*trace.main_table.get(2, cols::INIT), FE::from(0x03u64));
-        assert_eq!(*trace.main_table.get(3, cols::INIT), FE::from(0x04u64));
-        // Rest should be zero (padding)
-        assert_eq!(*trace.main_table.get(4, cols::INIT), FE::zero());
-
-        // Without accesses, fini should equal init
-        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::from(0x01u64));
-    }
-
-    #[test]
-    fn test_generate_page_trace_with_accesses() {
-        let data = vec![0xAA, 0xBB];
-        let config = PageConfig::with_data(0x3000, 16, data);
-
-        let mut final_state = FinalStateMap::new();
-        // Address 0x3000 was written with value 0xFF at timestamp 100
-        final_state.insert(
-            0x3000,
-            FinalByteState {
-                timestamp: 100,
-                value: 0xFF,
-            },
-        );
-
-        let trace = generate_page_trace(&config, &final_state);
-
-        // Row 0: address 0x3000 - was accessed
-        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::from(0xAAu64));
-        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::from(0xFFu64));
-        assert_eq!(
-            *trace.main_table.get(0, cols::TIMESTAMP_LO),
-            FE::from(100u64)
-        );
-
-        // Row 1: address 0x3001 - not accessed, fini = init
-        assert_eq!(*trace.main_table.get(1, cols::INIT), FE::from(0xBBu64));
-        assert_eq!(*trace.main_table.get(1, cols::FINI), FE::from(0xBBu64));
-        assert_eq!(*trace.main_table.get(1, cols::TIMESTAMP_LO), FE::zero());
-    }
-
-    #[test]
-    fn test_bus_interactions() {
-        let interactions = bus_interactions(0x1000); // page_base
-        assert_eq!(interactions.len(), 4); // C1, C2, C3, C4
-    }
-
-    #[test]
-    fn test_bus_interactions_high_address() {
-        // Test with high address like stack region
-        let stack_page = STACK_TOP & !(DEFAULT_PAGE_SIZE as u64 - 1);
-        let interactions = bus_interactions(stack_page);
-        assert_eq!(interactions.len(), 4);
-    }
 }

@@ -2,6 +2,7 @@
 name = "cli"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 executor = { path = "../../executor" }
@@ -11,7 +12,9 @@ clap = { version = "4.3.10", features = ["derive"] }
 bincode = "1"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+env_logger = "0.11"
 
 [features]
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
-instruments = ["prover/instruments"]
+disk-spill = ["prover/disk-spill"]
+instruments = ["prover/instruments", "stark/instruments"]

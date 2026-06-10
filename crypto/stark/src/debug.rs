@@ -89,7 +89,7 @@ pub fn validate_trace<
         });
 
     // --------- VALIDATE TRANSITION CONSTRAINTS -----------
-    let n_transition_constraints = air.context().num_transition_constraints();
+    let n_transition_constraints = air.context().num_transition_constraints;
     let exemption_steps: Vec<usize> =
         std::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
             .zip(air.transition_constraints())
@@ -150,22 +150,6 @@ pub fn validate_trace<
     }
     info!("Constraints validation check ended");
     ret
-}
-
-pub fn check_boundary_polys_divisibility<F: IsFFTField>(
-    boundary_polys: Vec<Polynomial<FieldElement<F>>>,
-    boundary_zerofiers: Vec<Polynomial<FieldElement<F>>>,
-) {
-    for (i, (poly, z)) in boundary_polys
-        .iter()
-        .zip(boundary_zerofiers.iter())
-        .enumerate()
-    {
-        let (_, b) = poly.clone().long_division_with_remainder(z);
-        if b != Polynomial::zero() {
-            error!("Boundary poly {i} is not divisible by its zerofier");
-        }
-    }
 }
 
 /// Validates that the one-dimensional array `data` can be interpreted as two-dimensional

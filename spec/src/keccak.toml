@@ -48,7 +48,7 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 1], ["-", ["^", 2, 32], 2]]]
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 2], "DWordWL"]]
 multiplicity = ["-", "μ"]
 
 [[constraint_groups]]

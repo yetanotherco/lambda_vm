@@ -92,6 +92,8 @@ type Expr = (
     | DummyExpr
 )
 
+OPSEL = ["AND", "OR", "XOR", "EQ", "LT", "SHIFT", "SHIFTW", "MUL", "DIVREM"]
+
 
 @dataclass
 class Environment:
@@ -351,6 +353,11 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
                 x.isidentifier(), f"Invalid identifier name for variable {x!r}"
             )
             return VarExpr(x)
+        case ["opsel", str(x)]:
+            if x not in OPSEL:
+                reporter.error(f"Unknown operation selector: {x!r}")
+                return LitExpr(0)
+            return LitExpr(OPSEL.index(x))
         case ["arr", *elems]:
             return ArrExpr([build_expr(config, e) for e in elems])
         case ["idx", x, y]:

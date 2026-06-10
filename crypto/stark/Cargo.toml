@@ -2,6 +2,7 @@
 name = "stark"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -22,6 +23,13 @@ itertools = "0.11.0"
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
 
+memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
+libc = { version = "0.2", optional = true }
+
+# GPU backend for trace LDE — only linked when `cuda` is enabled.
+math-cuda = { path = "../math-cuda", optional = true }
+
 # wasm
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.5", optional = true }
@@ -32,6 +40,7 @@ serde_cbor = { version = "0.11.1" }
 criterion = { version = "0.4", default-features = false }
 env_logger = "*"
 test-log = { version = "0.2.11", features = ["log"] }
+bincode = "1"
 
 [features]
 test-utils = []
@@ -39,7 +48,9 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
+cuda = ["dep:math-cuda"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
 
 
 [package.metadata.wasm-pack.profile.dev]

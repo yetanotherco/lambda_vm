@@ -9,18 +9,16 @@ use math::field::{
     extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 
-use crate::constraints::transition::TransitionConstraint;
+use crate::constraints::transition::TransitionConstraintEvaluator;
 use crate::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
+use crate::test_utils::multi_prove_ram;
 use crate::traits::AIR;
-use crate::{
-    prover::{IsStarkProver, Prover},
-    verifier::{IsStarkVerifier, Verifier},
-};
+use crate::verifier::{IsStarkVerifier, Verifier};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -137,7 +135,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace, &()),
         ];
 
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================
@@ -187,7 +185,7 @@ fn test_verify_serialized_multi_table_proofs() {
 fn create_cpu_air(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             BusInteraction::sender(
@@ -214,7 +212,7 @@ fn create_cpu_air(
 fn create_add_air(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
             BusId::Add,
@@ -234,7 +232,7 @@ fn create_add_air(
 fn create_mul_air(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
             BusId::Mul,

@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check clippy fmt lint
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -46,9 +46,15 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 ETHREX_FILE := executor/tests/ethrex_hoodi.bin
 ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
-SYSROOT_DIR := /opt/lambda-vm-sysroot
+# Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
+# to install the sysroot in a user-writable location and avoid sudo.
+SYSROOT_DIR ?= /opt/lambda-vm-sysroot
 SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+# CFLAGS for ckzg / ethrex guest programs: overrides the hardcoded `/opt/lambda-vm-sysroot`
+# in their .cargo/config.toml so cargo picks up our $(SYSROOT_DIR) instead.
+# $(abspath ...) because the build rule cd's into the program dir before invoking cargo.
+SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(abspath $(SYSROOT_DIR))
 
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
@@ -64,15 +70,26 @@ prepare-test-data:
 	fi
 
 prepare-sysroot:
-	@if [ ! -d "$(SYSROOT_DIR)" ]; then \
+	@if [ -d "$(SYSROOT_DIR)/include" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
+		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
+	else \
 		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
 		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
-		sudo mkdir -p /opt && sudo tar -xzf "$(SYSROOT_TARBALL)" -C /opt; \
+		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
+			tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
+				|| { rm -rf "$(SYSROOT_DIR)" "$(SYSROOT_TARBALL)"; exit 1; }; \
+		else \
+			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
+			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
+			sudo mkdir -p "$(SYSROOT_DIR)" \
+				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
+				|| { sudo rm -rf "$(SYSROOT_DIR)"; rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
+		fi; \
 		rm "$(SYSROOT_TARBALL)"; \
-	else \
-		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	fi
+# Note: the tarball rm above only runs on success — each error handler
+# cleans up the tarball itself before `exit 1`.
 
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)
@@ -83,7 +100,7 @@ compile-programs-asm:
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
-compile-bench: $(BENCH_ARTIFACTS)
+compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
@@ -93,6 +110,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
@@ -105,6 +123,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
@@ -166,6 +185,34 @@ test-prover-all:
 test-prover-debug:
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
+# Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
+test-disk-spill:
+	cargo test --release -p stark --features disk-spill disk_spill
+	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
+
+# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+test-math-cuda:
+	cargo test -p math-cuda --release
+
+# End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
+# Asserts every R1/R2/R3 GPU counter fired on a real prove.
+test-cuda-integration:
+	cargo test -p lambda-vm-prover --release --features cuda \
+	    --test cuda_path_integration -- --ignored --nocapture
+
+# math-cuda quick microbench (median of 10 runs)
+bench-math-cuda:
+	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
+
+# Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
+bench-prover:
+	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
+
+# Single-prove wall-time bench with the GPU LDE path enabled.
+# Needs an NVIDIA GPU + CUDA toolkit/driver.
+bench-prover-cuda:
+	cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
+
 # Build all
 build:
 	cargo build --workspace
@@ -181,6 +228,7 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -190,6 +238,7 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

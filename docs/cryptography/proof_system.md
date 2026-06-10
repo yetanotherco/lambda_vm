@@ -8,17 +8,20 @@ The proof system is the component responsible for generating the certificate of 
 5. Have short proofs.
 
 This section will cover the basic cryptographic primitives needed for the proof system and a description of the whole proof system and arguments used. Core concepts are:
-1. [Finite field](./finite_field.md)
-2. [Polynomials](./polynomials.md)
-3. [Extension field](./extension_field.md)
-4. [Hash function](./hash_function.md)
-5. [Fast-Fourier transform](./fast_fourier_transform.md)
-6. [Reed-Solomon codes](./reed_solomon_codes.md)
-7. [Constraint](./constraint.md)
-8. [Algebraic intermediate representation](./air.md)
-9. [Interactive oracle proof](./iop.md)
-10. [Fast Reed-Solomon Interactive Oracle Proof of Proximity (FRI)](./fri.md)
-11. [Provable security and conjectured security](./security.md)
-12. [Lookup argument](./lookup.md)
+
+> **Note:** the chapters below are a work in progress.
+
+1. Finite field
+2. Polynomials
+3. Extension field
+4. Hash function
+5. Fast-Fourier transform
+6. Reed-Solomon codes
+7. Constraint
+8. Algebraic intermediate representation
+9. Interactive oracle proof
+10. Fast Reed-Solomon Interactive Oracle Proof of Proximity (FRI)
+11. Provable security and conjectured security
+12. Lookup argument
 
 The flow of the proof system is described in the following section. 

@@ -9,18 +9,18 @@ use std::collections::HashMap;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
 };
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::test_utils::multi_prove_ram;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -55,7 +55,7 @@ mod receiver_cols {
 fn new_sender_air(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
@@ -90,7 +90,7 @@ fn new_sender_air(
 fn new_receiver_air(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
@@ -197,7 +197,7 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
@@ -307,7 +307,7 @@ fn prove_and_verify_custom(
     ];
 
     let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];

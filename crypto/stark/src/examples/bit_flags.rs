@@ -1,5 +1,5 @@
 use crate::{
-    constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
+    constraints::{boundary::BoundaryConstraints, transition::TransitionConstraintEvaluator},
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
@@ -18,7 +18,7 @@ impl BitConstraint {
     }
 }
 
-impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
+impl TransitionConstraintEvaluator<StarkField, StarkField> for BitConstraint {
     fn degree(&self) -> usize {
         2
     }
@@ -35,7 +35,7 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
         Some(15)
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<StarkField, StarkField>,
         transition_evaluations: &mut [FieldElement<StarkField>],
@@ -78,7 +78,7 @@ impl ZeroFlagConstraint {
     }
 }
 
-impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
+impl TransitionConstraintEvaluator<StarkField, StarkField> for ZeroFlagConstraint {
     fn degree(&self) -> usize {
         1
     }
@@ -91,7 +91,7 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
         16
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<StarkField, StarkField>,
         transition_evaluations: &mut [FieldElement<StarkField>],
@@ -120,7 +120,7 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 
 pub struct BitFlagsAIR {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<StarkField, StarkField>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<StarkField, StarkField>>>,
 }
 
 impl AIR for BitFlagsAIR {
@@ -135,8 +135,9 @@ impl AIR for BitFlagsAIR {
     fn new(proof_options: &ProofOptions) -> Self {
         let bit_constraint = Box::new(BitConstraint::new());
         let flag_constraint = Box::new(ZeroFlagConstraint::new());
-        let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
-            vec![bit_constraint, flag_constraint];
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![bit_constraint, flag_constraint];
 
         let num_transition_constraints = constraints.len();
 
@@ -155,7 +156,7 @@ impl AIR for BitFlagsAIR {
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.constraints
     }
 

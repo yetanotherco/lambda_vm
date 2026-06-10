@@ -177,40 +177,40 @@ name = "value"
 
 [[constraints.value]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "a", "i"], ["idx", "b", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "a", "i"], ["idx", "b", "i"]]
 output = ["idx", "a_and_b", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.value]]
 kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", "a", "i"], ["idx", "b", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", "a", "i"], ["idx", "b", "i"]]
 output = ["idx", "a_xor_b", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.value]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "c", "i"], ["idx", "a_xor_b", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "c", "i"], ["idx", "a_xor_b", "i"]]
 output = ["idx", "c_and_a_xor_b", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.value]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "e", "i"], ["idx", "f", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "e", "i"], ["idx", "f", "i"]]
 output = ["idx", "e_and_f", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.value]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["-", 255, ["idx", "e", "i"]], ["idx", "g", "i"]]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["-", 255, ["idx", "e", "i"]], ["idx", "g", "i"]]
 output = ["idx", "not_e_and_g", "i"]
 multiplicity = "μ"
 iter = ["i", 0, 3]
@@ -254,10 +254,10 @@ multiplicity = "μ"
 iter = ["i", 0, 1]
 
 [[constraints.addition]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["carry_a"]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.addition]]
 kind = "interaction"
@@ -267,10 +267,10 @@ multiplicity = "μ"
 iter = ["i", 0, 1]
 
 [[constraints.addition]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["carry_e"]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraint_groups]]
 name = "output"

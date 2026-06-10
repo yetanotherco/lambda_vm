@@ -3,7 +3,7 @@ use std::{marker::PhantomData, ops::Div};
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -13,9 +13,17 @@ use crate::{
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
-    helpers::resize_to_next_power_of_two,
     traits::ByteConversion,
 };
+
+/// Pads each trace column with zeros up to the next power of two so the
+/// radix-2 FFT can be applied. Local to this example — the production
+/// prover sizes its traces directly.
+fn resize_to_next_power_of_two<F: IsFFTField>(trace_columns: &mut [Vec<FieldElement<F>>]) {
+    for col in trace_columns.iter_mut() {
+        col.resize(col.len().next_power_of_two(), FieldElement::<F>::zero());
+    }
+}
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {
@@ -30,7 +38,7 @@ impl<F: IsFFTField> FibConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -48,7 +56,7 @@ where
         3 + 32 - 16 - 1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -95,7 +103,7 @@ impl<F: IsFFTField> PermutationConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for PermutationConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for PermutationConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -111,7 +119,7 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -153,7 +161,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +189,7 @@ where
 
     fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
-            Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
         > = vec![
             Box::new(FibConstraint::new()),
             Box::new(PermutationConstraint::new()),
@@ -265,7 +273,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
 

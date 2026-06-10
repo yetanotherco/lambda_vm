@@ -1,11 +1,12 @@
-use crate::errors::DeserializationError;
-
-use crate::errors::ByteConversionError;
+use crate::errors::{ByteConversionError, DeserializationError};
 /// A trait for converting an element to and from its byte representation and
 /// for getting an element from its byte representation in big-endian or
 /// little-endian order.
 pub trait ByteConversion {
-    /// Returns the byte representation of the element in big-endian order.}
+    /// Byte length of the big-endian representation.
+    const BYTE_LEN: usize;
+
+    /// Returns the byte representation of the element in big-endian order.
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8>;
 
@@ -22,6 +23,14 @@ pub trait ByteConversion {
     fn from_bytes_le(bytes: &[u8]) -> Result<Self, ByteConversionError>
     where
         Self: Sized;
+
+    /// Write big-endian bytes into `buf[..BYTE_LEN]`.
+    /// Override for zero-allocation performance in hot paths.
+    #[cfg(feature = "alloc")]
+    fn write_bytes_be(&self, buf: &mut [u8]) {
+        let bytes = self.to_bytes_be();
+        buf[..bytes.len()].copy_from_slice(&bytes);
+    }
 }
 
 /// Serialize function without args
@@ -47,6 +56,8 @@ impl AsBytes for u64 {
 }
 
 impl ByteConversion for u64 {
+    const BYTE_LEN: usize = 8;
+
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
         self.to_be_bytes().to_vec()

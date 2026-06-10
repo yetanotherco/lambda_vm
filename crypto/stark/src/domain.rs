@@ -1,10 +1,48 @@
 use math::{
-    fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset,
+    fft::roots_of_unity::get_powers_of_primitive_root_coset,
     field::{
         element::FieldElement,
         traits::{IsFFTField, IsField, IsSubFieldOf},
     },
 };
+
+/// Precomputed constants for barycentric interpolation on the trace-size coset.
+///
+/// Derived from a [`Domain`]: the N evaluation points at stride `blowup_factor`
+/// within the LDE coset, plus the field scalars that appear in every barycentric
+/// evaluation. Computed once in round 3 and shared across composition-poly and
+/// trace OOD evaluations.
+pub struct DomainConstants<F: IsField> {
+    /// The N trace-size coset points: `lde_coset[i * blowup_factor]` for `i in 0..N`.
+    pub points: Vec<FieldElement<F>>,
+    /// `coset_offset ^ N`.
+    pub offset_pow_n: FieldElement<F>,
+    /// `1 / N` in the base field.
+    pub size_inv: FieldElement<F>,
+    /// `(coset_offset ^ N) ^ -1`.
+    pub offset_pow_n_inv: FieldElement<F>,
+}
+
+impl<F: IsFFTField> DomainConstants<F> {
+    pub fn from_domain(domain: &Domain<F>) -> Self {
+        let n = domain.interpolation_domain_size;
+        let bf = domain.blowup_factor;
+        let points = (0..n)
+            .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+            .collect();
+        let offset_pow_n = domain.coset_offset.pow(n);
+        let size_inv = FieldElement::<F>::from(n as u64)
+            .inv()
+            .expect("domain size is non-zero; field characteristic must not divide n");
+        let offset_pow_n_inv = offset_pow_n.inv().expect("coset_offset_pow_n is non-zero");
+        Self {
+            points,
+            offset_pow_n,
+            size_inv,
+            offset_pow_n_inv,
+        }
+    }
+}
 
 use super::traits::AIR;
 
@@ -21,20 +59,22 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
+    /// Builds the interpolation and LDE domains used by the prover.
+    ///
+    /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).
+    /// - LDE domain: a coset of size `trace_length * blowup_factor`, shifted by
+    ///   `air.options().coset_offset`.
     pub fn new<A>(air: &A, trace_length: usize) -> Self
     where
-        A: AIR<Field = F>,
+        A: AIR<Field = F> + ?Sized,
     {
-        // Initial definitions
         let blowup_factor = air.options().blowup_factor as usize;
         let coset_offset = FieldElement::from(air.options().coset_offset);
-        let interpolation_domain_size = trace_length;
         let root_order = trace_length.trailing_zeros();
-        // * Generate Coset
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(
             root_order as u64,
-            interpolation_domain_size,
+            trace_length,
             &FieldElement::one(),
         )
         .unwrap();
@@ -54,7 +94,7 @@ impl<F: IsFFTField> Domain<F> {
             trace_roots_of_unity,
             blowup_factor,
             coset_offset,
-            interpolation_domain_size,
+            interpolation_domain_size: trace_length,
         }
     }
 }
@@ -77,47 +117,6 @@ impl<F: IsFFTField> VerifierDomain<F> {
     #[inline]
     pub fn lde_coset_element(&self, index: usize) -> FieldElement<F> {
         &self.coset_offset * self.lde_primitive_root.pow(index)
-    }
-}
-
-pub fn new_domain<Field, FieldExtension, PI>(
-    air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-    trace_length: usize,
-) -> Domain<Field>
-where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
-{
-    // Initial definitions
-    let blowup_factor = air.options().blowup_factor as usize;
-    let coset_offset = FieldElement::from(air.options().coset_offset);
-    let interpolation_domain_size = trace_length;
-    let root_order = trace_length.trailing_zeros();
-    // * Generate Coset
-    let trace_primitive_root = Field::get_primitive_root_of_unity(root_order as u64).unwrap();
-    let trace_roots_of_unity = get_powers_of_primitive_root_coset(
-        root_order as u64,
-        interpolation_domain_size,
-        &FieldElement::one(),
-    )
-    .unwrap();
-
-    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
-    let lde_roots_of_unity_coset = get_powers_of_primitive_root_coset(
-        lde_root_order as u64,
-        trace_length * blowup_factor,
-        &coset_offset,
-    )
-    .unwrap();
-
-    Domain {
-        root_order,
-        lde_roots_of_unity_coset,
-        trace_primitive_root,
-        trace_roots_of_unity,
-        blowup_factor,
-        coset_offset,
-        interpolation_domain_size,
     }
 }
 

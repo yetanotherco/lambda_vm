@@ -79,10 +79,10 @@ desc = "#`IS_WORD[SHA256_M[timestamp, i]]` for $0 <= i < #`index`$"
 name = "lookback"
 
 [[constraints.lookback]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["-", "index", 16]]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"
@@ -130,10 +130,10 @@ output = "s1"
 multiplicity = "μ"
 
 [[constraints.calc]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["carry"]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.calc]]
 kind = "interaction"
