@@ -442,7 +442,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZero {
     }
 }
 
-/// Creates all ECDAS transition constraints (199 total).
+/// Creates all ECDAS transition constraints (200 total).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
