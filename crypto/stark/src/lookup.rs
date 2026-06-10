@@ -1266,7 +1266,7 @@ impl Multiplicity {
 
     /// Evaluate the multiplicity for a single row of column-major main data.
     #[inline]
-    fn evaluate_at_row<F: IsField>(
+    pub fn evaluate_at_row<F: IsField>(
         &self,
         main_segment_cols: &[Vec<FieldElement<F>>],
         row: usize,
