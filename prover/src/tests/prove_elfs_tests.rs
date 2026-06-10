@@ -2500,6 +2500,31 @@ fn test_prove_ethrex_empty_block() {
     assert_eq!(proof.public_output.len(), 160);
 }
 
+/// Full prove → verify of a stateless ethrex block with one plain ETH-transfer
+/// transaction. Heavy: with main's software-keccak `ethrex.elf` this block is
+/// ~4.4M executed instructions (vs ~184k for the empty block), so proving needs
+/// a large-memory machine. Run explicitly with
+/// `cargo test -p prover --release test_prove_ethrex_simple_tx -- --ignored`.
+#[test]
+#[ignore = "takes too long / high memory (software keccak, ~4.4M instructions)"]
+fn test_prove_ethrex_simple_tx() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input = std::fs::read(workspace_root.join("executor/tests/ethrex_simple_tx.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex simple tx should verify"
+    );
+    assert_eq!(proof.public_output.len(), 160);
+}
+
 // =============================================================================
 // Security: private-input tamper tests
 // =============================================================================
