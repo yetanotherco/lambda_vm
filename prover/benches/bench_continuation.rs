@@ -22,7 +22,7 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: bench_continuation <main|cont> <elf_path> [epoch_size]");
+        eprintln!("usage: bench_continuation <count|main|cont> <elf_path> [epoch_size]");
         std::process::exit(2);
     }
     let mode = args[1].as_str();
@@ -31,6 +31,18 @@ fn main() {
 
     let start = Instant::now();
     match mode {
+        "count" => {
+            // Count cycles by running the executor to completion (no proving).
+            // Cycle count is a linear proxy for monolithic proving memory.
+            use executor::elf::Elf;
+            use executor::vm::execution::Executor;
+            let program = Elf::load(&elf).expect("bad ELF");
+            let result = Executor::new(&program, vec![])
+                .expect("executor")
+                .run()
+                .expect("execution failed");
+            println!("cycles = {}", result.logs.len());
+        }
         "main" => {
             lambda_vm_prover::prove(&elf).expect("monolithic prove failed");
             println!("main prove ok ({} bytes ELF)", elf.len());
