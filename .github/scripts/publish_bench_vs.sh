@@ -82,14 +82,25 @@ fi
 ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"
 ETHREX_SECTION=""
 if [ -f "$ETHREX_METRICS_FILE" ]; then
-    ETHREX_TIME=$(grep '^ethrex_empty_block_time_s=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
-    ETHREX_CYCLES=$(grep '^ethrex_empty_block_cycles=' "$ETHREX_METRICS_FILE" | cut -d= -f2-)
-    if [ -n "$ETHREX_TIME" ]; then
-        ETHREX_MRKDWN="*Empty block:* ${ETHREX_TIME}s"
-        if [ -n "$ETHREX_CYCLES" ] && [ "$ETHREX_CYCLES" != "n/a" ]; then
-            ETHREX_MRKDWN="${ETHREX_MRKDWN} (${ETHREX_CYCLES} cycles)"
+    # Render one "*<label>:* <time>s (<cycles> cycles)" line per block.
+    ethrex_line() {
+        local label=$1 key=$2 t c
+        t=$(grep "^${key}_time_s=" "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+        c=$(grep "^${key}_cycles=" "$ETHREX_METRICS_FILE" | cut -d= -f2-)
+        [ -z "$t" ] && return 0
+        local line="*${label}:* ${t}s"
+        if [ -n "$c" ] && [ "$c" != "n/a" ]; then
+            line="${line} (${c} cycles)"
         fi
-        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex Empty"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
+        printf '%s' "$line"
+    }
+    EMPTY_LINE=$(ethrex_line "Empty block" "ethrex_empty_block")
+    TX_LINE=$(ethrex_line "1 tx" "ethrex_1_tx")
+    ETHREX_MRKDWN=""
+    [ -n "$EMPTY_LINE" ] && ETHREX_MRKDWN="$EMPTY_LINE"
+    [ -n "$TX_LINE" ] && ETHREX_MRKDWN="${ETHREX_MRKDWN:+$ETHREX_MRKDWN\n}$TX_LINE"
+    if [ -n "$ETHREX_MRKDWN" ]; then
+        ETHREX_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Lambda VM - Ethrex"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$ETHREX_MRKDWN"'"}}'
     fi
 fi
 

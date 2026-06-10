@@ -55,7 +55,7 @@ jobs:
           ls -la executor/program_artifacts/rust/ethrex.elf
           sha256sum executor/program_artifacts/rust/ethrex.elf
 
-      - name: Run ethrex empty block benchmark
+      - name: Run ethrex block benchmarks
         continue-on-error: true
         run: |
           bash ./bench_vs/run_ethrex.sh \
