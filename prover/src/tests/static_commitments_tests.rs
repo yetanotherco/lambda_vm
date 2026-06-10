@@ -77,16 +77,22 @@ fn keccak_rc_static_matches_recompute_for_all_blowups() {
 /// blowup in `STATIC_BLOWUP_FACTORS`, builds a synthetic zero-init page at
 /// `DEFAULT_PAGE_SIZE` (page_base = 0 — the value doesn't affect the
 /// commitment since OFFSET is page-relative and INIT is uniformly zero) and
-/// asserts that `preprocessed_commitment` returns the same value as a
+/// asserts that `zero_init_preprocessed_commitment` returns the same value as a
 /// direct `compute_precomputed_commitment`. Catches AIR / FFT-pipeline drift
 /// AND confirms the wrapper dispatches through `static_zero_page_commitment`
-/// for the static blowups.
+/// for the static blowups. The explicit `is_some` assert inside the loop
+/// guarantees the static arm exists, so equality can't pass trivially via
+/// the fallback recompute path.
 #[test]
 fn zero_page_static_matches_recompute_for_all_blowups() {
     let zero_page_config = page::PageConfig::zero_init(0);
     for &blowup in STATIC_BLOWUP_FACTORS {
         let options = options_for(blowup);
-        let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
+        assert!(
+            page::static_zero_page_commitment(blowup).is_some(),
+            "no static zero-page match arm shipped for blowup={blowup}",
+        );
+        let from_wrapper = page::zero_init_preprocessed_commitment(&options);
         let recomputed = page::compute_precomputed_commitment(&zero_page_config, &options);
         assert_eq!(
             from_wrapper, recomputed,
@@ -111,7 +117,7 @@ fn page_non_static_blowup_recomputes_via_fallback() {
     );
     let zero_page_config = page::PageConfig::zero_init(0);
     let options = options_for(NON_STATIC_BLOWUP);
-    let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
+    let from_wrapper = page::zero_init_preprocessed_commitment(&options);
     let recomputed = page::compute_precomputed_commitment(&zero_page_config, &options);
     assert_eq!(
         from_wrapper, recomputed,
@@ -120,8 +126,8 @@ fn page_non_static_blowup_recomputes_via_fallback() {
 }
 
 /// Regression test for the `options.coset_offset == 3` gate in
-/// `page::preprocessed_commitment`. With a non-3 coset offset, the wrapper
-/// must NOT return a static value — it must recompute (matching direct
+/// `page::zero_init_preprocessed_commitment`. With a non-3 coset offset, the
+/// wrapper must NOT return a static value — it must recompute (matching direct
 /// compute) and must NOT equal the coset-3 static commitment. Ignored by
 /// default: each blowup at DEFAULT_PAGE_SIZE builds a 2^19-row × 2-col page
 /// LDE, multiple seconds per blowup. Run explicitly when validating the
@@ -134,9 +140,9 @@ fn page_non_three_coset_recomputes_and_differs_from_static() {
         let opts_coset3 = options_with_coset(blowup, STANDARD_COSET);
         let opts_coset7 = options_with_coset(blowup, NON_STANDARD_COSET);
 
-        let from_wrapper_7 = page::preprocessed_commitment(&zero_page_config, &opts_coset7);
+        let from_wrapper_7 = page::zero_init_preprocessed_commitment(&opts_coset7);
         let recomputed_7 = page::compute_precomputed_commitment(&zero_page_config, &opts_coset7);
-        let from_wrapper_3 = page::preprocessed_commitment(&zero_page_config, &opts_coset3);
+        let from_wrapper_3 = page::zero_init_preprocessed_commitment(&opts_coset3);
 
         assert_eq!(
             from_wrapper_7, recomputed_7,

@@ -343,9 +343,10 @@ impl VmAirs {
     /// is supplied, it is used directly and that page's FFT + Merkle build is
     /// skipped. Pages not in the list — including all zero-init pages and
     /// pages without a match — take the normal compute path (zero-init pages
-    /// hit a compile-time constant via `page::preprocessed_commitment`,
-    /// ELF data pages recompute from the ELF). When `None`, every ELF data
-    /// page recomputes from scratch.
+    /// hit a compile-time constant via
+    /// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
+    /// from the ELF). When `None`, every ELF data page recomputes from
+    /// scratch.
     ///
     /// The trust anchor for both `decode_commitment` and `page_commitments`
     /// is the caller's compiled binary — never accept prover-supplied bytes
@@ -420,8 +421,7 @@ impl VmAirs {
         // when shipped, else a single recompute) rather than per page. Every
         // program has at least one zero-init page (the stack is zero-
         // initialized), so this commitment is always used.
-        let zero_init_commitment =
-            page::preprocessed_commitment(&page::PageConfig::zero_init(0), proof_options);
+        let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
 
         let pages: Vec<_> = page_configs
             .iter()
@@ -433,9 +433,7 @@ impl VmAirs {
                     // by the memory bus constraints.
                     air
                 } else if config.init_values.is_none() {
-                    // Zero-init pages: the shared commitment computed once above
-                    // (via `page::preprocessed_commitment` so the static const-table
-                    // shortcut is used when applicable).
+                    // Zero-init pages: the shared commitment computed once above.
                     air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
@@ -446,7 +444,9 @@ impl VmAirs {
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
                         .map(|(_, c)| *c)
-                        .unwrap_or_else(|| page::preprocessed_commitment(config, proof_options));
+                        .unwrap_or_else(|| {
+                            page::compute_precomputed_commitment(config, proof_options)
+                        });
                     air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }
             })
@@ -787,10 +787,10 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// preprocessed commitments, keyed by `page_base`. For each ELF data page
 /// the verifier constructs, if a matching `(page_base, commitment)` pair is
 /// supplied, the FFT + Merkle build for that page is skipped. Pages without
-/// a match — including all zero-init pages — fall through to
-/// `page::preprocessed_commitment`, which returns a compile-time
-/// constant for zero-init pages and recomputes for ELF data pages. When
-/// `None`, every ELF data page recomputes from scratch.
+/// a match — including all zero-init pages — take the normal compute path
+/// (zero-init pages hit a compile-time constant via
+/// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
+/// from the ELF). When `None`, every ELF data page recomputes from scratch.
 ///
 /// Trust model: both `decode_commitment` and `page_commitments`, when
 /// supplied, must come from the caller's compiled binary (e.g. a
