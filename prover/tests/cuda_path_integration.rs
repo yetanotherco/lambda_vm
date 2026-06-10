@@ -47,19 +47,14 @@ fn gpu_path_fires_end_to_end() {
         "R2 GPU comp-poly tree did not fire"
     );
 
-    // R4 DEEP composition. Reuses the R1 main/aux handles and (when R2
-    // parts LDE took the keep path) the parts handle on Round2. Fires
-    // once per table whose lde_size clears the threshold.
+    // DEEP fires once per table that took the R1 GPU path.
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
 
-    // R4 FRI commit phase. One call per table (per
-    // `commit_phase_from_evaluations`); each call drives all FRI layers
-    // device-side internally.
+    // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
 
-    // Verify the GPU-produced proof. Catches the worst regression class:
-    // GPU dispatches fire but the device path produces a proof that
-    // doesn't satisfy the verifier.
+    // Counters only prove the dispatches ran; this checks the GPU proof
+    // actually satisfies the verifier.
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
