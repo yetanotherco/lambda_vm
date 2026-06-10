@@ -71,6 +71,11 @@ pub struct RuntimePageRange {
     pub count: u64,
 }
 
+/// Number of tables that always contribute exactly one sub-proof, regardless
+/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
+/// keccak_rc, register, ecsm, ec_scalar, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 11;
+
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -804,11 +809,12 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register) = 8, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 8 + page_configs.len();
+    // FIXED_TABLE_COUNT always-present tables, plus page tables.
+    let expected_proof_count =
+        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 8 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
