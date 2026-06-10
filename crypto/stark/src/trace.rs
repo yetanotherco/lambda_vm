@@ -544,8 +544,8 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
-            let inv_denoms_v = inv_denoms
-                .get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
+            let inv_denoms_v =
+                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
@@ -598,8 +598,8 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
-            let inv_denoms_v = inv_denoms
-                .get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
+            let inv_denoms_v =
+                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
