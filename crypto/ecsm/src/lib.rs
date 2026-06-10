@@ -54,6 +54,10 @@ pub enum EcsmError {
     ScalarOutOfRange,
     /// `x^3 + b` is not a quadratic residue, so `xG` is not a valid x-coordinate.
     NotOnCurve,
+    /// `xG >= p`: not a canonical field element. Reducing it silently would
+    /// diverge from the prover, whose `xR < p` range check makes a non-canonical
+    /// input unprovable (with `k = 1` the input is echoed back as `xR`).
+    CoordinateOutOfRange,
 }
 
 impl core::fmt::Display for EcsmError {
@@ -62,6 +66,7 @@ impl core::fmt::Display for EcsmError {
             EcsmError::ScalarIsZero => write!(f, "ECSM scalar k must be non-zero"),
             EcsmError::ScalarOutOfRange => write!(f, "ECSM scalar k must be < N"),
             EcsmError::NotOnCurve => write!(f, "ECSM xG is not a valid curve x-coordinate"),
+            EcsmError::CoordinateOutOfRange => write!(f, "ECSM xG must be < p"),
         }
     }
 }
@@ -93,6 +98,9 @@ pub(crate) fn prepare(
         return Err(EcsmError::ScalarOutOfRange);
     }
     let xg = BigUint::from_bytes_le(xg_le);
+    if xg >= p() {
+        return Err(EcsmError::CoordinateOutOfRange);
+    }
     let yg = recover_y_canonical(&xg).ok_or(EcsmError::NotOnCurve)?;
     Ok((k, AffinePoint { x: xg, y: yg }))
 }
@@ -214,6 +222,27 @@ mod tests {
         assert_eq!(
             scalar_mul_x(&to_le_32(&n()), &xg),
             Err(EcsmError::ScalarOutOfRange)
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_xg() {
+        // xG = p and xG = p + 1 (the alias of x = 1) must be rejected, not
+        // silently reduced: with k = 1 the input bytes would be echoed back as
+        // xR, which the prover's xR < p range check cannot prove.
+        let k = to_le_32(&BigUint::from(1u8));
+        for delta in [0u8, 1] {
+            assert_eq!(
+                scalar_mul_x(&k, &to_le_32(&(p() + BigUint::from(delta)))),
+                Err(EcsmError::CoordinateOutOfRange),
+                "xG = p + {delta} must be rejected"
+            );
+        }
+        // p − 1 is below the bound, so it must NOT hit the canonicity check
+        // (it is not on the curve, which is a different error).
+        assert_eq!(
+            scalar_mul_x(&k, &to_le_32(&(p() - BigUint::from(1u8)))),
+            Err(EcsmError::NotOnCurve)
         );
     }
 }
