@@ -415,46 +415,39 @@ impl VmAirs {
             register::NUM_PREPROCESSED_COLS,
         );
         // Every zero-init page shares one preprocessed commitment: OFFSET is
-        // page-relative and INIT is all-zero, so it depends only on the proof
-        // options. Compute it once here rather than once per zero-init page.
-        // Every program has at least one zero-init page (the stack is
-        // zero-initialized), so this commitment is always used.
-        // `preprocessed_commitment` returns the compile-time constant for
-        // standard `(coset_offset, blowup_factor)` pairs and recomputes from
-        // scratch otherwise.
+        // page-relative and INIT is all-zero, so it depends only on
+        // (blowup, coset) — all fixed here. Compute it once (static const
+        // when shipped, else a single recompute) rather than per page. Every
+        // program has at least one zero-init page (the stack is zero-
+        // initialized), so this commitment is always used.
         let zero_init_commitment =
             page::preprocessed_commitment(&page::PageConfig::zero_init(0), proof_options);
 
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
+                let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
-                    create_page_air(proof_options, config.page_base)
+                    air
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above
                     // (via `page::preprocessed_commitment` so the static const-table
                     // shortcut is used when applicable).
-                    create_page_air(proof_options, config.page_base)
-                        .with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
+                    air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
-                    // ELF data pages: INIT depends on the program's bytes. If the caller
-                    // supplied a matching `(page_base, commitment)` pair via
-                    // `page_commitments`, use it directly and skip the FFT + Merkle build;
-                    // otherwise recompute from the ELF data.
+                    // ELF data pages: INIT is program-specific, so the commitment is
+                    // per-page. Prefer a caller-supplied `(page_base, commitment)`
+                    // (recursion guest); otherwise recompute from the ELF.
                     let commitment = page_commitments
-                        .and_then(|list| {
-                            list.iter()
-                                .find(|(pb, _)| *pb == config.page_base)
-                                .map(|(_, c)| *c)
-                        })
-                        .unwrap_or_else(|| {
-                            page::compute_precomputed_commitment(config, proof_options)
-                        });
-                    create_page_air(proof_options, config.page_base)
-                        .with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|(pb, _)| *pb == config.page_base)
+                        .map(|(_, c)| *c)
+                        .unwrap_or_else(|| page::preprocessed_commitment(config, proof_options));
+                    air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }
             })
             .collect();
