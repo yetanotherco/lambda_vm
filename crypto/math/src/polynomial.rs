@@ -4,7 +4,10 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
-use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
+use crate::fft::two_half_fft::{
+    TwoHalfTwiddles, fft_batch_two_half, fft_batch_two_half_bitrev_input_layer1,
+    fft_batch_two_half_bitrev_output,
+};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -554,10 +557,84 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             return Err(FFTError::InputError(weights.len()));
         }
 
+        let prefix_len = n * num_cols;
+        if blowup_factor == 2 {
+            // Fast path: keep the iFFT output bit-reversed and feed the forward
+            // FFT pre-scrambled, eliminating the two facing row permutes of the
+            // round trip (iFFT final + forward initial) plus the forward layer-0
+            // butterflies. Output is bit-identical to the generic path.
+            //
+            // 1. iFFT on rows[..n], bit-reversed coefficient output:
+            //    A[k] = c[rev_n(k)] (no 1/n — folded into the weight pass).
+            fft_batch_two_half_bitrev_output::<F, E>(
+                &mut buffer[..prefix_len],
+                num_cols,
+                inv_twiddles,
+            )?;
+
+            // 2. Bit-reverse the weights instead of the data (n elements vs
+            //    n·num_cols).
+            let mut weights_br = weights[..n].to_vec();
+            in_place_bit_reverse_permute(&mut weights_br);
+
+            // 3. Expand + scale: the forward FFT's bit-reversed zero-padded
+            //    input is c[rev_n(k)] at row 2k, zero at row 2k+1 (since
+            //    rev_2n(q) = 2·rev_n(q) for q < n), and its layer-0 butterflies
+            //    map (x, 0) → (x, x). So rows (2k, 2k+1) ← w_br[k]·A[k], and the
+            //    forward transform starts at layer 1. Processed in halving
+            //    stages so reads (rows lo..hi) never alias writes (rows 2lo..2hi).
+            buffer.resize(lde_n * num_cols, FieldElement::zero());
+            let mut hi = n;
+            while hi > 1 {
+                let lo = hi / 2;
+                let (head, tail) = buffer.split_at_mut(hi * num_cols);
+                let src = &head[lo * num_cols..];
+                let dst = &mut tail[..(hi - lo) * 2 * num_cols];
+                let scale_pair = |i: usize, s: &[FieldElement<E>], d: &mut [FieldElement<E>]| {
+                    let w = &weights_br[lo + i];
+                    for (j, x) in s.iter().enumerate() {
+                        let v = w * x;
+                        d[j] = v.clone();
+                        d[num_cols + j] = v;
+                    }
+                };
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::{
+                        IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+                    };
+                    src.par_chunks(num_cols)
+                        .zip(dst.par_chunks_mut(2 * num_cols))
+                        .enumerate()
+                        .for_each(|(i, (s, d))| scale_pair(i, s, d));
+                }
+                #[cfg(not(feature = "parallel"))]
+                src.chunks(num_cols)
+                    .zip(dst.chunks_mut(2 * num_cols))
+                    .enumerate()
+                    .for_each(|(i, (s, d))| scale_pair(i, s, d));
+                hi = lo;
+            }
+            // k = 0 reads and writes row 0, so it runs last, in place.
+            let w0 = &weights_br[0];
+            let (row0, rest) = buffer.split_at_mut(num_cols);
+            for (j, x) in row0.iter_mut().enumerate() {
+                *x = w0 * &*x;
+                rest[j] = x.clone();
+            }
+
+            // 4. Forward FFT from the pre-scrambled state (skips the initial
+            //    permute and layer 0).
+            fft_batch_two_half_bitrev_input_layer1::<F, E>(buffer, num_cols, fwd_twiddles)?;
+
+            return Ok(());
+        }
+
+        // Generic path (blowup ≠ 2).
+        //
         // 1. iFFT on rows[..n] (cache-blocked two-half; natural→natural, no 1/n
         //    — the 1/n is folded into the coset-weight pass below). Replaces the
         //    flat-Bowers iFFT, which cache-thrashes at large n.
-        let prefix_len = n * num_cols;
         fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
 
         // 2. Scale by coset weights — one weight per row, multiply M elements

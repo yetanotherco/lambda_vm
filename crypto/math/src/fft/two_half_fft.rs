@@ -185,6 +185,61 @@ where
     FieldElement<F>: Sync,
     FieldElement<E>: Send + Sync,
 {
+    fft_batch_two_half_inner::<F, E>(buf, num_cols, tw, true, 0, true)
+}
+
+/// Same transform but the output stays in bit-reversed row order (the final
+/// permute is skipped). With inverse twiddles this yields bit-reversed
+/// coefficients, which `coset_lde_full_expand_row_major` consumes directly.
+#[cfg(feature = "alloc")]
+pub fn fft_batch_two_half_bitrev_output<F, E>(
+    buf: &mut [FieldElement<E>],
+    num_cols: usize,
+    tw: &TwoHalfTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    fft_batch_two_half_inner::<F, E>(buf, num_cols, tw, true, 0, false)
+}
+
+/// Forward transform for input that is ALREADY in bit-reversed row order AND
+/// has layer 0 pre-applied (skips the initial permute and starts at layer 1).
+/// For a zero-padded input, layer-0 butterflies are `(x, 0) → (x, x)`, so the
+/// caller provides duplicated row pairs and gets the natural-order DFT.
+#[cfg(feature = "alloc")]
+pub fn fft_batch_two_half_bitrev_input_layer1<F, E>(
+    buf: &mut [FieldElement<E>],
+    num_cols: usize,
+    tw: &TwoHalfTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
+    fft_batch_two_half_inner::<F, E>(buf, num_cols, tw, false, 1, true)
+}
+
+#[cfg(feature = "alloc")]
+fn fft_batch_two_half_inner<F, E>(
+    buf: &mut [FieldElement<E>],
+    num_cols: usize,
+    tw: &TwoHalfTwiddles<F>,
+    initial_bitrev: bool,
+    start_layer: usize,
+    final_bitrev: bool,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<F>: Sync,
+    FieldElement<E>: Send + Sync,
+{
     let m = num_cols;
     if m == 0 || buf.is_empty() {
         return Ok(());
@@ -210,16 +265,18 @@ where
     let mid = log_n.div_ceil(2);
 
     // Step 1: bit-reverse rows.
-    in_place_bit_reverse_permute_row_major(buf, m);
+    if initial_bitrev {
+        in_place_bit_reverse_permute_row_major(buf, m);
+    }
 
-    // Step 2: first half — layers 0..mid within 2^mid-row chunks (all identical).
+    // Step 2: first half — layers start..mid within 2^mid-row chunks (all identical).
     let first_chunk = (1usize << mid) * m;
     #[cfg(feature = "parallel")]
     let it = buf.par_chunks_mut(first_chunk);
     #[cfg(not(feature = "parallel"))]
     let it = buf.chunks_mut(first_chunk);
     it.for_each(|chunk| {
-        for layer in 0..mid {
+        for layer in start_layer..mid {
             dit_first_half_layer::<F, E>(chunk, m, layer, log_n, flat_tw);
         }
     });
@@ -240,7 +297,9 @@ where
     });
 
     // Step 5: final bit-reverse to natural order.
-    in_place_bit_reverse_permute_row_major(buf, m);
+    if final_bitrev {
+        in_place_bit_reverse_permute_row_major(buf, m);
+    }
 
     Ok(())
 }
