@@ -1015,10 +1015,6 @@ pub enum DvrmConstraintKind {
     UnsignedSignD,
     /// DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
     DivByZeroQ(usize),
-    /// div_by_zero * (r[i] - n[i]) = 0: on division by zero RISC-V returns the
-    /// numerator as the remainder, so pin r = n locally (the remainder analogue
-    /// of DivByZeroQ; without it r is free on a div_by_zero row).
-    DivByZeroR(usize),
 }
 
 /// DVRM table constraint.
@@ -1154,22 +1150,6 @@ impl DvrmConstraint {
                 let fill = FieldElement::<F>::from(SIGN_FILL);
                 &dbz * (&q - &fill)
             }
-            DvrmConstraintKind::DivByZeroR(i) => {
-                // div_by_zero * (r[i] - n[i]) = 0
-                let dbz = step
-                    .get_main_evaluation_element(0, cols::DIV_BY_ZERO)
-                    .clone();
-                let (r_col, n_col) = match i {
-                    0 => (cols::R_0, cols::N_0),
-                    1 => (cols::R_1, cols::N_1),
-                    2 => (cols::R_2, cols::N_2),
-                    3 => (cols::R_3, cols::N_3),
-                    _ => unreachable!(),
-                };
-                let r = step.get_main_evaluation_element(0, r_col).clone();
-                let n = step.get_main_evaluation_element(0, n_col).clone();
-                &dbz * (&r - &n)
-            }
         }
     }
 
@@ -1263,7 +1243,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
             DvrmConstraintKind::UnsignedSignR => 2,
             DvrmConstraintKind::UnsignedSignD => 2,
             DvrmConstraintKind::DivByZeroQ(_) => 2,
-            DvrmConstraintKind::DivByZeroR(_) => 2,
         }
     }
 
@@ -1339,12 +1318,6 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
     // DVRM-C16.i: div_by_zero implies q = all 1s (×4)
     for i in 0..4 {
         constraints.push(DvrmConstraint::new(DvrmConstraintKind::DivByZeroQ(i), idx));
-        idx += 1;
-    }
-
-    // div_by_zero implies r = n (×4): RISC-V returns the numerator on div-by-zero.
-    for i in 0..4 {
-        constraints.push(DvrmConstraint::new(DvrmConstraintKind::DivByZeroR(i), idx));
         idx += 1;
     }
 

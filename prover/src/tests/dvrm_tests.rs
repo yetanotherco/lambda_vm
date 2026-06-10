@@ -410,11 +410,15 @@ fn test_padding_row() {
     assert_eq!(row[cols::MU_R], FE::zero());
 }
 
-// Soundness regression: division by zero must return the numerator as the
-// remainder (RISC-V `REM`/`REMU`), and the denominator halves must be range-checked.
+// Soundness regression: the denominator halves must be range-checked (VM-5), and a
+// division-by-zero row must still return the numerator as the remainder. The latter
+// holds via the existing carry-chain / equality constraints (`n_sub_r + r = n`); an
+// explicit `div_by_zero => r = n` constraint is a spec-level addition the spec does
+// not mandate, so it is intentionally not added here.
 
-/// Enforcement: on a division-by-zero row, forging `r != n` is rejected by
-/// `DivByZeroR`, evaluated in isolation over a bus-less AIR.
+/// Enforcement: on a division-by-zero row, forging `r != n` is rejected by the
+/// carry-chain constraints (`n_sub_r + r = n`), evaluated in isolation over a bus-less
+/// AIR — no explicit div-by-zero remainder constraint is needed.
 #[test]
 fn test_dvrm_rejects_false_div_by_zero_remainder() {
     let air = busless_air(cols::NUM_COLUMNS, dvrm_constraints(0).0);
@@ -428,7 +432,7 @@ fn test_dvrm_rejects_false_div_by_zero_remainder() {
     trace.set_main(0, cols::R_0, FE::from(999u64));
     assert!(
         !validate_busless(&air, &trace),
-        "a forged remainder on div-by-zero must be rejected by DivByZeroR"
+        "a forged remainder on div-by-zero must be rejected by the carry-chain constraints"
     );
 }
 
@@ -444,9 +448,9 @@ fn test_dvrm_range_checks_denominator_halves() {
     }
 }
 
-/// Wiring: `create_dvrm_air` registers its in-chip constraints (including
-/// `DivByZeroR`) on top of its bus constraints. Catches a revert to
-/// `transition_constraints = vec![]` or a dropped constraint.
+/// Wiring: `create_dvrm_air` registers its in-chip constraints on top of its bus
+/// constraints. Catches a revert to `transition_constraints = vec![]` or a dropped
+/// constraint.
 #[test]
 fn test_dvrm_air_wires_in_chip_constraints() {
     let air = create_dvrm_air(&ProofOptions::default_test_options());

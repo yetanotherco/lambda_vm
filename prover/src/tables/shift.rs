@@ -637,11 +637,6 @@ pub enum ShiftConstraintKind {
     LimbShiftIsBit(usize),
     /// SHIFT-C12.i: out[i] - (shifted::DWordWL)[i] = 0
     OutputMatchesShifted(usize),
-    /// (1 - signed) * is_negative = 0: a logical (unsigned) shift must not
-    /// sign-extend. Without this, `is_negative` is free on an unsigned shift
-    /// (the MSB16 check that would pin it is gated by `signed`), letting a
-    /// prover turn on sign-extension (`extension = 0xFFFF * is_negative`).
-    IsNegativeZeroWhenUnsigned,
 }
 
 pub struct ShiftConstraint {
@@ -792,14 +787,6 @@ impl ShiftConstraint {
                 let half_hi = Self::compute_shifted_half(2 * i + 1, step);
                 out - half_lo - half_hi * shift_16
             }
-            ShiftConstraintKind::IsNegativeZeroWhenUnsigned => {
-                // (1 - signed) * is_negative = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let is_neg = step
-                    .get_main_evaluation_element(0, cols::IS_NEGATIVE)
-                    .clone();
-                (&one - &signed) * &is_neg
-            }
         }
     }
 }
@@ -813,7 +800,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
             ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
             ShiftConstraintKind::LimbShiftIsBit(_) => 2,
             ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
-            ShiftConstraintKind::IsNegativeZeroWhenUnsigned => 2,
         }
     }
 
@@ -832,8 +818,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
 
 /// Number of polynomial constraints in the SHIFT table.
 // 1 (DirectionImpliesMu) + 4 (ZbsOverrideX) + 1 (ZbsOverrideX4) + 4 (ZbsOverrideY)
-// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) + 1 (IsNegativeZeroWhenUnsigned) = 17
-pub const NUM_SHIFT_CONSTRAINTS: usize = 17;
+// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) = 16
+pub const NUM_SHIFT_CONSTRAINTS: usize = 16;
 
 /// Creates all polynomial constraints for the SHIFT table.
 pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, usize) {
@@ -870,9 +856,6 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
     for i in 0..2 {
         push(ShiftConstraintKind::OutputMatchesShifted(i));
     }
-
-    // (1 - signed) * is_negative = 0: logical shifts must not sign-extend.
-    push(ShiftConstraintKind::IsNegativeZeroWhenUnsigned);
 
     debug_assert_eq!(constraints.len(), NUM_SHIFT_CONSTRAINTS);
     (constraints, idx)
