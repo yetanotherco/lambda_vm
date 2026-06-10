@@ -111,8 +111,6 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
         let blowup_factor = lde_trace.blowup_factor;
         let num_rows = lde_trace.num_rows();
         let step_size = lde_trace.lde_step_size;
-        let num_main_cols = lde_trace.num_main_cols();
-        let num_aux_cols = lde_trace.num_aux_cols();
 
         for (step_idx, &offset) in offsets.iter().enumerate() {
             let initial_step_row = row + offset * step_size;
@@ -124,15 +122,11 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
             while step_row < end_step_row {
                 let step_row_idx = step_row % num_rows;
 
-                // Overwrite main row elements
-                for col in 0..num_main_cols {
-                    step.data[sub_row_idx][col] = lde_trace.get_main(step_row_idx, col).clone();
-                }
-
-                // Overwrite aux row elements
-                for col in 0..num_aux_cols {
-                    step.aux_data[sub_row_idx][col] = lde_trace.get_aux(step_row_idx, col).clone();
-                }
+                // The row-major LDE stores each row contiguously, so copy the
+                // whole row in one shot (a memcpy for Copy fields) instead of
+                // per-cell `get`s with their bounds checks.
+                step.data[sub_row_idx].clone_from_slice(lde_trace.main_row_slice(step_row_idx));
+                step.aux_data[sub_row_idx].clone_from_slice(lde_trace.aux_row_slice(step_row_idx));
 
                 sub_row_idx += 1;
                 step_row += blowup_factor;
