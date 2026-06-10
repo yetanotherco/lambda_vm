@@ -414,6 +414,17 @@ impl VmAirs {
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
+        // Every zero-init page shares one preprocessed commitment: OFFSET is
+        // page-relative and INIT is all-zero, so it depends only on the proof
+        // options. Compute it once here rather than once per zero-init page.
+        // Every program has at least one zero-init page (the stack is
+        // zero-initialized), so this commitment is always used.
+        // `preprocessed_commitment` returns the compile-time constant for
+        // standard `(coset_offset, blowup_factor)` pairs and recomputes from
+        // scratch otherwise.
+        let zero_init_commitment =
+            page::preprocessed_commitment(&page::PageConfig::zero_init(0), proof_options);
+
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
@@ -423,15 +434,11 @@ impl VmAirs {
                     // by the memory bus constraints.
                     create_page_air(proof_options, config.page_base)
                 } else if config.init_values.is_none() {
-                    // Zero-init pages: OFFSET + INIT are preprocessed and uniformly zero.
-                    // `preprocessed_commitment` returns the compile-time constant
-                    // for standard `(page_size, blowup_factor)` pairs and recomputes
-                    // otherwise — caller-supplied values aren't useful here because the
-                    // const is already cheaper than reading bytes through the API.
-                    create_page_air(proof_options, config.page_base).with_preprocessed(
-                        page::preprocessed_commitment(config, proof_options),
-                        page::NUM_PREPROCESSED_COLS,
-                    )
+                    // Zero-init pages: the shared commitment computed once above
+                    // (via `page::preprocessed_commitment` so the static const-table
+                    // shortcut is used when applicable).
+                    create_page_air(proof_options, config.page_base)
+                        .with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
                     // ELF data pages: INIT depends on the program's bytes. If the caller
                     // supplied a matching `(page_base, commitment)` pair via
@@ -443,7 +450,9 @@ impl VmAirs {
                                 .find(|(pb, _)| *pb == config.page_base)
                                 .map(|(_, c)| *c)
                         })
-                        .unwrap_or_else(|| page::preprocessed_commitment(config, proof_options));
+                        .unwrap_or_else(|| {
+                            page::compute_precomputed_commitment(config, proof_options)
+                        });
                     create_page_air(proof_options, config.page_base)
                         .with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }

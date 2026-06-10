@@ -1,0 +1,102 @@
+name = "KECCAK"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which the permutation is performed"
+pad = 0
+
+[[variables.input]]
+name = "addr"
+type = "DWordBL"
+desc = "memory address storing the first bit of the state"
+pad = 0
+
+[[variables.input]]
+name = "input_state"
+type = [[["Byte", 8], 5], 5]
+desc = "state at the start of executing the permutation"
+pad = 0
+
+[[variables.output]]
+name = "output_state"
+type = [[["Byte", 8], 5], 5]
+desc = "state after executing the permutation"
+pad = 0
+
+[[variables.auxiliary]]
+name = "state_ptr"
+type = [["DWordHL", 5], 5]
+desc = "memory addresses storing the entire state"
+pad = ["*", 8, ["arr", 
+        ["arr", 0, 1, 2, 3, 4],
+        ["arr", 5, 6, 7, 8, 9],
+        ["arr", 10, 11, 12, 13, 14],
+        ["arr", 15, 16, 17, 18, 19],
+        ["arr", 20, 21, 22, 23, 24]
+]]
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 2], "DWordWL"]]
+multiplicity = ["-", "μ"]
+
+[[constraint_groups]]
+name = "mem"
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
+output = "addr"
+multiplicity = "μ"
+ref = "keccak:c:read_addr"
+
+[[constraints.mem]]
+kind = "template"
+tag = "ADD"
+input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
+output = ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"]
+iters = [["x", 0, 4], ["y", 0, 4]]
+ref = "keccak:c:state_ptr"
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
+multiplicity = "μ"
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"], ["idx", ["idx", "output_state", "x"], "y"], "timestamp", 0, 0, 1]
+output = ["idx", ["idx", "input_state", "x"], "y"]
+iters = [["x", 0, 4], ["y", 0, 4]]
+multiplicity = "μ"
+ref = "keccak:c:load_store_state"
+
+[[constraint_groups]]
+name = "round"
+
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", 0, "input_state"]
+multiplicity = "μ"
+
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", 24, "output_state"]
+multiplicity = ["-", "μ"]

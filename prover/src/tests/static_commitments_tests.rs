@@ -83,7 +83,7 @@ fn keccak_rc_static_matches_recompute_for_all_blowups() {
 /// for the static blowups.
 #[test]
 fn zero_page_static_matches_recompute_for_all_blowups() {
-    let zero_page_config = page::PageConfig::zero_init(0, page::DEFAULT_PAGE_SIZE);
+    let zero_page_config = page::PageConfig::zero_init(0);
     for &blowup in STATIC_BLOWUP_FACTORS {
         let options = options_for(blowup);
         let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
@@ -109,7 +109,7 @@ fn page_non_static_blowup_recomputes_via_fallback() {
         !STATIC_BLOWUP_FACTORS.contains(&NON_STATIC_BLOWUP),
         "test relies on NON_STATIC_BLOWUP not being in STATIC_BLOWUP_FACTORS",
     );
-    let zero_page_config = page::PageConfig::zero_init(0, page::DEFAULT_PAGE_SIZE);
+    let zero_page_config = page::PageConfig::zero_init(0);
     let options = options_for(NON_STATIC_BLOWUP);
     let from_wrapper = page::preprocessed_commitment(&zero_page_config, &options);
     let recomputed = page::compute_precomputed_commitment(&zero_page_config, &options);
@@ -129,7 +129,7 @@ fn page_non_static_blowup_recomputes_via_fallback() {
 #[test]
 #[ignore = "heavy: 2^19-row page LDE per blowup; tens of seconds total"]
 fn page_non_three_coset_recomputes_and_differs_from_static() {
-    let zero_page_config = page::PageConfig::zero_init(0, page::DEFAULT_PAGE_SIZE);
+    let zero_page_config = page::PageConfig::zero_init(0);
     for &blowup in STATIC_BLOWUP_FACTORS {
         let opts_coset3 = options_with_coset(blowup, STANDARD_COSET);
         let opts_coset7 = options_with_coset(blowup, NON_STANDARD_COSET);

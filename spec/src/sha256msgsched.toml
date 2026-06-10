@@ -1,0 +1,163 @@
+name = "SHA256MSGSCHED"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp/identifier for this execution of the message schedule"
+pad = 0
+
+[[variables.input]]
+name = "index"
+type = "BaseField"
+desc = "The index of the output word"
+pad = 0
+
+[[variables.input]]
+name = "amount"
+type = "BaseField"
+desc = "The multiplicity with which to output the resulting word"
+pad = 0
+
+[[variables.output]]
+name = "out"
+type = "WordHL"
+desc = "The output, `w[index]`"
+
+[[variables.auxiliary]]
+name = "back2"
+type = "Word"
+desc = "`w[index - 2]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "back7"
+type = "Word"
+desc = "`w[index - 7]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "back15"
+type = "Word"
+desc = "`w[index - 15]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "back16"
+type = "Word"
+desc = "`w[index - 16]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "s0"
+type = "Word"
+desc = "$#`back15` >>> 7 xor #`back15` >>> 18 xor #`back15` >> 3$"
+pad = 0
+
+[[variables.auxiliary]]
+name = "s1"
+type = "Word"
+desc = "$#`back2` >>> 17 xor #`back2` >>> 19 xor #`back2` >> 10$"
+pad = 0
+
+[[variables.virtual]]
+name = "carry"
+type = "Byte"
+desc = "The carry of computing `out`"
+def = ["*", ["^", 2, -32], ["-", ["+", "back16", "s0", "back7", "s1"], ["cast", "out", "Word"]]]
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[assumptions]]
+desc = "#`IS_WORD[SHA256_M[timestamp, i]]` for $0 <= i < #`index`$"
+
+
+[[constraint_groups]]
+name = "lookback"
+
+[[constraints.lookback]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["-", "index", 16]]
+cond = "μ"
+
+[[constraints.lookback]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", ["-", "index", 2]]
+output = "back2"
+multiplicity = "μ"
+
+[[constraints.lookback]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", ["-", "index", 7]]
+output = "back7"
+multiplicity = "μ"
+
+[[constraints.lookback]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", ["-", "index", 15]]
+output = "back15"
+multiplicity = "μ"
+
+[[constraints.lookback]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", ["-", "index", 16]]
+output = "back16"
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "calc"
+
+[[constraints.calc]]
+kind = "interaction"
+tag = "ROTXOR"
+input = ["back15", 2, 11, 3, 0]
+output = "s0"
+multiplicity = "μ"
+
+[[constraints.calc]]
+kind = "interaction"
+tag = "ROTXOR"
+input = ["back2", 3, 2, 10, 0]
+output = "s1"
+multiplicity = "μ"
+
+[[constraints.calc]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["carry"]
+cond = "μ"
+
+[[constraints.calc]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "out", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.output]]
+kind = "arith"
+constraint = "$#`μ` = 0 => #`amount` = 0$"
+poly = ["*", ["not", "μ"], "amount"]
+
+[[constraints.output]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", "index"]
+output = ["cast", "out", "Word"]
+multiplicity = ["-", "amount"]

@@ -39,7 +39,7 @@ fn main() {
          // in `prover/src/tables/{{bitwise,keccak_rc,page}}.rs`.\n"
     );
 
-    let zero_page_config = page::PageConfig::zero_init(0, page::DEFAULT_PAGE_SIZE);
+    let zero_page_config = page::PageConfig::zero_init(0);
 
     for &blowup in STATIC_BLOWUP_FACTORS {
         let options = match GoldilocksCubicProofOptions::with_blowup(blowup) {
