@@ -1,0 +1,186 @@
+name = "ROTXOR"
+
+[[variables.input]]
+name = "a"
+type = "WordHL"
+desc = "The input value"
+pad = 0
+
+[[variables.input]]
+name = "r0"
+type = "Byte"
+desc = "The first amount of rotation, low nibble"
+pad = 0
+
+[[variables.input]]
+name = "r1"
+type = "Byte"
+desc = "The second amount of rotation, low nibble"
+pad = 0
+
+[[variables.input]]
+name = "r2"
+type = "Byte"
+desc = "The third amount of rotation, low nibble"
+pad = 0
+
+[[variables.input]]
+name = "last_rot"
+type = "Bit"
+desc = "Whether the rotation by `r2` is a rotation (1) or just a shift (0)"
+pad = 0
+
+[[variables.output]]
+name = "out"
+type = "WordBL"
+desc = "The output"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a0_left"
+type = "WordHL"
+desc = "`a << (16 - r0)`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a0_right"
+type = "WordHL"
+desc = "`a >> r0`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a1_left"
+type = "WordHL"
+desc = "`a0 << r1`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a1_right"
+type = "WordHL"
+desc = "`a0 >> (16 - r1)`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a2_left"
+type = "WordHL"
+desc = "`a << (16 - r2)`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a2_right"
+type = "WordHL"
+desc = "`a >> r2`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a0"
+type = "WordBL"
+desc = "`a >>> (16 + r0)`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a1"
+type = "WordBL"
+desc = "`a >>> (16 + r0 - r1)` (which is `a0 <<< r1`)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a2"
+type = "WordBL"
+desc = "`a >>> r2` or `a >> r2`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a01"
+type = "WordBL"
+desc = "$a_0 xor a_1$"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+pad = 0
+
+
+[[assumptions]]
+desc = "$#`r0`, #`r1`, #`r2` in [1, 15]$"
+
+
+[[constraint_groups]]
+name = "shift"
+
+[[constraints.shift]]
+kind = "interaction"
+tag = "HWSL"
+input = [["idx", "a", "i"], ["-", 16, "r0"]]
+output = ["arr", ["idx", "a0_left", "i"], ["idx", "a0_right", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ"
+
+[[constraints.shift]]
+kind = "interaction"
+tag = "HWSL"
+input = [["idx", ["cast", "a0", "WordHL"], "i"], "r1"]
+output = ["arr", ["idx", "a1_left", "i"], ["idx", "a1_right", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ"
+
+[[constraints.shift]]
+kind = "interaction"
+tag = "HWSL"
+input = [["idx", "a", "i"], ["-", 16, "r2"]]
+output = ["arr", ["idx", "a2_left", "i"], ["idx", "a2_right", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ"
+
+[[constraints.shift]]
+kind = "arith"
+constraint = "$#`a0[i]` = #`a0_left[i]` + #`a0_right[1 - i]`$"
+poly = ["-", ["idx", ["cast", "a0", "WordHL"], "i"], ["idx", "a0_left", "i"], ["idx", "a0_right", ["-", 1, "i"]]]
+iter = ["i", 0, 1]
+
+[[constraints.shift]]
+kind = "arith"
+constraint = "$#`a1[i]` = #`a1_left[i]` + #`a1_right[1 - i]`$"
+poly = ["-", ["idx", ["cast", "a1", "WordHL"], "i"], ["idx", "a1_left", "i"], ["idx", "a1_right", ["-", 1, "i"]]]
+iter = ["i", 0, 1]
+
+[[constraints.shift]]
+kind = "arith"
+constraint = "$#`a2[0]` = #`a2_left[1]` + #`a2_right[0]`$"
+poly = ["-", ["idx", ["cast", "a2", "WordHL"], 0], ["idx", "a2_left", 1], ["idx", "a2_right", 0]]
+
+[[constraints.shift]]
+kind = "arith"
+constraint = "$#`a2[1]` = #`last_rot` dot #`a2_left[0]` + #`a2_right[1]`$"
+poly = ["-", ["idx", ["cast", "a2", "WordHL"], 1], ["*", "last_rot", ["idx", "a2_left", 0]], ["idx", "a2_right", 1]]
+
+[[constraint_groups]]
+name = "xor"
+
+[[constraints.xor]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", "a0", "i"], ["idx", "a1", "i"]]
+output = ["idx", "a01", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.xor]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", "a01", "i"], ["idx", "a2", "i"]]
+output = ["idx", "out", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "ROTXOR"
+input = [["cast", "a", "Word"], "r0", "r1", "r2", "last_rot"]
+output = ["cast", "out", "Word"]
+multiplicity = ["-", "μ"]

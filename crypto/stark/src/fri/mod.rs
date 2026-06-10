@@ -21,9 +21,8 @@ use self::fri_functions::{
 ///
 /// The `T: Clone` and `F/E: 'static` bounds are required by the cuda GPU
 /// fast path (`try_fri_commit_gpu` snapshots the transcript and TypeId-
-/// checks the field types). They are present unconditionally — including
-/// in builds without the `cuda` feature — to keep one stable signature.
-/// All real transcript and field types in this crate satisfy them.
+/// checks the field types). They are present unconditionally (including
+/// in builds without the `cuda` feature) to keep one stable signature.
 pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,

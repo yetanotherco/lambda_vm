@@ -1,6 +1,6 @@
 //! R4 deep-composition polynomial evaluations on GPU.
 //!
-//! Mirrors `Self::compute_deep_composition_poly_evaluations` in
+//! Mirrors `compute_deep_composition_poly_evaluations` in
 //! `crypto/stark/src/prover.rs`. Accepts the main/aux LDEs as device
 //! handles (populated by the R1 fused path in `LDETraceTable`) and
 //! takes every other tensor (composition parts LDE, OOD evals,

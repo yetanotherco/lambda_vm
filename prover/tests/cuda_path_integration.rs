@@ -47,29 +47,22 @@ fn gpu_path_fires_end_to_end() {
         "R2 GPU comp-poly tree did not fire"
     );
 
-    // R4 DEEP composition. Reuses the R1 main/aux handles and (when R2
-    // parts LDE took the keep path) the parts handle on Round2. Fires
-    // once per table whose lde_size clears the threshold.
+    // DEEP fires once per table that took the R1 GPU path.
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
 
-    // R4 FRI commit phase. One call per table (per
-    // `commit_phase_from_evaluations`); each call drives all FRI layers
-    // device-side internally.
+    // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
 
-    // GPU batch-invert dispatch. Fires at least twice per table when the
-    // R3 OOD and R4 DEEP inv_denoms both go through the device pipeline
-    // (replaces the CPU `inplace_batch_inverse` + ~tens-of-MB H2D for
-    // each table). A regression where one of R3/R4 silently fell back
-    // to host inv_denoms would drop this below the expected ratio.
+    // GPU batch-invert dispatch fires for the R3 OOD and R4 DEEP
+    // inv_denoms pipelines. A regression where either silently fell back
+    // to host inv_denoms would drop this to zero.
     assert!(
         gpu_batch_invert_calls() > 0,
         "GPU batch-invert dispatch did not fire on R3 + R4"
     );
 
-    // Verify the GPU-produced proof. Catches the worst regression class:
-    // GPU dispatches fire but the device path produces a proof that
-    // doesn't satisfy the verifier.
+    // Counters only prove the dispatches ran; this checks the GPU proof
+    // actually satisfies the verifier.
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
