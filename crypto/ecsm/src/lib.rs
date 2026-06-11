@@ -5,10 +5,9 @@
 //! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Keeping a single implementation
 //! guarantees the two never diverge — in particular they pick the same `yG` square root.
 //!
-//! Curve point operations (decompression, doubling, addition) are delegated to the audited
-//! RustCrypto `k256` crate; the limb arithmetic for witness generation uses `num-bigint`
-//! (already a workspace dependency). All of this runs once per `ECALL`, so it is not
-//! performance critical.
+//! Curve point operations (decompression, doubling, addition) are delegated to the RustCrypto
+//! `k256` crate; the limb arithmetic for witness generation uses `num-bigint`. All of this
+//! runs once per `ECALL`, so it is not performance critical.
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 

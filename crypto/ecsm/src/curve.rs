@@ -1,9 +1,9 @@
 //! secp256k1 curve arithmetic and the chip-faithful double-and-add replay.
 //!
 //! The curve point operations (decompression, doubling, addition) are delegated to the
-//! audited RustCrypto `k256` crate; this module only adapts them to the `BigUint`
-//! representation the witness builder expects and drives the chip-specific double-and-add
-//! schedule. The curve is `y^2 = x^3 + 7 mod p` (short Weierstrass with `a = 0`). The point
+//! RustCrypto `k256` crate; this module adapts them to the `BigUint` representation used by
+//! the witness builder and drives the double-and-add schedule. The curve is
+//! `y^2 = x^3 + 7 mod p` (short Weierstrass with `a = 0`). The point
 //! at infinity never appears: the ECSM/ECDAS design guarantees it cannot occur for
 //! `k in [1, N)` (see `ecsm.typ` "Point at infinity" / ECDAS soundness argument), so every
 //! affine point below is well defined.

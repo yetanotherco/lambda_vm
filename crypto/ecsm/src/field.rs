@@ -22,14 +22,6 @@ impl Fp {
         Fp(BigUint::from(v) % p())
     }
 
-    pub fn zero() -> Self {
-        Fp(BigUint::from(0u8))
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0 == BigUint::from(0u8)
-    }
-
     /// `self + other mod p`. Both operands must already be reduced.
     pub fn add(&self, other: &Fp) -> Fp {
         Fp((&self.0 + &other.0) % p())
