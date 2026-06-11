@@ -22,7 +22,7 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
+//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
 //! - Sender: LT (×1 for abs_r < abs_d)
 //! - Sender: MUL (×2 for n_sub_r = d * q verification)
@@ -384,9 +384,34 @@ pub fn generate_dvrm_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
-    // DVRM-A1.i (IS_HALF[n[i]]) and DVRM-A2.i (IS_HALF[d[i]]) are assumptions:
-    // the CPU (sender) is responsible for range-checking n and d before sending
-    // to DVRM. The DVRM table does NOT send these IS_HALF lookups.
+    // -------------------------------------------------------------------------
+    // DVRM-A1.i: IS_HALF[n[i]] (×4) and DVRM-A2.i: IS_HALF[d[i]] (×4),
+    // multiplicity: μ_q + μ_r.
+    // The bus binds only the packed 32-bit words (DWordHL/DWordBL emit two
+    // words, not the four halves), so without these the input halves are free:
+    // a prover could supply non-canonical halves that re-pack to the same word
+    // yet sum to 0 in the field, forging div_by_zero (DVRM-C17 keys on the
+    // half-sum) for a nonzero denominator. Range-checking each half closes that.
+    // -------------------------------------------------------------------------
+    for col in [
+        cols::N_0,
+        cols::N_1,
+        cols::N_2,
+        cols::N_3,
+        cols::D_0,
+        cols::D_1,
+        cols::D_2,
+        cols::D_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
