@@ -51,12 +51,4 @@ impl Fp {
     pub fn inv(&self) -> Fp {
         Fp(self.0.modpow(&(p() - BigUint::from(2u32)), &p()))
     }
-
-    /// Square root via `a^((p+1)/4)` (valid because `p ≡ 3 mod 4`).
-    /// Returns `None` if `self` is not a quadratic residue.
-    pub fn sqrt(&self) -> Option<Fp> {
-        let exp = (p() + BigUint::from(1u32)) >> 2u32;
-        let r = Fp(self.0.modpow(&exp, &p()));
-        if &r.mul(&r) == self { Some(r) } else { None }
-    }
 }

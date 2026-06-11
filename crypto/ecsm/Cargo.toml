@@ -6,5 +6,6 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"

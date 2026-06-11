@@ -1,16 +1,16 @@
-//! secp256k1 curve arithmetic in affine coordinates and the chip-faithful
-//! double-and-add replay.
+//! secp256k1 curve arithmetic and the chip-faithful double-and-add replay.
 //!
-//! The curve is `y^2 = x^3 + 7 mod p` (short Weierstrass with `a = 0`). The point at
-//! infinity never appears: the ECSM/ECDAS design guarantees it cannot occur for
-//! `k in [1, N)` (see `ecsm.typ` "Point at infinity" / ECDAS soundness argument), so the
-//! affine formulas below are always well defined.
+//! The curve point operations (decompression, doubling, addition) are delegated to the
+//! audited RustCrypto `k256` crate; this module only adapts them to the `BigUint`
+//! representation the witness builder expects and drives the chip-specific double-and-add
+//! schedule. The curve is `y^2 = x^3 + 7 mod p` (short Weierstrass with `a = 0`). The point
+//! at infinity never appears: the ECSM/ECDAS design guarantees it cannot occur for
+//! `k in [1, N)` (see `ecsm.typ` "Point at infinity" / ECDAS soundness argument), so every
+//! affine point below is well defined.
 
+use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use k256::{AffinePoint as K256Affine, EncodedPoint, ProjectivePoint};
 use num_bigint::BigUint;
-
-use crate::B;
-use crate::field::Fp;
-use crate::p;
 
 /// An affine curve point. Never the point at infinity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,55 +19,62 @@ pub struct AffinePoint {
     pub y: BigUint,
 }
 
+/// `v` as 32 big-endian bytes (k256's `FieldBytes` layout). `v` must be `< 2^256`.
+fn to_be32(v: &BigUint) -> [u8; 32] {
+    let bytes = v.to_bytes_be();
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    out
+}
+
+/// Maps an on-curve affine point into k256's representation.
+fn to_k256(p: &AffinePoint) -> K256Affine {
+    let mut enc = [0u8; 65];
+    enc[0] = 0x04; // uncompressed SEC1: 0x04 || x || y
+    enc[1..33].copy_from_slice(&to_be32(&p.x));
+    enc[33..65].copy_from_slice(&to_be32(&p.y));
+    let ep = EncodedPoint::from_bytes(enc).expect("valid uncompressed SEC1 encoding");
+    Option::from(K256Affine::from_encoded_point(&ep)).expect("point is on the curve")
+}
+
+/// Maps a k256 affine point back into `BigUint` coordinates. The identity never occurs in
+/// the accelerator's schedule, so its (absent) coordinates are treated as unreachable.
+fn from_k256(p: &K256Affine) -> AffinePoint {
+    let ep = p.to_encoded_point(false);
+    AffinePoint {
+        x: BigUint::from_bytes_be(ep.x().expect("not the identity").as_slice()),
+        y: BigUint::from_bytes_be(ep.y().expect("not the identity").as_slice()),
+    }
+}
+
 /// Recovers the canonical (even) `y` for a given `x` such that `y^2 = x^3 + b mod p`.
 ///
 /// Both `y` and `p - y` are valid; we pick the even one so the executor and prover agree
 /// deterministically. The chip never constrains the parity (it only writes back `xR`, and
 /// `k·P` and `k·(-P)` share an x-coordinate), so any consistent choice is sound.
 ///
-/// Returns `None` when `x^3 + b` is not a quadratic residue (i.e. `x` is not a valid
-/// x-coordinate on the curve).
+/// Returns `None` when `x` is not a valid curve x-coordinate (`x^3 + b` is not a quadratic
+/// residue, or `x` is not a canonical field element).
 pub fn recover_y_canonical(x: &BigUint) -> Option<BigUint> {
-    let x = Fp::new(x.clone());
-    let rhs = x.mul(&x).mul(&x).add(&Fp::from_u64(B)); // x^3 + b
-    let y = rhs.sqrt()?;
-    let y = if y.0.bit(0) {
-        // odd → take the even root p - y
-        Fp::new(p() - &y.0)
-    } else {
-        y
-    };
-    Some(y.0)
+    // SEC1 compressed encoding: the `0x02` prefix selects the even-`y` root.
+    let mut enc = [0u8; 33];
+    enc[0] = 0x02;
+    enc[1..33].copy_from_slice(&to_be32(x));
+    let ep = EncodedPoint::from_bytes(enc).ok()?;
+    let affine: K256Affine = Option::from(K256Affine::from_encoded_point(&ep))?;
+    Some(from_k256(&affine).y)
 }
 
-/// `2·a` on the curve. Requires `a.y != 0` (always true on secp256k1).
+/// `2·a` on the curve.
 pub fn point_double(a: &AffinePoint) -> AffinePoint {
-    let x = Fp::new(a.x.clone());
-    let y = Fp::new(a.y.clone());
-    // λ = 3x² / 2y
-    let three_x2 = x.mul(&x).mul(&Fp::from_u64(3));
-    let two_y = y.add(&y);
-    let lambda = three_x2.mul(&two_y.inv());
-    // xr = λ² - 2x
-    let xr = lambda.mul(&lambda).sub(&x).sub(&x);
-    // yr = λ(x - xr) - y
-    let yr = lambda.mul(&x.sub(&xr)).sub(&y);
-    AffinePoint { x: xr.0, y: yr.0 }
+    let p = ProjectivePoint::from(to_k256(a));
+    from_k256(&(p + p).to_affine())
 }
 
 /// `a + g` on the curve. Requires `a.x != g.x` (always true in the chip's add steps).
 pub fn point_add(a: &AffinePoint, g: &AffinePoint) -> AffinePoint {
-    let xa = Fp::new(a.x.clone());
-    let ya = Fp::new(a.y.clone());
-    let xg = Fp::new(g.x.clone());
-    let yg = Fp::new(g.y.clone());
-    // λ = (yg - ya) / (xg - xa)
-    let lambda = yg.sub(&ya).mul(&xg.sub(&xa).inv());
-    // xr = λ² - xa - xg
-    let xr = lambda.mul(&lambda).sub(&xa).sub(&xg);
-    // yr = λ(xa - xr) - ya
-    let yr = lambda.mul(&xa.sub(&xr)).sub(&ya);
-    AffinePoint { x: xr.0, y: yr.0 }
+    let r = ProjectivePoint::from(to_k256(a)) + ProjectivePoint::from(to_k256(g));
+    from_k256(&r.to_affine())
 }
 
 /// One step of the double-and-add replay, at point level.

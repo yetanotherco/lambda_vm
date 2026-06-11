@@ -5,9 +5,10 @@
 //! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Keeping a single implementation
 //! guarantees the two never diverge — in particular they pick the same `yG` square root.
 //!
-//! All arithmetic uses `num-bigint`; it runs once per `ECALL`, so it is not performance
-//! critical. The crate depends only on `num-bigint`/`num-traits` so the executor keeps a
-//! minimal dependency footprint.
+//! Curve point operations (decompression, doubling, addition) are delegated to the audited
+//! RustCrypto `k256` crate; the limb arithmetic for witness generation uses `num-bigint`
+//! (already a workspace dependency). All of this runs once per `ECALL`, so it is not
+//! performance critical.
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
@@ -141,7 +142,7 @@ mod tests {
             n(),
             be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
         );
-        // p ≡ 3 mod 4 (needed for the sqrt formula).
+        // p ≡ 3 mod 4 (a known secp256k1 property).
         assert_eq!(&p() % 4u32, BigUint::from(3u8));
     }
 
