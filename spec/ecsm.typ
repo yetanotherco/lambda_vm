@@ -132,7 +132,8 @@ We emphasize here that @ec:c:c0_63_is_zero is required to ensure the sum evaluat
 The constraints @ec:c:c0_0 and @ec:c:c0_i, as well as the magic number $8160$ in @ec:c:range_c0 are discussed in @ecsm-limb_carry.
 #render_constraint_table(ecsm_chip, config, groups: "xG2")
 
-Next, we restrict the witness pair $(y_G, #`q1`)$:
+Next, we restrict the witness pair $(y_G, #`q1`)$.
+Note there that @ec:c:c1_0 and @ec:c:c1_i multiply `B` by `μ` to simplify the padding; there are no other side-effects to this since $#`μ` = 1$ on non-padding rows (@ec:c:mu_isbit).
 
 #render_constraint_table(ecsm_chip, config, groups: "yG")
 
