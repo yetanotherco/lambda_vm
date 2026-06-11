@@ -410,11 +410,10 @@ fn test_padding_row() {
     assert_eq!(row[cols::MU_R], FE::zero());
 }
 
-// Soundness regression: the denominator halves must be range-checked (VM-5), and a
-// division-by-zero row must still return the numerator as the remainder. The latter
-// holds via the existing carry-chain / equality constraints (`n_sub_r + r = n`); an
-// explicit `div_by_zero => r = n` constraint is a spec-level addition the spec does
-// not mandate, so it is intentionally not added here.
+// Div-by-zero remainder: a division-by-zero row must return the numerator as the
+// remainder. This holds via the existing carry-chain / equality constraints
+// (`n_sub_r + r = n`); an explicit `div_by_zero => r = n` constraint is a spec-level
+// addition the spec does not mandate, so it is intentionally not added here.
 
 /// Enforcement: on a division-by-zero row, forging `r != n` is rejected by the
 /// carry-chain constraints (`n_sub_r + r = n`), evaluated in isolation over a bus-less
@@ -435,6 +434,9 @@ fn test_dvrm_rejects_false_div_by_zero_remainder() {
         "a forged remainder on div-by-zero must be rejected by the carry-chain constraints"
     );
 }
+
+// Soundness regression (VM-5): the denominator halves must be IS_HALFWORD
+// range-checked so a prover cannot forge `div_by_zero` via non-canonical halves.
 
 /// Presence: the denominator halves are range-checked via IS_HALFWORD senders.
 #[test]
