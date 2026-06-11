@@ -25,7 +25,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for sign extraction)
-//! - Sender: IS_HALF (×8 for lo/hi range checks)
+//! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
 //! - Sender: IS_B20 (×4 for carry range checks)
 //! - Receiver: MUL (×2 for lo and hi results)
 
@@ -358,7 +358,7 @@ pub fn generate_mul_trace(
 ///
 /// The MUL table:
 /// - **Sends** MSB16 lookups for sign bit extraction (×2)
-/// - **Sends** IS_HALF lookups for lo/hi range checks (×8)
+/// - **Sends** IS_HALF lookups for lhs/rhs input and lo/hi output range checks (×16)
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -398,6 +398,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ],
     ));
+
+    // -------------------------------------------------------------------------
+    // IS_HALF lookups for lhs/rhs INPUT range checks (multiplicity: mu_lo + mu_hi).
+    // The bus binds only the packed 32-bit words, so without these the input
+    // half-limbs are free (non-canonical halves re-packing to the same word).
+    // -------------------------------------------------------------------------
+    for col in [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // IS_HALF lookups for lo range checks (multiplicity: mu_lo + mu_hi)

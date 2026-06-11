@@ -1286,15 +1286,29 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
 ///
 /// MUL sends MSB16 lookups when signed=1 to extract sign bits,
-/// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
+/// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
+/// and IS_B20 lookups for carry range checks.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
+    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 20);
 
     // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
     for (op, _wants_hi) in mul_ops {
         let (lo, hi) = op.compute_product();
+
+        // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
+        // in mul::bus_interactions).
+        for word in [op.lhs, op.rhs] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
 
         // IS_HALF for lo halfwords
         for shift in [0, 16, 32, 48] {
@@ -1358,16 +1372,32 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 
 /// Collects bitwise lookups from DVRM operations.
 ///
-/// Generates: IS_HALF (×12), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
+/// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
+/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op.
 ///
-/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are assumptions enforced by the CPU sender,
-/// not by the DVRM table. Only constraint-level IS_HALF lookups are generated here.
+/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
+/// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
+/// are collected here alongside the constraint-level ones.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
+    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
 
     for (op, _wants_remainder) in dvrm_ops {
+        // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
+        // half-limbs so a prover cannot supply non-canonical halves (matches the
+        // n/d IS_HALF senders in dvrm::bus_interactions).
+        for word in [op.n, op.d] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+
         // IS_HALF for r[0..4] (DVRM-C13)
         let r = op.compute_remainder();
         for shift in [0, 16, 32, 48] {
@@ -1637,8 +1667,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
             for byte_offset in 0..4u64 {
                 let byte_addr = word_addr + byte_offset;
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                let page_base = page::page_base_for_address(byte_addr, page_size);
-                let offset = page::offset_in_page(byte_addr, page_size);
+                let page_base = page::page_base_for_address(byte_addr);
+                let offset = page::offset_in_page(byte_addr);
                 let page_data = init_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
@@ -1649,8 +1679,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>
     if !private_input.is_empty() {
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
-            let page_base = page::page_base_for_address(addr, page_size);
-            let offset = page::offset_in_page(addr, page_size);
+            let page_base = page::page_base_for_address(addr);
+            let offset = page::offset_in_page(addr);
             let page_data = init_page_data
                 .entry(page_base)
                 .or_insert_with(|| vec![0u8; page_size]);
@@ -1675,7 +1705,7 @@ fn collect_bitwise_from_page(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr, page_size));
+        page_bases.insert(page::page_base_for_address(addr));
     }
 
     // Build final state map from memory_state
@@ -1692,8 +1722,9 @@ fn collect_bitwise_from_page(
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
 
-            // Get init value (from ELF or 0)
-            let init = init_data.map_or(0u8, |data| data[offset]);
+            // Get init value (from ELF or 0). `.get().unwrap_or(0)` to match the
+            // relaxed `init_values` contract: a shorter vec reads as trailing zeros.
+            let init = init_data.map_or(0u8, |data| data.get(offset).copied().unwrap_or(0));
 
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
@@ -2151,15 +2182,13 @@ fn generate_page_tables(
 ) {
     use std::collections::BTreeSet;
 
-    let page_size = page::DEFAULT_PAGE_SIZE;
-
     // Collect init data from ELF segments + private input region
     let init_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr, page_size));
+        page_bases.insert(page::page_base_for_address(addr));
     }
 
     // Build final state map from memory_state
@@ -2178,7 +2207,7 @@ fn generate_page_tables(
         use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let total_bytes = 4 + private_input.len(); // length prefix + data
         (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size))
+            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
             .collect()
     } else {
         std::collections::BTreeSet::new()
@@ -2187,11 +2216,11 @@ fn generate_page_tables(
     for &page_base in &page_bases {
         let config = if private_input_page_bases.contains(&page_base) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
-            PageConfig::with_private_input(page_base, page_size, init_data)
+            PageConfig::with_private_input(page_base, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
-            PageConfig::with_data(page_base, page_size, init_data.clone())
+            PageConfig::with_data(page_base, init_data.clone())
         } else {
-            PageConfig::zero_init(page_base, page_size)
+            PageConfig::zero_init(page_base)
         };
 
         let trace = page::generate_page_trace(&config, &final_state);
@@ -3214,7 +3243,6 @@ impl Traces {
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
-        let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, &[]);
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
@@ -3223,9 +3251,9 @@ impl Traces {
             .into_iter()
             .map(|base| {
                 if let Some(init_data) = init_page_data.get(&base) {
-                    PageConfig::with_data(base, page_size, init_data.clone())
+                    PageConfig::with_data(base, init_data.clone())
                 } else {
-                    PageConfig::zero_init(base, page_size)
+                    PageConfig::zero_init(base)
                 }
             })
             .collect()
@@ -3250,21 +3278,17 @@ impl Traces {
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
             for i in 0..count {
-                configs.push(PageConfig::zero_init(
-                    base + i * page_size as u64,
-                    page_size,
-                ));
+                configs.push(PageConfig::zero_init(base + i * page_size as u64));
             }
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
             use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
+            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
             for i in 0..num_private_input_pages {
                 configs.push(PageConfig {
                     page_base: first_page_base + i as u64 * page_size as u64,
-                    page_size,
                     init_values: None, // Verifier doesn't know these
                     is_private_input: true,
                 });

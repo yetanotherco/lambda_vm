@@ -22,14 +22,6 @@ impl Fp {
         Fp(BigUint::from(v) % p())
     }
 
-    pub fn zero() -> Self {
-        Fp(BigUint::from(0u8))
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0 == BigUint::from(0u8)
-    }
-
     /// `self + other mod p`. Both operands must already be reduced.
     pub fn add(&self, other: &Fp) -> Fp {
         Fp((&self.0 + &other.0) % p())
@@ -50,13 +42,5 @@ impl Fp {
     /// Returns zero for a zero input (which never occurs for valid curve arithmetic).
     pub fn inv(&self) -> Fp {
         Fp(self.0.modpow(&(p() - BigUint::from(2u32)), &p()))
-    }
-
-    /// Square root via `a^((p+1)/4)` (valid because `p ≡ 3 mod 4`).
-    /// Returns `None` if `self` is not a quadratic residue.
-    pub fn sqrt(&self) -> Option<Fp> {
-        let exp = (p() + BigUint::from(1u32)) >> 2u32;
-        let r = Fp(self.0.modpow(&exp, &p()));
-        if &r.mul(&r) == self { Some(r) } else { None }
     }
 }

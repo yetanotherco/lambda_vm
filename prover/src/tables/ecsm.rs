@@ -10,9 +10,12 @@
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!
 //! ## Padding
-//! Padding rows are all-zero with `mu = 0`. The two convolution relations are **µ-gated**
-//! (so they vanish on padding — an all-zero `yG` relation cannot hold because of the
-//! irreducible `−b` term), while every range check / virtual-carry check is also µ-gated.
+//! Padding rows have `mu = 0`, all columns zero **except `q1`, which pads to `p`**. This makes
+//! both carry relations close on padding without gating the whole recurrence: the x² relation
+//! has no standalone constant (closes at all-zero), and the yG relation closes because the
+//! `p² − q1·p` offset cancels (`q1 = p`) and the curve constant `b` is multiplied by `µ` (so it
+//! drops when `µ = 0`). Only that single `µ·b` term is µ-gated. The range checks /
+//! virtual-carry checks remain µ-gated as before.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
@@ -183,6 +186,14 @@ pub fn generate_ecsm_trace(
         }
 
         data[base + cols::MU] = FE::one();
+    }
+
+    // Padding rows (`mu = 0`) must carry `q1 = p` so the yG carry relation closes: the
+    // `p² − q1·p` offset cancels and the µ-gated `b` term drops. Bytes 0..31 hold p; byte 32
+    // stays 0 (a valid IS_BIT value).
+    for row_idx in n..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        write_bytes(&mut data, base, cols::Q1, &P_BYTES);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -576,7 +587,7 @@ pub fn ecdas_tuple(
 // Constraints
 // =========================================================================
 
-/// Which µ-gated convolution relation a carry constraint enforces.
+/// Which convolution relation a carry constraint enforces.
 #[derive(Clone, Copy)]
 enum Relation {
     /// `xG² − x2 − q0·p = 0`
@@ -593,8 +604,9 @@ fn p_byte<F: IsField>(m: usize) -> FieldElement<F> {
     }
 }
 
-/// µ-gated convolution carry constraint at limb `i`:
-/// `µ · (2^8·c_i − c_{i-1} − S_i) = 0`, with `c_{-1} = 0`.
+/// Convolution carry constraint at limb `i`: `2^8·c_i − c_{i-1} − S_i = 0`, with `c_{-1} = 0`.
+/// Unconditional (degree 2); the only µ-gated term is the curve constant `µ·b` inside `S_i`
+/// for the yG relation at limb 0 (see [`ConvCarry::s_i`]).
 struct ConvCarry {
     relation: Relation,
     i: usize,
@@ -635,7 +647,12 @@ impl ConvCarry {
                     s = s - byte(cols::Q1, 33, j) * p_byte::<F>(i - j);
                 }
                 if i == 0 {
-                    s = s - FieldElement::<F>::from(B);
+                    // Only the curve constant `b` is gated by `µ`: it vanishes on padding
+                    // (µ=0) and equals `b` on real rows (µ=1). `B` is the zero-extension of
+                    // `b`, so `B_i = 0` for i ≥ 1 — nothing to gate there. The rest of the
+                    // relation stays unconditional.
+                    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+                    s = s - mu * FieldElement::<F>::from(B);
                 }
             }
         }
@@ -645,7 +662,7 @@ impl ConvCarry {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
     fn degree(&self) -> usize {
-        3 // µ · (degree-2 convolution)
+        2 // degree-2 convolution; the only µ-gated term (µ·b) is degree 1
     }
 
     fn constraint_idx(&self) -> usize {
@@ -668,9 +685,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
             step.get_main_evaluation_element(0, c_base + self.i - 1)
                 .clone()
         };
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let rhs = FieldElement::<F>::from(256u64) * c_i - c_prev - self.s_i(step);
-        mu * rhs
+        FieldElement::<F>::from(256u64) * c_i - c_prev - self.s_i(step)
     }
 }
 
@@ -1043,46 +1058,70 @@ mod tests {
         assert_eq!(next, 148);
     }
 
-    /// Verifies SPEC-2 (a spec bug): `ecsm.toml` states the xG2/yG carry recurrences
-    /// UNCONDITIONALLY, but the yG relation is unsatisfiable on an all-zero (padding) row.
-    /// Its limb-0 residual is `−(P_0² − b) = −(47² − 7) = −2202 ≠ 0` (the `p²` and `−b`
-    /// constants don't cancel with zero witness). This is exactly why the implementation
-    /// µ-gates them (deviation D2). The x2 relation has no standalone constant → clean.
-    ///
-    /// We evaluate the constraint residual on a row with `µ=1` but zero witness (what a
-    /// padding row would be if forced active under the spec's unconditional form).
+    /// The yG carry recurrence is unsatisfiable on a padding row unless two ingredients hold,
+    /// and this test locks both:
+    ///   (a) `q1` pads to `p`, so the `p² − q1·p` offset cancels;
+    ///   (b) the curve constant `b` is multiplied by `µ`, so it drops when `µ = 0`.
+    /// Removing either ingredient leaves a nonzero residual on the yG limb-0 relation.
+    /// The x² relation has no standalone constant, so it closes on all-zero padding and is
+    /// left fully unconditional.
     #[test]
-    fn spec2_unconditional_yg_constraint_unsatisfiable_on_padding() {
-        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
-        main[cols::MU] = FE::one();
-        let view: TableView<GoldilocksField, GoldilocksExtension> =
-            TableView::new(vec![main], vec![]);
+    fn yg_padding_closes_via_q1_eq_p_and_mu_gated_b() {
+        // yG limb-0 ConvCarry residual on a one-off row with the given `µ` and `q1`.
+        let yg_residual = |mu: u64, q1_is_p: bool| {
+            let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+            main[cols::MU] = FE::from(mu);
+            if q1_is_p {
+                for (i, &b) in P_BYTES.iter().enumerate() {
+                    main[cols::Q1 + i] = FE::from(b as u64);
+                }
+            }
+            let view: TableView<GoldilocksField, GoldilocksExtension> =
+                TableView::new(vec![main], vec![]);
+            ConvCarry {
+                relation: Relation::Yg,
+                i: 0,
+                constraint_idx: 0,
+            }
+            .evaluate(&view)
+        };
 
-        // x2: no standalone constant → residual is zero (satisfiable by padding).
+        // The padding row this chip emits (µ = 0, q1 = p): both ingredients present → closes.
+        assert_eq!(
+            yg_residual(0, true),
+            FE::zero(),
+            "padding row (µ=0, q1=p) must close"
+        );
+
+        // Drop ingredient (a): q1 = 0 instead of p → the p² offset is uncancelled.
+        assert_eq!(
+            yg_residual(0, false),
+            FE::zero() - FE::from(2209u64),
+            "without q1=p the residual is −P_0² = −47²"
+        );
+
+        // Drop ingredient (b): force the row active (µ = 1) so the curve constant `b`
+        // survives even with q1 = p. Residual = b = 7.
+        assert_eq!(
+            yg_residual(1, true),
+            FE::from(7u64),
+            "with µ=1 (b ungated) the leftover residual is the curve constant b=7"
+        );
+
+        // x² has no standalone constant → closes on an all-zero padding row regardless.
+        let mut zero = vec![FE::zero(); cols::NUM_COLUMNS];
+        zero[cols::MU] = FE::zero();
+        let zview: TableView<GoldilocksField, GoldilocksExtension> =
+            TableView::new(vec![zero], vec![]);
         assert_eq!(
             ConvCarry {
                 relation: Relation::X2,
                 i: 0,
                 constraint_idx: 0,
             }
-            .evaluate(&view),
+            .evaluate(&zview),
             FE::zero(),
-            "x2 relation IS satisfiable by an all-zero row"
+            "x² closes on all-zero padding (no standalone constant)"
         );
-
-        // yG: residual = −(P_0² − b) = −2202 ≠ 0 → the spec's unconditional form would
-        // reject the padding row; µ-gating (µ=0 on real padding) is required.
-        let yg = ConvCarry {
-            relation: Relation::Yg,
-            i: 0,
-            constraint_idx: 0,
-        }
-        .evaluate(&view);
-        assert_ne!(
-            yg,
-            FE::zero(),
-            "yG unconditional residual must be NONZERO on a zero row (this is SPEC-2)"
-        );
-        assert_eq!(yg, FE::zero() - FE::from(2202u64), "residual = −(47² − 7)");
     }
 }

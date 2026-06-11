@@ -8,9 +8,8 @@
 
 use num_bigint::BigUint;
 
-use crate::B;
+#[cfg(test)]
 use crate::field::Fp;
-use crate::p;
 
 /// An affine curve point. Never the point at infinity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,19 +24,16 @@ pub struct AffinePoint {
 /// deterministically. The chip never constrains the parity (it only writes back `xR`, and
 /// `k·P` and `k·(-P)` share an x-coordinate), so any consistent choice is sound.
 ///
-/// Returns `None` when `x^3 + b` is not a quadratic residue (i.e. `x` is not a valid
-/// x-coordinate on the curve).
+/// Returns `None` when `x` is not a valid curve x-coordinate (`x^3 + b` is not a quadratic
+/// residue, or `x` is not a canonical field element).
 pub fn recover_y_canonical(x: &BigUint) -> Option<BigUint> {
-    let x = Fp::new(x.clone());
-    let rhs = x.mul(&x).mul(&x).add(&Fp::from_u64(B)); // x^3 + b
-    let y = rhs.sqrt()?;
-    let y = if y.0.bit(0) {
-        // odd → take the even root p - y
-        Fp::new(p() - &y.0)
-    } else {
-        y
-    };
-    Some(y.0)
+    // SEC1 compressed encoding: the `0x02` prefix selects the even-`y` root, delegated to k256.
+    let mut enc = [0u8; 33];
+    enc[0] = 0x02;
+    enc[1..33].copy_from_slice(&be32(x));
+    let ep = EncodedPoint::from_bytes(enc).ok()?;
+    let affine: K256Affine = Option::from(K256Affine::from_encoded_point(&ep))?;
+    Some(from_k256_affine(&affine).y)
 }
 
 /// `2·a` on the curve. Requires `a.y != 0` (always true on secp256k1).

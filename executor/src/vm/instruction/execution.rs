@@ -411,6 +411,14 @@ impl Instruction {
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
+                        // xG and k are both read at the same proof timestamp, so their
+                        // 32-byte ranges must be disjoint or the trace is unprovable
+                        // (MEMW orders accesses per address by strictly increasing
+                        // timestamp). xR may alias either: its accesses are offset to
+                        // later timestamps.
+                        if addr_xg.abs_diff(addr_k) < 32 {
+                            return Err(ExecutionError::EcsmOperandOverlap);
+                        }
                         let xg = load_u256_le(memory, addr_xg)?;
                         let k = load_u256_le(memory, addr_k)?;
                         let xr = ecsm::scalar_mul_x(&k, &xg)?;
@@ -598,6 +606,8 @@ pub enum ExecutionError {
     KeccakStateAddressOverflow(u64),
     #[error("ECSM address range overflows the lower 32-bit limb")]
     EcsmAddressOverflow,
+    #[error("ECSM xG and k operand ranges overlap")]
+    EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
 }

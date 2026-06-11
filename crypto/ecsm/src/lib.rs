@@ -5,9 +5,9 @@
 //! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Keeping a single implementation
 //! guarantees the two never diverge — in particular they pick the same `yG` square root.
 //!
-//! All arithmetic uses `num-bigint`; it runs once per `ECALL`, so it is not performance
-//! critical. The crate depends only on `num-bigint`/`num-traits` so the executor keeps a
-//! minimal dependency footprint.
+//! Curve point operations (decompression, doubling, addition) are delegated to the RustCrypto
+//! `k256` crate; the limb arithmetic for witness generation uses `num-bigint`. All of this
+//! runs once per `ECALL`, so it is not performance critical.
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
@@ -54,6 +54,10 @@ pub enum EcsmError {
     ScalarOutOfRange,
     /// `x^3 + b` is not a quadratic residue, so `xG` is not a valid x-coordinate.
     NotOnCurve,
+    /// `xG >= p`: not a canonical field element. Reducing it silently would
+    /// diverge from the prover, whose `xR < p` range check makes a non-canonical
+    /// input unprovable (with `k = 1` the input is echoed back as `xR`).
+    CoordinateOutOfRange,
 }
 
 impl core::fmt::Display for EcsmError {
@@ -62,6 +66,7 @@ impl core::fmt::Display for EcsmError {
             EcsmError::ScalarIsZero => write!(f, "ECSM scalar k must be non-zero"),
             EcsmError::ScalarOutOfRange => write!(f, "ECSM scalar k must be < N"),
             EcsmError::NotOnCurve => write!(f, "ECSM xG is not a valid curve x-coordinate"),
+            EcsmError::CoordinateOutOfRange => write!(f, "ECSM xG must be < p"),
         }
     }
 }
@@ -93,6 +98,9 @@ pub(crate) fn prepare(
         return Err(EcsmError::ScalarOutOfRange);
     }
     let xg = BigUint::from_bytes_le(xg_le);
+    if xg >= p() {
+        return Err(EcsmError::CoordinateOutOfRange);
+    }
     let yg = recover_y_canonical(&xg).ok_or(EcsmError::NotOnCurve)?;
     Ok((k, AffinePoint { x: xg, y: yg }))
 }
@@ -132,7 +140,7 @@ mod tests {
             n(),
             be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
         );
-        // p ≡ 3 mod 4 (needed for the sqrt formula).
+        // p ≡ 3 mod 4 (a known secp256k1 property).
         assert_eq!(&p() % 4u32, BigUint::from(3u8));
     }
 
@@ -213,6 +221,27 @@ mod tests {
         assert_eq!(
             scalar_mul_x(&to_le_32(&n()), &xg),
             Err(EcsmError::ScalarOutOfRange)
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_xg() {
+        // xG = p and xG = p + 1 (the alias of x = 1) must be rejected, not
+        // silently reduced: with k = 1 the input bytes would be echoed back as
+        // xR, which the prover's xR < p range check cannot prove.
+        let k = to_le_32(&BigUint::from(1u8));
+        for delta in [0u8, 1] {
+            assert_eq!(
+                scalar_mul_x(&k, &to_le_32(&(p() + BigUint::from(delta)))),
+                Err(EcsmError::CoordinateOutOfRange),
+                "xG = p + {delta} must be rejected"
+            );
+        }
+        // p − 1 is below the bound, so it must NOT hit the canonicity check
+        // (it is not on the curve, which is a different error).
+        assert_eq!(
+            scalar_mul_x(&k, &to_le_32(&(p() - BigUint::from(1u8)))),
+            Err(EcsmError::NotOnCurve)
         );
     }
 }

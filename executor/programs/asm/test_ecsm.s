@@ -29,7 +29,7 @@ main:
 	li	a7, -3
 	ecall
 
-	# Commit the 32-byte result xR so the test can check it equals x(2G).
+	# Commit the 32-byte result xR so the test can check it equals x(5G).
 	# Commit syscall: a0 = fd(1), a1 = buf_addr, a2 = count, a7 = 64.
 	li	a0, 1
 	addi	a1, sp, 64

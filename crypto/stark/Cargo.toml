@@ -49,6 +49,7 @@ instruments = []                                                     # This enab
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
 cuda = ["dep:math-cuda"]
+test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
 

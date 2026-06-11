@@ -88,6 +88,53 @@ fn ecsm_syscall_rejects_zero_scalar() {
 }
 
 #[test]
+fn ecsm_syscall_rejects_non_canonical_xg() {
+    // xG = p + 1 (the alias of x = 1) must error, not silently reduce: with
+    // k = 1 the executor would echo the non-canonical bytes back as xR, which
+    // the prover's xR < p range check cannot prove.
+    let mut xg = ecsm::P_BYTES;
+    xg[0] += 1; // p ends in 0x2F little-endian, so no carry
+    let err = run_ecsm(&k_le(1), &xg).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::CoordinateOutOfRange)
+    ));
+}
+
+/// Runs the ECSM syscall with caller-chosen operand addresses, `xG = Gx` and `k = 5`.
+fn run_ecsm_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionError> {
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+    write_u256_le(&mut memory, addr_xg, &gx_le());
+    write_u256_le(&mut memory, addr_k, &k_le(5));
+    registers.write(17, ECSM_SYSCALL_NUMBER).unwrap();
+    registers.write(10, addr_xr).unwrap();
+    registers.write(11, addr_xg).unwrap();
+    registers.write(12, addr_k).unwrap();
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, &mut memory)?;
+    Ok(())
+}
+
+#[test]
+fn ecsm_syscall_rejects_overlapping_xg_k() {
+    // xG and k are read at the same proof timestamp, so overlapping ranges
+    // would make the trace unprovable — the executor must reject them upfront.
+    for addr_k in [0x2000u64, 0x2008, 0x2018, 0x1FE8] {
+        let err = run_ecsm_at(0x1000, 0x2000, addr_k).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::EcsmOperandOverlap),
+            "addr_k = {addr_k:#x} overlaps addr_xg and must be rejected"
+        );
+    }
+    // Touching-but-disjoint ranges are fine (boundary: |diff| = 32)...
+    run_ecsm_at(0x1000, 0x2000, 0x2020).expect("disjoint k above xG must run");
+    run_ecsm_at(0x1000, 0x2000, 0x1FE0).expect("disjoint k below xG must run");
+    // ...and xR may alias xG (its accesses are offset to later timestamps).
+    run_ecsm_at(0x2000, 0x2000, 0x3000).expect("xR aliasing xG is allowed");
+}
+
+#[test]
 fn ecsm_syscall_rejects_address_overflow() {
     // addr_k near the lower-limb boundary so (addr mod 2^32) + 31 overflows.
     let mut pc = 0;
