@@ -265,6 +265,104 @@ impl Instruction {
     }
 }
 
+/// A decoded instruction together with the number of bytes it occupies in the
+/// instruction stream (`2` for an RV64C compressed instruction, `4` otherwise).
+///
+/// Compressed instructions are expanded to their equivalent base `Instruction`
+/// at decode time, so the rest of the pipeline (execution, constraints) only ever
+/// sees base instructions; `len` is what distinguishes them and drives `pc` advance
+/// and the prover's `c_type` flag.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodedInstruction {
+    pub instr: Instruction,
+    pub len: u8,
+}
+
+/// Decode a single instruction from a little-endian instruction word.
+///
+/// Only the low 16 bits are inspected to determine the length: if they do not end
+/// in `0b11` the instruction is a 2-byte RV64C compressed instruction and is
+/// expanded via [`decompress`](super::decompress::decompress); otherwise the full
+/// 32 bits are parsed as a base instruction. Callers that only have 16 bits
+/// available (e.g. at a segment boundary) must guarantee the high 16 bits are valid
+/// whenever the low half indicates a 4-byte instruction.
+pub fn decode_instruction(word: u32) -> Result<DecodedInstruction, InstructionError> {
+    let first_half = word as u16;
+    if super::decompress::instr_len(first_half) == 2 {
+        Ok(DecodedInstruction {
+            instr: super::decompress::decompress(first_half)?,
+            len: 2,
+        })
+    } else {
+        Ok(DecodedInstruction {
+            instr: Instruction::parse(word)?,
+            len: 4,
+        })
+    }
+}
+
+/// Decode an executable segment, given as the little-endian 4-byte memory words it
+/// was loaded from, into the sequence of `(byte_offset, instruction)` it contains.
+///
+/// The words are reinterpreted as a halfword stream and walked by the actual
+/// instruction width, so a segment may mix 2-byte (compressed) and 4-byte
+/// instructions, and a 4-byte instruction may start at a 2-byte (non-4) offset. A
+/// final dangling halfword (a 4-byte instruction whose second half lies past the
+/// segment) is treated as a non-instruction tail and dropped.
+///
+/// This is the single decode entry point shared by the executor's instruction
+/// cache and the prover/verifier's DECODE generation, so the two cannot disagree
+/// on instruction boundaries or `c_type`.
+pub fn decode_segment_words(
+    words: &[u32],
+) -> Result<Vec<(u64, DecodedInstruction)>, InstructionError> {
+    let halfwords: Vec<u16> = words
+        .iter()
+        .flat_map(|w| [*w as u16, (*w >> 16) as u16])
+        .collect();
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < halfwords.len() {
+        let lo = halfwords[i];
+        // A zero halfword is `c.unimp` / alignment padding (the ELF loader also
+        // zero-fills the high half of a final word when the segment's byte length
+        // is not a multiple of 4). It is never a real instruction start, so skip it
+        // instead of failing the whole segment decode. If such a slot is ever the
+        // target of a jump, the on-demand fetch path will surface the error.
+        if lo == 0 {
+            i += 1;
+            continue;
+        }
+        let byte_offset = (i as u64) * 2;
+        if super::decompress::instr_len(lo) == 2 {
+            out.push((
+                byte_offset,
+                DecodedInstruction {
+                    instr: super::decompress::decompress(lo)?,
+                    len: 2,
+                },
+            ));
+            i += 1;
+        } else {
+            // 4-byte instruction: needs the following halfword.
+            let Some(&hi) = halfwords.get(i + 1) else {
+                break; // dangling trailing halfword, not an instruction
+            };
+            let word = ((hi as u32) << 16) | (lo as u32);
+            out.push((
+                byte_offset,
+                DecodedInstruction {
+                    instr: Instruction::parse(word)?,
+                    len: 4,
+                },
+            ));
+            i += 2;
+        }
+    }
+    Ok(out)
+}
+
 fn parse_opcode(instruction: u32) -> Result<Opcode, InstructionError> {
     let opcode = instruction & OPCODE_MASK;
     Opcode::try_from(opcode)
@@ -631,4 +729,8 @@ pub enum InstructionError {
     InvalidSystemInstruction(u32),
     #[error("Invalid W32 instruction: operation not supported")]
     InvalidW32Instruction,
+    #[error("Illegal compressed instruction encoding: {0:#06x}")]
+    IllegalCompressed(u16),
+    #[error("Reserved compressed instruction encoding: {0:#06x}")]
+    ReservedCompressed(u16),
 }

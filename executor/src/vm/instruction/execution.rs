@@ -5,8 +5,6 @@ use crate::vm::{
     registers::Registers,
 };
 
-const REGULAR_PC_UPDATE: u64 = 4;
-
 pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
     KeccakPermute = 0,
@@ -37,14 +35,18 @@ impl TryFrom<u64> for SyscallNumbers {
 }
 
 impl Instruction {
-    /// Runs the given instruction and returns its execution log
+    /// Runs the given instruction and returns its execution log.
+    ///
+    /// `instr_len` is the encoded width of this instruction in bytes (2 for an
+    /// RV64C compressed instruction, 4 otherwise) and drives the `pc` advance.
     pub fn run(
         self,
         pc: &mut u64,
         registers: &mut Registers,
         memory: &mut Memory,
+        instr_len: u8,
     ) -> Result<Log, ExecutionError> {
-        let log = self.execute(*pc, registers, memory)?;
+        let log = self.execute(*pc, registers, memory, instr_len)?;
         *pc = log.next_pc;
         Ok(log)
     }
@@ -55,6 +57,7 @@ impl Instruction {
         pc: u64,
         registers: &mut Registers,
         memory: &mut Memory,
+        instr_len: u8,
     ) -> Result<Log, ExecutionError> {
         Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -66,7 +69,7 @@ impl Instruction {
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: op1 as u64,
                     src2_val: 0,
                     dst_val: res,
@@ -87,7 +90,7 @@ impl Instruction {
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: raw_src,
                     src2_val: 0,
                     dst_val: res,
@@ -96,23 +99,23 @@ impl Instruction {
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
                 let base_value = registers.read(base)?;
                 let new_pc = (((base_value as i64).wrapping_add(offset as i64)) & !1) as u64;
-                registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
+                registers.write(dst, pc.wrapping_add(instr_len as u64))?;
                 Log {
                     current_pc: pc,
                     next_pc: new_pc,
                     src1_val: base_value,
                     src2_val: 0,
-                    dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    dst_val: pc.wrapping_add(instr_len as u64),
                 }
             }
             Instruction::JumpAndLink { dst, offset } => {
-                registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
+                registers.write(dst, pc.wrapping_add(instr_len as u64))?;
                 Log {
                     current_pc: pc,
                     next_pc: (pc as i64).wrapping_add(offset as i64) as u64,
                     src1_val: 0,
                     src2_val: 0,
-                    dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    dst_val: pc.wrapping_add(instr_len as u64),
                 }
             }
             Instruction::Store {
@@ -151,7 +154,7 @@ impl Instruction {
                 };
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: base,
                     src2_val: read_value,
                     dst_val: 0,
@@ -184,7 +187,7 @@ impl Instruction {
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: base,
                     src2_val: 0,
                     dst_val: value,
@@ -200,7 +203,7 @@ impl Instruction {
                 let new_pc = if cond.apply(a, b) {
                     (pc as i64).wrapping_add(offset as i64) as u64
                 } else {
-                    pc.wrapping_add(REGULAR_PC_UPDATE)
+                    pc.wrapping_add(instr_len as u64)
                 };
                 Log {
                     current_pc: pc,
@@ -216,7 +219,7 @@ impl Instruction {
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: value,
@@ -228,7 +231,7 @@ impl Instruction {
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: value,
@@ -246,7 +249,7 @@ impl Instruction {
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: a,
                     src2_val: b,
                     dst_val: res,
@@ -270,7 +273,7 @@ impl Instruction {
                 registers.write(dst, res)?;
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: raw_src1,
                     src2_val: raw_src2,
                     dst_val: res,
@@ -285,7 +288,7 @@ impl Instruction {
                 // Todo: CSR are currently no-ops
                 Log {
                     current_pc: pc,
-                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,
@@ -372,7 +375,7 @@ impl Instruction {
                 }
                 Log {
                     current_pc: pc,
-                    next_pc: pc + REGULAR_PC_UPDATE,
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: syscall_number_raw,
                     src2_val,
                     dst_val,
@@ -382,7 +385,7 @@ impl Instruction {
                 // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
                 Log {
                     current_pc: pc,
-                    next_pc: pc + REGULAR_PC_UPDATE,
+                    next_pc: pc.wrapping_add(instr_len as u64),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,

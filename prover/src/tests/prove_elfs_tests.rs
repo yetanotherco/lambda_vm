@@ -596,6 +596,23 @@ fn test_prove_elfs_misalign_lh() {
     );
 }
 
+/// RV64C: prove + verify a program built from compressed (2-byte) instructions.
+/// This exercises the full production decode path on both sides — the prover
+/// re-decodes the ELF in `from_elf_and_logs` and the verifier recomputes the DECODE
+/// commitment in `commitment_from_elf`, both via the compressed-aware walk. The CPU
+/// `next_pc` constraint enforces `pc + (4 - 2*c_type)`, so a wrong `c_type` would make
+/// the proof unverifiable.
+#[test]
+fn test_prove_elfs_compressed() {
+    let (elf, logs, _instructions) = run_asm_elf("test_compressed");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_compressed prove/verify failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_misalign_lhu() {
     let (elf, logs, _instructions) = run_asm_elf("misalign_lhu");

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use executor::elf::Elf;
-use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::decoding::DecodedInstruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 #[cfg(feature = "disk-spill")]
@@ -318,7 +318,7 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 /// Returns a vector of CpuOperation, one per log entry.
 fn collect_cpu_ops(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
@@ -329,12 +329,13 @@ fn collect_cpu_ops(
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = instructions
+        let decoded = instructions
             .get(&log.current_pc)
             .copied()
             .ok_or(Error::MissingInstruction(log.current_pc))?;
 
-        let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
+        let op =
+            CpuOperation::from_log_and_instruction(log, timestamp, decoded.instr, decoded.len == 2);
         cpu_ops.push(op);
     }
     Ok(cpu_ops)
@@ -2587,11 +2588,12 @@ pub fn count_table_lengths(
 
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = instructions
+        let decoded = instructions
             .get(&log.current_pc)
             .copied()
             .ok_or(Error::MissingInstruction(log.current_pc))?;
-        let cpu_op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
+        let cpu_op =
+            CpuOperation::from_log_and_instruction(log, timestamp, decoded.instr, decoded.len == 2);
         cpu_count += 1;
 
         // Memory ops from load/store
@@ -3110,7 +3112,7 @@ impl Traces {
     /// Note: This creates empty PAGE tables since no ELF is provided.
     pub fn from_logs(
         logs: &[Log],
-        instructions: U64HashMap<Instruction>,
+        instructions: U64HashMap<DecodedInstruction>,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Phase 1: Logs → CPU operations
@@ -3178,7 +3180,7 @@ impl Traces {
     #[cfg(test)]
     pub fn from_logs_trimmed(
         logs: &[Log],
-        instructions: U64HashMap<Instruction>,
+        instructions: U64HashMap<DecodedInstruction>,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
@@ -3196,7 +3198,7 @@ impl Traces {
     #[cfg(test)]
     pub fn from_logs_minimal(
         logs: &[Log],
-        instructions: U64HashMap<Instruction>,
+        instructions: U64HashMap<DecodedInstruction>,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         Self::from_logs_trimmed(logs, instructions, max_rows)

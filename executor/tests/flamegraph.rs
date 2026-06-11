@@ -2,7 +2,9 @@ use executor::{
     elf::{FunctionSymbol, SymbolTable},
     flamegraph::FlamegraphGenerator,
     vm::{
-        execution::InstructionCache, instruction::decoding::Instruction, logs::Log,
+        execution::InstructionCache,
+        instruction::decoding::{DecodedInstruction, Instruction},
+        logs::Log,
         memory::U64HashMap,
     },
 };
@@ -23,7 +25,10 @@ fn make_symbol_table(symbols: Vec<(&str, u64, u64)>) -> SymbolTable {
 
 /// Helper to create an instruction cache
 fn make_instructions(instructions: Vec<(u64, Instruction)>) -> InstructionCache {
-    let map: U64HashMap<Instruction> = instructions.into_iter().collect();
+    let map: U64HashMap<DecodedInstruction> = instructions
+        .into_iter()
+        .map(|(addr, instr)| (addr, DecodedInstruction { instr, len: 4 }))
+        .collect();
     InstructionCache::from_map(&map)
 }
 

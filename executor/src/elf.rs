@@ -216,7 +216,9 @@ impl ProgramHeader {
 pub struct Segment {
     /// Base virtual address for this segment
     pub base_addr: u64,
-    /// The 32-bit instruction words in this segment
+    /// The raw 4-byte little-endian words of this segment. For executable
+    /// segments these may encode a mix of 2-byte (compressed) and 4-byte
+    /// instructions when reinterpreted as a halfword stream.
     pub values: Vec<u32>,
     /// Whether this segment is executable (has PF_X flag)
     pub is_executable: bool,
@@ -229,6 +231,11 @@ pub struct Elf {
 }
 
 pub(crate) const WORD_SIZE: u64 = 4;
+
+/// Minimum alignment for instruction addresses (entry point, executable segment
+/// base). The RV64C "C" extension allows instructions on 2-byte boundaries; the
+/// base ISA only ever produces 4-byte-aligned addresses, so 2 is the safe floor.
+const INSTRUCTION_ALIGN: u64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ElfError {
@@ -274,7 +281,9 @@ impl Elf {
             return Err(ElfError::NotExecutable);
         }
         let entry_point: u64 = elf_program.ehdr.e_entry;
-        if !entry_point.is_multiple_of(WORD_SIZE) {
+        // Instructions only need 2-byte alignment with the "C" (compressed)
+        // extension; without it everything is 4-byte aligned anyway.
+        if !entry_point.is_multiple_of(INSTRUCTION_ALIGN) {
             return Err(ElfError::InvalidEntryPoint);
         }
         let phdrs = elf_program.phdrs;
@@ -287,7 +296,7 @@ impl Elf {
             .iter()
             .filter(|program_header| program_header.p_type == PT_LOAD)
         {
-            if !program_header.p_vaddr.is_multiple_of(WORD_SIZE) {
+            if !program_header.p_vaddr.is_multiple_of(INSTRUCTION_ALIGN) {
                 return Err(ElfError::UnalignedVAddr);
             }
             let mut values = Vec::new();

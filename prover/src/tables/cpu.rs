@@ -56,7 +56,10 @@ use super::dvrm::DvrmOperation;
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use executor::vm::{
-    instruction::{decoding::Instruction, execution::SyscallNumbers},
+    instruction::{
+        decoding::{DecodedInstruction, Instruction},
+        execution::SyscallNumbers,
+    },
     logs::Log,
     memory::U64HashMap,
 };
@@ -698,8 +701,13 @@ impl CpuOperation {
     ///
     /// This creates the DecodeEntry internally. Use `from_log` with a pre-built
     /// DecodeEntry when possible to avoid redundant decoding.
-    pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
-        let decode = DecodeEntry::from_instruction(log.current_pc, instruction);
+    pub fn from_log_and_instruction(
+        log: &Log,
+        timestamp: u64,
+        instruction: Instruction,
+        c_type: bool,
+    ) -> Self {
+        let decode = DecodeEntry::from_instruction(log.current_pc, instruction, c_type);
         Self::from_log(log, timestamp, decode)
     }
 
@@ -757,11 +765,13 @@ impl CpuOperation {
         }
 
         // ECALL: Per spec constraint CO69, next_pc = pc + instr_size for all instructions,
-        // including ECALL. The CPU transition constraint enforces next_pc = pc + 4 on every
-        // row, so the trace must satisfy this even though the executor sets next_pc=0 to
-        // signal halt. The HALT table separately proves program termination via the ECALL bus.
+        // including ECALL. The CPU transition constraint enforces next_pc = pc + (4 - 2*c_type)
+        // on every row, so the trace must satisfy this even though the executor sets next_pc=0
+        // to signal halt. The HALT table separately proves program termination via the ECALL bus.
+        // (RV64C has no compressed ECALL, so c_type is false in practice, but we match the
+        // constraint exactly rather than relying on that.)
         if self.decode.op_ecall {
-            self.next_pc = self.decode.pc + 4;
+            self.next_pc = self.decode.pc + (4 - 2 * self.decode.c_type as u64);
         }
     }
 }
@@ -918,17 +928,18 @@ pub fn generate_cpu_trace(
 /// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
+        let decoded = *instructions
             .get(&log.current_pc)
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4 + 4,
-            instruction,
+            decoded.instr,
+            decoded.len == 2,
         ));
     }
     Ok(generate_cpu_trace(&operations))
@@ -947,17 +958,18 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 /// Convenience function that converts logs to operations and collects lookups.
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Result<Vec<super::bitwise::BitwiseOperation>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
+        let decoded = *instructions
             .get(&log.current_pc)
             .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4 + 4,
-            instruction,
+            decoded.instr,
+            decoded.len == 2,
         ));
     }
     Ok(collect_bitwise_ops(&operations))

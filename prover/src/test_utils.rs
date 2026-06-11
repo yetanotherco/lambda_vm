@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::decoding::{DecodedInstruction, Instruction};
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
@@ -131,7 +131,7 @@ pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
 /// Helper to run an ELF from the program_artifacts directory.
 ///
 /// Returns the ELF, execution logs, and instruction map.
-pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
+pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<DecodedInstruction>) {
     let elf_data = asm_elf_bytes(name);
     let elf = Elf::load(&elf_data).expect("Failed to load ELF");
     let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
@@ -146,13 +146,18 @@ pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
 /// Collect bitwise lookups from executor logs for minimal table generation.
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Vec<BitwiseOperation> {
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4, instruction);
+            let decoded = *instructions.get(&log.current_pc).unwrap();
+            let op = CpuOperation::from_log_and_instruction(
+                log,
+                (i as u64) * 4,
+                decoded.instr,
+                decoded.len == 2,
+            );
             op.collect_bitwise_ops()
         })
         .collect()
@@ -164,14 +169,14 @@ pub fn collect_bitwise_ops_from_logs(
 /// with the arg1, arg2, and signed values.
 pub fn collect_lt_lookups_from_logs(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Vec<LtOperation> {
     use executor::vm::instruction::decoding::{ArithOp, Comparison};
 
     let mut lookups = Vec::new();
 
     for log in logs {
-        let instruction = *instructions.get(&log.current_pc).unwrap();
+        let instruction = instructions.get(&log.current_pc).unwrap().instr;
 
         let is_slt = matches!(
             &instruction,
@@ -263,14 +268,14 @@ pub fn collect_lt_lookups_from_logs(
 /// Creates LoadOperation objects for each Load instruction in the logs.
 pub fn collect_load_ops_from_logs(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    instructions: &U64HashMap<DecodedInstruction>,
 ) -> Vec<crate::tables::load::LoadOperation> {
     use executor::vm::instruction::decoding::LoadStoreWidth;
 
     let mut load_ops = Vec::new();
 
     for log in logs {
-        let instruction = *instructions.get(&log.current_pc).unwrap();
+        let instruction = instructions.get(&log.current_pc).unwrap().instr;
 
         if let Instruction::Load { width, .. } = instruction {
             let base_address = log.src1_val.wrapping_add(match instruction {

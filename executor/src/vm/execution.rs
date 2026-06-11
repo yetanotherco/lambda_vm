@@ -4,7 +4,8 @@ use crate::{
     elf::Elf,
     vm::{
         instruction::{
-            decoding::{Instruction, InstructionError},
+            decoding::{DecodedInstruction, Instruction, InstructionError, decode_segment_words},
+            decompress::{decompress, instr_len},
             execution::ExecutionError,
         },
         logs::Log,
@@ -22,9 +23,9 @@ pub struct ReturnValues {
 pub struct ExecutionResult {
     pub return_values: ReturnValues,
     pub logs: Vec<Log>,
-    /// Predecoded instructions map (pc -> instruction)
-    /// Use this to look up instructions by their PC from the logs
-    pub instructions: U64HashMap<Instruction>,
+    /// Predecoded instructions map (pc -> decoded instruction + byte width).
+    /// Use this to look up instructions by their PC from the logs.
+    pub instructions: U64HashMap<DecodedInstruction>,
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
@@ -64,17 +65,41 @@ impl Executor {
         self.logs.clear();
 
         while self.pc != 0 && self.logs.len() < CHUNK_SIZE {
-            if !self.pc.is_multiple_of(4) {
+            // Instructions must be at least 2-byte aligned. With the RV64C "C"
+            // extension a compressed instruction can start on any 2-byte boundary
+            // (so `pc % 4 == 2` is legal); only an odd `pc` is truly misaligned.
+            if !self.pc.is_multiple_of(2) {
                 return Err(ExecutorError::InstructionAddressMisaligned(self.pc));
             }
-            let instruction = match self.instructions.get(self.pc) {
-                Some(&instr) => instr,
+            let decoded = match self.instructions.get(self.pc) {
+                Some(&decoded) => decoded,
                 None => {
-                    let next_instruction = self.memory.load_word(self.pc)?;
-                    Instruction::parse(next_instruction)?
+                    // Not predecoded (e.g. a jump outside the known segments): fetch
+                    // a halfword, and only read the second halfword if it is a 4-byte
+                    // instruction. Reading per-halfword avoids over-reading past the
+                    // end of a region that ends in a compressed instruction.
+                    let lo = self.memory.load_half(self.pc)?;
+                    if instr_len(lo) == 2 {
+                        DecodedInstruction {
+                            instr: decompress(lo)?,
+                            len: 2,
+                        }
+                    } else {
+                        let hi = self.memory.load_half(self.pc + 2)?;
+                        let word = ((hi as u32) << 16) | (lo as u32);
+                        DecodedInstruction {
+                            instr: Instruction::parse(word)?,
+                            len: 4,
+                        }
+                    }
                 }
             };
-            let log = instruction.run(&mut self.pc, &mut self.registers, &mut self.memory)?;
+            let log = decoded.instr.run(
+                &mut self.pc,
+                &mut self.registers,
+                &mut self.memory,
+                decoded.len,
+            )?;
             self.logs.push(log);
         }
 
@@ -131,13 +156,12 @@ fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result
 
 pub struct InstructionSegment {
     base_addr: u64,
-    instructions: Vec<Instruction>,
-}
-
-impl InstructionSegment {
-    fn end_addr(&self) -> u64 {
-        self.base_addr + (self.instructions.len() as u64 * 4)
-    }
+    /// Exclusive end address (`base_addr + byte length`).
+    end_addr: u64,
+    /// Decoded instructions indexed by 2-byte slot: slot `i` covers the halfword at
+    /// `base_addr + 2*i`. A slot is `Some` at an instruction start and `None` for
+    /// the second half of a 4-byte instruction (or a non-instruction tail).
+    entries: Vec<Option<DecodedInstruction>>,
 }
 
 pub struct InstructionCache {
@@ -145,39 +169,46 @@ pub struct InstructionCache {
 }
 
 impl InstructionCache {
-    /// Creates an InstructionCache from a hashmap of address -> instruction.
+    /// Creates an InstructionCache from a hashmap of address -> decoded instruction.
     /// Used for testing where we don't have real ELF segments.
-    pub fn from_map(map: &U64HashMap<Instruction>) -> Self {
+    pub fn from_map(map: &U64HashMap<DecodedInstruction>) -> Self {
         if map.is_empty() {
             return Self {
                 segments: Vec::new(),
             };
         }
 
-        let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_by_key(|(addr, _)| *addr);
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by_key(|(addr, _)| **addr);
 
         let mut segments = Vec::new();
-        let mut current_base = *entries[0].0;
-        let mut current_instructions = vec![*entries[0].1];
+        let mut base_addr = *sorted[0].0;
+        let mut entries: Vec<Option<DecodedInstruction>> = Vec::new();
+        let mut next_addr = base_addr;
 
-        for (addr, instruction) in entries.into_iter().skip(1) {
-            let expected_addr = current_base + (current_instructions.len() as u64 * 4);
-            if *addr == expected_addr {
-                current_instructions.push(*instruction);
-            } else {
+        for (&addr, &decoded) in sorted {
+            if addr != next_addr {
+                // Gap between instructions: close the current segment.
                 segments.push(InstructionSegment {
-                    base_addr: current_base,
-                    instructions: current_instructions,
+                    base_addr,
+                    end_addr: next_addr,
+                    entries: std::mem::take(&mut entries),
                 });
-                current_base = *addr;
-                current_instructions = vec![*instruction];
+                base_addr = addr;
+                next_addr = addr;
             }
+            entries.push(Some(decoded));
+            // The second halfword slot of a 4-byte instruction holds no start.
+            if decoded.len == 4 {
+                entries.push(None);
+            }
+            next_addr += decoded.len as u64;
         }
 
         segments.push(InstructionSegment {
-            base_addr: current_base,
-            instructions: current_instructions,
+            base_addr,
+            end_addr: next_addr,
+            entries,
         });
 
         Self { segments }
@@ -186,24 +217,26 @@ impl InstructionCache {
     pub fn new(segments: &[crate::elf::Segment]) -> Result<Self, InstructionError> {
         let mut result = Vec::new();
         for seg in segments.iter().filter(|s| s.is_executable) {
-            let instructions = seg
-                .values
-                .iter()
-                .map(|v| Instruction::parse(*v))
-                .collect::<Result<Vec<_>, _>>()?;
+            // Two 2-byte slots per 4-byte memory word.
+            let num_slots = seg.values.len() * 2;
+            let mut entries: Vec<Option<DecodedInstruction>> = vec![None; num_slots];
+            for (byte_offset, decoded) in decode_segment_words(&seg.values)? {
+                entries[(byte_offset / 2) as usize] = Some(decoded);
+            }
             result.push(InstructionSegment {
                 base_addr: seg.base_addr,
-                instructions,
+                end_addr: seg.base_addr + (num_slots as u64) * 2,
+                entries,
             });
         }
         Ok(Self { segments: result })
     }
 
-    pub fn get(&self, pc: u64) -> Option<&Instruction> {
+    pub fn get(&self, pc: u64) -> Option<&DecodedInstruction> {
         // Fast path: most programs have a single executable segment
         let segment = if self.segments.len() == 1 {
             let seg = &self.segments[0];
-            if pc < seg.base_addr || pc >= seg.end_addr() {
+            if pc < seg.base_addr || pc >= seg.end_addr {
                 return None;
             }
             seg
@@ -214,7 +247,7 @@ impl InstructionCache {
                 .binary_search_by(|seg| {
                     if pc < seg.base_addr {
                         Ordering::Greater
-                    } else if pc >= seg.end_addr() {
+                    } else if pc >= seg.end_addr {
                         Ordering::Less
                     } else {
                         Ordering::Equal
@@ -225,22 +258,27 @@ impl InstructionCache {
         };
 
         let byte_offset = pc - segment.base_addr;
-        if !byte_offset.is_multiple_of(4) {
+        if !byte_offset.is_multiple_of(2) {
             return None;
         }
-        segment.instructions.get((byte_offset / 4) as usize)
+        segment.entries.get((byte_offset / 2) as usize)?.as_ref()
     }
 
     pub fn instruction_count(&self) -> usize {
-        self.segments.iter().map(|s| s.instructions.len()).sum()
+        self.segments
+            .iter()
+            .map(|s| s.entries.iter().filter(|e| e.is_some()).count())
+            .sum()
     }
 
-    pub fn into_instruction_map(self) -> U64HashMap<Instruction> {
+    pub fn into_instruction_map(self) -> U64HashMap<DecodedInstruction> {
         let mut map = U64HashMap::default();
         for segment in self.segments {
-            for (i, instruction) in segment.instructions.into_iter().enumerate() {
-                let addr = segment.base_addr + (i as u64 * 4);
-                map.insert(addr, instruction);
+            let base_addr = segment.base_addr;
+            for (i, slot) in segment.entries.into_iter().enumerate() {
+                if let Some(decoded) = slot {
+                    map.insert(base_addr + (i as u64) * 2, decoded);
+                }
             }
         }
         map

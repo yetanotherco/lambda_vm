@@ -1,7 +1,7 @@
 //! Tests for the DECODE table.
 
 use executor::elf::{Elf, Segment};
-use executor::vm::instruction::decoding::{ArithOp, Instruction};
+use executor::vm::instruction::decoding::{ArithOp, DecodedInstruction, Instruction};
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 
@@ -17,6 +17,14 @@ use crate::test_utils::asm_elf_bytes;
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 use crate::{prove, verify_with_options};
+
+/// Wrap an `Instruction`-valued map as a `DecodedInstruction` map for tests that
+/// build programs by hand. All entries are treated as 4-byte (non-compressed).
+fn as_decoded(map: &U64HashMap<Instruction>) -> U64HashMap<DecodedInstruction> {
+    map.iter()
+        .map(|(&pc, &instr)| (pc, DecodedInstruction { instr, len: 4 }))
+        .collect()
+}
 
 // =========================================================================
 // Packed decode tests
@@ -346,7 +354,7 @@ fn test_from_instruction_arith() {
         op: ArithOp::Add,
     };
 
-    let entry = DecodeEntry::from_instruction(0x1000, instr);
+    let entry = DecodeEntry::from_instruction(0x1000, instr, false);
 
     assert_eq!(entry.pc, 0x1000);
     assert_eq!(entry.rd, 10);
@@ -368,7 +376,7 @@ fn test_from_instruction_arith_imm() {
         op: ArithOp::Add,
     };
 
-    let entry = DecodeEntry::from_instruction(0x1000, instr);
+    let entry = DecodeEntry::from_instruction(0x1000, instr, false);
 
     assert_eq!(entry.pc, 0x1000);
     assert_eq!(entry.rd, 10);
@@ -407,7 +415,7 @@ fn test_trace_generation_basic() {
         },
     );
 
-    let (trace, _pc_to_row) = generate_decode_trace(&instructions);
+    let (trace, _pc_to_row) = generate_decode_trace(&as_decoded(&instructions));
 
     // 2 instructions + 1 CPU padding entry = 3, padded to power of 2 = 4
     assert_eq!(trace.main_table.height, 4);
@@ -427,7 +435,7 @@ fn test_trace_multiplicities() {
         },
     );
 
-    let (mut trace, pc_to_row) = generate_decode_trace(&instructions);
+    let (mut trace, pc_to_row) = generate_decode_trace(&as_decoded(&instructions));
 
     // PC 0x1000 executed 5 times
     let lookups = vec![0x1000, 0x1000, 0x1000, 0x1000, 0x1000];
@@ -470,7 +478,7 @@ fn test_trace_multiple_instructions_different_multiplicities() {
         },
     );
 
-    let (mut trace, pc_to_row) = generate_decode_trace(&instructions);
+    let (mut trace, pc_to_row) = generate_decode_trace(&as_decoded(&instructions));
 
     // 0x1000 executed 3 times, 0x1004 executed 7 times
     let lookups = vec![
@@ -529,7 +537,7 @@ fn test_trace_padding_to_power_of_two() {
         },
     );
 
-    let (trace, _pc_to_row) = generate_decode_trace(&instructions);
+    let (trace, _pc_to_row) = generate_decode_trace(&as_decoded(&instructions));
 
     // 3 instructions + 1 CPU padding entry = 4, already power of 2
     assert_eq!(
@@ -572,7 +580,7 @@ fn test_trace_dword_encoding() {
         },
     );
 
-    let (trace, _pc_to_row) = generate_decode_trace(&instructions);
+    let (trace, _pc_to_row) = generate_decode_trace(&as_decoded(&instructions));
 
     // Find the row (could be row 0 or 1 due to HashMap ordering)
     let mut found = false;
@@ -648,8 +656,8 @@ fn test_compute_precomputed_commitment_deterministic() {
 
     let options = ProofOptions::default_test_options();
 
-    let commitment1 = compute_precomputed_commitment(&instructions, &options);
-    let commitment2 = compute_precomputed_commitment(&instructions, &options);
+    let commitment1 = compute_precomputed_commitment(&as_decoded(&instructions), &options);
+    let commitment2 = compute_precomputed_commitment(&as_decoded(&instructions), &options);
 
     assert_eq!(
         commitment1, commitment2,
@@ -688,8 +696,8 @@ fn test_compute_precomputed_commitment_different_programs() {
         },
     );
 
-    let commitment_a = compute_precomputed_commitment(&program_a, &options);
-    let commitment_b = compute_precomputed_commitment(&program_b, &options);
+    let commitment_a = compute_precomputed_commitment(&as_decoded(&program_a), &options);
+    let commitment_b = compute_precomputed_commitment(&as_decoded(&program_b), &options);
 
     assert_ne!(
         commitment_a, commitment_b,
@@ -728,8 +736,8 @@ fn test_compute_precomputed_commitment_different_pc() {
         },
     );
 
-    let commitment_a = compute_precomputed_commitment(&program_a, &options);
-    let commitment_b = compute_precomputed_commitment(&program_b, &options);
+    let commitment_a = compute_precomputed_commitment(&as_decoded(&program_a), &options);
+    let commitment_b = compute_precomputed_commitment(&as_decoded(&program_b), &options);
 
     assert_ne!(
         commitment_a, commitment_b,
@@ -766,8 +774,10 @@ fn test_instructions_from_elf_matches_executor() {
             .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare by converting to DecodeEntry - this is what the DECODE table uses
-        let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
-        let verifier_entry = DecodeEntry::from_instruction(*pc, *verifier_instr);
+        let executor_entry =
+            DecodeEntry::from_instruction(*pc, executor_instr.instr, executor_instr.len == 2);
+        let verifier_entry =
+            DecodeEntry::from_instruction(*pc, verifier_instr.instr, verifier_instr.len == 2);
 
         assert_eq!(
             executor_entry.packed_decode(),
@@ -788,6 +798,52 @@ fn test_instructions_from_elf_matches_executor() {
         verifier_instructions.len() >= executor_instructions.len(),
         "Verifier should have at least as many instructions as executor"
     );
+}
+
+/// RV64C: instructions_from_elf marks 2-byte instructions with c_type, and the
+/// executor and verifier decoders agree on the compressed program.
+#[test]
+fn test_instructions_from_elf_compressed_c_type() {
+    let (_elf, _logs, executor_instructions) = run_asm_elf("test_compressed");
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/test_compressed.elf");
+    let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let verifier_instructions =
+        instructions_from_elf(&elf).expect("Failed to extract instructions");
+
+    // The program really contains compressed instructions.
+    let compressed = verifier_instructions
+        .values()
+        .filter(|d| d.len == 2)
+        .count();
+    assert!(compressed > 0, "expected compressed instructions in ELF");
+
+    // Every executed instruction's DECODE entry carries the right c_type, and the
+    // executor and verifier decoders agree exactly on instruction width.
+    for (pc, executor_instr) in executor_instructions.iter() {
+        let verifier_instr = verifier_instructions
+            .get(pc)
+            .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
+        assert_eq!(
+            executor_instr.len, verifier_instr.len,
+            "instruction width mismatch at PC {:#x}",
+            pc
+        );
+
+        let c_type = executor_instr.len == 2;
+        let entry = DecodeEntry::from_instruction(*pc, executor_instr.instr, c_type);
+        let c_type_bit_set = entry.packed_decode() & (1u64 << bits::C_TYPE) != 0;
+        assert_eq!(
+            c_type_bit_set, c_type,
+            "c_type bit in packed_decode wrong at PC {:#x}",
+            pc
+        );
+    }
 }
 
 /// Test instructions_from_elf with a more complex program.
@@ -813,8 +869,10 @@ fn test_instructions_from_elf_matches_executor_complex() {
             .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare via DecodeEntry
-        let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
-        let verifier_entry = DecodeEntry::from_instruction(*pc, *verifier_instr);
+        let executor_entry =
+            DecodeEntry::from_instruction(*pc, executor_instr.instr, executor_instr.len == 2);
+        let verifier_entry =
+            DecodeEntry::from_instruction(*pc, verifier_instr.instr, verifier_instr.len == 2);
 
         assert_eq!(
             executor_entry.packed_decode(),

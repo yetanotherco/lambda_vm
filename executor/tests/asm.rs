@@ -37,6 +37,34 @@ fn test_private_input_memory_mapped() {
     assert_eq!(result.return_values.memory_values, input[4..12].to_vec());
 }
 
+/// RV64C: a self-checking program built almost entirely from compressed (2-byte)
+/// instructions. `a0` (the exit code) is 0 only if every compressed-instruction
+/// check produced the expected result. We also assert the ELF really contains
+/// 2-byte instructions, so the test cannot silently pass on a non-compressed build.
+#[test]
+fn test_compressed() {
+    let elf_data = std::fs::read("./program_artifacts/asm/test_compressed.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    assert_eq!(
+        result.return_values.register_values.0, 0,
+        "compressed self-check failed (a0 = {})",
+        result.return_values.register_values.0
+    );
+
+    let num_compressed = result
+        .instructions
+        .values()
+        .filter(|decoded| decoded.len == 2)
+        .count();
+    assert!(
+        num_compressed > 0,
+        "expected 2-byte (compressed) instructions in test_compressed.elf"
+    );
+}
+
 #[test]
 fn test_basic_program() {
     run_program("./program_artifacts/asm/basic_program.elf");
@@ -472,21 +500,28 @@ fn test_misalign_sd() {
     run_program("./program_artifacts/asm/misalign_sd.elf");
 }
 
+/// With the RV64C "C" extension a 2-byte-aligned PC is a valid instruction address,
+/// so jumping to pc=2 (which is not 4-aligned) must NOT raise
+/// `InstructionAddressMisaligned` — only an odd PC is misaligned, and that is
+/// unreachable via jalr/jal/branch (their targets are always even). `misaligned_pc.s`
+/// jumps to pc=2 where there is no instruction, so the executor fails to decode
+/// rather than trapping on alignment. This guards against the fetch alignment check
+/// regressing back to 4-byte (which would break compressed instructions).
 #[test]
-fn test_misaligned_pc_traps() {
+fn test_2byte_aligned_pc_not_misaligned() {
     let elf_data = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
     let program = Elf::load(&elf_data).unwrap();
     let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
     let err = loop {
         match executor.resume() {
             Ok(Some(_)) => continue,
-            Ok(None) => panic!("expected misaligned PC trap, program halted normally"),
+            Ok(None) => panic!("expected a decode error jumping to pc=2, program halted normally"),
             Err(e) => break e,
         }
     };
     assert!(
-        matches!(err, ExecutorError::InstructionAddressMisaligned(2)),
-        "expected InstructionAddressMisaligned(2), got {:?}",
+        !matches!(err, ExecutorError::InstructionAddressMisaligned(_)),
+        "pc=2 is 2-byte aligned and must not trap as misaligned with the C extension; got {:?}",
         err
     );
 }
