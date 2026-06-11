@@ -367,47 +367,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ]
 }
 
-/// Compute virtual carry[0] and carry[1] for the addition rhs + lhs_sub_rhs = lhs
-///
-/// From spec:
-/// carry[0] = 2^(-32) * (rhs[0] + cast(lhs_sub_rhs, DWordWL)[0] - lhs[0])
-/// carry[1] = 2^(-32) * (cast(rhs, DWordWL)[1] + cast(lhs_sub_rhs, DWordWL)[1] + carry[0] - cast(lhs, DWordWL)[1])
-///
-/// Note: carry[1] = 1 means lhs < rhs (unsigned), because the subtraction borrowed
-pub fn compute_carries(lhs: u64, rhs: u64, lhs_sub_rhs: u64) -> (u64, u64) {
-    // Cast to DWordWL format (2 words)
-    let lhs_lo = lhs & 0xFFFF_FFFF;
-    let lhs_hi = lhs >> 32;
-
-    let rhs_lo = rhs & 0xFFFF_FFFF;
-    let rhs_hi = rhs >> 32;
-
-    let sub_lo = lhs_sub_rhs & 0xFFFF_FFFF;
-    let sub_hi = lhs_sub_rhs >> 32;
-
-    // carry[0] = (rhs_lo + sub_lo - lhs_lo) / 2^32
-    // This should be 0 or 1 (or -1 in some representations)
-    let sum_lo = rhs_lo + sub_lo;
-    let carry_0 = if sum_lo >= lhs_lo {
-        (sum_lo - lhs_lo) >> 32
-    } else {
-        // This shouldn't happen if lhs_sub_rhs is computed correctly
-        0
-    };
-
-    // carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32
-    let sum_hi = rhs_hi + sub_hi + carry_0;
-    let carry_1 = if sum_hi >= lhs_hi {
-        (sum_hi - lhs_hi) >> 32
-    } else {
-        // This indicates lhs < rhs (unsigned)
-        // In field arithmetic, this would be handled differently
-        1
-    };
-
-    (carry_0, carry_1)
-}
-
 // =========================================================================
 // Constraints
 // =========================================================================

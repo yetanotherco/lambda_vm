@@ -10,7 +10,7 @@
 //!
 //! Note: the `MEMW` *write* fingerprint carries no `old` value — the
 //! previous memory contents are handled inside the MEMW table. So STORE needs
-//! no `old` column (mirrors the current CPU store sender, `cpu.rs:1672-1748`).
+//! no `old` column (the MEMW *write* fingerprint omits `old`).
 //!
 //! ## Columns
 //! - `base_address`: DWordWL (2 words) — effective write address
@@ -131,7 +131,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(10);
 
     // MEMW[0, base_address, value, timestamp, write2, write4, write8] (write,
-    // 16 elements, no `old`). Mirrors cpu.rs:1672-1748.
+    // 16 elements, no `old`).
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),

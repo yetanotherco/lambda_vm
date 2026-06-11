@@ -114,8 +114,10 @@ pub enum BusId {
     // Byte ALU (BITWISE table provides)
     // =========================================================================
     /// Unified byte-level ALU lookup: `BYTE_ALU[opsel, X, Y] -> out`, where
-    /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2). Collapses the
-    /// separate `AndByte`/`OrByte`/`XorByte` buses into one.
+    /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2). A single
+    /// op-selectable bus used by the rework chips (`CPU32`/`BYTEWISE`); the
+    /// per-op `AndByte`/`OrByte`/`XorByte` buses remain in use elsewhere
+    /// (`BRANCH`/`SHIFT`/keccak).
     ByteAlu = 24,
 
     // =========================================================================
