@@ -14,6 +14,7 @@ log "apt update + upgrade"
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 LLVM_VERSION="${LLVM_VERSION:-21}"
+LLVM_GPG_FINGERPRINT="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
 
 # Scaleway baremetal Debian ships grub-cloud-amd64; its postinst (fired as a
 # trigger by initramfs-tools / shim-signed / kernel upgrades) runs grub-install
@@ -41,6 +42,15 @@ if [ -z "$LLVM_CODENAME" ]; then
 fi
 install -d -m 0755 /etc/apt/keyrings
 wget -qO /etc/apt/keyrings/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+if ! LLVM_ACTUAL_FINGERPRINT="$(gpg --show-keys --with-colons /etc/apt/keyrings/apt.llvm.org.asc 2>/dev/null \
+    | awk -F: '/^fpr:/ { print $10; exit }')"; then
+    echo "ERROR: could not read apt.llvm.org GPG key fingerprint" >&2
+    exit 1
+fi
+if [ "$LLVM_ACTUAL_FINGERPRINT" != "$LLVM_GPG_FINGERPRINT" ]; then
+    echo "ERROR: apt.llvm.org GPG key fingerprint mismatch (got $LLVM_ACTUAL_FINGERPRINT, expected $LLVM_GPG_FINGERPRINT)" >&2
+    exit 1
+fi
 chmod 0644 /etc/apt/keyrings/apt.llvm.org.asc
 cat > /etc/apt/sources.list.d/apt.llvm.org.list <<EOF
 deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/$LLVM_CODENAME/ llvm-toolchain-$LLVM_CODENAME-$LLVM_VERSION main
