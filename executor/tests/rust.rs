@@ -293,10 +293,9 @@ fn test_ethrex() {
 }
 
 /// Executes a stateless ethrex block containing a single (plain ETH transfer)
-/// transaction. Execution only — no proving — against main's software-keccak
-/// `ethrex.elf`. The fixture is a serialized `ProgramInput` for the ethrex
-/// commit pinned in this crate's Cargo.lock. The VM's public output is checked
-/// against a native run of `execution_program`, mirroring `test_ethrex`.
+/// transaction. Execution only — no proving — against the ethrex guest ELF
+/// built from the same pinned ethrex revision as the native reference. The
+/// fixture is a serialized `ProgramInput`; see `tests/README.md` for provenance.
 #[test]
 fn test_ethrex_simple_tx() {
     use guest_program::{execution::execution_program, input::ProgramInput};
