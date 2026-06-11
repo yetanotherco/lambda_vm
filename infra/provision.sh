@@ -13,6 +13,7 @@ log() { printf '\n=== %s ===\n' "$*"; }
 log "apt update + upgrade"
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+LLVM_VERSION="${LLVM_VERSION:-21}"
 
 # Scaleway baremetal Debian ships grub-cloud-amd64; its postinst (fired as a
 # trigger by initramfs-tools / shim-signed / kernel upgrades) runs grub-install
@@ -24,11 +25,37 @@ apt-get update -y
 apt-get upgrade "${APT_OPTS[@]}"
 
 # --- 2. apt packages ---------------------------------------------------------
-log "apt install base packages + clang/lld/llvm + xz-utils"
+log "apt install base packages + xz-utils"
 apt-get install "${APT_OPTS[@]}" \
     ca-certificates curl wget gnupg vim git zip unzip openssl libssl-dev jq \
-    build-essential rsyslog htop rsync pkg-config locales ufw \
-    clang lld llvm xz-utils
+    build-essential rsyslog htop rsync pkg-config locales ufw xz-utils
+
+# Debian's default clang can lag behind RISC-V ISA attribute syntax emitted by
+# the checked-in assembly fixtures. Use a pinned apt.llvm.org toolchain.
+log "LLVM $LLVM_VERSION toolchain from apt.llvm.org"
+. /etc/os-release
+LLVM_CODENAME="${VERSION_CODENAME:-}"
+if [ -z "$LLVM_CODENAME" ]; then
+    echo "ERROR: could not determine Debian/Ubuntu codename from /etc/os-release" >&2
+    exit 1
+fi
+install -d -m 0755 /etc/apt/keyrings
+wget -qO /etc/apt/keyrings/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+chmod 0644 /etc/apt/keyrings/apt.llvm.org.asc
+cat > /etc/apt/sources.list.d/apt.llvm.org.list <<EOF
+deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/$LLVM_CODENAME/ llvm-toolchain-$LLVM_CODENAME-$LLVM_VERSION main
+EOF
+apt-get update -y
+apt-get install "${APT_OPTS[@]}" "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION"
+for tool in clang clang++ lld ld.lld llvm-ar llvm-ranlib; do
+    versioned="/usr/bin/$tool-$LLVM_VERSION"
+    if [ ! -x "$versioned" ]; then
+        echo "ERROR: expected $versioned after installing LLVM $LLVM_VERSION" >&2
+        exit 1
+    fi
+    ln -sf "$versioned" "/usr/local/bin/$tool"
+done
+clang --version | head -n 1
 
 # --- 3. users: admin (sudo) + app (no sudo) ----------------------------------
 log "users: admin (sudo) + app (no sudo)"

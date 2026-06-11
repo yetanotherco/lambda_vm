@@ -88,6 +88,7 @@ Everything has a working default; override via env var only when needed.
 | `READY_TIMEOUT` | `1800` (s) | `rent_baremetal.sh` | How long to wait for `status=ready && install.status=completed`. |
 | `PROVISION_FILE` | `<script_dir>/provision.sh` | both wrappers | Path to the remote provisioning script. |
 | `SSH_USER` | `root` | `provision_server.sh` | Switch to `admin` for re-runs after sshd hardening. |
+| `LLVM_VERSION` | `21` | `provision.sh` | LLVM major installed from apt.llvm.org for RISC-V assembly builds. |
 
 ### `SCW_TYPE` options
 
