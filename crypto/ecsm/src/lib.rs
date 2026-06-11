@@ -102,8 +102,7 @@ pub(crate) fn prepare(
 /// to guest memory at `addr_xR`.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    let (_steps, result) = replay_double_and_add(&k, &g);
-    Ok(to_le_32(&result.x))
+    Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
 }
 
 #[cfg(test)]

@@ -8,3 +8,7 @@ license.workspace = true
 [dependencies]
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
+# Audited secp256k1 arithmetic (host-side witness generation only; never in the
+# constraint system). Used for the projective double-and-add replay + batch
+# inversion that builds the ECDAS step witnesses efficiently.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }

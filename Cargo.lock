@@ -954,6 +954,7 @@ dependencies = [
 name = "ecsm"
 version = "0.1.0"
 dependencies = [
+ "k256",
  "num-bigint 0.4.6",
  "num-traits",
 ]
