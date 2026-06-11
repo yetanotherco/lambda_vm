@@ -194,7 +194,7 @@ fn prove_verify_epoch(
     let airs = VmAirs::new(
         elf,
         opts,
-        true,
+        false,
         &traces.page_configs,
         &table_counts,
         None,
