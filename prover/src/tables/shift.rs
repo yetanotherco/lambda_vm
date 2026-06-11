@@ -13,8 +13,8 @@
 //! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (11 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5)
+//! ## Bus Interactions (15 total)
+//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
 //! - Receiver: SHIFT (from CPU)
 
 use math::field::element::FieldElement;
@@ -377,7 +377,7 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(11);
+    let mut interactions = Vec::with_capacity(15);
 
     // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(

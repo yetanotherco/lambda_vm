@@ -621,7 +621,7 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BITWISE")
 }
 
-/// Create LT AIR with bus interactions.
+/// Create LT AIR with constraints and bus interactions.
 pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
     let (constraints, _) = lt_constraints(0);
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
@@ -763,7 +763,7 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("DECODE")
 }
 
-/// Create MUL AIR with bus interactions.
+/// Create MUL AIR with constraints and bus interactions.
 pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
     let (constraints, _) = mul_constraints(0);
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =

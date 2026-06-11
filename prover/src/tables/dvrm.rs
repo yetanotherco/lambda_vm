@@ -22,7 +22,7 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
+//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
 //! - Sender: LT (×1 for abs_r < abs_d)
 //! - Sender: MUL (×2 for n_sub_r = d * q verification)
