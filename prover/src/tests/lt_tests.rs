@@ -1,7 +1,11 @@
 //! Tests for the LT (Less-Than) table.
 
-use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
+use stark::proof::options::ProofOptions;
+use stark::traits::AIR;
+
+use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace, lt_constraints};
 use crate::tables::types::FE;
+use crate::test_utils::{busless_air, create_lt_air, in_chip_constraint_count, validate_busless};
 
 /// Signed comparison flag
 const SIGNED: bool = true;
@@ -167,4 +171,41 @@ fn test_bus_interactions_count() {
     // — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
     // timestamp / |r|<|d| checks) = 9.
     assert_eq!(interactions.len(), 9);
+}
+
+// Soundness regression: `lt` must equal `(lhs < rhs)`. The in-chip constraints were
+// dead code until they were wired into the production `create_lt_air`, so a prover
+// could certify a false comparison (and, via the memory-timestamp LT bus, forge
+// memory consistency). These guard against reintroducing that hole.
+
+/// Enforcement: a forged `lt = 1` for `20 <u 10` (true result 0) is rejected by
+/// `LtFormula`, evaluated in isolation over a bus-less AIR.
+#[test]
+fn test_lt_rejects_false_comparison() {
+    let air = busless_air(cols::NUM_COLUMNS, lt_constraints(0).0);
+    let mut trace = generate_lt_trace(&[LtOperation::new(20, 10, UNSIGNED)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest LT row (20 <u 10 = 0) must validate"
+    );
+
+    trace.set_main(0, cols::LT, FE::one());
+    assert!(
+        !validate_busless(&air, &trace),
+        "forged lt=1 for 20<u10 must be rejected by LtFormula"
+    );
+}
+
+/// Wiring: `create_lt_air` registers the in-chip constraints on top of its bus
+/// constraints. Directly catches a revert to `transition_constraints = vec![]`.
+#[test]
+fn test_lt_air_wires_in_chip_constraints() {
+    let air = create_lt_air(&ProofOptions::default_test_options());
+    let in_chip = in_chip_constraint_count(
+        air.num_transition_constraints(),
+        cols::NUM_COLUMNS,
+        bus_interactions(),
+    );
+    assert_eq!(in_chip, lt_constraints(0).0.len());
+    assert_eq!(lt_constraints(0).0.len(), 3);
 }

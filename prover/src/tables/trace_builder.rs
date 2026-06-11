@@ -1304,15 +1304,29 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
 ///
 /// MUL sends MSB16 lookups when signed=1 to extract sign bits,
-/// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
+/// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
+/// and IS_B20 lookups for carry range checks.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
+    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 20);
 
     // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
     for (op, _wants_hi) in mul_ops {
         let (lo, hi) = op.compute_product();
+
+        // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
+        // in mul::bus_interactions).
+        for word in [op.lhs, op.rhs] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
 
         // IS_HALF for lo halfwords
         for shift in [0, 16, 32, 48] {
@@ -1376,16 +1390,32 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 
 /// Collects bitwise lookups from DVRM operations.
 ///
-/// Generates: IS_HALF (×12), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
+/// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
+/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op.
 ///
-/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are assumptions enforced by the CPU sender,
-/// not by the DVRM table. Only constraint-level IS_HALF lookups are generated here.
+/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
+/// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
+/// are collected here alongside the constraint-level ones.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
+    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
 
     for (op, _wants_remainder) in dvrm_ops {
+        // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
+        // half-limbs so a prover cannot supply non-canonical halves (matches the
+        // n/d IS_HALF senders in dvrm::bus_interactions).
+        for word in [op.n, op.d] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((word >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+
         // IS_HALF for r[0..4] (DVRM-C13)
         let r = op.compute_remainder();
         for shift in [0, 16, 32, 48] {

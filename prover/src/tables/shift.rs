@@ -13,8 +13,8 @@
 //! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (11 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5)
+//! ## Bus Interactions (15 total)
+//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
 //! - Receiver: SHIFT (from CPU)
 
 use math::field::element::FieldElement;
@@ -419,7 +419,7 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(11);
+    let mut interactions = Vec::with_capacity(15);
 
     // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(
@@ -700,6 +700,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             packing: Packing::Direct,
         }],
     ));
+
+    // VM-3: range-check every input half `in[i]` as a 16-bit value, unconditionally
+    // on every active row. The SHIFT bus carries only the *packed* operand, so
+    // without these a non-canonical half-decomposition that wraps in the field
+    // (keeping the packed word constant) would be invisible to the caller while
+    // still changing the shifted output.
+    for input_col in cols::IN {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: input_col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     interactions
 }
@@ -1055,6 +1071,16 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             (half & 0xFF) as u8,
             (half >> 8) as u8,
         ));
+
+        // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+        // active row — matches the four IS_HALF senders added in `bus_interactions`.
+        for i in 0..4 {
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (op.in_halves[i] & 0xFF) as u8,
+                (op.in_halves[i] >> 8) as u8,
+            ));
+        }
     }
 
     bitwise_ops
