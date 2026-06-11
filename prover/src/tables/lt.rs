@@ -435,6 +435,15 @@ pub enum LtConstraintKind {
     Carry1IsBit,
     /// LT formula constraint
     LtFormula,
+    /// `out = lt XOR invert`, i.e. `out - (lt + invert - 2*lt*invert) = 0`
+    /// (`lt.toml:159`). The ALU bus consumes `out`, while `LtFormula` only binds
+    /// `lt` — without this the `out` column (used for BGE/BGEU via `invert`) is
+    /// free and any comparison result can be forged.
+    OutXorInvert,
+    /// IS_BIT constraint on `invert` (`lt:c:range_invert`).
+    InvertIsBit,
+    /// IS_BIT constraint on `signed` (`lt:c:range_signed`).
+    SignedIsBit,
 }
 
 impl LtConstraint {
@@ -561,6 +570,24 @@ impl LtConstraint {
                 // Constraint: lt - expected_lt = 0
                 lt - expected_lt
             }
+            LtConstraintKind::OutXorInvert => {
+                // out = lt XOR invert = lt + invert - 2*lt*invert
+                let out = step.get_main_evaluation_element(0, cols::OUT).clone();
+                let lt = step.get_main_evaluation_element(0, cols::LT).clone();
+                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
+                let two = FieldElement::<F>::from(2u64);
+                out - (&lt + &invert - two * &lt * &invert)
+            }
+            LtConstraintKind::InvertIsBit => {
+                // invert * (1 - invert) = 0
+                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
+                &invert * (one - &invert)
+            }
+            LtConstraintKind::SignedIsBit => {
+                // signed * (1 - signed) = 0
+                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
+                &signed * (one - &signed)
+            }
         }
     }
 }
@@ -573,6 +600,11 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint
             LtConstraintKind::Carry1IsBit => 2,
             // LT formula involves products like signed * A * (1-B)
             LtConstraintKind::LtFormula => 3,
+            // out - (lt + invert - 2*lt*invert): the lt*invert product is degree 2
+            LtConstraintKind::OutXorInvert => 2,
+            // X*(1-X)
+            LtConstraintKind::InvertIsBit => 2,
+            LtConstraintKind::SignedIsBit => 2,
         }
     }
 
@@ -606,6 +638,23 @@ pub fn lt_constraints(constraint_idx_start: usize) -> (Vec<LtConstraint>, usize)
             i
         }),
         LtConstraint::new(LtConstraintKind::LtFormula, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        // out = lt XOR invert (binds the ALU-bus-consumed `out` column).
+        LtConstraint::new(LtConstraintKind::OutXorInvert, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        // Range-check the boolean flags that drive the formula / bus.
+        LtConstraint::new(LtConstraintKind::InvertIsBit, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        LtConstraint::new(LtConstraintKind::SignedIsBit, {
             let i = idx;
             idx += 1;
             i

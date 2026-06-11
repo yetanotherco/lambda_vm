@@ -493,6 +493,13 @@ pub enum LoadConstraintKind {
     ExtensionMid(usize),
     /// !read2 && !read4 && !read8 => res[1] = signed * sign_bit * 255
     ExtensionLow,
+    /// `IS_BIT<flag>`: `flag * (1 - flag) = 0` for a boolean flag used as a bus
+    /// multiplicity / extension selector (`load.toml` `signed`/`read2`/`read4`/
+    /// `read8`). `usize` is the flag column.
+    FlagIsBit(usize),
+    /// `IS_BIT<read2 + read4 + read8>`: the width selector sum is boolean, so
+    /// `read1 = μ − sum` is well-formed (`load.toml:107-109`).
+    WidthSumIsBit,
 }
 
 /// LOAD table constraint.
@@ -550,6 +557,16 @@ impl LoadConstraint {
                 let expected = &signed * &sign_bit * &ff;
                 (&one - &read2 - &read4 - &read8) * (&res_1 - &expected)
             }
+            LoadConstraintKind::FlagIsBit(col) => {
+                // flag * (1 - flag) = 0
+                let flag = step.get_main_evaluation_element(0, col).clone();
+                &flag * (&one - &flag)
+            }
+            LoadConstraintKind::WidthSumIsBit => {
+                // sum * (1 - sum) = 0, sum = read2 + read4 + read8
+                let sum = &read2 + &read4 + &read8;
+                &sum * (&one - &sum)
+            }
         }
     }
 }
@@ -563,6 +580,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
             LoadConstraintKind::ExtensionHigh(_) => 3,
             LoadConstraintKind::ExtensionMid(_) => 3,
             LoadConstraintKind::ExtensionLow => 3,
+            // flag * (1 - flag) and sum * (1 - sum)
+            LoadConstraintKind::FlagIsBit(_) => 2,
+            LoadConstraintKind::WidthSumIsBit => 2,
         }
     }
 
@@ -587,6 +607,16 @@ pub fn constraints()
     > = Vec::new();
 
     let mut idx = 0;
+
+    // IS_BIT on the width/sign flags (used as bus multiplicities + extension
+    // selectors): signed, read2, read4, read8 (`load.toml` `all` group).
+    for flag_col in [cols::SIGNED, cols::READ2, cols::READ4, cols::READ8] {
+        constraints.push(LoadConstraint::new(LoadConstraintKind::FlagIsBit(flag_col), idx).boxed());
+        idx += 1;
+    }
+    // IS_BIT on the width-selector sum (so read1 = μ − sum is well-formed).
+    constraints.push(LoadConstraint::new(LoadConstraintKind::WidthSumIsBit, idx).boxed());
+    idx += 1;
 
     // (read2 + read4 + read8) => μ
     constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx).boxed());

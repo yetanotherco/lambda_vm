@@ -207,5 +207,27 @@ fn test_lt_air_wires_in_chip_constraints() {
         bus_interactions(),
     );
     assert_eq!(in_chip, lt_constraints(0).0.len());
-    assert_eq!(lt_constraints(0).0.len(), 3);
+    // Carry0IsBit, Carry1IsBit, LtFormula, OutXorInvert, InvertIsBit, SignedIsBit.
+    assert_eq!(lt_constraints(0).0.len(), 6);
+}
+
+/// Enforcement (this branch's unified-ALU-bus layout): the bus consumes `out`,
+/// not `lt`. A forged `out` (e.g. `out = 1` while `lt = invert = 0`) must be
+/// rejected by `OutXorInvert`. This is the hole `LtFormula` alone does NOT close
+/// here, since `LtFormula` only binds `lt`.
+#[test]
+fn test_lt_rejects_forged_out() {
+    let air = busless_air(cols::NUM_COLUMNS, lt_constraints(0).0);
+    // 20 <u 10 = 0 and invert = 0 ⇒ out must be 0.
+    let mut trace = generate_lt_trace(&[LtOperation::new(20, 10, UNSIGNED)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest LT row (out = lt XOR invert = 0) must validate"
+    );
+
+    trace.set_main(0, cols::OUT, FE::one());
+    assert!(
+        !validate_busless(&air, &trace),
+        "forged out=1 (lt=invert=0) must be rejected by OutXorInvert"
+    );
 }

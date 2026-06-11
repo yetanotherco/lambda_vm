@@ -739,6 +739,10 @@ pub enum ShiftConstraintKind {
     LimbShiftIsBit(usize),
     /// SHIFT-C12.i: out[i] - (shifted::DWordWL)[i] = 0
     OutputMatchesShifted(usize),
+    /// `IS_BIT<flag>`: `flag * (1 - flag) = 0` for a boolean flag used as a bus
+    /// multiplicity / shift selector (`shift:c:direction|signed|word_instr`).
+    /// `usize` is the flag column.
+    FlagIsBit(usize),
 }
 
 pub struct ShiftConstraint {
@@ -889,6 +893,12 @@ impl ShiftConstraint {
                 let half_hi = Self::compute_shifted_half(2 * i + 1, step);
                 out - half_lo - half_hi * shift_16
             }
+            ShiftConstraintKind::FlagIsBit(col) => {
+                // flag * (1 - flag) = 0
+                let flag = step.get_main_evaluation_element(0, col).clone();
+                let one = FieldElement::<F>::one();
+                &flag * (one - &flag)
+            }
         }
     }
 }
@@ -902,6 +912,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
             ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
             ShiftConstraintKind::LimbShiftIsBit(_) => 2,
             ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
+            ShiftConstraintKind::FlagIsBit(_) => 2,
         }
     }
 
@@ -920,8 +931,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
 
 /// Number of polynomial constraints in the SHIFT table.
 // 1 (DirectionImpliesMu) + 4 (ZbsOverrideX) + 1 (ZbsOverrideX4) + 4 (ZbsOverrideY)
-// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) = 16
-pub const NUM_SHIFT_CONSTRAINTS: usize = 16;
+// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) + 3 (FlagIsBit) = 19
+pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
 
 /// Creates all polynomial constraints for the SHIFT table.
 pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, usize) {
@@ -957,6 +968,12 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
     // C12.i: out[i] - (shifted::DWordWL)[i] = 0
     for i in 0..2 {
         push(ShiftConstraintKind::OutputMatchesShifted(i));
+    }
+
+    // IS_BIT[direction|signed|word_instr] (shift.toml `range` group): these flags
+    // drive bus multiplicities / shift selectors, so they must be boolean.
+    for flag_col in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR] {
+        push(ShiftConstraintKind::FlagIsBit(flag_col));
     }
 
     debug_assert_eq!(constraints.len(), NUM_SHIFT_CONSTRAINTS);
@@ -1071,7 +1088,6 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             (half & 0xFF) as u8,
             (half >> 8) as u8,
         ));
-
         // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
         // active row — matches the four IS_HALF senders added in `bus_interactions`.
         for i in 0..4 {
