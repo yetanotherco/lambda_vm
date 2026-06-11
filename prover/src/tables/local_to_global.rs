@@ -123,24 +123,24 @@ pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> HashMap<u64, (u
 // =========================================================================
 
 /// Column indices for the local-to-global table: one row per touched cell.
-/// Each `u64` field is split into lo/hi 32-bit words (a full `u64` does not fit
-/// a single Goldilocks element).
+/// Address and timestamp are split into lo/hi 32-bit words (a full `u64` does
+/// not fit a single Goldilocks element); value is a single byte (byte-granular
+/// RAM) and epoch is a single small counter.
 pub mod cols {
     pub const ADDRESS_LO: usize = 0;
     pub const ADDRESS_HI: usize = 1;
-    pub const INIT_VALUE_LO: usize = 2;
-    pub const INIT_VALUE_HI: usize = 3;
+    /// Value is a single byte (RAM is byte-granular), like PAGE's `value`.
+    pub const INIT_VALUE: usize = 2;
     /// Epoch is a small counter — a single column (no hi word).
-    pub const INIT_EPOCH: usize = 4;
-    pub const INIT_TIMESTAMP_LO: usize = 5;
-    pub const INIT_TIMESTAMP_HI: usize = 6;
-    pub const FINI_VALUE_LO: usize = 7;
-    pub const FINI_VALUE_HI: usize = 8;
-    pub const FINI_EPOCH: usize = 9;
-    pub const FINI_TIMESTAMP_LO: usize = 10;
-    pub const FINI_TIMESTAMP_HI: usize = 11;
+    pub const INIT_EPOCH: usize = 3;
+    pub const INIT_TIMESTAMP_LO: usize = 4;
+    pub const INIT_TIMESTAMP_HI: usize = 5;
+    pub const FINI_VALUE: usize = 6;
+    pub const FINI_EPOCH: usize = 7;
+    pub const FINI_TIMESTAMP_LO: usize = 8;
+    pub const FINI_TIMESTAMP_HI: usize = 9;
 
-    pub const NUM_COLUMNS: usize = 12;
+    pub const NUM_COLUMNS: usize = 10;
 }
 
 // =========================================================================
@@ -159,13 +159,11 @@ pub fn generate_local_to_global_trace(
         let base = row * cols::NUM_COLUMNS;
         data[base + cols::ADDRESS_LO] = FE::from(b.address & 0xFFFF_FFFF);
         data[base + cols::ADDRESS_HI] = FE::from(b.address >> 32);
-        data[base + cols::INIT_VALUE_LO] = FE::from(b.init.value & 0xFFFF_FFFF);
-        data[base + cols::INIT_VALUE_HI] = FE::from(b.init.value >> 32);
+        data[base + cols::INIT_VALUE] = FE::from(b.init.value & 0xFF);
         data[base + cols::INIT_EPOCH] = FE::from(b.init.originating_epoch);
         data[base + cols::INIT_TIMESTAMP_LO] = FE::from(b.init.timestamp & 0xFFFF_FFFF);
         data[base + cols::INIT_TIMESTAMP_HI] = FE::from(b.init.timestamp >> 32);
-        data[base + cols::FINI_VALUE_LO] = FE::from(b.fini.value & 0xFFFF_FFFF);
-        data[base + cols::FINI_VALUE_HI] = FE::from(b.fini.value >> 32);
+        data[base + cols::FINI_VALUE] = FE::from(b.fini.value & 0xFF);
         data[base + cols::FINI_EPOCH] = FE::from(b.fini.epoch);
         data[base + cols::FINI_TIMESTAMP_LO] = FE::from(b.fini.timestamp & 0xFFFF_FFFF);
         data[base + cols::FINI_TIMESTAMP_HI] = FE::from(b.fini.timestamp >> 32);
@@ -204,11 +202,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::INIT_VALUE_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::INIT_VALUE_HI,
+                    start_column: cols::INIT_VALUE,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -239,11 +233,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::FINI_VALUE_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_VALUE_HI,
+                    start_column: cols::FINI_VALUE,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -291,7 +281,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::Packed {
-                    start_column: cols::INIT_VALUE_LO,
+                    start_column: cols::INIT_VALUE,
                     packing: Packing::Direct,
                 },
             ],
@@ -319,7 +309,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::FINI_VALUE_LO,
+                    start_column: cols::FINI_VALUE,
                     packing: Packing::Direct,
                 },
             ],
@@ -470,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 12);
+        assert_eq!(cols::NUM_COLUMNS, 10);
     }
 
     #[test]
@@ -483,16 +473,13 @@ mod tests {
 
         let lo = |v: u64| FE::from(v & 0xFFFF_FFFF);
         let hi = |v: u64| FE::from(v >> 32);
+        let byte = |v: u64| FE::from(v & 0xFF);
 
         assert_eq!(*trace.main_table.get(0, cols::ADDRESS_LO), lo(b.address));
         assert_eq!(*trace.main_table.get(0, cols::ADDRESS_HI), hi(b.address));
         assert_eq!(
-            *trace.main_table.get(0, cols::INIT_VALUE_LO),
-            lo(b.init.value)
-        );
-        assert_eq!(
-            *trace.main_table.get(0, cols::INIT_VALUE_HI),
-            hi(b.init.value)
+            *trace.main_table.get(0, cols::INIT_VALUE),
+            byte(b.init.value)
         );
         assert_eq!(
             *trace.main_table.get(0, cols::INIT_EPOCH),
@@ -507,12 +494,8 @@ mod tests {
             hi(b.init.timestamp)
         );
         assert_eq!(
-            *trace.main_table.get(0, cols::FINI_VALUE_LO),
-            lo(b.fini.value)
-        );
-        assert_eq!(
-            *trace.main_table.get(0, cols::FINI_VALUE_HI),
-            hi(b.fini.value)
+            *trace.main_table.get(0, cols::FINI_VALUE),
+            byte(b.fini.value)
         );
         assert_eq!(
             *trace.main_table.get(0, cols::FINI_EPOCH),
@@ -563,9 +546,9 @@ mod tests {
         assert_eq!(init.bus_id, global_memory);
         assert_eq!(fini.bus_id, global_memory);
 
-        // Both tokens have the same 7-element shape so they can match across
-        // epochs: address(lo,hi), value(lo,hi), epoch, timestamp(lo,hi).
-        assert_eq!(init.values.len(), 7);
-        assert_eq!(fini.values.len(), 7);
+        // Both tokens have the same 6-element shape so they can match across
+        // epochs: address(lo,hi), value(byte), epoch, timestamp(lo,hi).
+        assert_eq!(init.values.len(), 6);
+        assert_eq!(fini.values.len(), 6);
     }
 }

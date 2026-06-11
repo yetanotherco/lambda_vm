@@ -36,12 +36,11 @@ type E = GoldilocksExtension;
 mod anchor_cols {
     pub const ADDR_LO: usize = 0;
     pub const ADDR_HI: usize = 1;
-    pub const VAL_LO: usize = 2;
-    pub const VAL_HI: usize = 3;
-    pub const EPOCH: usize = 4;
-    pub const TS_LO: usize = 5;
-    pub const TS_HI: usize = 6;
-    pub const NUM_COLUMNS: usize = 7;
+    pub const VAL: usize = 2;
+    pub const EPOCH: usize = 3;
+    pub const TS_LO: usize = 4;
+    pub const TS_HI: usize = 5;
+    pub const NUM_COLUMNS: usize = 6;
 }
 
 type Token = (u64, u64, u64, u64);
@@ -74,11 +73,7 @@ fn anchor_air(
             packing: Packing::Direct,
         },
         BusValue::Packed {
-            start_column: anchor_cols::VAL_LO,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::VAL_HI,
+            start_column: anchor_cols::VAL,
             packing: Packing::Direct,
         },
         BusValue::Packed {
@@ -117,8 +112,7 @@ fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
         let base = i * anchor_cols::NUM_COLUMNS;
         data[base + anchor_cols::ADDR_LO] = FE::from(addr & 0xFFFF_FFFF);
         data[base + anchor_cols::ADDR_HI] = FE::from(addr >> 32);
-        data[base + anchor_cols::VAL_LO] = FE::from(value & 0xFFFF_FFFF);
-        data[base + anchor_cols::VAL_HI] = FE::from(value >> 32);
+        data[base + anchor_cols::VAL] = FE::from(value & 0xFF);
         data[base + anchor_cols::EPOCH] = FE::from(epoch);
         data[base + anchor_cols::TS_LO] = FE::from(ts & 0xFFFF_FFFF);
         data[base + anchor_cols::TS_HI] = FE::from(ts >> 32);
@@ -227,10 +221,10 @@ fn memw_sub_trace(boundary: &[CellBoundary]) -> TraceTable<F, E> {
         let base = i * memw_sub_cols::NUM_COLUMNS;
         data[base + memw_sub_cols::ADDR_LO] = FE::from(b.address & 0xFFFF_FFFF);
         data[base + memw_sub_cols::ADDR_HI] = FE::from(b.address >> 32);
-        data[base + memw_sub_cols::INIT_VAL] = FE::from(b.init.value);
+        data[base + memw_sub_cols::INIT_VAL] = FE::from(b.init.value & 0xFF);
         data[base + memw_sub_cols::FINI_TS_LO] = FE::from(b.fini.timestamp & 0xFFFF_FFFF);
         data[base + memw_sub_cols::FINI_TS_HI] = FE::from(b.fini.timestamp >> 32);
-        data[base + memw_sub_cols::FINI_VAL] = FE::from(b.fini.value);
+        data[base + memw_sub_cols::FINI_VAL] = FE::from(b.fini.value & 0xFF);
     }
     TraceTable::new_main(data, memw_sub_cols::NUM_COLUMNS, 1)
 }
