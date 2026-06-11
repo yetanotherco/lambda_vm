@@ -20,7 +20,11 @@ use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::debug::validate_trace;
+use stark::domain::Domain;
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover, ProvingError};
@@ -59,7 +63,9 @@ use crate::tables::keccak_rnd::{
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
-use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
+use crate::tables::lt::{
+    LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols, lt_constraints,
+};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
@@ -71,7 +77,9 @@ use crate::tables::memw_register::{
     bus_interactions as memw_register_bus_interactions, cols as memw_register_cols,
     constraints as memw_register_constraints,
 };
-use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
+use crate::tables::mul::{
+    bus_interactions as mul_bus_interactions, cols as mul_cols, mul_constraints,
+};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
@@ -79,7 +87,7 @@ use crate::tables::register::{
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
 };
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
 pub type E = GoldilocksExtension;
@@ -106,6 +114,79 @@ where
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )
+}
+
+// =============================================================================
+// Soundness regression helpers (negative AIR tests)
+// =============================================================================
+
+/// Build a bus-less AIR carrying only the given in-chip transition constraints.
+/// With zero bus interactions, `AirWithBuses::new` appends no LogUp constraints
+/// and allocates no aux columns, so `validate_trace` evaluates exactly the chip's
+/// transition constraints over a main-only trace.
+pub fn busless_air<C: TransitionConstraint<F, E> + 'static>(
+    num_columns: usize,
+    constraints: Vec<C>,
+) -> VmAir {
+    let transition_constraints = constraints.into_iter().map(|c| c.boxed()).collect();
+    AirWithBuses::new(
+        num_columns,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &ProofOptions::default_test_options(),
+        1,
+        transition_constraints,
+    )
+}
+
+/// Run `validate_trace` for a bus-less chip AIR over a main-only trace.
+/// Returns `true` iff every transition constraint holds on every row.
+pub fn validate_busless(air: &VmAir, trace: &TraceTable<F, E>) -> bool {
+    let domain = Domain::new(air, trace.num_rows());
+    validate_trace(air, &(), trace, &domain, &[], None)
+}
+
+/// Number of transition constraints a production builder registers on top of its
+/// bus constraints, as a delta against a bus-only AIR with the same interactions
+/// but no in-chip constraints. Isolates the in-chip count even though
+/// `AirWithBuses::new` also appends LogUp constraints, so a plain count cannot.
+pub fn in_chip_constraint_count(
+    wired: usize,
+    num_columns: usize,
+    buses: Vec<BusInteraction>,
+) -> usize {
+    let bus_only = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+        num_columns,
+        AuxiliaryTraceBuildData {
+            interactions: buses,
+        },
+        &ProofOptions::default_test_options(),
+        1,
+        vec![],
+    )
+    .num_transition_constraints();
+    wired
+        .checked_sub(bus_only)
+        .expect("wired (in-chip + bus constraints) must be >= bus-only constraint count")
+}
+
+/// Collect the `start_column`s of every `IS_HALFWORD` sender in `interactions`.
+/// Used to assert input/operand half-limbs are range-checked. Scope: only
+/// single-column `Packed` senders (which is how every current IS_HALFWORD sender is
+/// declared); it does not inspect `Linear` senders or sender multiplicities.
+pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize> {
+    let id: u64 = BusId::IsHalfword.into();
+    interactions
+        .iter()
+        .filter(|i| i.is_sender && i.bus_id == id)
+        .flat_map(|i| {
+            i.values.iter().filter_map(|v| match v {
+                BusValue::Packed { start_column, .. } => Some(*start_column),
+                BusValue::Linear(_) => None,
+            })
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -540,9 +621,11 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("BITWISE")
 }
 
-/// Create LT AIR with bus interactions.
+/// Create LT AIR with constraints and bus interactions.
 pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let (constraints, _) = lt_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: lt_bus_interactions(),
@@ -680,9 +763,11 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("DECODE")
 }
 
-/// Create MUL AIR with bus interactions.
+/// Create MUL AIR with constraints and bus interactions.
 pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let (constraints, _) = mul_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: mul_bus_interactions(),

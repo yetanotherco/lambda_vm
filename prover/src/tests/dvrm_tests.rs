@@ -1,7 +1,16 @@
 //! Tests for the DVRM (Division/Remainder) table.
 
-use crate::tables::dvrm::{DvrmOperation, bus_interactions, cols, generate_dvrm_trace};
+use stark::proof::options::ProofOptions;
+use stark::traits::AIR;
+
+use crate::tables::dvrm::{
+    DvrmOperation, bus_interactions, cols, dvrm_constraints, generate_dvrm_trace,
+};
 use crate::tables::types::FE;
+use crate::test_utils::{
+    busless_air, create_dvrm_air, in_chip_constraint_count, is_halfword_sender_columns,
+    validate_busless,
+};
 
 /// Signed comparison flag
 const SIGNED: bool = true;
@@ -295,14 +304,15 @@ fn test_different_signed_flags_separate_rows() {
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
     // Expected interactions:
-    // - 12x IS_HALF senders (r×4, n_sub_r×4, q×4) — n and d are assumptions (A1, A2)
+    // - 8x IS_HALF senders for inputs (n×4, d×4) — A1/A2 now enforced, not assumed
+    // - 12x IS_HALF senders (r×4, n_sub_r×4, q×4)
     // - 3x MSB16 senders (sign_n, sign_r, sign_d)
     // - 1x LT sender (|r| < |d|)
     // - 2x MUL senders (n_sub_r = d*q lo + hi)
     // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C17 div_by_zero)
     // - 2x DVRM receivers (quotient, remainder)
-    // Total: 12 + 3 + 1 + 2 + 6 + 2 = 26
-    assert_eq!(interactions.len(), 26, "Expected 26 bus interactions");
+    // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 = 34
+    assert_eq!(interactions.len(), 34, "Expected 34 bus interactions");
 }
 
 #[test]
@@ -398,4 +408,58 @@ fn test_padding_row() {
     assert_eq!(row[cols::SIGNED], FE::zero());
     assert_eq!(row[cols::MU_Q], FE::zero());
     assert_eq!(row[cols::MU_R], FE::zero());
+}
+
+// Div-by-zero remainder: a division-by-zero row must return the numerator as the
+// remainder. This holds via the existing carry-chain / equality constraints
+// (`n_sub_r + r = n`); an explicit `div_by_zero => r = n` constraint is a spec-level
+// addition the spec does not mandate, so it is intentionally not added here.
+
+/// Enforcement: on a division-by-zero row, forging `r != n` is rejected by the
+/// carry-chain constraints (`n_sub_r + r = n`), evaluated in isolation over a bus-less
+/// AIR — no explicit div-by-zero remainder constraint is needed.
+#[test]
+fn test_dvrm_rejects_false_div_by_zero_remainder() {
+    let air = busless_air(cols::NUM_COLUMNS, dvrm_constraints(0).0);
+    // numerator = 20, denominator = 0 => div-by-zero, honest remainder = 20.
+    let mut trace = generate_dvrm_trace(&[(DvrmOperation::new(20, 0, UNSIGNED), true)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest div-by-zero row (r = n = 20) must validate"
+    );
+
+    trace.set_main(0, cols::R_0, FE::from(999u64));
+    assert!(
+        !validate_busless(&air, &trace),
+        "a forged remainder on div-by-zero must be rejected by the carry-chain constraints"
+    );
+}
+
+// Soundness regression (VM-5): the denominator halves must be IS_HALFWORD
+// range-checked so a prover cannot forge `div_by_zero` via non-canonical halves.
+
+/// Presence: the denominator halves are range-checked via IS_HALFWORD senders.
+#[test]
+fn test_dvrm_range_checks_denominator_halves() {
+    let cols_checked = is_halfword_sender_columns(&bus_interactions());
+    for c in [cols::D_0, cols::D_1, cols::D_2, cols::D_3] {
+        assert!(
+            cols_checked.contains(&c),
+            "DVRM must IS_HALF range-check denominator half column {c}"
+        );
+    }
+}
+
+/// Wiring: `create_dvrm_air` registers its in-chip constraints on top of its bus
+/// constraints. Catches a revert to `transition_constraints = vec![]` or a dropped
+/// constraint.
+#[test]
+fn test_dvrm_air_wires_in_chip_constraints() {
+    let air = create_dvrm_air(&ProofOptions::default_test_options());
+    let in_chip = in_chip_constraint_count(
+        air.num_transition_constraints(),
+        cols::NUM_COLUMNS,
+        bus_interactions(),
+    );
+    assert_eq!(in_chip, dvrm_constraints(0).0.len());
 }
