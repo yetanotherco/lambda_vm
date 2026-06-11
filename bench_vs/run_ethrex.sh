@@ -6,7 +6,7 @@
 # Add a block by appending a "label|input_basename" entry to BLOCKS — the input
 # file must live in executor/tests/.
 #
-# Usage: ./bench_vs/run_ethrex.sh [--report-dir DIR] [--no-color]
+# Usage: ./bench_vs/run_ethrex.sh [--report-dir DIR] [--rebuild-elf] [--no-color]
 #
 # Prerequisites:
 #   - Lambda VM CLI build dependencies available
@@ -20,6 +20,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="/tmp/bench_ethrex"
 REPORT_DIR=""
 NO_COLOR=false
+REBUILD_ELF=false
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,8 +46,12 @@ while [[ $# -gt 0 ]]; do
             NO_COLOR=true
             shift
             ;;
+        --rebuild-elf)
+            REBUILD_ELF=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--report-dir DIR] [--no-color]"
+            echo "Usage: $0 [--report-dir DIR] [--rebuild-elf] [--no-color]"
             exit 0
             ;;
         *)
@@ -102,7 +107,10 @@ echo ""
 echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
 cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 
-if [ -f "$ETHREX_ELF" ]; then
+if $REBUILD_ELF; then
+    echo -e "${GREEN}[Lambda VM] Rebuilding ethrex guest ELF...${NC}"
+    make -B -C "$ROOT_DIR" executor/program_artifacts/rust/ethrex.elf 2>&1 | tail -5
+elif [ -f "$ETHREX_ELF" ]; then
     echo -e "${YELLOW}[Lambda VM] Using pre-existing ethrex.elf at $ETHREX_ELF${NC}"
 else
     echo -e "${GREEN}[Lambda VM] Building ethrex guest ELF...${NC}"

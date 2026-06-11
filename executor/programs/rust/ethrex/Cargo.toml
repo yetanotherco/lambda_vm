@@ -7,7 +7,7 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", package="guest_program", default-features = false, features=["c-kzg"] }
+guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "a9de3e8b405dbf406cac31b930fd1ffdc216a429", package="guest_program", default-features = false, features=["c-kzg"] }
 rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
 c-kzg = { version = "2.1.1", features = ["eip-7594"] }
 
@@ -20,4 +20,3 @@ c-kzg = { git = "https://github.com/risc0/c-kzg-4844", tag = "c-kzg/v2.1.1-riscz
 # guest target; native builds keep the vendored asm. See patches/ethrex-crypto/.
 [patch."https://github.com/lambdaclass/ethrex.git"]
 ethrex-crypto = { path = "patches/ethrex-crypto" }
-
