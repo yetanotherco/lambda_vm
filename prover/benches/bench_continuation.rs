@@ -13,9 +13,13 @@
 //!     ls target/release/deps/bench_continuation-*   # the executable (no .d)
 //!
 //! Args:
-//!     <mode>        "main" (monolithic prove) or "cont" (continuation)
+//!     <mode>        "count", "main" (monolithic prove) or "cont" (continuation)
 //!     <elf_path>    path to a compiled ELF artifact
 //!     [epoch_size]  epoch length in cycles for "cont" (default 65536)
+//!
+//! Env:
+//!     BENCH_PRIVATE_INPUT  optional path to a private-input file (e.g. an
+//!                          ethrex ProgramInput .bin). Empty if unset.
 
 use std::time::Instant;
 
@@ -28,6 +32,12 @@ fn main() {
     let mode = args[1].as_str();
     let elf_path = &args[2];
     let elf = std::fs::read(elf_path).expect("failed to read ELF");
+    let private_inputs: Vec<u8> = match std::env::var("BENCH_PRIVATE_INPUT") {
+        Ok(path) if !path.is_empty() => {
+            std::fs::read(&path).expect("failed to read BENCH_PRIVATE_INPUT file")
+        }
+        _ => Vec::new(),
+    };
 
     let start = Instant::now();
     match mode {
@@ -37,14 +47,15 @@ fn main() {
             use executor::elf::Elf;
             use executor::vm::execution::Executor;
             let program = Elf::load(&elf).expect("bad ELF");
-            let result = Executor::new(&program, vec![])
+            let result = Executor::new(&program, private_inputs)
                 .expect("executor")
                 .run()
                 .expect("execution failed");
             println!("cycles = {}", result.logs.len());
         }
         "main" => {
-            lambda_vm_prover::prove(&elf).expect("monolithic prove failed");
+            lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
+                .expect("monolithic prove failed");
             println!("main prove ok ({} bytes ELF)", elf.len());
         }
         "cont" => {
@@ -52,9 +63,12 @@ fn main() {
                 .get(3)
                 .map(|s| s.parse().expect("bad epoch_size"))
                 .unwrap_or(65536);
-            let ok =
-                lambda_vm_prover::continuation::prove_and_verify_continuation(&elf, epoch_size)
-                    .expect("continuation failed");
+            let ok = lambda_vm_prover::continuation::prove_and_verify_continuation(
+                &elf,
+                &private_inputs,
+                epoch_size,
+            )
+            .expect("continuation failed");
             assert!(ok, "continuation did not verify");
             println!("cont prove+verify ok (epoch_size={epoch_size})");
         }

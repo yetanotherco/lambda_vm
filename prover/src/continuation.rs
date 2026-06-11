@@ -163,6 +163,7 @@ fn prove_verify_epoch(
     logs: &[Log],
     is_final: bool,
     boundary: &[CellBoundary],
+    private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> Result<Option<Commitment>, Error> {
     let mut traces = Traces::from_image_and_logs(
@@ -171,7 +172,7 @@ fn prove_verify_epoch(
         &start.register_init,
         logs,
         &MaxRowsConfig::default(),
-        &[],
+        private_inputs,
         is_final,
         true,
         #[cfg(feature = "disk-spill")]
@@ -328,11 +329,16 @@ fn verify_global(
 /// `epoch_size` cycles, prove+verify each epoch, prove+verify the cross-epoch
 /// global memory linkage, and check that each epoch proof committed the same
 /// local-to-global table the global proof used. Returns `Ok(true)` iff all hold.
-pub fn prove_and_verify_continuation(elf_bytes: &[u8], epoch_size: usize) -> Result<bool, Error> {
+pub fn prove_and_verify_continuation(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size: usize,
+) -> Result<bool, Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let mut executor = Executor::new(&elf, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
+    let mut executor = Executor::new(&elf, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    let program_image = build_initial_image(&elf, &[]);
+    let program_image = build_initial_image(&elf, private_inputs);
     let initial_memory: HashMap<u64, u64> =
         program_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
 
@@ -376,7 +382,15 @@ pub fn prove_and_verify_continuation(elf_bytes: &[u8], epoch_size: usize) -> Res
             register_init,
             is_first: index == 0,
         };
-        match prove_verify_epoch(&elf, &start, &logs, is_final, &boundary, &opts)? {
+        match prove_verify_epoch(
+            &elf,
+            &start,
+            &logs,
+            is_final,
+            &boundary,
+            private_inputs,
+            &opts,
+        )? {
             Some(root) => epoch_roots.push(root),
             None => return Ok(false),
         }
@@ -415,6 +429,6 @@ mod tests {
             .logs
             .len();
         let epoch_size = (total / 3).max(1);
-        assert!(prove_and_verify_continuation(&elf_bytes, epoch_size).unwrap());
+        assert!(prove_and_verify_continuation(&elf_bytes, &[], epoch_size).unwrap());
     }
 }
