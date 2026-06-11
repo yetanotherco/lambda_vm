@@ -442,7 +442,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZero {
     }
 }
 
-/// Creates all ECDAS transition constraints (200 total).
+/// Creates all ECDAS transition constraints (199 total).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -454,10 +454,12 @@ pub fn create_constraints(
     > = Vec::new();
     let mut idx = constraint_idx_start;
 
-    // IS_BIT(mu), IS_BIT(op), IS_BIT(next_op). `op` is also boolean transitively (it arrives
-    // on the Ecdas bus from a constant-0 seed or a prior IS_BIT'd next_op); the direct check
-    // makes the constraint layer self-contained (the λ relation blends op·add + (1−op)·double).
-    for col in [cols::MU, cols::OP, cols::NEXT_OP] {
+    // `op` needs no direct bit check: it is only ever the op field of an Ecdas bus token, and
+    // every producer of that token emits a bit there — ECSM seeds it with a constant 0, and
+    // each ECDAS step emits `next_op` (which is IS_BIT'd). The bus cannot be minted (IS_BIT(mu)
+    // blocks weight ≠ 1), so a row's received `op` is always in {0,1} and the λ/xR/yR selector
+    // `op·add + (1−op)·double` is well-defined.
+    for col in [cols::MU, cols::NEXT_OP] {
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }
@@ -588,11 +590,6 @@ mod tests {
                     FE::zero()
                 );
                 assert_eq!(
-                    IsBitConstraint::unconditional(cols::OP, 0).evaluate(&view),
-                    FE::zero(),
-                    "is_bit(op) k={k} row {row}"
-                );
-                assert_eq!(
                     MulZero {
                         a: cols::OP,
                         b: cols::NEXT_OP,
@@ -641,7 +638,7 @@ mod tests {
     #[test]
     fn create_constraints_count() {
         let (constraints, next) = create_constraints(0);
-        assert_eq!(constraints.len(), 200);
-        assert_eq!(next, 200);
+        assert_eq!(constraints.len(), 199);
+        assert_eq!(next, 199);
     }
 }
