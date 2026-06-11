@@ -61,6 +61,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         None,
         true,
         None,
+        None,
     );
 
     // Build air_trace_pairs for all tables
@@ -113,6 +114,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         None,
         true,
         None,
+        None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -153,6 +155,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &vm_proof.table_counts,
         None,
         true,
+        None,
         None,
     );
     let air_refs = airs.air_refs();
@@ -1172,6 +1175,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         None,
         true,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1189,6 +1193,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1220,7 +1225,7 @@ fn test_verify_rejects_tampered_public_output() {
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None, None)
             .expect("Valid commit proof should verify"),
         "Baseline proof should verify before tampering"
     );
@@ -1232,8 +1237,9 @@ fn test_verify_rejects_tampered_public_output() {
         ..vm_proof
     };
 
-    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None)
-        .expect("Verifier should not error on tampered public output");
+    let verified =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None)
+            .expect("Verifier should not error on tampered public output");
     assert!(
         !verified,
         "Verifier should reject proof when VmProof.public_output is tampered"
@@ -1731,7 +1737,7 @@ fn test_debug_memory_tokens_sb_sh() {
         .enumerate()
     {
         let page_base = page_config.page_base;
-        let page_size = page_config.page_size;
+        let page_size = crate::tables::page::DEFAULT_PAGE_SIZE;
         let page_lo = page_base & 0xFFFF_FFFF;
         let page_hi = page_base >> 32;
         let trace_rows = page_trace.num_rows();
@@ -1810,8 +1816,8 @@ fn test_debug_memory_tokens_sb_sh() {
     println!("\n=== ARE_BYTES Lookup Counts (from PAGE tables) ===");
     let mut page_pair_counts: HashMap<(u8, u8), u64> = HashMap::new();
     let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
-    for (page_idx, page_trace) in traces.pages.iter().enumerate() {
-        let page_size = traces.page_configs[page_idx].page_size;
+    for page_trace in traces.pages.iter() {
+        let page_size = crate::tables::page::DEFAULT_PAGE_SIZE;
         for row in 0..page_trace.num_rows().min(page_size) {
             let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as u8;
             let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as u8;
@@ -1922,6 +1928,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         None,
         true,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1938,6 +1945,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1990,6 +1998,7 @@ fn test_deep_stack_missing_pages_rejected() {
         None,
         true,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2006,6 +2015,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -2093,6 +2103,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         None,
         true,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2109,6 +2120,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -2170,7 +2182,7 @@ fn test_verify_rejects_zero_table_counts() {
         .expect("Prover should succeed on valid program");
 
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None, None)
             .expect("Verification should not error on valid proof"),
         "Valid proof should verify"
     );
@@ -2191,7 +2203,8 @@ fn test_verify_rejects_zero_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2212,7 +2225,8 @@ fn test_verify_rejects_zero_cpu_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2233,7 +2247,8 @@ fn test_verify_rejects_zero_memw_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2264,6 +2279,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         &zero_counts,
         None,
         true,
+        None,
         None,
     );
 
@@ -2369,7 +2385,8 @@ fn test_verify_rejects_inflated_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",
@@ -2749,6 +2766,7 @@ fn test_prove_first_epoch_without_halt() {
         None,
         false,
         None,
+        None,
     );
 
     let multi_proof = multi_prove_ram(
@@ -2835,6 +2853,7 @@ fn test_prove_second_epoch_from_snapshot() {
         None,
         false,
         Some(&register_init),
+        None,
     );
 
     let multi_proof = multi_prove_ram(
@@ -2925,6 +2944,7 @@ fn test_epoch_proof_commits_l2g() {
         &table_counts,
         None,
         false,
+        None,
         None,
     );
 
@@ -3082,6 +3102,7 @@ fn test_continuation_pipeline_end_to_end() {
             None,
             is_final,
             register_init_arg,
+            None,
         );
 
         let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
@@ -3202,6 +3223,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         &table_counts,
         None,
         false,
+        None,
         None,
     );
 

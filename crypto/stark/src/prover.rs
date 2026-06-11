@@ -74,6 +74,13 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// The prover's recomputed preprocessed Merkle root did not match the
+    /// commitment the AIR was constructed with (e.g. a stale static constant
+    /// in a table module, or a wrong caller-supplied entry such as
+    /// `page_commitments` / `decode_commitment`). Continuing would yield a
+    /// proof an honest verifier always rejects — fail fast on the prover side
+    /// with a localized error instead.
+    PrecomputedCommitmentMismatch,
     /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
     /// out of disk space, fd exhaustion, or mmap failure.
     #[cfg(feature = "disk-spill")]
@@ -328,6 +335,13 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
+    /// Device-resident de-interleaved LDE handle from the R2 fused GPU path
+    /// (`try_evaluate_parts_on_lde_gpu_keep`). When present, R4 DEEP skips
+    /// the `num_parts * 3 * lde_size * 8` byte H2D and reads parts on
+    /// device. `None` when the GPU R2 path didn't run (number_of_parts <= 2,
+    /// below threshold, or any CPU fallback).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -732,10 +746,9 @@ pub trait IsStarkProver<
                 let (mut mult_tree, mult_root) =
                     Self::commit_columns_bit_reversed(&columns[num_cols..])
                         .ok_or(ProvingError::EmptyCommitment)?;
-                debug_assert_eq!(
-                    precomputed_root, expected_precomputed_root,
-                    "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
-                );
+                if precomputed_root != expected_precomputed_root {
+                    return Err(ProvingError::PrecomputedCommitmentMismatch);
+                }
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
                     precomputed_tree.spill_nodes_to_disk().map_err(|e| {
@@ -1004,6 +1017,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[cfg(feature = "cuda")]
+        let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
         let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
@@ -1037,23 +1052,27 @@ pub trait IsStarkProver<
             };
 
             // GPU fast path: batched ext3 LDE for all parts in one call.
-            // Non-`_keep` variant. The device buffer is freed at end of
-            // call; downstream R3 reads the host-side evals. PR-4 will
-            // upgrade to the `_keep` variant to retain the handle for R4
-            // DEEP composition.
+            // `_keep` variant retains the de-interleaved device buffer as a
+            // `GpuLdeExt3` handle stored on Round2 so R4 DEEP can skip the
+            // `num_parts * 3 * lde_size * 8` byte H2D.
             #[cfg(feature = "cuda")]
             {
                 let parts_slices: Vec<&[FieldElement<FieldExtension>]> = composition_poly_parts
                     .iter()
                     .map(|p| p.coefficients.as_slice())
                     .collect();
-                crate::gpu_lde::try_evaluate_parts_on_lde_gpu::<Field, FieldExtension>(
+                match crate::gpu_lde::try_evaluate_parts_on_lde_gpu_keep::<Field, FieldExtension>(
                     &parts_slices,
                     domain.blowup_factor,
                     domain.interpolation_domain_size,
                     &domain.coset_offset,
-                )
-                .unwrap_or_else(cpu_eval)
+                ) {
+                    Some((evals, handle)) => {
+                        gpu_composition_parts = Some(handle);
+                        evals
+                    }
+                    None => cpu_eval(),
+                }
             }
             #[cfg(not(feature = "cuda"))]
             cpu_eval()
@@ -1091,6 +1110,8 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
+            #[cfg(feature = "cuda")]
+            gpu_composition_parts,
         })
     }
 
@@ -1162,7 +1183,7 @@ pub trait IsStarkProver<
         round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Round4<Field, FieldExtension>
     where
         FieldElement<FieldExtension>: AsBytes,
@@ -1222,14 +1243,13 @@ pub trait IsStarkProver<
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (fri_last_value, fri_layers) =
-            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
-                domain.root_order as usize,
-                lde_evals,
-                transcript,
-                &coset_offset,
-                domain_size,
-            );
+        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations(
+            domain.root_order as usize,
+            lde_evals,
+            transcript,
+            &coset_offset,
+            domain_size,
+        );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
 
@@ -1358,6 +1378,30 @@ pub trait IsStarkProver<
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
         let num_total_cols = num_main_cols + num_aux_cols;
+
+        // GPU fast path: device-resident DEEP composition. Reuses the R1
+        // main/aux LDE handles on `lde_trace` and (when the R2 fused path
+        // ran) the parts handle on `round_2_result.gpu_composition_parts`.
+        // Falls back to the CPU rayon loop below on any precondition miss
+        // or kernel failure.
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(deep_evals) =
+                crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
+                    lde_trace,
+                    round_2_result.gpu_composition_parts.as_ref(),
+                    &round_2_result.lde_composition_poly_evaluations,
+                    h_ood,
+                    &trace_ood_columns,
+                    composition_poly_gammas,
+                    trace_terms_gammas,
+                    &denoms,
+                    num_eval_points,
+                )
+            {
+                return deep_evals;
+            }
+        }
 
         // OOD column compression (Plonky3-style): precompute one value per eval point,
         //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
@@ -2158,7 +2202,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where

@@ -205,6 +205,7 @@ fn prove_verify_epoch(
         None,
         is_final,
         register_init_arg,
+        None,
     );
 
     let l2g_air = l2g_memory_air(opts);
