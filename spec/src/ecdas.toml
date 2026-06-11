@@ -237,6 +237,12 @@ multiplicity = ["-", "μ"]
 
 [[constraints.receive]]
 kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "ecdas:c:range_μ"
+
+[[constraints.receive]]
+kind = "template"
 tag = "IS_BYTE"
 input = ["round"]
 cond = "μ"
