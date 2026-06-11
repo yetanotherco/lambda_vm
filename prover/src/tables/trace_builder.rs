@@ -2313,8 +2313,12 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
-    if let Some(image) = initial_image {
+    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2).
+    // Continuation epochs (l2g_memory_bookend) skip PAGE entirely (see the
+    // generate_page_tables call below), so they skip its AreBytes lookups too.
+    if let Some(image) = initial_image
+        && !l2g_memory_bookend
+    {
         bitwise_ops.extend(collect_bitwise_from_page(
             image,
             memory_state,
@@ -2471,13 +2475,17 @@ fn build_traces(
             || {
                 rayon::join(
                     || match initial_image {
-                        Some(image) => generate_page_tables(
+                        // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G
+                        // table owns every touched cell's Memory init/fini, and every
+                        // untouched PAGE row self-cancels (init==fini, ts=0), so PAGE
+                        // contributes nothing to any bus here.
+                        Some(image) if !l2g_memory_bookend => generate_page_tables(
                             image,
                             memory_state,
                             private_input,
                             l2g_memory_bookend,
                         ),
-                        None => (Vec::new(), Vec::new()),
+                        _ => (Vec::new(), Vec::new()),
                     },
                     || register::generate_register_trace(&register_final_state, register_init),
                 )
@@ -2493,13 +2501,14 @@ fn build_traces(
     #[cfg(not(feature = "parallel"))]
     {
         match initial_image {
-            Some(image) => {
+            // See the parallel branch: continuation epochs skip PAGE entirely.
+            Some(image) if !l2g_memory_bookend => {
                 let (p, c) =
                     generate_page_tables(image, memory_state, private_input, l2g_memory_bookend);
                 pages = p;
                 page_configs = c;
             }
-            None => {
+            _ => {
                 pages = Vec::new();
                 page_configs = Vec::new();
             }

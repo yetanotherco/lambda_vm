@@ -148,8 +148,10 @@ fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
 }
 
 /// Per-epoch starting state: the memory image and register image the epoch begins from.
-struct EpochStart {
-    image: HashMap<u64, u8>,
+/// `image` is borrowed from the persistent cross-epoch image (init = previous fini), so
+/// it is not re-snapshotted or cloned per epoch.
+struct EpochStart<'a> {
+    image: &'a HashMap<u64, u8>,
     register_init: HashMap<u64, u32>,
     is_first: bool,
 }
@@ -168,7 +170,7 @@ fn prove_verify_epoch(
 ) -> Result<Option<Commitment>, Error> {
     let mut traces = Traces::from_image_and_logs(
         elf,
-        &start.image,
+        start.image,
         &start.register_init,
         logs,
         &MaxRowsConfig::default(),
@@ -338,9 +340,11 @@ pub fn prove_and_verify_continuation(
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    let program_image = build_initial_image(&elf, private_inputs);
-    let initial_memory: HashMap<u64, u64> =
-        program_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    // The cross-epoch memory image, carried forward across epochs: epoch i+1's init is
+    // epoch i's fini, so it is updated in place with each epoch's touched-cell final
+    // values rather than re-snapshotted from the executor every epoch.
+    let mut image = build_initial_image(&elf, private_inputs);
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
 
     // Running cross-epoch provenance (the L2G init source). Only the sparse
     // boundaries and the per-epoch roots are kept — everything else is dropped
@@ -352,12 +356,10 @@ pub fn prove_and_verify_continuation(
 
     let mut index: u64 = 0;
     loop {
-        // Capture the epoch's starting state BEFORE running it.
         let start_pc = executor.pc();
         if start_pc == 0 {
             break;
         }
-        let start_image: HashMap<u64, u8> = executor.memory().iter_bytes().collect();
         let register_init = if index == 0 {
             register::register_init_from_entry_point(elf.entry_point)
         } else {
@@ -374,11 +376,12 @@ pub fn prove_and_verify_continuation(
         };
         let is_final = executor.pc() == 0;
 
-        let touched = epoch_touched_cells(&elf, &start_image, &logs)?;
+        // `image` is this epoch's starting memory (the previous epoch's fini).
+        let touched = epoch_touched_cells(&elf, &image, &logs)?;
         let boundary = local_to_global::epoch_boundary(&mut provenance, index, &touched);
 
         let start = EpochStart {
-            image: start_image,
+            image: &image,
             register_init,
             is_first: index == 0,
         };
@@ -393,6 +396,11 @@ pub fn prove_and_verify_continuation(
         )? {
             Some(root) => epoch_roots.push(root),
             None => return Ok(false),
+        }
+
+        // Carry the image forward: this epoch's fini is the next epoch's init.
+        for cell in &boundary {
+            image.insert(cell.address, (cell.fini.value & 0xFF) as u8);
         }
         all_boundaries.push(boundary);
         // `start`, `logs`, and this epoch's traces are dropped here.
