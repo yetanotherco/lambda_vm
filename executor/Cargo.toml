@@ -14,4 +14,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", package="guest_program", default-features = false, branch = "crypto-default-features" }
+guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "a9de3e8b405dbf406cac31b930fd1ffdc216a429", package="guest_program", default-features = false, features = ["c-kzg"] }
