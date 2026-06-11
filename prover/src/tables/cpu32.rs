@@ -145,24 +145,32 @@ pub struct Cpu32Aux {
 }
 
 impl Cpu32Operation {
+    /// Whether the inputs are sign-extended (`alu_flags` bit 5).
+    pub fn signed(&self) -> bool {
+        (self.alu_flags as u64 & SIGNED_MASK) != 0
+    }
+
     /// Computes the derived auxiliary values (signs, extended args, rvd).
     pub fn compute_aux(&self) -> Cpu32Aux {
-        let signed = (self.alu_flags as u64 & SIGNED_MASK) != 0;
+        let signed = self.signed();
 
-        // Sign bits = MSB (bit 31) of the low word of each value.
-        let rv1_sign = (self.rv1 >> 31) & 1 == 1;
-        let rv2_sign = (self.rv2 >> 31) & 1 == 1;
+        // Sign bits via `SIGN(·, gate)`: `rv1`/`rv2` are gated by `signed` (the
+        // column is the MSB only when sign-extending, else 0 — matching the spec's
+        // `SIGN(rv·[1], signed)`); `res` is gated by `μ` (the `*W` result is always
+        // sign-extended).
+        let rv1_sign = signed && (self.rv1 >> 31) & 1 == 1;
+        let rv2_sign = signed && (self.rv2 >> 31) & 1 == 1;
         let res_sign = (self.res >> 31) & 1 == 1;
 
-        // arg1 = ext(rv1 low word): low word as-is, high word = (2^32-1) if
-        // (signed AND rv1_sign) else 0.
-        let arg1_hi = if signed && rv1_sign { HI_FILL } else { 0 };
+        // arg1 = ext(rv1 low word): low word as-is, high word = (2^32-1) when
+        // rv1_sign (which already folds in `signed`), else 0.
+        let arg1_hi = if rv1_sign { HI_FILL } else { 0 };
         let arg1 = (self.rv1 & 0xFFFF_FFFF) | (arg1_hi << 32);
 
         // arg2 = ext(rv2 low word) + imm. By the decoding assumption exactly one
         // of rv2 / imm is non-zero, so the per-word sums never overflow.
         let arg2_lo = (self.rv2 & 0xFFFF_FFFF) + (self.imm & 0xFFFF_FFFF);
-        let arg2_hi = if signed && rv2_sign { HI_FILL } else { 0 } + (self.imm >> 32);
+        let arg2_hi = if rv2_sign { HI_FILL } else { 0 } + (self.imm >> 32);
         let arg2 = (arg2_lo & 0xFFFF_FFFF) | (arg2_hi << 32);
 
         // rvd = sign-extend(res low word) — always sign-extended for *W.
@@ -532,14 +540,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // MSB16 sign extraction (high half of each low word).
-    for (half_col, sign_col) in [
-        (cols::RV1_1, cols::RV1_SIGN),
-        (cols::RV2_1, cols::RV2_SIGN),
-        (cols::RES_1, cols::RES_SIGN),
-    ] {
-        interactions.push(BusInteraction::sender(
+    // `rv1`/`rv2`: `SIGN(rv·[1], signed)` — the MSB16 is gated by `signed`, so the
+    // sign is only looked up when the inputs are sign-extended (unsigned ops send
+    // nothing and the `(1-signed)·rv·_sign = 0` arith forces the sign to 0).
+    // `res`: `SIGN(res[1], μ)` — the `*W` result is always sign-extended, so it is
+    // gated by `μ` (every active row) instead.
+    let msb16 = |half_col: usize, sign_col: usize, mult: usize| {
+        BusInteraction::sender(
             BusId::Msb16,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Column(mult),
             vec![
                 BusValue::Packed {
                     start_column: half_col,
@@ -550,8 +559,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
             ],
-        ));
-    }
+        )
+    };
+    interactions.push(msb16(cols::RV1_1, cols::RV1_SIGN, cols::SIGNED));
+    interactions.push(msb16(cols::RV2_1, cols::RV2_SIGN, cols::SIGNED));
+    interactions.push(msb16(cols::RES_1, cols::RES_SIGN, cols::MU));
 
     // CPU32[timestamp, pc, half_instruction_length] (receiver from the main CPU).
     interactions.push(BusInteraction::receiver(
@@ -592,11 +604,12 @@ pub struct Cpu32Constraint {
 pub enum Cpu32ConstraintKind {
     /// `arg1[0] = rv1[0] + 2^16·rv1[1]` (low word of `arg1`).
     Arg1Lo,
-    /// `arg1[1] = (2^32-1)·signed·rv1_sign` (sign/zero extension of the high word).
+    /// `arg1[1] = (2^32-1)·rv1_sign` (sign/zero extension of the high word;
+    /// `rv1_sign` already folds in `signed` via `SIGN(rv1[1], signed)`).
     Arg1Hi,
     /// `arg2[0] = rv2[0] + 2^16·rv2[1] + imm[0]`.
     Arg2Lo,
-    /// `arg2[1] = (2^32-1)·signed·rv2_sign + imm[1]`.
+    /// `arg2[1] = (2^32-1)·rv2_sign + imm[1]` (`rv2_sign` folds in `signed`).
     Arg2Hi,
     /// `rvd[0] = res[0] + 2^16·res[1]`.
     RvdLo,
@@ -607,6 +620,11 @@ pub enum Cpu32ConstraintKind {
     /// `read_register2·imm[i] = 0` (decoding guarantees at most one is nonzero;
     /// spec defense-in-depth assumption). `usize` is the `imm` limb column.
     Arg2Exclusive { imm_col: usize },
+    /// `(1 - signed)·sign_col = 0`: the arith half of `SIGN(rv·[1], signed)` —
+    /// when the inputs are not sign-extended the sign bit must be 0 (the MSB16
+    /// lookup is gated by `signed`, so it is not pinned otherwise). `usize` is
+    /// the sign column (`RV1_SIGN`/`RV2_SIGN`).
+    SignZeroWhenUnsigned { sign_col: usize },
     /// `(1 - μ)·flag = 0`: a flag that drives a bus interaction or a high-word
     /// fill must be 0 on a padding row (`μ = 0`). For the register flags this
     /// prevents a disconnected row from emitting a forged register read/write
@@ -631,16 +649,19 @@ impl Cpu32Constraint {
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constraint {
     fn degree(&self) -> usize {
         match self.kind {
+            // `arg·[1] = (2^32-1)·rv·_sign` is now linear (`signed` is folded into
+            // `rv·_sign`); the lo/rvd fills are linear too.
             Cpu32ConstraintKind::Arg1Lo
+            | Cpu32ConstraintKind::Arg1Hi
             | Cpu32ConstraintKind::Arg2Lo
+            | Cpu32ConstraintKind::Arg2Hi
             | Cpu32ConstraintKind::RvdLo
             | Cpu32ConstraintKind::RvdHi => 1,
-            // signed·sign (degree 2) and (1-read)·value (degree 2)
-            Cpu32ConstraintKind::Arg1Hi
-            | Cpu32ConstraintKind::Arg2Hi
-            | Cpu32ConstraintKind::RegZero { .. }
+            // (1-read)·value, read2·imm, (1-μ)·flag, (1-signed)·sign — all degree 2
+            Cpu32ConstraintKind::RegZero { .. }
             | Cpu32ConstraintKind::Arg2Exclusive { .. }
-            | Cpu32ConstraintKind::FlagImpliesMu { .. } => 2,
+            | Cpu32ConstraintKind::FlagImpliesMu { .. }
+            | Cpu32ConstraintKind::SignZeroWhenUnsigned { .. } => 2,
         }
     }
 
@@ -662,9 +683,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
             Cpu32ConstraintKind::Arg1Lo => {
                 get(cols::ARG1_0) - get(cols::RV1_0) - &shift16 * get(cols::RV1_1)
             }
-            Cpu32ConstraintKind::Arg1Hi => {
-                get(cols::ARG1_1) - hi_fill * get(cols::SIGNED) * get(cols::RV1_SIGN)
-            }
+            Cpu32ConstraintKind::Arg1Hi => get(cols::ARG1_1) - hi_fill * get(cols::RV1_SIGN),
             Cpu32ConstraintKind::Arg2Lo => {
                 get(cols::ARG2_0)
                     - get(cols::RV2_0)
@@ -672,9 +691,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
                     - get(cols::IMM_0)
             }
             Cpu32ConstraintKind::Arg2Hi => {
-                get(cols::ARG2_1)
-                    - hi_fill * get(cols::SIGNED) * get(cols::RV2_SIGN)
-                    - get(cols::IMM_1)
+                get(cols::ARG2_1) - hi_fill * get(cols::RV2_SIGN) - get(cols::IMM_1)
             }
             Cpu32ConstraintKind::RvdLo => {
                 get(cols::RVD_0) - get(cols::RES_0) - &shift16 * get(cols::RES_1)
@@ -689,6 +706,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
             }
             Cpu32ConstraintKind::FlagImpliesMu { flag_col } => {
                 (one - get(cols::MU)) * get(flag_col)
+            }
+            Cpu32ConstraintKind::SignZeroWhenUnsigned { sign_col } => {
+                (one - get(cols::SIGNED)) * get(sign_col)
             }
         }
     }
@@ -783,6 +803,16 @@ pub fn cpu32_constraints(
         Cpu32ConstraintKind::RvdHi,
     ] {
         constraints.push(Cpu32Constraint::new(kind, idx).boxed());
+        idx += 1;
+    }
+
+    // arith half of `SIGN(rv·[1], signed)`: when not sign-extending, the sign
+    // bit is 0 (the MSB16 is gated by `signed`, so it is not otherwise pinned).
+    for sign_col in [cols::RV1_SIGN, cols::RV2_SIGN] {
+        constraints.push(
+            Cpu32Constraint::new(Cpu32ConstraintKind::SignZeroWhenUnsigned { sign_col }, idx)
+                .boxed(),
+        );
         idx += 1;
     }
 

@@ -757,7 +757,8 @@ fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
 
 /// The BITWISE-table lookups a CPU32 row sends: 5×ARE_BYTES (byte fields),
 /// 8×IS_HALF (rv1/rv2 low-word halves + the 4 res halves), 1×BYTE_ALU (extracts
-/// the signed bit from `alu_flags`), and 3×MSB16 (rv1/rv2/res sign bits).
+/// the signed bit from `alu_flags`), and the MSB16 sign bits: `res` always, plus
+/// `rv1`/`rv2` only when `signed` (their MSB16 is gated by the `signed` column).
 fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
     let mut ops = Vec::with_capacity(17);
     let half = |v: u64, sh: u32| ((v >> sh) & 0xFFFF) as u16;
@@ -792,11 +793,14 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
         32,
         c.alu_flags,
     ));
-    // MSB16 on the high half of each low word (rv1, rv2, res).
-    let res_h1 = half(c.res, 16);
-    for h in [rv1_h1, rv2_h1, res_h1] {
-        push_half(&mut ops, BitwiseOperationType::Msb16, h);
+    // MSB16 on the high half of each low word. `rv1`/`rv2` are gated by `signed`
+    // (the SIGN template's `signed` multiplicity — no lookup when zero-extending);
+    // `res` is always sent (μ), since the `*W` result is always sign-extended.
+    if c.signed() {
+        push_half(&mut ops, BitwiseOperationType::Msb16, rv1_h1);
+        push_half(&mut ops, BitwiseOperationType::Msb16, rv2_h1);
     }
+    push_half(&mut ops, BitwiseOperationType::Msb16, half(c.res, 16));
     ops
 }
 
