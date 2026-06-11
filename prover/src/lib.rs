@@ -380,11 +380,22 @@ impl VmAirs {
     /// constant (e.g. the recursion guest, where the in-VM recompute is too
     /// expensive). When `None`, the commitment is computed from the ELF.
     ///
-    /// The trust anchor for `decode_commitment` is the caller's compiled
-    /// binary — never accept prover-supplied bytes here. A wrong value is
-    /// rejected, never silently accepted: it either mismatches the prover's
-    /// committed precomputed root (an explicit verifier check) or yields
-    /// diverging Fiat-Shamir challenges.
+    /// `page_commitments` is an optional list of precomputed ELF-data-page
+    /// preprocessed commitments, keyed by `page_base`. For each ELF data page
+    /// the verifier constructs, if a matching `(page_base, commitment)` pair
+    /// is supplied, it is used directly and that page's FFT + Merkle build is
+    /// skipped. Pages not in the list — including all zero-init pages and
+    /// pages without a match — take the normal compute path (zero-init pages
+    /// hit a compile-time constant via
+    /// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
+    /// from the ELF). When `None`, every ELF data page recomputes from
+    /// scratch.
+    ///
+    /// The trust anchor for both `decode_commitment` and `page_commitments`
+    /// is the caller's compiled binary — never accept prover-supplied bytes
+    /// here. A wrong value is rejected, never silently accepted: it either
+    /// mismatches the prover's committed precomputed root (an explicit
+    /// verifier check) or yields diverging Fiat-Shamir challenges.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -392,6 +403,7 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
+        page_commitments: Option<&[(u64, Commitment)]>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -447,31 +459,38 @@ impl VmAirs {
             register::NUM_PREPROCESSED_COLS,
         );
         // Every zero-init page shares one preprocessed commitment: OFFSET is
-        // page-relative and INIT is all-zero, so it depends only on the proof
-        // options. Compute it once here rather than once per zero-init page.
-        // Every program has at least one zero-init page (the stack is
-        // zero-initialized), so this commitment is always used.
-        let zero_init_commitment =
-            page::compute_precomputed_commitment(&page::PageConfig::zero_init(0), proof_options);
+        // page-relative and INIT is all-zero, so it depends only on
+        // (blowup, coset) — all fixed here. Compute it once (static const
+        // when shipped, else a single recompute) rather than per page. Every
+        // program has at least one zero-init page (the stack is zero-
+        // initialized), so this commitment is always used.
+        let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
 
         let pages: Vec<_> = page_configs
             .iter()
             .map(|config| {
+                let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
-                    create_page_air(proof_options, config.page_base)
+                    air
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
-                    create_page_air(proof_options, config.page_base)
-                        .with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
+                    air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
                 } else {
-                    // ELF data pages: INIT is program-specific, so recompute per page.
-                    create_page_air(proof_options, config.page_base).with_preprocessed(
-                        page::compute_precomputed_commitment(config, proof_options),
-                        page::NUM_PREPROCESSED_COLS,
-                    )
+                    // ELF data pages: INIT is program-specific, so the commitment is
+                    // per-page. Prefer a caller-supplied `(page_base, commitment)`
+                    // (recursion guest); otherwise recompute from the ELF.
+                    let commitment = page_commitments
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|(pb, _)| *pb == config.page_base)
+                        .map(|(_, c)| *c)
+                        .unwrap_or_else(|| {
+                            page::compute_precomputed_commitment(config, proof_options)
+                        });
+                    air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
                 }
             })
             .collect();
@@ -733,6 +752,7 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -805,6 +825,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         None,
+        None,
     )
 }
 
@@ -821,8 +842,18 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// commitment as a compile-time constant to avoid the in-VM recompute
 /// cost. When `None`, the verifier computes the commitment from the ELF.
 ///
-/// Trust model: `decode_commitment`, when supplied, must come from the
-/// caller's compiled binary (e.g. a `const [u8; 32]`), never from prover-
+/// `page_commitments` is an optional list of precomputed ELF-data-page
+/// preprocessed commitments, keyed by `page_base`. For each ELF data page
+/// the verifier constructs, if a matching `(page_base, commitment)` pair is
+/// supplied, the FFT + Merkle build for that page is skipped. Pages without
+/// a match — including all zero-init pages — take the normal compute path
+/// (zero-init pages hit a compile-time constant via
+/// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
+/// from the ELF). When `None`, every ELF data page recomputes from scratch.
+///
+/// Trust model: both `decode_commitment` and `page_commitments`, when
+/// supplied, must come from the caller's compiled binary (e.g. a
+/// `const [u8; 32]` and a `const [(u64, [u8; 32])]`), never from prover-
 /// supplied bytes. A wrong value is rejected, never silently accepted: it
 /// either mismatches the prover's committed precomputed root (an explicit
 /// verifier check) or yields diverging Fiat-Shamir challenges.
@@ -831,6 +862,7 @@ pub fn verify_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
@@ -877,6 +909,7 @@ pub fn verify_with_options(
         &page_configs,
         &vm_proof.table_counts,
         decode_commitment,
+        page_commitments,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
