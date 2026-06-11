@@ -109,7 +109,7 @@ cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail 
 
 if $REBUILD_ELF; then
     echo -e "${GREEN}[Lambda VM] Rebuilding ethrex guest ELF...${NC}"
-    make -B -C "$ROOT_DIR" executor/program_artifacts/rust/ethrex.elf 2>&1 | tail -5
+    make -B -C "$ROOT_DIR" executor/program_artifacts/rust/ethrex.elf
 elif [ -f "$ETHREX_ELF" ]; then
     echo -e "${YELLOW}[Lambda VM] Using pre-existing ethrex.elf at $ETHREX_ELF${NC}"
 else

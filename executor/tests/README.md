@@ -24,8 +24,6 @@ ethrex_simple_tx.bin
   contents: stateless ethrex block with one plain ETH transfer transaction
 ```
 
-The original generation command for these blobs is not encoded in this
-repository. Do not update the ethrex revision or replace these fixtures without
-also recording the command/tool, chain config or genesis, transaction contents,
-and resulting fixture hashes here. Prefer adding an in-repo generator before
-introducing additional ethrex fixtures.
+The original generation command for these blobs is not recorded in this
+repository. A follow-up should add an in-repo crate for generating custom ethrex
+block fixtures.
