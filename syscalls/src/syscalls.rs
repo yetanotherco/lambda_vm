@@ -20,24 +20,12 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
-#[cfg(target_arch = "riscv64")]
-/// This is a template for printing in the vm
-pub fn print_string(s: &str) {
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") s.as_ptr(),
-            in("a1") s.len(),
-            in("a7") SyscallNumbers::Print as usize,
-        );
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-/// This is a template for printing in the vm
-pub fn print_string(_: &str) {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
-}
+/// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
+/// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
+/// needed in provable programs, so `print_string` does nothing on every target.
+/// Keep it as a no-op rather than deleting call sites: that way no guest path can
+/// ever reintroduce an unmatched Print ecall. (See `SyscallNumbers::Print`.)
+pub fn print_string(_s: &str) {}
 
 /// # Safety
 ///
