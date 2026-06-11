@@ -189,9 +189,9 @@ fn decode_commitment_some_matches_default_path() {
 
     let decode_c = commitment_from_elf(&elf, &options).expect("decode commitment");
 
-    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None)
+    let default_ok = verify_with_options(&vm_proof, &elf_bytes, &options, None, None)
         .expect("verify with None should not error");
-    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(decode_c))
+    let explicit_ok = verify_with_options(&vm_proof, &elf_bytes, &options, Some(decode_c), None)
         .expect("verify with Some(correct) should not error");
 
     assert!(default_ok, "default path must accept the proof");
@@ -212,7 +212,7 @@ fn decode_commitment_wrong_value_rejects() {
     let mut wrong = commitment_from_elf(&elf, &options).expect("decode commitment");
     wrong[0] ^= 0xFF;
 
-    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong))
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some(wrong), None)
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(
         !result,
@@ -228,7 +228,7 @@ fn decode_commitment_zero_bytes_rejects() {
 
     // [0u8; 32] is the most plausible accidental default — passing it must
     // not pass verification.
-    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]))
+    let result = verify_with_options(&vm_proof, &elf_bytes, &options, Some([0u8; 32]), None)
         .expect("verify must not return Err — Fiat-Shamir mismatch is Ok(false)");
     assert!(
         !result,
@@ -259,6 +259,7 @@ fn decode_commitment_compile_time_const_accepts() {
         &elf_bytes,
         &options,
         Some(SUB_DECODE_COMMITMENT_BLOWUP_2),
+        None,
     )
     .expect("verify must not return Err");
     assert!(

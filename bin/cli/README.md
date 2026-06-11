@@ -34,13 +34,14 @@ See the root [`README.md`](../../README.md) for the toolchain setup.
 Run a RISC-V ELF program without generating a proof. Useful for testing and debugging.
 
 ```sh
-cargo run -p cli --release -- execute <PROGRAM.elf> [--private-input <FILE>] [--flamegraph <FILE>]
+cargo run -p cli --release -- execute <PROGRAM.elf> [--private-input <FILE>] [--flamegraph <FILE>] [--cycles]
 ```
 
 | Flag | Description |
 |---|---|
 | `--private-input <FILE>` | Pass private input bytes to the guest (read via `get_private_input()`). |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output. See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
+| `--cycles` | Count instructions during execution and print the dynamic instruction count. |
 
 ### Prove
 

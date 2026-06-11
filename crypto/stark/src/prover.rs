@@ -74,6 +74,13 @@ where
 pub enum ProvingError {
     WrongParameter(String),
     EmptyCommitment,
+    /// The prover's recomputed preprocessed Merkle root did not match the
+    /// commitment the AIR was constructed with (e.g. a stale static constant
+    /// in a table module, or a wrong caller-supplied entry such as
+    /// `page_commitments` / `decode_commitment`). Continuing would yield a
+    /// proof an honest verifier always rejects — fail fast on the prover side
+    /// with a localized error instead.
+    PrecomputedCommitmentMismatch,
     /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
     /// out of disk space, fd exhaustion, or mmap failure.
     #[cfg(feature = "disk-spill")]
@@ -739,10 +746,9 @@ pub trait IsStarkProver<
                 let (mut mult_tree, mult_root) =
                     Self::commit_columns_bit_reversed(&columns[num_cols..])
                         .ok_or(ProvingError::EmptyCommitment)?;
-                debug_assert_eq!(
-                    precomputed_root, expected_precomputed_root,
-                    "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
-                );
+                if precomputed_root != expected_precomputed_root {
+                    return Err(ProvingError::PrecomputedCommitmentMismatch);
+                }
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
                     precomputed_tree.spill_nodes_to_disk().map_err(|e| {
