@@ -104,7 +104,7 @@ Assumption @ec:a:addr_xG_alignment ensures no overflows happen when incrementing
 Note: `xG` is assumed to be range checked, since they're read from memory.
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
 
-=== Constrain `Gy`
+=== Constrain `yG`
 With $x_G$ read and range checked, we direct our attention to $y_G$.
 Rather than reading it from memory, the prover provides it as a witness and proves it to be correct.
 In particular, the chip enforces the relations 
