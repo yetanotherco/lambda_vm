@@ -54,7 +54,7 @@ Given curve point $P$ and scalar $k$, the multiple $k times P$ can trivially be 
 This accelerator instead leverages the _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) technique, which utilizes only $O(log(k))$ additions for the full multiplication.
 
 #strong("This accelerator.")
-The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [2^248, 2^256)$.
+The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [3, 2^256)$ that has odd order.
 In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
 This accelerator leverages _double-and-add_, executing the multiplication in $O(log(k))$ doublings and $O(w_H (k)) = O(log(k))$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
 
