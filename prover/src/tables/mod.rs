@@ -27,6 +27,7 @@ pub mod commit;
 pub mod cpu;
 pub mod decode;
 pub mod dvrm;
+pub mod global_memory;
 pub mod halt;
 pub mod keccak;
 pub mod keccak_rc;

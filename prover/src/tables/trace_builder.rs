@@ -1538,7 +1538,7 @@ pub fn epoch_touched_cells(
 }
 
 /// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
-fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
+pub(crate) fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
     for (&addr, &value) in image {

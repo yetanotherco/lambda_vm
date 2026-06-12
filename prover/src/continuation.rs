@@ -17,10 +17,7 @@ use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
-use stark::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
-    NullBoundaryConstraintBuilder, Packing,
-};
+use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover};
@@ -28,31 +25,19 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::MaxRowsConfig;
-use crate::tables::local_to_global::{self, CellBoundary, GENESIS_EPOCH};
+use crate::tables::local_to_global::{self, CellBoundary};
+use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
-use crate::tables::trace_builder::{Traces, build_initial_image, epoch_touched_cells};
-use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::trace_builder::{
+    Traces, build_init_page_data, build_initial_image, epoch_touched_cells,
+};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{Error, VmAirs, compute_expected_commit_bus_balance, verify_l2g_commitment_binding};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
-
-/// One GlobalMemory token `(address, value, epoch, timestamp)`.
-type Token = (u64, u64, u64, u64);
-
-/// Anchor trace columns: one GlobalMemory token per row, in the same order as the
-/// local-to-global table's GlobalMemory init/fini tokens.
-mod anchor_cols {
-    pub const ADDR_LO: usize = 0;
-    pub const ADDR_HI: usize = 1;
-    pub const VAL: usize = 2;
-    pub const EPOCH: usize = 3;
-    pub const TS_LO: usize = 4;
-    pub const TS_HI: usize = 5;
-    pub const NUM_COLUMNS: usize = 6;
-}
 
 fn empty_constraints()
 -> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
@@ -85,66 +70,58 @@ fn l2g_memory_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstra
     )
 }
 
-/// Anchor AIR: sends (genesis) or receives (program-end) one GlobalMemory token per row.
-fn anchor_air(
+/// GLOBAL_MEMORY AIR for one touched page (the cross-epoch analog of PAGE).
+///
+/// It sends each cell's genesis init and receives its finalization on the
+/// GlobalMemory bus. The genesis `init` column is preprocessed, so the verifier
+/// recomputes its commitment from the ELF — exactly PAGE's binding mechanism:
+/// ELF-data pages via `page::compute_precomputed_commitment`, zero-init pages
+/// (stack/heap) via the static zero-page commitment. The prover cannot choose
+/// the genesis values.
+fn global_memory_air(
     opts: &ProofOptions,
-    is_sender: bool,
+    config: &PageConfig,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let values = vec![
-        BusValue::Packed {
-            start_column: anchor_cols::ADDR_LO,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::ADDR_HI,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::VAL,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::EPOCH,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::TS_LO,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::TS_HI,
-            packing: Packing::Direct,
-        },
-    ];
-    let interaction = if is_sender {
-        BusInteraction::sender(BusId::GlobalMemory, Multiplicity::One, values)
-    } else {
-        BusInteraction::receiver(BusId::GlobalMemory, Multiplicity::One, values)
-    };
-    AirWithBuses::new(
-        anchor_cols::NUM_COLUMNS,
+    let air = AirWithBuses::new(
+        global_memory::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
-            interactions: vec![interaction],
+            interactions: global_memory::bus_interactions(config.page_base),
         },
         opts,
         1,
         empty_constraints(),
-    )
+    );
+    let commitment = if config.init_values.is_some() {
+        page::compute_precomputed_commitment(config, opts)
+    } else {
+        page::zero_init_preprocessed_commitment(opts)
+    };
+    air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
 }
 
-fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
-    let num_rows = tokens.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * anchor_cols::NUM_COLUMNS];
-    for (i, &(addr, value, epoch, ts)) in tokens.iter().enumerate() {
-        let base = i * anchor_cols::NUM_COLUMNS;
-        data[base + anchor_cols::ADDR_LO] = FE::from(addr & 0xFFFF_FFFF);
-        data[base + anchor_cols::ADDR_HI] = FE::from(addr >> 32);
-        data[base + anchor_cols::VAL] = FE::from(value & 0xFF);
-        data[base + anchor_cols::EPOCH] = FE::from(epoch);
-        data[base + anchor_cols::TS_LO] = FE::from(ts & 0xFFFF_FFFF);
-        data[base + anchor_cols::TS_HI] = FE::from(ts >> 32);
-    }
-    TraceTable::new_main(data, anchor_cols::NUM_COLUMNS, 1)
+/// The touched pages (sorted) and their ELF-derived genesis configs, rebuilt
+/// identically by prover and verifier from the ELF + private input. Each cell
+/// the program touched lives on one of these pages; a page in the ELF/input
+/// image carries its bytes as `init`, every other (stack/heap) page is zero-init.
+fn global_memory_configs(
+    boundaries: &[Vec<CellBoundary>],
+    elf: &Elf,
+    private_inputs: &[u8],
+) -> Vec<PageConfig> {
+    let image = build_initial_image(elf, private_inputs);
+    let init_page_data = build_init_page_data(&image);
+    let touched_pages: std::collections::BTreeSet<u64> = boundaries
+        .iter()
+        .flatten()
+        .map(|b| page::page_base_for_address(b.address))
+        .collect();
+    touched_pages
+        .into_iter()
+        .map(|page_base| match init_page_data.get(&page_base) {
+            Some(data) => PageConfig::with_data(page_base, data.clone()),
+            None => PageConfig::zero_init(page_base),
+        })
+        .collect()
 }
 
 /// Per-epoch starting state: the memory image and register image the epoch begins from.
@@ -246,56 +223,55 @@ fn prove_verify_epoch(
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
-/// GlobalMemory bus, plus a genesis sender (each cell's first init) and a
-/// program-end receiver (each cell's final fini). The bus balances iff every
-/// `fini` matches the next epoch's `init`.
+/// GlobalMemory bus, plus one GLOBAL_MEMORY table per touched page that sends each
+/// cell's genesis init (preprocessed from the ELF, so the verifier recomputes it)
+/// and receives its final value. The bus balances iff every `fini` matches the next
+/// epoch's `init` and every genesis value matches the ELF.
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
+    elf: &Elf,
+    private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
-    let all: Vec<CellBoundary> = boundaries.iter().flatten().copied().collect();
-
-    let genesis: Vec<Token> = all
-        .iter()
-        .filter(|b| b.init.originating_epoch == GENESIS_EPOCH)
-        .map(|b| {
-            (
-                b.address,
-                b.init.value,
-                b.init.originating_epoch,
-                b.init.timestamp,
-            )
-        })
-        .collect();
-
-    let mut final_fini: HashMap<u64, Token> = HashMap::new();
+    // Each cell's final state (boundaries are in epoch order, so the last fini wins).
+    let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
         for b in epoch {
-            final_fini.insert(
+            final_state.insert(
                 b.address,
-                (b.address, b.fini.value, b.fini.epoch, b.fini.timestamp),
+                global_memory::FiniState {
+                    value: (b.fini.value & 0xFF) as u8,
+                    epoch: b.fini.epoch,
+                    timestamp: b.fini.timestamp,
+                },
             );
         }
     }
-    let program_end: Vec<Token> = final_fini.into_values().collect();
+
+    let gm_configs = global_memory_configs(boundaries, elf, private_inputs);
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
         .map(|epoch| local_to_global::generate_local_to_global_trace(epoch))
         .collect();
-    let mut genesis_trace = anchor_trace(&genesis);
-    let mut program_end_trace = anchor_trace(&program_end);
+    let mut gm_traces: Vec<TraceTable<F, E>> = gm_configs
+        .iter()
+        .map(|config| global_memory::generate_global_trace(config, &final_state))
+        .collect();
 
     let l2g = l2g_global_air(opts);
-    let genesis_anchor = anchor_air(opts, true);
-    let program_end_anchor = anchor_air(opts, false);
+    let gm_airs: Vec<_> = gm_configs
+        .iter()
+        .map(|config| global_memory_air(opts, config))
+        .collect();
 
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_traces
         .iter_mut()
         .map(|t| (&l2g as AirRef, t, &()))
         .collect();
-    pairs.push((&genesis_anchor, &mut genesis_trace, &()));
-    pairs.push((&program_end_anchor, &mut program_end_trace, &()));
+    for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
+        pairs.push((air as AirRef, trace, &()));
+    }
 
     Prover::multi_prove(
         pairs,
@@ -309,15 +285,24 @@ fn prove_global(
 fn verify_global(
     boundaries: &[Vec<CellBoundary>],
     proof: &MultiProof<F, E, ()>,
+    elf: &Elf,
+    private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> bool {
     let l2g = l2g_global_air(opts);
-    let genesis_anchor = anchor_air(opts, true);
-    let program_end_anchor = anchor_air(opts, false);
+    // Rebuild the genesis configs FROM THE ELF and recompute their commitments:
+    // this is the binding — a prover that claimed different genesis values would
+    // commit a different root and fail to verify.
+    let gm_configs = global_memory_configs(boundaries, elf, private_inputs);
+    let gm_airs: Vec<_> = gm_configs
+        .iter()
+        .map(|config| global_memory_air(opts, config))
+        .collect();
 
     let mut refs: Vec<AirRef> = vec![&l2g; boundaries.len()];
-    refs.push(&genesis_anchor);
-    refs.push(&program_end_anchor);
+    for air in &gm_airs {
+        refs.push(air as AirRef);
+    }
 
     Verifier::multi_verify(
         &refs,
@@ -412,8 +397,8 @@ pub fn prove_and_verify_continuation(
     }
 
     // One global LogUp over all the (kept) local-to-global tables.
-    let global_proof = prove_global(&all_boundaries, &opts)?;
-    if !verify_global(&all_boundaries, &global_proof, &opts) {
+    let global_proof = prove_global(&all_boundaries, &elf, private_inputs, &opts)?;
+    if !verify_global(&all_boundaries, &global_proof, &elf, private_inputs, &opts) {
         return Ok(false);
     }
 
