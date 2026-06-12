@@ -43,9 +43,9 @@ desc = "`k`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "len_k"
+name = "idx_k"
 type = "Byte"
-desc = "Position of `k`'s most significant 1-bit"
+desc = "Index of `k`'s most significant 1-bit"
 pad = 0
 
 [[variables.auxiliary]]
@@ -613,13 +613,13 @@ multiplicity = "μ"
 [[constraints.delegate]]
 kind = "interaction"
 tag = "BIT"
-input = ["timestamp", "len_k"]
+input = ["timestamp", "idx_k"]
 multiplicity = "μ"
 
 [[constraints.delegate]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xG", "yG", "xG", "yG", ["-", "len_k", 1], 0]
+input = ["timestamp", "xG", "yG", "xG", "yG", ["-", "idx_k", 1], 0]
 multiplicity = "μ"
 ref = "ec:c:start_double_add"
 

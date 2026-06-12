@@ -147,7 +147,7 @@ Additionally, @ec:c:k_gt_0 ensures that $#`k` > 0$, preventing a case where $#`k
 
 === Subroutine
 With point $G$ and scalar $k$ fully constructed, we delegate bit-by-bit serving of the scalar `k` to the `EC_SCALAR` chip.
-Here, we capture the index of the most significant 1-bit of `k` in `len_k`.
+Here, we capture the index of the most significant 1-bit of `k` in `idx_k`.
 Note: if the prover decides to capture a lesser significant bit here, the LogUp will not balance, as the skipped bits will never taken off the bus.
 Next, we interact with the `ECDAS` chip, providing `G` both as the accumulator, and increment (@ec:c:start_double_add); we specifically instruct the chip to start with a _double_-operation.
 After completing its double-and-add sequence, the result is captured in `R` (@ec:c:receive_double_add).
