@@ -267,8 +267,9 @@ $
 $
 #aside("The case of " + $y_A = 0$ + ".")[
   Special attention should be paid to the first relation: if $y_A = 0$, $lambda$ can again be chosen freely.
-  As previously established, $y_A != 0$ for all points on the `secp256k1` curve.
-  Hence, this situation will not occur.
+
+  Note that $2 dot (x,0) = oo$, which implies this point only exists on curves with order $2$.
+  This situation will not occur here, as this accelerator only functions for curves with odd order.
 ]
 Reordering yields
 $
