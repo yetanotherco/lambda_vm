@@ -737,13 +737,24 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let trace_term = (0..ood_evaluations_table_width)
-            .zip(&challenges.trace_term_coeffs)
-            .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
-                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
+        // Row-outer fold: the trace denominator `1/(x - z)` depends only on the
+        // row (OOD step), so we factor it out of the per-column sum instead of
+        // multiplying it into every cell. This turns the `W·H` inner products
+        //   Σ_col Σ_row (diff·denom)·coeff
+        // into the algebraically identical
+        //   Σ_row denom·(Σ_col diff·coeff),
+        // dropping one ext3 multiplication per cell (≈ 2× fewer ext3 muls in the
+        // DEEP reconstruction, the dominant verifier arithmetic) and hoisting the
+        // OOD `get_row` out of the column loop (W·H → H calls). `trace_term_coeffs`
+        // is verifier-derived with shape `width × height`, so `[col][row]` indexing
+        // is in bounds (the OOD-width guard above pins `width`).
+        let trace_term =
+            (0..ood_evaluations_table_height).fold(FieldElement::zero(), |trace_term, row_idx| {
+                let ood_row = proof.trace_ood_evaluations.get_row(row_idx);
+                let row_sum = (0..ood_evaluations_table_width).fold(
                     FieldElement::zero(),
-                    |trace_t, (row_idx, coeff)| {
-                        let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
+                    |row_sum, col_idx| {
+                        let ood_val = &ood_row[col_idx];
                         // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
                         // Base columns are precomputed first, then main, then aux.
                         let diff: FieldElement<FieldExtension> = if col_idx < num_precomp {
@@ -753,11 +764,11 @@ pub trait IsStarkVerifier<
                         } else {
                             &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
                         };
-                        let poly_evaluation = diff * &trace_denoms_inv[row_idx];
-                        trace_t + &poly_evaluation * coeff
+                        let coeff = &trace_term_coeffs[col_idx][row_idx];
+                        row_sum + &diff * coeff
                     },
                 );
-                trace_terms + trace_i
+                trace_term + &row_sum * &trace_denoms_inv[row_idx]
             });
 
         let mut h_terms = FieldElement::zero();
