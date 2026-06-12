@@ -203,7 +203,15 @@ def expr_to_text(expr, parent_prec: int = 100) -> str:
                 inner = expr_to_text(expr[1], PREC["neg"])
                 return wrap(f"-{inner}", PREC["neg"])
             else:
-                parts = [expr_to_text(e, PREC["sub"]) for e in expr[1:]]
+                parts = [expr_to_text(expr[1], PREC["sub"])]
+                for e in expr[2:]:
+                    rendered = expr_to_text(e, PREC["sub"])
+                    # Subtraction is not associative on the right:
+                    # `a - (b + c)` and `a - (b - c)` must not render as
+                    # `a - b + c` / `a - b - c`.
+                    if isinstance(e, list) and e and e[0] in {"+", "-", "not"}:
+                        rendered = f"({rendered})"
+                    parts.append(rendered)
                 return wrap(" - ".join(parts), PREC["sub"])
         elif op == "cast":
             inner = expr_to_text(expr[1], PREC["cast"])

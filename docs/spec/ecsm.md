@@ -494,7 +494,7 @@ Lastly, the updated accumulator is sent out for the next step to be processed ([
 | | _polynomial:_ `op * next_op = 0` | |
 | `ECDAS-C25` | `next_op` = 1 => `μ` = 1 |  |
 | | _polynomial:_ `next_op * (1 - μ) = 0` | |
-| `ECDAS-C26` | `ECDAS[timestamp, xR, yR, xG, yG, round - 1 - next_op, next_op]` | μ |
+| `ECDAS-C26` | `ECDAS[timestamp, xR, yR, xG, yG, round - (1 - next_op), next_op]` | μ |
 
 ### Padding
 
