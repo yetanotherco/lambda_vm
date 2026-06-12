@@ -602,11 +602,11 @@ mod keccak_tests {
 
         let xor = ops
             .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::XorByte)
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluXor)
             .count();
         let and = ops
             .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::AndByte)
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluAnd)
             .count();
         let are_bytes = ops
             .iter()
@@ -621,8 +621,8 @@ mod keccak_tests {
             .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
             .count();
 
-        assert_eq!(xor, 24 * 608, "XorByte count");
-        assert_eq!(and, 24 * 200 + 1, "AndByte count");
+        assert_eq!(xor, 24 * 608, "ByteAluXor count");
+        assert_eq!(and, 24 * 200 + 1, "ByteAluAnd count");
         // Cxz_right Byte→Bit (spec d75944ee): drops 40 ARE_BYTES per round.
         // Spec emits one IS_BYTE template per byte; ops pair adjacent bytes
         // into ARE_BYTES (20 cxz_left + 200 rho per round, 4 addr per call).
@@ -730,7 +730,7 @@ mod keccak_tests {
         assert_eq!(
             keccak::bus_interactions().len(),
             134,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),

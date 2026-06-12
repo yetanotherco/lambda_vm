@@ -1,6 +1,6 @@
 //! BITWISE precomputed lookup table.
 //!
-//! This table provides 10 different lookup types used by other tables:
+//! This table provides byte/range lookup types used by other tables:
 //!
 //! ## Range Checks
 //! - `ARE_BYTES[X, Y]` - X and Y are valid bytes [0, 256). Spec template
@@ -9,9 +9,7 @@
 //! - `IS_B20[X]` - X is a valid 20-bit value [0, 2^20)
 //!
 //! ## Bitwise Operations
-//! - `AND_BYTE[X, Y]` -> X & Y
-//! - `OR_BYTE[X, Y]` -> X | Y
-//! - `XOR_BYTE[X, Y]` -> X ^ Y
+//! - `BYTE_ALU[opsel, X, Y] -> out` for byte AND/OR/XOR
 //! - `MSB8[X]` -> most significant bit of byte
 //! - `MSB16[X]` -> most significant bit of halfword
 //! - `ZERO[X]` -> whether X is zero
@@ -71,35 +69,29 @@ pub mod cols {
     pub const SLLC: usize = 10;
 
     // Multiplicity columns for each lookup type
-    /// Multiplicity for AND_BYTE lookups
-    pub const MU_AND: usize = 11;
-    /// Multiplicity for OR_BYTE lookups
-    pub const MU_OR: usize = 12;
-    /// Multiplicity for XOR_BYTE lookups
-    pub const MU_XOR: usize = 13;
     /// Multiplicity for MSB8 lookups
-    pub const MU_MSB8: usize = 14;
+    pub const MU_MSB8: usize = 11;
     /// Multiplicity for MSB16 lookups
-    pub const MU_MSB16: usize = 15;
+    pub const MU_MSB16: usize = 12;
     /// Multiplicity for ZERO lookups
-    pub const MU_ZERO: usize = 16;
+    pub const MU_ZERO: usize = 13;
     /// Multiplicity for ARE_BYTES lookups. Each lookup checks X and Y; pass Y=0
     /// for a single-byte range check (spec template `IS_BYTE<X>`).
-    pub const MU_ARE_BYTES: usize = 17;
+    pub const MU_ARE_BYTES: usize = 14;
     /// Multiplicity for IS_HALF lookups
-    pub const MU_IS_HALF: usize = 18;
+    pub const MU_IS_HALF: usize = 15;
     /// Multiplicity for IS_B20 lookups
-    pub const MU_IS_B20: usize = 19;
+    pub const MU_IS_B20: usize = 16;
     /// Multiplicity for HWSL lookups
-    pub const MU_HWSL: usize = 20;
+    pub const MU_HWSL: usize = 17;
     /// Multiplicity for `BYTE_ALU[opsel=AND]` lookups
-    pub const MU_BYTE_ALU_AND: usize = 21;
+    pub const MU_BYTE_ALU_AND: usize = 18;
     /// Multiplicity for `BYTE_ALU[opsel=OR]` lookups
-    pub const MU_BYTE_ALU_OR: usize = 22;
+    pub const MU_BYTE_ALU_OR: usize = 19;
     /// Multiplicity for `BYTE_ALU[opsel=XOR]` lookups
-    pub const MU_BYTE_ALU_XOR: usize = 23;
+    pub const MU_BYTE_ALU_XOR: usize = 20;
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 24;
+    pub const NUM_COLUMNS: usize = 21;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
@@ -438,9 +430,6 @@ pub fn update_multiplicities(
     for op in ops {
         let row = row_index(op.x, op.y, op.z);
         let mu_col = match op.lookup_type {
-            BitwiseOperationType::AndByte => cols::MU_AND,
-            BitwiseOperationType::OrByte => cols::MU_OR,
-            BitwiseOperationType::XorByte => cols::MU_XOR,
             BitwiseOperationType::Msb8 => cols::MU_MSB8,
             BitwiseOperationType::Msb16 => cols::MU_MSB16,
             BitwiseOperationType::Zero => cols::MU_ZERO,
@@ -486,10 +475,9 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (MU_AND..=MU_BYTE_ALU_XOR), including
-            // the BYTE_ALU columns (rows used only by a BYTE_ALU lookup
-            // must not be trimmed).
-            (cols::MU_AND..=cols::MU_BYTE_ALU_XOR).any(|col| row_data[col] != FE::zero())
+            // Check all multiplicity columns, including rows used only by a
+            // BYTE_ALU lookup.
+            (cols::MU_MSB8..=cols::MU_BYTE_ALU_XOR).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -520,9 +508,6 @@ pub(crate) fn trim_zero_rows(
 /// Types of lookups the BITWISE table provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitwiseOperationType {
-    AndByte,
-    OrByte,
-    XorByte,
     Msb8,
     Msb16,
     Zero,
@@ -530,7 +515,6 @@ pub enum BitwiseOperationType {
     IsHalf,
     IsB20,
     Hwsl,
-    // Unified `BYTE_ALU` lookups, keyed by opsel.
     ByteAluAnd,
     ByteAluOr,
     ByteAluXor,
@@ -622,63 +606,6 @@ impl BitwiseOperation {
 /// in the spec corresponds to receiving lookups from other tables).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // AND_BYTE[X, Y] -> AND
-        BusInteraction::receiver(
-            BusId::AndByte,
-            Multiplicity::Column(cols::MU_AND),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::AND,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // OR_BYTE[X, Y] -> OR
-        BusInteraction::receiver(
-            BusId::OrByte,
-            Multiplicity::Column(cols::MU_OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // XOR_BYTE[X, Y] -> XOR
-        BusInteraction::receiver(
-            BusId::XorByte,
-            Multiplicity::Column(cols::MU_XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::XOR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
         // MSB8[X] -> MSB8
         BusInteraction::receiver(
             BusId::Msb8,

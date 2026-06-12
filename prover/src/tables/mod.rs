@@ -17,7 +17,7 @@
 //! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
 //! - **PAGE**: Paged memory init/final table (one per used page)
-//! - **REGISTER**: Register init/final table (32 registers × 8 bytes = 256 rows)
+//! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
 
 pub mod types;
 

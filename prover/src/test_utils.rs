@@ -499,26 +499,23 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 13]> = HashMap::new();
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
 
     for op in ops {
         let key = (op.x, op.y, op.z);
         let mu_idx = match op.lookup_type {
-            BitwiseOperationType::AndByte => 0,
-            BitwiseOperationType::OrByte => 1,
-            BitwiseOperationType::XorByte => 2,
-            BitwiseOperationType::Msb8 => 3,
-            BitwiseOperationType::Msb16 => 4,
-            BitwiseOperationType::Zero => 5,
-            BitwiseOperationType::AreBytes => 6,
-            BitwiseOperationType::IsHalf => 7,
-            BitwiseOperationType::IsB20 => 8,
-            BitwiseOperationType::Hwsl => 9,
-            BitwiseOperationType::ByteAluAnd => 10,
-            BitwiseOperationType::ByteAluOr => 11,
-            BitwiseOperationType::ByteAluXor => 12,
+            BitwiseOperationType::Msb8 => 0,
+            BitwiseOperationType::Msb16 => 1,
+            BitwiseOperationType::Zero => 2,
+            BitwiseOperationType::AreBytes => 3,
+            BitwiseOperationType::IsHalf => 4,
+            BitwiseOperationType::IsB20 => 5,
+            BitwiseOperationType::Hwsl => 6,
+            BitwiseOperationType::ByteAluAnd => 7,
+            BitwiseOperationType::ByteAluOr => 8,
+            BitwiseOperationType::ByteAluXor => 9,
         };
-        row_data.entry(key).or_insert([0; 13])[mu_idx] += 1;
+        row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
 
     // Need at least 4 rows for FRI, pad to power of 2
@@ -566,19 +563,16 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
         // Multiplicity columns
         let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_BYTE_ALU_AND] = FE::from(mus[10]);
-        data[base + bitwise_cols::MU_BYTE_ALU_OR] = FE::from(mus[11]);
-        data[base + bitwise_cols::MU_BYTE_ALU_XOR] = FE::from(mus[12]);
+        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[0]);
+        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[1]);
+        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[2]);
+        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[3]);
+        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[4]);
+        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[5]);
+        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_BYTE_ALU_AND] = FE::from(mus[7]);
+        data[base + bitwise_cols::MU_BYTE_ALU_OR] = FE::from(mus[8]);
+        data[base + bitwise_cols::MU_BYTE_ALU_XOR] = FE::from(mus[9]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)

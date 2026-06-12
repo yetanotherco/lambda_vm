@@ -14,7 +14,7 @@
 //! - Multiplicity: `μ`
 //!
 //! ## Bus Interactions (15 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
 //! - Receiver: SHIFT (from CPU)
 
 use math::field::element::FieldElement;
@@ -438,11 +438,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
+    // SHIFT-C1: BYTE_ALU[bit_shift; AND, shift, 15] | left (= μ - direction)
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
@@ -455,15 +456,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
+    // SHIFT-C2: BYTE_ALU[bit_shift; AND, 256 - zbs * 16 - shift, 15] | right
+    // (= direction)
     // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
     // [0,255].
     // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
     // 256 - 16 - shift ∈ [0,255].
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::DIRECTION),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::linear(vec![
                 LinearTerm::Constant(256),
                 LinearTerm::Column {
@@ -561,13 +564,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
+    // SHIFT-C11: BYTE_ALU[encoded_limb; AND, shift, mask] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
     // mask = 48 - 32 * word_instr
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::MU),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             // first input: shift
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
@@ -665,9 +669,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // Range checks for the low-word high bits (so the in2 low-word decomposition
     // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT is also
-    // byte-checked implicitly via the AND_BYTE[shift, mask] lookups; we still emit
+    // byte-checked implicitly via the BYTE_ALU[AND, shift, mask] lookups; we still emit
     // the explicit ARE_BYTES[shift[0]] below to match the spec's `IS_BYTE[shift[0]]`
-    // (defense-in-depth, redundant with AND_BYTE). SHIFT_HIGH (the high word) needs
+    // (defense-in-depth, redundant with BYTE_ALU[AND]). SHIFT_HIGH (the high word) needs
     // no check: IS_WORD is assumed (it equals the CPU's well-formed arg2 high word
     // on the bus), matching the spec's `shift[3]`.
     interactions.push(BusInteraction::sender(
@@ -988,7 +992,7 @@ use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
 /// Collect BITWISE table lookups needed by a set of unique shift operations.
 ///
-/// Each unique operation (with its multiplicity) generates HWSL/AND_BYTE/MSB16/ZERO
+/// Each unique operation (with its multiplicity) generates HWSL/BYTE_ALU/MSB16/ZERO
 /// lookups. The lookups must be generated per-unique-operation (matching the SHIFT table's
 /// deduplication and μ column), and repeated `multiplicity` times.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
@@ -1011,21 +1015,21 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C1: AND_BYTE[shift, 15] | left (= μ - direction = 1 - direction)
+        // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
         if left {
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AndByte,
+                BitwiseOperationType::ByteAluAnd,
                 op.shift,
                 15,
             ));
         }
 
-        // C2: AND_BYTE[256 - zbs*16 - shift, 15] | right (= direction)
+        // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
         if right {
             let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
             let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AndByte,
+                BitwiseOperationType::ByteAluAnd,
                 complement,
                 15,
             ));
@@ -1060,10 +1064,10 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C11: AND_BYTE[shift, mask] | μ (= 1)
+        // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
         let mask = if op.word_instr { 16 } else { 48 };
         bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
+            BitwiseOperationType::ByteAluAnd,
             op.shift,
             mask,
         ));
@@ -1077,7 +1081,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ((op.shift_amount >> 8) & 0xFF) as u8,
         ));
         // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
-        // redundant with the AND_BYTE[shift, mask] lookups above).
+        // redundant with the BYTE_ALU[AND, shift, mask] lookups above).
         bitwise_ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             op.shift,

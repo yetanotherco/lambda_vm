@@ -96,9 +96,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // 10 legacy lookups (one per type; HWSLC merged into HWSL) + 3 BYTE_ALU
-    // receivers (opsel AND/OR/XOR).
-    assert_eq!(interactions.len(), 13);
+    // 7 non-BYTE_ALU lookups + 3 BYTE_ALU receivers (opsel AND/OR/XOR).
+    assert_eq!(interactions.len(), 10);
 }
 
 #[test]
@@ -453,14 +452,15 @@ mod soundness_tests {
     fn create_sender_air(
         proof_options: &ProofOptions,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        use crate::tables::types::BusId;
+        use crate::tables::types::{BusId, alu_op};
 
         let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::AndByte,
+                BusId::ByteAlu,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
+                    BusValue::constant(alu_op::AND as u64),
                     BusValue::Packed {
                         start_column: sender_cols::X,
                         packing: Packing::Direct,
@@ -504,14 +504,15 @@ mod soundness_tests {
         proof_options: &ProofOptions,
         preprocessed: Option<(stark::config::Commitment, usize)>,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        use crate::tables::types::BusId;
+        use crate::tables::types::{BusId, alu_op};
 
         let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::AndByte,
+                BusId::ByteAlu,
                 Multiplicity::Column(receiver_cols::MU_AND),
                 vec![
+                    BusValue::constant(alu_op::AND as u64),
                     BusValue::Packed {
                         start_column: receiver_cols::X,
                         packing: Packing::Direct,

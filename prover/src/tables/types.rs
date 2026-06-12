@@ -54,12 +54,8 @@ pub enum BusId {
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
-    /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
-    AndByte = 3,
-    /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
-    OrByte = 4,
-    /// Bitwise XOR of two bytes: XOR_BYTE[X, Y] -> X ^ Y
-    XorByte = 5,
+    // IDs 3, 4, and 5 are reserved for the removed legacy
+    // AndByte/OrByte/XorByte buses. Byte AND/OR/XOR lookups use ByteAlu.
     /// Most significant bit of a byte: MSB8[X] -> (X >> 7) & 1
     Msb8 = 6,
     /// Most significant bit of a halfword: MSB16[X] -> (X >> 15) & 1
@@ -114,10 +110,7 @@ pub enum BusId {
     // Byte ALU (BITWISE table provides)
     // =========================================================================
     /// Unified byte-level ALU lookup: `BYTE_ALU[opsel, X, Y] -> out`, where
-    /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2). A single
-    /// op-selectable bus used by the rework chips (`CPU32`/`BYTEWISE`); the
-    /// per-op `AndByte`/`OrByte`/`XorByte` buses remain in use elsewhere
-    /// (`BRANCH`/`SHIFT`/keccak).
+    /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2).
     ByteAlu = 24,
 
     // =========================================================================
@@ -144,9 +137,6 @@ impl BusId {
             BusId::AreBytes => "AreBytes",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
-            BusId::AndByte => "AndByte",
-            BusId::OrByte => "OrByte",
-            BusId::XorByte => "XorByte",
             BusId::Msb8 => "Msb8",
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
@@ -176,9 +166,6 @@ impl TryFrom<u64> for BusId {
             0 => Ok(BusId::AreBytes),
             1 => Ok(BusId::IsHalfword),
             2 => Ok(BusId::IsB20),
-            3 => Ok(BusId::AndByte),
-            4 => Ok(BusId::OrByte),
-            5 => Ok(BusId::XorByte),
             6 => Ok(BusId::Msb8),
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
@@ -283,8 +270,6 @@ pub mod alu_op {
 /// the CPU's `packed_decode` reconstruction, so the DECODE bus fingerprint
 /// matches on both sides.
 ///
-/// NOTE: not yet wired into the DECODE/CPU tables — those still use the older
-/// [`packed_decode`] layout.
 pub mod packed_decode_shrunk {
     // Top-level flags + register indices.
     pub const READ_REG1: u32 = 0;
