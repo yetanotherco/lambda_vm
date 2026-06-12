@@ -48,12 +48,12 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_ec_scalar_air, create_ecdas_air, create_ecsm_air,
-    create_halt_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
-    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
-    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
-    create_shift_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_scalar_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air, create_store_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -90,6 +90,11 @@ pub struct TableCounts {
     pub shift: usize,
     pub branch: usize,
     pub memw_register: usize,
+    // Auxiliary ALU / memory / CPU32 dispatch chips
+    pub eq: usize,
+    pub bytewise: usize,
+    pub store: usize,
+    pub cpu32: usize,
 }
 
 impl TableCounts {
@@ -105,6 +110,10 @@ impl TableCounts {
             + self.shift
             + self.branch
             + self.memw_register
+            + self.eq
+            + self.bytewise
+            + self.store
+            + self.cpu32
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -123,6 +132,10 @@ impl TableCounts {
             ("shift", self.shift),
             ("branch", self.branch),
             ("memw_register", self.memw_register),
+            ("eq", self.eq),
+            ("bytewise", self.bytewise),
+            ("store", self.store),
+            ("cpu32", self.cpu32),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -221,6 +234,11 @@ pub(crate) struct VmAirs {
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
+    // Auxiliary ALU / memory / CPU32 dispatch chips
+    pub eqs: Vec<VmAir>,
+    pub bytewises: Vec<VmAir>,
+    pub stores: Vec<VmAir>,
+    pub cpu32s: Vec<VmAir>,
 }
 
 impl VmAirs {
@@ -281,6 +299,18 @@ impl VmAirs {
         {
             pairs.push((air, trace, &()));
         }
+        for (air, trace) in self.eqs.iter().zip(traces.eqs.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.bytewises.iter().zip(traces.bytewises.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.stores.iter().zip(traces.stores.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
 
         pairs
     }
@@ -332,6 +362,18 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.memw_registers {
+            refs.push(air);
+        }
+        for air in &self.eqs {
+            refs.push(air);
+        }
+        for air in &self.bytewises {
+            refs.push(air);
+        }
+        for air in &self.stores {
+            refs.push(air);
+        }
+        for air in &self.cpu32s {
             refs.push(air);
         }
 
@@ -472,6 +514,18 @@ impl VmAirs {
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
             .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
             .collect();
+        let eqs: Vec<_> = (0..table_counts.eq)
+            .map(|i| create_eq_air(proof_options).with_name(&format!("EQ[{}]", i)))
+            .collect();
+        let bytewises: Vec<_> = (0..table_counts.bytewise)
+            .map(|i| create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+            .collect();
+        let stores: Vec<_> = (0..table_counts.store)
+            .map(|i| create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+            .collect();
+        let cpu32s: Vec<_> = (0..table_counts.cpu32)
+            .map(|i| create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+            .collect();
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -499,6 +553,10 @@ impl VmAirs {
             register,
             pages,
             memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
         }
     }
 }

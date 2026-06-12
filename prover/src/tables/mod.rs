@@ -17,19 +17,22 @@
 //! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
 //! - **PAGE**: Paged memory init/final table (one per used page)
-//! - **REGISTER**: Register init/final table (32 registers × 8 bytes = 256 rows)
+//! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
 
 pub mod types;
 
 pub mod bitwise;
 pub mod branch;
+pub mod bytewise;
 pub mod commit;
 pub mod cpu;
+pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
 pub mod ec_scalar;
 pub mod ecdas;
 pub mod ecsm;
+pub mod eq;
 pub mod halt;
 pub mod keccak;
 pub mod keccak_rc;
@@ -43,6 +46,7 @@ pub mod mul;
 pub mod page;
 pub mod register;
 pub mod shift;
+pub mod store;
 pub mod trace_builder;
 
 pub use types::BusId;
@@ -85,6 +89,11 @@ pub mod max_rows {
     pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
     pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
     pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
+    // Auxiliary ALU / memory / CPU32 dispatch chips
+    pub const EQ: usize = 1 << 20;
+    pub const BYTEWISE: usize = 1 << 20;
+    pub const STORE: usize = 1 << 20;
+    pub const CPU32: usize = 1 << 19;
 }
 
 /// Per-table maximum row limits, configurable for different environments.
@@ -103,6 +112,10 @@ pub struct MaxRowsConfig {
     pub load: usize,
     pub branch: usize,
     pub memw_register: usize,
+    pub eq: usize,
+    pub bytewise: usize,
+    pub store: usize,
+    pub cpu32: usize,
 }
 
 impl Default for MaxRowsConfig {
@@ -118,6 +131,10 @@ impl Default for MaxRowsConfig {
             load: max_rows::LOAD,
             branch: max_rows::BRANCH,
             memw_register: max_rows::MEMW_R,
+            eq: max_rows::EQ,
+            bytewise: max_rows::BYTEWISE,
+            store: max_rows::STORE,
+            cpu32: max_rows::CPU32,
         }
     }
 }
@@ -137,6 +154,10 @@ impl MaxRowsConfig {
             load: 1 << 5,
             branch: 1 << 5,
             memw_register: 1 << 5,
+            eq: 1 << 5,
+            bytewise: 1 << 5,
+            store: 1 << 5,
+            cpu32: 1 << 5,
         }
     }
 }

@@ -6,7 +6,7 @@
 //! - Use multi_prove/multi_verify with bus interactions
 //!
 //! Wired buses:
-//! - CPU sends AND_BYTE, OR_BYTE, XOR_BYTE to Bitwise (×8 each)
+//! - Byte-level AND/OR/XOR lookups are routed through BYTE_ALU
 //! - CPU sends MSB16 to Bitwise (for rv1_sign_bit, arg2_sign_bit when word_instr=1)
 //! - CPU sends MSB8 to Bitwise (for res_sign_bit when word_instr=1)
 //! - CPU sends ZERO to Bitwise (for is_equal when BEQ=1)
@@ -806,8 +806,8 @@ fn test_prove_elfs_test_shift_8() {
 }
 
 // Tests that right shift by 0 bits (srli a0, a2, 0) is provable.
-// Regression test for SHIFT-C4: previously C4 sent AND_BYTE[bit_shift; 256, 15] when
-// shift=0, which is out of AND_BYTE's byte range (0-255), making the proof fail.
+// Regression test for SHIFT-C4: previously the shift mask lookup could send 256
+// as a byte input when shift=0, making the proof fail.
 #[test]
 fn test_prove_elfs_srli_one_zero() {
     let (elf, logs, instructions) = run_asm_elf("srli_one_zero");
@@ -1251,7 +1251,7 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
 ///
 /// Without the ARE_BYTES range checks on addr(0..7), an attacker could keep
 /// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
-/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// address as a field element while setting addr(0)=0 (passing the BYTE_ALU
 /// alignment check) and folding the carry into addr(1) as a non-byte
 /// FE-element. This test asserts that mutating addr(1) to a non-byte value
 /// unbalances the verifier's bus checks and the proof is rejected.
@@ -2348,6 +2348,10 @@ fn test_verify_rejects_zero_table_counts() {
             shift: 0,
             branch: 0,
             memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
         },
         ..vm_proof
     };
@@ -2419,6 +2423,10 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
         memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, None);
 

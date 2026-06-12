@@ -39,13 +39,16 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
+use super::bytewise;
 use super::commit::{self, CommitOperation};
 use super::cpu::{self, CpuOperation};
+use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
 use super::ec_scalar;
 use super::ecdas;
 use super::ecsm;
+use super::eq;
 use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
@@ -59,6 +62,7 @@ use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
+use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -293,16 +297,8 @@ impl RegisterState {
 
 /// Get byte count and signed flag from CpuOperation memory flags.
 fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
-    let byte_count = if op.decode.memory_8bytes {
-        8
-    } else if op.decode.memory_4bytes {
-        4
-    } else if op.decode.memory_2bytes {
-        2
-    } else {
-        1
-    };
-    (byte_count, op.decode.signed)
+    let f = &op.decode.fields;
+    (f.mem_bytes(), f.mem_signed())
 }
 
 /// Pack a 64-bit register value into the MEMW value format.
@@ -358,7 +354,7 @@ fn collect_cpu_ops(
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
-/// ecsm_ops, ec_scalar_ops, ecdas_ops)
+/// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -372,6 +368,7 @@ fn collect_ops_from_cpu(
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
+    Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
@@ -383,6 +380,7 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
+    let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ec_scalar_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
@@ -390,15 +388,22 @@ fn collect_ops_from_cpu(
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
+        // Word (`*W`) instructions delegate to the CPU32 table (built in program
+        // order; its register accesses are still emitted via the shared register
+        // collector below so the MEMW table balances).
+        if op.decode.fields.word_instr {
+            cpu32_ops.push(build_cpu32_op(op));
+        }
+
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
-        if op.decode.op_load {
+        if op.decode.fields.is_load() {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
-        } else if op.decode.op_store {
+        } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
         }
@@ -470,32 +475,37 @@ fn collect_ops_from_cpu(
             ecdas_ops.extend(ecdas_rows);
         }
 
-        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
-
-        // Collect LT operations from SLT/BLT instructions
-        if op.decode.op_slt || op.decode.op_blt {
-            let arg1 = op.compute_arg1();
-            let arg2 = op.compute_arg2();
-            lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
+        // --- ALU chip dispatch (no state tracking) ---
+        // Word (`*W`) instructions are delegated to CPU32 (which itself drives
+        // the ALU chips); the main CPU does not send the ALU bus for them, so we
+        // must not emit chip ops here. CPU32 op-generation is B5b.
+        let f = op.decode.fields;
+        if !f.word_instr {
+            // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
+            // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
+            if f.is_lt() {
+                lt_ops.push(LtOperation::new_with_invert(
+                    op.rv1,
+                    op.arg2,
+                    f.alu_signed(),
+                    f.alu_signed2_or_invert(),
+                ));
+            }
+            // SHIFT: SLL/SRL/SRA. direction = invert bit (0 = left, 1 = right).
+            // The full arg2 goes on the ALU bus as in2; the chip uses its low
+            // byte for the (mod 32/64) computation.
+            if f.is_shift() {
+                shift_ops.push(ShiftOperation::new(
+                    op.rv1,
+                    op.arg2,
+                    f.alu_signed2_or_invert(),
+                    f.alu_signed(),
+                    f.word_instr,
+                ));
+            }
         }
 
-        // Collect SHIFT operations
-        if op.decode.op_shift {
-            let input = op.compute_arg1();
-            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
-            let direction = op.decode.mp_selector; // 0=left, 1=right
-            let signed = op.decode.signed;
-            let word_instr = op.decode.word_instr;
-            shift_ops.push(ShiftOperation::new(
-                input,
-                shift_amount,
-                direction,
-                signed,
-                word_instr,
-            ));
-        }
-
-        // Collect bitwise lookups
+        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
@@ -514,6 +524,7 @@ fn collect_ops_from_cpu(
         bitwise_ops,
         commit_ops,
         keccak_ops,
+        cpu32_ops,
         ecsm_ops,
         ec_scalar_ops,
         ecdas_ops,
@@ -605,19 +616,21 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
         *byte = (store_value >> (j * 8)) & 0xFF;
     }
 
-    // Create MEMW operation (write) - M7 uses timestamp+1
+    // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
+    // the old inline M7). It uses the base timestamp — the same the CPU sends on
+    // the MEMORY bus — per spec store.toml.
     let memw_op = MemwOperation::new(
         false, // is_register = false
         base_address,
         value_bytes,
-        op.timestamp + 1,
+        op.timestamp,
         byte_count as u8,
         false, // is_read = false (write)
     )
     .with_old(old_values, old_timestamps);
 
-    // Update memory state (using timestamp+1 to match M7)
-    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
+    // Update memory state at the base timestamp (matches the STORE MEMW write).
+    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp);
 
     memw_op
 }
@@ -752,7 +765,11 @@ fn collect_register_ops_from_cpu(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let mut memw_ops = Vec::with_capacity(4);
-    let d = &op.decode;
+    let d = &op.decode.fields;
+    // These register accesses happen for every real instruction. For non-word
+    // rows the main CPU sends the MEMW lookups; for word (`*W`) rows the CPU32
+    // table sends them. Either way the MEMW *table* receives the same record, so
+    // we generate it here (in program order, for register-state timestamps).
 
     // M1: Read rs1 register at timestamp+0
     // Skip x0 (hardwired zero). x255 (the register where the pc is stored) is handled
@@ -812,6 +829,156 @@ fn collect_register_ops_from_cpu(
     register_state.write_pc(op.next_pc, op.timestamp + 1);
 
     memw_ops
+}
+
+// =============================================================================
+// CPU32 (word `*W` instruction) op-generation
+// =============================================================================
+
+/// The raw ALU result `res` for a CPU32 row, matching what the dispatched chip
+/// (or the ADD/SUB fast-path) computes from the sign-extended `arg1`/`arg2`.
+fn cpu32_res(c: &cpu32::Cpu32Operation, arg1: u64, arg2: u64) -> u64 {
+    use crate::tables::types::alu_op;
+    if c.add {
+        return arg1.wrapping_add(arg2);
+    }
+    if c.sub {
+        return arg1.wrapping_sub(arg2);
+    }
+    if !c.alu {
+        return 0;
+    }
+    let op = c.alu_flags & 0x1F;
+    let signed = (c.alu_flags >> 5) & 1 == 1;
+    let s2_or_inv = (c.alu_flags >> 6) & 1 == 1;
+    let muldiv = (c.alu_flags >> 7) & 1 == 1;
+    if op == alu_op::SHIFT || op == alu_op::SHIFTW {
+        // The ALU bus carries the chip's raw OUT (not the sign-extended value);
+        // CPU32 sign-extends it to rvd.
+        ShiftOperation::new(arg1, arg2, s2_or_inv, signed, true).compute_out()
+    } else if op == alu_op::MUL {
+        MulOperation::new(arg1, signed, arg2, s2_or_inv)
+            .compute_product()
+            .0
+    } else if op == alu_op::DIVREM {
+        let d = DvrmOperation::new(arg1, arg2, signed);
+        if muldiv {
+            d.compute_remainder()
+        } else {
+            d.compute_quotient()
+        }
+    } else {
+        0
+    }
+}
+
+/// Builds the CPU32 row for a word (`*W`) instruction. `op.rv1/rv2/rvd` carry the
+/// real register values (the main CPU delegate row zeroes its own columns).
+fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
+    let f = &op.decode.fields;
+    let mut c = cpu32::Cpu32Operation {
+        timestamp: op.timestamp,
+        pc: op.decode.pc,
+        rs1: f.rs1,
+        read_register1: f.read_register1,
+        rv1: op.rv1,
+        rs2: f.rs2,
+        read_register2: f.read_register2,
+        rv2: op.rv2,
+        imm: op.decode.imm,
+        res: 0,
+        rd: f.rd,
+        write_register: f.write_register,
+        alu: f.alu,
+        alu_flags: f.alu_flags,
+        add: f.add,
+        sub: f.sub,
+        half_instruction_length: f.half_instruction_length,
+    };
+    let aux = c.compute_aux();
+    c.res = cpu32_res(&c, aux.arg1, aux.arg2);
+    c
+}
+
+/// The BITWISE-table lookups a CPU32 row sends: 5×ARE_BYTES (byte fields),
+/// 8×IS_HALF (rv1/rv2 low-word halves + the 4 res halves), 1×BYTE_ALU (extracts
+/// the signed bit from `alu_flags`), and the MSB16 sign bits: `res` always, plus
+/// `rv1`/`rv2` only when `signed` (their MSB16 is gated by the `signed` column).
+fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::with_capacity(17);
+    let half = |v: u64, sh: u32| ((v >> sh) & 0xFFFF) as u16;
+    let push_half = |ops: &mut Vec<BitwiseOperation>, kind, h: u16| {
+        ops.push(BitwiseOperation::halfword(
+            kind,
+            (h & 0xFF) as u8,
+            (h >> 8) as u8,
+        ));
+    };
+
+    for b in [c.half_instruction_length, c.alu_flags, c.rs1, c.rs2, c.rd] {
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            b,
+        ));
+    }
+    // IS_HALF: rv1[0],rv1[1],rv2[0],rv2[1],res[0..3]
+    let rv1_h0 = half(c.rv1, 0);
+    let rv1_h1 = half(c.rv1, 16);
+    let rv2_h0 = half(c.rv2, 0);
+    let rv2_h1 = half(c.rv2, 16);
+    for h in [rv1_h0, rv1_h1, rv2_h0, rv2_h1] {
+        push_half(&mut ops, BitwiseOperationType::IsHalf, h);
+    }
+    for i in 0..4 {
+        push_half(&mut ops, BitwiseOperationType::IsHalf, half(c.res, i * 16));
+    }
+    // BYTE_ALU[AND, X=32, Y=alu_flags] -> 32*signed (extract signed bit).
+    ops.push(BitwiseOperation::byte_op(
+        BitwiseOperationType::ByteAluAnd,
+        32,
+        c.alu_flags,
+    ));
+    // MSB16 on the high half of each low word. `rv1`/`rv2` are gated by `signed`
+    // (the SIGN template's `signed` multiplicity — no lookup when zero-extending);
+    // `res` is always sent (μ), since the `*W` result is always sign-extended.
+    if c.signed() {
+        push_half(&mut ops, BitwiseOperationType::Msb16, rv1_h1);
+        push_half(&mut ops, BitwiseOperationType::Msb16, rv2_h1);
+    }
+    push_half(&mut ops, BitwiseOperationType::Msb16, half(c.res, 16));
+    ops
+}
+
+/// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
+/// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
+#[allow(clippy::type_complexity)]
+fn cpu32_chip_op(
+    c: &cpu32::Cpu32Operation,
+    shift_ops: &mut Vec<ShiftOperation>,
+    mul_ops: &mut Vec<(MulOperation, bool)>,
+    dvrm_ops: &mut Vec<(DvrmOperation, bool)>,
+) {
+    use crate::tables::types::alu_op;
+    if c.add || c.sub || !c.alu {
+        return;
+    }
+    let aux = c.compute_aux();
+    let op = c.alu_flags & 0x1F;
+    let signed = aux.signed;
+    let s2_or_inv = (c.alu_flags >> 6) & 1 == 1;
+    let muldiv = (c.alu_flags >> 7) & 1 == 1;
+    if op == alu_op::SHIFT || op == alu_op::SHIFTW {
+        shift_ops.push(ShiftOperation::new(
+            aux.arg1, aux.arg2, s2_or_inv, signed, true,
+        ));
+    } else if op == alu_op::MUL {
+        mul_ops.push((
+            MulOperation::new(aux.arg1, signed, aux.arg2, s2_or_inv),
+            muldiv,
+        ));
+    } else if op == alu_op::DIVREM {
+        dvrm_ops.push((DvrmOperation::new(aux.arg1, aux.arg2, signed), muldiv));
+    }
 }
 
 /// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
@@ -916,12 +1083,15 @@ fn collect_commit_memw_ops(
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
 ///
-/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes every register:
+/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes the GP registers:
 /// - x1-x9, x11-x31: write 0 (zeroize)
 /// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
-/// - x255 (PC): write 1 (halted sentinel)
 ///
-/// Also updates `register_state` so `to_final_state_map()` reflects the finalized values.
+/// The PC (x255) is NOT finalized here — it is handled on the inline-PC `memory`
+/// bus by the HALT chip's consume_pc/emit_pc plus the CPU padding chain (its
+/// REGISTER final token is set separately by the caller, at the last padding
+/// timestamp). Also updates `register_state` so `to_final_state_map()` reflects
+/// the finalized GP register values.
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
     let ts = u64::MAX;
@@ -961,16 +1131,9 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         register_state.write(i, 0, ts);
     }
 
-    // x255 (PC): write 1
-    {
-        let (old_val, old_ts) = register_state.read_pc();
-        let old_value = pack_register_value(old_val);
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, 510, pack_register_value(1), ts, 2, false)
-            .with_old(old_value, old_timestamps);
-        ops.push(memw_op);
-        register_state.write_pc(1, ts);
-    }
+    // x255 (PC) is finalized via the inline-PC `memory` bus + REGISTER table, not
+    // via a MEMW write at 2^64-1. See `collect_halt_ops` doc and the PC finalization
+    // in the caller.
 
     ops
 }
@@ -1543,7 +1706,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 ///
 /// BRANCH sends:
 /// - ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
-/// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
+/// - BYTE_ALU[AND, unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
 /// Returns: Vec of bitwise lookups
@@ -1568,10 +1731,10 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
             next_pc_low_1,
         ));
 
-        // AND_BYTE[unmasked_low_byte, 254] → next_pc_low[0]
+        // BYTE_ALU[AND, unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
+            BitwiseOperationType::ByteAluAnd,
             unmasked_low_byte,
             254, // 0xFE mask
         ));
@@ -1616,21 +1779,19 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
     let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        // ARE_BYTES[RS1, RS2] pair (both zero in padding)
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            0,
-            0,
-        ));
-        // ARE_BYTES[RD, 0] single (zero in padding)
-        ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            0,
-        ));
-        // 12 ARE_BYTES lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
-        for _ in 0..12 {
+        // The shrunk CPU sends, per row (incl. padding where all values are 0):
+        // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
+        // 4× IS_HALF (the four `res` halves).
+        for _ in 0..3 {
             ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
+                0,
+                0,
+            ));
+        }
+        for _ in 0..4 {
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 0,
                 0,
             ));
@@ -1918,7 +2079,7 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
 
 /// Collect BITWISE lookups generated by the keccak chips.
 ///
-/// The keccak round chip sends XOR_BYTE, AND_BYTE, HWSL, and ARE_BYTES
+/// The keccak round chip sends BYTE_ALU, HWSL, and ARE_BYTES
 /// interactions; the keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
@@ -1931,7 +2092,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         let state_addr = kop.state_addr;
 
         ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
+            BitwiseOperationType::ByteAluAnd,
             (state_addr & 0xFF) as u8,
             7,
         ));
@@ -1968,7 +2129,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         // Replay keccak round computation to extract bitwise lookups
         let mut state = kop.input;
         for round in 0..24 {
-            // --- theta: Cxz chain XOR_BYTE (160) ---
+            // --- theta: Cxz chain BYTE_ALU[XOR] (160) ---
             let mut cxz = [[[0u8; 8]; 4]; 5];
             for x in 0..5 {
                 for b in 0..8 {
@@ -1976,7 +2137,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let v1 = ((state[x + 5] >> (b * 8)) & 0xFF) as u8;
                     cxz[x][0][b] = v0 ^ v1;
                     ops.push(BitwiseOperation::byte_op(
-                        BitwiseOperationType::XorByte,
+                        BitwiseOperationType::ByteAluXor,
                         v0,
                         v1,
                     ));
@@ -1988,7 +2149,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         let sv = ((state[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         cxz[x][stage][b] = prev ^ sv;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::XorByte,
+                            BitwiseOperationType::ByteAluXor,
                             prev,
                             sv,
                         ));
@@ -2039,7 +2200,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // theta: Dxz XOR_BYTE (40)
+            // theta: Dxz BYTE_ALU[XOR] (40)
             let mut d_bytes = [[0u8; 8]; 5];
             for x in 0..5 {
                 for b in 0..8 {
@@ -2047,14 +2208,14 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let rb = rotated_c[(x + 1) % 5][b];
                     d_bytes[x][b] = a ^ rb;
                     ops.push(BitwiseOperation::byte_op(
-                        BitwiseOperationType::XorByte,
+                        BitwiseOperationType::ByteAluXor,
                         a,
                         rb,
                     ));
                 }
             }
 
-            // theta final: XOR_BYTE (200)
+            // theta final: BYTE_ALU[XOR] (200)
             let mut theta_lanes = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
@@ -2067,7 +2228,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     for b in 0..8 {
                         let s = ((lane >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::XorByte,
+                            BitwiseOperationType::ByteAluXor,
                             s,
                             d_bytes[x][b],
                         ));
@@ -2122,7 +2283,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // chi: AND_BYTE (200) + XOR_BYTE (200)
+            // chi: BYTE_ALU[AND] (200) + BYTE_ALU[XOR] (200)
             let mut chi_lanes = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
@@ -2134,14 +2295,14 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         let not_byte = ((not_next >> (b * 8)) & 0xFF) as u8;
                         let n2_byte = ((next2 >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::AndByte,
+                            BitwiseOperationType::ByteAluAnd,
                             not_byte,
                             n2_byte,
                         ));
                         let pi_byte = ((pi_lanes[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         let and_byte = ((and_val >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::XorByte,
+                            BitwiseOperationType::ByteAluXor,
                             pi_byte,
                             and_byte,
                         ));
@@ -2149,13 +2310,13 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // iota: XOR_BYTE (8)
+            // iota: BYTE_ALU[XOR] (8)
             let rc_val = KECCAK_RC[round];
             for b in 0..8 {
                 let chi_byte = ((chi_lanes[0] >> (b * 8)) & 0xFF) as u8;
                 let rc_byte = ((rc_val >> (b * 8)) & 0xFF) as u8;
                 ops.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::XorByte,
+                    BitwiseOperationType::ByteAluXor,
                     chi_byte,
                     rc_byte,
                 ));
@@ -2308,6 +2469,11 @@ pub struct Traces {
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
+    pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub cpu32s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -2326,6 +2492,12 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -2370,10 +2542,11 @@ fn collect_all_ops(
     mut memw_ops: Vec<MemwOperation>,
     load_ops: Vec<LoadOperation>,
     mut lt_ops: Vec<LtOperation>,
-    shift_ops: Vec<ShiftOperation>,
-    bitwise_ops: Vec<BitwiseOperation>,
+    mut shift_ops: Vec<ShiftOperation>,
+    mut bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -2399,43 +2572,80 @@ fn collect_all_ops(
             BranchOperation::new(
                 op.decode.pc,
                 op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.compute_arg1(), // register value must match CPU's arg1 for bus signature
-                op.decode.op_jalr,
+                op.rv1,        // register value must match the CPU's BRANCH bus signature
+                op.decode.fields.jalr(),
             )
         })
         .collect();
 
-    // Collect MUL operations from CPU ops where op_mul = true
+    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
+    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
     let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| op.decode.op_mul)
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
         .map(|op| {
-            let lhs = op.compute_arg1();
-            let lhs_signed = op.decode.signed;
-            // rhs_signed = mp_selector per spec CPU-CA44:
-            // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
-            let rhs_signed = op.decode.mp_selector;
-            let rhs = op.compute_arg2();
-            let wants_hi = op.decode.muldiv_selector;
+            let f = op.decode.fields;
             (
-                MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                wants_hi,
+                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+                f.alu_muldiv(),
             )
         })
         .collect();
 
-    // Collect DVRM operations from CPU ops where op_divrem = true
-    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+    // Collect DVRM operations from non-word DIV/REM instructions.
+    let mut dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| op.decode.op_divrem)
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
         .map(|op| {
-            let n = op.compute_arg1();
-            let d = op.compute_arg2();
-            let signed = op.decode.signed;
-            let wants_remainder = op.decode.muldiv_selector;
-            (DvrmOperation::new(n, d, signed), wants_remainder)
+            let f = op.decode.fields;
+            (
+                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+                f.alu_muldiv(),
+            )
         })
         .collect();
+
+    // Collect the ALU/MEMORY chip ops (non-word rows).
+    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
+    let eq_ops: Vec<eq::EqOperation> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+        .collect();
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+        .collect();
+    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
+    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
+    // table row).
+    let store_ops: Vec<store::StoreOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.fields.is_store())
+        .map(|op| {
+            // The MEMORY bus and the STORE chip's MEMW write share the base
+            // timestamp (spec store.toml uses one `timestamp` for both).
+            store::StoreOperation::new(
+                op.res,
+                op.timestamp,
+                op.rv2,
+                op.decode.fields.mem_bytes() as u8,
+            )
+        })
+        .collect();
+
+    // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
+    // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
+    // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
+    // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
+    for c in &cpu32_ops {
+        cpu32_chip_op(c, &mut shift_ops, &mut mul_ops, &mut dvrm_ops);
+        bitwise_ops.extend(collect_cpu32_bitwise(c));
+    }
 
     // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
     for (op, _wants_remainder) in &dvrm_ops {
@@ -2467,6 +2677,10 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
         ecsm_ops,
         ec_scalar_ops,
         ecdas_ops,
@@ -2485,7 +2699,7 @@ fn build_traces(
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
-    register_state: RegisterState,
+    mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
@@ -2504,6 +2718,10 @@ fn build_traces(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
         ecsm_ops,
         ec_scalar_ops,
         ecdas_ops,
@@ -2523,6 +2741,16 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
+    // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
+    for op in &bytewise_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
+    for op in &eq_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
+    for op in &store_ops {
+        bitwise_ops.extend(op.collect_bitwise_ops());
+    }
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
@@ -2559,9 +2787,18 @@ fn build_traces(
     let halt_op = cpu_ops
         .iter()
         .rev()
-        .find(|op| op.decode.op_ecall)
+        .find(|op| op.decode.fields.ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
+    let halt_next_pc = halt_op.next_pc;
+
+    // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
+    // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
+    // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
+    // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
+    // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
+    // must match that last write to balance the memory argument.
+    register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -2634,6 +2871,38 @@ fn build_traces(
         storage_mode,
     )?;
 
+    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
+    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
+    // contributes nothing to any bus.
+    let eqs = chunk_and_generate::<eq::EqOperation>(
+        &eq_ops,
+        max_rows.eq,
+        eq::generate_eq_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
+        &bytewise_ops,
+        max_rows.bytewise,
+        bytewise::generate_bytewise_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let stores = chunk_and_generate::<store::StoreOperation>(
+        &store_ops,
+        max_rows.store,
+        store::generate_store_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
+        &cpu32_ops,
+        max_rows.cpu32,
+        cpu32::generate_cpu32_trace,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
@@ -2687,7 +2956,7 @@ fn build_traces(
                     || register::generate_register_trace(&register_final_state, entry_point),
                 )
             },
-            || halt::generate_halt_trace(halt_timestamp),
+            || halt::generate_halt_trace(halt_timestamp, halt_next_pc),
         );
         let (pages_v, page_configs_v) = pages_val;
         pages = pages_v;
@@ -2709,7 +2978,7 @@ fn build_traces(
             }
         }
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp);
+        halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -2768,6 +3037,10 @@ fn build_traces(
         ec_scalar: ec_scalar_trace,
         ecdas: ecdas_trace,
         memw_registers,
+        eqs,
+        bytewises,
+        stores,
+        cpu32s,
     })
 }
 
@@ -2876,7 +3149,7 @@ pub fn count_table_lengths(
         cpu_count += 1;
 
         // Memory ops from load/store
-        if cpu_op.decode.op_load {
+        if cpu_op.decode.fields.is_load() {
             let (memw_op, _load_op, _bitwise) =
                 collect_load_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
@@ -2886,7 +3159,7 @@ pub fn count_table_lengths(
                 &mut memw_register_count,
             );
             load_count += 1;
-        } else if cpu_op.decode.op_store {
+        } else if cpu_op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
@@ -2931,17 +3204,18 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        // CPU-side per-instruction-kind counters
-        if cpu_op.decode.op_slt || cpu_op.decode.op_blt {
+        // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
+        let f = &cpu_op.decode.fields;
+        if !f.word_instr && f.is_lt() {
             lt_count += 1;
         }
-        if cpu_op.decode.op_shift {
+        if !f.word_instr && f.is_shift() {
             shift_count += 1;
         }
-        if cpu_op.decode.op_mul {
+        if !f.word_instr && f.is_mul() {
             mul_count += 1;
         }
-        if cpu_op.decode.op_divrem {
+        if !f.word_instr && f.is_divrem() {
             dvrm_count += 1;
         }
         if cpu_op.branch_cond {
@@ -3008,14 +3282,17 @@ impl Traces {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::bytewise::cols::NUM_COLUMNS as BYTEWISE_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::cpu32::cols::NUM_COLUMNS as CPU32_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
         use super::ec_scalar::cols::NUM_COLUMNS as EC_SCALAR_COLS;
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
+        use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -3032,6 +3309,7 @@ impl Traces {
         use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+        use super::store::cols::NUM_COLUMNS as STORE_COLS;
 
         let Traces {
             cpus,
@@ -3056,6 +3334,10 @@ impl Traces {
             ec_scalar,
             ecdas,
             memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -3102,6 +3384,18 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
+        for t in eqs {
+            total += (t.num_rows() * EQ_COLS) as u64;
+        }
+        for t in bytewises {
+            total += (t.num_rows() * BYTEWISE_COLS) as u64;
+        }
+        for t in stores {
+            total += (t.num_rows() * STORE_COLS) as u64;
+        }
+        for t in cpu32s {
+            total += (t.num_rows() * CPU32_COLS) as u64;
+        }
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
         total += (ec_scalar.num_rows() * EC_SCALAR_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
@@ -3140,6 +3434,10 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
+        let n_eq = aux_cols(super::eq::bus_interactions().len());
+        let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
+        let n_store = aux_cols(super::store::bus_interactions().len());
+        let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ec_scalar = aux_cols(super::ec_scalar::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
@@ -3167,6 +3465,10 @@ impl Traces {
             ec_scalar,
             ecdas,
             memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -3213,6 +3515,18 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
+        for t in eqs {
+            total += (t.num_rows() * n_eq) as u64;
+        }
+        for t in bytewises {
+            total += (t.num_rows() * n_bytewise) as u64;
+        }
+        for t in stores {
+            total += (t.num_rows() * n_store) as u64;
+        }
+        for t in cpu32s {
+            total += (t.num_rows() * n_cpu32) as u64;
+        }
         total += (ecsm.num_rows() * n_ecsm) as u64;
         total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
@@ -3232,6 +3546,10 @@ impl Traces {
             shift: self.shifts.len(),
             branch: self.branches.len(),
             memw_register: self.memw_registers.len(),
+            eq: self.eqs.len(),
+            bytewise: self.bytewises.len(),
+            store: self.stores.len(),
+            cpu32: self.cpu32s.len(),
         }
     }
 
@@ -3378,6 +3696,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            cpu32_ops,
             ecsm_ops,
             ec_scalar_ops,
             ecdas_ops,
@@ -3392,6 +3711,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            cpu32_ops,
             ecsm_ops,
             ec_scalar_ops,
             ecdas_ops,
@@ -3440,6 +3760,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            cpu32_ops,
             ecsm_ops,
             ec_scalar_ops,
             ecdas_ops,
@@ -3454,6 +3775,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            cpu32_ops,
             ecsm_ops,
             ec_scalar_ops,
             ecdas_ops,

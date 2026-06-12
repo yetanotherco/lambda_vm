@@ -10,25 +10,21 @@
 //! - `imm`: DWordWL (2 cols) - fully extended 64-bit immediate
 //! - `μ`: BaseField (1 col) - multiplicity
 //!
-//! ## packed_decode Format (51 bits)
+//! ## packed_decode Format
+//!
+//! A single base-field element packing the control flags, register indices, and
+//! the `alu_flags`/`mem_flags` bytes. The authoritative bit layout lives in
+//! `packed_decode_shrunk` and is produced by `ShrunkDecode::pack` (both in
+//! `tables/types.rs`) — consult those for the exact bit position of every field.
+//! Summary (low → high bits):
 //!
 //! ```text
-//! Bits [0]:     read_register1
-//! Bits [1]:     read_register2
-//! Bits [2]:     write_register
-//! Bits [3]:     memory_2bytes
-//! Bits [4]:     memory_4bytes
-//! Bits [5]:     memory_8bytes
-//! Bits [6]:     c_type
-//! Bits [7]:     signed
-//! Bits [8]:     mp_selector
-//! Bits [9]:     muldiv_selector
-//! Bits [10]:    word_instr
-//! Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
-//!               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
-//! Bits [27:35]: rs1 (8 bits)
-//! Bits [35:43]: rs2 (8 bits)
-//! Bits [43:51]: rd (8 bits)
+//! Bits [0..10]:  read_register1, read_register2, write_register, word_instr,
+//!                ALU, ADD, SUB, MEMORY, BRANCH, ECALL (one bit each)
+//! Bits [10..34]: rs1, rs2, rd (8 bits each)
+//! Bits [34..42]: half_instruction_length (Byte: byte length / 2)
+//! Bits [42..50]: alu_flags (Byte: alu_op in bits 0-4, then signed / signed2|invert / muldiv)
+//! Bits [50..58]: mem_flags (Byte: JALR|memory_op, signed, 2B, 4B, 8B)
 //! ```
 //!
 //! ## Bus Interactions
@@ -113,7 +109,8 @@ pub fn generate_decode_trace(
         .enumerate()
         .map(|(row_idx, (&pc, &instr))| {
             pc_to_row.insert(pc, row_idx);
-            DecodeEntry::from_instruction(pc, instr)
+            // instruction_length = 4 (RV64C compressed decode is a separate workstream).
+            DecodeEntry::from_instruction(pc, instr, 4)
         })
         .collect();
 
@@ -161,7 +158,8 @@ pub fn generate_decode_trace(
         data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
     }
 
-    // Fill padding rows with DECODE padding pattern: pc=7, EBREAK=1
+    // Fill padding rows with the DECODE padding pattern: odd pc=1, all flags 0
+    // (unprovable as a fetch target; same row the CPU pads to).
     let padding_entry = DecodeEntry::padding_entry();
     for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
@@ -377,7 +375,7 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
                 let addr = segment.base_addr + (i as u64 * 4);
                 let instruction = Instruction::parse(word)?;
                 pc_to_row.insert(addr, decode_entries.len());
-                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
+                decode_entries.push(DecodeEntry::from_instruction(addr, instruction, 4));
             }
         }
     }

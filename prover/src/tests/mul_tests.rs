@@ -263,12 +263,13 @@ fn test_different_signed_flags_separate_rows() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Expected interactions:
+    // Expected interactions (every MUL lookup goes through the unified ALU
+    // bus — CPU MUL/MULH dispatch and dvrm's `d*q` consistency):
     // - 2x MSB16 senders (lhs sign, rhs sign)
     // - 8x IS_HALF senders for inputs (lhs[0..4], rhs[0..4]) — range-check input halves
     // - 8x IS_HALF senders for outputs (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
-    // - 2x MUL receivers (lo, hi)
+    // - 2x ALU receivers (lo, hi)
     // Total: 2 + 8 + 8 + 4 + 2 = 24
     assert_eq!(interactions.len(), 24, "Expected 24 bus interactions");
 }
@@ -339,7 +340,9 @@ fn test_mul_air_wires_in_chip_constraints() {
         bus_interactions(),
     );
     assert_eq!(in_chip, mul_constraints(0).0.len());
-    assert_eq!(mul_constraints(0).0.len(), 6);
+    // 2x SignedIsBit + LhsSign + RhsSign + 4x RawProduct (#644 added the two
+    // SignedIsBit constraints that #652's count of 6 predated).
+    assert_eq!(mul_constraints(0).0.len(), 8);
 }
 
 /// Presence: every input halfword is range-checked via IS_HALFWORD senders, so a
