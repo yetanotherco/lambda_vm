@@ -84,10 +84,16 @@ pub fn batch_inverse_ext3_dev(
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
-    debug_assert!(
-        n <= u32::MAX as usize / BLOCK_SIZE as usize,
-        "batch_inverse_ext3_dev: n {n} would truncate the u32 grid_dim",
-    );
+    // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
+    // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
+    // and leave a tail uninverted. Reachable on LDE size 2^23+ × multi-
+    // eval-point R4. Returning Err lets the dispatcher's Err(_) => None
+    // route the caller to the CPU `inplace_batch_inverse` fallback.
+    if n > u32::MAX as usize / BLOCK_SIZE as usize {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
     if n == 1 {
         // Single element: D2H, host invert, H2D. Avoids running the
         // scan + combine machinery for a degenerate case.
@@ -176,10 +182,14 @@ pub fn compute_and_invert_denoms_ext3_dev(
     let total = k_scalars
         .checked_mul(n)
         .expect("compute_and_invert_denoms_ext3_dev: k_scalars * n overflow");
-    debug_assert!(
-        total <= u32::MAX as usize / BLOCK_SIZE as usize,
-        "compute_and_invert_denoms_ext3_dev: total {total} would truncate the u32 grid_dim",
-    );
+    // See `batch_inverse_ext3_dev` for the rationale: runtime Err, not
+    // debug_assert, so release builds also route past the silent-truncation
+    // hazard via the caller's CPU fallback.
+    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
 
     let z_dev = stream.clone_htod(z_scalars_host)?;
     // SAFETY: the compute_denoms_ext3 kernel writes every output slot.
