@@ -594,7 +594,7 @@ ref = "ec:c:mu_isbit"
 [[constraints.ecall]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 3], ["-", ["^", 2, 32], 1]]]
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 11], "DWordWL"]]
 multiplicity = ["-", "μ"]
 
 [[constraint_groups]]
