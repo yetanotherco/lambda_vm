@@ -47,6 +47,76 @@ def type_to_text(typ) -> str:
     return str(typ)
 
 
+def signature_type_to_text(typ) -> str:
+    """Convert a signature type to text, including nested array types."""
+    if isinstance(typ, str):
+        return typ
+    if isinstance(typ, list) and len(typ) == 2 and isinstance(typ[1], int):
+        return f"{signature_type_to_text(typ[0])}[{typ[1]}]"
+    return str(typ)
+
+
+def render_signature(sig: dict) -> str:
+    """Render one signature from signatures.toml."""
+    if sig.get("kind") == "template":
+        lb, rb = "<", ">"
+    else:
+        lb, rb = "[", "]"
+
+    cond = sig.get("cond")
+    cond_str = f"{signature_type_to_text(cond)} => " if cond else ""
+    input_str = ", ".join(signature_type_to_text(t) for t in sig.get("input", []))
+    output = sig.get("output")
+    output_str = f"{signature_type_to_text(output)}; " if output else ""
+    return f"`{cond_str}{sig.get('tag', '')}{lb}{output_str}{input_str}{rb}`"
+
+
+def signature_type_size(typ, config: dict) -> int:
+    """Compute the bus size contribution for one signature type."""
+    factor = 1
+    while isinstance(typ, list) and len(typ) == 2 and isinstance(typ[1], int):
+        factor *= typ[1]
+        typ = typ[0]
+
+    if not isinstance(typ, str):
+        return factor
+
+    for type_cfg in config.get("variables", {}).get("types", []):
+        if type_cfg.get("label") == typ:
+            return factor * len(type_cfg.get("subtypes", []))
+
+    return factor
+
+
+def render_signatures_doc(signatures_toml: dict, config: dict) -> str:
+    """Render the signatures chapter from signatures.toml."""
+    signatures = signatures_toml.get("signatures", [])
+    interactions = [sig for sig in signatures if sig.get("kind") == "interaction"]
+    templates = [sig for sig in signatures if sig.get("kind") == "template"]
+
+    lines = ["# Signatures", ""]
+    lines.append(f"The following lists signatures of the {len(interactions)} interactions in this VM.")
+    lines.append("")
+    lines.append("| Signature | Bus size |")
+    lines.append("|-----------|----------|")
+    for sig in interactions:
+        vars_ = list(sig.get("input", []))
+        if "output" in sig:
+            vars_.append(sig["output"])
+        bus_size = sum(signature_type_size(t, config) for t in vars_)
+        lines.append(f"| {render_signature(sig)} | {bus_size} |")
+
+    lines.append("")
+    lines.append(f"Below, we list the signatures of the {len(templates)} templates in this VM.")
+    lines.append("")
+    lines.append("| Signature |")
+    lines.append("|-----------|")
+    for sig in templates:
+        lines.append(f"| {render_signature(sig)} |")
+
+    return "\n".join(lines)
+
+
 def expr_to_text(expr, parent_prec: int = 100) -> str:
     """
     Convert a polynomial expression to readable text.
@@ -133,7 +203,15 @@ def expr_to_text(expr, parent_prec: int = 100) -> str:
                 inner = expr_to_text(expr[1], PREC["neg"])
                 return wrap(f"-{inner}", PREC["neg"])
             else:
-                parts = [expr_to_text(e, PREC["sub"]) for e in expr[1:]]
+                parts = [expr_to_text(expr[1], PREC["sub"])]
+                for e in expr[2:]:
+                    rendered = expr_to_text(e, PREC["sub"])
+                    # Subtraction is not associative on the right:
+                    # `a - (b + c)` and `a - (b - c)` must not render as
+                    # `a - b + c` / `a - b - c`.
+                    if isinstance(e, list) and e and e[0] in {"+", "-", "not"}:
+                        rendered = f"({rendered})"
+                    parts.append(rendered)
                 return wrap(" - ".join(parts), PREC["sub"])
         elif op == "cast":
             inner = expr_to_text(expr[1], PREC["cast"])
@@ -196,6 +274,7 @@ CHAPTERS = [
     ("commit", "COMMIT Chip"),
     ("sha256", "SHA256 Accelerator"),
     ("keccak", "KECCAK Accelerator"),
+    ("ecsm", "ECSM Accelerator"),
 ]
 
 
@@ -647,6 +726,9 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
     # Load default TOML data (may be empty for prose-only or multi-chip files)
     default_chip = load_toml(toml_path)
 
+    if toml_path.name == "signatures.toml" and "signatures" in default_chip:
+        return render_signatures_doc(default_chip, config)
+
     # Chip registry: variable_name -> chip_data
     chips = {}
     if default_chip:
@@ -663,6 +745,14 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
             'rendered_constraint_groups': set(),
             'constraint_counter': 1,
         }
+
+    def has_rendered_content(st):
+        return (
+            st.get('rendered_columns', False)
+            or st.get('rendered_assumptions', False)
+            or st.get('rendered_constraints', False)
+            or bool(st.get('rendered_constraint_groups', set()))
+        )
 
     # State registry: variable_name -> render state
     states = {}
@@ -697,7 +787,16 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, s
             if elem_type == 'load_chip':
                 var_name, chip_path = content
                 chip_toml_path = spec_dir / chip_path if spec_dir else Path(chip_path)
-                chips[var_name] = load_toml(chip_toml_path)
+                loaded_chip = load_toml(chip_toml_path)
+                if (
+                    var_name != 'chip'
+                    and 'chip' in chips
+                    and chips['chip'].get('name') == loaded_chip.get('name')
+                    and not has_rendered_content(states.get('chip', {}))
+                ):
+                    del chips['chip']
+                    states.pop('chip', None)
+                chips[var_name] = loaded_chip
                 states[var_name] = reset_chip_state()
                 continue
 

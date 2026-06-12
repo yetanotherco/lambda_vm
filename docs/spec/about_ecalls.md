@@ -10,4 +10,4 @@ When `ECALL` is executed, it is assumed that: - register `A7` contains the syste
 
 We provide a list of supported ECALL numbers. Negative numbers (represented as 2s complement 64-bit numbers), are used for our own custom accelerators/extensions.
 
-/ 64: `write` ([commit]) / 93: `exit` ([halt]) / -1: `SHA256` ([sha256]) / -2: `KECCAK` ([keccak])
+/ 64: `write` ([commit]) / 93: `exit` ([halt]) / -1: `SHA256` ([sha256]) / -2: `KECCAK` ([keccak]) / -3: `ECSM` ([ecsm])

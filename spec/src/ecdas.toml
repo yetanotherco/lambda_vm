@@ -1,0 +1,509 @@
+name = "ECDAS"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "Timestamp at which the operation is executed."
+pad = 0
+
+[[variables.input]]
+name = "xG"
+type = "U256BL"
+desc = "$x_#`G`$"
+pad = 0
+
+[[variables.input]]
+name = "yG"
+type = "U256BL"
+desc = "$y_#`G`$"
+pad = 0
+
+[[variables.input]]
+name = "xA"
+type = "U256BL"
+desc = "$x_#`A`$"
+pad = 0
+
+[[variables.input]]
+name = "yA"
+type = "U256BL"
+desc = "$y_#`A`$"
+pad = 0
+
+[[variables.input]]
+name = "round"
+type = "Byte"
+desc = "scaling round"
+pad = 0
+
+[[variables.input]]
+name = "op"
+type = "Bit"
+desc = "whether to double (0) or add (1)"
+pad = 0
+
+[[variables.output]]
+name = "xR"
+type = "U256BL"
+desc = "$x_#`R`$"
+pad = 0
+
+[[variables.output]]
+name = "yR"
+type = "U256BL"
+desc = "$y_#`R`$"
+pad = 0
+
+[[variables.auxiliary]]
+name = "λ"
+type = "U256BL"
+desc = "`λ`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "q0"
+type = ["Byte", 33]
+desc = "quotient used to constrain `λ`"
+pad = "r"
+
+[[variables.auxiliary]]
+name = "c0"
+type = ["BaseField", 64]
+desc = "carries used to constrain `λ`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "q1"
+type = ["Byte", 33]
+desc = "quotient used to constrain `xR`"
+pad = "r"
+
+[[variables.auxiliary]]
+name = "c1"
+type = ["BaseField", 64]
+desc = "carries used to constrain `xR`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "q2"
+type = ["Byte", 33]
+desc = "quotient used to constrain `yR`"
+pad = "r"
+
+[[variables.auxiliary]]
+name = "c2"
+type = ["BaseField", 64]
+desc = "carries used to constrain `yR`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "next_op"
+type = "Bit"
+desc = "`op`-flag for the next iteration"
+pad = 0
+
+[[variables.virtual]]
+name = "XG"
+type = "U512BL"
+desc = "zero-extension of `xG`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "xG", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "YG"
+type = "U512BL"
+desc = "zero-extension of `yG`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "yG", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "XA"
+type = "U512BL"
+desc = "zero-extension of `xA`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "xA", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "YA"
+type = "U512BL"
+desc = "zero-extension of `yA`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "yA", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "XR"
+type = "U512BL"
+desc = "zero-extension of `xR`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "xR", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "YR"
+type = "U512BL"
+desc = "zero-extension of `yR`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "yR", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "Λ"
+type = "U512BL"
+desc = "zero-extension of `λ`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "λ", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "Q0"
+type = "U512BL"
+desc = "zero-extension of `q0`"
+def = {polys=[
+    {iter=["i", 0, 32], poly=["idx", "q0", "i"]},
+    {iter=["i", 33, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "Q1"
+type = "U512BL"
+desc = "zero-extension of `q1`"
+def = {polys=[
+    {iter=["i", 0, 32], poly=["idx", "q1", "i"]},
+    {iter=["i", 33, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "Q2"
+type = "U512BL"
+desc = "zero-extension of `q2`"
+def = {polys=[
+    {iter=["i", 0, 32], poly=["idx", "q2", "i"]},
+    {iter=["i", 33, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "P"
+type = "U512BL"
+desc = "zero-extension of `p`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "p", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
+name = "R"
+type = "U512BL"
+desc = "zero-extension of `r`"
+def = {polys=[
+    {iter=["i", 0, 32], poly=["idx", "r", "i"]},
+    {iter=["i", 33, 63], poly=0},
+]}
+
+[[variables.constant]]
+name = "p"
+type = "U256BL"
+desc = "Prime field modulus"
+
+[[variables.constant]]
+name = "r"
+type = ["Byte", 33]
+desc = "Offset value; equals $3 #`p`$"
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "receive"
+
+[[constraints.receive]]
+kind = "interaction"
+tag = "ECDAS"
+input = ["timestamp", "xA", "yA", "xG", "yG", "round", "op"]
+multiplicity = ["-", "μ"]
+
+[[constraints.receive]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "ecdas:c:range_μ"
+
+[[constraints.receive]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["round"]
+cond = "μ"
+ref = "ecdas:c:range_round"
+
+[[constraint_groups]]
+name = "lambda"
+
+[[constraints.lambda]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "λ", "i"]]
+iter = ["i", 0, 31]
+cond = "μ"
+ref = "ecdas:c:range_lambda"
+
+[[constraints.lambda]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "q0", "i"]]
+iter = ["i", 0, 32]
+cond = "μ"
+ref = "ecdas:c:range_q0"
+
+[[constraints.lambda]]
+kind = "arith"
+constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0) + #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
+poly = ["-",
+    ["+",
+        ["*", ["^", 2, 8], ["idx", "c0", 0]],
+        ["*", ["idx", "Q0", 0], ["idx", "P", 0]]
+    ],
+    ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ["*", "op",
+        ["-",
+            ["+",
+                ["*", ["idx", "Λ", 0], ["-", ["idx", "XG", 0], ["idx", "XA", 0]]],
+                ["idx", "YA", 0],
+            ],
+            ["idx", "YG", 0]
+        ]
+    ],
+    ["*", ["not", "op"],
+        ["-",
+            ["*", 2, ["idx", "Λ", 0], ["idx", "YA", 0]],
+            ["*", 3, ["idx", "XA", 0], ["idx", "XA", 0]]
+        ]
+    ]
+]
+ref = "ecdas:c:c0_0"
+
+[[constraints.lambda]]
+kind = "arith"
+constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
+poly = ["-",
+    ["*", ["^", 2, 8], ["idx", "c0", "i"]],
+    ["idx", "c0", ["-", "i", 1]],
+    ["*", "op", ["-", ["idx", "YA", "i"], ["idx", "YG", "i"]]],
+    ["sum", ["=", "j", 0], "i", ["+",
+        ["*",
+            "op",
+            ["*",
+                ["idx", "Λ", "j"],
+                ["-", ["idx", "XG", ["-", "i", "j"]], ["idx", "XA", ["-", "i", "j"]]]
+            ]
+        ],
+        ["*",
+            ["not", "op"],
+            ["-",
+                ["*", 2, ["idx", "Λ", "j"], ["idx", "YA", ["-", "i", "j"]]],
+                ["*", 3, ["idx", "XA", "j"], ["idx", "XA", ["-", "i", "j"]]]
+            ]
+        ],
+        ["-",
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]
+        ]
+    ]]
+]
+iter = ["i", 1, 63]
+ref = "ecdas:c:c0_i"
+
+[[constraints.lambda]]
+kind = "arith"
+constraint = "$#`c0`_63 = 0$"
+poly = ["idx", "c0", 63]
+ref = "ecdas:c:c0_63_is_zero"
+
+[[constraints.lambda]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["+", ["idx", "c0", "i"], 32636]]
+iter = ["i", 0, 62]
+multiplicity = "μ"
+ref = "ecdas:c:range_c0"
+
+[[constraint_groups]]
+name = "xR"
+
+[[constraints.xR]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "xR", "i"]]
+iter = ["i", 0, 31]
+cond = "μ"
+
+[[constraints.xR]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "q1", "i"]]
+iter = ["i", 0, 32]
+cond = "μ"
+
+[[constraints.xR]]
+kind = "arith"
+constraint = "$2^8 dot #`c1`_0 = #`Λ`_0 dot #`Λ`_0 - #`XA`_0 - #`XG`_0 - #`XR`_0 - (1-#`op`) (#`XA`_0 - #`XG`_0) + #`R`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
+poly = ["-",
+    ["+",
+        ["*", ["idx", "Λ", 0], ["idx", "Λ", 0]],
+        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ],
+    ["*", ["idx", "Q1", 0], ["idx", "P", 0]],
+    ["idx", "XA", 0],
+    ["idx", "XG", 0],
+    ["idx", "XR", 0],
+    ["*", ["not", "op"], ["-", ["idx", "XA", 0], ["idx", "XG", 0]]],
+    ["*", ["^", 2, 8], ["idx", "c1", 0]],
+]
+
+[[constraints.xR]]
+kind = "arith"
+constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`XA`_i - #`XG`_i - #`XR`_i - (1- #`op`) (#`XA`_i - #`XG`_i) + sum_(j=0)^i #`Λ`_j dot #`Λ`_(i-j) + #`R`_j dot #`P`_(i-j) - #`Q1`_j dot #`P`_(i-j)$"
+poly = ["-",
+    ["idx", "c1", ["-", "i", 1]],
+    ["*", ["^", 2, 8], ["idx", "c1", "i"]],
+    ["idx", "XA", "i"],
+    ["idx", "XG", "i"],
+    ["idx", "XR", "i"],
+    ["*", ["not", "op"], ["-", ["idx", "XA", "i"], ["idx", "XG", "i"]]],
+    ["sum", ["=", "j", 0], "i",
+        ["-",
+            ["*", ["idx", "Q1", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "Λ", "j"], ["idx", "Λ", ["-", "i", "j"]]],
+        ]
+    ],
+]
+iter = ["i", 1, 63]
+
+[[constraints.xR]]
+kind = "arith"
+constraint = "$#`c1`_63 = 0$"
+poly = ["idx", "c1", 63]
+
+[[constraints.xR]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["+", ["idx", "c1", "i"], 8161]]
+iter = ["i", 0, 62]
+multiplicity = "μ"
+
+
+[[constraint_groups]]
+name = "yR"
+
+[[constraints.yR]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "yR", "i"]]
+iter = ["i", 0, 31]
+cond = "μ"
+
+[[constraints.yR]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "q2", "i"]]
+iter = ["i", 0, 32]
+cond = "μ"
+
+[[constraints.yR]]
+kind = "arith"
+constraint = "$2^8 dot #`c2`_0 = #`Λ`_0 dot (#`XA`_0 - #`XR`_0) - #`YA`_0 - #`YR`_0 + #`R`_0 dot #`P`_0 - #`Q2`_0 dot #`P`_0$"
+poly = ["-",
+    ["+",
+        ["*", ["idx", "Λ", 0], ["-", ["idx", "XA", 0], ["idx", "XR", 0]]],
+        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ],
+    ["*", ["idx", "Q2", 0], ["idx", "P", 0]],
+    ["idx", "YA", 0],
+    ["idx", "YR", 0],
+    ["*", ["^", 2, 8], ["idx", "c2", 0]]
+]
+
+[[constraints.yR]]
+kind = "arith"
+constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`YA`_i - #`YR`_i + sum_(j=0)^i #`Λ`_j dot (#`XA`_(i-j) - #`XR`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q2`_j dot #`P`_(i-j)$"
+poly = ["-",
+    ["idx", "c2", ["-", "i", 1]],
+    ["*", ["^", 2, 8], ["idx", "c2", "i"]],
+    ["idx", "YA", "i"],
+    ["idx", "YR", "i"],
+    ["sum", ["=", "j", 0], "i",
+        ["-",
+            ["*", ["idx", "Q2", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*",
+                ["idx", "Λ", "j"],
+                ["-",
+                    ["idx", "XA", ["-", "i", "j"]],
+                    ["idx", "XR", ["-", "i", "j"]],
+                ],
+            ],
+        ]
+    ]
+]
+iter = ["i", 1, 63]
+
+[[constraints.yR]]
+kind = "arith"
+constraint = "$#`c2`_63 = 0$"
+poly = ["idx", "c2", 63]
+
+[[constraints.yR]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["+", ["idx", "c2", "i"], 16320]]
+iter = ["i", 0, 62]
+multiplicity = "μ"
+
+
+[[constraint_groups]]
+name = "send"
+
+[[constraints.send]]
+kind = "template"
+tag = "IS_BIT"
+input = ["next_op"]
+ref = "ecdas:c:range_next_op"
+
+[[constraints.send]]
+kind = "interaction"
+tag = "BIT"
+input = ["timestamp", "round"]
+multiplicity = ["-", "next_op"]
+ref = "ecdas:c:receive_next_op"
+
+[[constraints.send]]
+kind = "arith"
+constraint = "$#`op` = 1 => #`next_op` = 0$"
+poly = ["*", "op", "next_op"]
+ref = "ecdas:c:op_implies_not_next_op"
+
+[[constraints.send]]
+kind = "arith"
+constraint = "$#`next_op` = 1 => #`μ` = 1$"
+poly = ["*", "next_op", ["not", "μ"]]
+ref = "ecdas:c:next_op_implies_mu"
+
+[[constraints.send]]
+kind = "interaction"
+tag = "ECDAS"
+input = ["timestamp", "xR", "yR", "xG", "yG", ["-", "round", ["-", 1, "next_op"]], "next_op"]
+multiplicity = "μ"
+ref = "ecdas:c:send"
