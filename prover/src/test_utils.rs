@@ -41,6 +41,9 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::bytewise::{
+    bus_interactions as bytewise_bus_interactions, cols as bytewise_cols,
+};
 use crate::tables::commit::{
     bus_interactions as commit_bus_interactions, cols as commit_cols,
     create_constraints as commit_constraints,
@@ -48,10 +51,14 @@ use crate::tables::commit::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::cpu32::{
+    bus_interactions as cpu32_bus_interactions, cols as cpu32_cols, cpu32_constraints,
+};
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
+use crate::tables::eq::{bus_interactions as eq_bus_interactions, cols as eq_cols, eq_constraints};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
 use crate::tables::keccak_rc::{
@@ -86,6 +93,9 @@ use crate::tables::register::{
 };
 use crate::tables::shift::{
     bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
+};
+use crate::tables::store::{
+    bus_interactions as store_bus_interactions, cols as store_cols, store_constraints,
 };
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
@@ -494,16 +504,16 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     for op in ops {
         let key = (op.x, op.y, op.z);
         let mu_idx = match op.lookup_type {
-            BitwiseOperationType::AndByte => 0,
-            BitwiseOperationType::OrByte => 1,
-            BitwiseOperationType::XorByte => 2,
-            BitwiseOperationType::Msb8 => 3,
-            BitwiseOperationType::Msb16 => 4,
-            BitwiseOperationType::Zero => 5,
-            BitwiseOperationType::AreBytes => 6,
-            BitwiseOperationType::IsHalf => 7,
-            BitwiseOperationType::IsB20 => 8,
-            BitwiseOperationType::Hwsl => 9,
+            BitwiseOperationType::Msb8 => 0,
+            BitwiseOperationType::Msb16 => 1,
+            BitwiseOperationType::Zero => 2,
+            BitwiseOperationType::AreBytes => 3,
+            BitwiseOperationType::IsHalf => 4,
+            BitwiseOperationType::IsB20 => 5,
+            BitwiseOperationType::Hwsl => 6,
+            BitwiseOperationType::ByteAluAnd => 7,
+            BitwiseOperationType::ByteAluOr => 8,
+            BitwiseOperationType::ByteAluXor => 9,
         };
         row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
@@ -553,16 +563,16 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
         // Multiplicity columns
         let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
+        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[0]);
+        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[1]);
+        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[2]);
+        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[3]);
+        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[4]);
+        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[5]);
+        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_BYTE_ALU_AND] = FE::from(mus[7]);
+        data[base + bitwise_cols::MU_BYTE_ALU_OR] = FE::from(mus[8]);
+        data[base + bitwise_cols::MU_BYTE_ALU_XOR] = FE::from(mus[9]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
@@ -659,6 +669,70 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("SHIFT")
+}
+
+/// Create the EQ AIR.
+pub fn create_eq_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = eq_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: eq_bus_interactions(),
+    };
+    AirWithBuses::new(
+        eq_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("EQ")
+}
+
+/// Create the BYTEWISE AIR. No polynomial constraints.
+pub fn create_bytewise_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: bytewise_bus_interactions(),
+    };
+    AirWithBuses::new(
+        bytewise_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("BYTEWISE")
+}
+
+/// Create the STORE AIR.
+pub fn create_store_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = store_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: store_bus_interactions(),
+    };
+    AirWithBuses::new(
+        store_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("STORE")
+}
+
+/// Create the CPU32 AIR.
+pub fn create_cpu32_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = cpu32_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: cpu32_bus_interactions(),
+    };
+    AirWithBuses::new(
+        cpu32_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("CPU32")
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
