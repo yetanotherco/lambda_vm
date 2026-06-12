@@ -1194,9 +1194,15 @@ where
         return None;
     }
     let expected_inv_denoms = lde_size.checked_mul(1 + num_eval_points)?;
-    // When the caller supplies a device handle for inv_denoms, the host
-    // slice is ignored; otherwise we validate its length.
-    if inv_denoms_dev.is_none() && inv_denoms_host.len() != expected_inv_denoms {
+    // The fully-resident `(Some(parts), Some(dev_inv))` arm ignores the
+    // host inv_denoms slice; every other arm slices into it. Validate the
+    // host length whenever the chosen arm will consume it, even when a
+    // dev inv_denoms handle is also present (a (None, Some) combination
+    // is reachable when R2's keep path missed but the batch-invert
+    // dispatch succeeded; without this guard that path would panic
+    // slicing an empty host buffer).
+    let arm_needs_host_inv = !(parts_dev.is_some() && inv_denoms_dev.is_some());
+    if arm_needs_host_inv && inv_denoms_host.len() != expected_inv_denoms {
         return None;
     }
 

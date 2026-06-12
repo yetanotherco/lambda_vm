@@ -126,9 +126,13 @@ extern "C" __global__ void block_inclusive_scan_fwd_ext3(
     }
 
     // Block total = scan value at the last VALID thread of this block.
-    // Two cases: full block (tid == 255) or partial last block (gid == n-1).
-    bool is_last_in_block = (tid == BLOCK_SIZE - 1) || (gid == n - 1);
-    if (is_last_in_block) {
+    // The last valid gid in this block is min(block_end - 1, n - 1).
+    // Computing it explicitly (instead of `tid == 255 || gid == n - 1`)
+    // ensures EXACTLY ONE thread writes per block — in a partial last
+    // block the two conditions would otherwise both fire and race.
+    uint64_t block_end = ((uint64_t)blockIdx.x + 1) * BLOCK_SIZE;
+    uint64_t last_valid_gid = (block_end - 1 < n - 1) ? (block_end - 1) : (n - 1);
+    if (gid == last_valid_gid) {
         block_totals[(uint64_t)blockIdx.x * 3 + 0] = shmem[tid].a;
         block_totals[(uint64_t)blockIdx.x * 3 + 1] = shmem[tid].b;
         block_totals[(uint64_t)blockIdx.x * 3 + 2] = shmem[tid].c;
@@ -214,8 +218,11 @@ extern "C" __global__ void block_inclusive_scan_rev_ext3(
         scan_out[gid * 3 + 2] = shmem[tid].c;
     }
 
-    bool is_last_in_block = (tid == BLOCK_SIZE - 1) || (pos_from_end == n - 1);
-    if (is_last_in_block) {
+    // Mutually-exclusive last-thread mask (same idea as fwd): the last
+    // valid pos_from_end in this block is min(block_end - 1, n - 1).
+    uint64_t block_end_rev = ((uint64_t)blockIdx.x + 1) * BLOCK_SIZE;
+    uint64_t last_valid_pos = (block_end_rev - 1 < n - 1) ? (block_end_rev - 1) : (n - 1);
+    if (pos_from_end == last_valid_pos) {
         block_totals[(uint64_t)blockIdx.x * 3 + 0] = shmem[tid].a;
         block_totals[(uint64_t)blockIdx.x * 3 + 1] = shmem[tid].b;
         block_totals[(uint64_t)blockIdx.x * 3 + 2] = shmem[tid].c;
