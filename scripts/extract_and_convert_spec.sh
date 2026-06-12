@@ -29,7 +29,7 @@ git show "$BRANCH:spec/src/config.toml" > "$TEMP_DIR/src/config.toml" 2>/dev/nul
 }
 
 # Extract all chip TOML files
-for file in $(git ls-tree -r "$BRANCH" --name-only | grep '^spec/src/.*\.toml$' | grep -v config.toml | grep -v page.toml); do
+for file in $(git ls-tree -r "$BRANCH" --name-only | grep '^spec/src/.*\.toml$' | grep -v config.toml); do
     filename=$(basename "$file")
     git show "$BRANCH:$file" > "$TEMP_DIR/src/$filename" 2>/dev/null || true
 done
