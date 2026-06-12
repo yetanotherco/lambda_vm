@@ -263,7 +263,7 @@ $
 Introducing non-negative witnesses $q''_0$ and $q''_1$, we convert these into
 $
   2lambda y_A - 3x_A^2 + (#`r` - q''_0) p &= 0,\
-  lambda^2 - 2x_A - x_G - x_R + (#`r` - q''_1) p &= 0.\
+  lambda^2 - 2x_A - x_R + (#`r` - q''_1) p &= 0.\
 $
 #aside("The case of " + $y_A = 0$ + ".")[
   Special attention should be paid to the first relation: if $y_A = 0$, $lambda$ can again be chosen freely.
@@ -273,7 +273,7 @@ $
 Reordering yields
 $
   q''_0 &= #`r` + p^(-1) dot (2lambda y_A - 3x_A^2 ),\
-  q''_1 &= #`r` + p^(-1) dot (lambda^2 - 2x_A - x_G - x_R ).\
+  q''_1 &= #`r` + p^(-1) dot (lambda^2 - 2x_A - x_R ).\
 $
 where $q''_0 in (#`r`-3p, #`r` + 2p)$, and $q''_1 = (#`r`, #`r` + p)$.
 We can now leverage the `op`-flag to merge the relations for $lambda$ and $x_R$ into
