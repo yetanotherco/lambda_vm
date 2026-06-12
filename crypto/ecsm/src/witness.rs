@@ -20,7 +20,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 
 use crate::curve::{StepPts, replay_double_and_add};
-use crate::{B, EcsmError, P_BYTES, n, p, prepare, to_le_32};
+use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, to_le_32};
 
 /// Full ECSM-chip witness for one scalar multiplication (one ECSM row).
 #[derive(Debug, Clone)]
@@ -103,16 +103,22 @@ fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
 ///
 /// These asserts catch any transcription error in the `terms` builders: for valid inputs
 /// the relation `LHS − RHS = 0` holds exactly, so every partial sum is divisible by 256.
-fn limb_carries(terms: &[i128; 64]) -> [i64; 64] {
+fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
     let mut c = [0i64; 64];
     let mut carry: i128 = 0;
     for i in 0..64 {
         let s = carry + terms[i];
-        assert!(s % 256 == 0, "ECSM witness: limb {i} not divisible by 256");
+        assert!(
+            s % 256 == 0,
+            "ECSM witness {relation}: limb {i} not divisible by 256"
+        );
         carry = s / 256;
         c[i] = carry as i64;
     }
-    assert!(c[63] == 0, "ECSM witness: closing carry c_63 must be 0");
+    assert!(
+        c[63] == 0,
+        "ECSM witness {relation}: closing carry c_63 must be 0"
+    );
     c
 }
 
@@ -126,7 +132,7 @@ fn carries_x2(xg: &[i128; 64], x2: &[i128; 64], q0: &[i128; 64], pp: &[i128; 64]
     for i in 0..64 {
         terms[i] = conv(xg, xg, i) - x2[i] - conv(q0, pp, i);
     }
-    limb_carries(&terms)
+    limb_carries("x2", &terms)
 }
 
 /// ECSM `yG` relation: `yG^2 + p^2 − xG·x2 − b − q1·p = 0`.
@@ -142,7 +148,7 @@ fn carries_yg(
     for i in 0..64 {
         terms[i] = conv(yg, yg, i) + conv(pp, pp, i) - conv(x2, xg, i) - conv(q1, pp, i) - b[i];
     }
-    limb_carries(&terms)
+    limb_carries("yG", &terms)
 }
 
 /// ECDAS `λ` relation:
@@ -178,7 +184,7 @@ fn carries_lambda(
         };
         terms[i] = branch + conv(r, pp, i) - conv(q0, pp, i);
     }
-    limb_carries(&terms)
+    limb_carries("lambda", &terms)
 }
 
 /// ECDAS `xR` relation:
@@ -200,7 +206,7 @@ fn carries_xr(
         terms[i] =
             conv(lam, lam, i) - xa[i] - xg[i] - xr[i] - op_term + conv(r, pp, i) - conv(q1, pp, i);
     }
-    limb_carries(&terms)
+    limb_carries("xR", &terms)
 }
 
 /// ECDAS `yR` relation: `λ(xA − xR) − yA − yR + (r − q2)p = 0`.
@@ -223,7 +229,7 @@ fn carries_yr(
         }
         terms[i] = conv_lam - ya[i] - yr[i] + conv(r, pp, i) - conv(q2, pp, i);
     }
-    limb_carries(&terms)
+    limb_carries("yR", &terms)
 }
 
 // =========================================================================
@@ -231,9 +237,12 @@ fn carries_yr(
 // =========================================================================
 
 /// Little-endian 33 bytes of a non-negative value that fits in 264 bits.
-fn to_le_33(v: &BigUint) -> [u8; 33] {
+fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
     let mut bytes = v.to_bytes_le();
-    assert!(bytes.len() <= 33, "ECSM witness: quotient exceeds 33 bytes");
+    assert!(
+        bytes.len() <= 33,
+        "ECSM witness {relation}: quotient exceeds 33 bytes"
+    );
     bytes.resize(33, 0);
     let mut out = [0u8; 33];
     out.copy_from_slice(&bytes[..33]);
@@ -242,15 +251,15 @@ fn to_le_33(v: &BigUint) -> [u8; 33] {
 
 /// `r + numerator / p`, where `numerator` must be divisible by `p`. Asserts divisibility
 /// and that the result is non-negative (guaranteed by the spec quotient ranges).
-fn shifted_quotient(numerator: &BigInt, p_big: &BigInt, r_big: &BigInt) -> BigUint {
+fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &BigInt) -> BigUint {
     assert!(
         (numerator % p_big).is_zero(),
-        "ECSM witness: numerator not divisible by p"
+        "ECSM witness {relation}: numerator not divisible by p"
     );
     let q = r_big + numerator / p_big;
     assert!(
         !q.is_negative(),
-        "ECSM witness: quotient unexpectedly negative"
+        "ECSM witness {relation}: quotient unexpectedly negative"
     );
     q.to_biguint().expect("non-negative")
 }
@@ -265,12 +274,11 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     let (k, g) = prepare(k_le, xg_le)?;
 
     let p_big = BigInt::from(p());
-    let r_big = BigInt::from(BigUint::from(3u8) * p()); // r = 3p
-    let r_bytes_33 = to_le_33(&(BigUint::from(3u8) * p()));
+    let r_big = BigInt::from(BigUint::from_bytes_le(&R_BYTES)); // r = 3p
 
     // Common zero-extended constants.
     let pp = ext64(&P_BYTES);
-    let r_ext = ext64(&r_bytes_33);
+    let r_ext = ext64(&R_BYTES);
     let b_bytes = {
         let mut a = [0u8; 32];
         a[0] = B as u8;
@@ -290,8 +298,8 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 
     // --- ECSM: yG relation, quotient q1 = (yG^2 − xG·x2 − b)/p + p ---
     let num_yg = BigInt::from(&g.y * &g.y) - BigInt::from(&g.x * &x2_big) - BigInt::from(B);
-    let q1_big = shifted_quotient(&num_yg, &p_big, &p_big);
-    let q1_b = to_le_33(&q1_big);
+    let q1_big = shifted_quotient("yG", &num_yg, &p_big, &p_big);
+    let q1_b = to_le_33("yG", &q1_big);
     let c1 = carries_yg(
         &ext64(&yg_b),
         &pp,
@@ -376,21 +384,21 @@ fn build_step(
     } else {
         2 * &lam_i * &ya_i - 3 * &xa_i * &xa_i
     };
-    let q0_big = shifted_quotient(&num0, p_big, r_big);
-    let q0_b = to_le_33(&q0_big);
+    let q0_big = shifted_quotient("lambda", &num0, p_big, r_big);
+    let q0_b = to_le_33("lambda", &q0_big);
 
     // q1: xR relation numerator  λ² − xA − xG − xR + (1−op)(xG − xA).
     let mut num1 = &lam_i * &lam_i - &xa_i - &xg_i - &xr_i;
     if s.op == 0 {
         num1 += &xg_i - &xa_i;
     }
-    let q1_big = shifted_quotient(&num1, p_big, r_big);
-    let q1_b = to_le_33(&q1_big);
+    let q1_big = shifted_quotient("xR", &num1, p_big, r_big);
+    let q1_b = to_le_33("xR", &q1_big);
 
     // q2: yR relation numerator  λ(xA − xR) − yA − yR.
     let num2 = &lam_i * (&xa_i - &xr_i) - &ya_i - &yr_i;
-    let q2_big = shifted_quotient(&num2, p_big, r_big);
-    let q2_b = to_le_33(&q2_big);
+    let q2_big = shifted_quotient("yR", &num2, p_big, r_big);
+    let q2_b = to_le_33("yR", &q2_big);
 
     let c0 = carries_lambda(
         s.op,

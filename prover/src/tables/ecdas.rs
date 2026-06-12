@@ -7,7 +7,7 @@
 //! and `next_op`. When `next_op = 1` it consumes the scalar bit at `round` on the `Bit`
 //! bus (an add follows). ECSM seeds and drains the bus; interior rows telescope.
 //!
-//! See `spec/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
+//! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
 //! to `r` and `op = 0`, which makes every relation hold with zero carries.
 
 use math::field::element::FieldElement;
@@ -22,12 +22,11 @@ use crate::constraints::templates::IsBitConstraint;
 use crate::tables::ecsm::ecdas_tuple;
 use ecsm::{EcdasStep, P_BYTES};
 
-/// `r = 3·p` as 33 little-endian bytes (the spec offset that keeps all quotients positive).
-pub const R_BYTES: [u8; 33] = [
-    0x8D, 0xF4, 0xFF, 0xFF, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x02,
-];
+pub(crate) use ecsm::R_BYTES;
+
+pub(crate) const CARRY_OFFSET_LAMBDA: i64 = 32636;
+pub(crate) const CARRY_OFFSET_XR: i64 = 8161;
+pub(crate) const CARRY_OFFSET_YR: i64 = 16320;
 
 // =========================================================================
 // Column indices (~521 columns)
@@ -206,7 +205,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             LinearTerm::Constant(off),
         ])
     };
-    for (base, off) in [(cols::C0, 32636i64), (cols::C1, 8161), (cols::C2, 16320)] {
+    for (base, off) in [
+        (cols::C0, CARRY_OFFSET_LAMBDA),
+        (cols::C1, CARRY_OFFSET_XR),
+        (cols::C2, CARRY_OFFSET_YR),
+    ] {
         for i in 0..63 {
             out.push(BusInteraction::sender(
                 BusId::IsHalfword,
@@ -454,11 +457,9 @@ pub fn create_constraints(
     > = Vec::new();
     let mut idx = constraint_idx_start;
 
-    // `op` needs no direct bit check: it is only ever the op field of an Ecdas bus token, and
-    // every producer of that token emits a bit there — ECSM seeds it with a constant 0, and
-    // each ECDAS step emits `next_op` (which is IS_BIT'd). The bus cannot be minted (IS_BIT(mu)
-    // blocks weight ≠ 1), so a row's received `op` is always in {0,1} and the λ/xR/yR selector
-    // `op·add + (1−op)·double` is well-defined.
+    // `op` needs no direct bit check. The receiver multiplicity `mu` is bit-checked below,
+    // and the only producers of the op field are ECSM's constant-0 seed and previous ECDAS
+    // rows' bit-checked `next_op`, so a received `op` is always in {0,1}.
     for col in [cols::MU, cols::NEXT_OP] {
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;

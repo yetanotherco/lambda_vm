@@ -31,8 +31,8 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 3, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 2;
 
-/// `2^32`. The lower 32-bit limb of an address must not overflow when the small per-access
-/// offsets are added (ECSM spec address-alignment assumptions).
+/// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
+/// largest per-access offset is added: +24 for doubleword reads/writes, +31 for scalar bytes.
 const LOW_LIMB: u64 = 1 << 32;
 
 impl TryFrom<u64> for SyscallNumbers {
@@ -401,7 +401,8 @@ impl Instruction {
                     SyscallNumbers::Ecsm => {
                         // ECSM(-3): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
-                        // xG, k, xR are 32-byte little-endian values.
+                        // xG, k, xR are 32-byte little-endian values; xG and xR must be
+                        // canonical field elements and k must be in [1, N).
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
@@ -423,8 +424,8 @@ impl Instruction {
                         let k = load_u256_le(memory, addr_k)?;
                         let xr = ecsm::scalar_mul_x(&k, &xg)?;
                         store_u256_le(memory, addr_xr, &xr)?;
-                        // Carry the input addresses for the prover; addr_xR = x10 is recovered
-                        // from the register state.
+                        // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
+                        // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }

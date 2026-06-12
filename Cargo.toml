@@ -4,9 +4,9 @@ members = [
   "prover",
   "crypto/stark",
   "crypto/crypto",
+  "crypto/ecsm",
   "crypto/math",
   "crypto/math-cuda",
-  "crypto/ecsm",
   "bin/cli",
 ]
 

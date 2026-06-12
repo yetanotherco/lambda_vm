@@ -1215,10 +1215,9 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
     );
 }
 
-/// Verifies SPEC-1 (a spec bug) + deviation D1: `ecdas.toml` omits `IS_BIT(µ)`, but `µ` is the
-/// multiplicity of every ECDAS bus interaction. The implementation adds `IS_BIT(µ)`; this test
-/// confirms it is load-bearing by forging a non-boolean `µ` on a real ECDAS row and asserting
-/// the verifier rejects. (k=5 produces 3 ECDAS rows.)
+/// Regression test: `µ` is the multiplicity of every ECDAS bus interaction, so it must remain
+/// boolean. Forge a non-boolean `µ` on a real ECDAS row and assert the verifier rejects.
+/// (k=5 produces 3 ECDAS rows.)
 #[test]
 fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
     use crate::tables::ecdas::cols as ecdas_cols;
@@ -1242,7 +1241,7 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
-        "Verifier must reject a non-boolean ECDAS multiplicity (IS_BIT(µ), spec omits it)"
+        "Verifier must reject a non-boolean ECDAS multiplicity"
     );
 }
 

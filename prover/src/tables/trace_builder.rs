@@ -2030,10 +2030,10 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             out.push(is_byte_op(w.y_g[i]));
             out.push(is_byte_op(w.q1[i]));
         }
-        // IS_HALF on the carries c0[i]+8160, c1[i]+16319 (i = 0..62).
+        // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
-            out.push(is_half_op((w.c0[i] + 8160) as u16));
-            out.push(is_half_op((w.c1[i] + 16319) as u16));
+            out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
+            out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
         // IS_HALF on the U256HL limbs of k_sub_N and xR_sub_p.
         for i in 0..16 {
@@ -2069,9 +2069,9 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
             out.push(is_byte_op(s.q2[i]));
         }
         for i in 0..63 {
-            out.push(is_half_op((s.c0[i] + 32636) as u16));
-            out.push(is_half_op((s.c1[i] + 8161) as u16));
-            out.push(is_half_op((s.c2[i] + 16320) as u16));
+            out.push(is_half_op((s.c0[i] + ecdas::CARRY_OFFSET_LAMBDA) as u16));
+            out.push(is_half_op((s.c1[i] + ecdas::CARRY_OFFSET_XR) as u16));
+            out.push(is_half_op((s.c2[i] + ecdas::CARRY_OFFSET_YR) as u16));
         }
     }
     out
@@ -2871,9 +2871,7 @@ fn build_traces(
         storage_mode,
     )?;
 
-    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
-    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
-    // contributes nothing to any bus.
+    // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
     let eqs = chunk_and_generate::<eq::EqOperation>(
         &eq_ops,
         max_rows.eq,
