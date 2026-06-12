@@ -79,6 +79,7 @@ impl std::error::Error for EcsmError {}
 
 /// Converts a `BigUint` to 32 little-endian bytes (zero-padded / truncated to 32).
 pub fn to_le_32(v: &BigUint) -> [u8; 32] {
+    debug_assert!(v.bits() <= 256, "to_le_32: value exceeds 256 bits");
     let mut bytes = v.to_bytes_le();
     bytes.resize(32, 0);
     let mut out = [0u8; 32];
