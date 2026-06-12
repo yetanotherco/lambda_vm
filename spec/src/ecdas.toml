@@ -492,7 +492,7 @@ ref = "ecdas:c:range_next_op"
 kind = "interaction"
 tag = "BIT"
 input = ["timestamp", "round"]
-multiplicity = ["-", "next_op"]
+multiplicity = "next_op"
 ref = "ecdas:c:receive_next_op"
 
 [[constraints.send]]

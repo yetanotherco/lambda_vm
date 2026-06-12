@@ -614,7 +614,7 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "BIT"
 input = ["timestamp", "len_k"]
-multiplicity = ["-", "μ"]
+multiplicity = "μ"
 
 [[constraints.delegate]]
 kind = "interaction"

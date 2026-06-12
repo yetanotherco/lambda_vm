@@ -84,7 +84,7 @@ kind = "interaction"
 tag = "BIT"
 input = ["timestamp", ["+", ["*", 8, "offset"], "i"]]
 iter = ["i", 0, 7]
-multiplicity = ["idx", "limb_bits", "i"]
+multiplicity = ["-", ["idx", "limb_bits", "i"]]
 
 [[constraints.serve]]
 kind = "arith"
