@@ -88,6 +88,15 @@ fn ecsm_syscall_rejects_zero_scalar() {
 }
 
 #[test]
+fn ecsm_syscall_rejects_out_of_range_scalar() {
+    let err = run_ecsm(&ecsm::N_BYTES, &gx_le()).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::ScalarOutOfRange)
+    ));
+}
+
+#[test]
 fn ecsm_syscall_rejects_non_canonical_xg() {
     // xG = p + 1 (the alias of x = 1) must error, not silently reduce: with
     // k = 1 the executor would echo the non-canonical bytes back as xR, which
@@ -98,6 +107,18 @@ fn ecsm_syscall_rejects_non_canonical_xg() {
     assert!(matches!(
         err,
         ExecutionError::Ecsm(ecsm::EcsmError::CoordinateOutOfRange)
+    ));
+}
+
+#[test]
+fn ecsm_syscall_rejects_xg_not_on_curve() {
+    // p - 1 is canonical, but not a valid secp256k1 x-coordinate.
+    let mut xg = ecsm::P_BYTES;
+    xg[0] -= 1;
+    let err = run_ecsm(&k_le(1), &xg).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::NotOnCurve)
     ));
 }
 
@@ -132,20 +153,21 @@ fn ecsm_syscall_rejects_overlapping_xg_k() {
     run_ecsm_at(0x1000, 0x2000, 0x1FE0).expect("disjoint k below xG must run");
     // ...and xR may alias xG (its accesses are offset to later timestamps).
     run_ecsm_at(0x2000, 0x2000, 0x3000).expect("xR aliasing xG is allowed");
+    run_ecsm_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
 }
 
 #[test]
 fn ecsm_syscall_rejects_address_overflow() {
-    // addr_k near the lower-limb boundary so (addr mod 2^32) + 31 overflows.
-    let mut pc = 0;
-    let mut registers = Registers::default();
-    let mut memory = Memory::default();
-    registers.write(17, ECSM_SYSCALL_NUMBER).unwrap();
-    registers.write(10, 0x1000).unwrap();
-    registers.write(11, 0x2000).unwrap();
-    registers.write(12, 0xFFFF_FFF0).unwrap(); // (mod 2^32) + 31 ≥ 2^32
-    let err = Instruction::EcallEbreak
-        .run(&mut pc, &mut registers, &mut memory)
-        .unwrap_err();
-    assert!(matches!(err, ExecutionError::EcsmAddressOverflow));
+    // xR/xG check the last doubleword base (+24); k checks every scalar byte (+31).
+    for (addr_xr, addr_xg, addr_k) in [
+        (0xFFFF_FFE8, 0x2000, 0x3000),
+        (0x1000, 0xFFFF_FFE8, 0x3000),
+        (0x1000, 0x2000, 0xFFFF_FFF0),
+    ] {
+        let err = run_ecsm_at(addr_xr, addr_xg, addr_k).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::EcsmAddressOverflow),
+            "expected address overflow for xR={addr_xr:#x}, xG={addr_xg:#x}, k={addr_k:#x}"
+        );
+    }
 }

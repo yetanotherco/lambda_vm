@@ -1,5 +1,4 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
-.Lfunc_end0:
 	.globl	main
 main:
 	# Stack layout (96 bytes): xG at sp+0, k at sp+32, xR at sp+64.

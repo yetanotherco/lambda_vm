@@ -3,10 +3,10 @@
 //! One row per `ECALL(-3)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
 //! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
-//! and delegates the double-and-add to ECDAS / EC_SCALAR over the `Ecdas`/`ServeK`/`Bit`
-//! buses.
+//! triggers EC_SCALAR to serve `k` bit-by-bit, and delegates the double-and-add to ECDAS over
+//! the `Ecdas`/`ServeK`/`Bit` buses.
 //!
-//! See `spec/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
+//! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!
 //! ## Padding
@@ -28,6 +28,9 @@ use stark::trace::TraceTable;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
+
+pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
+pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
 // Column indices (~427 columns)
@@ -443,7 +446,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::YG, 32, &mut out);
     is_byte(cols::Q1, 32, &mut out); // q1[0..31]; q1[32] is an IS_BIT constraint
 
-    // IS_HALF range checks: c0[i]+8160, c1[i]+16319 (i=0..62), then k_sub_N / xR_sub_p.
+    // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
     let half_offset = |col: usize, off: i64| {
         BusValue::linear(vec![
             LinearTerm::Column {
@@ -457,14 +460,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         out.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu(),
-            vec![half_offset(cols::c0(i), 8160)],
+            vec![half_offset(cols::c0(i), CARRY_OFFSET_X2)],
         ));
     }
     for i in 0..63 {
         out.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu(),
-            vec![half_offset(cols::c1(i), 16319)],
+            vec![half_offset(cols::c1(i), CARRY_OFFSET_YG)],
         ));
     }
     for i in 0..16 {

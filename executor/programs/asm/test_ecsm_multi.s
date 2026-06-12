@@ -1,5 +1,4 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
-.Lfunc_end0:
 	.globl	main
 main:
 	# Stack layout (96 bytes): xG at sp+0, k at sp+32, xR at sp+64.
@@ -20,7 +19,7 @@ main:
 	sd	zero, 48(sp)
 	sd	zero, 56(sp)
 
-	# --- call 1: k = 1 (no ECDAS steps; start/final tuples cancel directly) ---
+	# --- call 1: k = 1 (no ECDAS rows; result equals G directly) ---
 	li	t0, 1
 	sd	t0, 32(sp)
 	addi	a0, sp, 64

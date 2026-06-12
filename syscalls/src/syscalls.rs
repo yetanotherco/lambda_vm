@@ -20,7 +20,7 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
-/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (u64::MAX - 2, = -3).
+/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-3 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 2;
 
@@ -136,7 +136,8 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 
 #[cfg(target_arch = "riscv64")]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator. All values are 32-byte
-/// little-endian. Requires `0 < k < N` and `xG` a valid curve x-coordinate; `xR` may alias `xG`.
+/// little-endian. Requires `0 < k < N` and a canonical valid `xG` curve coordinate.
+/// `xG` and `k` must not overlap; `xR` may alias either input.
 pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
     unsafe {
         asm!(

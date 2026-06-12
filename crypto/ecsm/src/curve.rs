@@ -86,7 +86,7 @@ pub struct StepPts {
 }
 
 /// Reference slope `lambda` for one step, computed in `BigUint` `F_p`.
-/// Used by the reference replay and the k256 parity test.
+/// Used by the reference replay.
 #[cfg(test)]
 pub fn step_lambda(a: &AffinePoint, g: &AffinePoint, op: u8) -> BigUint {
     let xa = Fp::new(a.x.clone());
