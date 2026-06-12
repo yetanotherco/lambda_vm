@@ -38,9 +38,15 @@ where
     type Data = [FieldElement<F>; 2];
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
+        // One reused buffer; `write_bytes` is non-allocating for the field types
+        // used in production (Goldilocks / ext3), unlike `as_bytes()`.
+        let mut buf = Vec::new();
         let mut hasher = D::new();
-        hasher.update(input[0].as_bytes());
-        hasher.update(input[1].as_bytes());
+        input[0].write_bytes(&mut buf);
+        hasher.update(&buf);
+        buf.clear();
+        input[1].write_bytes(&mut buf);
+        hasher.update(&buf);
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -102,9 +108,12 @@ where
         I: IntoIterator<Item = &'a FieldElement<F>>,
         F: 'a,
     {
+        let mut buf = Vec::new();
         let mut hasher = D::new();
         for element in elements {
-            hasher.update(element.as_bytes());
+            buf.clear();
+            element.write_bytes(&mut buf);
+            hasher.update(&buf);
         }
         let mut result_hash = [0u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
@@ -124,9 +133,12 @@ where
     type Data = Vec<FieldElement<F>>;
 
     fn hash_data(input: &Vec<FieldElement<F>>) -> [u8; NUM_BYTES] {
+        let mut buf = Vec::new();
         let mut hasher = D::new();
         for element in input.iter() {
-            hasher.update(element.as_bytes());
+            buf.clear();
+            element.write_bytes(&mut buf);
+            hasher.update(&buf);
         }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());

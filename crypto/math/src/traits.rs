@@ -39,6 +39,12 @@ pub trait ByteConversion {
 pub trait AsBytes {
     /// Default serialize without args
     fn as_bytes(&self) -> alloc::vec::Vec<u8>;
+
+    /// Append the same bytes as `as_bytes()` to `out`. Default allocates via
+    /// `as_bytes()`; field elements override this to avoid the per-call `Vec`.
+    fn write_bytes(&self, out: &mut alloc::vec::Vec<u8>) {
+        out.extend_from_slice(&self.as_bytes());
+    }
 }
 
 #[cfg(feature = "alloc")]

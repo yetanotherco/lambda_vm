@@ -537,6 +537,12 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
     }
+    fn write_bytes(&self, out: &mut alloc::vec::Vec<u8>) {
+        // Same big-endian bytes as `as_bytes()`, written in place (no `Vec`).
+        let start = out.len();
+        out.resize(start + 24, 0);
+        ByteConversion::write_bytes_be(self, &mut out[start..]);
+    }
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
