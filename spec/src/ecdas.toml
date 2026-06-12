@@ -226,6 +226,23 @@ type = "Bit"
 desc = ""
 pad = 0
 
+[[assumptions]]
+desc = "$E(0, b, p)$ has odd order."
+ref = "ecdas:a:curve_odd_order"
+
+[[assumptions]]
+desc = "the $k$ served by `EC_SCALAR` is smaller than the curve order $N$."
+ref = "ecdas:a:k_lt_order"
+
+[[assumptions]]
+desc = "$(x_A, y_A)$ is a valid, non-$O$ point on the curve."
+ref = "ecdas:a:A_is_valid"
+
+[[assumptions]]
+desc = "$(x_G, y_G)$ is a valid, non-$O$ point on the curve."
+ref = "ecdas:a:G_is_valid"
+
+
 [[constraint_groups]]
 name = "receive"
 

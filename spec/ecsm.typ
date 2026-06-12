@@ -191,21 +191,15 @@ Recall that the addition of two curve points $A, B$ is treated differently based
 )
 Cases 2 and 3 may, for specific inputs, evaluate to $#inf$:
 a point that has no native short-Weierstrass representation.
-Therefore, the #ecsm and #ecdas chips were designed to avoid this case.
-To see how, note that #ecsm
-+ is the sole chip that can "activate" the #ecdas chip by issuing an `ECDAS` lookup,
-+ enforces that $G$ and the initial $A$ do not equal $#inf$, and
-+ ensures $k in [1, N)$, where $N$ denotes the order of the curve.
-This combined yields that neither doubling $A$ or adding $A + G$ can produce $#inf$:
+Therefore, the #ecdas chip is designed to avoid this case:
 
 *Double.*
-For $2A$ to equal $#inf$, the curve must have _even_ order.
-Since the order of the curve is assumed _odd_, such a point does not exist.
+For $2A$ to equal $#inf$, the curve must have _even_ order; on curves with _odd_ order (@ecdas:a:curve_odd_order), such a point does not exist.
 
 *Add.*
 If $A + G = #inf$, then $A = -G = #inf - G = r N G - G$ for some $r >= 0$.
-Because #ecsm initializes $A = G eq.not #inf$, it must hold that $r >= 1$.
-Furthermore, the restriction that $k <= N-1$ ensures $r <= 1$.
+Since $A = G eq.not #inf$ (@ecdas:a:A_is_valid, @ecdas:a:G_is_valid), it must hold that $r >= 1$.
+Furthermore, the assumption that $k <= N-1$ (@ecdas:a:k_lt_order) ensures $r <= 1$.
 Hence, $A = (N-1)G$.
 Since $N-1$ is the maximal value of $k$, the previous round producing $A = (N-1)G$ was the last round of this scalar multiplication.
 This means that now `round` is negative, which will fail constraint @ecdas:c:range_round.
@@ -218,6 +212,9 @@ This means that now `round` is negative, which will fail constraint @ecdas:c:ran
 
 The #ecdas chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(ecdas_chip, config)
+
+== Assumptions
+#render_chip_assumptions(ecdas_chip, config)
 
 == Constraints
 First, the chips receives the input for this double/add step:
