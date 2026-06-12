@@ -20,7 +20,6 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 
 use crate::curve::{StepPts, replay_double_and_add};
-use crate::field::Fp;
 use crate::{B, EcsmError, P_BYTES, n, p, prepare, to_le_32};
 
 /// Full ECSM-chip witness for one scalar multiplication (one ECSM row).
@@ -344,21 +343,8 @@ fn build_step(
     r_ext: &[i128; 64],
     pp: &[i128; 64],
 ) -> EcdasStep {
-    let xa = Fp::new(s.a.x.clone());
-    let ya = Fp::new(s.a.y.clone());
-    let xg = Fp::new(s.g.x.clone());
-    let yg = Fp::new(s.g.y.clone());
-
-    // λ: add ⇒ (yG−yA)/(xG−xA); double ⇒ 3xA²/(2yA).
-    let lambda = if s.op == 1 {
-        yg.sub(&ya).mul(&xg.sub(&xa).inv())
-    } else {
-        let three_x2 = xa.mul(&xa).mul(&Fp::from_u64(3));
-        let two_y = ya.add(&ya);
-        three_x2.mul(&two_y.inv())
-    };
-
-    let lam_b = to_le_32(&lambda.0);
+    // λ is precomputed (batched) during the double-and-add replay.
+    let lam_b = to_le_32(&s.lambda);
     let xa_b = to_le_32(&s.a.x);
     let ya_b = to_le_32(&s.a.y);
     let xg_b = to_le_32(&s.g.x);
@@ -376,7 +362,7 @@ fn build_step(
         ext64(&yr_b),
     );
 
-    let lam_i = BigInt::from(lambda.0.clone());
+    let lam_i = BigInt::from(s.lambda.clone());
     let xa_i = BigInt::from(s.a.x.clone());
     let ya_i = BigInt::from(s.a.y.clone());
     let xg_i = BigInt::from(s.g.x.clone());

@@ -2,12 +2,16 @@
 //!
 //! This crate is shared by the executor (which needs `k·G`'s x-coordinate to write back
 //! to guest memory) and the prover (which replays the full double-and-add sequence to
-//! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Keeping a single implementation
-//! guarantees the two never diverge — in particular they pick the same `yG` square root.
+//! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Both entry points compute the same
+//! `k·G` over the audited `k256` curve arithmetic — the executor via `k256`'s scalar
+//! multiplication, the prover via a projective double-and-add replay — so the x-coordinate
+//! they write/prove agrees. It is also independent of the `yG` root: both recover the same
+//! canonical `yG` in `prepare`, and `k·P` and `k·(-P)` share an x.
 //!
-//! Curve point operations (decompression, doubling, addition) are delegated to the RustCrypto
-//! `k256` crate; the limb arithmetic for witness generation uses `num-bigint`. All of this
-//! runs once per `ECALL`, so it is not performance critical.
+//! Curve point operations are delegated to the RustCrypto `k256` crate; witness generation
+//! replays the schedule in `k256` projective coordinates and batch-inverts the slope
+//! denominators, while `num-bigint` carries the coordinate/limb representation the trace
+//! needs. All of this runs once per `ECALL`, so it is not performance critical.
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
@@ -110,8 +114,7 @@ pub(crate) fn prepare(
 /// to guest memory at `addr_xR`.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    let (_steps, result) = replay_double_and_add(&k, &g);
-    Ok(to_le_32(&result.x))
+    Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
 }
 
 #[cfg(test)]
