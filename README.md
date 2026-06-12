@@ -19,7 +19,7 @@ The **[public roadmap](https://yetanotherco.github.io/lambda_vm_roadmap/)** lays
 - Rust nightly with `rust-src` component
 - Clang with RISC-V target support and LLD linker (used by `make compile-programs-asm`)
   - **macOS**: `brew install llvm` (the Homebrew LLVM includes `clang` and `lld` with RISC-V support)
-  - **Linux**: `apt install clang lld` (or equivalent for your distribution)
+  - **Linux**: use LLVM 21+ from apt.llvm.org or your distribution; older distro clang packages may reject the assembly fixtures' RISC-V ISA attributes
 
 ### Dev dependencies
 
