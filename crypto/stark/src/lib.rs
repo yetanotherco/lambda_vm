@@ -22,6 +22,7 @@ pub mod lookup;
 pub(crate) mod par;
 pub mod proof;
 pub mod prover;
+pub mod r4_denoms;
 #[cfg(feature = "disk-spill")]
 pub mod storage_mode;
 pub mod table;

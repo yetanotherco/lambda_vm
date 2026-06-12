@@ -57,8 +57,9 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
         return Ok(Vec::new());
     }
     if n == 1 {
-        // Below GPU break-even (one element). Invert on host via Fermat.
-        let inv = invert_ext3_host([a[0], a[1], a[2]]);
+        // Below GPU break-even (one element). Invert on host via the math
+        // crate's `Fp3::inv`.
+        let inv = invert_ext3_host([a[0], a[1], a[2]])?;
         return Ok(inv.to_vec());
     }
 
@@ -83,12 +84,16 @@ pub fn batch_inverse_ext3_dev(
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
+    debug_assert!(
+        n <= u32::MAX as usize / BLOCK_SIZE as usize,
+        "batch_inverse_ext3_dev: n {n} would truncate the u32 grid_dim",
+    );
     if n == 1 {
         // Single element: D2H, host invert, H2D. Avoids running the
         // scan + combine machinery for a degenerate case.
         let host_view: Vec<u64> = stream.clone_dtoh(&input.slice(0..3))?;
         stream.synchronize()?;
-        let inv = invert_ext3_host([host_view[0], host_view[1], host_view[2]]);
+        let inv = invert_ext3_host([host_view[0], host_view[1], host_view[2]])?;
         let mut out = unsafe { stream.alloc::<u64>(3) }?;
         stream.memcpy_htod(&inv, &mut out)?;
         return Ok(out);
@@ -108,7 +113,7 @@ pub fn batch_inverse_ext3_dev(
     // total = prefix[n-1] = suffix[0]. Invert on host (one Fermat per batch).
     let last_host: Vec<u64> = stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))?;
     stream.synchronize()?;
-    let inv_total = invert_ext3_host([last_host[0], last_host[1], last_host[2]]);
+    let inv_total = invert_ext3_host([last_host[0], last_host[1], last_host[2]])?;
     let mut inv_total_dev = unsafe { stream.alloc::<u64>(3) }?;
     stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
 
@@ -131,7 +136,11 @@ pub fn batch_inverse_ext3_dev(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    stream.synchronize()?;
+    // No terminal `stream.synchronize()`: the caller's downstream consumers
+    // (e.g. `barycentric_*_on_device_with_dev_inv_denoms`,
+    // `deep_composition_ext3_with_dev_parts_and_inv_denoms`) run on the
+    // same stream and thus observe the combine kernel's writes via
+    // CUDA's per-stream FIFO ordering.
     Ok(out_dev)
 }
 
@@ -167,6 +176,10 @@ pub fn compute_and_invert_denoms_ext3_dev(
     let total = k_scalars
         .checked_mul(n)
         .expect("compute_and_invert_denoms_ext3_dev: k_scalars * n overflow");
+    debug_assert!(
+        total <= u32::MAX as usize / BLOCK_SIZE as usize,
+        "compute_and_invert_denoms_ext3_dev: total {total} would truncate the u32 grid_dim",
+    );
 
     let z_dev = stream.clone_htod(z_scalars_host)?;
     // SAFETY: the compute_denoms_ext3 kernel writes every output slot.
@@ -363,133 +376,26 @@ fn scan_into_rev(
 // Host-side ext3 inverse (one element, used to invert the batch total).
 // =============================================================================
 
-const GOLDILOCKS_P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
-
-fn gl_mul(a: u64, b: u64) -> u64 {
-    let prod = (a as u128) * (b as u128);
-    (prod % GOLDILOCKS_P) as u64
-}
-
-fn gl_add(a: u64, b: u64) -> u64 {
-    let s = (a as u128) + (b as u128);
-    (s % GOLDILOCKS_P) as u64
-}
-
-fn gl_sub(a: u64, b: u64) -> u64 {
-    // Inputs from gl_mul/gl_add are always reduced; this assert defends
-    // against future reuse with raw (potentially non-canonical) inputs.
-    debug_assert!((b as u128) < GOLDILOCKS_P, "gl_sub: b must be canonical");
-    let a128 = a as u128;
-    let b128 = b as u128;
-    if a128 >= b128 {
-        ((a128 - b128) % GOLDILOCKS_P) as u64
-    } else {
-        (((GOLDILOCKS_P - b128) + a128) % GOLDILOCKS_P) as u64
-    }
-}
-
-fn gl_pow(mut base: u64, mut exp: u64) -> u64 {
-    let mut acc: u64 = 1;
-    while exp != 0 {
-        if exp & 1 != 0 {
-            acc = gl_mul(acc, base);
-        }
-        base = gl_mul(base, base);
-        exp >>= 1;
-    }
-    acc
-}
-
-fn gl_inv(a: u64) -> u64 {
-    // Fermat: a^{p-2} (only valid for non-zero a).
-    gl_pow(a, GOLDILOCKS_P as u64 - 2)
-}
-
-/// Invert one ext3 element on the host. Used once per batch inverse to
-/// invert the total product; the main batch inverse work stays on GPU.
-fn invert_ext3_host(x: [u64; 3]) -> [u64; 3] {
-    let a = x[0];
-    let b = x[1];
-    let c = x[2];
-
-    // Adjugate over Fp[w]/(w^3 - 2). Mirrors `Degree3GoldilocksExtensionField::inv`.
-    let bc = gl_mul(b, c);
-    let d = gl_sub(gl_mul(a, a), gl_add(bc, bc)); // a^2 - 2bc
-    let cc = gl_mul(c, c);
-    let ab = gl_mul(a, b);
-    let e = gl_sub(gl_add(cc, cc), ab); // 2c^2 - ab
-    let bb = gl_mul(b, b);
-    let ac = gl_mul(a, c);
-    let f = gl_sub(bb, ac); // b^2 - ac
-
-    let ad = gl_mul(a, d);
-    let bf = gl_mul(b, f);
-    let ce = gl_mul(c, e);
-    let two_bf = gl_add(bf, bf);
-    let two_ce = gl_add(ce, ce);
-    let norm = gl_add(ad, gl_add(two_bf, two_ce));
-
-    // gl_inv(0) = 0^(p-2) = 0 mod p; without this assert we would silently
-    // return [0,0,0] and poison the whole batch inverse.
-    assert!(norm != 0, "invert_ext3_host: input has zero norm");
-    let inv_norm = gl_inv(norm);
-    [
-        gl_mul(d, inv_norm),
-        gl_mul(e, inv_norm),
-        gl_mul(f, inv_norm),
-    ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::invert_ext3_host;
+/// Invert one ext3 element on the host via the math crate's `Fp3::inv`.
+/// Used once per batch inverse to invert the total product; the main batch
+/// inverse work stays on GPU. Returns a cudarc `DriverError` on zero norm
+/// so the caller's `Err(_) => None` fallback path fires (instead of
+/// panicking past it).
+fn invert_ext3_host(x: [u64; 3]) -> Result<[u64; 3]> {
     use math::field::element::FieldElement;
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
     use math::field::goldilocks::GoldilocksField;
-    use math::field::traits::IsPrimeField;
 
     type Fp = FieldElement<GoldilocksField>;
     type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
 
-    fn canon3(a: [u64; 3]) -> [u64; 3] {
-        [
-            GoldilocksField::canonical(&a[0]),
-            GoldilocksField::canonical(&a[1]),
-            GoldilocksField::canonical(&a[2]),
-        ]
-    }
-
-    /// Parity: our adjugate-based ext3 inverse must match
-    /// `Degree3GoldilocksExtensionField::inv`. This catches a regression if
-    /// either implementation diverges from the other (e.g., adjugate sign
-    /// or normalisation drift). Runs without a GPU.
-    #[test]
-    fn invert_ext3_host_matches_lambdaworks() {
-        let cases: [[u64; 3]; 8] = [
-            [1, 0, 0],
-            [0, 1, 0],
-            [0, 0, 1],
-            [1, 1, 1],
-            [2, 3, 5],
-            [7, 11, 13],
-            [u64::MAX - 5, 1234567, 89],
-            [0xdead_beef, 0xface_feed, 0x1234_5678_9abc_def0],
-        ];
-        for raw in cases {
-            let lw = Fp3::new([
-                Fp::from_raw(raw[0]),
-                Fp::from_raw(raw[1]),
-                Fp::from_raw(raw[2]),
-            ])
-            .inv()
-            .expect("non-zero norm");
-            let lw_raw = canon3([
-                *lw.value()[0].value(),
-                *lw.value()[1].value(),
-                *lw.value()[2].value(),
-            ]);
-            let ours = canon3(invert_ext3_host(raw));
-            assert_eq!(ours, lw_raw, "mismatch for input {raw:?}");
-        }
-    }
+    let elem = Fp3::new([Fp::from_raw(x[0]), Fp::from_raw(x[1]), Fp::from_raw(x[2])]);
+    let inv = elem.inv().map_err(|_| {
+        cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN)
+    })?;
+    Ok([
+        *inv.value()[0].value(),
+        *inv.value()[1].value(),
+        *inv.value()[2].value(),
+    ])
 }

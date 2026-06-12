@@ -817,7 +817,7 @@ pub(crate) fn try_barycentric_base_on_handle<F, E>(
     g_n_inv: &FieldElement<F>,
     z_pow_n: &FieldElement<E>,
     inv_denoms_host: &[FieldElement<E>],
-    inv_denoms_dev: Option<(&CudaSlice<u64>, usize, &Arc<CudaStream>)>,
+    r3_ctx: Option<(&R3DevContext, usize)>,
 ) -> Option<Vec<FieldElement<E>>>
 where
     F: IsField + IsSubFieldOf<E> + 'static,
@@ -842,7 +842,7 @@ where
         return None;
     }
     // Host inv_denoms length only matters on the host path.
-    if inv_denoms_dev.is_none() && inv_denoms_host.len() != n {
+    if r3_ctx.is_none() && inv_denoms_host.len() != n {
         return None;
     }
 
@@ -850,14 +850,14 @@ where
     // #[repr(transparent)] over u64.
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
 
-    let sums_raw = match inv_denoms_dev {
-        Some((inv_dev, inv_offset_u64, stream)) => {
+    let sums_raw = match r3_ctx {
+        Some((ctx, inv_offset_u64)) => {
             match math_cuda::barycentric::barycentric_base_on_device_with_dev_inv_denoms(
-                stream,
+                &ctx.stream,
                 main,
                 row_stride,
-                points_raw,
-                inv_dev,
+                &ctx.coset_points,
+                &ctx.inv_denoms,
                 inv_offset_u64,
                 n,
             ) {
@@ -900,7 +900,7 @@ pub(crate) fn try_barycentric_ext3_on_handle<F, E>(
     g_n_inv: &FieldElement<F>,
     z_pow_n: &FieldElement<E>,
     inv_denoms_host: &[FieldElement<E>],
-    inv_denoms_dev: Option<(&CudaSlice<u64>, usize, &Arc<CudaStream>)>,
+    r3_ctx: Option<(&R3DevContext, usize)>,
 ) -> Option<Vec<FieldElement<E>>>
 where
     F: IsField + IsSubFieldOf<E> + 'static,
@@ -924,20 +924,20 @@ where
     if aux.lde_size != n.checked_mul(row_stride)? {
         return None;
     }
-    if inv_denoms_dev.is_none() && inv_denoms_host.len() != n {
+    if r3_ctx.is_none() && inv_denoms_host.len() != n {
         return None;
     }
 
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
 
-    let sums_raw = match inv_denoms_dev {
-        Some((inv_dev, inv_offset_u64, stream)) => {
+    let sums_raw = match r3_ctx {
+        Some((ctx, inv_offset_u64)) => {
             match math_cuda::barycentric::barycentric_ext3_on_device_with_dev_inv_denoms(
-                stream,
+                &ctx.stream,
                 aux,
                 row_stride,
-                points_raw,
-                inv_dev,
+                &ctx.coset_points,
+                &ctx.inv_denoms,
                 inv_offset_u64,
                 n,
             ) {
@@ -1425,6 +1425,80 @@ where
     let handle =
         try_compute_and_invert_inv_denoms_dev::<F, E>(coset_base, z_scalars, sign, &stream)?;
     Some((handle, stream))
+}
+
+/// R3 OOD device-side context: bundles the inverted denominators, the
+/// coset_points upload (used by every barycentric kernel for this batch),
+/// and the stream so producer + consumers serialize naturally. Hoisting
+/// `coset_points` here means the barycentric kernels read the same
+/// device buffer across `num_eval_points * {main, aux}` calls instead
+/// of re-uploading `dc.points` each iteration.
+#[derive(Debug)]
+pub(crate) struct R3DevContext {
+    pub inv_denoms: CudaSlice<u64>,
+    pub coset_points: CudaSlice<u64>,
+    pub stream: Arc<CudaStream>,
+}
+
+/// Build an [`R3DevContext`] in one stream: acquire backend, allocate
+/// stream, H2D coset_points once, then run `compute_and_invert_denoms`
+/// against that same handle so the coset H2D isn't repeated by any
+/// downstream barycentric kernel.
+///
+/// Returns `None` on type / threshold mismatch, backend init failure, or
+/// any cudarc error.
+pub(crate) fn try_prep_r3_dev_context<F, E>(
+    coset_base: &[FieldElement<F>],
+    z_scalars: &[FieldElement<E>],
+) -> Option<R3DevContext>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n = coset_base.len();
+    let k_scalars = z_scalars.len();
+    if n == 0 || k_scalars == 0 {
+        return None;
+    }
+    let total = n.checked_mul(k_scalars)?;
+    if total < gpu_lde_threshold() {
+        return None;
+    }
+
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+
+    // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
+    // #[repr(transparent)] over u64.
+    let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
+    let coset_points = stream.clone_htod(coset_u64).ok()?;
+
+    // SAFETY: E == Ext3 per TypeId check.
+    let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
+
+    let inv_denoms = match math_cuda::inverse::compute_and_invert_denoms_ext3_dev(
+        &coset_points,
+        z_u64,
+        n,
+        k_scalars,
+        math_cuda::inverse::DenomSign::ZMinusX,
+        &stream,
+    ) {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    GPU_BATCH_INVERT_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(R3DevContext {
+        inv_denoms,
+        coset_points,
+        stream,
+    })
 }
 
 /// R4 FRI dispatch: drive the full FRI commit phase device-side. Mirrors

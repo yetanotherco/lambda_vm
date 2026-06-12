@@ -179,9 +179,10 @@ pub fn barycentric_base_on_device(
     Ok(out)
 }
 
-/// Same as [`barycentric_base_on_device`] but reads `inv_denoms` from a
-/// device handle (no per-call H2D) and runs on the caller's stream (so
-/// the inv_denoms producer and this kernel serialize naturally).
+/// Same as [`barycentric_base_on_device`] but reads `inv_denoms` AND
+/// `coset_points` from device handles (no per-call H2D) and runs on the
+/// caller's stream (so the inv_denoms producer and this kernel serialize
+/// naturally).
 ///
 /// `inv_denoms_dev` is the full multi-eval-point buffer from
 /// `compute_and_invert_denoms_ext3_dev`. `inv_offset_u64` is the start
@@ -191,12 +192,12 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     stream: &Arc<CudaStream>,
     main_handle: &GpuLdeBase,
     row_stride: usize,
-    coset_points: &[u64],
+    coset_points_dev: &CudaSlice<u64>,
     inv_denoms_dev: &CudaSlice<u64>,
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
-    assert_eq!(coset_points.len(), n);
+    assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
         .expect("barycentric inv_denoms range overflow");
@@ -208,9 +209,9 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     let col_stride = main_handle.lde_size;
 
     let be = backend()?;
-    let points_dev = stream.clone_htod(coset_points)?;
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
     let inv_view = inv_denoms_dev.slice(inv_offset_u64..inv_end);
+    let points_view = coset_points_dev.slice(0..n);
 
     let col_stride_u64 = col_stride as u64;
     let row_stride_u64 = row_stride as u64;
@@ -226,7 +227,7 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
             .arg(main_handle.buf.as_ref())
             .arg(&col_stride_u64)
             .arg(&row_stride_u64)
-            .arg(&points_dev)
+            .arg(&points_view)
             .arg(&inv_view)
             .arg(&n_u64)
             .arg(&mut out_dev)
@@ -291,12 +292,12 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     stream: &Arc<CudaStream>,
     aux_handle: &GpuLdeExt3,
     row_stride: usize,
-    coset_points: &[u64],
+    coset_points_dev: &CudaSlice<u64>,
     inv_denoms_dev: &CudaSlice<u64>,
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
-    assert_eq!(coset_points.len(), n);
+    assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
         .expect("barycentric inv_denoms range overflow");
@@ -308,9 +309,9 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     let col_stride = aux_handle.lde_size;
 
     let be = backend()?;
-    let points_dev = stream.clone_htod(coset_points)?;
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
     let inv_view = inv_denoms_dev.slice(inv_offset_u64..inv_end);
+    let points_view = coset_points_dev.slice(0..n);
 
     let col_stride_u64 = col_stride as u64;
     let row_stride_u64 = row_stride as u64;
@@ -326,7 +327,7 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
             .arg(aux_handle.buf.as_ref())
             .arg(&col_stride_u64)
             .arg(&row_stride_u64)
-            .arg(&points_dev)
+            .arg(&points_view)
             .arg(&inv_view)
             .arg(&n_u64)
             .arg(&mut out_dev)

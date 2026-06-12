@@ -1391,17 +1391,15 @@ pub trait IsStarkProver<
         }
 
         // CPU denoms + batch inverse for the fallback paths below.
-        // Convention: x_i - z_k (R4 DEEP's downstream consumer in the rayon
-        // loop expects 1/(x - z) for the standard DEEP polynomial form).
-        let num_denoms = lde_size * (1 + num_eval_points);
-        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
-        for z_k in core::iter::once(&z_power).chain(z_shifted.iter()) {
-            for x_i in &domain.lde_roots_of_unity_coset {
-                denoms.push(x_i - z_k);
-            }
-        }
-        FieldElement::inplace_batch_inverse(&mut denoms)
-            .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
+        // Single-source helper shared with the GPU parity test so any
+        // sign/ordering/layout drift breaks the test instead of silently
+        // diverging CUDA vs non-CUDA proofs.
+        let denoms = crate::r4_denoms::build_r4_inv_denoms_cpu::<Field, FieldExtension>(
+            &domain.lde_roots_of_unity_coset,
+            &z_power,
+            &z_shifted,
+        )
+        .expect("R4 inv denoms: coset points are base field, poles are extension field");
 
         let inv_h = &denoms[0..lde_size];
 

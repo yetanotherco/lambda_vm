@@ -41,6 +41,8 @@ criterion = { version = "0.4", default-features = false }
 env_logger = "*"
 test-log = { version = "0.2.11", features = ["log"] }
 bincode = "1"
+rand = { version = "0.8.5", features = ["std"] }
+rand_chacha = "0.3.1"
 
 [features]
 test-utils = []
