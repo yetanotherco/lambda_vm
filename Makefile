@@ -56,6 +56,10 @@ SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 # $(abspath ...) because the build rule cd's into the program dir before invoking cargo.
 SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(abspath $(SYSROOT_DIR))
 
+CLANG ?= clang
+ASM_CFLAGS ?= --target=riscv64 -march=rv64im -mabi=lp64
+ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
+
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
@@ -94,8 +98,8 @@ prepare-sysroot:
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)
 	@set -e; for src in $(ASM_PROGRAMS); do \
-		echo "clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
-		clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
+		echo "$(CLANG) $(ASM_CFLAGS) $(ASM_LDFLAGS) $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
+		$(CLANG) $(ASM_CFLAGS) $(ASM_LDFLAGS) $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
 	done
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
