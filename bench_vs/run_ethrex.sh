@@ -32,6 +32,7 @@ NC='\033[0m'
 BLOCKS=(
     "ethrex empty block|ethrex_empty_block.bin"
     "ethrex 1 tx|ethrex_simple_tx.bin"
+    "ethrex 10 txs|ethrex_10_transfers.bin"
 )
 
 # --- Parse args -------------------------------------------------------------

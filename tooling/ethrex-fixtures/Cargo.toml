@@ -1,0 +1,23 @@
+[package]
+name = "ethrex-fixtures"
+version = "0.1.0"
+edition = "2024"
+
+# Detached workspace: keeps the heavy ethrex host deps out of the main build.
+[workspace]
+
+[dependencies]
+# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
+# so the generated ProgramInput rkyv layout matches what the guest deserializes.
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-blockchain" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-storage" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common" }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program" }
+ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-l2-rpc" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
+serde_json = "1"
+bytes = "1"
+secp256k1 = "0.30"
+hex = "0.4"
