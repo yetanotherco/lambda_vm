@@ -166,6 +166,10 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 Similar to `addr_xG` and `addr_k`, it is assumed that the addition of the small offsets will not overflow the lower limb of `addr_xR` (@ec:a:addr_xR_alignment).
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
+== Carry offset
+#et[Finish this]
+$#`carry_offset` = 8160$
+
 == Padding
 #render_chip_padding_table(ecsm_chip, config)
 
@@ -319,6 +323,10 @@ Lastly, the updated accumulator is sent out for the next step to be processed (@
 To determine whether the next step should be an addition or doubling, the `next_op` bit is provided as witness by the prover.
 Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_mu), when the current $#`op` = 0$ (double), and does require the scalar bit in this position to be set (@ecdas:c:receive_next_op).
 #render_constraint_table(ecdas_chip, config, groups: "send")
+
+== Carry offsets
+#et[Finish this]
+$#`carry_offsets` = (32636, 8161, 16320)$
 
 == Padding
 #render_chip_padding_table(ecdas_chip, config)
