@@ -189,7 +189,6 @@ Recall that the addition of two curve points $A, B$ is treated differently based
   enum.item[$x_A eq x_B$ and $y_A eq.not -y_B$, or],
   enum.item[$x_A eq x_B$ and $y_A eq -y_B$]
 )
-where _double_ may encounter the last two cases, while _add_ may encounter all three.
 Cases 2 and 3 may, for specific inputs, evaluate to $#inf$:
 a point that has no native short-Weierstrass representation.
 Therefore, the #ecsm and #ecdas chips were designed to avoid this case.
@@ -201,7 +200,7 @@ This combined yields that neither doubling $A$ or adding $A + G$ can produce $#i
 
 *Double.*
 For $2A$ to equal $#inf$, the curve must have _even_ order.
-Since the order of the `secp256k1` curve is _odd_, such a point does not exist.
+Since the order of the curve is assumed _odd_, such a point does not exist.
 
 *Add.*
 If $A + G = #inf$, then $A = -G = #inf - G = r N G - G$ for some $r >= 0$.
