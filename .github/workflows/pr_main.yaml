@@ -96,7 +96,6 @@ jobs:
 
       - name: Run ignored executor tests
         run: |
-          make prepare-test-data
           cargo test --release -p executor test_ethrex -- --ignored
           cargo test --release -p executor test_ckzg -- --ignored
 
