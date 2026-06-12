@@ -394,4 +394,25 @@ mod parity_tests {
             assert_eq!(steps, steps_ref, "step list mismatch for k = {k}");
         }
     }
+
+    /// The executor's fast path (`scalar_mul_affine_x`) and the prover's replay must agree
+    /// on `x(k·G)`: the executor writes it to guest memory and the prover proves it, so any
+    /// divergence would make a correct execution unprovable. They run through two distinct
+    /// k256 entry points (native scalar-mul vs projective double-and-add), so pin them here.
+    #[test]
+    fn executor_and_replay_agree_on_result_x() {
+        let g = generator();
+        let mut scalars: Vec<BigUint> = (1u64..40).map(BigUint::from).collect();
+        for &kv in &[0xFFu64, 0xABCD, 1 << 20, 123_456_789, u64::MAX] {
+            scalars.push(BigUint::from(kv));
+        }
+        scalars.push(&n() / BigUint::from(2u8));
+        scalars.push(&n() - BigUint::from(1u8));
+
+        for k in scalars {
+            let (_steps, result) = replay_double_and_add(&k, &g);
+            let exec_x = scalar_mul_affine_x(&k, &g);
+            assert_eq!(result.x, exec_x, "executor/replay x mismatch for k = {k}");
+        }
+    }
 }
