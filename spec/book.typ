@@ -49,6 +49,9 @@
       ("commit.typ", [`COMMIT` chip], <commit>),
       ("sha256.typ", [`SHA256` accelerator], <sha256>),
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
+    )),
+    ("MATHEMATICS", (
+      ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs-and-carries>),
     ))
   )
 )
