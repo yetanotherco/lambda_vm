@@ -31,3 +31,8 @@ This template introduces #nr_interactions interaction(s).
 = Constraints
 This template introduces the following constraints
 #render_constraint_table(chip, config)
+
+Note that the correctness of these constraints follows from @lm:limb-decomposition-constraint-correctness, when applied to $(S, L, C, alpha, mu) = (2^64, 2^32, 2, 2, 0)$:
+- the definition of `carry` matches that of @eq:def_ci and @eq:c_-1_is_zero, 
+- @eq:range_ci is enforced by @add:c:carry, and
+- @eq:range_wi follows from @add:a:sum.
