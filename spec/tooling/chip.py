@@ -278,7 +278,7 @@ class ModExpr:
             elt = elt.get_const()
             return Range.const(elt % modulus)
         else:
-            return Range(0, modulus-1)
+            return Range(0, modulus - 1)
 
 
 @dataclass
@@ -293,9 +293,7 @@ class PowExpr:
             reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
             return DEFAULT_TYPE
         if isinstance(exp, list) or not exp.is_const():
-            reporter.error(
-                f"Invalid exponentiation with non-const exponent: {self.exp!r}"
-            )
+            reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
             return DEFAULT_TYPE
         val = pow(base.get_const(), exp.get_const(), env.config.variables.prime)
         return Range.const(val)
@@ -349,9 +347,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case int(x):
             return LitExpr(x)
         case str(x):
-            reporter.asserts(
-                x.isidentifier(), f"Invalid identifier name for variable {x!r}"
-            )
+            reporter.asserts(x.isidentifier(), f"Invalid identifier name for variable {x!r}")
             return VarExpr(x)
         case ["opsel", str(x)]:
             if x not in OPSEL:
@@ -371,9 +367,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case ["+", *terms]:
             return AddExpr([build_expr(config, t) for t in terms])
         case ["-", head, *subs]:
-            return SubExpr(
-                build_expr(config, head), [build_expr(config, s) for s in subs]
-            )
+            return SubExpr(build_expr(config, head), [build_expr(config, s) for s in subs])
         case ["mod", elt, modulus]:
             return ModExpr(build_expr(config, elt), build_expr(config, modulus))
         case ["^", base, exp]:
@@ -388,6 +382,17 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return DummyExpr()
 
 
+def check_padding_fits(var_name: str, config: "Config", type: Type, pad: Expr):
+    def fits(v, t):
+        if isinstance(v, Range):
+            return v.is_const() and constant_fits(v.get_const(), t)
+        else:
+            return isinstance(v, list) and isinstance(t, list) and len(v) == len(t) and all(map(fits, v, t))
+
+    val = pad.typecheck(Environment(config, {}, {}))
+    reporter.asserts(fits(val, type), f"{var_name!r}: Invalid padding {pad!r} for type {type!r}")
+
+
 @dataclass
 class Iter:
     name: str
@@ -396,18 +401,12 @@ class Iter:
 
     def __init__(self, config: "Config", name: str, start: object, stop: object):
         self.name = name
-        reporter.asserts(
-            isinstance(self.name, str), f"iter name is not a string: {self.name!r}"
-        )
-        reporter.asserts(
-            self.name.isidentifier(), f"Not a valid identifier: {self.name!r}"
-        )
+        reporter.asserts(isinstance(self.name, str), f"iter name is not a string: {self.name!r}")
+        reporter.asserts(self.name.isidentifier(), f"Not a valid identifier: {self.name!r}")
         self.start = build_expr(config, start)
         self.stop = build_expr(config, stop)
 
-    def typecheck[T](
-        self, env: Environment, callback: Callable[[Environment], Iterable[T]]
-    ) -> Iterable[T]:
+    def typecheck[T](self, env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
         start = self.start.typecheck(env)
         if isinstance(start, list) or not start.is_const():
             reporter.error(f"Starting value of iterator not a const: {self!r}")
@@ -444,9 +443,7 @@ def iters_of(obj: dict, config, name=None) -> list[Iter]:
         return Iter(config, *arr)
 
     if "iters" in obj:
-        reporter.asserts(
-            "iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}"
-        )
+        reporter.asserts("iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}")
         return [clean_iter(it) for it in obj["iters"]]
     elif "iter" in obj:
         return [clean_iter(obj["iter"])]
@@ -475,14 +472,10 @@ class TypeConfig:
                 f"Invalid range: {data!r}",
             )
             start, stop = data["range"]
-            if not isinstance(start, int) and not (
-                isinstance(start, str) and start.isdigit()
-            ):
+            if not isinstance(start, int) and not (isinstance(start, str) and start.isdigit()):
                 reporter.error(f"Range start not an int: {data!r}")
                 start = 0
-            if not isinstance(stop, int) and not (
-                isinstance(stop, str) and stop.isdigit()
-            ):
+            if not isinstance(stop, int) and not (isinstance(stop, str) and stop.isdigit()):
                 reporter.error(f"Range end not an int: {data!r}")
                 stop = start
             reporter.asserts(int(start) <= int(stop), f"Inverted range: {data!r}")
@@ -553,9 +546,7 @@ class ConfigMetadata:
     def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.version = data["version"]
-        reporter.asserts(
-            isinstance(self.version, int), f"version {self.version!r} is not an int"
-        )
+        reporter.asserts(isinstance(self.version, int), f"version {self.version!r} is not an int")
 
 
 @dataclass
@@ -610,6 +601,7 @@ class Variable:
         self.desc = data["desc"]
         reporter.asserts(isinstance(self.desc, str), f"{self.desc!r} is not a string")
         self.pad = build_expr(None, data.get("pad", 0))
+        check_padding_fits(self.name, config, self.type, self.pad)
         self.precomputed = data.get("precomputed", False)
         reporter.asserts(
             isinstance(self.precomputed, bool),
@@ -617,9 +609,7 @@ class Variable:
         )
 
 
-def all_iters[T](
-    its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]
-) -> Iterable[T]:
+def all_iters[T](its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
     if not its:
         yield from callback(env)
     else:
@@ -640,17 +630,11 @@ class VirtualDef:
     def __init__(self, config: Config, name: str, tp: Type, data: dict):
         if "poly" in data:
             idx = data.get("idx", None)
-            self.defs = [
-                PolyWithIters(
-                    build_expr(config, data["poly"]), iters_of(data, config, name=idx)
-                )
-            ]
+            self.defs = [PolyWithIters(build_expr(config, data["poly"]), iters_of(data, config, name=idx))]
         elif "polys" in data:
             idx = data.get("idx", None)
             self.defs = [
-                PolyWithIters(
-                    build_expr(config, poly["poly"]), iters_of(poly, config, name=idx)
-                )
+                PolyWithIters(build_expr(config, poly["poly"]), iters_of(poly, config, name=idx))
                 for poly in data["polys"]
             ]
         else:
@@ -683,9 +667,7 @@ class VirtualVariable(Variable):
                 for s in seen:
                     ln = min(len(s), len(indices))
                     if s[:ln] == tuple(indices[:ln]):
-                        reporter.error(
-                            f"Double definition for virtual column: {self!r} at index {indices}"
-                        )
+                        reporter.error(f"Double definition for virtual column: {self!r} at index {indices}")
                         break
 
                 val = poly.typecheck(env)
@@ -703,21 +685,15 @@ class VirtualVariable(Variable):
                 # But threading the extra needed state through overly complicates everything
                 start = it.start.typecheck(env)
                 if isinstance(start, list) or not start.is_const():
-                    reporter.error(
-                        f"Starting value of virtual def iter not a const: {self!r}"
-                    )
+                    reporter.error(f"Starting value of virtual def iter not a const: {self!r}")
                     start = Range.const(0)
                 stop = it.stop.typecheck(env)
                 if isinstance(stop, list) or not stop.is_const():
-                    reporter.error(
-                        f"Ending value of virtual def iter not a const: {self!r}"
-                    )
+                    reporter.error(f"Ending value of virtual def iter not a const: {self!r}")
                     stop = Range.const(start.get_const())
 
                 if isinstance(expected, Range):
-                    reporter.error(
-                        f"Virtual definition has an iter for a scalar: {self!r}"
-                    )
+                    reporter.error(f"Virtual definition has an iter for a scalar: {self!r}")
                     return
 
                 if not 0 <= start.get_const() <= stop.get_const() < len(expected):
@@ -760,9 +736,7 @@ class VirtualVariable(Variable):
             )
             assigned_type = self.def_.defs[0].poly.typecheck(env)
             if not isinstance(assigned_type, Range):
-                reporter.error(
-                    f"Assigning non-scalar type to scalar virtual column: {self!r}"
-                )
+                reporter.error(f"Assigning non-scalar type to scalar virtual column: {self!r}")
                 return self.type
             # Check type fits?
             # Leaving this out because it produces too much noise with one-hot assumptions
@@ -771,9 +745,7 @@ class VirtualVariable(Variable):
             # Check no indices are covered twice
             seen: set[tuple] = set()
             for poly_iters in self.def_.defs:
-                handle_iters(
-                    env, poly_iters.iters, poly_iters.poly, self.type, [], seen
-                )
+                handle_iters(env, poly_iters.iters, poly_iters.poly, self.type, [], seen)
             # Check everything is covered
             check_covered(self.type, seen, [])
         return self.type
@@ -785,9 +757,7 @@ class Assumption:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
-        )
+        assert_no_unexpected(data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"})
         self.desc = data["desc"]
         self.iters = iters_of(data, config)
 
@@ -800,9 +770,7 @@ class ArithConstraint:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
-        )
+        assert_no_unexpected(data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
         assert data["kind"] == "arith"
         self.constraint = data["constraint"]
         reporter.asserts(
@@ -810,9 +778,7 @@ class ArithConstraint:
             f"Constraint not a string: {self.constraint!r}",
         )
         self.desc = data.get("desc", "")
-        reporter.asserts(
-            isinstance(self.desc, str), f"desc is not a string: {self.desc!r}"
-        )
+        reporter.asserts(isinstance(self.desc, str), f"desc is not a string: {self.desc!r}")
         self.poly = build_expr(config, data["poly"])
         self.iters = iters_of(data, config)
 
@@ -827,9 +793,7 @@ class ArithConstraint:
                     f"Unsatisfiable constraint, 0 not in range: {self!r} {t}",
                 )
             else:
-                reporter.error(
-                    f"Non-scalar value for polynomial constraint: {self!r} {t}"
-                )
+                reporter.error(f"Non-scalar value for polynomial constraint: {self!r} {t}")
 
         for t in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
             check_includes_zero(t)
@@ -849,11 +813,7 @@ class Signature:
             return False
         if (self.output is None) != (other.output is None):
             return False
-        if (
-            self.output is not None
-            and other.output is not None
-            and not structure_matches(self.output, other.output)
-        ):
+        if self.output is not None and other.output is not None and not structure_matches(self.output, other.output):
             return False
         return structure_matches(self.input, other.input)
 
@@ -889,13 +849,9 @@ class InteractionLike:
         )
         assert data["kind"] == self.kind
         self.tag = data["tag"]
-        reporter.asserts(
-            isinstance(self.tag, str), f"tag is not a string: {self.tag!r}"
-        )
+        reporter.asserts(isinstance(self.tag, str), f"tag is not a string: {self.tag!r}")
         self.desc = data.get("desc", "")
-        reporter.asserts(
-            isinstance(self.desc, str), f"Description is not a string: {self.desc!r}"
-        )
+        reporter.asserts(isinstance(self.desc, str), f"Description is not a string: {self.desc!r}")
         self.input = [build_expr(config, inp) for inp in data["input"]]
         if "output" in data:
             self.output = build_expr(config, data["output"])
@@ -955,9 +911,7 @@ class DummyConstraint:
         return []
 
 
-type Constraint = (
-    ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
-)
+type Constraint = ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
 
 
 def build_constraint(config, data: dict) -> Constraint:
@@ -983,15 +937,11 @@ class Chip:
 
     def __init__(self, config: Config, data: dict):
         """Construct a chip from toml-parsed data"""
-        assert_no_unexpected(
-            data, set(type(self).__annotations__.keys()) | {"constraint_groups"}
-        )
+        assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"constraint_groups"})
         assert_no_unexpected(data["variables"], config.variables.categories.all)
         self.config = config
         self.name = data["name"]
-        reporter.asserts(
-            isinstance(self.name, str), f"name is not a string: {self.name!r}"
-        )
+        reporter.asserts(isinstance(self.name, str), f"name is not a string: {self.name!r}")
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
         self.variables = [
             (Variable if cat != "virtual" else VirtualVariable)(config, cat, var)
@@ -1036,9 +986,7 @@ class Chip:
 
 
 def build_signature(config: Config, data: dict) -> Signature:
-    assert_no_unexpected(
-        data, {"tag", "kind", "input", "output", "cond", "multiplicity"}
-    )
+    assert_no_unexpected(data, {"tag", "kind", "input", "output", "cond", "multiplicity"})
     Sig: type[Signature]
     match data["kind"]:
         case "template":
@@ -1048,9 +996,7 @@ def build_signature(config: Config, data: dict) -> Signature:
             )
             Sig = TemplateSignature
         case "interaction":
-            reporter.asserts(
-                "cond" not in data, f"Template signature with cond: {data!r}"
-            )
+            reporter.asserts("cond" not in data, f"Template signature with cond: {data!r}")
             Sig = InteractionSignature
         case other:
             reporter.error(f"Signature of invalid kind '{other}': {data!r}")
@@ -1074,9 +1020,7 @@ def read_signatures(config, filename) -> list[Signature]:
 
 def check_signatures(found: Iterable[Signature], expected: list[Signature]):
     for sig in found:
-        reporter.asserts(
-            any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}"
-        )
+        reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
 
 
 if __name__ == "__main__":

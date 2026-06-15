@@ -18,19 +18,19 @@ pad = 0
 name = "address"
 type = "DWordWL"
 desc = "Address of first byte to commit."
-pad = ["arr", 0, 0, 0, 0]
+pad = 0
 
 [[variables.auxiliary]]
 name = "address_incr"
 type = "DWordHL"
 desc = "$#`address` + 1$"
-pad = ["arr", 1, 0, 0, 0]
+pad = 1
 
 [[variables.auxiliary]]
 name = "count"
 type = "DWordWL"
 desc = "number of bytes to commit"
-pad = ["arr", 1, 0, 0, 0]
+pad = 1
 
 [[variables.auxiliary]]
 name = "count_decr"
