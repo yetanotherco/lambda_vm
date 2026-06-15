@@ -55,6 +55,22 @@ jobs:
             --rebuild-elf \
             --no-color
 
+      - name: Refresh Plonky3 to latest main
+        continue-on-error: true
+        run: |
+          cargo update --manifest-path bench_vs_plonky3/Cargo.toml \
+            -p p3-air -p p3-field -p p3-goldilocks -p p3-matrix \
+            -p p3-commit -p p3-challenger -p p3-symmetric \
+            -p p3-merkle-tree -p p3-keccak -p p3-fri \
+            -p p3-uni-stark -p p3-dft
+
+      - name: Run Plonky3 nightly benchmark
+        continue-on-error: true
+        run: |
+          bash ./bench_vs_plonky3/run.sh \
+            --log-rows 21 --num-sequences 16 --runs 10 --scalar \
+            --report-dir bench_vs_artifacts/p3 --no-color
+
       - name: Upload nightly benchmark artifact
         uses: actions/upload-artifact@v4
         with:

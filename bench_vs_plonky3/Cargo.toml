@@ -1,0 +1,54 @@
+[package]
+name = "bench-vs-plonky3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Lambda STARK
+stark = { path = "../crypto/stark", features = ["test-utils"] }
+crypto = { path = "../crypto/crypto", features = ["std", "serde"] }
+math = { path = "../crypto/math", features = [
+    "std",
+    "lambdaworks-serde-binary",
+] }
+
+p3-air = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3.git" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", features = ["parallel"] }
+
+# Tracing for P3 span-based profiling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+
+[dev-dependencies]
+criterion = { version = "0.4", default-features = false }
+
+[features]
+# Both provers run multi-threaded by default: Plonky3's `Radix2DitParallel` DFT
+# uses rayon unconditionally, so Lambda must also enable `parallel` for a fair
+# apples-to-apples comparison. Disable with `--no-default-features` to compare
+# single-threaded. The cubic extension is `x^3 - 2` (binomial) on Lambda and
+# `x^3 - x - 1` (trinomial) on upstream Plonky3 — same degree, same soundness.
+default = ["parallel"]
+parallel = ["stark/parallel"]
+instruments = ["stark/instruments"]
+
+[[bin]]
+name = "prove_bench"
+path = "src/bin/prove_bench.rs"
+
+[[bench]]
+name = "stark_comparison"
+harness = false
