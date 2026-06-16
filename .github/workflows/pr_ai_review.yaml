@@ -119,13 +119,25 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
         run: |
-          python3 runner/.github/scripts/ai_review.py run-lane \
+          set +e
+          LANE_OUT="ai-review-lane/${{ matrix.lane.id }}.json"
+          timeout 300s python3 runner/.github/scripts/ai_review.py run-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --prompt-dir runner/.github/ai-review/prompts \
-            --out "ai-review-lane/${{ matrix.lane.id }}.json"
+            --out "$LANE_OUT"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            python3 runner/.github/scripts/ai_review.py lane-error \
+              --lane-json "$LANE_JSON" \
+              --context ai-review-context/context.json \
+              --kind review \
+              --message "lane command exited with status $status" \
+              --out "$LANE_OUT"
+          fi
 
       - name: Upload lane result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ai-review-lane-${{ matrix.lane.id }}
@@ -133,7 +145,10 @@ jobs:
 
   candidates:
     needs: [prepare, context, openrouter-review]
-    if: needs.prepare.outputs.should_run == 'true'
+    if: |
+      always() &&
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.context.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       has_candidates: ${{ steps.candidates.outputs.has_candidates }}
@@ -151,6 +166,7 @@ jobs:
           path: ai-review-context
 
       - name: Download lane results
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           pattern: ai-review-lane-*
@@ -205,14 +221,26 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
         run: |
-          python3 runner/.github/scripts/ai_review.py verify-lane \
+          set +e
+          LANE_OUT="ai-review-verification/${{ matrix.lane.id }}.json"
+          timeout 300s python3 runner/.github/scripts/ai_review.py verify-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --candidates ai-review-candidates/candidates.json \
             --prompt-dir runner/.github/ai-review/prompts \
-            --out "ai-review-verification/${{ matrix.lane.id }}.json"
+            --out "$LANE_OUT"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            python3 runner/.github/scripts/ai_review.py lane-error \
+              --lane-json "$LANE_JSON" \
+              --context ai-review-context/context.json \
+              --kind verification \
+              --message "lane command exited with status $status" \
+              --out "$LANE_OUT"
+          fi
 
       - name: Upload verification result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ai-review-verification-${{ matrix.lane.id }}

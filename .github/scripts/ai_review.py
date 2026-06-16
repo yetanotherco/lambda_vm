@@ -49,6 +49,13 @@ def main() -> int:
     run_lane.add_argument("--prompt-dir", required=True)
     run_lane.add_argument("--out", required=True)
 
+    lane_error = sub.add_parser("lane-error")
+    lane_error.add_argument("--lane-json", required=True)
+    lane_error.add_argument("--context", required=True)
+    lane_error.add_argument("--kind", required=True, choices=["review", "verification"])
+    lane_error.add_argument("--message", required=True)
+    lane_error.add_argument("--out", required=True)
+
     candidates = sub.add_parser("candidates")
     candidates.add_argument("--lanes-dir", required=True)
     candidates.add_argument("--context", required=True)
@@ -78,6 +85,8 @@ def main() -> int:
         return cmd_context(args)
     if args.command == "run-lane":
         return cmd_run_lane(args)
+    if args.command == "lane-error":
+        return cmd_lane_error(args)
     if args.command == "candidates":
         return cmd_candidates(args)
     if args.command == "verify-lane":
@@ -187,8 +196,21 @@ def cmd_context(args: argparse.Namespace) -> int:
 def cmd_run_lane(args: argparse.Namespace) -> int:
     lane = json.loads(args.lane_json)
     context = read_json(pathlib.Path(args.context))
-    prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
-    result = run_review_lane(lane, context, prompt)
+    try:
+        prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
+        result = run_review_lane(lane, context, prompt)
+    except Exception as exc:
+        result = lane_base_result(lane, context, kind="review")
+        result.update({"status": "error", "error": f"lane failed: {exc}"})
+    write_json(pathlib.Path(args.out), result)
+    return 0
+
+
+def cmd_lane_error(args: argparse.Namespace) -> int:
+    lane = json.loads(args.lane_json)
+    context = read_json(pathlib.Path(args.context))
+    result = lane_base_result(lane, context, kind=args.kind)
+    result.update({"status": "error", "error": args.message})
     write_json(pathlib.Path(args.out), result)
     return 0
 
@@ -217,8 +239,12 @@ def cmd_verify_lane(args: argparse.Namespace) -> int:
     lane = json.loads(args.lane_json)
     context = read_json(pathlib.Path(args.context))
     candidates = read_json(pathlib.Path(args.candidates))
-    prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
-    result = run_verifier_lane(lane, context, candidates, prompt)
+    try:
+        prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
+        result = run_verifier_lane(lane, context, candidates, prompt)
+    except Exception as exc:
+        result = lane_base_result(lane, context, kind="verification")
+        result.update({"status": "error", "error": f"lane failed: {exc}"})
     write_json(pathlib.Path(args.out), result)
     return 0
 
@@ -437,6 +463,12 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
         content = parsed["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return {"status": "error", "error": f"Unexpected OpenRouter response: {json.dumps(parsed)[:1000]}"}
+    if isinstance(content, list):
+        content = json.dumps(content)
+    elif content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = str(content)
 
     return {
         "status": "success",
