@@ -13,6 +13,8 @@ tools:
 permission:
   bash: deny
   edit: deny
+  write: deny
+  patch: deny
   webfetch: deny
 ---
 You are a senior code reviewer reviewing a single pull request.
