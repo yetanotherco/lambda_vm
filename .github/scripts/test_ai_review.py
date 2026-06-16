@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import unittest
@@ -194,6 +195,52 @@ class AiReviewExtractorTests(unittest.TestCase):
         payload = ai_review.openrouter_payload(lane, "system", "user")
 
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+    def test_strip_sse_comments_drops_keepalive_and_whitespace(self) -> None:
+        body = ": OPENROUTER PROCESSING\n: OPENROUTER PROCESSING\n{\"findings\": []}\n"
+        self.assertEqual(ai_review.strip_sse_comments(body), '{"findings": []}')
+        # whitespace/keepalive-only body collapses to empty (the transient failure case)
+        self.assertEqual(ai_review.strip_sse_comments("\n\n   \n"), "")
+
+    def test_openrouter_chat_retries_on_empty_body(self) -> None:
+        good = json.dumps(
+            {"choices": [{"message": {"content": '{"findings": []}'}, "finish_reason": "stop"}],
+             "provider": "Novita", "usage": {}, "id": "gen-1"}
+        )
+        bodies = iter(["\n\n   \n", good])  # whitespace-only body, then valid JSON
+
+        class FakeResp:
+            def __init__(self, text: str) -> None:
+                self._b = text.encode("utf-8")
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, *exc: Any) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return self._b
+
+        calls = {"n": 0}
+
+        def fake_urlopen(req: Any, timeout: Any = None) -> "FakeResp":
+            calls["n"] += 1
+            return FakeResp(next(bodies))
+
+        original_urlopen = ai_review.urllib.request.urlopen
+        original_sleep = ai_review.time.sleep
+        ai_review.urllib.request.urlopen = fake_urlopen
+        ai_review.time.sleep = lambda *a, **k: None
+        try:
+            result = ai_review.openrouter_chat({"model": "minimax/minimax-m3"}, "sys", "usr", "key")
+        finally:
+            ai_review.urllib.request.urlopen = original_urlopen
+            ai_review.time.sleep = original_sleep
+
+        self.assertEqual(calls["n"], 2)  # retried once after the empty body
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["provider"], "Novita")
 
     def test_extract_json_accepts_bare_json(self) -> None:
         parsed, parse_error = ai_review.extract_json('{"summary":"ok","findings":[]}', required_key="findings")

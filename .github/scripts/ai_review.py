@@ -450,6 +450,9 @@ def infer_tier_from_lane(lane: dict[str, Any]) -> str:
     return "standard"
 
 
+RETRYABLE_HTTP_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+
 def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) -> dict[str, Any]:
     payload = openrouter_payload(lane, system, user)
     data = json.dumps(payload).encode("utf-8")
@@ -459,17 +462,48 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
         "HTTP-Referer": github_repo_url(),
         "X-Title": "lambda_vm AI Review",
     }
-    req = urllib.request.Request(OPENROUTER_URL, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(body)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return {"status": "error", "error": f"OpenRouter HTTP {exc.code}: {body[:1000]}"}
-    except Exception as exc:
-        return {"status": "error", "error": f"OpenRouter request failed: {exc}"}
 
+    last_error = "no response"
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 * attempt)
+        req = urllib.request.Request(OPENROUTER_URL, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            last_error = f"OpenRouter HTTP {exc.code}: {err_body[:1000]}"
+            if exc.code in RETRYABLE_HTTP_STATUS:
+                continue
+            return {"status": "error", "error": last_error}
+        except Exception as exc:
+            last_error = f"OpenRouter request failed: {exc}"
+            continue
+
+        # OpenRouter sends SSE keep-alive comment lines (": ...") and/or whitespace
+        # while the upstream is still generating; an empty/whitespace body means the
+        # JSON never arrived (transient), so strip the noise and retry rather than fail.
+        json_text = strip_sse_comments(body)
+        if not json_text:
+            last_error = "OpenRouter returned an empty response body"
+            continue
+        try:
+            parsed = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            last_error = f"OpenRouter response was not valid JSON: {exc} | body[:200]={body[:200]!r}"
+            continue
+        return parse_openrouter_response(parsed)
+
+    return {"status": "error", "error": f"OpenRouter failed after retries: {last_error}"}
+
+
+def strip_sse_comments(body: str) -> str:
+    lines = [line for line in body.splitlines() if not line.lstrip().startswith(":")]
+    return "\n".join(lines).strip()
+
+
+def parse_openrouter_response(parsed: Any) -> dict[str, Any]:
     try:
         choice = parsed["choices"][0]
         content = choice["message"]["content"]
