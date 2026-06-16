@@ -152,7 +152,7 @@ class AiReviewParsingTests(unittest.TestCase):
 
 
 class AiReviewExtractorTests(unittest.TestCase):
-    def test_openrouter_payload_requests_json_without_reasoning_controls(self) -> None:
+    def test_openrouter_payload_omits_json_mode_and_reasoning_by_default(self) -> None:
         lane = {
             "id": "glm-standard",
             "model": "z-ai/glm-5.1",
@@ -162,9 +162,23 @@ class AiReviewExtractorTests(unittest.TestCase):
 
         payload = ai_review.openrouter_payload(lane, "system", "user")
 
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        # Forcing json_object mode makes reasoning models reason until truncated
+        # without emitting content, so it must not be sent unless a lane opts in.
+        self.assertNotIn("response_format", payload)
         self.assertEqual(payload["max_tokens"], 32000)
         self.assertNotIn("reasoning", payload)
+
+    def test_openrouter_payload_passes_through_explicit_response_format(self) -> None:
+        lane = {
+            "id": "glm-standard",
+            "model": "z-ai/glm-5.1",
+            "prompt": "standard",
+            "response_format": {"type": "json_object"},
+        }
+
+        payload = ai_review.openrouter_payload(lane, "system", "user")
+
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
 
     def test_extract_json_accepts_bare_json(self) -> None:
         parsed, parse_error = ai_review.extract_json('{"summary":"ok","findings":[]}', required_key="findings")

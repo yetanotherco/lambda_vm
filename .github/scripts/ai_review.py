@@ -464,9 +464,11 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
         return {"status": "error", "error": f"OpenRouter request failed: {exc}"}
 
     try:
-        content = parsed["choices"][0]["message"]["content"]
+        choice = parsed["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return {"status": "error", "error": f"Unexpected OpenRouter response: {json.dumps(parsed)[:1000]}"}
+    finish_reason = choice.get("finish_reason")
     if isinstance(content, list):
         content = json.dumps(content)
     elif content is None:
@@ -476,8 +478,9 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
     if not content.strip():
         return {
             "status": "error",
-            "error": "OpenRouter returned empty message.content",
+            "error": f"OpenRouter returned empty message.content (finish_reason={finish_reason})",
             "raw_response": content,
+            "finish_reason": finish_reason,
             "usage": parsed.get("usage", {}),
             "openrouter_id": parsed.get("id"),
         }
@@ -485,13 +488,14 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
     return {
         "status": "success",
         "raw_response": content,
+        "finish_reason": finish_reason,
         "usage": parsed.get("usage", {}),
         "openrouter_id": parsed.get("id"),
     }
 
 
 def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": lane["model"],
         "messages": [
             {"role": "system", "content": system},
@@ -499,8 +503,14 @@ def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str
         ],
         "temperature": lane.get("temperature", 0.1),
         "max_tokens": int(lane.get("max_output_tokens", 2400)),
-        "response_format": lane.get("response_format", {"type": "json_object"}),
     }
+    # response_format is opt-in per lane. Forcing {"type": "json_object"} routes to
+    # structured-output providers and, on reasoning models, makes the model reason
+    # until truncated without ever emitting content. We rely on extract_json instead.
+    response_format = lane.get("response_format")
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return payload
 
 
 def format_review_prompt(lane: dict[str, Any], context: dict[str, Any], prompt: str) -> str:
