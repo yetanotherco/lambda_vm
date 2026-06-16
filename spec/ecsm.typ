@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, aside, et
+#import "/book.typ": book-page, aside, attention, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -14,13 +14,15 @@
 
 #show: book-page("ecsm.typ")
 
+#show math.equation.where(block: false): box
+
 #let ecsm_chip = load_chip("src/ecsm.toml", config)
 #let ecsm = raw(ecsm_chip.name)
 
-= Theory behind Elliptic Curves
+= Elliptic Curve Background
 
 #let inf = math.cal("O")
-An elliptic curve $E(a, b, p)$ in _short Weierstrass_ form has parameters $a,b in FF_p$ for some prime $p$ with $4a^3+27b^2 eq.not 0$, and coordinates $(x, y) in FF_p^2$ satisfying the equation 
+An elliptic curve $E(a, b, p)$ in _short Weierstrass_ form has parameters $a,b in FF_p$ for some prime $p$ with $4a^3+27b^2 eq.not 0$, and points $(x, y) in FF_p^2$ satisfying the equation 
 $
   y^2=x^3+a x+b.
 $
@@ -48,23 +50,30 @@ with $lambda = frac((y_Q - y_P), (x_Q - x_P), style: "horizontal")$.
 When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2, 2y_P, style: "horizontal")$.
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
-#strong("Scalar multiplication.")
-An addition operation gives rise to an algorithm for scalar multiplication.
-Given curve point $P$ and scalar $k$, the multiple $k times P$ can trivially be computed as $P + P + ... + P$.
-This accelerator instead leverages the _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) technique, which utilizes only $O(log(k))$ additions for the full multiplication.
-
-#strong("This accelerator.")
-The purpose of this accelerator is to speed up the scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [3, 2^256)$ that has odd order.
-In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
-This accelerator leverages _double-and-add_, executing the multiplication in $O(log(k))$ doublings and $O(w_H (k)) = O(log(k))$ additions, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
-
 = Overview
+This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
+In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
+
+#attention("Variable space.")[
+    This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
+    As such, *this accelerator should only be used for input sets with public $k$.*
+]
+
 The accelerator comprises three chips:
-- *`ECSM` (Elliptic Curve Scalar Multiply)*; this chip is responsible for loading inputs $x_G$ and $k$ from memory,
-  reconstructing $y_G$,
-  dispatching a double-and-add sequence request to the `ECDAS` chip, and writing the result point $x_R$ back to memory.
-- *`ECDAS` (Elliptic Curve Double/Add Sequence)* is responsible for the consecutive doubling/adding the provided point to itself, ultimately arriving at $k times G$.
-- *`EC_SCALAR`* serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
+- *`ECSM` (Elliptic Curve Scalar Multiply)*.
+    This chip is responsible for 
+    - loading $k$ from memory and verifying that is is contained in $[1, N)$,
+    - loading inputs $x_G$ and reconstructing $y_G$,
+    - verifying $(k times G)_x < p$, and
+    - writing $(k times G)_x$ to memory.
+    It interacts with the `ECDAS` chip, sending $k$ and $G$ as input, and receiving $k times G$ as result.
+- *`ECDAS` (Elliptic Curve Double/Add Sequence)*.
+    This chip computes $k times G$ by recursively interacting with itself.
+    At each step, the chip either adds the point to the accumulator ($A <- A + G$) or doubles the accumulator ($A <- 2A$), where the sequence of doubles and adds is dependent on $k$.
+    The process is repeated until $A = k times G$.
+    This technique is called _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) and manages to compute the multiplication in $O(log(k))$ doubling-steps and $O(w_H (k)) = O(log(k))$ addition-steps, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
+- *`EC_SCALAR`*.
+    Per the direction of `ECSM`, this chip serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
 
 = ECSM <ecsm-sm>
 
@@ -74,7 +83,7 @@ The #ecsm (Elliptic Curve Scalar Multiply) chip is generic over the constants
 - $N$, the order of the curve group.
 To support scalar multiplication over different curves, one chip instance should be created for each curve.
 
-The chip is triggered by executing `ECALL`, with the ECALL-number is set to $-3$.
+The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$.
 The chip expects 
 - `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
