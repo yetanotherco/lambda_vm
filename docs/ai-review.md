@@ -10,8 +10,8 @@ Comment on a pull request with one of these commands:
 
 | Command | Tier | Current reviewers | Use when |
 | --- | --- | --- | --- |
-| `/ai-review standard` | Standard | Kimi | Everyday PRs that are ready for serious review. |
-| `/ai-review critical` | Critical | Codex and Claude | Soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
+| `/ai-review standard` | Standard | OpenRouter matrix + verifier | Everyday PRs that are ready for serious review. |
+| `/ai-review critical` | Critical | OpenRouter matrix + verifiers, plus native Codex and Claude | Soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
 | `/kimi` | Individual | Kimi | Ad-hoc lightweight review. |
 | `/codex` | Individual | Codex | Ad-hoc Codex-only review. |
 | `/claude` | Individual | Claude | Ad-hoc Claude-only review. |
@@ -26,10 +26,15 @@ any model runner:
 - `general.md` backs the individual `/kimi`, `/codex`, and `/claude` commands.
 - `standard.md` backs `/ai-review standard`.
 - `critical.md` backs `/ai-review critical`.
+- `lanes/*.md` backs focused OpenRouter review and verification lanes.
 
 Model-specific workflows should load one of these prompt files and pass its
 contents to the reviewer. Do not duplicate prompt bodies inside model-specific
 workflow YAML unless the model adapter requires a small wrapper around the shared
+prompt.
+
+The model-to-prompt mapping lives in `.github/ai-review/matrix.json`. Prompts
+are intentionally model-agnostic; the matrix decides which model receives which
 prompt.
 
 ## Tier Policy
@@ -65,22 +70,50 @@ the deciding factor. Trigger critical review for changes touching:
 - security-sensitive infra or CI behavior
 - merge-conflict resolutions in high-risk branches
 
-Critical review runs Codex and Claude independently. Treat their results as
-separate reviewer opinions; a finding should still include concrete evidence in
-the changed code.
+Critical review also triggers native Codex and Claude independently. Treat their
+results as separate reviewer opinions; they currently post their own comments
+and are not included in the structured OpenRouter provenance report.
 
-## Model Matrix Plan
+## OpenRouter Matrix
 
-The current implementation reuses existing first-party secrets:
+`/ai-review standard` and `/ai-review critical` require `OPENROUTER_API_KEY`.
+If the secret is missing, the workflow still posts a report, but the OpenRouter
+lanes are marked as skipped.
 
+The current implementation uses these secrets:
+
+- `OPENROUTER_API_KEY` for the structured matrix, verification, artifacts, and
+  final report
 - `OPENAI_API_KEY` for Codex
 - `ANTHROPIC_API_KEY` for Claude
-- `KIMI_API_KEY` for the current lightweight Kimi lane
+- `KIMI_API_KEY` for the individual `/kimi` command
 
-When `OPENROUTER_API_KEY` is added, the standard tier should move from the
-single Kimi lane to a cheap OpenRouter matrix. Keep Codex and Claude native for
-critical review; do not route them through OpenRouter unless there is a clear
-reason to give up first-party behavior.
+Standard review lanes:
+
+| Lane | Model | Prompt |
+| --- | --- | --- |
+| `minimax-correctness` | `minimax/minimax-m3` | `correctness` |
+| `minimax-maintainability` | `minimax/minimax-m3` | `maintainability` |
+| `mimo-tests` | `xiaomi/mimo-v2.5` | `tests` |
+| `glm-standard` | `z-ai/glm-5.1` | `standard` |
+| `qwen-standard-verifier` | `qwen/qwen3.7-plus` | `verify` |
+
+Critical review lanes:
+
+| Lane | Model | Prompt |
+| --- | --- | --- |
+| `minimax-critical-correctness` | `minimax/minimax-m3` | `correctness` |
+| `minimax-critical-maintainability` | `minimax/minimax-m3` | `maintainability` |
+| `deepseek-soundness` | `deepseek/deepseek-v4-pro` | `soundness` |
+| `glm-critical` | `z-ai/glm-5.1` | `critical` |
+| `qwen-critical` | `qwen/qwen3.7-max` | `critical` |
+| `glm-critical-verifier` | `z-ai/glm-5.1` | `verify-critical` |
+| `deepseek-critical-verifier` | `deepseek/deepseek-v4-pro` | `verify-critical` |
+
+Reviewer lanes see the diff plus current and base contents for changed files,
+within size limits. Verifier lanes see the deduplicated candidate findings plus
+the same PR context. Verification status is `confirmed`, `rejected`,
+`uncertain`, or `candidate` when no verifier result is available.
 
 OpenRouter catalog snapshot from 2026-06-16:
 
@@ -96,9 +129,9 @@ OpenRouter catalog snapshot from 2026-06-16:
 | `z-ai/glm-5.1` | 0.98 | 3.08 | 202,752 | 43.4 | 67.1 | 4 |
 | `qwen/qwen3.7-max` | 1.25 | 3.75 | 1,000,000 | 50.1 | 66.6 | 10 |
 
-Use these rankings as initial guidance only. The review artifacts should track
-which model and prompt found each confirmed issue, because local usefulness
-matters more than public benchmark rank.
+Use these rankings as initial guidance only. The review artifacts track which
+model and prompt found each issue, because local usefulness matters more than
+public benchmark rank.
 
 ## Multiple Prompts Versus One Prompt
 
@@ -127,16 +160,24 @@ Initial policy:
 
 ## Evaluation Artifacts
 
-The next OpenRouter matrix should write structured artifacts so model quality can
-be measured over time:
+The OpenRouter workflow writes structured artifacts so model quality can be
+measured over time:
 
 ```text
-.ai-review/runs/pr-<number>/
-  raw/<lane-id>.json
+ai-review-context-<pr-number>/
+  context.json
+  pr.diff
+ai-review-lane-<lane-id>/
+  <lane-id>.json
+ai-review-candidates-<pr-number>/
   candidates.json
-  verification.json
+  model-metrics.json
+ai-review-verification-<lane-id>/
+  <lane-id>.json
+ai-review-final-<tier>-<pr-number>/
   final-issues.json
   model-metrics.json
+  report.md
 ```
 
 Each final issue should preserve provenance:
@@ -146,8 +187,8 @@ Each final issue should preserve provenance:
   "issue_id": "AI-004",
   "status": "confirmed",
   "severity": "high",
-  "found_by": ["minimax-m3-bugs", "glm-5.1-reasoning"],
-  "verified_by": ["deepseek-v4-pro"],
+  "found_by": ["minimax-correctness:minimax/minimax-m3", "glm-standard:z-ai/glm-5.1"],
+  "verified_by": ["qwen-standard-verifier:qwen/qwen3.7-plus"],
   "rejected_by": [],
   "file": "prover/src/tables/cpu.rs",
   "line": 123
@@ -155,7 +196,7 @@ Each final issue should preserve provenance:
 ```
 
 Do not count a verifier as `found_by` if it saw candidate findings from another
-model. Track discovery and verification separately so we can evaluate:
+model. Discovery and verification are tracked separately so we can evaluate:
 
 - confirmed unique discoveries per model and prompt
 - false-positive and duplicate rates

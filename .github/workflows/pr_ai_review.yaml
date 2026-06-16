@@ -1,0 +1,294 @@
+name: AI Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  prepare:
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/ai-review') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.prepare.outputs.should_run }}
+      tier: ${{ steps.prepare.outputs.tier }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      head_ref: ${{ steps.prepare.outputs.head_ref }}
+      review_lanes: ${{ steps.prepare.outputs.review_lanes }}
+      verifier_lanes: ${{ steps.prepare.outputs.verifier_lanes }}
+      custom_prompt: ${{ steps.prepare.outputs.custom_prompt }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Parse review command
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py prepare \
+            --event "$GITHUB_EVENT_PATH" \
+            --matrix runner/.github/ai-review/matrix.json \
+            --prompt-dir runner/.github/ai-review/prompts \
+            --output "$GITHUB_OUTPUT"
+
+  context:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Checkout PR merge
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+          fetch-depth: 0
+          path: subject
+
+      - name: Fetch base and head refs
+        working-directory: subject
+        run: |
+          git fetch --no-tags origin \
+            ${{ needs.prepare.outputs.base_sha }} \
+            +refs/pull/${{ needs.prepare.outputs.pr_number }}/head:${{ needs.prepare.outputs.head_ref }}
+
+      - name: Build review context
+        run: |
+          python3 runner/.github/scripts/ai_review.py context \
+            --repo subject \
+            --base-sha "${{ needs.prepare.outputs.base_sha }}" \
+            --head-ref "${{ needs.prepare.outputs.head_ref }}" \
+            --pr-number "${{ needs.prepare.outputs.pr_number }}" \
+            --out-dir ai-review-context
+
+      - name: Upload review context
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+  openrouter-review:
+    needs: [prepare, context]
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJson(needs.prepare.outputs.review_lanes) }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Run OpenRouter review lane
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          LANE_JSON: ${{ toJson(matrix.lane) }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py run-lane \
+            --lane-json "$LANE_JSON" \
+            --context ai-review-context/context.json \
+            --prompt-dir runner/.github/ai-review/prompts \
+            --out "ai-review-lane/${{ matrix.lane.id }}.json"
+
+      - name: Upload lane result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-lane-${{ matrix.lane.id }}
+          path: ai-review-lane
+
+  candidates:
+    needs: [prepare, context, openrouter-review]
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      has_candidates: ${{ steps.candidates.outputs.has_candidates }}
+      candidate_count: ${{ steps.candidates.outputs.candidate_count }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download lane results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-lane-*
+          path: ai-review-lanes
+          merge-multiple: true
+
+      - name: Merge candidate findings
+        id: candidates
+        run: |
+          python3 runner/.github/scripts/ai_review.py candidates \
+            --lanes-dir ai-review-lanes \
+            --context ai-review-context/context.json \
+            --out-dir ai-review-candidates \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Upload candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+  openrouter-verify:
+    needs: [prepare, context, candidates]
+    if: |
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.candidates.outputs.has_candidates == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJson(needs.prepare.outputs.verifier_lanes) }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+      - name: Run OpenRouter verifier lane
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          LANE_JSON: ${{ toJson(matrix.lane) }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py verify-lane \
+            --lane-json "$LANE_JSON" \
+            --context ai-review-context/context.json \
+            --candidates ai-review-candidates/candidates.json \
+            --prompt-dir runner/.github/ai-review/prompts \
+            --out "ai-review-verification/${{ matrix.lane.id }}.json"
+
+      - name: Upload verification result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-verification-${{ matrix.lane.id }}
+          path: ai-review-verification
+
+  final-report:
+    needs: [prepare, context, openrouter-review, candidates, openrouter-verify]
+    if: |
+      always() &&
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.candidates.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download lane results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-lane-*
+          path: ai-review-lanes
+          merge-multiple: true
+
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+      - name: Download verification results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: ai-review-verification-*
+          path: ai-review-verifications
+          merge-multiple: true
+
+      - name: Build and post report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py report \
+            --lanes-dir ai-review-lanes \
+            --verifications-dir ai-review-verifications \
+            --context ai-review-context/context.json \
+            --candidates ai-review-candidates/candidates.json \
+            --out-dir ai-review-final \
+            --post-comment
+
+      - name: Upload final report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-final-${{ needs.prepare.outputs.tier }}-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-final
+
+  codex-critical-review:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
+    with:
+      custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  claude-critical-review:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
+    with:
+      model: sonnet
+      max_turns: 30
+      custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
