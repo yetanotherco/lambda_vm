@@ -98,15 +98,35 @@ jobs:
     needs: [prepare, context]
     if: needs.prepare.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    # Least privilege: agentic lanes get read-only repo access and the OpenRouter key
+    # only. They never receive write permissions or the comment-posting token.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         lane: ${{ fromJson(needs.prepare.outputs.review_lanes) }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
       - name: Checkout review runner
         uses: actions/checkout@v4
         with:
           path: runner
+
+      - name: Checkout PR for exploration
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+          path: subject
+
+      - name: Install trusted sandbox config
+        run: |
+          rm -rf subject/.opencode
+          cp -r runner/.opencode subject/.opencode
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -114,20 +134,33 @@ jobs:
           name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
           path: ai-review-context
 
-      - name: Install JSON repair fallback
-        run: python3 -m pip install --quiet json-repair
+      - name: Install opencode and JSON repair
+        run: |
+          python3 -m pip install --quiet json-repair
+          curl -fsSL https://opencode.ai/install | bash
+          # add likely install locations to PATH for subsequent steps
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Run OpenRouter review lane
+      - name: Verify opencode
+        run: opencode --version
+
+      - name: Run agentic review lane
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
         run: |
           set +e
           LANE_OUT="ai-review-lane/${{ matrix.lane.id }}.json"
-          timeout 600s python3 runner/.github/scripts/ai_review.py run-lane \
+          timeout 760s python3 runner/.github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
+            --kind review \
             --prompt-dir runner/.github/ai-review/prompts \
+            --repo subject \
+            --agent review-ro \
+            --timeout 700 \
             --out "$LANE_OUT"
           status=$?
           if [ "$status" -ne 0 ]; then
@@ -135,7 +168,7 @@ jobs:
               --lane-json "$LANE_JSON" \
               --context ai-review-context/context.json \
               --kind review \
-              --message "lane command exited with status $status" \
+              --message "agentic lane exited with status $status" \
               --out "$LANE_OUT"
           fi
 
@@ -197,15 +230,33 @@ jobs:
       needs.prepare.outputs.should_run == 'true' &&
       needs.candidates.outputs.has_candidates == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         lane: ${{ fromJson(needs.prepare.outputs.verifier_lanes) }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
       - name: Checkout review runner
         uses: actions/checkout@v4
         with:
           path: runner
+
+      - name: Checkout PR for exploration
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+          path: subject
+
+      - name: Install trusted sandbox config
+        run: |
+          rm -rf subject/.opencode
+          cp -r runner/.opencode subject/.opencode
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -219,21 +270,34 @@ jobs:
           name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
           path: ai-review-candidates
 
-      - name: Install JSON repair fallback
-        run: python3 -m pip install --quiet json-repair
+      - name: Install opencode and JSON repair
+        run: |
+          python3 -m pip install --quiet json-repair
+          curl -fsSL https://opencode.ai/install | bash
+          # add likely install locations to PATH for subsequent steps
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Run OpenRouter verifier lane
+      - name: Verify opencode
+        run: opencode --version
+
+      - name: Run agentic verifier lane
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
         run: |
           set +e
           LANE_OUT="ai-review-verification/${{ matrix.lane.id }}.json"
-          timeout 600s python3 runner/.github/scripts/ai_review.py verify-lane \
+          timeout 760s python3 runner/.github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
+            --kind verification \
             --candidates ai-review-candidates/candidates.json \
             --prompt-dir runner/.github/ai-review/prompts \
+            --repo subject \
+            --agent review-ro \
+            --timeout 700 \
             --out "$LANE_OUT"
           status=$?
           if [ "$status" -ne 0 ]; then
@@ -241,7 +305,7 @@ jobs:
               --lane-json "$LANE_JSON" \
               --context ai-review-context/context.json \
               --kind verification \
-              --message "lane command exited with status $status" \
+              --message "agentic lane exited with status $status" \
               --out "$LANE_OUT"
           fi
 

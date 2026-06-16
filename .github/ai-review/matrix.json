@@ -2,71 +2,47 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "minimax-correctness",
-        "model": "minimax/minimax-m3",
-        "prompt": "correctness",
-        "max_output_tokens": 32000,
-        "provider": {
-          "order": ["novita"],
-          "allow_fallbacks": false
-        }
+        "id": "nemotron-correctness",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "prompt": "correctness"
+      },
+      {
+        "id": "glm-correctness",
+        "model": "z-ai/glm-5.1",
+        "prompt": "correctness"
       }
     ],
-    "verifier_lanes": []
+    "verifier_lanes": [
+      {
+        "id": "deepseek-verifier",
+        "model": "deepseek/deepseek-v4-pro",
+        "prompt": "verify"
+      }
+    ]
   },
   "critical": {
     "review_lanes": [
       {
-        "id": "minimax-critical-correctness",
-        "model": "minimax/minimax-m3",
-        "prompt": "correctness",
-        "max_output_tokens": 32000,
-        "provider": {
-          "order": ["novita"],
-          "allow_fallbacks": false
-        }
+        "id": "nemotron-correctness",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "prompt": "correctness"
       },
       {
-        "id": "minimax-critical-maintainability",
-        "model": "minimax/minimax-m3",
-        "prompt": "maintainability",
-        "max_output_tokens": 32000,
-        "provider": {
-          "order": ["novita"],
-          "allow_fallbacks": false
-        }
+        "id": "glm-maintainability",
+        "model": "z-ai/glm-5.1",
+        "prompt": "maintainability"
       },
       {
         "id": "deepseek-soundness",
         "model": "deepseek/deepseek-v4-pro",
-        "prompt": "soundness",
-        "max_output_tokens": 32000
-      },
-      {
-        "id": "glm-critical",
-        "model": "z-ai/glm-5.1",
-        "prompt": "critical",
-        "max_output_tokens": 32000
-      },
-      {
-        "id": "qwen-critical",
-        "model": "qwen/qwen3.7-max",
-        "prompt": "critical",
-        "max_output_tokens": 32000
+        "prompt": "soundness"
       }
     ],
     "verifier_lanes": [
       {
         "id": "glm-critical-verifier",
         "model": "z-ai/glm-5.1",
-        "prompt": "verify-critical",
-        "max_output_tokens": 32000
-      },
-      {
-        "id": "deepseek-critical-verifier",
-        "model": "deepseek/deepseek-v4-pro",
-        "prompt": "verify-critical",
-        "max_output_tokens": 32000
+        "prompt": "verify-critical"
       }
     ]
   }

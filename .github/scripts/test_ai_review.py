@@ -482,6 +482,7 @@ class AiReviewVerificationTests(unittest.TestCase):
                 {"issue_id": "AI-002", "severity": "medium", "title": "B", "claim": "B", "found_by": []},
                 {"issue_id": "AI-003", "severity": "low", "title": "C", "claim": "C", "found_by": []},
                 {"issue_id": "AI-004", "severity": "low", "title": "D", "claim": "D", "found_by": []},
+                {"issue_id": "AI-005", "severity": "high", "title": "E", "claim": "E", "found_by": []},
             ],
         }
         verification_results = [
@@ -504,6 +505,16 @@ class AiReviewVerificationTests(unittest.TestCase):
                         "status": "uncertain",
                         "verifier": "verifier-b:model",
                     },
+                    {
+                        "issue_id": "AI-005",
+                        "status": "confirmed",
+                        "verifier": "verifier-a:model",
+                    },
+                    {
+                        "issue_id": "AI-005",
+                        "status": "rejected",
+                        "verifier": "verifier-b:model",
+                    },
                 ],
             }
         ]
@@ -518,6 +529,8 @@ class AiReviewVerificationTests(unittest.TestCase):
         self.assertEqual(by_id["AI-003"]["status"], "uncertain")
         self.assertEqual(by_id["AI-003"]["uncertain_by"], ["verifier-b:model"])
         self.assertEqual(by_id["AI-004"]["status"], "candidate")
+        # conflicting verifiers (one confirms, one rejects) must surface as uncertain
+        self.assertEqual(by_id["AI-005"]["status"], "uncertain")
 
 
 if __name__ == "__main__":
