@@ -362,7 +362,7 @@ ref = "ecdas:c:c0_63_is_zero"
 [[constraints.lambda]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], ["idx", "carry_offset", 0]]]
+input = [["+", ["idx", "c0", "i"], ["idx", "carry_offsets", 0]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ecdas:c:range_c0"
