@@ -195,7 +195,7 @@ Recall that the addition of two curve points $A, B$ is treated differently based
 )
 Cases 2 and 3 may, for specific inputs, evaluate to $#inf$:
 a point that has no native short-Weierstrass representation.
-Therefore, the #ecdas chip is designed to avoid this case:
+Therefore, the #ecdas chip is designed to avoid these cases:
 
 *Double.*
 For $2A$ to equal $#inf$, the curve must have _even_ order; on curves with _odd_ order (@ecdas:a:curve_odd_order), such a point does not exist.
@@ -226,73 +226,35 @@ First, the chips receives the input for this double/add step:
 
 === Operation switching
 The `op`-flag determines whether $R := 2A$ (0) or $R:= A+G$ (1).
-This chip introduces a set of constraints that properly constrains $R$ depending on this flag.
-To illustrate how this is achieved, we split addition up in three relations:
-$
-  lambda &equiv (y_G - y_A)/(x_G - x_A) &&mod p,\
-  x_R &equiv lambda^2 - x_A - x_G &&mod p,\
-  y_R &equiv lambda (x_A - x_R) - y_A &&mod p.\
-$
-Introducing the non-negative witnesses $q'_0, q'_1$ and $q_2$, we can convert these relations into
-$
-  lambda (x_G - x_A) - y_G + y_A + (#`r` - q'_0) p &= 0,\
-  lambda^2 - x_A - x_G - x_R + (#`r` - q'_1) p &= 0,\
-  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0,\
-$
-for some $r in NN$ to be fixed later.
-
-#aside("The case of " + $x_A = x_G$ + ".")[
-  Special attention should be paid to the first relation: if $x_A = x_G$, $lambda$ can be chosen freely.
-  By design, this situation cannot occur.
-
-  Observe that this would require either $A = G$ or $A = -G$.
-  With the latter situation previously ruled out, only the first remains.
-  For $A = (r N + 1) G$ for some $r in NN$ and $N$ the order of the curve, all cases with $r>0$ can be ruled out since #ecsm verifies that the scalar $k < N$.
-  The remaining case $A=G$ is the intial state pushed onto the LogUp by #ecsm (@ec:c:start_double_add), with `op`-flag set to $0$ (_double_), not `add`.
-  Hence, this situation cannot occur.  
-]
-
-We rewrite the relations to find
-$
-  q'_0 &= #`r` + (lambda (x_G - x_A) - y_G + y_A)/ p,\
-  q'_1 &= #`r` + (lambda^2 - x_A - x_G - x_R)/ p,\
-  q_2  &= #`r` + (lambda (x_A - x_R) - y_A - y_R)/ p\
-$
-from which we can conclude that $q'_0, q_2 in (#`r`-p, #`r`+p)$ and $q'_1 in (#`r`-3, #`r` + p)$.
-When doubling, only the formulae for $lambda$ and $x_R$ are different:
-$
-  lambda &equiv (3x_A^2)/(2y_A) &&mod p,\
-  x_R &equiv lambda^2 - 2x_A &&mod p.\
-$
-Introducing non-negative witnesses $q''_0$ and $q''_1$, we convert these into
-$
-  2lambda y_A - 3x_A^2 + (#`r` - q''_0) p &= 0,\
-  lambda^2 - 2x_A - x_R + (#`r` - q''_1) p &= 0.\
-$
-#aside("The case of " + $y_A = 0$ + ".")[
-  Special attention should be paid to the first relation: if $y_A = 0$, $lambda$ can again be chosen freely.
-
-  Note that $2 dot (x,0) = oo$, which implies this point only exists on curves with order $2$.
-  This situation will not occur here, as this accelerator only functions for curves with odd order.
-]
-Reordering yields
-$
-  q''_0 &= #`r` + (2lambda y_A - 3x_A^2)/p,\
-  q''_1 &= #`r` + (lambda^2 - 2x_A - x_R)/p.\
-$
-where $q''_0 in (#`r`-3p, #`r` + 2p)$, and $q''_1 = (#`r`-3, #`r` + p)$.
-We can now leverage the `op`-flag to merge the relations for $lambda$ and $x_R$ into
+This chip introduces a set of three constraints that correctly constrains $R$ depending on this flag:
 $
   #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0,\
-  lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0\
+  lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0,
 $
-which yields
+To see how, note that these relations reorder to
 $
-  q_0 &= #`r` + (#`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2))/p,\
-  q_1 &= #`r` + (lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A))/p.\
+  2lambda y_A - 3x_A^2 + (#`r` - q_0) p = 0 &<==>& lambda &equiv (3x_A^2)/(2y_A) mod p,\
+  lambda^2 - 2x_A - x_R + (#`r` - q_1) p = 0 &<==>& x_R &equiv lambda^2 - 2x_A mod p,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p = 0 &<==>& y_R &equiv lambda(x_A - x_R) - y_A mod p.
 $
-with $q_0 in (r-3p, r+2p)$ and $q_1 in (r-3, r+p)$.
-By selecting $r = 3p$, we ensure $q_0 in (0, 5p)$, #box[$q_1 in (3p-3, 4p)$] and $q_2 in (2p, 4p)$ are non-negative for all inputs.
+when $#`op`=0$.
+If instead $#`op`=1$, they reorder to
+$
+  (x_G - x_A)lambda - y_G + y_A + (#`r` - q_0) p = 0 &<==>& lambda &equiv (y_G - y_A)/(x_G - x_A) mod p,\
+  lambda^2 - x_A - x_G - x_R + (#`r` - q_1) p = 0 &<==>& x_R &equiv lambda^2 - x_A - x_G mod p,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p = 0 &<==>& y_R &equiv lambda(x_A - x_R) - y_A mod p.
+$
+By selecting $r = 3p$, we ensure $q_0 in (0, 5p)$, $q_1 in (3p-3, 4p)$ and $q_2 in (2p, 4p)$ are non-zero, irrespective of the value of `op`.
+
+The observant reader my notice that $lambda$ is underconstrained when $(#`op`, y_A) = (1, 0)$ and $(#`op`, x_A) = (0, x_G)$.
+The first case is ruled out because this accelerator restricts itself to odd-order curves; such curves do not have a point with $y = 0$.
+For the second to occur, it must be that $A - G = inf$; the case that $A + G = inf$ was previously ruled out.
+This requires that $A = (r N + 1) G$ for some $r in NN$ and $N$ the order of the curve.
+Note that all cases with $r>0$ can be ruled out since #ecsm verifies that the scalar $k < N$.
+The final case $A=G$ is the intial state pushed onto the LogUp by #ecsm (@ec:c:start_double_add), with `op`-flag set to $0$ (_double_), not `add`.
+Hence, this situation cannot occur either. 
+
 
 === Constraining $lambda$
 We start by establishing the relation
