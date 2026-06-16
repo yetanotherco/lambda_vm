@@ -862,6 +862,9 @@ class Signature:
             return False
         if self.output is not None and other.output is not None and not structure_matches(self.output, other.output):
             return False
+        # Used as `sig.matches(expected)`, so `self` is the concrete signature found in the toml
+        if self.condition is not None and other.condition is None:
+            return False
         return structure_matches(self.input, other.input)
 
 
@@ -1078,6 +1081,7 @@ def build_signature(config: Config, data: dict) -> Signature:
             Sig = TemplateSignature
         case "interaction":
             reporter.asserts("cond" not in data, f"Template signature with cond: {data!r}")
+            cond = Range.const(1)
             Sig = InteractionSignature
         case other:
             reporter.error(f"Signature of invalid kind '{other}': {data!r}")
