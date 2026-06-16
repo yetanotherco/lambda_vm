@@ -5,7 +5,12 @@
         "id": "minimax-correctness",
         "model": "minimax/minimax-m3",
         "prompt": "correctness",
-        "max_output_tokens": 32000
+        "max_output_tokens": 32000,
+        "provider": {
+          "order": ["minimax", "novita"],
+          "ignore": ["parasail"],
+          "allow_fallbacks": true
+        }
       }
     ],
     "verifier_lanes": []
@@ -16,13 +21,23 @@
         "id": "minimax-critical-correctness",
         "model": "minimax/minimax-m3",
         "prompt": "correctness",
-        "max_output_tokens": 32000
+        "max_output_tokens": 32000,
+        "provider": {
+          "order": ["minimax", "novita"],
+          "ignore": ["parasail"],
+          "allow_fallbacks": true
+        }
       },
       {
         "id": "minimax-critical-maintainability",
         "model": "minimax/minimax-m3",
         "prompt": "maintainability",
-        "max_output_tokens": 32000
+        "max_output_tokens": 32000,
+        "provider": {
+          "order": ["minimax", "novita"],
+          "ignore": ["parasail"],
+          "allow_fallbacks": true
+        }
       },
       {
         "id": "deepseek-soundness",

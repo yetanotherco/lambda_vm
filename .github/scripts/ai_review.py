@@ -488,6 +488,7 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
             "error": f"OpenRouter returned empty message.content (finish_reason={finish_reason})",
             "raw_response": content,
             "finish_reason": finish_reason,
+            "provider": parsed.get("provider"),
             "usage": parsed.get("usage", {}),
             "openrouter_id": parsed.get("id"),
         }
@@ -496,6 +497,7 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
         "status": "success",
         "raw_response": content,
         "finish_reason": finish_reason,
+        "provider": parsed.get("provider"),
         "usage": parsed.get("usage", {}),
         "openrouter_id": parsed.get("id"),
     }
@@ -517,6 +519,9 @@ def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str
     response_format = lane.get("response_format")
     if response_format is not None:
         payload["response_format"] = response_format
+    provider = lane.get("provider")
+    if provider is not None:
+        payload["provider"] = provider
     return payload
 
 
