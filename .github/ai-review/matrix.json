@@ -7,14 +7,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "minimax-maintainability",
+        "id": "minimax-quality",
         "model": "minimax/MiniMax-M3",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "minimax-tests",
-        "model": "minimax/MiniMax-M3",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "kimi-correctness",
@@ -22,14 +17,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "kimi-maintainability",
+        "id": "kimi-quality",
         "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "kimi-tests",
-        "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "nemotron-correctness",
@@ -37,14 +27,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "nemotron-maintainability",
+        "id": "nemotron-quality",
         "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "nemotron-tests",
-        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "glm-correctness",
@@ -52,14 +37,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "glm-maintainability",
+        "id": "glm-quality",
         "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "glm-tests",
-        "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "tests"
+        "prompt": "quality"
       }
     ],
     "verifier_lanes": [
@@ -78,14 +58,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "minimax-maintainability",
+        "id": "minimax-quality",
         "model": "minimax/MiniMax-M3",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "minimax-tests",
-        "model": "minimax/MiniMax-M3",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "kimi-correctness",
@@ -93,14 +68,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "kimi-maintainability",
+        "id": "kimi-quality",
         "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "kimi-tests",
-        "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "nemotron-correctness",
@@ -108,14 +78,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "nemotron-maintainability",
+        "id": "nemotron-quality",
         "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "nemotron-tests",
-        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "glm-correctness",
@@ -123,14 +88,9 @@
         "prompt": "correctness"
       },
       {
-        "id": "glm-maintainability",
+        "id": "glm-quality",
         "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "maintainability"
-      },
-      {
-        "id": "glm-tests",
-        "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "tests"
+        "prompt": "quality"
       },
       {
         "id": "claude-general",

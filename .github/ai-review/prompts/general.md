@@ -1,7 +1,5 @@
-1. **Soundness and security issues** - Label by criticality (Critical/High/Medium/Low)
+1. **Safety and security issues** - Label by criticality (Critical/High/Medium/Low)
    - Rust: unsafe blocks, error handling, panics, memory safety issues
-   - ZK/prover soundness: incorrect local constraints, missing trace assignments,
-     invalid witness assumptions, inconsistent proving or verification behavior
    - VM/executor: instruction semantics, memory access, state transitions,
      inconsistent execution/proving behavior
 
