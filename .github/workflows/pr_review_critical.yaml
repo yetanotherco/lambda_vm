@@ -1,0 +1,90 @@
+name: Critical AI Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  codex-critical-review:
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/ai-review critical') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
+    with:
+      custom_prompt: |
+        This is the critical AI review tier. Treat this PR as security- or
+        soundness-sensitive even if the diff is small.
+
+        Review only issues introduced by this PR. Use the diff as the scope anchor,
+        but inspect surrounding code, call sites, tests, and relevant base/head
+        behavior when needed.
+
+        Focus on:
+
+        1. **Soundness, security, and correctness**
+           - Constraint under-specification, missing bus interactions, trace mistakes
+           - VM/executor behavior changes, memory access, privilege or state bugs
+           - Cryptographic misuse, weak randomness, timing-sensitive logic
+           - Unsafe Rust, panics on reachable inputs, unchecked assumptions
+
+        2. **Regression and integration risk**
+           - Changed invariants, changed public contracts, test fixture drift
+           - Interactions across prover tables, statement generation, AIR inclusion,
+             executor behavior, GPU/CUDA paths, or infra scripts
+
+        3. **Maintainability risks**
+           - Complexity that hides correctness assumptions
+           - Stale comments, stale names, misleading docs, or scope drift
+
+        Guidelines:
+        - Prefer concrete, high-confidence findings over exhaustive speculation.
+        - Do not perform a full spec audit unless the PR directly changes the spec.
+        - Do not report unrelated pre-existing issues unless this PR worsens them.
+        - Be concise and actionable.
+        - If no issues are found, say so briefly.
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  claude-critical-review:
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/ai-review critical') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
+    with:
+      model: sonnet
+      max_turns: 30
+      custom_prompt: |
+        This is the critical AI review tier. Treat this PR as security- or
+        soundness-sensitive even if the diff is small.
+
+        Review only issues introduced by this PR. Use the diff as the scope anchor,
+        but inspect surrounding code, call sites, tests, and relevant base/head
+        behavior when needed.
+
+        Focus on:
+
+        1. **Soundness, security, and correctness**
+           - Constraint under-specification, missing bus interactions, trace mistakes
+           - VM/executor behavior changes, memory access, privilege or state bugs
+           - Cryptographic misuse, weak randomness, timing-sensitive logic
+           - Unsafe Rust, panics on reachable inputs, unchecked assumptions
+
+        2. **Regression and integration risk**
+           - Changed invariants, changed public contracts, test fixture drift
+           - Interactions across prover tables, statement generation, AIR inclusion,
+             executor behavior, GPU/CUDA paths, or infra scripts
+
+        3. **Maintainability risks**
+           - Complexity that hides correctness assumptions
+           - Stale comments, stale names, misleading docs, or scope drift
+
+        Guidelines:
+        - Prefer concrete, high-confidence findings over exhaustive speculation.
+        - Do not perform a full spec audit unless the PR directly changes the spec.
+        - Do not report unrelated pre-existing issues unless this PR worsens them.
+        - Be concise and actionable.
+        - If no issues are found, say so briefly.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

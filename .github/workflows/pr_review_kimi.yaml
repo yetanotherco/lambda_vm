@@ -1,16 +1,12 @@
 name: Kimi Code Review
 
 on:
-  pull_request:
-    types: [opened, ready_for_review]
   issue_comment:
     types: [created]
 
 jobs:
   kimi-review:
     if: |
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        contains(github.event.comment.body, '/kimi') &&
