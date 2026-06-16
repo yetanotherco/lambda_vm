@@ -104,10 +104,10 @@ Standard review lanes:
 | Lane | Model | Prompt |
 | --- | --- | --- |
 | `minimax-correctness` | `minimax/minimax-m3` | `correctness` |
-| `minimax-maintainability` | `minimax/minimax-m3` | `maintainability` |
-| `mimo-tests` | `xiaomi/mimo-v2.5` | `tests` |
-| `glm-standard` | `z-ai/glm-5.1` | `standard` |
-| `qwen-standard-verifier` | `qwen/qwen3.7-plus` | `verify` |
+
+The standard tier is temporarily reduced to one MiniMax lane while validating
+OpenRouter response behavior. Restore the broader standard matrix after a lane
+successfully emits structured output and its token usage is understood.
 
 Critical review lanes:
 
@@ -125,6 +125,13 @@ Reviewer lanes see the diff plus current and base contents for changed files,
 within size limits. Verifier lanes see the deduplicated candidate findings plus
 the same PR context. Verification status is `confirmed`, `rejected`,
 `uncertain`, or `candidate` when no verifier result is available.
+
+OpenRouter lanes request JSON mode for structured artifacts, but the workflow
+does not disable model reasoning. Cheap reasoning models should get enough
+`max_output_tokens` in `.github/ai-review/matrix.json` to think and still emit
+the final JSON response. The current matrix uses a generous `32000` completion
+cap so the first successful runs can show actual completion usage in the
+uploaded metrics; tune it down only after observing real usage.
 
 OpenRouter catalog snapshot from 2026-06-16:
 

@@ -339,17 +339,23 @@ def run_review_lane(lane: dict[str, Any], context: dict[str, Any], prompt: str) 
     if response["status"] != "success":
         return base_result
 
-    parsed, parse_error = extract_json(response["raw_response"])
+    if not response.get("raw_response", "").strip():
+        base_result.update({"status": "error", "error": "model returned empty response"})
+        return base_result
+
+    parsed, parse_error = extract_json(response["raw_response"], required_key="findings")
     findings = []
     if isinstance(parsed, dict):
         raw_findings = parsed.get("findings", [])
         if isinstance(raw_findings, list):
             findings = [normalize_finding(f, lane) for f in raw_findings if isinstance(f, dict)]
+        else:
+            parse_error = parse_error or "top-level 'findings' must be an array"
         base_result["summary"] = parsed.get("summary", "")
     elif isinstance(parsed, list):
         findings = [normalize_finding(f, lane) for f in parsed if isinstance(f, dict)]
     else:
-        parse_error = parse_error or "response did not contain a JSON object"
+        parse_error = parse_error or "response did not contain top-level findings JSON"
 
     base_result["findings"] = [f for f in findings if f.get("claim") or f.get("title")]
     if parse_error:
@@ -392,17 +398,23 @@ def run_verifier_lane(
     if response["status"] != "success":
         return base_result
 
-    parsed, parse_error = extract_json(response["raw_response"])
+    if not response.get("raw_response", "").strip():
+        base_result.update({"status": "error", "error": "model returned empty response"})
+        return base_result
+
+    parsed, parse_error = extract_json(response["raw_response"], required_key="verifications")
     verifications = []
     if isinstance(parsed, dict):
         raw_items = parsed.get("verifications", [])
         if isinstance(raw_items, list):
             verifications = [normalize_verification(v, lane) for v in raw_items if isinstance(v, dict)]
+        else:
+            parse_error = parse_error or "top-level 'verifications' must be an array"
         base_result["summary"] = parsed.get("summary", "")
     elif isinstance(parsed, list):
         verifications = [normalize_verification(v, lane) for v in parsed if isinstance(v, dict)]
     else:
-        parse_error = parse_error or "response did not contain a JSON object"
+        parse_error = parse_error or "response did not contain top-level verifications JSON"
     base_result["verifications"] = [v for v in verifications if v.get("issue_id")]
     if parse_error:
         base_result["parse_error"] = parse_error
@@ -432,15 +444,7 @@ def infer_tier_from_lane(lane: dict[str, Any]) -> str:
 
 
 def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) -> dict[str, Any]:
-    payload = {
-        "model": lane["model"],
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": lane.get("temperature", 0.1),
-        "max_tokens": lane.get("max_output_tokens", 2400),
-    }
+    payload = openrouter_payload(lane, system, user)
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -469,12 +473,33 @@ def openrouter_chat(lane: dict[str, Any], system: str, user: str, api_key: str) 
         content = ""
     elif not isinstance(content, str):
         content = str(content)
+    if not content.strip():
+        return {
+            "status": "error",
+            "error": "OpenRouter returned empty message.content",
+            "raw_response": content,
+            "usage": parsed.get("usage", {}),
+            "openrouter_id": parsed.get("id"),
+        }
 
     return {
         "status": "success",
         "raw_response": content,
         "usage": parsed.get("usage", {}),
         "openrouter_id": parsed.get("id"),
+    }
+
+
+def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str, Any]:
+    return {
+        "model": lane["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": lane.get("temperature", 0.1),
+        "max_tokens": int(lane.get("max_output_tokens", 2400)),
+        "response_format": lane.get("response_format", {"type": "json_object"}),
     }
 
 
@@ -951,24 +976,54 @@ def load_json_files(root: pathlib.Path) -> list[dict[str, Any]]:
     return results
 
 
-def extract_json(text: str) -> tuple[Any, str | None]:
+def extract_json(text: str, required_key: str | None = None) -> tuple[Any, str | None]:
+    if not text.strip():
+        return None, "empty model response"
+
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    for block in fenced:
-        try:
-            return json.loads(block), None
-        except json.JSONDecodeError:
-            pass
+    if fenced:
+        schema_error = None
+        decode_error = None
+        for block in fenced:
+            try:
+                parsed = json.loads(block)
+            except json.JSONDecodeError as exc:
+                decode_error = decode_error or f"invalid JSON in fenced block: {exc.msg}"
+                continue
+            if json_has_required_shape(parsed, required_key):
+                return parsed, None
+            schema_error = schema_error or json_shape_error(required_key)
+        return None, schema_error or decode_error or "could not parse JSON from model response"
 
     decoder = json.JSONDecoder()
+    schema_error = None
+    decode_error = None
     for idx, char in enumerate(text):
         if char not in "[{":
             continue
         try:
             parsed, _ = decoder.raw_decode(text[idx:])
-            return parsed, None
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            decode_error = decode_error or f"invalid JSON in model response: {exc.msg}"
             continue
-    return None, "could not parse JSON from model response"
+        if json_has_required_shape(parsed, required_key):
+            return parsed, None
+        schema_error = schema_error or json_shape_error(required_key)
+    return None, schema_error or decode_error or "could not parse JSON from model response"
+
+
+def json_has_required_shape(parsed: Any, required_key: str | None) -> bool:
+    if required_key is None:
+        return True
+    if isinstance(parsed, list):
+        return True
+    return isinstance(parsed, dict) and required_key in parsed
+
+
+def json_shape_error(required_key: str | None) -> str:
+    if required_key:
+        return f"response JSON must be a top-level object with '{required_key}' or a top-level array"
+    return "response did not contain a JSON object or array"
 
 
 def github_json(method: str, path: str, token: str, body: dict[str, Any] | None = None) -> Any:
@@ -1088,7 +1143,7 @@ def lane_status(lane: dict[str, Any]) -> str:
     if status in {"error", "skipped"} and lane.get("error"):
         return f"{status}: {lane['error'][:120]}"
     if lane.get("parse_error"):
-        return f"{status}: parse warning"
+        return f"{status}: parse warning: {lane['parse_error'][:120]}"
     return status
 
 

@@ -5,35 +5,10 @@
         "id": "minimax-correctness",
         "model": "minimax/minimax-m3",
         "prompt": "correctness",
-        "max_output_tokens": 2400
-      },
-      {
-        "id": "minimax-maintainability",
-        "model": "minimax/minimax-m3",
-        "prompt": "maintainability",
-        "max_output_tokens": 2200
-      },
-      {
-        "id": "mimo-tests",
-        "model": "xiaomi/mimo-v2.5",
-        "prompt": "tests",
-        "max_output_tokens": 1800
-      },
-      {
-        "id": "glm-standard",
-        "model": "z-ai/glm-5.1",
-        "prompt": "standard",
-        "max_output_tokens": 2600
+        "max_output_tokens": 32000
       }
     ],
-    "verifier_lanes": [
-      {
-        "id": "qwen-standard-verifier",
-        "model": "qwen/qwen3.7-plus",
-        "prompt": "verify",
-        "max_output_tokens": 2600
-      }
-    ]
+    "verifier_lanes": []
   },
   "critical": {
     "review_lanes": [
@@ -41,31 +16,31 @@
         "id": "minimax-critical-correctness",
         "model": "minimax/minimax-m3",
         "prompt": "correctness",
-        "max_output_tokens": 2600
+        "max_output_tokens": 32000
       },
       {
         "id": "minimax-critical-maintainability",
         "model": "minimax/minimax-m3",
         "prompt": "maintainability",
-        "max_output_tokens": 2200
+        "max_output_tokens": 32000
       },
       {
         "id": "deepseek-soundness",
         "model": "deepseek/deepseek-v4-pro",
         "prompt": "soundness",
-        "max_output_tokens": 3000
+        "max_output_tokens": 32000
       },
       {
         "id": "glm-critical",
         "model": "z-ai/glm-5.1",
         "prompt": "critical",
-        "max_output_tokens": 3200
+        "max_output_tokens": 32000
       },
       {
         "id": "qwen-critical",
         "model": "qwen/qwen3.7-max",
         "prompt": "critical",
-        "max_output_tokens": 3200
+        "max_output_tokens": 32000
       }
     ],
     "verifier_lanes": [
@@ -73,13 +48,13 @@
         "id": "glm-critical-verifier",
         "model": "z-ai/glm-5.1",
         "prompt": "verify-critical",
-        "max_output_tokens": 3200
+        "max_output_tokens": 32000
       },
       {
         "id": "deepseek-critical-verifier",
         "model": "deepseek/deepseek-v4-pro",
         "prompt": "verify-critical",
-        "max_output_tokens": 3200
+        "max_output_tokens": 32000
       }
     ]
   }
