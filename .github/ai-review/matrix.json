@@ -2,20 +2,30 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "nemotron-correctness",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "id": "minimax-correctness",
+        "model": "minimax/MiniMax-M3",
         "prompt": "correctness"
       },
       {
-        "id": "glm-correctness",
-        "model": "z-ai/glm-5.2",
+        "id": "kimi-correctness",
+        "model": "moonshotai/kimi-k2.7-code",
         "prompt": "correctness"
+      },
+      {
+        "id": "nemotron-soundness",
+        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+        "prompt": "soundness"
+      },
+      {
+        "id": "glm-maintainability",
+        "model": "openrouter/z-ai/glm-5.2",
+        "prompt": "maintainability"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "kimi-verifier",
-        "model": "moonshotai/kimi-k2.7-code",
+        "id": "deepseek-verifier",
+        "model": "openrouter/deepseek/deepseek-v4-pro",
         "prompt": "verify"
       }
     ]
@@ -23,25 +33,40 @@
   "critical": {
     "review_lanes": [
       {
-        "id": "nemotron-correctness",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "id": "minimax-correctness",
+        "model": "minimax/MiniMax-M3",
         "prompt": "correctness"
       },
       {
+        "id": "kimi-correctness",
+        "model": "moonshotai/kimi-k2.7-code",
+        "prompt": "correctness"
+      },
+      {
+        "id": "nemotron-soundness",
+        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+        "prompt": "soundness"
+      },
+      {
         "id": "glm-maintainability",
-        "model": "z-ai/glm-5.2",
+        "model": "openrouter/z-ai/glm-5.2",
         "prompt": "maintainability"
       },
       {
-        "id": "deepseek-soundness",
-        "model": "deepseek/deepseek-v4-pro",
+        "id": "deepseek-correctness",
+        "model": "openrouter/deepseek/deepseek-v4-pro",
+        "prompt": "correctness"
+      },
+      {
+        "id": "claude-soundness",
+        "model": "anthropic/claude-opus-4-8",
         "prompt": "soundness"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "kimi-critical-verifier",
-        "model": "moonshotai/kimi-k2.7-code",
+        "id": "gpt-verifier",
+        "model": "openai/gpt-5.5",
         "prompt": "verify-critical"
       }
     ]

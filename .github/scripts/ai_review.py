@@ -313,11 +313,8 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
     candidates = read_json(pathlib.Path(args.candidates)) if args.candidates else {"issues": []}
     base_result = lane_base_result(lane, context, kind=args.kind)
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        base_result.update({"status": "skipped", "error": "OPENROUTER_API_KEY is not set"})
-        write_json(pathlib.Path(args.out), base_result)
-        return 0
+    # opencode resolves provider credentials itself (env vars + auth.json), so no
+    # provider-specific key check here — a missing credential surfaces as a lane error.
     if args.kind == "verification" and not candidates.get("issues"):
         base_result.update({"status": "skipped", "error": "No candidate issues to verify"})
         write_json(pathlib.Path(args.out), base_result)
@@ -332,7 +329,7 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
             message = build_agentic_verification_message(lane, context, candidates, prompt)
             required_key = "verifications"
         raw = run_opencode_agent(
-            pathlib.Path(args.repo), lane["model"], args.agent, message, api_key, args.timeout
+            pathlib.Path(args.repo), lane["model"], args.agent, message, args.timeout
         )
         base_result["raw_response"] = raw[-20000:]
         parsed, parse_error = extract_json(raw, required_key=required_key)
@@ -355,20 +352,21 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
 
 
 def run_opencode_agent(
-    repo: pathlib.Path, model: str, agent: str, message: str, api_key: str, timeout: int
+    repo: pathlib.Path, model: str, agent: str, message: str, timeout: int
 ) -> str:
-    env = dict(os.environ)
-    env["OPENROUTER_API_KEY"] = api_key
+    # model is a fully provider-qualified opencode id (e.g. "openrouter/z-ai/glm-5.2",
+    # "minimax-coding-plan/MiniMax-M3", "anthropic/claude-opus-4-8"). opencode resolves
+    # credentials from the environment and ~/.local/share/opencode/auth.json.
     # --format json emits a JSONL event stream; the assistant's output (including the
     # final findings JSON) arrives in "text" events. The human-rendered default format
     # drops the final message in non-TTY environments, so we always parse the stream.
-    cmd = ["opencode", "run", message, "--agent", agent, "-m", f"openrouter/{model}", "--format", "json"]
+    cmd = ["opencode", "run", message, "--agent", agent, "-m", model, "--format", "json"]
     proc = subprocess.run(
         cmd,
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=env,
+        env=dict(os.environ),
         timeout=timeout,
     )
     out = proc.stdout.decode("utf-8", errors="replace")
