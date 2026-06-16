@@ -1063,7 +1063,7 @@ class Chip:
         for c in self.constraints:
             for sig in c.typecheck(env):
                 # Recurse on templates
-                if isinstance(sig, TemplateSignature):
+                if isinstance(sig, TemplateSignature) and sig.tag in check_template:
                     reporter.push_context(repr(c))
                     check_template[sig.tag](sig.condition, sig.input, sig.output)
                     reporter.pop_context()
@@ -1145,7 +1145,8 @@ if __name__ == "__main__":
     if reported:
         sys.exit(1)
 
-    template_checkers["SUB"] = lambda cond, input, output: template_checkers["ADD"](cond, [output, input[1]], input[0])
+    if "ADD" in template_checkers:
+        template_checkers["SUB"] = lambda cond, input, output: template_checkers["ADD"](cond, [output, input[1]], input[0])
 
     for chip in chips:
         reporter.update_location(f"Chip {chip.name}")
