@@ -16,7 +16,18 @@ Comment on a pull request with one of these commands:
 | `/codex` | Individual | Codex | Ad-hoc Codex-only review. |
 | `/claude` | Individual | Claude | Ad-hoc Claude-only review. |
 
-Only repository owners, members, and collaborators can trigger these reviews.
+You can also add one of these labels to a pull request:
+
+| Label | Tier |
+| --- | --- |
+| `ai-review-standard` | Standard |
+| `ai-review-critical` | Critical |
+
+The label trigger is useful for testing workflow changes before they are merged,
+because `pull_request` label events run against the PR workflow definition.
+
+Comment commands are restricted to repository owners, members, and
+collaborators. Label triggers are controlled by GitHub's label permissions.
 
 ## Prompt Files
 

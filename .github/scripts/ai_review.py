@@ -89,13 +89,10 @@ def main() -> int:
 
 def cmd_prepare(args: argparse.Namespace) -> int:
     event = read_json(pathlib.Path(args.event))
-    body = event.get("comment", {}).get("body", "")
-    tier = parse_tier_command(body)
-    association = event.get("comment", {}).get("author_association", "")
-    is_pr = bool(event.get("issue", {}).get("pull_request"))
+    tier, pr_number = parse_review_trigger(event)
 
     outputs: dict[str, Any] = {"should_run": "false"}
-    if not tier or not is_pr or association not in AUTHORIZED_ASSOCIATIONS:
+    if not tier or not pr_number:
         write_github_outputs(pathlib.Path(args.output), outputs)
         return 0
 
@@ -105,7 +102,6 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     repo = os.environ["GITHUB_REPOSITORY"]
     token = os.environ["GITHUB_TOKEN"]
-    pr_number = int(event["issue"]["number"])
     pr = github_json("GET", f"/repos/{repo}/pulls/{pr_number}", token=token)
 
     prompt_path = pathlib.Path(args.prompt_dir) / f"{tier}.md"
@@ -253,6 +249,33 @@ def parse_tier_command(body: str) -> str | None:
     if not match:
         return None
     return match.group(1).lower()
+
+
+def parse_tier_label(name: str) -> str | None:
+    labels = {
+        "ai-review-standard": "standard",
+        "ai-review-critical": "critical",
+    }
+    return labels.get(name.strip().lower())
+
+
+def parse_review_trigger(event: dict[str, Any]) -> tuple[str | None, int | None]:
+    if event.get("comment") and event.get("issue", {}).get("pull_request"):
+        association = event.get("comment", {}).get("author_association", "")
+        if association not in AUTHORIZED_ASSOCIATIONS:
+            return None, None
+        tier = parse_tier_command(event.get("comment", {}).get("body", ""))
+        if not tier:
+            return None, None
+        return tier, int(event["issue"]["number"])
+
+    if event.get("action") == "labeled" and event.get("pull_request"):
+        tier = parse_tier_label(event.get("label", {}).get("name", ""))
+        if not tier:
+            return None, None
+        return tier, int(event["pull_request"]["number"])
+
+    return None, None
 
 
 def run_review_lane(lane: dict[str, Any], context: dict[str, Any], prompt: str) -> dict[str, Any]:
