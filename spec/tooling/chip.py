@@ -93,6 +93,7 @@ type Expr = (
     | MulExpr
     | AddExpr
     | SubExpr
+    | ModExpr
     | PowExpr
     | SumExpr
     | NotExpr
@@ -105,7 +106,7 @@ OPSEL = ["AND", "OR", "XOR", "EQ", "LT", "SHIFT", "SHIFTW", "MUL", "DIVREM"]
 @dataclass
 class Environment:
     config: "Config"
-    valmap: dict[str, Range]
+    valmap: dict[str, Type]
     typemap: dict[str, Type]
 
     def with_val(self, key: str, val: Range) -> Self:
@@ -402,7 +403,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return DummyExpr()
 
 
-def check_padding_fits(var_name: str, config: "Config", type: Type, pad: Expr):
+def check_padding_fits(config: "Config", type: Type, pad: Expr):
     def fits(v, t):
         if isinstance(v, Range):
             return v.is_const() and constant_fits(v.get_const(), t)
@@ -410,7 +411,7 @@ def check_padding_fits(var_name: str, config: "Config", type: Type, pad: Expr):
             return isinstance(v, list) and isinstance(t, list) and len(v) == len(t) and all(map(fits, v, t))
 
     val = pad.typecheck(Environment(config, {}, {}))
-    reporter.asserts(fits(val, type), f"{var_name!r}: Invalid padding {pad!r} for type {type!r}")
+    reporter.asserts(fits(val, type), f"Invalid padding {pad!r} for type {type!r}")
 
 
 @dataclass
@@ -621,7 +622,8 @@ class Variable:
         self.desc = data["desc"]
         reporter.asserts(isinstance(self.desc, str), f"{self.desc!r} is not a string")
         self.pad = build_expr(None, data.get("pad", 0))
-        check_padding_fits(self.name, config, self.type, self.pad)
+        with reporter.context(self.name):
+            check_padding_fits(config, self.type, self.pad)
         self.precomputed = data.get("precomputed", False)
         reporter.asserts(
             isinstance(self.precomputed, bool),
@@ -647,7 +649,7 @@ class VirtualDef:
     # A list of polynomials with each a set of iters they range over
     defs: list[PolyWithIters]
 
-    def __init__(self, config: Config, name: str, tp: Type, data: dict):
+    def __init__(self, config: Config, data: dict):
         if "poly" in data:
             idx = data.get("idx", None)
             self.defs = [PolyWithIters(build_expr(config, data["poly"]), iters_of(data, config, name=idx))]
@@ -671,7 +673,7 @@ class VirtualVariable(Variable):
         data = copy.deepcopy(data)
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
-        self.def_ = VirtualDef(config, self.name, self.type, def_)
+        self.def_ = VirtualDef(config, def_)
 
     def typecheck(self, env: Environment) -> Type:
         def handle_iters(
@@ -959,7 +961,7 @@ class InteractionConstraint(InteractionLike):
 
 @dataclass
 class DummyConstraint:
-    def typecheck(self, env: Environment) -> list[Never]:
+    def typecheck(self, _env: Environment) -> list[Never]:
         return []
 
 
