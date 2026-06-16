@@ -10,7 +10,7 @@ Comment on a pull request with one of these commands:
 
 | Command | Tier | Current reviewers | Use when |
 | --- | --- | --- | --- |
-| `/ai-review standard` | Standard | Kimi | Everyday PRs that are ready for a lightweight review. |
+| `/ai-review standard` | Standard | Kimi | Everyday PRs that are ready for serious review. |
 | `/ai-review critical` | Critical | Codex and Claude | Soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
 | `/kimi` | Individual | Kimi | Ad-hoc lightweight review. |
 | `/codex` | Individual | Codex | Ad-hoc Codex-only review. |
@@ -23,7 +23,8 @@ Only repository owners, members, and collaborators can trigger these reviews.
 ### Standard
 
 Use standard review for most PRs after they are ready for review. The goal is a
-quick check for forgotten issues, not a final certification.
+serious, high-signal review using the standard-cost reviewer set, not a final
+certification.
 
 The standard reviewer focuses on:
 
