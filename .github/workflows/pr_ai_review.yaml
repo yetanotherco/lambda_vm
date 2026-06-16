@@ -125,8 +125,12 @@ jobs:
 
       - name: Install trusted sandbox config
         run: |
-          rm -rf subject/.opencode
-          cp -r runner/.opencode subject/.opencode
+          # Strip any PR-provided opencode config so a PR cannot weaken its own
+          # sandbox, then install the trusted read-only agent globally so opencode
+          # discovers it regardless of working directory or version.
+          rm -rf subject/.opencode subject/opencode.json subject/opencode.jsonc
+          mkdir -p "$HOME/.config/opencode/agent"
+          cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -137,7 +141,9 @@ jobs:
       - name: Install opencode and JSON repair
         run: |
           python3 -m pip install --quiet json-repair
-          curl -fsSL https://opencode.ai/install | bash
+          # Pin to a known-good version; newer builds changed agent discovery and
+          # crashed on session-title generation in CI.
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2
           # add likely install locations to PATH for subsequent steps
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -255,8 +261,12 @@ jobs:
 
       - name: Install trusted sandbox config
         run: |
-          rm -rf subject/.opencode
-          cp -r runner/.opencode subject/.opencode
+          # Strip any PR-provided opencode config so a PR cannot weaken its own
+          # sandbox, then install the trusted read-only agent globally so opencode
+          # discovers it regardless of working directory or version.
+          rm -rf subject/.opencode subject/opencode.json subject/opencode.jsonc
+          mkdir -p "$HOME/.config/opencode/agent"
+          cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -273,7 +283,9 @@ jobs:
       - name: Install opencode and JSON repair
         run: |
           python3 -m pip install --quiet json-repair
-          curl -fsSL https://opencode.ai/install | bash
+          # Pin to a known-good version; newer builds changed agent discovery and
+          # crashed on session-title generation in CI.
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2
           # add likely install locations to PATH for subsequent steps
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
