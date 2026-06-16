@@ -48,6 +48,10 @@ jobs:
             --no-color
 
       - name: Run ethrex block benchmarks
+        id: ethrex_bench
+        # continue-on-error so the artifact upload, summary, and Slack steps below still
+        # run even when the ethrex bench fails; the "Fail if ethrex benchmark failed" step
+        # at the end of the job re-surfaces the failure so the run shows red.
         continue-on-error: true
         run: |
           bash ./bench_vs/run_ethrex.sh \
@@ -70,3 +74,9 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
         run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"
+
+      - name: Fail if ethrex benchmark failed
+        if: always() && steps.ethrex_bench.outcome == 'failure'
+        run: |
+          echo "::error::ethrex block benchmark step failed — see the 'Run ethrex block benchmarks' step logs"
+          exit 1

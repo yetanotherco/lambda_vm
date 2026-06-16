@@ -73,20 +73,26 @@ prepare-test-data:
 		echo "ethrex_hoodi.bin already exists"; \
 	fi
 
+# The guard checks for include/stdlib.h (not just the include/ dir) so that a PARTIAL
+# sysroot — directories present but missing the C standard library headers — is detected
+# as incomplete and re-provisioned, instead of being mistaken for a complete one. When it
+# re-provisions, it first removes any existing $(SYSROOT_DIR) and re-extracts from scratch,
+# so a partial/stale/corrupt sysroot self-heals without manual intervention on the runner.
 prepare-sysroot:
-	@if [ -d "$(SYSROOT_DIR)/include" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
+	@if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	else \
-		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
+		echo "Provisioning sysroot at $(SYSROOT_DIR) (downloading lambda-vm-sysroot-rv64im.tar.gz)..."; \
 		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
 		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
-			tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
+			rm -rf "$(SYSROOT_DIR)" && mkdir -p "$(SYSROOT_DIR)" \
+				&& tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
 				|| { rm -rf "$(SYSROOT_DIR)" "$(SYSROOT_TARBALL)"; exit 1; }; \
 		else \
 			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
 			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
-			sudo mkdir -p "$(SYSROOT_DIR)" \
+			sudo rm -rf "$(SYSROOT_DIR)" && sudo mkdir -p "$(SYSROOT_DIR)" \
 				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
 				|| { sudo rm -rf "$(SYSROOT_DIR)"; rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
 		fi; \
@@ -110,7 +116,12 @@ compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
 
 # Compile rust (64-bit)
-$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
+# Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
+# first (the aggregate compile-programs-rust/compile-bench targets already do, but a
+# bare pattern-rule invocation like `make -B .../ethrex.elf` would otherwise skip it
+# and fail to compile C deps such as c-kzg). Order-only because prepare-sysroot is
+# .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
+$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
@@ -123,7 +134,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches (64-bit)
-$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
+$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
