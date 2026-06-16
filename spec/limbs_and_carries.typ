@@ -45,8 +45,7 @@ $
   &= mu dot x dot y + alpha dot z\
   &= mu dot (sum_(i=0)^(n-1) x_i dot L^i) dot (sum_(j=0)^(n-1) y_j dot L^j) + alpha dot sum_(k=0)^(n-1) z_k dot L^k\
   &= (sum_(i=0)^(n-1) sum_(j=0)^(n-1) mu dot x_i dot y_j dot L^(i + j)) + sum_(k=0)^(n-1) alpha dot z_k dot L^k\
-  &= sum_(i=0)^(n-1) alpha dot z_i dot L^i + sum_(j=0)^(n-1) mu dot x_i dot y_j dot L^(i + j)\
-//   &= sum_(i=0)^(2(n-1)) alpha dot z_i dot L^i + sum_(j=0)^(n-1) mu dot x_i dot y_j dot L^(i + j)\
+  &= sum_(i=0)^(n-1) (alpha dot z_i dot L^i + sum_(j=0)^(n-1) mu dot x_i dot y_j dot L^(i + j))\
   &= sum_(r=0)^(2(n-1)) alpha dot z_r dot L^r + sum_(j=0)^r mu dot x_(r-j) dot y_j dot L^r\
   &= sum_(r=0)^(2(n-1)) (alpha dot z_r + mu dot sum_(j=0)^r x_(r-j) dot y_j) dot L^r\
   &= sum_(r=0)^(2(n-1)) overline(w)_r dot L^r
@@ -67,7 +66,7 @@ Note that these $c_i$ effectively move the "overflow" from one limb to the next 
 they're commonly referred to as the _carry_ values.
 
 #lemma[
-    Given $alpha, mu in [L/2-1]$ and $x, y, z in [S]$, $(w_0, w_1, ..., w_(2n-2), 0, 0, ...) in [L]^*$ 
+    Given $alpha, mu in [L/2-1]$ and $x, y, z in [S]$, $(w_0, w_1, ..., w_(2n-1), 0, 0, ...) in [L]^*$ 
     for previously defined series $w_i$ is the unique limb decomposition of $f_(alpha, mu)(x, y, z)$
     if and only if $c_(2n-1) = 0$.
 ]<lm:wi_decomp_f>
@@ -185,7 +184,7 @@ of $f_(alpha, mu) (x, y, z)$ when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alp
 
 Now, observe that 
 $
-  &max_(i in [2n]) min(mu (i+1) (L-1) + alpha - mu - delta, mu (2n-i-1)(L-2) - mu (2n-i) - delta')\
+  &max_(i in [2n]) min(mu (i+1) (L-1) + alpha - mu - delta, mu (2n-i-1)(L-2) + mu (2n-i) - delta')\
   =& mu n (L-1) + alpha - mu - delta
 $
 acts as an upper bound on all carry elements.
@@ -203,7 +202,7 @@ Lastly, we prove that there exists a correct method of constraining the relation
         c_(-1) &= 0, #<eq:c_-1_is_zero>\
         w_i &in [L] #<eq:range_wi>
     $
-    together enforce $w_i = r_i + c_(i-1) mod L$ as long as $C in [mu n L + alpha, frac(p,L, style:"horizontal"))$.
+    together enforce $w_i = overline(w)_i + c_(i-1) mod L$ as long as $C in [mu n L + alpha, frac(p,L, style:"horizontal"))$.
 ]<lm:limb-decomposition-constraint-correctness>
 
 #proof[
@@ -226,7 +225,7 @@ Lastly, we prove that there exists a correct method of constraining the relation
     $overline(w)_i <= mu n(L-1)^2 + alpha (L-1)$ 
     can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2.
     Moreover, observe that $|X_i inter [L]| <= 1$ since $C < frac(p,L, style:"horizontal")$.
-    Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $w_(i-1)$ is correct, 
-    and as a result, $c_i = floor.l frac(overline(w)_0, L, style: "horizontal") floor.r$ is correct.
+    Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
+    and as a result, $c_i = floor.l frac(overline(w)_i + c_(i-1), L, style: "horizontal") floor.r$ is correct.
     The proof now follows by induction, with @eq:c_-1_is_zero enforcing the base case.
 ]
