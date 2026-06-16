@@ -17,6 +17,11 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::paged_mem::PagedMem;
+
+/// Per-cell provenance: `(last_writer_epoch, value, timestamp)`. Unset cells read
+/// back as the genesis default `(GENESIS_EPOCH, 0, 0)`.
+type Provenance = PagedMem<(u64, u64, u64)>;
 
 /// Sentinel `originating_epoch` for cells whose value comes from the program's
 /// initial memory — no prior epoch wrote them.
@@ -82,16 +87,14 @@ pub fn epoch_boundaries(
 /// per-epoch step of [`epoch_boundaries`], exposed so the streaming continuation
 /// prover can build each epoch's table incrementally without all epochs at once.
 pub fn epoch_boundary(
-    provenance: &mut HashMap<u64, (u64, u64, u64)>,
+    provenance: &mut Provenance,
     epoch: u64,
     touched: &[(u64, u64, u64)],
 ) -> Vec<CellBoundary> {
     let mut boundaries = Vec::with_capacity(touched.len());
     for &(address, end_value, end_timestamp) in touched {
-        let (originating_epoch, init_value, init_timestamp) = provenance
-            .get(&address)
-            .copied()
-            .unwrap_or((GENESIS_EPOCH, 0, 0));
+        // Unset cells read back as the genesis default `(GENESIS_EPOCH, 0, 0)`.
+        let (originating_epoch, init_value, init_timestamp) = provenance.get(address);
         boundaries.push(CellBoundary {
             address,
             init: InitClaim {
@@ -105,17 +108,18 @@ pub fn epoch_boundary(
                 timestamp: end_timestamp,
             },
         });
-        provenance.insert(address, (epoch, end_value, end_timestamp));
+        provenance.set(address, (epoch, end_value, end_timestamp));
     }
     boundaries
 }
 
-/// Seed the provenance map from the program's initial memory (genesis cells).
-pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> HashMap<u64, (u64, u64, u64)> {
-    initial_memory
-        .iter()
-        .map(|(&addr, &value)| (addr, (GENESIS_EPOCH, value, 0)))
-        .collect()
+/// Seed the provenance store from the program's initial memory (genesis cells).
+pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> Provenance {
+    let mut provenance = Provenance::new((GENESIS_EPOCH, 0, 0));
+    for (&addr, &value) in initial_memory {
+        provenance.set(addr, (GENESIS_EPOCH, value, 0));
+    }
+    provenance
 }
 
 // =========================================================================

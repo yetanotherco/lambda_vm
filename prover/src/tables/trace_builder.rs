@@ -59,6 +59,7 @@ use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
+use crate::paged_mem::{ImageSource, PagedMem};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -72,14 +73,18 @@ type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
 struct MemoryState {
-    /// Map from byte address to (value, timestamp)
-    cells: HashMap<u64, MemoryCell>,
+    /// Per byte-address `(value, timestamp)`, as a dense per-page store. This is
+    /// the hot structure — `read_byte`/`write_byte` hit it on every memory access
+    /// during the replay, and it's rebuilt each epoch — so a per-page array (small
+    /// page-map lookup + dense indexing, no per-cell hashing or rehash-on-grow)
+    /// is both lighter and faster than a per-cell `HashMap`.
+    cells: PagedMem<MemoryCell>,
 }
 
 impl MemoryState {
     fn new() -> Self {
         Self {
-            cells: HashMap::new(),
+            cells: PagedMem::new((0, 0)),
         }
     }
 
@@ -88,11 +93,11 @@ impl MemoryState {
     /// Pre-populates all starting bytes with timestamp=0 so that when MEMW first
     /// accesses an address, it gets the correct initial value for `old_value`.
     /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
-    fn from_image(image: &HashMap<u64, u8>) -> Self {
-        let cells = image
-            .iter()
-            .map(|(&addr, &value)| (addr, (value, 0)))
-            .collect();
+    fn from_image<I: ImageSource>(image: &I) -> Self {
+        let mut cells = PagedMem::new((0, 0));
+        for (addr, value) in image.image_iter() {
+            cells.set(addr, (value, 0));
+        }
         Self { cells }
     }
 
@@ -104,18 +109,18 @@ impl MemoryState {
             "page_size must be a power of two for the bitmask to work"
         );
         let mask = !(page_size - 1);
-        let pages: HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
+        let pages: HashSet<u64> = self.cells.iter().map(|(a, _)| a & mask).collect();
         pages.len() as u64
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
-        self.cells.get(&address).copied().unwrap_or((0, 0))
+        self.cells.get(address)
     }
 
     /// Write a byte to memory with the given timestamp.
     fn write_byte(&mut self, address: u64, value: u8, timestamp: u64) {
-        self.cells.insert(address, (value, timestamp));
+        self.cells.set(address, (value, timestamp));
     }
 
     /// Read multiple bytes. Returns arrays of values and timestamps.
@@ -1504,6 +1509,31 @@ pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u6
     image
 }
 
+/// Build the initial-memory image as a dense per-page store instead of a
+/// per-cell `HashMap`. Used by the streaming continuation, which carries the
+/// image across all epochs (so its size matters); the byte values are identical
+/// to [`build_initial_image`]. Unset cells read back as 0.
+pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> PagedMem<u8> {
+    let mut image = PagedMem::new(0u8);
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr.wrapping_add(byte_offset);
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                image.set(byte_addr, byte_value);
+            }
+        }
+    }
+    if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
+            image.set(PRIVATE_INPUT_START_INDEX + i as u64, b);
+        }
+    }
+    image
+}
+
 /// Return the memory cells (bytes) an epoch touched, as `(address, end_value,
 /// end_timestamp)` — the per-epoch input for the local-to-global table.
 ///
@@ -1514,9 +1544,9 @@ pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u6
 ///
 /// Reuses the early phases of [`Traces::from_image_and_logs`] read-only; sharing
 /// a single path with it is left to a later step.
-pub fn epoch_touched_cells(
+pub fn epoch_touched_cells<I: ImageSource>(
     elf: &Elf,
-    initial_image: &HashMap<u64, u8>,
+    initial_image: &I,
     logs: &[Log],
 ) -> Result<Vec<(u64, u64, u64)>, Error> {
     let instructions = decode::instructions_from_elf(elf)
@@ -1531,17 +1561,17 @@ pub fn epoch_touched_cells(
         .cells
         .iter()
         .filter(|(_, cell)| cell.1 > 0)
-        .map(|(addr, cell)| (*addr, cell.0 as u64, cell.1))
+        .map(|(addr, cell)| (addr, cell.0 as u64, cell.1))
         .collect();
     touched.sort_by_key(|&(addr, _, _)| addr);
     Ok(touched)
 }
 
 /// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
-pub(crate) fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec<u8>> {
+pub(crate) fn build_init_page_data<I: ImageSource>(image: &I) -> HashMap<u64, Vec<u8>> {
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
-    for (&addr, &value) in image {
+    for (addr, value) in image.image_iter() {
         let page_base = page::page_base_for_address(addr);
         let offset = page::offset_in_page(addr);
         let page_data = init_page_data
@@ -1552,8 +1582,8 @@ pub(crate) fn build_init_page_data(image: &HashMap<u64, u8>) -> HashMap<u64, Vec
     init_page_data
 }
 
-fn collect_bitwise_from_page(
-    image: &HashMap<u64, u8>,
+fn collect_bitwise_from_page<I: ImageSource>(
+    image: &I,
     memory_state: &MemoryState,
     exclude_touched: bool,
 ) -> Vec<BitwiseOperation> {
@@ -1565,10 +1595,7 @@ fn collect_bitwise_from_page(
     let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
-    for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
-    }
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
     // Build final state map from memory_state, matching `generate_page_tables`:
     // when `exclude_touched`, touched cells (timestamp > 0) are dropped so PAGE
@@ -1578,7 +1605,7 @@ fn collect_bitwise_from_page(
         .cells
         .iter()
         .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
-        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
     // For each page and each byte, add ARE_BYTES lookups for init and fini
@@ -1963,8 +1990,8 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
 
 /// every address accessed during execution (ELF init + runtime stores/loads).
 /// ELF pages get their init data from the binary; all others are zero-init.
-fn generate_page_tables(
-    image: &HashMap<u64, u8>,
+fn generate_page_tables<I: ImageSource>(
+    image: &I,
     memory_state: &MemoryState,
     private_input: &[u8],
     exclude_touched: bool,
@@ -1978,10 +2005,7 @@ fn generate_page_tables(
     let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
-    for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
-    }
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
     // Build final state map from memory_state. When `exclude_touched` (continuation
     // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
@@ -1991,7 +2015,7 @@ fn generate_page_tables(
         .cells
         .iter()
         .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
-        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
     // Generate PAGE tables and configs
@@ -2266,9 +2290,9 @@ fn collect_all_ops(
 /// PAGE tables and PAGE bitwise lookups seeded from the initial-memory image;
 /// `None` produces empty page tables.
 #[allow(clippy::too_many_arguments)]
-fn build_traces(
+fn build_traces<I: ImageSource + Sync>(
     ops: CollectedOps,
-    initial_image: Option<&HashMap<u64, u8>>,
+    initial_image: Option<&I>,
     memory_state: &MemoryState,
     register_init: &HashMap<u64, u32>,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -2558,11 +2582,11 @@ fn build_traces(
                 .cells
                 .iter()
                 .filter(|(_, cell)| cell.1 > 0)
-                .map(|(&addr, &(value, ts))| (addr, value as u64, ts))
+                .map(|(addr, (value, ts))| (addr, value as u64, ts))
                 .collect();
             touched.sort_by_key(|&(addr, _, _)| addr);
             let initial_memory: HashMap<u64, u64> =
-                image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+                image.image_iter().map(|(a, v)| (a, v as u64)).collect();
             let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
             local_to_global::generate_local_to_global_trace(&boundaries[0])
         }
@@ -3192,9 +3216,9 @@ impl Traces {
     /// registers, require the terminating ECALL). Intermediate epochs (`false`)
     /// skip HALT and keep their boundary register/memory state.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_image_and_logs(
+    pub fn from_image_and_logs<I: ImageSource + Sync>(
         elf: &Elf,
-        initial_image: &HashMap<u64, u8>,
+        initial_image: &I,
         register_init: &HashMap<u64, u32>,
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
@@ -3299,7 +3323,7 @@ impl Traces {
         // Phases 3-5 (elf=None → empty PAGE tables)
         build_traces(
             ops,
-            None,
+            None::<&HashMap<u64, u8>>,
             &memory_state,
             &register_init,
             decode_trace,

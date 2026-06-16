@@ -25,11 +25,13 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::paged_mem::PagedMem;
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    Traces, build_init_page_data, build_initial_image, epoch_touched_cells,
+    Traces, build_init_page_data, build_initial_image, build_initial_image_paged,
+    epoch_touched_cells,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
@@ -128,7 +130,7 @@ fn global_memory_configs(
 /// `image` is borrowed from the persistent cross-epoch image (init = previous fini), so
 /// it is not re-snapshotted or cloned per epoch.
 struct EpochStart<'a> {
-    image: &'a HashMap<u64, u8>,
+    image: &'a PagedMem<u8>,
     register_init: HashMap<u64, u32>,
     is_first: bool,
 }
@@ -328,8 +330,8 @@ pub fn prove_and_verify_continuation(
     // The cross-epoch memory image, carried forward across epochs: epoch i+1's init is
     // epoch i's fini, so it is updated in place with each epoch's touched-cell final
     // values rather than re-snapshotted from the executor every epoch.
-    let mut image = build_initial_image(&elf, private_inputs);
-    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let mut image = build_initial_image_paged(&elf, private_inputs);
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(a, v)| (a, v as u64)).collect();
 
     // Running cross-epoch provenance (the L2G init source). Only the sparse
     // boundaries and the per-epoch roots are kept — everything else is dropped
@@ -385,7 +387,7 @@ pub fn prove_and_verify_continuation(
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
         for cell in &boundary {
-            image.insert(cell.address, (cell.fini.value & 0xFF) as u8);
+            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
         all_boundaries.push(boundary);
         // `start`, `logs`, and this epoch's traces are dropped here.
