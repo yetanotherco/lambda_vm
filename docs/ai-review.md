@@ -18,6 +18,20 @@ Comment on a pull request with one of these commands:
 
 Only repository owners, members, and collaborators can trigger these reviews.
 
+## Prompt Files
+
+Reviewer prompts live in `.github/ai-review/prompts/` so they can be reused by
+any model runner:
+
+- `general.md` backs the individual `/kimi`, `/codex`, and `/claude` commands.
+- `standard.md` backs `/ai-review standard`.
+- `critical.md` backs `/ai-review critical`.
+
+Model-specific workflows should load one of these prompt files and pass its
+contents to the reviewer. Do not duplicate prompt bodies inside model-specific
+workflow YAML unless the model adapter requires a small wrapper around the shared
+prompt.
+
 ## Tier Policy
 
 ### Standard

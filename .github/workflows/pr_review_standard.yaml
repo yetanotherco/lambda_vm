@@ -5,40 +5,32 @@ on:
     types: [created]
 
 jobs:
-  standard-review:
+  review-prompt:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/ai-review standard') &&
       contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      custom_prompt: ${{ steps.prompt.outputs.custom_prompt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load review prompt
+        id: prompt
+        run: |
+          {
+            echo 'custom_prompt<<__PROMPT__'
+            cat .github/ai-review/prompts/standard.md
+            echo '__PROMPT__'
+          } >> "$GITHUB_OUTPUT"
+
+  standard-review:
+    needs: review-prompt
+    if: needs.review-prompt.result == 'success'
     uses: yetanotherco/actions/.github/workflows/pr_review_kimi.yml@v1.0.0
     with:
-      custom_prompt: |
-        This is the standard AI review tier. Review this PR seriously and report
-        concrete issues that should be addressed before merge.
-
-        Review only issues introduced by this PR. Use the diff as the scope anchor.
-        Do not perform a full spec audit and do not report unrelated pre-existing issues.
-
-        Focus on:
-
-        1. **Correctness and regressions**
-           - Logic errors, edge cases, changed invariants, incorrect error handling
-           - VM, prover, memory, bus, trace, and constraint behavior affected by the diff
-
-        2. **Tests and observability**
-           - Missing tests for new behavior or fixed edge cases
-           - Tests whose names/assertions no longer match the behavior
-
-        3. **Simplicity and maintainability**
-           - Unnecessary complexity, duplicated logic, avoidable abstractions
-           - Stale comments, stale names, misleading doc comments, or scope drift
-
-        Guidelines:
-        - Prefer fewer, higher-confidence findings.
-        - Do not suggest micro-optimizations or cosmetic rewrites.
-        - Be concise and actionable.
-        - Include concrete file and line references when possible.
-        - If no issues are found, say so briefly.
+      custom_prompt: ${{ needs.review-prompt.outputs.custom_prompt }}
       max_lines: 12000
     secrets:
       KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}

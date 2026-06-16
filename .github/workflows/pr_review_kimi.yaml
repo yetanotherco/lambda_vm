@@ -5,31 +5,31 @@ on:
     types: [created]
 
 jobs:
-  kimi-review:
+  review-prompt:
     if: |
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/kimi') &&
-       contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/kimi') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      custom_prompt: ${{ steps.prompt.outputs.custom_prompt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load review prompt
+        id: prompt
+        run: |
+          {
+            echo 'custom_prompt<<__PROMPT__'
+            cat .github/ai-review/prompts/general.md
+            echo '__PROMPT__'
+          } >> "$GITHUB_OUTPUT"
+
+  kimi-review:
+    needs: review-prompt
+    if: needs.review-prompt.result == 'success'
     uses: yetanotherco/actions/.github/workflows/pr_review_kimi.yml@v1.0.0
     with:
-      custom_prompt: |
-        1. **Security vulnerabilities** - Label by criticality (Critical/High/Medium/Low)
-           - Rust: unsafe blocks, error handling, panics, memory safety issues
-           - Cryptography: incorrect implementations, timing attacks, weak randomness
-           - VM: instruction handling, memory access, privilege escalation
-
-        2. **Potential bugs** - Logic errors, edge cases, incorrect behavior, race conditions
-
-        3. **Performance issues** - Only significant: e.g. O(n²) on unbounded input, unnecessary allocations, hot path inefficiencies
-
-        4. **Simplicity** - Prefer simple, readable code over clever abstractions
-
-        Guidelines:
-        - Be concise and to the point
-        - Do NOT suggest micro-optimizations or premature abstractions
-        - Always prefer simplicity over complexity when performance gains are marginal
-        - Focus on real issues, not hypothetical improvements
-        - Be concise and actionable
+      custom_prompt: ${{ needs.review-prompt.outputs.custom_prompt }}
     secrets:
       KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}

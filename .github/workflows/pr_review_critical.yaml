@@ -5,86 +5,42 @@ on:
     types: [created]
 
 jobs:
-  codex-critical-review:
+  review-prompt:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/ai-review critical') &&
       contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      custom_prompt: ${{ steps.prompt.outputs.custom_prompt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load review prompt
+        id: prompt
+        run: |
+          {
+            echo 'custom_prompt<<__PROMPT__'
+            cat .github/ai-review/prompts/critical.md
+            echo '__PROMPT__'
+          } >> "$GITHUB_OUTPUT"
+
+  codex-critical-review:
+    needs: review-prompt
+    if: needs.review-prompt.result == 'success'
     uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
     with:
-      custom_prompt: |
-        This is the critical AI review tier. Treat this PR as security- or
-        soundness-sensitive even if the diff is small.
-
-        Review only issues introduced by this PR. Use the diff as the scope anchor,
-        but inspect surrounding code, call sites, tests, and relevant base/head
-        behavior when needed.
-
-        Focus on:
-
-        1. **Soundness, security, and correctness**
-           - Constraint under-specification, missing bus interactions, trace mistakes
-           - VM/executor behavior changes, memory access, privilege or state bugs
-           - Cryptographic misuse, weak randomness, timing-sensitive logic
-           - Unsafe Rust, panics on reachable inputs, unchecked assumptions
-
-        2. **Regression and integration risk**
-           - Changed invariants, changed public contracts, test fixture drift
-           - Interactions across prover tables, statement generation, AIR inclusion,
-             executor behavior, GPU/CUDA paths, or infra scripts
-
-        3. **Maintainability risks**
-           - Complexity that hides correctness assumptions
-           - Stale comments, stale names, misleading docs, or scope drift
-
-        Guidelines:
-        - Prefer concrete, high-confidence findings over exhaustive speculation.
-        - Do not perform a full spec audit unless the PR directly changes the spec.
-        - Do not report unrelated pre-existing issues unless this PR worsens them.
-        - Be concise and actionable.
-        - If no issues are found, say so briefly.
+      custom_prompt: ${{ needs.review-prompt.outputs.custom_prompt }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
   claude-critical-review:
-    if: |
-      github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/ai-review critical') &&
-      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    needs: review-prompt
+    if: needs.review-prompt.result == 'success'
     uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
     with:
       model: sonnet
       max_turns: 30
-      custom_prompt: |
-        This is the critical AI review tier. Treat this PR as security- or
-        soundness-sensitive even if the diff is small.
-
-        Review only issues introduced by this PR. Use the diff as the scope anchor,
-        but inspect surrounding code, call sites, tests, and relevant base/head
-        behavior when needed.
-
-        Focus on:
-
-        1. **Soundness, security, and correctness**
-           - Constraint under-specification, missing bus interactions, trace mistakes
-           - VM/executor behavior changes, memory access, privilege or state bugs
-           - Cryptographic misuse, weak randomness, timing-sensitive logic
-           - Unsafe Rust, panics on reachable inputs, unchecked assumptions
-
-        2. **Regression and integration risk**
-           - Changed invariants, changed public contracts, test fixture drift
-           - Interactions across prover tables, statement generation, AIR inclusion,
-             executor behavior, GPU/CUDA paths, or infra scripts
-
-        3. **Maintainability risks**
-           - Complexity that hides correctness assumptions
-           - Stale comments, stale names, misleading docs, or scope drift
-
-        Guidelines:
-        - Prefer concrete, high-confidence findings over exhaustive speculation.
-        - Do not perform a full spec audit unless the PR directly changes the spec.
-        - Do not report unrelated pre-existing issues unless this PR worsens them.
-        - Be concise and actionable.
-        - If no issues are found, say so briefly.
+      custom_prompt: ${{ needs.review-prompt.outputs.custom_prompt }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
