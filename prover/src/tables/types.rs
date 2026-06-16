@@ -47,73 +47,87 @@ pub enum BusId {
     /// Single-byte checks (spec template `IS_BYTE<X>`) send the second value as 0.
     AreBytes = 0,
     /// Range check: value is a valid halfword [0, 2^16)
-    IsHalfword,
+    IsHalfword = 1,
     /// Range check: value is a 20-bit value [0, 2^20)
-    IsB20,
+    IsB20 = 2,
 
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
-    /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
-    AndByte,
-    /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
-    OrByte,
-    /// Bitwise XOR of two bytes: XOR_BYTE[X, Y] -> X ^ Y
-    XorByte,
+    // IDs 3, 4, and 5 are reserved for the removed legacy
+    // AndByte/OrByte/XorByte buses. Byte AND/OR/XOR lookups use ByteAlu.
     /// Most significant bit of a byte: MSB8[X] -> (X >> 7) & 1
-    Msb8,
+    Msb8 = 6,
     /// Most significant bit of a halfword: MSB16[X] -> (X >> 15) & 1
-    Msb16,
+    Msb16 = 7,
     /// Check if value is zero: ZERO[X] -> X == 0 ? 1 : 0
-    Zero,
+    Zero = 8,
 
     // =========================================================================
     // Shift helpers (BITWISE table provides)
     // =========================================================================
     /// Halfword shift left: HWSL[X, Z] -> [(X << Z) & 0xFFFF, X >> (16 - Z)]
-    Hwsl,
+    Hwsl = 9,
 
     // =========================================================================
     // Arithmetic operations (separate tables)
     // =========================================================================
-    /// Less-than comparison: LT[lhs, rhs, signed] -> lhs < rhs
-    Lt,
-    /// Multiplication: MUL[lhs, lhs_signed, rhs, rhs_signed, hi] -> product
-    Mul,
-    /// Division/Remainder: DVRM[result; n, d, signed, muldiv_selector]
-    Dvrm,
-    /// Shift operation: SHIFT[in, shift, dir, signed, word] -> out
-    Shift,
+    // The four per-chip ALU buses (LT, MUL, DVRM, SHIFT — IDs 10/11/12/13)
+    // are collapsed into [`Alu`](BusId::Alu). Their numeric IDs are reserved
+    // (not removed) so the live variants below keep their discriminants stable.
 
     // =========================================================================
     // Memory/Control
     // =========================================================================
     /// Memory word read/write with timestamps (lookup bus from CPU)
-    Memw,
-    /// Memory load with sign/zero extension (lookup bus from CPU)
-    Load,
+    Memw = 14,
+    // ID 15 (Load) is reserved: the load lookup is now dispatched through
+    // [`MemoryOp`](BusId::MemoryOp).
     /// Internal memory consistency bus: memory[is_register, address, timestamp, value]
     /// Used for read/write pairing in MEMW table (M1-M8 in spec)
-    Memory,
+    Memory = 16,
     /// Branch target computation
-    Branch,
+    Branch = 17,
 
     // =========================================================================
     // System (specs not yet defined)
     // =========================================================================
     /// Instruction decode lookup
-    Decode,
+    Decode = 18,
     /// System call handling (CPU → HALT/COMMIT for all ECALLs)
-    Ecall,
+    Ecall = 19,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte,
+    CommitNextByte = 20,
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
-    Commit,
+    Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
-    Keccak,
+    Keccak = 22,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
-    KeccakRc,
+    KeccakRc = 23,
+
+    // =========================================================================
+    // Byte ALU (BITWISE table provides)
+    // =========================================================================
+    /// Unified byte-level ALU lookup: `BYTE_ALU[opsel, X, Y] -> out`, where
+    /// `opsel` is an [`alu_op`] descriptor (AND=0/OR=1/XOR=2).
+    ByteAlu = 24,
+
+    // =========================================================================
+    // Unified ALU + high-level memory dispatch
+    // =========================================================================
+    /// Unified ALU lookup: `ALU[out; in1, in2, alu_flags]`. The CPU (sender)
+    /// dispatches to the ALU chips (lt/mul/dvrm/shift/eq/bytewise/cpu32) which
+    /// receive on this bus, selected by the `alu_flags` byte. Replaces the
+    /// per-chip `Lt`/`Mul`/`Dvrm`/`Shift` output buses.
+    Alu = 25,
+    /// High-level memory op: `MEMORY[out; timestamp, address, value, mem_flags]`.
+    /// The CPU (sender) dispatches to `LOAD`/`STORE` based on `mem_flags`.
+    /// Distinct from the low-level [`Memory`](BusId::Memory) token bus.
+    MemoryOp = 26,
+    /// CPU → CPU32 delegation of word (`*W`) instructions:
+    /// `CPU32[timestamp, pc, instruction_length]`.
+    Cpu32 = 27,
 }
 
 impl BusId {
@@ -123,27 +137,23 @@ impl BusId {
             BusId::AreBytes => "AreBytes",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
-            BusId::AndByte => "AndByte",
-            BusId::OrByte => "OrByte",
-            BusId::XorByte => "XorByte",
             BusId::Msb8 => "Msb8",
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
             BusId::Hwsl => "Hwsl",
-            BusId::Lt => "Lt",
-            BusId::Mul => "Mul",
-            BusId::Shift => "Shift",
             BusId::Memw => "Memw",
-            BusId::Load => "Load",
             BusId::Memory => "Memory",
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::Dvrm => "Dvrm",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
+            BusId::ByteAlu => "ByteAlu",
+            BusId::Alu => "Alu",
+            BusId::MemoryOp => "MemoryOp",
+            BusId::Cpu32 => "Cpu32",
         }
     }
 }
@@ -156,19 +166,11 @@ impl TryFrom<u64> for BusId {
             0 => Ok(BusId::AreBytes),
             1 => Ok(BusId::IsHalfword),
             2 => Ok(BusId::IsB20),
-            3 => Ok(BusId::AndByte),
-            4 => Ok(BusId::OrByte),
-            5 => Ok(BusId::XorByte),
             6 => Ok(BusId::Msb8),
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
             9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Lt),
-            11 => Ok(BusId::Mul),
-            12 => Ok(BusId::Dvrm),
-            13 => Ok(BusId::Shift),
             14 => Ok(BusId::Memw),
-            15 => Ok(BusId::Load),
             16 => Ok(BusId::Memory),
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
@@ -177,6 +179,10 @@ impl TryFrom<u64> for BusId {
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
+            24 => Ok(BusId::ByteAlu),
+            25 => Ok(BusId::Alu),
+            26 => Ok(BusId::MemoryOp),
+            27 => Ok(BusId::Cpu32),
             other => Err(other),
         }
     }
@@ -232,61 +238,488 @@ pub const NEG_INV_2_112: u64 = 18446462594437939201;
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
 
 // =========================================================================
-// packed_decode bit positions (shared between CPU and DECODE tables)
+// ALU operation descriptors
 // =========================================================================
 
-/// Bit positions for the packed_decode field.
+/// Numerical descriptors for ALU operations, per `spec/decode.typ`.
 ///
-/// This is the single source of truth for how decode fields are packed into
-/// a 51-bit value. Used by:
-/// - `DecodeEntry::packed_decode()` - packs fields into a u64
-/// - CPU table bus interaction - builds LinearTerm coefficients
+/// These values are the single source of truth for:
+/// - the `opsel` selector of the [`BusId::ByteAlu`] lookup (AND/OR/XOR), and
+/// - the low 5 bits (`alu_op`) of the packed `alu_flags` byte consumed by the
+///   unified `ALU` bus and the ALU chips (shift/lt/mul/dvrm).
+pub mod alu_op {
+    pub const AND: u8 = 0;
+    pub const OR: u8 = 1;
+    pub const XOR: u8 = 2;
+    pub const EQ: u8 = 3;
+    pub const LT: u8 = 4;
+    pub const SHIFT: u8 = 5;
+    pub const SHIFTW: u8 = 6;
+    pub const MUL: u8 = 7;
+    pub const DIVREM: u8 = 8;
+}
+
+// =========================================================================
+// packed_decode layout
+// =========================================================================
+
+/// Bit layout of the shrunk `packed_decode` field (58 bits used), per
+/// `cpu.toml:184-205` and `decode_uncompressed.toml`.
 ///
-/// ## Format (51 bits total)
+/// This is the single source of truth shared by the DECODE-table producer and
+/// the CPU's `packed_decode` reconstruction, so the DECODE bus fingerprint
+/// matches on both sides.
 ///
-/// ```text
-/// Bits [0-10]:  Control flags (read_reg1, read_reg2, write_reg, memory_*, etc.)
-/// Bits [11-26]: ALU operation flags (ADD, SUB, SLT, AND, OR, XOR, etc.)
-/// Bits [27-34]: rs1 register index (8 bits)
-/// Bits [35-42]: rs2 register index (8 bits)
-/// Bits [43-50]: rd register index (8 bits)
-/// ```
-pub mod packed_decode {
-    // Control flags (bits 0-10)
+pub mod packed_decode_shrunk {
+    // Top-level flags + register indices.
     pub const READ_REG1: u32 = 0;
     pub const READ_REG2: u32 = 1;
     pub const WRITE_REG: u32 = 2;
-    pub const MEMORY_2BYTES: u32 = 3;
-    pub const MEMORY_4BYTES: u32 = 4;
-    pub const MEMORY_8BYTES: u32 = 5;
-    pub const C_TYPE: u32 = 6;
-    pub const SIGNED: u32 = 7;
-    pub const MP_SELECTOR: u32 = 8;
-    pub const MULDIV_SELECTOR: u32 = 9;
-    pub const WORD_INSTR: u32 = 10;
+    pub const WORD_INSTR: u32 = 3;
+    pub const ALU: u32 = 4;
+    pub const ADD: u32 = 5;
+    pub const SUB: u32 = 6;
+    pub const MEMORY: u32 = 7;
+    pub const BRANCH: u32 = 8;
+    pub const ECALL: u32 = 9;
+    pub const RS1: u32 = 10;
+    pub const RS2: u32 = 18;
+    pub const RD: u32 = 26;
+    /// `half_instruction_length`: bytes/2 (1 for C-type, 2 for regular). The
+    /// half-encoding makes odd (misaligned) instruction lengths unrepresentable
+    /// (`spec/src/cpu.toml`).
+    pub const HALF_INSTRUCTION_LENGTH: u32 = 34;
+    pub const ALU_FLAGS: u32 = 42;
+    pub const MEM_FLAGS: u32 = 50;
 
-    // ALU operation flags (bits 11-26)
-    pub const OP_ADD: u32 = 11;
-    pub const OP_SUB: u32 = 12;
-    pub const OP_SLT: u32 = 13;
-    pub const OP_AND: u32 = 14;
-    pub const OP_OR: u32 = 15;
-    pub const OP_XOR: u32 = 16;
-    pub const OP_SHIFT: u32 = 17;
-    pub const OP_JALR: u32 = 18;
-    pub const OP_BEQ: u32 = 19;
-    pub const OP_BLT: u32 = 20;
-    pub const OP_LOAD: u32 = 21;
-    pub const OP_STORE: u32 = 22;
-    pub const OP_MUL: u32 = 23;
-    pub const OP_DIVREM: u32 = 24;
-    pub const OP_ECALL: u32 = 25;
-    pub const OP_EBREAK: u32 = 26;
+    // `alu_flags` byte interior: bits 0-4 are the `alu_op` descriptor
+    // (see [`super::alu_op`]); the high bits are flags.
+    pub const ALU_FLAGS_OP_MASK: u8 = 0x1F;
+    pub const ALU_FLAGS_SIGNED: u32 = 5;
+    /// `signed2` (MUL) and `invert` (SHIFT/EQ/LT) are mutually exclusive and
+    /// share this bit (`64·(signed2 + invert)` in `decode_uncompressed.toml`).
+    pub const ALU_FLAGS_SIGNED2_OR_INVERT: u32 = 6;
+    pub const ALU_FLAGS_MULDIV: u32 = 7;
 
-    // Register indices (bits 27-50)
-    pub const RS1: u32 = 27;
-    pub const RS2: u32 = 35;
-    pub const RD: u32 = 43;
+    // `mem_flags` byte interior. Bit 0 aliases `JALR` (under BRANCH) and
+    // `memory_op` (0=LOAD/1=STORE, under MEMORY); the two are mutually exclusive.
+    pub const MEM_FLAGS_JALR_OR_OP: u32 = 0;
+    pub const MEM_FLAGS_SIGNED: u32 = 1;
+    pub const MEM_FLAGS_2B: u32 = 2;
+    pub const MEM_FLAGS_4B: u32 = 3;
+    pub const MEM_FLAGS_8B: u32 = 4;
+}
+
+/// Build the `alu_flags` byte: `alu_op + 32·signed + 64·(signed2|invert) + 128·muldiv`.
+pub fn build_alu_flags(alu_op: u8, signed: bool, signed2_or_invert: bool, muldiv: bool) -> u8 {
+    use packed_decode_shrunk as b;
+    debug_assert!(alu_op <= b::ALU_FLAGS_OP_MASK, "alu_op must fit in 5 bits");
+    alu_op
+        | ((signed as u8) << b::ALU_FLAGS_SIGNED)
+        | ((signed2_or_invert as u8) << b::ALU_FLAGS_SIGNED2_OR_INVERT)
+        | ((muldiv as u8) << b::ALU_FLAGS_MULDIV)
+}
+
+/// Build the `mem_flags` byte: `jalr_or_op + 2·mem_signed + 4·mem_2B + 8·mem_4B + 16·mem_8B`.
+pub fn build_mem_flags(
+    jalr_or_memory_op: bool,
+    mem_signed: bool,
+    mem_2b: bool,
+    mem_4b: bool,
+    mem_8b: bool,
+) -> u8 {
+    use packed_decode_shrunk as b;
+    ((jalr_or_memory_op as u8) << b::MEM_FLAGS_JALR_OR_OP)
+        | ((mem_signed as u8) << b::MEM_FLAGS_SIGNED)
+        | ((mem_2b as u8) << b::MEM_FLAGS_2B)
+        | ((mem_4b as u8) << b::MEM_FLAGS_4B)
+        | ((mem_8b as u8) << b::MEM_FLAGS_8B)
+}
+
+/// Logical (unpacked) view of the reworked `packed_decode` field. `alu_flags`
+/// and `mem_flags` are stored already-packed (build them with
+/// [`build_alu_flags`] / [`build_mem_flags`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ShrunkDecode {
+    pub read_register1: bool,
+    pub read_register2: bool,
+    pub write_register: bool,
+    pub word_instr: bool,
+    pub alu: bool,
+    pub add: bool,
+    pub sub: bool,
+    pub memory: bool,
+    pub branch: bool,
+    pub ecall: bool,
+    pub rs1: u8,
+    pub rs2: u8,
+    pub rd: u8,
+    /// Half the byte length of the instruction (1 for C-type, 2 for regular);
+    /// the real length is `2 * half_instruction_length`.
+    pub half_instruction_length: u8,
+    pub alu_flags: u8,
+    pub mem_flags: u8,
+}
+
+impl ShrunkDecode {
+    /// Pack into the 58-bit `packed_decode` field value.
+    pub fn pack(&self) -> u64 {
+        use packed_decode_shrunk as b;
+        ((self.read_register1 as u64) << b::READ_REG1)
+            | ((self.read_register2 as u64) << b::READ_REG2)
+            | ((self.write_register as u64) << b::WRITE_REG)
+            | ((self.word_instr as u64) << b::WORD_INSTR)
+            | ((self.alu as u64) << b::ALU)
+            | ((self.add as u64) << b::ADD)
+            | ((self.sub as u64) << b::SUB)
+            | ((self.memory as u64) << b::MEMORY)
+            | ((self.branch as u64) << b::BRANCH)
+            | ((self.ecall as u64) << b::ECALL)
+            | ((self.rs1 as u64) << b::RS1)
+            | ((self.rs2 as u64) << b::RS2)
+            | ((self.rd as u64) << b::RD)
+            | ((self.half_instruction_length as u64) << b::HALF_INSTRUCTION_LENGTH)
+            | ((self.alu_flags as u64) << b::ALU_FLAGS)
+            | ((self.mem_flags as u64) << b::MEM_FLAGS)
+    }
+
+    /// Inverse of [`pack`](Self::pack).
+    pub fn unpack(packed: u64) -> Self {
+        use packed_decode_shrunk as b;
+        let bit = |pos: u32| (packed >> pos) & 1 == 1;
+        let byte = |pos: u32| ((packed >> pos) & 0xFF) as u8;
+        Self {
+            read_register1: bit(b::READ_REG1),
+            read_register2: bit(b::READ_REG2),
+            write_register: bit(b::WRITE_REG),
+            word_instr: bit(b::WORD_INSTR),
+            alu: bit(b::ALU),
+            add: bit(b::ADD),
+            sub: bit(b::SUB),
+            memory: bit(b::MEMORY),
+            branch: bit(b::BRANCH),
+            ecall: bit(b::ECALL),
+            rs1: byte(b::RS1),
+            rs2: byte(b::RS2),
+            rd: byte(b::RD),
+            half_instruction_length: byte(b::HALF_INSTRUCTION_LENGTH),
+            alu_flags: byte(b::ALU_FLAGS),
+            mem_flags: byte(b::MEM_FLAGS),
+        }
+    }
+
+    /// Build the reworked packed-decode flags for an instruction, per
+    /// `spec/decode.typ`. Does NOT include `pc`/`imm` (separate DECODE columns).
+    ///
+    /// `instruction_length` is the byte length: 2 (RV64C compressed) or 4. It is
+    /// stored as `half_instruction_length = instruction_length / 2`; the real
+    /// length is recovered as `2 * half_instruction_length`.
+    ///
+    /// Per `spec/decode.typ`: conditional branches set
+    /// `BRANCH=1 ∧ ALU=1` (the EQ/LT chip computes the comparison; `BRANCH`
+    /// selects `arg2 = rv2`). JAL/JALR set `BRANCH=1 ∧ JALR=1` with no ALU op —
+    /// the return address `pc + instruction_length` is written to `rvd` by the
+    /// CPU branch group, not the ALU.
+    pub fn from_instruction(instruction: Instruction, instruction_length: u8) -> Self {
+        debug_assert!(
+            instruction_length.is_multiple_of(2),
+            "instruction_length must be even (RISC-V instructions are 2 or 4 bytes)"
+        );
+        let mut d = Self {
+            half_instruction_length: instruction_length / 2,
+            ..Default::default()
+        };
+        match instruction {
+            Instruction::Arith {
+                dst,
+                src1,
+                src2,
+                op,
+            } => {
+                d.rd = dst as u8;
+                d.rs1 = src1 as u8;
+                d.rs2 = src2 as u8;
+                d.read_register1 = src1 != 0;
+                d.read_register2 = src2 != 0;
+                d.write_register = dst != 0;
+                d.apply_arith_op(op, false);
+            }
+            Instruction::ArithImm { dst, src, op, .. } => {
+                d.rd = dst as u8;
+                d.rs1 = src as u8;
+                d.read_register1 = src != 0;
+                d.write_register = dst != 0;
+                d.apply_arith_op(op, false);
+            }
+            Instruction::ArithW {
+                dst,
+                src1,
+                src2,
+                op,
+            } => {
+                d.rd = dst as u8;
+                d.rs1 = src1 as u8;
+                d.rs2 = src2 as u8;
+                d.read_register1 = src1 != 0;
+                d.read_register2 = src2 != 0;
+                d.write_register = dst != 0;
+                d.word_instr = true;
+                d.apply_arith_op(op, true);
+            }
+            Instruction::ArithImmW { dst, src, op, .. } => {
+                d.rd = dst as u8;
+                d.rs1 = src as u8;
+                d.read_register1 = src != 0;
+                d.write_register = dst != 0;
+                d.word_instr = true;
+                d.apply_arith_op(op, true);
+            }
+            // JAL is represented as JALR rd, x255, imm (x255 holds pc).
+            Instruction::JumpAndLink { dst, .. } => {
+                d.rd = dst as u8;
+                d.rs1 = 255;
+                d.read_register1 = true;
+                d.write_register = dst != 0;
+                d.branch = true;
+                d.mem_flags = build_mem_flags(true, false, false, false, false); // JALR bit
+            }
+            Instruction::JumpAndLinkRegister { base, dst, .. } => {
+                d.rd = dst as u8;
+                d.rs1 = base as u8;
+                d.read_register1 = base != 0;
+                d.write_register = dst != 0;
+                d.branch = true;
+                d.mem_flags = build_mem_flags(true, false, false, false, false); // JALR bit
+            }
+            Instruction::Store {
+                src, base, width, ..
+            } => {
+                d.rs1 = base as u8;
+                d.rs2 = src as u8;
+                d.read_register1 = base != 0;
+                d.read_register2 = src != 0;
+                d.add = true; // address = rv1 + imm
+                d.memory = true;
+                let (m2, m4, m8) = store_width_bits(width);
+                d.mem_flags = build_mem_flags(true, false, m2, m4, m8); // memory_op = store
+            }
+            Instruction::Load {
+                dst, base, width, ..
+            } => {
+                d.rd = dst as u8;
+                d.rs1 = base as u8;
+                d.read_register1 = base != 0;
+                d.write_register = dst != 0;
+                d.add = true; // address = rv1 + imm
+                d.memory = true;
+                let (m2, m4, m8, signed) = load_width_bits(width);
+                d.mem_flags = build_mem_flags(false, signed, m2, m4, m8); // memory_op = load
+            }
+            Instruction::Branch {
+                src1, src2, cond, ..
+            } => {
+                d.rs1 = src1 as u8;
+                d.rs2 = src2 as u8;
+                d.read_register1 = src1 != 0;
+                d.read_register2 = src2 != 0;
+                d.branch = true;
+                d.alu = true; // Q3: conditional branches go through the EQ/LT ALU chip
+                let (op, signed, invert) = branch_cond_flags(cond);
+                d.alu_flags = build_alu_flags(op, signed, invert, false);
+            }
+            // LUI is represented as ADDI rd, x0, imm.
+            Instruction::LoadUpperImm { dst, .. } => {
+                d.rd = dst as u8;
+                d.write_register = dst != 0;
+                d.add = true;
+            }
+            // AUIPC is represented as ADDI rd, x255, imm (x255 holds pc).
+            Instruction::AddUpperImmToPc { dst, .. } => {
+                d.rd = dst as u8;
+                d.rs1 = 255;
+                d.read_register1 = true;
+                d.write_register = dst != 0;
+                d.add = true;
+            }
+            Instruction::EcallEbreak => {
+                d.rs1 = 17; // a7 holds the syscall number
+                d.read_register1 = true;
+                d.ecall = true;
+            }
+            // FENCE and CSR are treated as no-ops (ADDI x0, x0, 0).
+            Instruction::Fence | Instruction::CSR { .. } => {
+                d.add = true;
+            }
+        }
+        d
+    }
+
+    /// Set the `ADD`/`SUB`/`ALU` flags and `alu_flags` byte for an `ArithOp`,
+    /// per `spec/decode.typ`. `ADD`/`SUB` are fast-paths (ALU not set).
+    fn apply_arith_op(&mut self, op: ArithOp, word_instr: bool) {
+        let shift = if word_instr {
+            alu_op::SHIFTW
+        } else {
+            alu_op::SHIFT
+        };
+        // (alu_op, signed, signed2|invert, muldiv, is_add, is_sub)
+        let (alu, signed, s2_or_inv, muldiv, is_add, is_sub) = match op {
+            ArithOp::Add => (0, false, false, false, true, false),
+            ArithOp::Sub => (0, false, false, false, false, true),
+            ArithOp::And => (alu_op::AND, false, false, false, false, false),
+            ArithOp::Or => (alu_op::OR, false, false, false, false, false),
+            ArithOp::Xor => (alu_op::XOR, false, false, false, false, false),
+            ArithOp::ShiftLeftLogical => (shift, false, false, false, false, false),
+            ArithOp::ShiftRightLogical => (shift, false, true, false, false, false), // invert = right
+            ArithOp::ShiftRightArith => (shift, true, true, false, false, false),
+            ArithOp::SetLessThan => (alu_op::LT, true, false, false, false, false),
+            ArithOp::SetLessThanU => (alu_op::LT, false, false, false, false, false),
+            ArithOp::Mul => (alu_op::MUL, true, true, false, false, false),
+            ArithOp::MulHigh => (alu_op::MUL, true, true, true, false, false),
+            ArithOp::MulHighSignedUnsigned => (alu_op::MUL, true, false, true, false, false),
+            ArithOp::MulHighUnsigned => (alu_op::MUL, false, false, true, false, false),
+            ArithOp::Div => (alu_op::DIVREM, true, false, false, false, false),
+            ArithOp::DivUnsigned => (alu_op::DIVREM, false, false, false, false, false),
+            ArithOp::Remainder => (alu_op::DIVREM, true, false, true, false, false),
+            ArithOp::RemainderUnsigned => (alu_op::DIVREM, false, false, true, false, false),
+        };
+        self.add = is_add;
+        self.sub = is_sub;
+        self.alu = !(is_add || is_sub);
+        self.alu_flags = build_alu_flags(alu, signed, s2_or_inv, muldiv);
+    }
+
+    // ---- packed `alu_flags` accessors ----
+
+    /// The `alu_op` descriptor (bits 0-4 of `alu_flags`).
+    #[inline]
+    pub fn alu_op(&self) -> u8 {
+        self.alu_flags & packed_decode_shrunk::ALU_FLAGS_OP_MASK
+    }
+    /// `signed` flag (bit 5 of `alu_flags`).
+    #[inline]
+    pub fn alu_signed(&self) -> bool {
+        (self.alu_flags >> packed_decode_shrunk::ALU_FLAGS_SIGNED) & 1 == 1
+    }
+    /// Shared `signed2`/`invert` flag (bit 6 of `alu_flags`); meaning depends on
+    /// `alu_op` (MUL: `signed2`; SHIFT/EQ/LT: `invert`).
+    #[inline]
+    pub fn alu_signed2_or_invert(&self) -> bool {
+        (self.alu_flags >> packed_decode_shrunk::ALU_FLAGS_SIGNED2_OR_INVERT) & 1 == 1
+    }
+    /// `muldiv_selector` flag (bit 7 of `alu_flags`).
+    #[inline]
+    pub fn alu_muldiv(&self) -> bool {
+        (self.alu_flags >> packed_decode_shrunk::ALU_FLAGS_MULDIV) & 1 == 1
+    }
+
+    // ---- packed `mem_flags` accessors (valid under `memory`/`branch`) ----
+
+    /// Virtual `JALR` bit (bit 0 of `mem_flags`); valid under `branch`.
+    #[inline]
+    pub fn jalr(&self) -> bool {
+        self.mem_flags & 1 == 1
+    }
+    /// STORE (vs LOAD) when `memory`: `memory_op` is bit 0 of `mem_flags`.
+    #[inline]
+    pub fn is_store(&self) -> bool {
+        self.memory && (self.mem_flags & 1 == 1)
+    }
+    /// LOAD (vs STORE) when `memory`.
+    #[inline]
+    pub fn is_load(&self) -> bool {
+        self.memory && (self.mem_flags & 1 == 0)
+    }
+    /// `mem_signed` flag (bit 1 of `mem_flags`).
+    #[inline]
+    pub fn mem_signed(&self) -> bool {
+        (self.mem_flags >> packed_decode_shrunk::MEM_FLAGS_SIGNED) & 1 == 1
+    }
+    /// Memory access width in bytes (from the `mem_flags` width bits; default 1).
+    #[inline]
+    pub fn mem_bytes(&self) -> usize {
+        use packed_decode_shrunk as b;
+        if (self.mem_flags >> b::MEM_FLAGS_8B) & 1 == 1 {
+            8
+        } else if (self.mem_flags >> b::MEM_FLAGS_4B) & 1 == 1 {
+            4
+        } else if (self.mem_flags >> b::MEM_FLAGS_2B) & 1 == 1 {
+            2
+        } else {
+            1
+        }
+    }
+
+    // ---- ALU operation classifiers (valid only when `alu`) ----
+
+    #[inline]
+    pub fn is_and(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::AND
+    }
+    #[inline]
+    pub fn is_or(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::OR
+    }
+    #[inline]
+    pub fn is_xor(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::XOR
+    }
+    #[inline]
+    pub fn is_eq(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::EQ
+    }
+    #[inline]
+    pub fn is_lt(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::LT
+    }
+    #[inline]
+    pub fn is_shift(&self) -> bool {
+        self.alu && matches!(self.alu_op(), x if x == alu_op::SHIFT || x == alu_op::SHIFTW)
+    }
+    #[inline]
+    pub fn is_mul(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::MUL
+    }
+    #[inline]
+    pub fn is_divrem(&self) -> bool {
+        self.alu && self.alu_op() == alu_op::DIVREM
+    }
+}
+
+/// Memory-width bits `(mem_2B, mem_4B, mem_8B)` for STORE (1 byte = none set).
+fn store_width_bits(width: LoadStoreWidth) -> (bool, bool, bool) {
+    match width {
+        LoadStoreWidth::Byte | LoadStoreWidth::ByteUnsigned => (false, false, false),
+        LoadStoreWidth::Half | LoadStoreWidth::HalfUnsigned => (true, false, false),
+        LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => (false, true, false),
+        LoadStoreWidth::DoubleWord => (false, false, true),
+    }
+}
+
+/// Memory-width bits `(mem_2B, mem_4B, mem_8B, mem_signed)` for LOAD.
+/// `mem_signed = ¬[U]`; the full-width `LD` is not sign-extended.
+fn load_width_bits(width: LoadStoreWidth) -> (bool, bool, bool, bool) {
+    match width {
+        LoadStoreWidth::Byte => (false, false, false, true),
+        LoadStoreWidth::ByteUnsigned => (false, false, false, false),
+        LoadStoreWidth::Half => (true, false, false, true),
+        LoadStoreWidth::HalfUnsigned => (true, false, false, false),
+        LoadStoreWidth::Word => (false, true, false, true),
+        LoadStoreWidth::WordUnsigned => (false, true, false, false),
+        LoadStoreWidth::DoubleWord => (false, false, true, false),
+    }
+}
+
+/// `(alu_op, signed, invert)` for a branch comparison, per `spec/decode.typ`.
+fn branch_cond_flags(cond: Comparison) -> (u8, bool, bool) {
+    match cond {
+        Comparison::Equal => (alu_op::EQ, false, false),
+        Comparison::NotEqual => (alu_op::EQ, false, true),
+        Comparison::LessThan => (alu_op::LT, true, false),
+        Comparison::LessThanUnsigned => (alu_op::LT, false, false),
+        Comparison::GreaterOrEqual => (alu_op::LT, true, true),
+        Comparison::GreaterOrEqualUnsigned => (alu_op::LT, false, true),
+    }
 }
 
 // =========================================================================
@@ -304,498 +737,48 @@ pub mod packed_decode {
 /// - **CPU table**: `CpuOperation` contains a `DecodeEntry` plus runtime values (rv1, rv2, etc.)
 /// - **DECODE table**: Stores `DecodeEntry` directly, with multiplicity tracking
 ///
-/// ## packed_decode Format (51 bits)
-///
-/// ```text
-/// Bits [0]:     read_register1
-/// Bits [1]:     read_register2
-/// Bits [2]:     write_register
-/// Bits [3]:     memory_2bytes
-/// Bits [4]:     memory_4bytes
-/// Bits [5]:     memory_8bytes
-/// Bits [6]:     c_type
-/// Bits [7]:     signed
-/// Bits [8]:     mp_selector
-/// Bits [9]:     muldiv_selector
-/// Bits [10]:    word_instr
-/// Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
-///               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
-/// Bits [27:35]: rs1 (8 bits)
-/// Bits [35:43]: rs2 (8 bits)
-/// Bits [43:51]: rd (8 bits)
-/// ```
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
+/// The packed decode layout is defined by [`packed_decode_shrunk`] and produced
+/// by [`ShrunkDecode::pack`]; consult those for the bit positions of every flag,
+/// the ALU/MEM flag bytes, and the rs1/rs2/rd register indices.
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct DecodeEntry {
-    // Program counter
-    /// Program counter (64-bit)
+    /// Program counter (64-bit).
     pub pc: u64,
-
-    // Register indices (8 bits each)
-    /// Source register 1 index
-    pub rs1: u8,
-    /// Source register 2 index
-    pub rs2: u8,
-    /// Destination register index
-    pub rd: u8,
-
-    // Control flags
-    /// Whether to read from rs1
-    pub read_register1: bool,
-    /// Whether to read from rs2
-    pub read_register2: bool,
-    /// Whether to write to rd
-    pub write_register: bool,
-    /// Memory access is 2 bytes
-    pub memory_2bytes: bool,
-    /// Memory access is 4 bytes
-    pub memory_4bytes: bool,
-    /// Memory access is 8 bytes
-    pub memory_8bytes: bool,
-    /// Compressed instruction (2 bytes instead of 4)
-    pub c_type: bool,
-    /// Signed operation
-    pub signed: bool,
-    /// Multi-purpose selector (shift direction, branch invert, etc.)
-    pub mp_selector: bool,
-    /// MUL/DIV output selector
-    pub muldiv_selector: bool,
-    /// Word instruction (32-bit with sign extension)
-    pub word_instr: bool,
-
-    // ALU selector flags (one-hot)
-    /// ADD operation
-    pub op_add: bool,
-    /// SUB operation
-    pub op_sub: bool,
-    /// SLT (Set Less Than) operation
-    pub op_slt: bool,
-    /// AND operation
-    pub op_and: bool,
-    /// OR operation
-    pub op_or: bool,
-    /// XOR operation
-    pub op_xor: bool,
-    /// SHIFT operation
-    pub op_shift: bool,
-    /// JALR operation
-    pub op_jalr: bool,
-    /// BEQ (Branch if Equal) operation
-    pub op_beq: bool,
-    /// BLT (Branch if Less Than) operation
-    pub op_blt: bool,
-    /// LOAD operation
-    pub op_load: bool,
-    /// STORE operation
-    pub op_store: bool,
-    /// MUL operation
-    pub op_mul: bool,
-    /// DIVREM operation
-    pub op_divrem: bool,
-    /// ECALL operation
-    pub op_ecall: bool,
-    /// EBREAK operation
-    pub op_ebreak: bool,
-
-    // Immediate value
-    /// Fully extended 64-bit immediate
+    /// Fully sign-extended 64-bit immediate.
     pub imm: u64,
+    /// Packed decode flags + register indices.
+    pub fields: ShrunkDecode,
 }
 
 impl DecodeEntry {
-    /// Creates a new empty DecodeEntry.
+    /// Creates an empty DecodeEntry.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates the special padding entry for DECODE table.
-    ///
-    /// Uses pc=7 with EBREAK=1 flag set. This makes padding rows
-    /// unprovable since CPU asserts EBREAK=0.
+    /// Padding row for the DECODE/CPU tables: an odd PC (never a valid fetch
+    /// target, hence unprovable) with all flags zero. Replaces the old
+    /// EBREAK-based padding (EBREAK has no decoding in this layout).
     pub fn padding_entry() -> Self {
         Self {
-            pc: 7,
-            op_ebreak: true,
-            ..Default::default()
+            pc: 1,
+            imm: 0,
+            fields: ShrunkDecode::default(),
         }
     }
 
-    /// Packs all flags and register indices into a single 51-bit value.
-    ///
-    /// This matches the spec's packed_decode format (decode.md).
-    /// Bit positions are defined in the `packed_decode` module.
-    ///
-    /// Note: The register flags (read_register1, read_register2, write_register)
-    /// are adjusted to exclude x0 (hardwired zero) and x255 (virtual PC for AUIPC/JAL).
-    /// This matches the CPU trace columns and ensures the DECODE bus balances.
+    /// Packs the decode fields into the `packed_decode` field-element value.
     pub fn packed_decode(&self) -> u64 {
-        use crate::tables::types::packed_decode as bits;
-
-        let mut packed: u64 = 0;
-
-        // Control flags (bits 0-10)
-        // x0 is hardwired to zero and never physically read.
-        // x255 is the register where the pc is stored (per spec decode.md),
-        // so read_register1=1 for rs1=255.
-        let read_reg1_physical = self.read_register1 && self.rs1 != 0;
-        let read_reg2_physical = self.read_register2 && self.rs2 != 0;
-        let write_reg_physical = self.write_register && self.rd != 0;
-        packed |= (read_reg1_physical as u64) << bits::READ_REG1;
-        packed |= (read_reg2_physical as u64) << bits::READ_REG2;
-        packed |= (write_reg_physical as u64) << bits::WRITE_REG;
-        packed |= (self.memory_2bytes as u64) << bits::MEMORY_2BYTES;
-        packed |= (self.memory_4bytes as u64) << bits::MEMORY_4BYTES;
-        packed |= (self.memory_8bytes as u64) << bits::MEMORY_8BYTES;
-        packed |= (self.c_type as u64) << bits::C_TYPE;
-        packed |= (self.signed as u64) << bits::SIGNED;
-        packed |= (self.mp_selector as u64) << bits::MP_SELECTOR;
-        packed |= (self.muldiv_selector as u64) << bits::MULDIV_SELECTOR;
-        packed |= (self.word_instr as u64) << bits::WORD_INSTR;
-
-        // ALU flags (bits 11-26)
-        packed |= (self.op_add as u64) << bits::OP_ADD;
-        packed |= (self.op_sub as u64) << bits::OP_SUB;
-        packed |= (self.op_slt as u64) << bits::OP_SLT;
-        packed |= (self.op_and as u64) << bits::OP_AND;
-        packed |= (self.op_or as u64) << bits::OP_OR;
-        packed |= (self.op_xor as u64) << bits::OP_XOR;
-        packed |= (self.op_shift as u64) << bits::OP_SHIFT;
-        packed |= (self.op_jalr as u64) << bits::OP_JALR;
-        packed |= (self.op_beq as u64) << bits::OP_BEQ;
-        packed |= (self.op_blt as u64) << bits::OP_BLT;
-        packed |= (self.op_load as u64) << bits::OP_LOAD;
-        packed |= (self.op_store as u64) << bits::OP_STORE;
-        packed |= (self.op_mul as u64) << bits::OP_MUL;
-        packed |= (self.op_divrem as u64) << bits::OP_DIVREM;
-        packed |= (self.op_ecall as u64) << bits::OP_ECALL;
-        packed |= (self.op_ebreak as u64) << bits::OP_EBREAK;
-
-        // Register indices (bits 27-50)
-        packed |= (self.rs1 as u64) << bits::RS1;
-        packed |= (self.rs2 as u64) << bits::RS2;
-        packed |= (self.rd as u64) << bits::RD;
-
-        packed
+        self.fields.pack()
     }
 
-    /// Creates a DecodeEntry from a PC and Instruction.
-    ///
-    /// Extracts all decode-time information: pc, registers, flags, immediate.
-    pub fn from_instruction(pc: u64, instruction: Instruction) -> Self {
-        let mut entry = Self {
+    /// Decode an instruction into `(pc, imm, fields)`. `instruction_length` is
+    /// 2 (RV64C compressed) or 4.
+    pub fn from_instruction(pc: u64, instruction: Instruction, instruction_length: u8) -> Self {
+        Self {
             pc,
-            ..Default::default()
-        };
-
-        match instruction {
-            Instruction::Arith {
-                dst,
-                src1,
-                src2,
-                op,
-            } => {
-                entry.rd = dst as u8;
-                entry.rs1 = src1 as u8;
-                entry.rs2 = src2 as u8;
-                entry.read_register1 = src1 != 0;
-                entry.read_register2 = src2 != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-                Self::set_arith_op(&mut entry, op);
-            }
-
-            Instruction::ArithImm { dst, src, imm, op } => {
-                entry.rd = dst as u8;
-                entry.rs1 = src as u8;
-                entry.rs2 = 0;
-                entry.imm = imm as i64 as u64; // Sign extend
-                entry.read_register1 = src != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-                Self::set_arith_op(&mut entry, op);
-            }
-
-            Instruction::ArithW {
-                dst,
-                src1,
-                src2,
-                op,
-            } => {
-                entry.rd = dst as u8;
-                entry.rs1 = src1 as u8;
-                entry.rs2 = src2 as u8;
-                entry.word_instr = true;
-                entry.read_register1 = src1 != 0;
-                entry.read_register2 = src2 != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-                Self::set_arith_op(&mut entry, op);
-            }
-
-            Instruction::ArithImmW { dst, src, imm, op } => {
-                entry.rd = dst as u8;
-                entry.rs1 = src as u8;
-                entry.rs2 = 0;
-                entry.imm = imm as i64 as u64; // Sign extend
-                entry.word_instr = true;
-                entry.read_register1 = src != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-                Self::set_arith_op(&mut entry, op);
-            }
-
-            Instruction::JumpAndLink { dst, offset } => {
-                entry.op_jalr = true;
-                entry.rd = dst as u8;
-                // Per spec: JAL is represented as JALR rd, x255, imm
-                // x255 is the virtual register holding PC
-                entry.rs1 = 255;
-                entry.read_register1 = true; // rs1 ≠ 0
-                entry.imm = offset as i64 as u64;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-            }
-
-            Instruction::JumpAndLinkRegister { base, dst, offset } => {
-                entry.op_jalr = true;
-                entry.rd = dst as u8;
-                entry.rs1 = base as u8;
-                entry.imm = offset as i64 as u64;
-                entry.read_register1 = base != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-            }
-
-            Instruction::Store {
-                src,
-                offset,
-                base,
-                width,
-            } => {
-                entry.op_store = true;
-                entry.rs1 = base as u8;
-                entry.rs2 = src as u8;
-                entry.imm = offset as i64 as u64;
-                entry.read_register1 = base != 0;
-                entry.read_register2 = src != 0;
-                // write_register = false for STORE
-                Self::set_memory_width(&mut entry, width);
-            }
-
-            Instruction::Load {
-                dst,
-                offset,
-                base,
-                width,
-            } => {
-                entry.op_load = true;
-                entry.rd = dst as u8;
-                entry.rs1 = base as u8;
-                entry.imm = offset as i64 as u64;
-                entry.read_register1 = base != 0;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-                Self::set_memory_width(&mut entry, width);
-                // Set signed flag for sign-extending loads
-                match width {
-                    LoadStoreWidth::Byte | LoadStoreWidth::Half | LoadStoreWidth::Word => {
-                        entry.signed = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            Instruction::Branch {
-                src1,
-                src2,
-                cond,
-                offset,
-            } => {
-                entry.rs1 = src1 as u8;
-                entry.rs2 = src2 as u8;
-                entry.imm = offset as i64 as u64;
-                entry.read_register1 = src1 != 0;
-                entry.read_register2 = src2 != 0;
-
-                match cond {
-                    Comparison::Equal => {
-                        entry.op_beq = true;
-                    }
-                    Comparison::NotEqual => {
-                        entry.op_beq = true;
-                        entry.mp_selector = true; // Inverted
-                    }
-                    Comparison::LessThan => {
-                        entry.op_blt = true;
-                        entry.signed = true;
-                    }
-                    Comparison::LessThanUnsigned => {
-                        entry.op_blt = true;
-                    }
-                    Comparison::GreaterOrEqual => {
-                        entry.op_blt = true;
-                        entry.signed = true;
-                        entry.mp_selector = true; // Inverted
-                    }
-                    Comparison::GreaterOrEqualUnsigned => {
-                        entry.op_blt = true;
-                        entry.mp_selector = true; // Inverted
-                    }
-                }
-            }
-
-            Instruction::LoadUpperImm { dst, imm } => {
-                entry.op_add = true;
-                entry.rd = dst as u8;
-                entry.rs1 = 0;
-                entry.rs2 = 0;
-                // LUI immediate is sign-extended to 64 bits
-                entry.imm = (imm as i32) as i64 as u64;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-            }
-
-            Instruction::AddUpperImmToPc { dst, imm } => {
-                entry.op_add = true;
-                entry.rd = dst as u8;
-                // Per spec: AUIPC is represented as ADDI rd, x255, imm
-                // x255 is the virtual register holding PC
-                entry.rs1 = 255;
-                entry.read_register1 = true; // rs1 ≠ 0
-                // AUIPC immediate is sign-extended to 64 bits
-                entry.imm = (imm as i32) as i64 as u64;
-                if dst != 0 {
-                    entry.write_register = true;
-                }
-            }
-
-            Instruction::CSR { .. } => {
-                // CSR instructions are executed as no-ops by the VM (see
-                // executor Instruction::CSR arm returning dst_val: 0,
-                // src1/2_val: 0). Mirror that here by treating them as
-                // `ADDI x0, x0, 0` — same pattern as `Fence`. This sets
-                // `op_add=true` so CM54's multiplicity is non-zero and the
-                // CPU's PC-update Memw sender fires.
-                entry.op_add = true;
-            }
-
-            Instruction::EcallEbreak => {
-                entry.op_ecall = true;
-                entry.rs1 = 17; // a7 (syscall number)
-                entry.read_register1 = true; // M1 reads a7 → rv1 = syscall number
-                // rs2 and rd default to 0 per spec; read_register2 and write_register remain false.
-                // HALT/COMMIT chips access registers via direct MEMW interactions.
-            }
-
-            Instruction::Fence => {
-                // Per spec, FENCE is a no-op interpreted as ADDI x0, x0, 0.
-                entry.op_add = true;
-            }
-        }
-
-        entry
-    }
-
-    /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(entry: &mut Self, arith_op: ArithOp) {
-        match arith_op {
-            ArithOp::Add => {
-                entry.op_add = true;
-            }
-            ArithOp::Sub => {
-                entry.op_sub = true;
-            }
-            ArithOp::Xor => entry.op_xor = true,
-            ArithOp::Or => entry.op_or = true,
-            ArithOp::And => entry.op_and = true,
-            ArithOp::ShiftLeftLogical => {
-                entry.op_shift = true;
-                // mp_selector = 0 for left shift
-            }
-            ArithOp::ShiftRightLogical => {
-                entry.op_shift = true;
-                entry.mp_selector = true; // Right shift
-            }
-            ArithOp::ShiftRightArith => {
-                entry.op_shift = true;
-                entry.mp_selector = true;
-                entry.signed = true;
-            }
-            ArithOp::SetLessThan => {
-                entry.op_slt = true;
-                entry.signed = true;
-            }
-            ArithOp::SetLessThanU => {
-                entry.op_slt = true;
-            }
-            ArithOp::Mul => {
-                entry.op_mul = true;
-                entry.mp_selector = true;
-                entry.signed = true;
-            }
-            ArithOp::MulHigh => {
-                entry.op_mul = true;
-                entry.muldiv_selector = true;
-                entry.mp_selector = true; // both operands signed for MULH
-                entry.signed = true;
-            }
-            ArithOp::MulHighSignedUnsigned => {
-                entry.op_mul = true;
-                entry.muldiv_selector = true;
-                // mp_selector = false (default): rhs is unsigned for MULHSU
-                entry.signed = true;
-            }
-            ArithOp::MulHighUnsigned => {
-                entry.op_mul = true;
-                entry.muldiv_selector = true;
-            }
-            ArithOp::Div => {
-                entry.op_divrem = true;
-                entry.signed = true;
-            }
-            ArithOp::DivUnsigned => {
-                entry.op_divrem = true;
-            }
-            ArithOp::Remainder => {
-                entry.op_divrem = true;
-                entry.muldiv_selector = true;
-                entry.signed = true;
-            }
-            ArithOp::RemainderUnsigned => {
-                entry.op_divrem = true;
-                entry.muldiv_selector = true;
-            }
-        }
-    }
-
-    /// Helper to set memory width flags (exclusive encoding per spec).
-    ///
-    /// Memory width uses exclusive flags ("exactly N bytes"):
-    /// - 1 byte: no flags
-    /// - 2 bytes: memory_2bytes = true
-    /// - 4 bytes: memory_4bytes = true
-    /// - 8 bytes: memory_8bytes = true
-    fn set_memory_width(entry: &mut Self, width: LoadStoreWidth) {
-        match width {
-            LoadStoreWidth::Byte | LoadStoreWidth::ByteUnsigned => {
-                // 1 byte - no flags set
-            }
-            LoadStoreWidth::Half | LoadStoreWidth::HalfUnsigned => {
-                entry.memory_2bytes = true;
-            }
-            LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => {
-                entry.memory_4bytes = true;
-            }
-            LoadStoreWidth::DoubleWord => {
-                entry.memory_8bytes = true;
-            }
+            imm: imm_from_instruction(instruction),
+            fields: ShrunkDecode::from_instruction(instruction, instruction_length),
         }
     }
 }
@@ -853,3 +836,19 @@ impl std::hash::Hasher for FxHasher {
 
 /// `HashMap` keyed with [`FxHasher`].
 pub type FxHashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// The fully sign-extended 64-bit immediate for an instruction (0 when none).
+fn imm_from_instruction(instruction: Instruction) -> u64 {
+    match instruction {
+        Instruction::ArithImm { imm, .. } | Instruction::ArithImmW { imm, .. } => imm as i64 as u64,
+        Instruction::JumpAndLink { offset, .. }
+        | Instruction::JumpAndLinkRegister { offset, .. }
+        | Instruction::Store { offset, .. }
+        | Instruction::Load { offset, .. }
+        | Instruction::Branch { offset, .. } => offset as i64 as u64,
+        Instruction::LoadUpperImm { imm, .. } | Instruction::AddUpperImmToPc { imm, .. } => {
+            (imm as i32) as i64 as u64
+        }
+        _ => 0,
+    }
+}

@@ -11,14 +11,19 @@ use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
+use math::traits::AsBytes;
 
+use crate::config::FriLayerMerkleTreeBackend;
 use crate::domain::Domain;
+use crate::fri::fri_commitment::FriLayer;
+use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::trace::LDETraceTable;
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
@@ -63,6 +68,8 @@ pub fn reset_all_gpu_call_counters() {
     GPU_PARTS_LDE_CALLS.store(0, Ordering::Relaxed);
     GPU_BARY_CALLS.store(0, Ordering::Relaxed);
     GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
+    GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
+    GPU_FRI_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -614,7 +621,7 @@ pub fn gpu_merkle_tree_calls() -> u64 {
 // ============================================================================
 
 /// R2 dispatch counter: incremented once per
-/// [`try_evaluate_parts_on_lde_gpu`] call that actually routed to the GPU.
+/// [`try_evaluate_parts_on_lde_gpu_keep`] call that actually routed to the GPU.
 pub(crate) static GPU_PARTS_LDE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_parts_lde_calls() -> u64 {
     GPU_PARTS_LDE_CALLS.load(Ordering::Relaxed)
@@ -718,102 +725,10 @@ where
     out
 }
 
-/// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
-/// coefficient parts). Returns the LDE evaluations as `Vec<Vec<FieldElement<E>>>`
-/// of length `lde_size` per part on success, `None` to fall through to the CPU
-/// path. Used by `round_2_compute_composition_polynomial` in the
-/// `number_of_parts > 2` branch.
-///
-/// Inputs are immutable (`&[&[FieldElement<E>]]`) and outputs are fresh, so
-/// there is no `restore_columns_on_err` needed. `Err` just returns `None`
-/// and the caller's coefficient slices are left untouched.
-pub(crate) fn try_evaluate_parts_on_lde_gpu<F, E>(
-    parts_coefs: &[&[FieldElement<E>]],
-    blowup_factor: usize,
-    domain_size: usize,
-    offset: &FieldElement<F>,
-) -> Option<Vec<Vec<FieldElement<E>>>>
-where
-    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
-{
-    if parts_coefs.is_empty() {
-        return Some(Vec::new());
-    }
-    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
-        return None;
-    }
-    let lde_size = domain_size.checked_mul(blowup_factor)?;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    let m = parts_coefs.len();
-
-    // Weights: `offset^k` for k in 0..domain_size. F is Goldilocks by check above.
-    let mut weights_u64 = Vec::with_capacity(domain_size);
-    let mut w = FieldElement::<F>::one();
-    for _ in 0..domain_size {
-        // SAFETY: F == Goldilocks per TypeId check. FieldElement<Gl> is
-        // #[repr(transparent)] over u64.
-        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
-        weights_u64.push(v);
-        w *= offset;
-    }
-
-    // Pack parts into per-part `3 * domain_size` u64 buffers (zero-padded).
-    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
-    for part in parts_coefs.iter() {
-        let mut buf = vec![0u64; 3 * domain_size];
-        let len = part.len().min(domain_size);
-        // SAFETY: E == Ext3; backing is `[FieldElement<Gl>; 3]` = `[u64; 3]`.
-        let src_ptr = part.as_ptr() as *const u64;
-        let src_len = len.checked_mul(3).expect("part src len overflow");
-        let src = unsafe { from_raw_parts(src_ptr, src_len) };
-        buf[..src_len].copy_from_slice(src);
-        part_bufs.push(buf);
-    }
-    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
-
-    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
-        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
-        .collect();
-    let gpu_result = {
-        let mut out_slices: Vec<&mut [u64]> = outputs
-            .iter_mut()
-            .map(|o| {
-                let ptr = o.as_mut_ptr() as *mut u64;
-                let byte_len = lde_size.checked_mul(3).expect("ext3 out len overflow");
-                // SAFETY: E == Ext3 per TypeId check; Vec<FieldElement<E>> of
-                // length `lde_size` is layout-equivalent to `[u64; 3 * lde_size]`.
-                unsafe { from_raw_parts_mut(ptr, byte_len) }
-            })
-            .collect();
-        math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
-            &input_slices,
-            domain_size,
-            blowup_factor,
-            &weights_u64,
-            &mut out_slices,
-        )
-    };
-    if gpu_result.is_err() {
-        // Outputs are local and dropped on return; caller's inputs are
-        // immutable, so no restore is needed.
-        return None;
-    }
-    GPU_PARTS_LDE_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(outputs)
-}
-
 /// R2 GPU dispatch: build the composition-polynomial Merkle tree from the
-/// host-side ext3 LDE eval Vecs produced by [`try_evaluate_parts_on_lde_gpu`]
-/// (or the CPU path). Uses the same row-pair leaf pattern as the CPU
+/// host-side ext3 LDE eval Vecs produced by
+/// [`try_evaluate_parts_on_lde_gpu_keep`] (or the CPU path). Uses the same
+/// row-pair leaf pattern as the CPU
 /// `commit_composition_polynomial`: each leaf hashes 2 consecutive
 /// bit-reversed rows.
 ///
@@ -1002,4 +917,455 @@ where
 
     let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
     Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+// ============================================================================
+// R2 keep-handle variant, R4 DEEP composition, FRI commit dispatches
+// ============================================================================
+
+/// R4 DEEP-composition dispatch counter.
+pub(crate) static GPU_DEEP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_deep_calls() -> u64 {
+    GPU_DEEP_CALLS.load(Ordering::Relaxed)
+}
+
+/// FRI commit-phase dispatch counter (one per `try_fri_commit_gpu` call,
+/// not per layer).
+pub(crate) static GPU_FRI_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_fri_calls() -> u64 {
+    GPU_FRI_CALLS.load(Ordering::Relaxed)
+}
+
+/// Test-only: schedule the Nth upcoming FRI fold call (1 = first, 2 =
+/// second, ...) to return Err, exercising the snapshot-restore path in
+/// [`try_fri_commit_gpu`]. Pass -1 to disable. Production default is -1.
+/// Only available with the `test-cuda-faults` feature.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_fri_fold_fault(n_calls_until_err: i64) {
+    math_cuda::fri::FAULT_FOLDS_REMAINING_UNTIL_ERR.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
+/// coefficient parts). Returns both the host LDE eval Vecs (needed for the
+/// R2 Merkle commit and R3 OOD path) and a device-resident `GpuLdeExt3`
+/// handle to the same de-interleaved buffer, so R4 DEEP can skip the
+/// `num_parts * 3 * lde_size * 8` byte H2D.
+pub(crate) fn try_evaluate_parts_on_lde_gpu_keep<F, E>(
+    parts_coefs: &[&[FieldElement<E>]],
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if parts_coefs.is_empty() {
+        return None;
+    }
+    if !domain_size.is_power_of_two() || !blowup_factor.is_power_of_two() {
+        return None;
+    }
+    let lde_size = domain_size.checked_mul(blowup_factor)?;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    let m = parts_coefs.len();
+
+    let mut weights_u64 = Vec::with_capacity(domain_size);
+    let mut w = FieldElement::<F>::one();
+    for _ in 0..domain_size {
+        // SAFETY: F == Goldilocks per TypeId check.
+        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
+        weights_u64.push(v);
+        w *= offset;
+    }
+
+    let mut part_bufs: Vec<Vec<u64>> = Vec::with_capacity(m);
+    for part in parts_coefs.iter() {
+        let mut buf = vec![0u64; 3 * domain_size];
+        let len = part.len().min(domain_size);
+        // SAFETY: E == Ext3 per TypeId check; backing is `[u64; 3]`.
+        let src_ptr = part.as_ptr() as *const u64;
+        let src_len = len.checked_mul(3).expect("part src len overflow");
+        let src = unsafe { from_raw_parts(src_ptr, src_len) };
+        buf[..src_len].copy_from_slice(src);
+        part_bufs.push(buf);
+    }
+    let input_slices: Vec<&[u64]> = part_bufs.iter().map(|v| v.as_slice()).collect();
+
+    let mut outputs: Vec<Vec<FieldElement<E>>> = (0..m)
+        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+        .collect();
+    let handle_result = {
+        let mut out_slices: Vec<&mut [u64]> = outputs
+            .iter_mut()
+            .map(|o| {
+                let ptr = o.as_mut_ptr() as *mut u64;
+                let byte_len = lde_size.checked_mul(3).expect("ext3 out len overflow");
+                // SAFETY: E == Ext3; Vec of `lde_size` ext3 is `3*lde_size` u64s.
+                unsafe { from_raw_parts_mut(ptr, byte_len) }
+            })
+            .collect();
+        math_cuda::lde::evaluate_poly_coset_batch_ext3_into_keep(
+            &input_slices,
+            domain_size,
+            blowup_factor,
+            &weights_u64,
+            &mut out_slices,
+        )
+    };
+    let handle = match handle_result {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    GPU_PARTS_LDE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((outputs, handle))
+}
+
+/// Reinterpret a slice of ext3 `FieldElement`s as a raw `&[u64]` of length
+/// `3 * col.len()`. Caller must have established `E == Ext3` (TypeId check).
+///
+/// SAFETY: `E == Degree3GoldilocksExtensionField` so each element is
+/// `[FieldElement<Gl>; 3]` = `[u64; 3]`.
+unsafe fn ext3_slice_to_u64<E: IsField>(col: &[FieldElement<E>]) -> &[u64] {
+    let len = col.len().checked_mul(3).expect("ext3 u64 len overflow");
+    let ptr = col.as_ptr() as *const u64;
+    unsafe { from_raw_parts(ptr, len) }
+}
+
+/// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated
+/// `Vec<FieldElement<E>>` of length `n`. Caller must have established
+/// `E == Ext3`.
+fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
+where
+    E: IsField + 'static,
+{
+    type Gl = GoldilocksField;
+    type Ext3 = Degree3GoldilocksExtensionField;
+    assert_eq!(TypeId::of::<E>(), TypeId::of::<Ext3>());
+    assert!(raw.len().is_multiple_of(3));
+    let n = raw.len() / 3;
+    let mut out: Vec<FieldElement<E>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v: FieldElement<Ext3> = FieldElement::<Ext3>::new([
+            FieldElement::<Gl>::from_raw(raw[i * 3]),
+            FieldElement::<Gl>::from_raw(raw[i * 3 + 1]),
+            FieldElement::<Gl>::from_raw(raw[i * 3 + 2]),
+        ]);
+        // SAFETY: TypeId-checked above. E == Ext3, identical layout.
+        out.push(unsafe { transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&v) });
+    }
+    out
+}
+
+/// R4 GPU dispatch: per-row DEEP composition over the full LDE domain.
+/// Reuses the device-resident main + (optional) aux LDE handles from R1
+/// and, when supplied, the device-resident composition-parts LDE handle
+/// from the R2 `_keep` path.
+///
+/// Returns the `lde_size` ext3 evaluations of the DEEP polynomial on
+/// success, or `None` to let the caller run its existing CPU loop. The
+/// caller's `inv_denoms` must be `inv_denoms[0..lde_size]` for the H-term
+/// and `inv_denoms[(1+k)*lde_size..(2+k)*lde_size]` for trace term k
+/// (matching `compute_deep_composition_poly_evaluations`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_deep_composition_gpu<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    parts_dev: Option<&math_cuda::lde::GpuLdeExt3>,
+    parts_host: &[Vec<FieldElement<E>>],
+    h_ood: &[FieldElement<E>],
+    trace_ood_columns: &[Vec<FieldElement<E>>],
+    composition_poly_gammas: &[FieldElement<E>],
+    trace_terms_gammas: &[Vec<FieldElement<E>>],
+    inv_denoms: &[FieldElement<E>],
+    num_eval_points: usize,
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let lde_size = main.lde_size;
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if !lde_size.is_power_of_two() {
+        return None;
+    }
+    let num_main = main.m;
+    let aux_handle = lde_trace.gpu_aux();
+    let num_aux = aux_handle.map(|a| a.m).unwrap_or(0);
+    let num_total_cols = num_main + num_aux;
+    let num_parts = composition_poly_gammas.len();
+    if h_ood.len() != num_parts {
+        return None;
+    }
+    if trace_ood_columns.len() != num_total_cols
+        || trace_ood_columns.iter().any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    if trace_terms_gammas.len() != num_total_cols
+        || trace_terms_gammas
+            .iter()
+            .any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    let expected_inv_denoms = lde_size.checked_mul(1 + num_eval_points)?;
+    if inv_denoms.len() != expected_inv_denoms {
+        return None;
+    }
+
+    // Validate the host parts when we don't have a device handle, since
+    // the math-cuda call will assert these.
+    if parts_dev.is_none() {
+        if parts_host.len() != num_parts {
+            return None;
+        }
+        if parts_host.iter().any(|p| p.len() != lde_size) {
+            return None;
+        }
+    } else if let Some(p) = parts_dev
+        && (p.m != num_parts || p.lde_size != lde_size)
+    {
+        return None;
+    }
+
+    // Pack host buffers. SAFETY for ext3 transmutes: E == Ext3 by TypeId check.
+    let h_ood_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(h_ood) };
+
+    // trace_ood: num_total_cols * num_eval_points * 3 (ext3 interleaved,
+    // (col * num_eval_points + k) layout).
+    let mut trace_ood_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_ood_columns {
+        let slice = unsafe { ext3_slice_to_u64::<E>(col) };
+        trace_ood_raw.extend_from_slice(slice);
+    }
+
+    let gammas_h_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(composition_poly_gammas) };
+
+    let mut gammas_tr_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_terms_gammas {
+        let slice = unsafe { ext3_slice_to_u64::<E>(col) };
+        gammas_tr_raw.extend_from_slice(slice);
+    }
+
+    // inv_denoms is laid out as (1 + num_eval_points) blocks of lde_size
+    // each. Split the H-term block and the trace blocks (concatenated).
+    let inv_h_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(&inv_denoms[0..lde_size]) };
+    let inv_t_raw: &[u64] =
+        unsafe { ext3_slice_to_u64::<E>(&inv_denoms[lde_size..lde_size * (1 + num_eval_points)]) };
+
+    // domain_size == lde_size here: R4 DEEP evaluates at every LDE point
+    // (Plonky3-style direct LDE). Calling the kernel with row_stride = 1
+    // makes its `row = i * row_stride` index every row.
+    let domain_size_kernel = lde_size;
+    let row_stride_kernel = 1usize;
+
+    // Pack parts host path if no device handle.
+    let parts_host_packed: Vec<u64>;
+    let result = if let Some(parts) = parts_dev {
+        math_cuda::deep::deep_composition_ext3_with_dev_parts(
+            main,
+            aux_handle,
+            parts,
+            h_ood_raw,
+            &trace_ood_raw,
+            gammas_h_raw,
+            &gammas_tr_raw,
+            inv_h_raw,
+            inv_t_raw,
+            num_parts,
+            num_main,
+            num_aux,
+            num_eval_points,
+            row_stride_kernel,
+            domain_size_kernel,
+        )
+    } else {
+        // De-interleave each ext3 part column into 3 contiguous base-field
+        // slabs of length `lde_size` (the math-cuda kernel reads the parts
+        // buffer with layout `h_lde[(p*3 + k) * lde_stride + r]`).
+        let mut packed = vec![0u64; num_parts * 3 * lde_size];
+        for (p, col) in parts_host.iter().enumerate() {
+            let slice = unsafe { ext3_slice_to_u64::<E>(col) };
+            for (r, chunk) in slice.chunks_exact(3).enumerate() {
+                packed[(p * 3) * lde_size + r] = chunk[0];
+                packed[(p * 3 + 1) * lde_size + r] = chunk[1];
+                packed[(p * 3 + 2) * lde_size + r] = chunk[2];
+            }
+        }
+        parts_host_packed = packed;
+        math_cuda::deep::deep_composition_ext3(
+            main,
+            aux_handle,
+            &parts_host_packed,
+            h_ood_raw,
+            &trace_ood_raw,
+            gammas_h_raw,
+            &gammas_tr_raw,
+            inv_h_raw,
+            inv_t_raw,
+            num_parts,
+            num_main,
+            num_aux,
+            num_eval_points,
+            row_stride_kernel,
+            domain_size_kernel,
+        )
+    };
+
+    let deep_raw = match result {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    debug_assert_eq!(deep_raw.len(), lde_size * 3);
+    Some(u64_to_ext3_vec::<E>(&deep_raw))
+}
+
+/// R4 FRI dispatch: drive the full FRI commit phase device-side. Mirrors
+/// [`crate::fri::commit_phase_from_evaluations`]: per-layer transcript
+/// ping-pong (sample zeta, fold, build Merkle tree, append root).
+///
+/// Returns `None` on any failure (precondition miss or cudarc error
+/// mid-loop). On a mid-loop failure the transcript is restored from the
+/// snapshot taken at entry, so the caller's CPU fallback path runs against
+/// a byte-identical pre-GPU transcript state and produces the same proof
+/// it would have produced had the GPU never been tried. This requires the
+/// concrete transcript type to support snapshot semantics via `Clone`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_fri_commit_gpu<F, E, T>(
+    number_layers: usize,
+    evals: &[FieldElement<E>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> Option<(
+    FieldElement<E>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n0 = evals.len();
+    if n0 != domain_size || !n0.is_power_of_two() || n0 < 2 {
+        return None;
+    }
+    if n0 < gpu_lde_threshold() {
+        return None;
+    }
+
+    // Pre-compute inv_twiddles on CPU (matches commit_phase_from_evaluations)
+    // and pack to u64 before any transcript mutation, so on H2D / state
+    // construction failure the caller's transcript is untouched.
+    let inv_twiddles = compute_coset_twiddles_inv::<F>(coset_offset, domain_size);
+    let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
+    for t in &inv_twiddles {
+        // SAFETY: F == Goldilocks per TypeId check; FieldElement<Gl> is
+        // #[repr(transparent)] over u64.
+        let v: u64 = unsafe { *(t.value() as *const _ as *const u64) };
+        inv_tw_u64.push(v);
+    }
+
+    // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
+    let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
+
+    let mut state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    // Snapshot the transcript before any sampling. On a cudarc failure
+    // mid-loop we restore from this snapshot and return None, so the CPU
+    // fallback in `commit_phase_from_evaluations` starts from a byte-
+    // identical transcript and produces the same proof it would have
+    // produced had this dispatch never been called.
+    let transcript_snapshot = transcript.clone();
+
+    let num_committed_layers = number_layers.saturating_sub(1);
+    let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
+        Vec::with_capacity(num_committed_layers);
+
+    for _ in 0..num_committed_layers {
+        // <<<< Receive challenge zeta_k
+        let zeta: FieldElement<E> = transcript.sample_field_element();
+        // SAFETY: E == Ext3.
+        let zeta_ptr = &zeta as *const FieldElement<E> as *const u64;
+        let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
+
+        let (root, layer_evals_u64, nodes_bytes) = match state.fold_and_commit_layer(zeta_raw) {
+            Ok(v) => v,
+            Err(_) => {
+                *transcript = transcript_snapshot.clone();
+                return None;
+            }
+        };
+
+        // Build the FriLayer: ext3 evals + Merkle tree from precomputed nodes.
+        let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
+
+        debug_assert!(nodes_bytes.len().is_multiple_of(32));
+        let nodes: Vec<[u8; 32]> = nodes_bytes
+            .chunks_exact(32)
+            .map(|c| c.try_into().expect("chunks_exact(32) yields 32 bytes"))
+            .collect();
+        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_precomputed_nodes(nodes)
+            .expect("FRI commit: precomputed nodes form a valid tree");
+
+        fri_layer_list.push(FriLayer::new(&evaluation, merkle_tree));
+
+        // >>>> Send commitment: [p_k]
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&root);
+        transcript.append_bytes(&root_arr);
+    }
+
+    // <<<< Receive challenge zeta_{n-1}
+    let zeta_last: FieldElement<E> = transcript.sample_field_element();
+    let zeta_ptr = &zeta_last as *const FieldElement<E> as *const u64;
+    let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
+
+    let last_raw = match state.fold_final(zeta_raw) {
+        Ok(v) => v,
+        Err(_) => {
+            *transcript = transcript_snapshot;
+            return None;
+        }
+    };
+    let last_vec = u64_to_ext3_vec::<E>(&last_raw);
+    let last_value = last_vec
+        .into_iter()
+        .next()
+        .expect("fold_final returns 1 elt");
+
+    // >>>> Send value: p_n
+    transcript.append_field_element(&last_value);
+
+    GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((last_value, fri_layer_list))
 }

@@ -6,7 +6,7 @@
 //! - Use multi_prove/multi_verify with bus interactions
 //!
 //! Wired buses:
-//! - CPU sends AND_BYTE, OR_BYTE, XOR_BYTE to Bitwise (×8 each)
+//! - Byte-level AND/OR/XOR lookups are routed through BYTE_ALU
 //! - CPU sends MSB16 to Bitwise (for rv1_sign_bit, arg2_sign_bit when word_instr=1)
 //! - CPU sends MSB8 to Bitwise (for res_sign_bit when word_instr=1)
 //! - CPU sends ZERO to Bitwise (for is_equal when BEQ=1)
@@ -59,6 +59,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
 
     // Build air_trace_pairs for all tables
@@ -109,6 +110,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -147,6 +149,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         true,
         &page_configs,
         &vm_proof.table_counts,
+        None,
         None,
     );
     let air_refs = airs.air_refs();
@@ -803,8 +806,8 @@ fn test_prove_elfs_test_shift_8() {
 }
 
 // Tests that right shift by 0 bits (srli a0, a2, 0) is provable.
-// Regression test for SHIFT-C4: previously C4 sent AND_BYTE[bit_shift; 256, 15] when
-// shift=0, which is out of AND_BYTE's byte range (0-255), making the proof fail.
+// Regression test for SHIFT-C4: previously the shift mask lookup could send 256
+// as a byte input when shift=0, making the proof fail.
 #[test]
 fn test_prove_elfs_srli_one_zero() {
     let (elf, logs, instructions) = run_asm_elf("srli_one_zero");
@@ -1077,7 +1080,7 @@ fn test_prove_elfs_keccak_multi_call() {
 ///
 /// Without the ARE_BYTES range checks on addr(0..7), an attacker could keep
 /// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
-/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// address as a field element while setting addr(0)=0 (passing the BYTE_ALU
 /// alignment check) and folding the carry into addr(1) as a non-byte
 /// FE-element. This test asserts that mutating addr(1) to a non-byte value
 /// unbalances the verifier's bus checks and the proof is rejected.
@@ -1164,6 +1167,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1179,6 +1183,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         true,
         &wrong_configs,
         &table_counts,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1210,7 +1215,7 @@ fn test_verify_rejects_tampered_public_output() {
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed for test_commit_4");
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None, None)
             .expect("Valid commit proof should verify"),
         "Baseline proof should verify before tampering"
     );
@@ -1222,8 +1227,9 @@ fn test_verify_rejects_tampered_public_output() {
         ..vm_proof
     };
 
-    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None)
-        .expect("Verifier should not error on tampered public output");
+    let verified =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None)
+            .expect("Verifier should not error on tampered public output");
     assert!(
         !verified,
         "Verifier should reject proof when VmProof.public_output is tampered"
@@ -1910,6 +1916,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1924,6 +1931,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &verifier_configs,
         &table_counts,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -1974,6 +1982,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1988,6 +1997,7 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &wrong_configs,
         &table_counts,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -2073,6 +2083,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2087,6 +2098,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &verifier_configs,
         &table_counts,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
@@ -2148,7 +2160,7 @@ fn test_verify_rejects_zero_table_counts() {
         .expect("Prover should succeed on valid program");
 
     assert!(
-        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None)
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options, None, None)
             .expect("Verification should not error on valid proof"),
         "Valid proof should verify"
     );
@@ -2165,11 +2177,16 @@ fn test_verify_rejects_zero_table_counts() {
             shift: 0,
             branch: 0,
             memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
         },
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2190,7 +2207,8 @@ fn test_verify_rejects_zero_cpu_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2211,7 +2229,8 @@ fn test_verify_rejects_zero_memw_count() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(result.is_err(), "Got {:?}", result);
 }
 
@@ -2233,8 +2252,12 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
         memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, None);
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 8);
@@ -2338,7 +2361,8 @@ fn test_verify_rejects_inflated_table_counts() {
         ..vm_proof
     };
 
-    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None);
+    let result =
+        crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options, None, None);
     assert!(
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",

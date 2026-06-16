@@ -292,6 +292,24 @@ fn test_ethrex() {
     );
 }
 
+/// Executes a stateless ethrex block containing a single (plain ETH transfer)
+/// transaction. Execution only — no proving — against the ethrex guest ELF
+/// built from the same pinned ethrex revision as the native reference. The
+/// fixture is a serialized `ProgramInput`; see `tests/README.md` for provenance.
+#[test]
+fn test_ethrex_simple_tx() {
+    use guest_program::{execution::execution_program, input::ProgramInput};
+    use rkyv::rancor::Error;
+    let inputs = std::fs::read("tests/ethrex_simple_tx.bin").unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input).unwrap();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ethrex.elf",
+        output.encode(),
+        inputs,
+    );
+}
+
 #[ignore = "Ignored until the vm is fast enough to run this test"]
 #[test]
 fn test_ckzg() {
