@@ -254,9 +254,9 @@ for some $r in NN$ to be fixed later.
 
 We rewrite the relations to find
 $
-  q'_0 &= #`r` + p^(-1) dot (lambda (x_G - x_A) - y_G + y_A),\
-  q'_1 &= #`r` + p^(-1) dot (lambda^2 - x_A - x_G - x_R),\
-  q_2  &= #`r` + p^(-1) dot (lambda (x_A - x_R) - y_A - y_R)\
+  q'_0 &= #`r` + (lambda (x_G - x_A) - y_G + y_A)/ p,\
+  q'_1 &= #`r` + (lambda^2 - x_A - x_G - x_R)/ p,\
+  q_2  &= #`r` + (lambda (x_A - x_R) - y_A - y_R)/ p\
 $
 from which we can conclude that $q'_0, q_2 in (#`r`-p, #`r`+p)$ and $q'_1 in (#`r`-3, #`r` + p)$.
 When doubling, only the formulae for $lambda$ and $x_R$ are different:
@@ -277,8 +277,8 @@ $
 ]
 Reordering yields
 $
-  q''_0 &= #`r` + p^(-1) dot (2lambda y_A - 3x_A^2 ),\
-  q''_1 &= #`r` + p^(-1) dot (lambda^2 - 2x_A - x_R ).\
+  q''_0 &= #`r` + (2lambda y_A - 3x_A^2)/p,\
+  q''_1 &= #`r` + (lambda^2 - 2x_A - x_R)/p.\
 $
 where $q''_0 in (#`r`-3p, #`r` + 2p)$, and $q''_1 = (#`r`-3, #`r` + p)$.
 We can now leverage the `op`-flag to merge the relations for $lambda$ and $x_R$ into
@@ -288,8 +288,8 @@ $
 $
 which yields
 $
-  q_0 &= #`r` + p^(-1) dot (#`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2)),\
-  q_1 &= #`r` + p^(-1) dot ((lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A)).\
+  q_0 &= #`r` + (#`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2))/p,\
+  q_1 &= #`r` + (lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A))/p.\
 $
 with $q_0 in (r-3p, r+2p)$ and $q_1 in (r-3, r+p)$.
 By selecting $r = 3p$, we ensure $q_0 in (0, 5p)$, #box[$q_1 in (3p-3, 4p)$] and $q_2 in (2p, 4p)$ are non-negative for all inputs.
