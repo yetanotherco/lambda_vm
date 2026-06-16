@@ -202,14 +202,14 @@ class CastExpr:
 class MulExpr:
     factors: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             reporter.error(f"Multiplication of non-scalar types: {self!r}")
             return DEFAULT_TYPE
         elif not isinstance(a, Range):
-            return [self.type_match(x, b) for x in a]
+            return [self.typecheck_binop(x, b) for x in a]
         elif isinstance(b, list):
-            return self.type_match(b, a)
+            return self.typecheck_binop(b, a)
         else:
             extrema = [x * y for x in [a.low, a.high] for y in [b.low, b.high]]
             return Range(min(extrema), max(extrema))
@@ -218,7 +218,7 @@ class MulExpr:
         reporter.asserts(self.factors != [], f"Empty product: {self!r}")
         t: Type = Range.const(1)
         for f in self.factors:
-            t = self.type_match(t, f.typecheck(env))
+            t = self.typecheck_binop(t, f.typecheck(env))
         return t
 
 
@@ -226,12 +226,12 @@ class MulExpr:
 class AddExpr:
     terms: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Adding array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in b]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Adding of scalar and array types {self!r}")
             return DEFAULT_TYPE
@@ -244,7 +244,7 @@ class AddExpr:
             return Range.const(0)
         t: Type = self.terms[0].typecheck(env)
         for term in self.terms[1:]:
-            t = self.type_match(t, term.typecheck(env))
+            t = self.typecheck_binop(t, term.typecheck(env))
         return t
 
 
@@ -253,12 +253,12 @@ class SubExpr:
     head: Expr
     subs: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Subtracting array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in a]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Subtraction of scalar and array types {self!r}")
             return DEFAULT_TYPE
@@ -273,7 +273,7 @@ class SubExpr:
                 return t
             return Range(-t.high, -t.low)
         for term in self.subs:
-            t = self.type_match(t, term.typecheck(env))
+            t = self.typecheck_binop(t, term.typecheck(env))
         return t
 
 
@@ -324,12 +324,12 @@ class SumExpr:
     iter: "Iter"
     terms: Expr
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Summing array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in b]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Summing of scalar and array types {self!r}")
             return DEFAULT_TYPE
@@ -339,7 +339,7 @@ class SumExpr:
     def typecheck(self, env: Environment) -> Type:
         t: Type = Range.const(0)
         for tc in self.iter.typecheck(env, lambda e: [self.terms.typecheck(e)]):
-            t = self.type_match(t, tc)
+            t = self.typecheck_binop(t, tc)
         return t
 
 
