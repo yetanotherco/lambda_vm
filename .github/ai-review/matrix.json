@@ -8,14 +8,14 @@
       },
       {
         "id": "glm-correctness",
-        "model": "z-ai/glm-5.1",
+        "model": "z-ai/glm-5.2",
         "prompt": "correctness"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "deepseek-verifier",
-        "model": "deepseek/deepseek-v4-pro",
+        "id": "kimi-verifier",
+        "model": "moonshotai/kimi-k2.7-code",
         "prompt": "verify"
       }
     ]
@@ -29,7 +29,7 @@
       },
       {
         "id": "glm-maintainability",
-        "model": "z-ai/glm-5.1",
+        "model": "z-ai/glm-5.2",
         "prompt": "maintainability"
       },
       {
@@ -40,8 +40,8 @@
     ],
     "verifier_lanes": [
       {
-        "id": "glm-critical-verifier",
-        "model": "z-ai/glm-5.1",
+        "id": "kimi-critical-verifier",
+        "model": "moonshotai/kimi-k2.7-code",
         "prompt": "verify-critical"
       }
     ]
