@@ -23,7 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
 // =========================================================================
@@ -354,9 +354,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 5. Alignment: addr[0] & 7 = 0, which enforces addr % 8 == 0.
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::MU),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::Packed {
                 start_column: cols::addr(0),
                 packing: Packing::Direct,

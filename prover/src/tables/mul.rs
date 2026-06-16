@@ -27,7 +27,8 @@
 //! - Sender: MSB16 (×2 for sign extraction)
 //! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
 //! - Sender: IS_B20 (×4 for carry range checks)
-//! - Receiver: MUL (×2 for lo and hi results)
+//! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
+//!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
 use std::collections::HashMap;
 
@@ -41,8 +42,14 @@ use stark::trace::TraceTable;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
 };
+
+/// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
+/// range-check sends so they fire once per row-instance.
+fn row_mult() -> Multiplicity {
+    Multiplicity::Sum(cols::MU_LO, cols::MU_HI)
+}
 
 // =========================================================================
 // Column indices for MUL table
@@ -112,10 +119,11 @@ pub mod cols {
     /// raw_product[3]: Intermediate convolution value
     pub const RAW_PRODUCT_3: usize = 23;
 
-    // Multiplicity columns
-    /// μ_lo: multiplicity for lo result lookups
+    // Multiplicity columns. All MUL lookups (CPU MUL/MULH dispatch and dvrm's
+    // internal `d*q` consistency checks) go through the unified `ALU` bus.
+    /// μ_lo: `ALU` bus multiplicity for lo result lookups
     pub const MU_LO: usize = 24;
-    /// μ_hi: multiplicity for hi result lookups
+    /// μ_hi: `ALU` bus multiplicity for hi result lookups
     pub const MU_HI: usize = 25;
 
     /// Total number of columns
@@ -135,6 +143,10 @@ const SIGN_FILL: u64 = 0xFFFF;
 
 /// A single MUL operation to be added to the trace.
 ///
+/// Every operation is dispatched on the unified `ALU` bus (CPU MUL/MULH and
+/// dvrm's internal `d*q` consistency checks); the lo/hi half is selected by
+/// the sender's `flags` byte at lookup time.
+///
 /// Derives Hash and Eq for HashMap-based deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MulOperation {
@@ -148,12 +160,12 @@ pub struct MulOperation {
     pub rhs_signed: bool,
 }
 
-/// Multiplicities for a MUL operation (separate for lo and hi lookups).
+/// Multiplicities for a MUL operation, split by lo/hi result lookup.
 #[derive(Debug, Clone, Default)]
 pub struct MulMultiplicities {
-    /// Count of lookups requesting lo result
+    /// `ALU` bus count requesting lo result
     pub mu_lo: u64,
-    /// Count of lookups requesting hi result
+    /// `ALU` bus count requesting hi result
     pub mu_hi: u64,
 }
 
@@ -342,7 +354,7 @@ pub fn generate_mul_trace(
         data[base + cols::RAW_PRODUCT_2] = FE::from(raw[2]);
         data[base + cols::RAW_PRODUCT_3] = FE::from(raw[3]);
 
-        // Fill multiplicities
+        // Fill multiplicities (ALU bus, lo/hi)
         data[base + cols::MU_LO] = FE::from(multiplicities.mu_lo);
         data[base + cols::MU_HI] = FE::from(multiplicities.mu_hi);
     }
@@ -430,7 +442,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -444,7 +456,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for col in [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -463,7 +475,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -484,7 +496,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * lo[0] - 2^-48 * lo[1] - 2^-32 * lo[2] - 2^-16 * lo[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -518,7 +530,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-32 * hi[0] - 2^-16 * hi[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -564,7 +576,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * hi[0] - 2^-48 * hi[1] - 2^-32 * hi[2] - 2^-16 * hi[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -618,78 +630,62 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MUL receiver for lo result
+    // ALU receivers: every MUL lookup arrives here — CPU
+    // MUL/MULH/MULHSU/MULHU dispatch and dvrm's internal `d*q` consistency.
+    // ALU[lhs, rhs, flags, result] where flags =
+    //   opsel(MUL) + 32*lhs_signed + 64*rhs_signed (+128 for the hi result).
     // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, lo, 0] per spec MUL-C7
+    let mul_flags = |hi: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Constant(alu_op::MUL as i64 + hi),
+            LinearTerm::Column {
+                coefficient: 32,
+                column: cols::LHS_SIGNED,
+            },
+            LinearTerm::Column {
+                coefficient: 64,
+                column: cols::RHS_SIGNED,
+            },
+        ])
+    };
+    // ALU lo (muldiv bit 7 = 0)
     interactions.push(BusInteraction::receiver(
-        BusId::Mul,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_LO),
         vec![
-            // lhs as DWordHL (4 halfwords -> 2 words)
             BusValue::Packed {
                 start_column: cols::LHS_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
             BusValue::Packed {
                 start_column: cols::RHS_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // lo as DWordHL (result)
+            mul_flags(0),
             BusValue::Packed {
                 start_column: cols::LO_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 0 (lo)
-            BusValue::constant(0),
         ],
     ));
-
-    // -------------------------------------------------------------------------
-    // MUL receiver for hi result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, hi, 1] per spec MUL-C8
+    // ALU hi (muldiv bit 7 = 1 => +128)
     interactions.push(BusInteraction::receiver(
-        BusId::Mul,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_HI),
         vec![
-            // lhs as DWordHL
             BusValue::Packed {
                 start_column: cols::LHS_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
             BusValue::Packed {
                 start_column: cols::RHS_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // hi as DWordHL (result)
+            mul_flags(128),
             BusValue::Packed {
                 start_column: cols::HI_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 1 (hi)
-            BusValue::constant(1),
         ],
     ));
 
@@ -707,6 +703,10 @@ pub enum MulConstraintKind {
     LhsSign,
     /// SIGN constraint for rhs: (1 - rhs_signed) * rhs_is_negative = 0
     RhsSign,
+    /// IS_BIT range check on a sign flag column: `x * (1 - x) = 0`. Required
+    /// because `lhs_signed`/`rhs_signed` are used as bus multiplicities, so an
+    /// out-of-range value (e.g. `lhs_signed = 3`) would otherwise be accepted.
+    SignedIsBit(usize),
     /// Raw product convolution formula for index i
     RawProduct(usize),
 }
@@ -754,6 +754,12 @@ impl MulConstraint {
                     .clone();
                 let one = FieldElement::<F>::one();
                 (&one - &rhs_signed) * &rhs_is_neg
+            }
+            MulConstraintKind::SignedIsBit(col) => {
+                // x * (1 - x) = 0
+                let x = step.get_main_evaluation_element(0, col).clone();
+                let one = FieldElement::<F>::one();
+                &x * &(&one - &x)
             }
             MulConstraintKind::RawProduct(i) => {
                 // raw_product[i] = convolution formula
@@ -852,6 +858,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
         match self.kind {
             // (1 - signed) * is_negative is degree 2
             MulConstraintKind::LhsSign | MulConstraintKind::RhsSign => 2,
+            // x * (1 - x) is degree 2
+            MulConstraintKind::SignedIsBit(_) => 2,
             // Raw product: lhs_ext[j] * rhs_ext[idx-j] where each may involve
             // sign_fill * is_negative (degree 1), so product is degree 2
             // But we're summing many degree-2 terms, still degree 2
@@ -878,6 +886,18 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
 pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usize) {
     let mut idx = constraint_idx_start;
     let mut constraints = Vec::new();
+
+    // IS_BIT range checks on the sign flags (used as bus multiplicities).
+    constraints.push(MulConstraint::new(
+        MulConstraintKind::SignedIsBit(cols::LHS_SIGNED),
+        idx,
+    ));
+    idx += 1;
+    constraints.push(MulConstraint::new(
+        MulConstraintKind::SignedIsBit(cols::RHS_SIGNED),
+        idx,
+    ));
+    idx += 1;
 
     // SIGN constraints
     constraints.push(MulConstraint::new(MulConstraintKind::LhsSign, idx));
