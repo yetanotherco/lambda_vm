@@ -10,7 +10,8 @@ Focus on:
 1. **Soundness, security, and correctness**
    - Constraint under-specification, missing bus interactions, trace mistakes
    - VM/executor behavior changes, memory access, privilege or state bugs
-   - Cryptographic misuse, weak randomness, timing-sensitive logic
+   - Obvious transcript/Fiat-Shamir, commitment, challenge-ordering, or
+     witness-soundness drift visible from the changed code
    - Unsafe Rust, panics on reachable inputs, unchecked assumptions
 
 2. **Regression and integration risk**

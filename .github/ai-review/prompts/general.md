@@ -1,7 +1,9 @@
-1. **Security vulnerabilities** - Label by criticality (Critical/High/Medium/Low)
+1. **Soundness and security issues** - Label by criticality (Critical/High/Medium/Low)
    - Rust: unsafe blocks, error handling, panics, memory safety issues
-   - Cryptography: incorrect implementations, timing attacks, weak randomness
-   - VM: instruction handling, memory access, privilege escalation
+   - ZK/prover soundness: incorrect local constraints, missing trace assignments,
+     invalid witness assumptions, inconsistent proving or verification behavior
+   - VM/executor: instruction semantics, memory access, state transitions,
+     inconsistent execution/proving behavior
 
 2. **Potential bugs** - Logic errors, edge cases, incorrect behavior, race conditions
 

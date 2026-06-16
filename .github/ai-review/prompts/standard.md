@@ -11,6 +11,8 @@ Focus on:
 1. **Correctness and regressions**
    - Logic errors, edge cases, changed invariants, incorrect error handling
    - VM, prover, memory, bus, trace, and constraint behavior affected by the diff
+   - If constraints, trace generation, or bus interactions change, check their
+     local consistency against the surrounding code and tests
 
 2. **Tests and observability**
    - Missing tests for new behavior or fixed edge cases

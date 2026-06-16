@@ -43,18 +43,24 @@ certification.
 The standard reviewer focuses on:
 
 - correctness and regressions introduced by the branch
+- local constraint, trace, and bus consistency when those files change
 - missing tests or changed test intent
 - simplicity and maintainability
 - stale comments, stale names, misleading docs, and scope drift
+
+Standard review is allowed to review constraint changes in the PR. It is not a
+proof-system or transcript design audit.
 
 ### Critical
 
 Use critical review when a small change can still have high impact. Size is not
 the deciding factor. Trigger critical review for changes touching:
 
-- prover constraints, trace generation, buses, AIR inclusion, or statements
+- soundness-sensitive prover constraints, trace generation, buses, AIR
+  inclusion, or statements
 - VM, executor, memory, CPU, ALU, load/store, branch, decode, or halt behavior
-- cryptography, hashing, Fiat-Shamir, FRI, Merkle, or randomness
+- hashing, Fiat-Shamir transcripts, FRI, Merkle commitments, challenge
+  derivation, or broader prover/verifier soundness assumptions
 - GPU/CUDA proving paths
 - security-sensitive infra or CI behavior
 - merge-conflict resolutions in high-risk branches
