@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import sys
 import tomllib
@@ -19,10 +20,10 @@ class ErrorReporter:
         self.reported = False
         self.location = [loc]
 
-    def push_context(self, ctx: str):
+    @contextlib.contextmanager
+    def context(self, ctx: str):
         self.location.append(ctx)
-
-    def pop_context(self):
+        yield
         self.location.pop()
 
     def error(self, message: str):
@@ -1028,13 +1029,11 @@ class Chip:
         env = Environment(self.config, {}, typemap)
         for v in self.variables:
             if isinstance(v, VirtualVariable):
-                reporter.push_context(v.name)
-                v.typecheck(env)
-                reporter.pop_context()
+                with reporter.context(v.name):
+                    v.typecheck(env)
         for c in self.constraints:
-            reporter.push_context(repr(c))
-            yield from c.typecheck(env)
-            reporter.pop_context()
+            with reporter.context(repr(c)):
+                yield from c.typecheck(env)
 
     def check_assignment(
         self,
@@ -1064,9 +1063,8 @@ class Chip:
             for sig in c.typecheck(env):
                 # Recurse on templates
                 if isinstance(sig, TemplateSignature) and sig.tag in check_template:
-                    reporter.push_context(repr(c))
-                    check_template[sig.tag](sig.condition, sig.input, sig.output)
-                    reporter.pop_context()
+                    with reporter.context(repr(c)):
+                        check_template[sig.tag](sig.condition, sig.input, sig.output)
 
 
 def build_signature(config: Config, data: dict) -> Signature:
