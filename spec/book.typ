@@ -80,15 +80,19 @@
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
 #let cdsg = todo.with(background: olive, name: "Cyprien")
 
-#let aside(title, body) = context figure(
+#let highlight(title, body, color) = context figure(
   block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false)[
     #block(inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
            width: 100% + 2em,
-           fill: rgb("55aaff"),
+           fill: color,
            stroke: luma(50%),
            align(center, strong(text(fill: black, title))))
     #align(left, body)
 ])
+
+#let aside(title, body) = highlight(title, body, rgb("55aaff"))
+
+#let attention(title, body) = highlight("Attention: " + title, body, rgb("#ff2600"))
 
 
 #let is-shiroa = "x-target" in sys.inputs
