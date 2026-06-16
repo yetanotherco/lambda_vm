@@ -2,7 +2,9 @@ This is the standard AI review tier. Review this PR seriously and report
 concrete issues that should be addressed before merge.
 
 Review only issues introduced by this PR. Use the diff as the scope anchor.
-Do not perform a full spec audit and do not report unrelated pre-existing issues.
+Do not attempt a full spec audit in this workflow. Flag obvious spec or doc drift
+only when it is directly visible from the PR context, and do not report unrelated
+pre-existing issues.
 
 Focus on:
 

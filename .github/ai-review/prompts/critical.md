@@ -24,7 +24,8 @@ Focus on:
 
 Guidelines:
 - Prefer concrete, high-confidence findings over exhaustive speculation.
-- Do not perform a full spec audit unless the PR directly changes the spec.
+- Do not attempt a full spec audit in this workflow. Flag obvious spec or doc
+  drift only when it is directly visible from the PR context.
 - Do not report unrelated pre-existing issues unless this PR worsens them.
 - Be concise and actionable.
 - If no issues are found, say so briefly.
