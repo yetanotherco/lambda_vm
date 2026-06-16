@@ -9,19 +9,25 @@ from typing import Never, Optional, Self
 
 class ErrorReporter:
     reported: bool
-    location: str
+    location: list[str]
 
     def __init__(self, location: str):
         self.reported = False
-        self.location = location
+        self.location = [location]
 
     def update_location(self, loc: str):
         self.reported = False
-        self.location = loc
+        self.location = [loc]
+
+    def push_context(self, ctx: str):
+        self.location.append(ctx)
+
+    def pop_context(self):
+        self.location.pop()
 
     def error(self, message: str):
         self.reported = True
-        print(f"ERROR {self.location}: {message}", file=sys.stderr)
+        print(f"ERROR {'/'.join(self.location)}: {message}", file=sys.stderr)
 
     def asserts(self, condition: bool, message: str):
         if not condition:
@@ -175,6 +181,19 @@ class CastExpr:
                 constant_fits(base.get_const(), self.type),
                 f"Casting const to type it doesn't fit: {self!r}",
             )
+            if isinstance(self.type, list):
+                return [
+                    CastExpr(LitExpr(base.get_const() if i == 0 else 0), t).typecheck(env)
+                    for i, t in enumerate(self.type)
+                ]
+            return base
+        if isinstance(base, list) and all(b == Range.const(0) for b in base):
+            # Workaround for casts of constant zero, to make padding work nicely
+            # This may become cleaner if we eventually get to the cast rework from #326
+            if isinstance(self.type, Range):
+                return Range.const(0)
+            else:
+                return [CastExpr(LitExpr(0), t).typecheck(env) for t in self.type]
         return self.type
 
 
@@ -750,6 +769,32 @@ class VirtualVariable(Variable):
             check_covered(self.type, seen, [])
         return self.type
 
+    def populate_env(self, env: Environment):
+        # We start off general, and assume that the defs
+        # are ordered in such a way that each one at most
+        # depends on the ones before it
+        env.valmap[self.name] = copy.deepcopy(self.type)
+
+        def assign(env, container, its, v):
+            idx = env.valmap[its[0].name].get_const()
+            if len(its) == 1:
+                container[idx] = v
+            else:
+                assign(env, container[idx], its[1:], v)
+
+        for poly_iters in self.def_.defs:
+            if not poly_iters.iters:
+                env.valmap[self.name] = poly_iters.poly.typecheck(env)
+                continue
+
+            for _ in all_iters(
+                poly_iters.iters,
+                env,
+                lambda e: [assign(e, env.valmap[self.name], poly_iters.iters, poly_iters.poly.typecheck(e))],
+            ):
+                # Consume the iterator
+                pass
+
 
 @dataclass
 class Assumption:
@@ -803,6 +848,7 @@ class ArithConstraint:
 @dataclass
 class Signature:
     tag: str
+    condition: Optional[Type]
     input: list[Type]
     output: Optional[Type]
 
@@ -870,11 +916,13 @@ class InteractionLike:
     def typecheck(self, env: Environment) -> Iterable[Signature]:
         def callback(e: Environment) -> Iterable[Signature]:
             # TODO: Should we be able to check cond/multiplicity somehow?
+            condition = None
             if self.conditional is not None:
-                self.conditional.typecheck(e)
+                condition = self.conditional.typecheck(e)
             return [
                 self.signature(
                     self.tag,
+                    condition,
                     [inp.typecheck(e) for inp in self.input],
                     self.output.typecheck(e) if self.output else None,
                 )
@@ -980,20 +1028,55 @@ class Chip:
         env = Environment(self.config, {}, typemap)
         for v in self.variables:
             if isinstance(v, VirtualVariable):
+                reporter.push_context(v.name)
                 v.typecheck(env)
+                reporter.pop_context()
         for c in self.constraints:
+            reporter.push_context(repr(c))
             yield from c.typecheck(env)
+            reporter.pop_context()
+
+    def check_assignment(
+        self,
+        check_template: dict[str, Callable[[Optional[Type], list[Type], Type], None]],
+        values: Optional[dict[str, Type]] = None,
+    ):
+        env = Environment(self.config, {}, {})
+        if values is None:
+            for v in self.variables:
+                if not isinstance(v, VirtualVariable):
+                    t = v.type
+                    if isinstance(t, list) and len(t) == 1:
+                        t = t[0]
+                    env.valmap[v.name] = CastExpr(v.pad, t).typecheck(env)
+        else:
+            for v in self.variables:
+                if not isinstance(v, VirtualVariable):
+                    if v.name not in values:
+                        reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
+                        return
+                    env.valmap[v.name] = values[v.name]
+        for v in self.variables:
+            if isinstance(v, VirtualVariable):
+                v.populate_env(env)
+
+        for c in self.constraints:
+            for sig in c.typecheck(env):
+                # Recurse on templates
+                if isinstance(sig, TemplateSignature):
+                    reporter.push_context(repr(c))
+                    check_template[sig.tag](sig.condition, sig.input, sig.output)
+                    reporter.pop_context()
 
 
 def build_signature(config: Config, data: dict) -> Signature:
-    assert_no_unexpected(data, {"tag", "kind", "input", "output", "cond", "multiplicity"})
+    assert_no_unexpected(data, {"tag", "kind", "input", "output", "cond"})
     Sig: type[Signature]
+    cond: Optional[Type] = None
     match data["kind"]:
         case "template":
-            reporter.asserts(
-                "multiplicity" not in data,
-                f"Template signature with multiplicity: {data!r}",
-            )
+            if "cond" in data:
+                cond = build_type(config, data["cond"])
             Sig = TemplateSignature
         case "interaction":
             reporter.asserts("cond" not in data, f"Template signature with cond: {data!r}")
@@ -1008,7 +1091,7 @@ def build_signature(config: Config, data: dict) -> Signature:
         output = build_type(config, data["output"])
     else:
         output = None
-    return Sig(tag, input, output)
+    return Sig(tag, cond, input, output)
 
 
 def read_signatures(config, filename) -> list[Signature]:
@@ -1023,6 +1106,27 @@ def check_signatures(found: Iterable[Signature], expected: list[Signature]):
         reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
 
 
+def template_checker(check_template: dict[str, Callable[[Optional[Type], list[Type], Type], None]], chip: Chip):
+    def check(cond: Optional[Type], input: list[Type], output: Type):
+        input = input[:]
+        values = {}
+        for v in chip.variables:
+            match v.category:
+                case "input":
+                    values[v.name] = input.pop(0)
+                case "output":
+                    values[v.name] = output
+                case "condition":
+                    values[v.name] = cond if cond else Range.const(1)
+                case "virtual":
+                    pass
+                case other:
+                    reporter.error(f"Cannot check template with variable of category {other!r}")
+        chip.check_assignment(check_template, values)
+
+    return check
+
+
 if __name__ == "__main__":
     config = Config.from_file(sys.argv[1])
     signatures = read_signatures(config, sys.argv[2])
@@ -1031,17 +1135,25 @@ if __name__ == "__main__":
 
     reported = False
     chips: list[Chip] = []
+    template_checkers: dict[str, Callable[[Optional[Type], list[Type], Type], None]] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
-        chips.append(Chip.from_file(config, file))
+        chips.append(chip := Chip.from_file(config, file))
+        template_checkers[chip.name] = template_checker(template_checkers, chip)
         reported |= reporter.reported
     if reported:
         sys.exit(1)
 
+    template_checkers["SUB"] = lambda cond, input, output: template_checkers["ADD"](cond, [output, input[1]], input[0])
+
     for chip in chips:
         reporter.update_location(f"Chip {chip.name}")
         check_signatures(chip.typecheck(), signatures)
+        reported |= reporter.reported
+    for chip in chips:
+        reporter.update_location(f"Padding {chip.name}")
+        chip.check_assignment(template_checkers)
         reported |= reporter.reported
     if reported:
         sys.exit(1)

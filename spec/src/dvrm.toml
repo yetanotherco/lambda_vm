@@ -27,7 +27,7 @@ pad = 0
 name = "q"
 type = "DWordHL"
 desc = "The quotient; $#`n` / #`d`$ rounded towards zero."
-pad = 0
+pad = ["arr", 65535, 65535, 65535, 65535]
 
 [[variables.output]]
 name = "r"
