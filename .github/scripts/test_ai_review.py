@@ -242,6 +242,21 @@ class AiReviewExtractorTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["provider"], "Novita")
 
+    def test_opencode_assistant_text_extracts_text_events(self) -> None:
+        stream = "\n".join(
+            [
+                json.dumps({"type": "step_start"}),
+                json.dumps({"type": "tool_use", "part": {"tool": "read"}}),
+                json.dumps({"type": "text", "part": {"text": "let me look..."}}),
+                json.dumps({"type": "text", "part": {"text": '{"summary":"s","findings":[]}'}}),
+                "not-json-noise",
+            ]
+        )
+        text = ai_review.opencode_assistant_text(stream)
+        parsed, parse_error = ai_review.extract_json(text, required_key="findings")
+        self.assertIsNone(parse_error)
+        self.assertEqual(parsed, {"summary": "s", "findings": []})
+
     def test_extract_json_accepts_bare_json(self) -> None:
         parsed, parse_error = ai_review.extract_json('{"summary":"ok","findings":[]}', required_key="findings")
 

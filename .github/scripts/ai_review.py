@@ -359,16 +359,43 @@ def run_opencode_agent(
 ) -> str:
     env = dict(os.environ)
     env["OPENROUTER_API_KEY"] = api_key
-    cmd = ["opencode", "run", message, "--agent", agent, "-m", f"openrouter/{model}"]
+    # --format json emits a JSONL event stream; the assistant's output (including the
+    # final findings JSON) arrives in "text" events. The human-rendered default format
+    # drops the final message in non-TTY environments, so we always parse the stream.
+    cmd = ["opencode", "run", message, "--agent", agent, "-m", f"openrouter/{model}", "--format", "json"]
     proc = subprocess.run(
         cmd,
         cwd=str(repo),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         env=env,
         timeout=timeout,
     )
-    return strip_ansi(proc.stdout.decode("utf-8", errors="replace"))
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace")
+    text = opencode_assistant_text(out)
+    if not text.strip():
+        # Surface diagnostics so the lane result shows why nothing was produced.
+        return f"[opencode produced no assistant text]\nstderr:\n{err[-3000:]}\nstdout-tail:\n{strip_ansi(out)[-3000:]}"
+    return text
+
+
+def opencode_assistant_text(stdout: str) -> str:
+    parts: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "text":
+            part = event.get("part") or {}
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
 
 
 def strip_ansi(text: str) -> str:
