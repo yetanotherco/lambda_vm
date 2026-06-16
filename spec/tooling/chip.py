@@ -1042,7 +1042,7 @@ class Chip:
 
     def check_assignment(
         self,
-        check_template: dict[str, Callable[[Optional[Type], list[Type], Type], None]],
+        template_checkers: dict[str, "TemplateChecker"],
         values: Optional[dict[str, Type]] = None,
     ):
         env = Environment(self.config, {}, {})
@@ -1067,9 +1067,9 @@ class Chip:
         for c in self.constraints:
             for sig in c.typecheck(env):
                 # Recurse on templates
-                if isinstance(sig, TemplateSignature) and sig.tag in check_template:
+                if isinstance(sig, TemplateSignature) and sig.tag in template_checkers:
                     with reporter.context(repr(c)):
-                        check_template[sig.tag](sig.condition, sig.input, sig.output)
+                        template_checkers[sig.tag](template_checkers, sig.condition, sig.input, sig.output)
 
 
 def build_signature(config: Config, data: dict) -> Signature:
@@ -1110,8 +1110,13 @@ def check_signatures(found: Iterable[Signature], expected: list[Signature]):
         reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
 
 
-def template_checker(check_template: dict[str, Callable[[Optional[Type], list[Type], Type], None]], chip: Chip):
-    def check(cond: Optional[Type], input: list[Type], output: Type):
+# A Function taking a mapping of available templates (for recursive expansion),
+# an optional condition variable, a list of inputs and an output,
+# and checks that it satisfies the template the checker represents.
+type TemplateChecker = Callable[[dict[str, TemplateChecker], Optional[Type], list[Type], Optional[Type]], None]
+
+def build_template_checker(chip: Chip) -> TemplateChecker:
+    def check(template_checkers: dict[str, TemplateChecker], cond: Optional[Type], input: list[Type], output: Optional[Type]) -> None:
         input = input[:]
         values = {}
         for v in chip.variables:
@@ -1119,6 +1124,9 @@ def template_checker(check_template: dict[str, Callable[[Optional[Type], list[Ty
                 case "input":
                     values[v.name] = input.pop(0)
                 case "output":
+                    if output is None:
+                        reporter.error(f"No output available for template output variable {v.name!r}")
+                        return
                     values[v.name] = output
                 case "condition":
                     values[v.name] = cond if cond else Range.const(1)
@@ -1126,7 +1134,7 @@ def template_checker(check_template: dict[str, Callable[[Optional[Type], list[Ty
                     pass
                 case other:
                     reporter.error(f"Cannot check template with variable of category {other!r}")
-        chip.check_assignment(check_template, values)
+        chip.check_assignment(template_checkers, values)
 
     return check
 
@@ -1139,18 +1147,19 @@ if __name__ == "__main__":
 
     reported = False
     chips: list[Chip] = []
-    template_checkers: dict[str, Callable[[Optional[Type], list[Type], Type], None]] = {}
+    template_checkers: dict[str, TemplateChecker] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
-        chips.append(chip := Chip.from_file(config, file))
-        template_checkers[chip.name] = template_checker(template_checkers, chip)
+        chip = Chip.from_file(config, file)
+        chips.append(chip)
+        template_checkers[chip.name] = build_template_checker(chip)
         reported |= reporter.reported
     if reported:
         sys.exit(1)
 
     if "ADD" in template_checkers:
-        template_checkers["SUB"] = lambda cond, input, output: template_checkers["ADD"](cond, [output, input[1]], input[0])
+        template_checkers["SUB"] = lambda checkers, cond, input, output: checkers["ADD"](checkers, cond, [output, input[1]], input[0])
 
     for chip in chips:
         reporter.update_location(f"Chip {chip.name}")
