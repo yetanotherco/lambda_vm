@@ -39,17 +39,20 @@ class AiReviewParsingTests(unittest.TestCase):
             "file_context": [],
         }
         self.original_openrouter_chat = ai_review.openrouter_chat
+        self.original_repair_json = ai_review.repair_json
         self.original_api_key = os.environ.get("OPENROUTER_API_KEY")
         os.environ["OPENROUTER_API_KEY"] = "test-key"
 
     def tearDown(self) -> None:
         ai_review.openrouter_chat = self.original_openrouter_chat
+        ai_review.repair_json = self.original_repair_json
         if self.original_api_key is None:
             os.environ.pop("OPENROUTER_API_KEY", None)
         else:
             os.environ["OPENROUTER_API_KEY"] = self.original_api_key
 
-    def test_extract_json_rejects_malformed_fenced_json_without_nested_salvage(self) -> None:
+    def test_extract_json_rejects_malformed_fenced_json_when_repair_unavailable(self) -> None:
+        ai_review.repair_json = None
         raw_response = '''```json
 {
   "summary": "tests",
@@ -72,7 +75,19 @@ class AiReviewParsingTests(unittest.TestCase):
         self.assertIsNone(parsed)
         self.assertIn("invalid JSON in fenced block", parse_error)
 
+    def test_extract_json_recovers_malformed_json_via_repair(self) -> None:
+        recovered = {"summary": "tests", "findings": [{"title": "Missing tests"}]}
+        ai_review.repair_json = lambda candidate, return_objects=False: recovered
+
+        # Unescaped inner quotes that strict json.loads cannot parse.
+        raw_response = '```json\n{"findings": [{"title": "uses contains("a", "b")"}]}\n```'
+        parsed, parse_error = ai_review.extract_json(raw_response, required_key="findings")
+
+        self.assertEqual(parsed, recovered)
+        self.assertIn("recovered malformed JSON via json-repair", parse_error)
+
     def test_run_review_lane_keeps_malformed_json_as_parse_warning(self) -> None:
+        ai_review.repair_json = None
         raw_response = '''```json
 {
   "summary": "tests",
@@ -351,11 +366,13 @@ class AiReviewVerificationTests(unittest.TestCase):
             ],
         }
         self.original_openrouter_chat = ai_review.openrouter_chat
+        self.original_repair_json = ai_review.repair_json
         self.original_api_key = os.environ.get("OPENROUTER_API_KEY")
         os.environ["OPENROUTER_API_KEY"] = "test-key"
 
     def tearDown(self) -> None:
         ai_review.openrouter_chat = self.original_openrouter_chat
+        ai_review.repair_json = self.original_repair_json
         if self.original_api_key is None:
             os.environ.pop("OPENROUTER_API_KEY", None)
         else:

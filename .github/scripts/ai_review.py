@@ -18,6 +18,13 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+try:
+    # Optional fallback for repairing slightly-malformed model JSON (e.g. unescaped
+    # quotes when a finding quotes code). Installed in CI; absent locally is fine.
+    from json_repair import repair_json
+except ImportError:  # pragma: no cover
+    repair_json = None
+
 
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -1003,6 +1010,10 @@ def extract_json(text: str, required_key: str | None = None) -> tuple[Any, str |
             if json_has_required_shape(parsed, required_key):
                 return parsed, None
             schema_error = schema_error or json_shape_error(required_key)
+        for block in fenced:
+            repaired = repair_malformed_json(block, required_key)
+            if repaired is not None:
+                return repaired, f"recovered malformed JSON via json-repair ({decode_error or schema_error})"
         return None, schema_error or decode_error or "could not parse JSON from model response"
 
     decoder = json.JSONDecoder()
@@ -1019,7 +1030,20 @@ def extract_json(text: str, required_key: str | None = None) -> tuple[Any, str |
         if json_has_required_shape(parsed, required_key):
             return parsed, None
         schema_error = schema_error or json_shape_error(required_key)
+    repaired = repair_malformed_json(text, required_key)
+    if repaired is not None:
+        return repaired, f"recovered malformed JSON via json-repair ({decode_error or schema_error})"
     return None, schema_error or decode_error or "could not parse JSON from model response"
+
+
+def repair_malformed_json(candidate: str, required_key: str | None) -> Any:
+    if repair_json is None:
+        return None
+    try:
+        parsed = repair_json(candidate, return_objects=True)
+    except Exception:
+        return None
+    return parsed if json_has_required_shape(parsed, required_key) else None
 
 
 def json_has_required_shape(parsed: Any, required_key: str | None) -> bool:

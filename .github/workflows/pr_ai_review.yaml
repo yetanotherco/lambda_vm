@@ -114,6 +114,9 @@ jobs:
           name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
           path: ai-review-context
 
+      - name: Install JSON repair fallback
+        run: python3 -m pip install --quiet json-repair
+
       - name: Run OpenRouter review lane
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -215,6 +218,9 @@ jobs:
         with:
           name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
           path: ai-review-candidates
+
+      - name: Install JSON repair fallback
+        run: python3 -m pip install --quiet json-repair
 
       - name: Run OpenRouter verifier lane
         env:
