@@ -21,10 +21,11 @@ Focus on:
 3. **Simplicity and maintainability**
    - Unnecessary complexity, duplicated logic, avoidable abstractions
    - Stale comments, stale names, misleading doc comments, or scope drift
+   - Cosmetic rewrites when they make changed code easier to read or maintain
 
 Guidelines:
 - Prefer fewer, higher-confidence findings.
-- Do not suggest micro-optimizations or cosmetic rewrites.
+- Do not suggest micro-optimizations or low-signal churn.
 - Be concise and actionable.
 - Include concrete file and line references when possible.
 - If no issues are found, say so briefly.

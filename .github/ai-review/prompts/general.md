@@ -9,11 +9,13 @@
 
 3. **Performance issues** - Only significant: e.g. O(n^2) on unbounded input, unnecessary allocations, hot path inefficiencies
 
-4. **Simplicity** - Prefer simple, readable code over clever abstractions
+4. **Simplicity and readability** - Prefer simple, readable code over clever
+   abstractions. Cosmetic rewrites are acceptable when they make changed code,
+   names, comments, or docs easier to understand.
 
 Guidelines:
 - Be concise and to the point
-- Do NOT suggest micro-optimizations or premature abstractions
+- Do NOT suggest micro-optimizations, churn, or premature abstractions
 - Always prefer simplicity over complexity when performance gains are marginal
 - Focus on real issues, not hypothetical improvements
 - Be concise and actionable
