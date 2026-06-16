@@ -217,7 +217,9 @@ fn test_lt_deduplication() {
             && row[lt::cols::RHS_0] == FE::from(10u64)
             && row[lt::cols::SIGNED] == FE::from(1u64)
         {
-            // Found our SLT row - verify multiplicity is 3
+            // Found our SLT row - verify multiplicity is 3. Every LT lookup
+            // (including SLT) goes through the unified ALU bus and
+            // is counted in the single `MU` column.
             assert_eq!(row[lt::cols::MU], FE::from(3u64));
             found_slt = true;
             break;
@@ -268,10 +270,11 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check AND multiplicity was updated for (0x12, 0x34, 0)
+    // AND/OR/XOR now go through the BYTEWISE chip on the unified BYTE_ALU bus,
+    // so the AND byte (0x12, 0x34) increments MU_BYTE_ALU_AND.
     let row_idx = bitwise::row_index(0x12, 0x34, 0);
     let row = traces.bitwise.main_table.get_row(row_idx);
-    assert_eq!(row[bitwise::cols::MU_AND], FE::one());
+    assert_eq!(row[bitwise::cols::MU_BYTE_ALU_AND], FE::one());
 }
 
 #[test]
@@ -561,4 +564,264 @@ fn test_lt_generates_bitwise_lookups() {
         FE::zero(),
         "IS_HALF lookup for lhs_sub_rhs[0] should have non-zero multiplicity"
     );
+}
+
+mod keccak_tests {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::keccak::cols as core_cols;
+    use crate::tables::keccak::{self, KeccakOperation};
+    use crate::tables::keccak_rc;
+    use crate::tables::keccak_rnd::cols as rnd_cols;
+    use crate::tables::keccak_rnd::{self, KeccakRoundOperation};
+    use crate::tables::trace_builder::*;
+    use crate::tables::types::FE;
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    fn make_keccak_ops() -> (KeccakOperation, KeccakRoundOperation) {
+        let input = [0u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let kop = KeccakOperation {
+            timestamp: 42,
+            state_addr: 0x1000,
+            input,
+            output,
+        };
+        let rop = KeccakRoundOperation {
+            timestamp: 42,
+            input,
+            output,
+        };
+        (kop, rop)
+    }
+
+    #[test]
+    fn test_keccak_bitwise_ops_count() {
+        let (kop, _) = make_keccak_ops();
+        let ops = collect_bitwise_from_keccak(&[kop]);
+
+        let xor = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluXor)
+            .count();
+        let and = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluAnd)
+            .count();
+        let are_bytes = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::AreBytes)
+            .count();
+        let hwsl = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::Hwsl)
+            .count();
+        let is_half = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
+            .count();
+
+        assert_eq!(xor, 24 * 608, "ByteAluXor count");
+        assert_eq!(and, 24 * 200 + 1, "ByteAluAnd count");
+        // Cxz_right Byte→Bit (spec d75944ee): drops 40 ARE_BYTES per round.
+        // Spec emits one IS_BYTE template per byte; ops pair adjacent bytes
+        // into ARE_BYTES (20 cxz_left + 200 rho per round, 4 addr per call).
+        assert_eq!(are_bytes, 24 * 220 + 4, "AreBytes count");
+        assert_eq!(hwsl, 24 * 120, "Hwsl count");
+        assert_eq!(is_half, 100, "IsHalf count");
+        assert_eq!(ops.len(), 105 + 24 * 1148, "Total bitwise ops");
+    }
+
+    #[test]
+    fn test_keccak_round_trace_matches_f1600() {
+        let (_, rop) = make_keccak_ops();
+        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
+
+        let mut ref_state = [0u64; 25];
+        for round in 0..24 {
+            let rc = executor::vm::instruction::execution::KECCAK_RC[round];
+            let mut c = [0u64; 5];
+            for x in 0..5 {
+                c[x] = ref_state[x]
+                    ^ ref_state[x + 5]
+                    ^ ref_state[x + 10]
+                    ^ ref_state[x + 15]
+                    ^ ref_state[x + 20];
+            }
+            let mut d = [0u64; 5];
+            for x in 0..5 {
+                d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+            }
+            for i in 0..25 {
+                ref_state[i] ^= d[i % 5];
+            }
+            let mut b = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    b[y + 5 * ((2 * x + 3 * y) % 5)] = ref_state[x + 5 * y]
+                        .rotate_left(executor::vm::instruction::execution::KECCAK_RHO[x][y]);
+                }
+            }
+            for x in 0..5 {
+                for y in 0..5 {
+                    ref_state[x + 5 * y] =
+                        b[x + 5 * y] ^ (!b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
+                }
+            }
+            ref_state[0] ^= rc;
+
+            let base = round * rnd_cols::NUM_COLUMNS;
+            for (lane, &lane_val) in ref_state.iter().enumerate() {
+                let x = lane % 5;
+                let y = lane / 5;
+                for byte_idx in 0..8 {
+                    let expected = FE::from((lane_val >> (byte_idx * 8)) & 0xFF);
+                    let col = if x == 0 && y == 0 {
+                        rnd_cols::iota(byte_idx)
+                    } else {
+                        rnd_cols::chi(x, y, byte_idx)
+                    };
+                    let trace_val = &rnd_trace.main_table.data[base + col];
+                    assert_eq!(
+                        &expected, trace_val,
+                        "Round {round} lane ({x},{y}) byte {byte_idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_keccak_core_round_state_consistency() {
+        let (kop, rop) = make_keccak_ops();
+        let core_trace = keccak::generate_keccak_trace(&[kop]);
+        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
+
+        // Round 0 start == core input_state
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
+                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
+                    assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
+                }
+            }
+        }
+
+        // Round 23 out == core output_state
+        let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
+                    let rnd_val = if x == 0 && y == 0 {
+                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
+                    } else {
+                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
+                    };
+                    assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_keccak_bus_interaction_counts() {
+        assert_eq!(
+            keccak::bus_interactions().len(),
+            134,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+        );
+        assert_eq!(
+            keccak_rnd::bus_interactions().len(),
+            1151,
+            "KECCAK_RND: 3 IO + 440 theta + 300 rho + 400 chi + 8 iota \
+             (Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
+             ARE_BYTES sends are paired per spec ARE_BYTES interaction signature)"
+        );
+        assert_eq!(
+            keccak_rc::bus_interactions().len(),
+            1,
+            "KECCAK_RC: 1 receiver"
+        );
+    }
+
+    #[test]
+    fn test_keccak_column_counts() {
+        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(
+            rnd_cols::NUM_COLUMNS,
+            1480,
+            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
+        );
+        assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
+    }
+
+    #[test]
+    fn test_keccak_constraint_counts() {
+        let (core_constraints, _) = keccak::create_constraints(0);
+        assert_eq!(
+            core_constraints.len(),
+            51,
+            "KECCAK core: 25 ADD pairs + no-overflow"
+        );
+
+        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
+        assert_eq!(
+            rnd_constraints.len(),
+            20,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
+        );
+    }
+}
+
+mod routing_tests {
+    use crate::tables::memw::MemwOperation;
+    use crate::tables::trace_builder::*;
+
+    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
+        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
+            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn test_is_register_op_delta_at_boundary_routes_in() {
+        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
+        let op = make_register_op(0x10000, 0);
+        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_above_boundary_falls_back() {
+        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
+        let op = make_register_op(0x10001, 0);
+        assert!(
+            !is_register_op(&op),
+            "delta = 2^16 + 1 should fall back to MEMW_A"
+        );
+    }
+
+    #[test]
+    fn test_is_register_op_delta_one_routes_in() {
+        // delta = 1: minimum allowed value
+        let op = make_register_op(1, 0);
+        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_zero_falls_back() {
+        // delta = 0: ts[0] not strictly greater than old_ts[0]
+        let op = make_register_op(5, 5);
+        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_upper_limb_mismatch_falls_back() {
+        // ts_hi != old_ts_hi: shared upper limb assumption violated
+        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
+        assert!(
+            !is_register_op(&op),
+            "different upper limbs should fall back to MEMW_A"
+        );
+    }
 }

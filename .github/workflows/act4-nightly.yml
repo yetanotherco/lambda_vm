@@ -1,0 +1,187 @@
+name: ACT4 Nightly
+
+on:
+  workflow_run:
+    # Runs after Bench Vs Nightly to make sure the self-hosted runner is available
+    workflows: ["Bench Vs Nightly"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: act4-nightly
+  cancel-in-progress: false
+
+jobs:
+  test:
+    # ACT4 is independent of the benchmark outcome; the workflow_run trigger is
+    # only used to serialize on the shared bench runner. Run on any benchmark
+    # conclusion, skipping only cases where re-running is pointless: 'cancelled'
+    # (a newer bench run is already on its way) and 'skipped' (nothing ran).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion != 'cancelled' &&
+       github.event.workflow_run.conclusion != 'skipped')
+    runs-on: [self-hosted, bench]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # ubuntu:24.04 linux/amd64 manifest digest (bench runner is x64).
+      UBUNTU_IMAGE: ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff
+    steps:
+      - name: Validate LAMBDAVM_SHA format
+        run: |
+          if [[ ! "$LAMBDAVM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid LAMBDAVM_SHA: $LAMBDAVM_SHA"
+            exit 1
+          fi
+
+      - name: Scrub root-owned leftovers from previous Docker runs
+        run: |
+          if [ -d test-results ] || [ -d out ]; then
+            docker run --rm -v "$PWD:/work" -w /work "$UBUNTU_IMAGE" rm -rf test-results out
+          fi
+
+      - name: Checkout zkevm-test-monitor
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: eth-act/zkevm-test-monitor
+          ref: c9e710b43448576920f7e841a2b68bab8b7a20f8
+
+      - name: Pin lambdavm.commit to current main SHA
+        run: |
+          echo "Pinning lambdavm.commit to $LAMBDAVM_SHA"
+          jq --arg sha "$LAMBDAVM_SHA" '.zkvms.lambdavm.commit = $sha' config.json > config.json.tmp
+          mv config.json.tmp config.json
+          jq '.zkvms.lambdavm' config.json
+
+      - name: Pin Dockerfile base image to digest
+        run: |
+          dockerfile=docker/build-lambdavm/Dockerfile
+          sed -i "s|^FROM ubuntu:24.04|FROM ${UBUNTU_IMAGE}|" "$dockerfile"
+          if grep -qE '^FROM .*ubuntu:24\.04' "$dockerfile"; then
+            echo "Unpinned ubuntu:24.04 still present in $dockerfile"
+            exit 1
+          fi
+
+      - name: Build + test lambdavm
+        id: run
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p out
+          ./run all lambdavm 2>&1 | tee out/run.log
+
+      - name: Compute pass/fail from summaries
+        id: summary
+        if: always()
+        env:
+          STEP_RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          mkdir -p out
+          shopt -s nullglob
+          summaries=(test-results/lambdavm/summary-act4-*.json)
+
+          # No summaries means the build/test pipeline failed to produce results.
+          if [ ${#summaries[@]} -eq 0 ]; then
+            msg="No ACT4 summary files were produced. See run.log."
+            echo "$msg" | tee out/summary.md
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## ACT4 results for lambdavm @ $LAMBDAVM_SHA"
+            echo ""
+            for f in "${summaries[@]}"; do
+              jq -r '"- **\(.suite)**: \(.passed)/\(.total) passed (\(.failed) failed)"' "$f"
+            done
+          } | tee out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+          FAILED=0
+          for f in "${summaries[@]}"; do
+            n=$(jq '.failed // 0' "$f")
+            FAILED=$((FAILED + n))
+          done
+          echo "Total failed tests: $FAILED"
+          if [ "$STEP_RUN_OUTCOME" = "failure" ]; then
+            echo "./run exited non-zero"
+            exit 1
+          fi
+          [ "$FAILED" -eq 0 ]
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: act4-results-${{ github.run_id }}
+          path: |
+            out/
+            test-results/lambdavm/
+          retention-days: 30
+
+      - name: Remove root-owned Docker leftovers
+        # Leave the shared runner workspace clean for other workflows.
+        if: always()
+        run: |
+          if [ -d test-results ] || [ -d out ]; then
+            docker run --rm -v "$PWD:/work" -w /work "$UBUNTU_IMAGE" rm -rf test-results out
+          fi
+
+  report:
+    needs: test
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      LAMBDAVM_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Validate LAMBDAVM_SHA format
+        run: |
+          if [[ ! "$LAMBDAVM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid LAMBDAVM_SHA: $LAMBDAVM_SHA"
+            exit 1
+          fi
+
+      - name: Download test artifacts
+        # An early test-job failure may upload nothing. Still notify Slack,
+        # falling back to a placeholder when out/summary.md is absent.
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: act4-results-${{ github.run_id }}
+
+      - name: Post failure to Slack
+        env:
+          # Reuse the nightly benchmark webhook so failures land in the channel
+          # the team already watches. Manual runs use the test webhook so smoke
+          # tests don't ping the real channel.
+          SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "SLACK_WEBHOOK not configured, skipping notification."
+            exit 0
+          fi
+
+          summary="$(cat out/summary.md 2>/dev/null || echo '_summary not available_')"
+
+          payload="$(jq -n \
+            --arg sha "$LAMBDAVM_SHA" \
+            --arg run "$RUN_URL" \
+            --arg rid "$GITHUB_RUN_ID" \
+            --arg summary "$summary" \
+            '{
+              blocks: [
+                {type: "header", text: {type: "plain_text", text: ":x: ACT4 nightly failed", emoji: true}},
+                {type: "section", text: {type: "mrkdwn", text: ("*Commit:* `" + $sha + "`\n*Run:* <" + $run + "|workflow run>\n*Artifacts:* `act4-results-" + $rid + "` (attached to the run)")}},
+                {type: "section", text: {type: "mrkdwn", text: ("```" + $summary + "```")}}
+              ]
+            }')"
+
+          curl -fsS -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload"

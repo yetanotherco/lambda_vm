@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod fft_helpers_test {
-    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
     use crate::fft::test_helpers::naive_matrix_dft_test;
     use crate::field::element::FieldElement;
     use crate::field::test_fields::u64_test_field::U64TestField;
@@ -48,15 +48,14 @@ mod fft_helpers_test {
 mod fft_polynomial_tests {
     use crate::field::traits::IsField;
 
-    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::{
+    use crate::fft::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
-    use crate::fft::polynomial::compose_fft;
     use crate::field::element::FieldElement;
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
+    use crate::polynomial::compose_fft;
     use proptest::{collection, prelude::*};
 
     /// Evaluates a polynomial at a slice of points
@@ -98,30 +97,34 @@ mod fft_polynomial_tests {
         (fft_eval, naive_eval)
     }
 
-    fn gen_fft_and_naive_interpolate<F: IsFFTField + Send + Sync>(
+    /// FFT interpolation round-trip: interpolate `fft_evals` back to a
+    /// polynomial via FFT, then re-evaluate at every twiddle via Horner.
+    /// `(recovered, original)` agree iff `interpolate_fft` is correct — an
+    /// independent check using a different algorithm.
+    fn gen_fft_interpolate_round_trip<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
+    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
         let twiddles =
             get_powers_of_primitive_root(order, 1 << order, RootsConfig::Natural).unwrap();
 
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
         let fft_poly = Polynomial::interpolate_fft::<F>(fft_evals).unwrap();
+        let recovered = evaluate_slice(&fft_poly, &twiddles);
 
-        (fft_poly, naive_poly)
+        (recovered, fft_evals.to_vec())
     }
 
-    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField + Send + Sync>(
+    fn gen_fft_coset_interpolate_round_trip<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
         offset: &FieldElement<F>,
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
+    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
         let twiddles = get_powers_of_primitive_root_coset(order, 1 << order, offset).unwrap();
 
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
         let fft_poly = Polynomial::interpolate_offset_fft(fft_evals, offset).unwrap();
+        let recovered = evaluate_slice(&fft_poly, &twiddles);
 
-        (fft_poly, naive_poly)
+        (recovered, fft_evals.to_vec())
     }
 
     fn gen_fft_interpolate_and_evaluate<F: IsFFTField + Send + Sync>(
@@ -205,8 +208,8 @@ mod fft_polynomial_tests {
             fn test_fft_interpolate_matches_naive(fft_evals in field_vec(4)
                                                            .prop_filter("Avoid polynomials of size not power of two",
                                                                         |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_interpolate(&fft_evals);
-                prop_assert_eq!(fft_poly, naive_poly);
+                let (recovered, original) = gen_fft_interpolate_round_trip(&fft_evals);
+                prop_assert_eq!(recovered, original);
             }
 
             // Property-based test that ensures FFT interpolation with an offset is the same as naive.
@@ -214,8 +217,8 @@ mod fft_polynomial_tests {
             fn test_fft_interpolate_coset_matches_naive(offset in offset(), fft_evals in field_vec(4)
                                                            .prop_filter("Avoid polynomials of size not power of two",
                                                                         |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_coset_interpolate(&fft_evals, &offset);
-                prop_assert_eq!(fft_poly, naive_poly);
+                let (recovered, original) = gen_fft_coset_interpolate_round_trip(&fft_evals, &offset);
+                prop_assert_eq!(recovered, original);
             }
 
             // Property-based test that ensures interpolation is the inverse operation of evaluation.
@@ -228,32 +231,6 @@ mod fft_polynomial_tests {
                 prop_assert_eq!(poly, new_poly);
             }
 
-            // Property-based test that ensures evaluate_fft_bit_reversed returns the same
-            // values as evaluate_fft followed by an in-place bit-reverse permutation,
-            // across varying blowup factors.
-            #[test]
-            fn test_fft_bit_reversed_matches_evaluate_fft_then_permute(poly in poly(6), blowup_factor in powers_of_two(4)) {
-                let mut expected = Polynomial::evaluate_fft::<F>(&poly, blowup_factor, None).unwrap();
-                in_place_bit_reverse_permute(&mut expected);
-                let got = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, blowup_factor, None).unwrap();
-                prop_assert_eq!(got, expected);
-            }
-
-            #[test]
-            fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
-                prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
-            }
-
-            #[test]
-            fn test_fft_division_works(poly in non_zero_poly(7), other in non_zero_poly(7)) {
-                prop_assert_eq!(poly.fast_division::<F>(&other).unwrap(), poly.long_division_with_remainder(&other));
-            }
-
-            #[test]
-            fn test_invert_polynomial_mod_works(poly in non_zero_poly(7), k in powers_of_two(4)) {
-                let inverted_poly = poly.invert_polynomial_mod::<F>(k).unwrap();
-                prop_assert_eq!((poly * inverted_poly).truncate(k), Polynomial::new(&[FE::one()]));
-            }
         }
 
         #[test]
@@ -264,24 +241,6 @@ mod fft_polynomial_tests {
                 compose_fft::<F, F>(&p, &q),
                 Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(2)])
             );
-        }
-
-        #[test]
-        fn fft_bit_reversed_handles_domain_size_greater_than_coeff_len() {
-            let poly = Polynomial::new(&[FE::new(1), FE::new(2), FE::new(3)]);
-            let domain_size = 32;
-            let mut expected = Polynomial::evaluate_fft::<F>(&poly, 1, Some(domain_size)).unwrap();
-            in_place_bit_reverse_permute(&mut expected);
-            let got =
-                Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 1, Some(domain_size)).unwrap();
-            assert_eq!(got, expected);
-        }
-
-        #[test]
-        fn fft_bit_reversed_returns_zeros_for_empty_polynomial() {
-            let poly: Polynomial<FE> = Polynomial::new(&[]);
-            let got = Polynomial::evaluate_fft_bit_reversed::<F>(&poly, 1, Some(8)).unwrap();
-            assert_eq!(got, vec![FE::zero(); 8]);
         }
     }
 
@@ -306,8 +265,8 @@ mod fft_polynomial_tests {
 
 #[cfg(test)]
 mod roots_of_unity_tests {
-    use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
     use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::field::traits::RootsConfig;
     use proptest::prelude::*;
@@ -330,5 +289,110 @@ mod roots_of_unity_tests {
         // U64TestField has TWO_ADICITY = 32, so order 33 should fail
         let result = get_powers_of_primitive_root::<F>(33, 1, RootsConfig::Natural);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod coset_lde_tests {
+    use crate::fft::bowers_fft::LayerTwiddles;
+    use crate::field::element::FieldElement;
+    use crate::field::goldilocks::GoldilocksField;
+    use crate::polynomial::Polynomial;
+    use alloc::vec::Vec;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    #[test]
+    fn coset_lde_full_into_matches_coset_lde_full() {
+        let offset = FE::from(3u64);
+        let blowup_factor = 2;
+
+        for order in 1..=10 {
+            let n = 1usize << order;
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+            let lde_size = n * blowup_factor;
+            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let mut weights = Vec::with_capacity(n);
+            let mut offset_power = n_inv;
+            for _ in 0..n {
+                weights.push(offset_power);
+                offset_power = &offset_power * &offset;
+            }
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            // Test with pre-allocated buffer
+            let mut buffer = Vec::with_capacity(lde_size);
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch at order {}", order);
+        }
+    }
+
+    #[test]
+    fn coset_lde_full_into_reuses_buffer() {
+        let offset = FE::from(5u64);
+        let blowup_factor = 2usize;
+        let n = 16usize;
+        let lde_size = n * blowup_factor;
+
+        let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut offset_power = n_inv;
+        for _ in 0..n {
+            weights.push(offset_power);
+            offset_power = &offset_power * &offset;
+        }
+
+        // Pre-allocate buffer once, reuse for two different inputs
+        let mut buffer = Vec::with_capacity(lde_size);
+
+        for seed in [13u64, 42u64] {
+            let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
     }
 }

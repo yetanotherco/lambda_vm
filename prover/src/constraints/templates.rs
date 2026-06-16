@@ -449,7 +449,7 @@ impl AddConstraint {
         let carry = match self.carry_idx {
             0 => self.compute_carry_0(step),
             1 => self.compute_carry_1(step),
-            _ => panic!("Invalid carry index"),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
 
         if self.cond_cols.is_empty() {
@@ -508,17 +508,4 @@ pub fn new_is_bit_constraints(
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tables::types::GoldilocksField;
-
-    #[test]
-    fn test_inv_shift_32_is_correct() {
-        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
-        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
-        assert_eq!(inv * shift, FieldElement::one());
-    }
 }

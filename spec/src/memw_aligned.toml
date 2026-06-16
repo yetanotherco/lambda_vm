@@ -118,6 +118,28 @@ desc = "`IS_BIT<write2 + write4 + write8>`"
 desc = "`IS_WORD[timestamp[i]]`"
 iter = ["i", 0, 1]
 
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write2"]
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write4"]
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write8"]
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = [["+", "write2", "write4", "write8"]]
 
 [[constraint_groups]]
 name = "consistency"
@@ -150,9 +172,9 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "LT"
-input = ["old_timestamp", "timestamp", 0]
-output = 1
+tag = "ALU"
+input = ["old_timestamp", "timestamp", ["opsel", "LT"]]
+output = ["arr", 1, 0]
 multiplicity = "μ_sum"
 
 [[constraint_groups]]

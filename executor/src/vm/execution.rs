@@ -64,6 +64,9 @@ impl Executor {
         self.logs.clear();
 
         while self.pc != 0 && self.logs.len() < CHUNK_SIZE {
+            if !self.pc.is_multiple_of(4) {
+                return Err(ExecutorError::InstructionAddressMisaligned(self.pc));
+            }
             let instruction = match self.instructions.get(self.pc) {
                 Some(&instr) => instr,
                 None => {
@@ -252,4 +255,6 @@ pub enum ExecutorError {
     ExecutionError(#[from] ExecutionError),
     #[error("Memory error: {0}")]
     MemoryError(#[from] MemoryError),
+    #[error("Instruction address misaligned: {0:#018x}")]
+    InstructionAddressMisaligned(u64),
 }

@@ -1,5 +1,5 @@
 use crate::fri::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place};
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;

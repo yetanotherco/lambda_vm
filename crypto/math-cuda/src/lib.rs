@@ -4,7 +4,10 @@
 //! element-wise arith) is either internal to the LDE pipeline or used by the
 //! parity test suite.
 
+pub mod barycentric;
+pub mod deep;
 pub mod device;
+pub mod fri;
 pub mod lde;
 pub mod merkle;
 pub mod ntt;

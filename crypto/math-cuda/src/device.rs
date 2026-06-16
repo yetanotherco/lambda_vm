@@ -93,6 +93,10 @@ impl Drop for PinnedStaging {
 const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
 const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
 const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
+const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
+const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
+const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
+
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -102,16 +106,15 @@ const STREAM_POOL_SIZE: usize = 32;
 pub struct Backend {
     pub ctx: Arc<CudaContext>,
     streams: Vec<Arc<CudaStream>>,
-    /// Single shared pinned staging buffer, grown to the biggest LDE size
-    /// seen. Concurrent batched LDE calls serialise on it; in exchange the
-    /// process keeps only ONE gigabyte-sized pinned allocation (per-stream
-    /// buffers 32×-inflated memory use and multiplied the one-time pinning
-    /// cost for every first use of a new table size).
-    pinned_staging: Mutex<PinnedStaging>,
-    /// Separate pinned staging for Merkle leaf hashes. Sized `num_rows * 32`
-    /// bytes. It lives alongside the LDE staging so the GPU→host D2H for
-    /// hashed leaves runs at full PCIe line-rate.
-    pinned_hashes: Mutex<PinnedStaging>,
+    /// Per-rayon-worker pinned staging buffers. Indexed by
+    /// `rayon::current_thread_index()` (0 for non-rayon callers). Each slot
+    /// grows lazily on first use, idle slots stay at zero allocation.
+    /// Worst-case footprint is `N_workers × max_LDE_size` of pinned host RAM.
+    pinned_staging: Vec<Mutex<PinnedStaging>>,
+    /// Per-worker pinned staging for Merkle leaf hashes. Same layout as
+    /// `pinned_staging`; sized `num_rows * 32` bytes per slot. Lives
+    /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
+    pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
 
@@ -144,6 +147,19 @@ pub struct Backend {
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
 
+    // barycentric.ptx
+    pub barycentric_base_batched: CudaFunction,
+    pub barycentric_ext3_batched: CudaFunction,
+    pub barycentric_base_batched_strided: CudaFunction,
+    pub barycentric_ext3_batched_strided: CudaFunction,
+
+    // deep.ptx
+    pub deep_composition_ext3_row: CudaFunction,
+
+    // fri.ptx
+    pub fri_fold_ext3: CudaFunction,
+    pub fri_update_twiddles: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -161,13 +177,28 @@ impl Backend {
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
         let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
+        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
+        let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
+        let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
             streams.push(ctx.new_stream()?);
         }
-        let pinned_staging = Mutex::new(PinnedStaging::empty());
-        let pinned_hashes = Mutex::new(PinnedStaging::empty());
+        // One slot per rayon worker. `current_thread_index()` returns
+        // `0..current_num_threads()`, and non-rayon callers (None) map to slot 0,
+        // so this many slots covers every caller.
+        //
+        // `current_num_threads()` returns the default-pool size (the cpu count)
+        // when no custom pool is in use. Stable across the backend's lifetime
+        // since rayon's pool is fixed at first use.
+        let n_slots = rayon::current_num_threads().max(1);
+        let pinned_staging: Vec<Mutex<PinnedStaging>> = (0..n_slots)
+            .map(|_| Mutex::new(PinnedStaging::empty()))
+            .collect();
+        let pinned_hashes: Vec<Mutex<PinnedStaging>> = (0..n_slots)
+            .map(|_| Mutex::new(PinnedStaging::empty()))
+            .collect();
         // Separate "utility" stream for twiddle uploads and other bookkeeping;
         // not part of the pool that callers rotate through.
         let util_stream = ctx.new_stream()?;
@@ -201,6 +232,15 @@ impl Backend {
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
+            barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
+            barycentric_base_batched_strided: bary
+                .load_function("barycentric_base_batched_strided")?,
+            barycentric_ext3_batched_strided: bary
+                .load_function("barycentric_ext3_batched_strided")?,
+            deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
+            fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
+            fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
@@ -219,16 +259,30 @@ impl Backend {
         self.streams[idx].clone()
     }
 
-    /// Shared pinned staging buffer. Grows to the largest LDE the process
-    /// has seen so far. Concurrent callers serialise on the mutex.
+    /// Per-rayon-worker pinned staging buffer. Returns the slot for the
+    /// current worker (or slot 0 outside a rayon context). Grows lazily to
+    /// the largest LDE the worker has seen. See [`Backend`]'s
+    /// `pinned_staging` field for the rationale behind the per-worker
+    /// split.
     pub fn pinned_staging(&self) -> &Mutex<PinnedStaging> {
-        &self.pinned_staging
+        &self.pinned_staging[self.worker_slot(self.pinned_staging.len())]
     }
 
-    /// Separate pinned staging for Merkle leaf hash output. Sized in u64
+    /// Per-worker pinned staging for Merkle leaf hash output. Sized in u64
     /// units. Caller should reserve `(num_rows * 32 + 7) / 8` u64s.
     pub fn pinned_hashes(&self) -> &Mutex<PinnedStaging> {
-        &self.pinned_hashes
+        &self.pinned_hashes[self.worker_slot(self.pinned_hashes.len())]
+    }
+
+    /// Map `rayon::current_thread_index()` to a slot index, with a defensive
+    /// clamp in case the rayon pool grew past the Vec we sized at init.
+    fn worker_slot(&self, len: usize) -> usize {
+        let idx = rayon::current_thread_index().unwrap_or(0);
+        // Should be unreachable with rayon's fixed default pool, but if a
+        // larger custom pool sneaks in we still want safety: Fall back to
+        // slot 0 (correctness preserved, just contention).
+        debug_assert!(idx < len, "rayon worker {idx} >= staging slots {len}");
+        idx.min(len.saturating_sub(1))
     }
 
     pub fn fwd_twiddles_for(&self, log_n: u64) -> Result<Arc<CudaSlice<u64>>> {

@@ -1,7 +1,7 @@
 //! Ext3 batched coset LDE must agree with the CPU `coset_lde_full_expand`
 //! on each column independently when run over `FieldElement<Ext3>`.
 
-use math::fft::cpu::bowers_fft::LayerTwiddles;
+use math::fft::bowers_fft::LayerTwiddles;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;

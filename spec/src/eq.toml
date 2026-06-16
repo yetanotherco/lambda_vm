@@ -1,0 +1,93 @@
+name = "EQ"
+
+[[variables.input]]
+name = "a"
+type = "DWordWL"
+desc = "The first input"
+pad = 0
+
+[[variables.input]]
+name = "b"
+type = "DWordWL"
+desc = "The second input"
+pad = 0
+
+[[variables.input]]
+name = "invert"
+type = "Bit"
+desc = "Whether to invert the result"
+pad = 0
+
+[[variables.output]]
+name = "res"
+type = "Bit"
+desc = "The result"
+pad = 0
+
+[[variables.auxiliary]]
+name = "diff"
+type = "DWordHL"
+desc = "The difference `a - b`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "eq"
+type = "Bit"
+desc = "The bit indicating `a == b`"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+pad = 0
+
+
+[[assumptions]]
+desc = "`IS_WORD[a[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[b[i]]`"
+iter = ["i", 0, 1]
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "diff", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["invert"]
+
+[[constraints.all]]
+kind = "template"
+tag = "SUB"
+input = ["a", "b"]
+output = ["cast", "diff", "DWordWL"]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["idx", "diff", 0], ["idx", "diff", 1], ["idx", "diff", 2], ["idx", "diff", 3]]]
+output = "eq"
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`res` = #`eq` xor #`invert`$"
+poly = ["-", ["+", "res", ["*", 2, "eq", "invert"]], "eq", "invert"]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ALU"
+input = ["a", "b", ["+", ["opsel", "EQ"], ["*", 64, "invert"]]]
+output = ["arr", "res", 0]
+multiplicity = ["-", "μ"]

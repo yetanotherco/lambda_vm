@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+cuda = ["stark/cuda"]
+test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 disk-spill = ["stark/disk-spill"]
