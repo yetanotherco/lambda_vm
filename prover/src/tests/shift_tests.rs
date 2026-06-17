@@ -37,5 +37,5 @@ fn test_shift_air_wires_in_chip_constraints() {
         bus_interactions(),
     );
     assert_eq!(in_chip, NUM_SHIFT_CONSTRAINTS);
-    assert_eq!(NUM_SHIFT_CONSTRAINTS, 16);
+    assert_eq!(NUM_SHIFT_CONSTRAINTS, 19);
 }
