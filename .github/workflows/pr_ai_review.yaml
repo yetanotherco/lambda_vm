@@ -24,7 +24,7 @@ jobs:
       (
         github.event_name == 'pull_request' &&
         github.event.action == 'labeled' &&
-        contains(fromJson('["ai-review-standard", "ai-review-critical"]'), github.event.label.name)
+        contains(fromJson('["ai-review", "ai-review-standard", "ai-review-critical"]'), github.event.label.name)
       )
     runs-on: ubuntu-latest
     outputs:

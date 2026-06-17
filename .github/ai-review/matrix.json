@@ -1,44 +1,4 @@
 {
-  "standard": {
-    "review_lanes": [
-      {
-        "id": "glm",
-        "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "general",
-        "variant": "low"
-      },
-      {
-        "id": "kimi",
-        "model": "openrouter/moonshotai/kimi-k2.7-code",
-        "prompt": "general",
-        "variant": "low"
-      },
-      {
-        "id": "nemotron",
-        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "general",
-        "variant": "low"
-      },
-      {
-        "id": "minimax",
-        "model": "minimax/MiniMax-M3",
-        "prompt": "general",
-        "variant": "high"
-      }
-    ],
-    "verifier_lanes": [
-      {
-        "id": "deepseek-verifier",
-        "model": "openrouter/deepseek/deepseek-v4-pro",
-        "prompt": "verify",
-        "variant": "low"
-      }
-    ],
-    "deduper": {
-      "model": "openrouter/minimax/minimax-m3",
-      "variant": "low"
-    }
-  },
   "critical": {
     "review_lanes": [
       {

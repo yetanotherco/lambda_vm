@@ -169,7 +169,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     token = os.environ["GITHUB_TOKEN"]
     pr = github_json("GET", f"/repos/{repo}/pulls/{pr_number}", token=token)
 
-    prompt_path = pathlib.Path(args.prompt_dir) / f"{tier}.md"
+    # Single native-review prompt (fed to the native Codex/Claude reviews via the
+    # custom_prompt output); decoupled from the tier key.
+    prompt_path = pathlib.Path(args.prompt_dir) / "native-review.md"
     custom_prompt = prompt_path.read_text(encoding="utf-8")
     tier_config = matrix[tier]
 
@@ -723,18 +725,19 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def parse_tier_command(body: str) -> str | None:
-    match = re.search(r"(?im)^\s*/ai-review\s+(standard|critical)\b", body)
-    if not match:
-        return None
-    return match.group(1).lower()
+    # Single review flow: any /ai-review comment (with or without a legacy
+    # standard|critical argument) runs the one "critical" flow.
+    if re.search(r"(?im)^\s*/ai-review\b", body):
+        return "critical"
+    return None
 
 
 def parse_tier_label(name: str) -> str | None:
-    labels = {
-        "ai-review-standard": "standard",
-        "ai-review-critical": "critical",
-    }
-    return labels.get(name.strip().lower())
+    # Any ai-review* label (including legacy ai-review-standard/-critical) runs
+    # the single "critical" flow.
+    if name.strip().lower().startswith("ai-review"):
+        return "critical"
+    return None
 
 
 def parse_review_trigger(event: dict[str, Any]) -> tuple[str | None, int | None]:

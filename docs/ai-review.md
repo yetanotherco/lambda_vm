@@ -1,30 +1,24 @@
 # AI Review Workflow
 
-This repository uses manually triggered AI review tiers. Expensive reviewers
-should run when the author or reviewer asks for them, not when a draft PR is
-opened.
+This repository uses a single, manually triggered AI review flow. It is
+deliberately opt-in: expensive reviewers run when the author or a reviewer asks
+for them, never automatically on PR open.
 
 ## Commands
 
-Comment on a pull request with one of these commands:
+Comment `/ai-review` on a pull request to run the review. There is a single
+flow; the legacy `/ai-review standard` and `/ai-review critical` forms still
+work and run the same thing.
 
-| Command | Tier | Current reviewers | Use when |
-| --- | --- | --- | --- |
-| `/ai-review standard` | Standard | OpenRouter matrix + verifier | Everyday PRs that are ready for serious review. |
-| `/ai-review critical` | Critical | OpenRouter matrix + verifiers, plus native Codex and Claude | Soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
-| `/kimi` | Individual | Kimi | Ad-hoc lightweight review. |
-| `/codex` | Individual | Codex | Ad-hoc Codex-only review. |
-| `/claude` | Individual | Claude | Ad-hoc Claude-only review. |
+| Command | Reviewers | Use when |
+| --- | --- | --- |
+| `/ai-review` | Open-weight swarm + verifier (structured report), plus native Codex and Claude (opus) | Any PR worth a serious review — especially soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
 
-You can also add one of these labels to a pull request:
-
-| Label | Tier |
-| --- | --- |
-| `ai-review-standard` | Standard |
-| `ai-review-critical` | Critical |
-
-The label trigger is useful for testing workflow changes before they are merged,
-because `pull_request` label events run against the PR workflow definition.
+You can also add the `ai-review` label to a pull request (the legacy
+`ai-review-standard` / `ai-review-critical` labels also work and run the same
+flow). The label trigger is useful for testing workflow changes before they are
+merged, because `pull_request` label events run against the PR workflow
+definition.
 
 Comment commands are restricted to repository owners, members, and
 collaborators. Label triggers are controlled by GitHub's label permissions.
@@ -34,10 +28,10 @@ collaborators. Label triggers are controlled by GitHub's label permissions.
 Reviewer prompts live in `.github/ai-review/prompts/` so they can be reused by
 any model runner:
 
-- `general.md` backs the individual `/kimi`, `/codex`, and `/claude` commands.
-- `standard.md` backs `/ai-review standard`.
-- `critical.md` backs `/ai-review critical`.
-- `lanes/*.md` backs focused OpenRouter review and verification lanes.
+- `general.md` is the finder prompt used by every swarm lane.
+- `lanes/verify.md` is the verifier prompt.
+- `native-review.md` is the brief handed to the native Codex and Claude reviews
+  (passed as the `custom_prompt` input to their workflows).
 
 Model-specific workflows should load one of these prompt files and pass its
 contents to the reviewer. Do not duplicate prompt bodies inside model-specific
@@ -48,15 +42,12 @@ The model-to-prompt mapping lives in `.github/ai-review/matrix.json`. Prompts
 are intentionally model-agnostic; the matrix decides which model receives which
 prompt.
 
-## Tier Policy
+## What the review covers
 
-### Standard
+The review is one flow with two independent parts:
 
-Use standard review for most PRs after they are ready for review. The goal is a
-serious, high-signal review using the standard-cost reviewer set, not a final
-certification.
-
-The standard reviewer focuses on:
+**1. Structured swarm** (open-weight finders + verifier) → one deduplicated
+report with per-finding provenance. It focuses on:
 
 - correctness and regressions introduced by the branch
 - local constraint, trace, and bus consistency when those files change
@@ -64,13 +55,12 @@ The standard reviewer focuses on:
 - simplicity and maintainability
 - stale comments, stale names, misleading docs, and scope drift
 
-Standard review is allowed to review constraint changes in the PR. It is not a
-proof-system or transcript design audit.
+It reviews constraint changes in the PR but is not a proof-system or transcript
+design audit — that depth comes from the native reviews below.
 
-### Critical
-
-Use critical review when a small change can still have high impact. Size is not
-the deciding factor. Trigger critical review for changes touching:
+**2. Native Codex + Claude (opus) reviews** run independently in the vendors'
+own harnesses (the `native-review.md` brief) and post their own comments. They
+are the soundness-aware pass, covering:
 
 - soundness-sensitive prover constraints, trace generation, buses, AIR
   inclusion, or statements
@@ -81,9 +71,8 @@ the deciding factor. Trigger critical review for changes touching:
 - security-sensitive infra or CI behavior
 - merge-conflict resolutions in high-risk branches
 
-Critical review also triggers native Codex and Claude independently. Treat their
-results as separate reviewer opinions; they currently post their own comments
-and are not included in the structured OpenRouter provenance report.
+Treat the native results as separate reviewer opinions; they are not included in
+the structured provenance report.
 
 ## Reviewer Matrix
 
@@ -95,12 +84,12 @@ opencode id, so the provider determines which key is used:
   deduper (everything `openrouter/...`). This key has a **daily spend limit**;
   heavy experimentation can exhaust it (403 "Key limit exceeded (daily limit)").
 - `MINIMAX_API_KEY` — the direct `minimax/MiniMax-M3` finder lanes.
-- `ANTHROPIC_API_KEY` — the critical-tier native Claude review (opus).
-- `OPENAI_API_KEY` — the critical-tier native Codex review.
-- `KIMI_API_KEY` → mapped to `MOONSHOT_API_KEY` for the `/kimi` command **only**.
-  Kimi in the review swarm goes through **OpenRouter** (`openrouter/moonshotai/...`),
-  because the direct Moonshot endpoint rejected the key with `401 Incorrect API
-  key`. See "Lessons learned".
+- `ANTHROPIC_API_KEY` — the native Claude review (opus).
+- `OPENAI_API_KEY` — the native Codex review.
+- `KIMI_API_KEY` (→ `MOONSHOT_API_KEY`) is **no longer used** — the standalone
+  `/kimi` command was retired. Kimi in the review swarm goes through **OpenRouter**
+  (`openrouter/moonshotai/...`), because the direct Moonshot endpoint rejected the
+  key with `401 Incorrect API key`. See "Lessons learned".
 
 A missing key makes only that provider's lanes fail; the report still posts.
 
@@ -116,13 +105,14 @@ not free-text JSON:
 
 The tool writes the validated result to `$AI_REVIEW_OUT`, which the orchestrator
 reads back. Flow: **finders → heuristic + LLM dedup → verifier → report**. The
-matrix (`.github/ai-review/matrix.json`) is per-tier `review_lanes`,
-`verifier_lanes`, and a `deduper`. Each lane is `{id, model, prompt, variant}`;
-`variant` is opencode's reasoning effort (see "Reasoning effort" below).
+matrix (`.github/ai-review/matrix.json`) holds the single flow's `review_lanes`,
+`verifier_lanes`, and a `deduper` (keyed `critical` for backward compatibility).
+Each lane is `{id, model, prompt, variant}`; `variant` is opencode's reasoning
+effort (see "Reasoning effort" below).
 
 All finders use the broad **`general`** prompt (correctness + cosmetic + perf in
 one pass), at `low` effort except minimax (`high`, its measured sweet spot — see
-"Reasoning effort"). Current **standard** (cheap) matrix:
+"Reasoning effort"). The structured swarm is **open-weight end-to-end**:
 
 | Lane | Model | Prompt | Variant |
 | --- | --- | --- | --- |
@@ -133,16 +123,14 @@ one pass), at `low` effort except minimax (`high`, its measured sweet spot — s
 | `deepseek-verifier` (verify) | `openrouter/deepseek/deepseek-v4-pro` | verify | low |
 | deduper | `openrouter/minimax/minimax-m3` | — | low |
 
-Current **critical** (expensive) matrix uses the **same open-weight finder swarm,
-`deepseek-v4-pro`/`verify` verifier, and minimax-m3 deduper as standard** — the
-structured pipeline is open-weight end-to-end. What makes critical "critical" is
-that it *also* triggers the native **Codex** (GPT) and native **Claude** (opus)
-reviews, which run in their own vendor harnesses (`critical.md` prompt) and post
-their own independent comments. The flagship closed models contribute as
-independent native reviews rather than swarm finders: in measured runs the
-native Codex pass found a high-severity issue the whole swarm missed, while an
-opus *swarm* finder cost ~$1/run for only one unique low finding — so opus was
-moved out of the swarm and into its native harness.
+Alongside the swarm, the flow **also** triggers the native **Codex** (GPT) and
+native **Claude** (opus) reviews — they run in their own vendor harnesses
+(`native-review.md` brief) and post their own independent comments, outside the
+structured report. The flagship closed models contribute as independent native
+reviews rather than swarm finders: in measured runs the native Codex pass found
+a high-severity issue the whole swarm missed, while an opus *swarm* finder cost
+~$1/run for only one unique low finding — so opus was moved out of the swarm and
+into its native harness.
 
 Reviewer lanes see the diff plus current/base contents for changed files (size
 limited). Verifier lanes see the deduplicated candidates plus the same context.
@@ -206,8 +194,9 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
    model — don't assume. Sweep by adding `<id>-low` and `<id>-high` lanes and
    comparing findings count **and severity** (count alone misled us on kimi).
    Raise the per-call and wrapper timeouts generously for `high`/`max` lanes.
-4. Default new models to `low`; reserve the expensive direct models (Claude/GPT)
-   for the critical tier.
+4. Default new models to `low`. Keep the expensive flagship closed models
+   (Claude/GPT) out of the swarm — they contribute via the native Codex/Claude
+   reviews instead.
 
 ## Lessons Learned / Gotchas
 
