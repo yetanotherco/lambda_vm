@@ -20,6 +20,13 @@ flow). The label trigger is useful for testing workflow changes before they are
 merged, because `pull_request` label events run against the PR workflow
 definition.
 
+> **Note:** the **native Claude** review and the `/ai-review` **comment** trigger
+> only activate once this workflow is merged to the default branch.
+> `claude-code-action` refuses to run unless the invoking workflow is identical to
+> the version on `main` (an anti-pwn-request guard), and `issue_comment` always
+> uses the default-branch workflow. Pre-merge, use the **label** trigger: the
+> swarm and native Codex run, but native Claude self-skips until merge.
+
 Comment commands are restricted to repository owners, members, and
 collaborators. Label triggers are controlled by GitHub's label permissions.
 
@@ -178,11 +185,11 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
 
 ## Adding or Changing a Model
 
-1. Add `{id, model, prompt, variant: "low"}` to the tier in
-   `.github/ai-review/matrix.json`. Use a provider-qualified opencode id
-   (`openrouter/<author>/<model>` or a direct provider id); confirm it exists on
-   models.dev and its provider key is in the workflow env.
-2. Run the tier on a real PR and read the lane artifact:
+1. Add `{id, model, prompt, variant: "low"}` to `review_lanes` (or
+   `verifier_lanes`) in `.github/ai-review/matrix.json`. Use a provider-qualified
+   opencode id (`openrouter/<author>/<model>` or a direct provider id); confirm it
+   exists on models.dev and its provider key is in the workflow env.
+2. Run the review on a real PR and read the lane artifact:
    - `submission.submitted == true` with findings → working.
    - `submitted: false` / `event_counts: {step_start: 1}` → emitted nothing
      (reasoning-burn / no convergence). Try another `variant` or drop it.
@@ -268,30 +275,14 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   text previews, per-step output/reasoning tokens), `cost`, `tokens`,
   `returncode`, and a stderr tail — that is how every failure above was diagnosed.
 
-## Multiple Prompts Versus One Prompt
+## One prompt for all reviewers
 
-Use multiple prompts when both conditions hold:
-
-- the model is cheap enough that repeated input is acceptable
-- the model benefits from a narrow lens and may blur tasks in a broad prompt
-
-Use one broad prompt when either condition holds:
-
-- the model is expensive enough that repeated full-context input dominates cost
-- the model handles multi-objective review well enough in one pass
-
-Initial policy:
-
-| Model family | Prompt strategy | Reason |
-| --- | --- | --- |
-| MiMo V2.5 | Multiple focused prompts | Extremely cheap; use for stale comments, missing tests, edge cases, and adversarial sanity checks. |
-| MiniMax M3 | Multiple focused prompts | Cheap enough for repeated passes and strong enough to be a workhorse. |
-| DeepSeek V4 Flash | One or two focused prompts | Very cheap; good for adversarial or regression-focused checks. |
-| Qwen 3.7 Plus | One broad prompt | Strong cheap generalist; avoid redundant repeated input until local data says otherwise. |
-| Kimi K2.7 Code | One code-focused prompt | More expensive output and smaller context; use as a coding specialist. |
-| GLM 5.1 | One reasoning-focused prompt | More expensive; use for broad correctness reasoning, not repeated cheap lanes. |
-| Codex / GPT-5.5 | One broad pass or targeted verification | Expensive; reserve repeated use for critical findings. |
-| Claude Sonnet/Opus/Fable | One broad pass or targeted disagreement review | Expensive; use for critical PRs or to challenge Codex findings. |
+The system uses a single generic prompt (`general.md`) for every reviewer — the
+open-weight swarm finders and the native Codex/Claude reviews alike. An earlier
+design used multiple focused prompts per model; it was dropped because the
+structured swarm converges better on one broad prompt and a per-model prompt
+matrix wasn't worth the upkeep. There is intentionally no separate soundness
+prompt — see "Lessons learned" for why.
 
 ## Evaluation Artifacts
 
@@ -322,8 +313,8 @@ Each final issue should preserve provenance:
   "issue_id": "AI-004",
   "status": "confirmed",
   "severity": "high",
-  "found_by": ["minimax-correctness:minimax/minimax-m3", "glm-standard:z-ai/glm-5.1"],
-  "verified_by": ["qwen-standard-verifier:qwen/qwen3.7-plus"],
+  "found_by": ["nemotron:openrouter/nvidia/nemotron-3-ultra-550b-a55b", "glm:openrouter/z-ai/glm-5.2"],
+  "verified_by": ["deepseek-verifier:openrouter/deepseek/deepseek-v4-pro"],
   "rejected_by": [],
   "file": "prover/src/tables/cpu.rs",
   "line": 123
