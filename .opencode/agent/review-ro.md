@@ -25,6 +25,14 @@ the JSON result. Do not repeatedly re-read the same file or second-guess
 indefinitely — a thorough review of the diff plus its immediate dependencies is
 enough.
 
+CRITICAL — how to respond each turn: every message you send must be EITHER a
+tool call (to read more) OR the final JSON object. Never send a message that
+only narrates your plan or intentions — do NOT write things like "Now I have a
+thorough understanding", "let me analyze", or "let me compile the findings". A
+message with no tool call is treated as your final answer, so the moment you
+have read enough, your very next message must BE the JSON object itself, with no
+preamble. Narration without the JSON counts as producing nothing.
+
 Scope: report ONLY issues introduced or exposed by the PR diff provided in the user
 message. Do not flag pre-existing code unrelated to the change.
 

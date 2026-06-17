@@ -328,10 +328,11 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
         else:
             message = build_agentic_verification_message(lane, context, candidates, prompt)
             required_key = "verifications"
-        raw = run_opencode_agent(
+        raw, meta = run_opencode_agent(
             pathlib.Path(args.repo), lane["model"], args.agent, message, args.timeout
         )
         base_result["raw_response"] = raw[-20000:]
+        base_result["opencode"] = meta
         parsed, parse_error = extract_json(raw, required_key=required_key)
         if args.kind == "review":
             findings = parse_findings(parsed, lane)
@@ -353,7 +354,7 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
 
 def run_opencode_agent(
     repo: pathlib.Path, model: str, agent: str, message: str, timeout: int
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     # model is a fully provider-qualified opencode id (e.g. "openrouter/z-ai/glm-5.2",
     # "minimax-coding-plan/MiniMax-M3", "anthropic/claude-opus-4-8"). opencode resolves
     # credentials from the environment and ~/.local/share/opencode/auth.json.
@@ -372,10 +373,30 @@ def run_opencode_agent(
     out = proc.stdout.decode("utf-8", errors="replace")
     err = proc.stderr.decode("utf-8", errors="replace")
     text = opencode_assistant_text(out)
+    meta = opencode_stream_meta(out)
+    meta["stderr_tail"] = err[-1500:]
     if not text.strip():
         # Surface diagnostics so the lane result shows why nothing was produced.
-        return f"[opencode produced no assistant text]\nstderr:\n{err[-3000:]}\nstdout-tail:\n{strip_ansi(out)[-3000:]}"
-    return text
+        text = f"[opencode produced no assistant text]\nstderr:\n{err[-3000:]}\nstdout-tail:\n{strip_ansi(out)[-3000:]}"
+    return text, meta
+
+
+def opencode_stream_meta(stdout: str) -> dict[str, Any]:
+    # Event-type counts (tool_use / text / step_start / step_finish) reveal whether the
+    # agent hit a step cap (many steps then forced text) or stopped on its own.
+    counts: dict[str, int] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            etype = event.get("type", "?")
+            counts[etype] = counts.get(etype, 0) + 1
+    return {"event_counts": counts, "stream_tail": strip_ansi(stdout)[-6000:]}
 
 
 def opencode_assistant_text(stdout: str) -> str:
