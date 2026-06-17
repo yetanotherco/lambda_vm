@@ -6,6 +6,8 @@ use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
@@ -119,8 +121,15 @@ where
 {
     if !fri_layers.is_empty() {
         let num_layers = fri_layers.len();
-        iotas
-            .iter()
+        // Each query (iota) walks the FRI layers independently, reading only the
+        // immutable layer evaluations + Merkle trees. Parallel across queries
+        // (under the `parallel` feature); `map().collect()` preserves order, so
+        // the output is byte-identical to the serial path.
+        #[cfg(not(feature = "parallel"))]
+        let iota_iter = iotas.iter();
+        #[cfg(feature = "parallel")]
+        let iota_iter = iotas.par_iter();
+        iota_iter
             .map(|iota_s| {
                 let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
                 let mut layers_auth_paths = Vec::with_capacity(num_layers);

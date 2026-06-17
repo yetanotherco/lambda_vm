@@ -1553,55 +1553,62 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let mut openings = Vec::with_capacity(indexes_to_open.len());
-
         let lde_trace = &round_1_result.lde_trace;
         let main_commit = &round_1_result.main;
         let is_preprocessed = main_commit.is_preprocessed();
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        for index in indexes_to_open.iter() {
-            // For preprocessed tables, open the main split (multiplicities only);
-            // for normal tables, open all main columns.
-            let main_trace_opening = if is_preprocessed {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
-                })
-            } else {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row(row)
-                })
-            };
+        // Each query index opens independently and only reads immutable
+        // structures (Merkle trees + LDE), so the per-query authentication-path
+        // walks run in parallel (under the `parallel` feature). `map().collect()`
+        // preserves order, so the openings vector is byte-identical to serial.
+        #[cfg(not(feature = "parallel"))]
+        let index_iter = indexes_to_open.iter();
+        #[cfg(feature = "parallel")]
+        let index_iter = indexes_to_open.par_iter();
+        index_iter
+            .map(|index| {
+                // For preprocessed tables, open the main split (multiplicities only);
+                // for normal tables, open all main columns.
+                let main_trace_opening = if is_preprocessed {
+                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                        lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
+                    })
+                } else {
+                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                        lde_trace.gather_main_row(row)
+                    })
+                };
 
-            // For preprocessed tables, also open the precomputed-columns tree.
-            let precomputed_trace_opening = main_commit.precomputed_tree.as_ref().map(|tree| {
-                Self::open_polys_with(domain, tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
-                })
-            });
+                // For preprocessed tables, also open the precomputed-columns tree.
+                let precomputed_trace_opening =
+                    main_commit.precomputed_tree.as_ref().map(|tree| {
+                        Self::open_polys_with(domain, tree, *index, |row| {
+                            lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
+                        })
+                    });
 
-            let composition_openings = Self::open_composition_poly(
-                &round_2_result.composition_poly_merkle_tree,
-                &round_2_result.lde_composition_poly_evaluations,
-                *index,
-            );
+                let composition_openings = Self::open_composition_poly(
+                    &round_2_result.composition_poly_merkle_tree,
+                    &round_2_result.lde_composition_poly_evaluations,
+                    *index,
+                );
 
-            let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                    lde_trace.gather_aux_row(row)
-                })
-            });
+                let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
+                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                        lde_trace.gather_aux_row(row)
+                    })
+                });
 
-            openings.push(DeepPolynomialOpening {
-                composition_poly: composition_openings,
-                main_trace_polys: main_trace_opening,
-                precomputed_trace_polys: precomputed_trace_opening,
-                aux_trace_polys,
-            });
-        }
-
-        openings
+                DeepPolynomialOpening {
+                    composition_poly: composition_openings,
+                    main_trace_polys: main_trace_opening,
+                    precomputed_trace_polys: precomputed_trace_opening,
+                    aux_trace_polys,
+                }
+            })
+            .collect()
     }
 
     // TODO: propagate errors instead of unwrap() in commit_columns, reconstruct_round1, and expand_columns_to_lde
