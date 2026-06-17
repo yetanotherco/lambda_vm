@@ -492,6 +492,8 @@ def opencode_stream_meta(stdout: str) -> dict[str, Any]:
     # exactly what it did ("read X, read Y, then emitted empty") without raw-stream digging.
     counts: dict[str, int] = {}
     timeline: list[dict[str, Any]] = []
+    total_cost = 0.0
+    tok_totals = {"input": 0, "output": 0, "reasoning": 0}
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -522,9 +524,22 @@ def opencode_stream_meta(stdout: str) -> dict[str, Any]:
         elif etype == "step_finish":
             tok = part.get("tokens") or {}
             timeline.append({"t": "step", "out": tok.get("output"), "reasoning": tok.get("reasoning")})
+            cost = part.get("cost")
+            if isinstance(cost, (int, float)):
+                total_cost += cost
+            for k in tok_totals:
+                v = tok.get(k)
+                if isinstance(v, (int, float)):
+                    tok_totals[k] += v
     if len(timeline) > 240:
         timeline = timeline[:120] + [{"t": "truncated", "dropped": len(timeline) - 240}] + timeline[-120:]
-    return {"event_counts": counts, "timeline": timeline, "stream_tail": strip_ansi(stdout)[-4000:]}
+    return {
+        "event_counts": counts,
+        "timeline": timeline,
+        "cost": round(total_cost, 6),
+        "tokens": tok_totals,
+        "stream_tail": strip_ansi(stdout)[-4000:],
+    }
 
 
 def opencode_assistant_text(stdout: str) -> str:
