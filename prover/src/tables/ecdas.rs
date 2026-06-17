@@ -24,6 +24,7 @@ use ecsm::{EcdasStep, P_BYTES};
 
 pub(crate) use ecsm::R_BYTES;
 
+// Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offsets" (@ecsm-limb_carry).
 pub(crate) const CARRY_OFFSET_LAMBDA: i64 = 32636;
 pub(crate) const CARRY_OFFSET_XR: i64 = 8161;
 pub(crate) const CARRY_OFFSET_YR: i64 = 16320;
@@ -124,6 +125,9 @@ pub fn generate_ecdas_trace(
         write_bytes(&mut data, base, cols::Q1, &s.q1);
         write_bytes(&mut data, base, cols::Q2, &s.q2);
         for i in 0..64 {
+            debug_assert!((0..1 << 16).contains(&(s.c0[i] + CARRY_OFFSET_LAMBDA)));
+            debug_assert!((0..1 << 16).contains(&(s.c1[i] + CARRY_OFFSET_XR)));
+            debug_assert!((0..1 << 16).contains(&(s.c2[i] + CARRY_OFFSET_YR)));
             data[base + cols::c0(i)] = fe_from_i64(s.c0[i]);
             data[base + cols::c1(i)] = fe_from_i64(s.c1[i]);
             data[base + cols::c2(i)] = fe_from_i64(s.c2[i]);

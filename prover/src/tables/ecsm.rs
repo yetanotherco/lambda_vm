@@ -29,6 +29,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
+// Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
 pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
@@ -184,6 +185,8 @@ pub fn generate_ecsm_trace(
         write_halfwords(&mut data, base, cols::XR_SUB_P, &w.x_r_sub_p);
 
         for i in 0..64 {
+            debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
+            debug_assert!((0..1 << 16).contains(&(w.c1[i] + CARRY_OFFSET_YG)));
             data[base + cols::c0(i)] = fe_from_i64(w.c0[i]);
             data[base + cols::c1(i)] = fe_from_i64(w.c1[i]);
         }
@@ -445,6 +448,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::Q0, 32, &mut out);
     is_byte(cols::YG, 32, &mut out);
     is_byte(cols::Q1, 32, &mut out); // q1[0..31]; q1[32] is an IS_BIT constraint
+    // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
     // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
     let half_offset = |col: usize, off: i64| {

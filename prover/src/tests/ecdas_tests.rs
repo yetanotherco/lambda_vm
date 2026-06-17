@@ -28,8 +28,8 @@ fn k_le(v: u64) -> [u8; 32] {
     k
 }
 
-fn ops_for(k: u64) -> Vec<EcdasOperation> {
-    let w = compute_witness(&k_le(k), &gx_le()).unwrap();
+fn ops_for_bytes(k_le: &[u8; 32]) -> Vec<EcdasOperation> {
+    let w = compute_witness(k_le, &gx_le()).unwrap();
     w.steps
         .into_iter()
         .map(|step| EcdasOperation {
@@ -37,6 +37,10 @@ fn ops_for(k: u64) -> Vec<EcdasOperation> {
             step,
         })
         .collect()
+}
+
+fn ops_for(k: u64) -> Vec<EcdasOperation> {
+    ops_for_bytes(&k_le(k))
 }
 
 fn row_view(
@@ -123,6 +127,33 @@ fn constraints_hold_on_generated_trace() {
                     }
                     .evaluate(&view),
                     FE::zero()
+                );
+            }
+        }
+    }
+}
+
+/// Worst-case carries: N-1 (largest valid scalar) runs the full 256-bit ladder.
+#[test]
+fn constraints_hold_for_near_order_scalar() {
+    let mut k = ecsm::N_BYTES;
+    k[0] -= 1;
+    let ops = ops_for_bytes(&k);
+    assert!(!ops.is_empty());
+    let trace = generate_ecdas_trace(&ops);
+    for row in 0..trace.num_rows() {
+        let view = row_view(&trace, row);
+        for relation in [Relation::Lambda, Relation::Xr, Relation::Yr] {
+            for i in 0..64 {
+                assert_eq!(
+                    ConvCarry {
+                        relation,
+                        i,
+                        constraint_idx: 0
+                    }
+                    .evaluate(&view),
+                    FE::zero(),
+                    "conv N-1 i={i} row {row}"
                 );
             }
         }
