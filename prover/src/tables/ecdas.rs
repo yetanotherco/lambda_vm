@@ -219,8 +219,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // Receive Bit[ts, round] when adding next (mult = next_op).
-    out.push(BusInteraction::receiver(
+    // Send Bit[ts, round] when adding next (mult = next_op).
+    out.push(BusInteraction::sender(
         BusId::Bit,
         Multiplicity::Column(cols::NEXT_OP),
         vec![ts_lo(), ts_hi(), packed(cols::ROUND)],
@@ -445,7 +445,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZero {
     }
 }
 
-/// Creates all ECDAS transition constraints (199 total).
+/// Creates all ECDAS transition constraints (200 total).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -457,10 +457,8 @@ pub fn create_constraints(
     > = Vec::new();
     let mut idx = constraint_idx_start;
 
-    // `op` needs no direct bit check. The receiver multiplicity `mu` is bit-checked below,
-    // and the only producers of the op field are ECSM's constant-0 seed and previous ECDAS
-    // rows' bit-checked `next_op`, so a received `op` is always in {0,1}.
-    for col in [cols::MU, cols::NEXT_OP] {
+    // IS_BIT on μ, op and next_op (the spec range-checks op: ecdas:c:range_op).
+    for col in [cols::MU, cols::OP, cols::NEXT_OP] {
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }

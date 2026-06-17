@@ -1,6 +1,6 @@
 //! ECSM core chip — orchestrates one secp256k1 scalar multiplication `k·G`.
 //!
-//! One row per `ECALL(-3)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
+//! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
 //! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
 //! triggers EC_SCALAR to serve `k` bit-by-bit, and delegates the double-and-add to ECDAS over
@@ -515,8 +515,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(31),
         ],
     ));
-    // BIT receiver: the MSB at position len_k.
-    out.push(BusInteraction::receiver(
+    // BIT sender: the MSB at position len_k.
+    out.push(BusInteraction::sender(
         BusId::Bit,
         mu(),
         vec![ts_lo(), ts_hi(), packed(cols::LEN_K)],

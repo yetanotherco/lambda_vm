@@ -80,6 +80,10 @@ fn constraints_hold_on_generated_trace() {
                 FE::zero()
             );
             assert_eq!(
+                IsBitConstraint::unconditional(cols::OP, 0).evaluate(&view),
+                FE::zero()
+            );
+            assert_eq!(
                 MulZero {
                     a: cols::OP,
                     b: cols::NEXT_OP,
@@ -128,6 +132,6 @@ fn constraints_hold_on_generated_trace() {
 #[test]
 fn create_constraints_count() {
     let (constraints, next) = create_constraints(0);
-    assert_eq!(constraints.len(), 199);
-    assert_eq!(next, 199);
+    assert_eq!(constraints.len(), 200);
+    assert_eq!(next, 200);
 }

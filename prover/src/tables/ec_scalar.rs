@@ -226,10 +226,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 3. Send Bit[timestamp, 8*offset + i] for each set bit (mult = limb_bits[i]).
+    // 3. Receive Bit[timestamp, 8*offset + i] for each set bit (mult = limb_bits[i]).
     for i in 0..8 {
         let [t0, t1] = ts();
-        interactions.push(BusInteraction::sender(
+        interactions.push(BusInteraction::receiver(
             BusId::Bit,
             Multiplicity::Column(cols::limb_bit(i)),
             vec![
