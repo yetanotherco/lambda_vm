@@ -23,4 +23,11 @@ Focus on:
 If constraints, trace generation, or bus interactions change, check local
 consistency against nearby code and tests. Do not attempt a full spec audit.
 
-Ignore unrelated pre-existing issues. Prefer high-confidence findings.
+Stay within issues introduced or exposed by this diff (ignore unrelated
+pre-existing problems). Report every plausible issue, not just the ones you are
+certain about: a separate verifier re-checks each finding against the code, so a
+medium- or low-confidence candidate is still valuable — set its `confidence`
+field honestly and let the verifier decide. Do not fabricate baseless issues to
+fill space, but do not drop a genuine concern just because you are not fully
+sure. If a line of reasoning surfaces a possible bug, submit it with the
+appropriate confidence rather than discarding it.

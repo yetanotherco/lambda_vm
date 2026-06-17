@@ -38,9 +38,12 @@ SUBMIT_INSTRUCTION = (
     "When you have finished reading the relevant code, report your result by CALLING the "
     "submit_findings tool exactly once. Each finding needs: severity "
     "(critical|high|medium|low), confidence (high|medium|low), title, file, line, claim "
-    "(what is wrong), evidence (why the code supports it), suggested_fix. Pass an empty "
-    "findings array if there are no real issues. Report ONLY through submit_findings — do "
-    "not write the findings as prose or JSON in your message."
+    "(what is wrong), evidence (why the code supports it), suggested_fix. Report every "
+    "plausible issue, not just ones you are certain about — a separate verifier re-checks "
+    "each finding, so include medium- and low-confidence candidates with an honest "
+    "confidence rating rather than dropping them. If your reasoning surfaces a possible "
+    "bug, submit it. Use an empty findings array only when you genuinely found nothing. "
+    "Report ONLY through submit_findings — do not write the findings as prose or JSON."
 )
 # End-injection: if exploration ended without a submit_findings call, resume the session
 # and force the tool call (the ask is now the current instruction, not a stale preamble).
