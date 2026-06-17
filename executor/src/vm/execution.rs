@@ -105,10 +105,15 @@ impl Executor {
 
     /// Run to completion and return all logs (consumes executor)
     pub fn run(mut self) -> Result<ExecutionResult, ExecutorError> {
-        let mut logs = Vec::with_capacity(CHUNK_SIZE);
+        let mut logs = Vec::new();
 
-        while let Some(chunk) = self.resume()? {
-            logs.extend_from_slice(chunk);
+        // `resume()` fills `self.logs` (a reused chunk buffer) and returns a
+        // borrow of it. Drop that borrow immediately (`.is_some()`), then *move*
+        // the chunk out with `append` instead of cloning it via
+        // `extend_from_slice`: this avoids holding a second copy of every chunk
+        // and the per-log clone, lowering peak log memory during proving.
+        while self.resume()?.is_some() {
+            logs.append(&mut self.logs);
         }
 
         Ok(ExecutionResult {
