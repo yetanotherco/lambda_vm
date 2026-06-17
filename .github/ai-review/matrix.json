@@ -2,8 +2,8 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "gpt-nano-correctness",
-        "model": "openrouter/openai/gpt-5-nano",
+        "id": "qwen-flash-correctness",
+        "model": "openrouter/qwen/qwen3-30b-a3b-instruct-2507",
         "prompt": "correctness"
       },
       {
@@ -19,8 +19,8 @@
     ],
     "verifier_lanes": [
       {
-        "id": "gpt-nano-verifier",
-        "model": "openrouter/openai/gpt-5-nano",
+        "id": "glm-flash-verifier",
+        "model": "openrouter/z-ai/glm-4.7-flash",
         "prompt": "verify"
       }
     ]
