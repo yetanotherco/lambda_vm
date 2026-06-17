@@ -167,15 +167,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 10. ethrex test fixture ------------------------------------------------
-ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
-ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
-if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
-    log "downloading ethrex_hoodi.bin"
-    sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
-fi
-
-# --- 11. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 10. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming

@@ -12,7 +12,9 @@ rustc-demangle = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
+# Exact pin: must match the fixture writer + guest so the rkyv ProgramInput
+# layout the executor tests read stays consistent (see tooling/ethrex-fixtures).
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # Native reference for the ethrex tests (host-side `execution_program` with
 # `NativeCrypto`). Pinned to the same ethrex rev as the guest ELF
 # (executor/programs/rust/ethrex) — the open LambdaVM-backend PR branch.

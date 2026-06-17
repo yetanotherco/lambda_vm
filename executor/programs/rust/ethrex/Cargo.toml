@@ -12,7 +12,9 @@ lambda-vm-syscalls = { path = "../../../../syscalls" }
 # `lambdavm` feature provides `crypto::lambdavm::LambdaVmCrypto` (keccak via our
 # precompile syscall, the rest via pure-Rust crates incl. kzg-rs).
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
+# Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
+# executor test reader so the rkyv ProgramInput layout stays consistent.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
 # `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
 # older commit. Override it with our working-tree copy so the guest links our

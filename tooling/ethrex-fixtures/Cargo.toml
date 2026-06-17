@@ -16,7 +16,9 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-l2-rpc" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
+# Exact pin: the fixture writer and the guest/executor readers must agree on the
+# rkyv layout. Keep this in sync with executor/{Cargo.toml,programs/rust/ethrex/Cargo.toml}.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 serde_json = "1"
 bytes = "1"
 secp256k1 = "0.30"

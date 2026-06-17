@@ -87,6 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = blockchain.build_payload(skeleton)?;
     let block = result.payload;
     let included = block.body.transactions.len();
+    assert_eq!(
+        included as u64, n_transfers,
+        "only {included}/{n_transfers} transactions made it into the block \
+         (check gas limit / account balance / nonces)"
+    );
 
     // --- 4. stateless witness -> ProgramInput -> rkyv ----------------------
     let witness = blockchain.generate_witness_for_blocks(&[block.clone()]).await?;
