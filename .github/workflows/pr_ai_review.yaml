@@ -164,8 +164,8 @@ jobs:
           LANE_ID: ${{ matrix.lane.id }}
         run: |
           set +e
-          # Use the env var (not raw ${{ }} interpolation) so the id is not parsed
-          # as shell; prepare also validates it against [A-Za-z0-9._-].
+          # Pass the id through the env var so the runner never parses it as
+          # shell; prepare also validates it against [A-Za-z0-9._-].
           LANE_OUT="ai-review-lane/$LANE_ID.json"
           timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
@@ -316,8 +316,8 @@ jobs:
           LANE_ID: ${{ matrix.lane.id }}
         run: |
           set +e
-          # Use the env var (not raw ${{ }} interpolation) so the id is not parsed
-          # as shell; prepare also validates it against [A-Za-z0-9._-].
+          # Pass the id through the env var so the runner never parses it as
+          # shell; prepare also validates it against [A-Za-z0-9._-].
           LANE_OUT="ai-review-verification/$LANE_ID.json"
           timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
