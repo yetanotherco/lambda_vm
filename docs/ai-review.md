@@ -85,53 +85,61 @@ Critical review also triggers native Codex and Claude independently. Treat their
 results as separate reviewer opinions; they currently post their own comments
 and are not included in the structured OpenRouter provenance report.
 
-## OpenRouter Matrix
+## Reviewer Matrix
 
-`/ai-review standard` and `/ai-review critical` require `OPENROUTER_API_KEY`.
-If the secret is missing, the workflow still posts a report, but the OpenRouter
-lanes are marked as skipped.
+API keys are **organization-level** GitHub secrets (not repo-level — `gh secret
+list` on the repo won't show them). Each lane's `model` is a provider-qualified
+opencode id, so the provider determines which key is used:
 
-The current implementation uses these secrets:
+- `OPENROUTER_API_KEY` — glm, kimi, nemotron, deepseek lanes, and the minimax-m3
+  deduper (everything `openrouter/...`). This key has a **daily spend limit**;
+  heavy experimentation can exhaust it (403 "Key limit exceeded (daily limit)").
+- `MINIMAX_API_KEY` — the direct `minimax/MiniMax-M3` finder lanes.
+- `ANTHROPIC_API_KEY` — the critical-tier `claude-opus-4-8` finder and native Claude.
+- `OPENAI_API_KEY` — the critical-tier `gpt-5.5` verifier and native Codex.
+- `KIMI_API_KEY` → mapped to `MOONSHOT_API_KEY` for the `/kimi` command **only**.
+  Kimi in the review swarm goes through **OpenRouter** (`openrouter/moonshotai/...`),
+  because the direct Moonshot endpoint rejected the key with `401 Incorrect API
+  key`. See "Lessons learned".
 
-- `OPENROUTER_API_KEY` for the structured matrix, verification, artifacts, and
-  final report
-- `OPENAI_API_KEY` for Codex
-- `ANTHROPIC_API_KEY` for Claude
-- `KIMI_API_KEY` for the individual `/kimi` command
+A missing key makes only that provider's lanes fail; the report still posts.
 
-Standard review lanes:
+### Architecture (agentic, via opencode)
 
-| Lane | Model | Prompt |
-| --- | --- | --- |
-| `minimax-correctness` | `minimax/minimax-m3` | `correctness` |
+Each lane is **not** a single chat completion. It runs an **opencode** agent in a
+read-only sandbox (`.opencode/agent/review-ro.md`) that can `read`/`grep`/`glob`
+the repo to explore the change in context, then **reports through a tool call**,
+not free-text JSON:
 
-The standard tier is temporarily reduced to one MiniMax lane while validating
-OpenRouter response behavior. Restore the broader standard matrix after a lane
-successfully emits structured output and its token usage is understood.
+- review lanes call **`submit_findings`** (`.opencode/tools/submit_findings.ts`)
+- verifier lanes call **`submit_verifications`** (`.opencode/tools/submit_verifications.ts`)
 
-Critical review lanes:
+The tool writes the validated result to `$AI_REVIEW_OUT`, which the orchestrator
+reads back. Flow: **finders → heuristic + LLM dedup → verifier → report**. The
+matrix (`.github/ai-review/matrix.json`) is per-tier `review_lanes`,
+`verifier_lanes`, and a `deduper`. Each lane is `{id, model, prompt, variant}`;
+`variant` is opencode's reasoning effort (see "Reasoning effort" below).
 
-| Lane | Model | Prompt |
-| --- | --- | --- |
-| `minimax-critical-correctness` | `minimax/minimax-m3` | `correctness` |
-| `minimax-critical-maintainability` | `minimax/minimax-m3` | `maintainability` |
-| `deepseek-soundness` | `deepseek/deepseek-v4-pro` | `soundness` |
-| `glm-critical` | `z-ai/glm-5.1` | `critical` |
-| `qwen-critical` | `qwen/qwen3.7-max` | `critical` |
-| `glm-critical-verifier` | `z-ai/glm-5.1` | `verify-critical` |
-| `deepseek-critical-verifier` | `deepseek/deepseek-v4-pro` | `verify-critical` |
+Current **standard** (cheap) matrix:
 
-Reviewer lanes see the diff plus current and base contents for changed files,
-within size limits. Verifier lanes see the deduplicated candidate findings plus
-the same PR context. Verification status is `confirmed`, `rejected`,
-`uncertain`, or `candidate` when no verifier result is available.
+| Lane | Model | Prompt | Variant |
+| --- | --- | --- | --- |
+| `glm-correctness` | `openrouter/z-ai/glm-5.2` | correctness | low |
+| `kimi-correctness` | `openrouter/moonshotai/kimi-k2.7-code` | correctness | low |
+| `nemotron-correctness` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b` | correctness | low |
+| `minimax-high` | `minimax/MiniMax-M3` | correctness | high |
+| `minimax-max` | `minimax/MiniMax-M3` | correctness | max |
+| `deepseek-verifier` (verify) | `openrouter/deepseek/deepseek-v4-pro` | verify | low |
+| deduper | `openrouter/minimax/minimax-m3` | — | low |
 
-OpenRouter lanes request JSON mode for structured artifacts, but the workflow
-does not disable model reasoning. Cheap reasoning models should get enough
-`max_output_tokens` in `.github/ai-review/matrix.json` to think and still emit
-the final JSON response. The current matrix uses a generous `32000` completion
-cap so the first successful runs can show actual completion usage in the
-uploaded metrics; tune it down only after observing real usage.
+Current **critical** (expensive) matrix = the standard finder swarm **plus**
+`anthropic/claude-opus-4-8` (`general` prompt) as a finder and
+`openai/gpt-5.5` as the verifier (`verify-critical`); same minimax-m3 deduper.
+Critical also triggers the native Codex and Claude reviews as separate comments.
+
+Reviewer lanes see the diff plus current/base contents for changed files (size
+limited). Verifier lanes see the deduplicated candidates plus the same context.
+Final status is `confirmed`, `rejected`, `uncertain`, or `candidate` (no verdict).
 
 OpenRouter catalog snapshot from 2026-06-16:
 
@@ -150,6 +158,84 @@ OpenRouter catalog snapshot from 2026-06-16:
 Use these rankings as initial guidance only. The review artifacts track which
 model and prompt found each issue, because local usefulness matters more than
 public benchmark rank.
+
+## Reasoning Effort (`variant`): what we learned
+
+`variant` maps to opencode's provider-specific reasoning effort
+(`minimal` < `low` < `medium` < `high` < `max`). It is best-effort: opencode
+applies it where the provider supports it and silently ignores it otherwise
+(no error), so `low` is a safe default on any lane.
+
+Measured per-model behavior (swept on PR #671 — the AI-review PR itself, ~131KB diff):
+
+| Model | low | high | Takeaway |
+| --- | --- | --- | --- |
+| minimax-M3 | ~5 | **~43** | high reasons hard over the diff and finds far more (incl. real criticals). Its sweet spot. Also run `max` — it *explores* instead of diff-reasoning and finds **different** issues. |
+| glm-5.2 | 3 | 2 | high gives nothing → `low` |
+| nemotron-3-ultra | 7 | 0 (explored but never converged) | high is flakier → `low` |
+| kimi-k2.7-code | 5 (incl. a critical) | 8 (all medium/low) | at `low` kimi explores files and finds fewer but **higher-severity** issues; at `high` it skips tools, reasons over the diff only, and finds more but **shallower** issues → `low` |
+
+**Key insight: `high` is not universally better.** For most models it makes them
+lean on pure diff-reasoning and skip exploration — finding *more but shallower*
+issues and missing bugs that require reading files for context. Only **minimax**
+clearly benefits from `high`. Everything else is best at `low`, which is cheaper
+and less flaky; the verifier and swarm redundancy cover the recall you'd
+otherwise chase with `high`. Watch for lanes that explore (many `tool_use`
+events) yet submit nothing — that's a reasoning-burn / convergence failure.
+
+## Adding or Changing a Model
+
+1. Add `{id, model, prompt, variant: "low"}` to the tier in
+   `.github/ai-review/matrix.json`. Use a provider-qualified opencode id
+   (`openrouter/<author>/<model>` or a direct provider id); confirm it exists on
+   models.dev and its provider key is in the workflow env.
+2. Run the tier on a real PR and read the lane artifact:
+   - `submission.submitted == true` with findings → working.
+   - `submitted: false` / `event_counts: {step_start: 1}` → emitted nothing
+     (reasoning-burn / no convergence). Try another `variant` or drop it.
+   - `error` with `401`/`403` → provider auth or OpenRouter daily-cap problem.
+   - reads with `status: error` → path/sandbox issue.
+3. Tune `variant` UP only if a low-vs-high **sweep** shows real gains for that
+   model — don't assume. Sweep by adding `<id>-low` and `<id>-high` lanes and
+   comparing findings count **and severity** (count alone misled us on kimi).
+   Raise the per-call and wrapper timeouts generously for `high`/`max` lanes.
+4. Default new models to `low`; reserve the expensive direct models (Claude/GPT)
+   for the critical tier.
+
+## Lessons Learned / Gotchas
+
+- **Report via a tool, not free-text JSON.** Agentic models reliably make tool
+  calls but routinely fail the "stop exploring and hand-write the final JSON"
+  step (empty output / narration). `submit_findings` / `submit_verifications`
+  fixed convergence. Single-shot calls (the deduper) can use free-text JSON
+  safely — it's the *agentic loop* that made hand-written JSON fragile.
+- **Message on stdin, not argv.** The prompt + diff is piped to opencode on
+  stdin; as an argv string it fails with `E2BIG` once the diff crosses ~128KB.
+- **Review from the repo root.** opencode's cwd must be the repo root (checkout
+  at the workspace root, `--repo .`). With the repo in a `runner/` subdir the
+  agent built absolute paths against the workspace root and its reads errored.
+  Lane jobs check out at root; other jobs keep their `runner/` checkout.
+- **Dedup is two-stage.** A path+text heuristic (`clean_path` normalizes to
+  repo-relative via `GITHUB_WORKSPACE`) plus a conservative **LLM dedup** (the
+  `deduper`; minimax-m3 won the precision A/B vs deepseek). The LLM call needs a
+  generous `max_tokens` (~40k) or reasoning truncates the answer to empty. Dedup
+  errs toward under-merging: residual dupes are harmless, over-merging hides a
+  finding.
+- **`found_by` is provenance.** Both merge stages union it, so the report shows
+  every lane (hence variant) that found each issue.
+- **OpenRouter vs direct.** OpenRouter mangles tool-calling for some models, so
+  agentic lanes prefer direct keys where possible; OpenRouter is fine for cheap
+  finders and single-shot calls. Kimi must go via OpenRouter (direct Moonshot
+  returned `401`). The OpenRouter key has a **daily spend cap** — heavy
+  experimentation exhausts it.
+- **Security.** The agent is read-only (`bash`/`edit`/`write`/`patch`/`webfetch`
+  denied) with `external_directory: deny`, so it can't read `/proc/self/environ`
+  or credential files to leak keys via the report (verified). **Open issue:** the
+  workflow installs the agent + tools by copying them *from the PR checkout*, so a
+  malicious PR could weaken its own sandbox — install them from the base branch.
+- **Diagnostics.** Each lane records an opencode `timeline` (tool calls + args,
+  text previews, per-step output/reasoning tokens), `cost`, `tokens`,
+  `returncode`, and a stderr tail — that is how every failure above was diagnosed.
 
 ## Multiple Prompts Versus One Prompt
 
