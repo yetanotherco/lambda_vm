@@ -64,18 +64,14 @@
         "model": "minimax/MiniMax-M3",
         "prompt": "general",
         "variant": "high"
-      },
-      {
-        "id": "claude",
-        "model": "anthropic/claude-opus-4-8",
-        "prompt": "general"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "gpt-verifier",
-        "model": "openai/gpt-5.5",
-        "prompt": "verify-critical"
+        "id": "deepseek-verifier",
+        "model": "openrouter/deepseek/deepseek-v4-pro",
+        "prompt": "verify",
+        "variant": "low"
       }
     ],
     "deduper": {

@@ -95,8 +95,8 @@ opencode id, so the provider determines which key is used:
   deduper (everything `openrouter/...`). This key has a **daily spend limit**;
   heavy experimentation can exhaust it (403 "Key limit exceeded (daily limit)").
 - `MINIMAX_API_KEY` — the direct `minimax/MiniMax-M3` finder lanes.
-- `ANTHROPIC_API_KEY` — the critical-tier `claude-opus-4-8` finder and native Claude.
-- `OPENAI_API_KEY` — the critical-tier `gpt-5.5` verifier and native Codex.
+- `ANTHROPIC_API_KEY` — the critical-tier native Claude review (opus).
+- `OPENAI_API_KEY` — the critical-tier native Codex review.
 - `KIMI_API_KEY` → mapped to `MOONSHOT_API_KEY` for the `/kimi` command **only**.
   Kimi in the review swarm goes through **OpenRouter** (`openrouter/moonshotai/...`),
   because the direct Moonshot endpoint rejected the key with `401 Incorrect API
@@ -120,22 +120,29 @@ matrix (`.github/ai-review/matrix.json`) is per-tier `review_lanes`,
 `verifier_lanes`, and a `deduper`. Each lane is `{id, model, prompt, variant}`;
 `variant` is opencode's reasoning effort (see "Reasoning effort" below).
 
-Current **standard** (cheap) matrix:
+All finders use the broad **`general`** prompt (correctness + cosmetic + perf in
+one pass), at `low` effort except minimax (`high`, its measured sweet spot — see
+"Reasoning effort"). Current **standard** (cheap) matrix:
 
 | Lane | Model | Prompt | Variant |
 | --- | --- | --- | --- |
-| `glm-correctness` | `openrouter/z-ai/glm-5.2` | correctness | low |
-| `kimi-correctness` | `openrouter/moonshotai/kimi-k2.7-code` | correctness | low |
-| `nemotron-correctness` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b` | correctness | low |
-| `minimax-high` | `minimax/MiniMax-M3` | correctness | high |
-| `minimax-max` | `minimax/MiniMax-M3` | correctness | max |
+| `glm` | `openrouter/z-ai/glm-5.2` | general | low |
+| `kimi` | `openrouter/moonshotai/kimi-k2.7-code` | general | low |
+| `nemotron` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b` | general | low |
+| `minimax` | `minimax/MiniMax-M3` | general | high |
 | `deepseek-verifier` (verify) | `openrouter/deepseek/deepseek-v4-pro` | verify | low |
 | deduper | `openrouter/minimax/minimax-m3` | — | low |
 
-Current **critical** (expensive) matrix = the standard finder swarm **plus**
-`anthropic/claude-opus-4-8` (`general` prompt) as a finder and
-`openai/gpt-5.5` as the verifier (`verify-critical`); same minimax-m3 deduper.
-Critical also triggers the native Codex and Claude reviews as separate comments.
+Current **critical** (expensive) matrix uses the **same open-weight finder swarm,
+`deepseek-v4-pro`/`verify` verifier, and minimax-m3 deduper as standard** — the
+structured pipeline is open-weight end-to-end. What makes critical "critical" is
+that it *also* triggers the native **Codex** (GPT) and native **Claude** (opus)
+reviews, which run in their own vendor harnesses (`critical.md` prompt) and post
+their own independent comments. The flagship closed models contribute as
+independent native reviews rather than swarm finders: in measured runs the
+native Codex pass found a high-severity issue the whole swarm missed, while an
+opus *swarm* finder cost ~$1/run for only one unique low finding — so opus was
+moved out of the swarm and into its native harness.
 
 Reviewer lanes see the diff plus current/base contents for changed files (size
 limited). Verifier lanes see the deduplicated candidates plus the same context.

@@ -113,8 +113,13 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout repo (PR merge) at workspace root
+      - name: Checkout PR merge at workspace root
         uses: actions/checkout@v4
+        with:
+          # Explicit PR merge ref so BOTH triggers review the PR: label (pull_request)
+          # already defaults to the merge ref, but the /ai-review issue_comment trigger
+          # would otherwise check out the default branch and review the wrong code.
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
 
       - name: Install sandbox agent
         run: |
@@ -251,8 +256,13 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout repo (PR merge) at workspace root
+      - name: Checkout PR merge at workspace root
         uses: actions/checkout@v4
+        with:
+          # Explicit PR merge ref so BOTH triggers review the PR: label (pull_request)
+          # already defaults to the merge ref, but the /ai-review issue_comment trigger
+          # would otherwise check out the default branch and review the wrong code.
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
 
       - name: Install sandbox agent
         run: |
@@ -403,7 +413,7 @@ jobs:
     if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
     uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
     with:
-      model: sonnet
+      model: opus
       max_turns: 30
       custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
     secrets:
