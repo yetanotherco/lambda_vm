@@ -54,6 +54,13 @@ jobs:
         # at the end of the job re-surfaces the failure so the run shows red.
         continue-on-error: true
         run: |
+          # Provision the RISC-V sysroot in a user-writable dir instead of the default
+          # /opt/lambda-vm-sysroot, which on the self-hosted bench runner is root-owned
+          # and was never fully provisioned (missing libc headers → c-kzg failed to find
+          # stdlib.h). `make` (via SYSROOT_DIR ?=) picks this up and passes it as clang's
+          # --sysroot, so the guest ELF rebuild self-provisions with no sudo, and the
+          # extracted sysroot is cached in $HOME across nightly runs.
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           bash ./bench_vs/run_ethrex.sh \
             --report-dir bench_vs_artifacts \
             --rebuild-elf \
