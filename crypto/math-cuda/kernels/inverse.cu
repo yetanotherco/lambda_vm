@@ -29,10 +29,9 @@
 // ---------------------------------------------------------------------------
 // 1. compute_denoms_ext3
 //
-// If `subtract_x = 0` (R3 OOD convention): denoms[k * n + i] = z[k] - x[i].
-//   Matches CPU `barycentric_inv_denoms(z, points)` = 1/(z - points[i]).
-// If `subtract_x = 1` (R4 DEEP convention): denoms[k * n + i] = x[i] - z[k].
-//   Matches CPU R4 `denoms.push(x_i - z_k)` convention.
+// `denom_sign` matches `DenomSign` on the Rust side:
+//   0 (DenomSign::ZMinusX): denoms[k * n + i] = z[k] - x[i].   (R3 OOD)
+//   1 (DenomSign::XMinusZ): denoms[k * n + i] = x[i] - z[k].   (R4 DEEP)
 //
 // Output is ext3-interleaved of length 3 * k_scalars * n.
 //
@@ -44,7 +43,7 @@ extern "C" __global__ void compute_denoms_ext3(
     const uint64_t *z_scalars, // 3 * k_scalars u64
     uint64_t n,
     uint64_t k_scalars,
-    uint64_t subtract_x,       // 0: z - x; 1: x - z
+    uint64_t denom_sign,       // 0: z - x; 1: x - z (mirrors `DenomSign`)
     uint64_t *denoms_out       // 3 * k_scalars * n u64
 ) {
     uint64_t flat = (uint64_t)blockIdx.x * BLOCK_SIZE + threadIdx.x;
@@ -54,14 +53,15 @@ extern "C" __global__ void compute_denoms_ext3(
     uint64_t k = flat / n;
     uint64_t i = flat - k * n;
 
+    // Hoist the per-thread index multiplications so the three indexed
+    // loads/stores below are addition-only.
+    const uint64_t *z_base = z_scalars + k * 3;
+    uint64_t *out_base = denoms_out + flat * 3;
+
     uint64_t x_i = x_base[i];
-    ext3::Fe3 z = {
-        z_scalars[k * 3 + 0],
-        z_scalars[k * 3 + 1],
-        z_scalars[k * 3 + 2],
-    };
+    ext3::Fe3 z = { z_base[0], z_base[1], z_base[2] };
     ext3::Fe3 d;
-    if (subtract_x == 0) {
+    if (denom_sign == 0) {
         // z - x: lift x to (x, 0, 0), subtract from z.
         d.a = goldilocks::sub(z.a, x_i);
         d.b = z.b;
@@ -73,9 +73,9 @@ extern "C" __global__ void compute_denoms_ext3(
         d.c = goldilocks::neg(z.c);
     }
 
-    denoms_out[flat * 3 + 0] = d.a;
-    denoms_out[flat * 3 + 1] = d.b;
-    denoms_out[flat * 3 + 2] = d.c;
+    out_base[0] = d.a;
+    out_base[1] = d.b;
+    out_base[2] = d.c;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,11 +98,13 @@ extern "C" __global__ void block_inclusive_scan_fwd_ext3(
     uint64_t tid = threadIdx.x;
     uint64_t gid = (uint64_t)blockIdx.x * BLOCK_SIZE + tid;
 
-    // Load input or identity.
+    // Load input or identity. Hoist the per-thread index multiplication
+    // so the three loads/stores below are addition-only.
     if (gid < n) {
-        shmem[tid].a = input[gid * 3 + 0];
-        shmem[tid].b = input[gid * 3 + 1];
-        shmem[tid].c = input[gid * 3 + 2];
+        const uint64_t *in_base = input + gid * 3;
+        shmem[tid].a = in_base[0];
+        shmem[tid].b = in_base[1];
+        shmem[tid].c = in_base[2];
     } else {
         shmem[tid] = ext3::one();
     }
@@ -120,9 +122,10 @@ extern "C" __global__ void block_inclusive_scan_fwd_ext3(
 
     // Write per-element scan result.
     if (gid < n) {
-        scan_out[gid * 3 + 0] = shmem[tid].a;
-        scan_out[gid * 3 + 1] = shmem[tid].b;
-        scan_out[gid * 3 + 2] = shmem[tid].c;
+        uint64_t *out_base = scan_out + gid * 3;
+        out_base[0] = shmem[tid].a;
+        out_base[1] = shmem[tid].b;
+        out_base[2] = shmem[tid].c;
     }
 
     // Block total = scan value at the last VALID thread of this block.
@@ -133,9 +136,10 @@ extern "C" __global__ void block_inclusive_scan_fwd_ext3(
     uint64_t block_end = ((uint64_t)blockIdx.x + 1) * BLOCK_SIZE;
     uint64_t last_valid_gid = (block_end - 1 < n - 1) ? (block_end - 1) : (n - 1);
     if (gid == last_valid_gid) {
-        block_totals[(uint64_t)blockIdx.x * 3 + 0] = shmem[tid].a;
-        block_totals[(uint64_t)blockIdx.x * 3 + 1] = shmem[tid].b;
-        block_totals[(uint64_t)blockIdx.x * 3 + 2] = shmem[tid].c;
+        uint64_t *bt_base = block_totals + (uint64_t)blockIdx.x * 3;
+        bt_base[0] = shmem[tid].a;
+        bt_base[1] = shmem[tid].b;
+        bt_base[2] = shmem[tid].c;
     }
 }
 
@@ -156,20 +160,14 @@ extern "C" __global__ void apply_block_offsets_fwd_ext3(
     uint64_t gid = (uint64_t)blockIdx.x * BLOCK_SIZE + tid;
     if (gid >= n) return;
 
-    ext3::Fe3 offset = {
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 0],
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 1],
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 2],
-    };
-    ext3::Fe3 val = {
-        scan_inout[gid * 3 + 0],
-        scan_inout[gid * 3 + 1],
-        scan_inout[gid * 3 + 2],
-    };
+    const uint64_t *off_base = block_totals_scanned + (blockIdx.x - 1) * 3;
+    uint64_t *inout_base = scan_inout + gid * 3;
+    ext3::Fe3 offset = { off_base[0], off_base[1], off_base[2] };
+    ext3::Fe3 val    = { inout_base[0], inout_base[1], inout_base[2] };
     ext3::Fe3 res = ext3::mul(offset, val);
-    scan_inout[gid * 3 + 0] = res.a;
-    scan_inout[gid * 3 + 1] = res.b;
-    scan_inout[gid * 3 + 2] = res.c;
+    inout_base[0] = res.a;
+    inout_base[1] = res.b;
+    inout_base[2] = res.c;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,9 +193,10 @@ extern "C" __global__ void block_inclusive_scan_rev_ext3(
     uint64_t gid = valid ? (n - 1 - pos_from_end) : 0;
 
     if (valid) {
-        shmem[tid].a = input[gid * 3 + 0];
-        shmem[tid].b = input[gid * 3 + 1];
-        shmem[tid].c = input[gid * 3 + 2];
+        const uint64_t *in_base = input + gid * 3;
+        shmem[tid].a = in_base[0];
+        shmem[tid].b = in_base[1];
+        shmem[tid].c = in_base[2];
     } else {
         shmem[tid] = ext3::one();
     }
@@ -213,9 +212,10 @@ extern "C" __global__ void block_inclusive_scan_rev_ext3(
     }
 
     if (valid) {
-        scan_out[gid * 3 + 0] = shmem[tid].a;
-        scan_out[gid * 3 + 1] = shmem[tid].b;
-        scan_out[gid * 3 + 2] = shmem[tid].c;
+        uint64_t *out_base = scan_out + gid * 3;
+        out_base[0] = shmem[tid].a;
+        out_base[1] = shmem[tid].b;
+        out_base[2] = shmem[tid].c;
     }
 
     // Mutually-exclusive last-thread mask (same idea as fwd): the last
@@ -223,9 +223,10 @@ extern "C" __global__ void block_inclusive_scan_rev_ext3(
     uint64_t block_end_rev = ((uint64_t)blockIdx.x + 1) * BLOCK_SIZE;
     uint64_t last_valid_pos = (block_end_rev - 1 < n - 1) ? (block_end_rev - 1) : (n - 1);
     if (pos_from_end == last_valid_pos) {
-        block_totals[(uint64_t)blockIdx.x * 3 + 0] = shmem[tid].a;
-        block_totals[(uint64_t)blockIdx.x * 3 + 1] = shmem[tid].b;
-        block_totals[(uint64_t)blockIdx.x * 3 + 2] = shmem[tid].c;
+        uint64_t *bt_base = block_totals + (uint64_t)blockIdx.x * 3;
+        bt_base[0] = shmem[tid].a;
+        bt_base[1] = shmem[tid].b;
+        bt_base[2] = shmem[tid].c;
     }
 }
 
@@ -248,20 +249,14 @@ extern "C" __global__ void apply_block_offsets_rev_ext3(
     if (pos_from_end >= n) return;
     uint64_t gid = n - 1 - pos_from_end;
 
-    ext3::Fe3 offset = {
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 0],
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 1],
-        block_totals_scanned[(blockIdx.x - 1) * 3 + 2],
-    };
-    ext3::Fe3 val = {
-        scan_inout[gid * 3 + 0],
-        scan_inout[gid * 3 + 1],
-        scan_inout[gid * 3 + 2],
-    };
+    const uint64_t *off_base = block_totals_scanned + (blockIdx.x - 1) * 3;
+    uint64_t *inout_base = scan_inout + gid * 3;
+    ext3::Fe3 offset = { off_base[0], off_base[1], off_base[2] };
+    ext3::Fe3 val    = { inout_base[0], inout_base[1], inout_base[2] };
     ext3::Fe3 res = ext3::mul(offset, val);
-    scan_inout[gid * 3 + 0] = res.a;
-    scan_inout[gid * 3 + 1] = res.b;
-    scan_inout[gid * 3 + 2] = res.c;
+    inout_base[0] = res.a;
+    inout_base[1] = res.b;
+    inout_base[2] = res.c;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,24 +285,27 @@ extern "C" __global__ void batch_inverse_combine_ext3(
     if (i == 0) {
         p = ext3::one();
     } else {
-        p.a = prefix[(i - 1) * 3 + 0];
-        p.b = prefix[(i - 1) * 3 + 1];
-        p.c = prefix[(i - 1) * 3 + 2];
+        const uint64_t *p_base = prefix + (i - 1) * 3;
+        p.a = p_base[0];
+        p.b = p_base[1];
+        p.c = p_base[2];
     }
 
     ext3::Fe3 s;
     if (i == n - 1) {
         s = ext3::one();
     } else {
-        s.a = suffix[(i + 1) * 3 + 0];
-        s.b = suffix[(i + 1) * 3 + 1];
-        s.c = suffix[(i + 1) * 3 + 2];
+        const uint64_t *s_base = suffix + (i + 1) * 3;
+        s.a = s_base[0];
+        s.b = s_base[1];
+        s.c = s_base[2];
     }
 
     ext3::Fe3 tmp = ext3::mul(p, inv_t);
     ext3::Fe3 res = ext3::mul(tmp, s);
 
-    out[i * 3 + 0] = res.a;
-    out[i * 3 + 1] = res.b;
-    out[i * 3 + 2] = res.c;
+    uint64_t *out_base = out + i * 3;
+    out_base[0] = res.a;
+    out_base[1] = res.b;
+    out_base[2] = res.c;
 }

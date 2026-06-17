@@ -196,7 +196,8 @@ pub fn compute_and_invert_denoms_ext3_dev(
     let mut denoms = unsafe { stream.alloc::<u64>(3 * total) }?;
     let n_u64 = n as u64;
     let k_u64 = k_scalars as u64;
-    let subtract_x_u64: u64 = match sign {
+    // Kernel `denom_sign`: 0 = DenomSign::ZMinusX, 1 = DenomSign::XMinusZ.
+    let denom_sign_u64: u64 = match sign {
         DenomSign::ZMinusX => 0,
         DenomSign::XMinusZ => 1,
     };
@@ -213,7 +214,7 @@ pub fn compute_and_invert_denoms_ext3_dev(
             .arg(&z_dev)
             .arg(&n_u64)
             .arg(&k_u64)
-            .arg(&subtract_x_u64)
+            .arg(&denom_sign_u64)
             .arg(&mut denoms)
             .launch(cfg)?;
     }
