@@ -602,19 +602,24 @@ class AiReviewSubmissionTests(unittest.TestCase):
         out = ai_review.apply_dedup_clusters(cands, [["AI-001"], ["AI-999", "AI-998"], "junk"])
         self.assertEqual([i["issue_id"] for i in out["issues"]], ["AI-001"])
 
-    def test_clean_path_normalizes_runner_checkout_prefix(self) -> None:
-        self.assertEqual(
-            ai_review.clean_path("runner/.github/scripts/ai_review.py"),
-            ".github/scripts/ai_review.py",
-        )
-        self.assertEqual(
-            ai_review.clean_path("/home/runner/work/lambda_vm/lambda_vm/runner/docs/ai-review.md"),
-            "docs/ai-review.md",
-        )
-        self.assertEqual(
-            ai_review.clean_path(".github/scripts/ai_review.py"), ".github/scripts/ai_review.py"
-        )
-        self.assertIsNone(ai_review.clean_path("n/a"))
+    def test_clean_path_strips_workspace_prefix(self) -> None:
+        old = os.environ.get("GITHUB_WORKSPACE")
+        os.environ["GITHUB_WORKSPACE"] = "/home/runner/work/lambda_vm/lambda_vm"
+        try:
+            self.assertEqual(
+                ai_review.clean_path("/home/runner/work/lambda_vm/lambda_vm/.github/scripts/ai_review.py"),
+                ".github/scripts/ai_review.py",
+            )
+            self.assertEqual(
+                ai_review.clean_path(".github/scripts/ai_review.py"), ".github/scripts/ai_review.py"
+            )
+            self.assertEqual(ai_review.clean_path("./docs/ai-review.md"), "docs/ai-review.md")
+            self.assertIsNone(ai_review.clean_path("n/a"))
+        finally:
+            if old is None:
+                os.environ.pop("GITHUB_WORKSPACE", None)
+            else:
+                os.environ["GITHUB_WORKSPACE"] = old
 
     def test_format_source_cell_breaks_model_onto_own_line(self) -> None:
         cell = ai_review.format_source_cell(["minimax-correctness:minimax/MiniMax-M3"])

@@ -1718,14 +1718,12 @@ def clean_path(value: Any) -> str | None:
     if not text or text.lower() in {"n/a", "none", "-"}:
         return None
     # Normalize to a repo-relative path so the SAME file reported differently across lanes
-    # collapses in dedup. opencode runs inside the `runner/` checkout, so a file arrives as
-    # an absolute ".../runner/<path>", a workspace-relative "runner/<path>", or an
-    # already-relative "<path>". Strip everything up to and including the checkout's
-    # "runner/" segment (assumes the checkout dir is named "runner", which the workflow
-    # guarantees).
-    idx = text.rfind("runner/")
-    if idx != -1:
-        text = text[idx + len("runner/") :]
+    # collapses in dedup. opencode reviews from the repo root (the workspace), so an
+    # absolute report is GITHUB_WORKSPACE + path; strip that prefix. (Don't pattern-match
+    # "runner/" — the runner's HOME is /home/runner, which would false-match.)
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace and text.startswith(workspace):
+        text = text[len(workspace) :]
     if text.startswith("./"):
         text = text[2:]
     text = text.lstrip("/")

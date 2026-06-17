@@ -113,22 +113,20 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout review runner
+      - name: Checkout repo (PR merge) at workspace root
         uses: actions/checkout@v4
-        with:
-          path: runner
 
       - name: Install sandbox agent
         run: |
-          # Run opencode in the single `runner` checkout (already the PR merge).
-          # A second identical PR checkout made the agent wander between two copies
-          # of every file and exhaust its step budget. Install the read-only agent
-          # globally so discovery is version-independent.
+          # The repo is checked out at the workspace root (no subdir) so opencode's cwd is
+          # the repo root: the agent's file paths (incl. naive absolute ones) resolve to
+          # real files instead of a sibling dir. Install the read-only agent globally so
+          # discovery is version-independent.
           mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
-          cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          cp .opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
           # Install custom tools (submit_findings) globally too, so review lanes report
           # findings via a tool call instead of hand-written JSON.
-          cp runner/.opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+          cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -161,18 +159,18 @@ jobs:
         run: |
           set +e
           LANE_OUT="ai-review-lane/${{ matrix.lane.id }}.json"
-          timeout 2200s python3 runner/.github/scripts/ai_review.py agentic-lane \
+          timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --kind review \
-            --prompt-dir runner/.github/ai-review/prompts \
-            --repo runner \
+            --prompt-dir .github/ai-review/prompts \
+            --repo . \
             --agent review-ro \
             --timeout 1800 \
             --out "$LANE_OUT"
           status=$?
           if [ "$status" -ne 0 ]; then
-            python3 runner/.github/scripts/ai_review.py lane-error \
+            python3 .github/scripts/ai_review.py lane-error \
               --lane-json "$LANE_JSON" \
               --context ai-review-context/context.json \
               --kind review \
@@ -253,22 +251,20 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout review runner
+      - name: Checkout repo (PR merge) at workspace root
         uses: actions/checkout@v4
-        with:
-          path: runner
 
       - name: Install sandbox agent
         run: |
-          # Run opencode in the single `runner` checkout (already the PR merge).
-          # A second identical PR checkout made the agent wander between two copies
-          # of every file and exhaust its step budget. Install the read-only agent
-          # globally so discovery is version-independent.
+          # The repo is checked out at the workspace root (no subdir) so opencode's cwd is
+          # the repo root: the agent's file paths (incl. naive absolute ones) resolve to
+          # real files instead of a sibling dir. Install the read-only agent globally so
+          # discovery is version-independent.
           mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
-          cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          cp .opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
           # Install custom tools (submit_findings) globally too, so review lanes report
           # findings via a tool call instead of hand-written JSON.
-          cp runner/.opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+          cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -307,19 +303,19 @@ jobs:
         run: |
           set +e
           LANE_OUT="ai-review-verification/${{ matrix.lane.id }}.json"
-          timeout 2200s python3 runner/.github/scripts/ai_review.py agentic-lane \
+          timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --kind verification \
             --candidates ai-review-candidates/candidates.json \
-            --prompt-dir runner/.github/ai-review/prompts \
-            --repo runner \
+            --prompt-dir .github/ai-review/prompts \
+            --repo . \
             --agent review-ro \
             --timeout 1800 \
             --out "$LANE_OUT"
           status=$?
           if [ "$status" -ne 0 ]; then
-            python3 runner/.github/scripts/ai_review.py lane-error \
+            python3 .github/scripts/ai_review.py lane-error \
               --lane-json "$LANE_JSON" \
               --context ai-review-context/context.json \
               --kind verification \
