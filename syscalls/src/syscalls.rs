@@ -20,9 +20,9 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
-/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-3 as usize).
+/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
-const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 2;
+const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't

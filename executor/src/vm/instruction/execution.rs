@@ -26,13 +26,13 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
-/// The spec uses ECALL number `-3`; interpreted as an unsigned 64-bit value that is
-/// `u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD`, which the ECSM core table puts on the `Ecall`
-/// bus as `[lo32, hi32] = [2^32 - 3, 2^32 - 1]`.
-pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// The spec uses ECALL number `-11`; interpreted as an unsigned 64-bit value that is
+/// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
+/// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
+pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
-/// largest per-access offset is added: +24 for doubleword reads/writes, +31 for scalar bytes.
+/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
 
 impl TryFrom<u64> for SyscallNumbers {
@@ -399,7 +399,7 @@ impl Instruction {
                         src2_val = state_addr;
                     }
                     SyscallNumbers::Ecsm => {
-                        // ECSM(-3): k×G on secp256k1.
+                        // ECSM(-11): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
                         // xG, k, xR are 32-byte little-endian values; xG and xR must be
                         // canonical field elements and k must be in [1, N).

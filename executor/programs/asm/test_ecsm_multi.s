@@ -25,7 +25,7 @@ main:
 	addi	a0, sp, 64
 	addi	a1, sp, 0
 	addi	a2, sp, 32
-	li	a7, -3
+	li	a7, -11
 	ecall
 	li	a0, 1
 	addi	a1, sp, 64
@@ -39,7 +39,7 @@ main:
 	addi	a0, sp, 64
 	addi	a1, sp, 0
 	addi	a2, sp, 32
-	li	a7, -3
+	li	a7, -11
 	ecall
 	li	a0, 1
 	addi	a1, sp, 64
@@ -53,7 +53,7 @@ main:
 	addi	a0, sp, 64
 	addi	a1, sp, 0
 	addi	a2, sp, 32
-	li	a7, -3
+	li	a7, -11
 	ecall
 	li	a0, 1
 	addi	a1, sp, 64

@@ -21,11 +21,11 @@ main:
 	sd	zero, 48(sp)
 	sd	zero, 56(sp)
 
-	# ECSM ecall: a0 = &xR, a1 = &xG, a2 = &k, a7 = -3.
+	# ECSM ecall: a0 = &xR, a1 = &xG, a2 = &k, a7 = -11.
 	addi	a0, sp, 64
 	addi	a1, sp, 0
 	addi	a2, sp, 32
-	li	a7, -3
+	li	a7, -11
 	ecall
 
 	# Commit the 32-byte result xR so the test can check it equals x(5G).
