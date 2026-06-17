@@ -460,6 +460,40 @@ mod disk_spill_tests {
         }
     }
 
+    /// `row_major_data()` is the accessor `Trace::main_data_row_major()` feeds
+    /// to the row-major LDE. After a spill the heap `data` is freed, so it must
+    /// read back through the mmap byte-for-byte. Regression guard for the
+    /// EmptyCommitment bug (commit 08eaa8b), where a spilled main table handed
+    /// the LDE an emptied buffer. `get`/`get_row` were already covered above;
+    /// the full row-major read (the one the LDE actually uses) was not.
+    #[test]
+    fn test_table_spill_row_major_data_roundtrip() {
+        let width = 5;
+        let height = 8;
+        let data: Vec<FieldElement<F>> = (0..width * height)
+            .map(|i| FieldElement::<F>::from((i as u64).wrapping_mul(7) + 3))
+            .collect();
+
+        let mut table = Table::new(data.clone(), width);
+        assert_eq!(
+            table.row_major_data(),
+            data.as_slice(),
+            "row_major_data must match the source before spill"
+        );
+
+        table.spill_to_disk().expect("spill_to_disk failed");
+        assert!(
+            table.data.is_empty(),
+            "heap data should be freed after spill"
+        );
+
+        assert_eq!(
+            table.row_major_data(),
+            data.as_slice(),
+            "row_major_data must round-trip through the mmap after spill"
+        );
+    }
+
     #[test]
     fn test_table_spill_empty_is_noop() {
         let mut table = Table::<F>::new(Vec::new(), 0);

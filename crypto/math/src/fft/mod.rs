@@ -1,8 +1,6 @@
 pub mod bit_reversing;
 #[cfg(feature = "alloc")]
 pub mod bowers_fft;
-#[cfg(feature = "alloc")]
-pub mod bowers_fft_batch;
 pub mod errors;
 #[cfg(feature = "alloc")]
 pub mod roots_of_unity;

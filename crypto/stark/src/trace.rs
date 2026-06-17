@@ -381,17 +381,6 @@ where
         }
     }
 
-    /// Borrow the row-major main buffer with its column count. Used by the
-    /// row-major Merkle commit (`commit_rows_bit_reversed`).
-    pub fn main_row_major(&self) -> (&[FieldElement<F>], usize) {
-        (&self.main_data, self.num_main_cols)
-    }
-
-    /// Borrow the row-major aux buffer with its column count.
-    pub fn aux_row_major(&self) -> (&[FieldElement<E>], usize) {
-        (&self.aux_data, self.num_aux_cols)
-    }
-
     /// Attach an already-populated device LDE handle for the main columns.
     /// Only set when the GPU fused pipeline produced the LDE. Callers that
     /// ran the CPU path should leave this alone.
@@ -416,35 +405,6 @@ where
         self.gpu_aux.as_ref()
     }
 
-    /// Consume self and re-materialize the column vectors. Inverse of
-    /// `from_columns` — pays the same O(N · M) transpose cost.
-    #[allow(clippy::type_complexity)]
-    // Index addresses two parallel arrays (column Vec + flat row-major buffer).
-    #[allow(clippy::needless_range_loop)]
-    pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
-        let mut main_columns: Vec<Vec<FieldElement<F>>> = (0..self.num_main_cols)
-            .map(|_| Vec::with_capacity(self.num_rows))
-            .collect();
-        for row in 0..self.num_rows {
-            let row_off = row * self.num_main_cols;
-            for col in 0..self.num_main_cols {
-                main_columns[col].push(self.main_data[row_off + col].clone());
-            }
-        }
-
-        let mut aux_columns: Vec<Vec<FieldElement<E>>> = (0..self.num_aux_cols)
-            .map(|_| Vec::with_capacity(self.num_rows))
-            .collect();
-        for row in 0..self.num_rows {
-            let row_off = row * self.num_aux_cols;
-            for col in 0..self.num_aux_cols {
-                aux_columns[col].push(self.aux_data[row_off + col].clone());
-            }
-        }
-
-        (main_columns, aux_columns)
-    }
-
     pub fn num_main_cols(&self) -> usize {
         self.num_main_cols
     }
@@ -467,20 +427,6 @@ where
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         &self.aux_data[row * self.num_aux_cols + col]
-    }
-
-    /// Borrow a full main-trace row as a contiguous slice (zero copy).
-    #[inline]
-    pub fn main_row_slice(&self, row_idx: usize) -> &[FieldElement<F>] {
-        let off = row_idx * self.num_main_cols;
-        &self.main_data[off..off + self.num_main_cols]
-    }
-
-    /// Borrow a full aux-trace row as a contiguous slice (zero copy).
-    #[inline]
-    pub fn aux_row_slice(&self, row_idx: usize) -> &[FieldElement<E>] {
-        let off = row_idx * self.num_aux_cols;
-        &self.aux_data[off..off + self.num_aux_cols]
     }
 
     /// Gather a full main-trace row into an owned Vec.

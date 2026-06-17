@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+#[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
 use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 use math::fft::two_half_fft::TwoHalfTwiddles;
@@ -277,7 +278,13 @@ where
 /// where `g` is the coset offset and `n_inv = 1/n`. These are used in the iFFT+coset-shift
 /// step of `expand_columns_to_lde`.
 pub(crate) struct LdeTwiddles<F: IsFFTField> {
+    /// Legacy per-column `LayerTwiddles`, only consumed by the debug-checks
+    /// reconstruct path and the test-utils precomputed-commitment helper. Kept
+    /// out of release builds so the production row-major LDE doesn't carry the
+    /// extra (forward set is size `n·blowup`) twiddle memory for nothing.
+    #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
     inv: LayerTwiddles<F>,
+    #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
     fwd: LayerTwiddles<F>,
     /// Cache-blocked two-half twiddles for the batched row-major LDE path
     /// (`coset_lde_full_expand_row_major`). `two_half_inv` is size-`n` inverse,
@@ -308,8 +315,10 @@ impl<F: IsFFTField> LdeTwiddles<F> {
         };
 
         Self {
+            #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
             inv: LayerTwiddles::<F>::new_inverse(domain_size.trailing_zeros() as u64)
                 .expect("valid inverse twiddles"),
+            #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
             fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
                 .expect("valid forward twiddles"),
             two_half_inv: TwoHalfTwiddles::<F>::new(domain_size.trailing_zeros() as usize, true)
@@ -760,6 +769,10 @@ pub trait IsStarkProver<
     ///
     /// Accepts shared [`LdeTwiddles`] to avoid redundant twiddle generation and weight
     /// computation across phases (A, C, Rounds 2-4).
+    ///
+    /// Only the test-utils precomputed-commitment helper drives this; the
+    /// production path commits the precomputed split via the row-major LDE.
+    #[cfg(any(test, feature = "test-utils"))]
     fn compute_lde_from_columns_cached<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -797,6 +810,10 @@ pub trait IsStarkProver<
     ///
     /// Performs iFFT + coset shift + FFT in place. Coset weights are pre-cached in
     /// `LdeTwiddles` to avoid recomputation across phases.
+    ///
+    /// Only the debug-checks reconstruct path uses this; production builds the
+    /// main/aux LDE through the row-major two-half FFT.
+    #[cfg(feature = "debug-checks")]
     fn expand_columns_to_lde<E>(
         columns: &mut [Vec<FieldElement<E>>],
         domain: &Domain<Field>,

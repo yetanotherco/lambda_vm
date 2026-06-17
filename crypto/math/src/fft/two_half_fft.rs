@@ -7,17 +7,15 @@
 //! layers within `2^mid`-row chunks → bit-reverse → remaining layers within
 //! `2^(log_n−mid)`-row chunks → bit-reverse. The bit-reversals turn the
 //! large-stride butterflies into chunk-local ones — the cache win the flat
-//! Bowers misses. Output is natural order, identical to
-//! `bowers_fft_batch_row_major` followed by `in_place_bit_reverse_permute_row_major`.
+//! Bowers misses. Output is natural order, identical to a per-column
+//! single-column Bowers FFT followed by `in_place_bit_reverse_permute_row_major`.
 //!
 //! Twiddles are precomputed once per size in [`TwoHalfTwiddles`] and reused
 //! across calls (the trace LDE invokes this once per direction per domain, and
 //! the same domain recurs across tables and rounds).
 
 #[cfg(feature = "alloc")]
-use crate::fft::bit_reversing::reverse_index;
-#[cfg(feature = "alloc")]
-use crate::fft::bowers_fft_batch::in_place_bit_reverse_permute_row_major;
+use crate::fft::bit_reversing::{in_place_bit_reverse_permute_row_major, reverse_index};
 #[cfg(feature = "alloc")]
 use crate::fft::errors::FFTError;
 #[cfg(feature = "alloc")]
@@ -25,6 +23,8 @@ use crate::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", feature = "parallel"))]
 use rayon::prelude::*;
 
@@ -169,8 +169,8 @@ fn dit_second_half_layer<F, E>(
 /// Cache-blocked, transpose-free batched FFT. `buf` is `n * num_cols` row-major
 /// (`n` rows of `num_cols` consecutive elements); `tw` are the precomputed
 /// twiddles for size `n` in the desired direction (forward or inverse).
-/// Output is the natural-order DFT (matches `bowers_fft_batch_row_major`
-/// followed by `in_place_bit_reverse_permute_row_major`). Inverse transforms
+/// Output is the natural-order DFT (matches a per-column single-column Bowers
+/// FFT followed by `in_place_bit_reverse_permute_row_major`). Inverse transforms
 /// are NOT scaled by `1/n` — that is the caller's responsibility (e.g. folded
 /// into the coset-weight pass of the LDE).
 #[cfg(feature = "alloc")]

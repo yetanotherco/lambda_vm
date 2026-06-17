@@ -1,7 +1,5 @@
-use crate::fft::bowers_fft::LayerTwiddles;
-use crate::fft::bowers_fft_batch::{
-    bowers_fft_batch_row_major, bowers_ifft_batch_row_major, in_place_bit_reverse_permute_row_major,
-};
+use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
 use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
@@ -9,17 +7,47 @@ use alloc::vec::Vec;
 
 type F = GoldilocksField;
 
-fn reference_natural_fft(buf: &mut [FieldElement<F>], m: usize, log_n: usize) {
-    let tw = LayerTwiddles::<F>::new(log_n as u64).unwrap();
-    bowers_fft_batch_row_major::<F, F>(buf, m, &tw).unwrap();
-    in_place_bit_reverse_permute_row_major(buf, m);
+/// Apply a single-column transform `f` independently to each of the `m`
+/// columns of a flat `n * m` row-major buffer. The single-column `bowers_fft`
+/// is the same algorithm the batched row-major FFT mirrors, so it is the
+/// reference oracle for `fft_batch_two_half` (the LDE differential test already
+/// proves the row-major transpose-compare end to end).
+fn per_column<G: FnMut(&mut Vec<FieldElement<F>>)>(
+    buf: &mut [FieldElement<F>],
+    m: usize,
+    n: usize,
+    mut f: G,
+) {
+    for col in 0..m {
+        let mut c: Vec<FieldElement<F>> = (0..n).map(|r| buf[r * m + col]).collect();
+        f(&mut c);
+        for (r, v) in c.into_iter().enumerate() {
+            buf[r * m + col] = v;
+        }
+    }
 }
 
-// Mirrors the LDE's iFFT: bit-reverse then flat Bowers inverse (no 1/n).
+/// Natural-order forward FFT, per column, via the single-column Bowers FFT
+/// (DIF → bit-reversed) followed by the bit-reverse permute back to natural
+/// order. Matches `fft_batch_two_half` (forward).
+fn reference_natural_fft(buf: &mut [FieldElement<F>], m: usize, log_n: usize) {
+    let n = 1usize << log_n;
+    let tw = LayerTwiddles::<F>::new(log_n as u64).unwrap();
+    per_column(buf, m, n, |c| {
+        bowers_fft_opt_fused::<F, F>(c, &tw).unwrap();
+        in_place_bit_reverse_permute(c);
+    });
+}
+
+/// Mirrors the LDE's iFFT: bit-reverse then the single-column Bowers inverse
+/// (DIT, no 1/n). Matches `fft_batch_two_half` (inverse).
 fn reference_natural_ifft(buf: &mut [FieldElement<F>], m: usize, log_n: usize) {
+    let n = 1usize << log_n;
     let tw = LayerTwiddles::<F>::new_inverse(log_n as u64).unwrap();
-    in_place_bit_reverse_permute_row_major(buf, m);
-    bowers_ifft_batch_row_major::<F, F>(buf, m, &tw).unwrap();
+    per_column(buf, m, n, |c| {
+        in_place_bit_reverse_permute(c);
+        bowers_ifft_opt::<F, F>(c, &tw).unwrap();
+    });
 }
 
 fn sample(n: usize, m: usize) -> Vec<FieldElement<F>> {
@@ -29,7 +57,7 @@ fn sample(n: usize, m: usize) -> Vec<FieldElement<F>> {
 }
 
 #[test]
-fn two_half_matches_flat_bowers() {
+fn two_half_matches_single_column() {
     for log_n in [2usize, 3, 4, 5, 6, 8, 10] {
         for m in [1usize, 3, 7] {
             let n = 1 << log_n;
@@ -61,27 +89,27 @@ fn wrong_twiddle_size_errors() {
     assert!(fft_batch_two_half::<F, F>(&mut buf, m, &tw).is_err());
 }
 
-/// Timing micro-bench (run with `--release --ignored --nocapture`).
+/// Timing micro-bench (run with `--release --ignored --nocapture`). Compares
+/// the batched two-half FFT against the per-column single-column FFT — the
+/// path the LDE used before the row-major rework.
 #[test]
 #[ignore]
-fn bench_two_half_vs_flat() {
+fn bench_two_half_vs_single_column() {
     use std::time::Instant;
     let m = 64;
     for log_n in [20usize, 21, 22, 23] {
         let n = 1 << log_n;
         let input = sample(n, m);
-        let tw = LayerTwiddles::<F>::new(log_n as u64).unwrap();
         let two_tw = TwoHalfTwiddles::<F>::new(log_n, false).unwrap();
 
         let runs = 5;
-        let mut t_flat = f64::INFINITY;
+        let mut t_single = f64::INFINITY;
         let mut t_two = f64::INFINITY;
         for _ in 0..runs {
             let mut a = input.clone();
             let s = Instant::now();
-            bowers_fft_batch_row_major::<F, F>(&mut a, m, &tw).unwrap();
-            in_place_bit_reverse_permute_row_major(&mut a, m);
-            t_flat = t_flat.min(s.elapsed().as_secs_f64());
+            reference_natural_fft(&mut a, m, log_n);
+            t_single = t_single.min(s.elapsed().as_secs_f64());
 
             let mut c = input.clone();
             let s = Instant::now();
@@ -89,10 +117,10 @@ fn bench_two_half_vs_flat() {
             t_two = t_two.min(s.elapsed().as_secs_f64());
         }
         println!(
-            "log_n={log_n} m={m}: flat={:.4}s two_half={:.4}s  two/flat={:.2}x",
-            t_flat,
+            "log_n={log_n} m={m}: single={:.4}s two_half={:.4}s  two/single={:.2}x",
+            t_single,
             t_two,
-            t_flat / t_two
+            t_single / t_two
         );
     }
 }
