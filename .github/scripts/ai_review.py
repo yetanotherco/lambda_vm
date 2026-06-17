@@ -1399,15 +1399,15 @@ def render_report(
                 "",
                 "**Claim**",
                 "",
-                issue.get("claim", "").strip() or "-",
+                html_escape(issue.get("claim", "").strip()) or "-",
                 "",
                 "**Evidence**",
                 "",
-                issue.get("evidence", "").strip() or "-",
+                html_escape(issue.get("evidence", "").strip()) or "-",
                 "",
                 "**Suggested fix**",
                 "",
-                issue.get("suggested_fix", "").strip() or "-",
+                html_escape(issue.get("suggested_fix", "").strip()) or "-",
                 "",
                 "</details>",
             ]
@@ -1854,8 +1854,14 @@ def format_location(issue: dict[str, Any]) -> str:
     return f"{file}:{line}" if line else file
 
 
+def html_escape(text: str) -> str:
+    # Neutralize HTML so model-supplied text can't inject markup/links into the
+    # posted comment (the report intentionally emits its own <details>/<br>).
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def md_escape(text: str) -> str:
-    return str(text).replace("|", "\\|").replace("\n", " ")
+    return html_escape(text).replace("|", "\\|").replace("\n", " ")
 
 
 def lane_status(lane: dict[str, Any]) -> str:

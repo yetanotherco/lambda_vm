@@ -30,6 +30,11 @@ export default tool({
   },
   async execute(args) {
     const out = process.env.AI_REVIEW_OUT
+    // Defense-in-depth: only ever write to the orchestrator's expected lane file,
+    // never an arbitrary path, even if AI_REVIEW_OUT were somehow influenced.
+    if (out && !/^lane-[A-Za-z0-9._-]+\.submit\.json$/.test(out.split("/").pop() ?? "")) {
+      return `ERROR: refusing to write to unexpected path ${out}.`
+    }
     // Models sometimes pass `findings` as a JSON string instead of an array; coerce.
     let findings: unknown = args.findings
     if (typeof findings === "string") {

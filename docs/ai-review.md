@@ -253,6 +253,12 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   the write token from forks by default.) Comment triggers are gated to
   OWNER/MEMBER/COLLABORATOR. Lane ids are validated to `[A-Za-z0-9._-]` and passed
   via env (not raw `${{ }}` shell interpolation) to close matrix→shell injection.
+  The same trusted same-repo `if` is also replicated on every downstream job that
+  holds secrets or the write token (`openrouter-review`, `candidates`,
+  `openrouter-verify`, `final-report`) so the gate isn't a single transitive
+  choke point. Model-supplied finding text is HTML-escaped before it goes into the
+  posted comment, and the `submit_*` tools only write to the orchestrator's
+  expected `lane-*.submit.json` path.
   Residual (accepted): a *write-access* user could still run malicious code with
   the secrets — they can already reach secrets via other workflows, so it's
   within the trust boundary. The fuller fix (run trusted runner code from the

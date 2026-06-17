@@ -25,6 +25,10 @@ export default tool({
   },
   async execute(args) {
     const out = process.env.AI_REVIEW_OUT
+    // Defense-in-depth: only ever write to the orchestrator's expected lane file.
+    if (out && !/^lane-[A-Za-z0-9._-]+\.submit\.json$/.test(out.split("/").pop() ?? "")) {
+      return `ERROR: refusing to write to unexpected path ${out}.`
+    }
     let verifications: unknown = args.verifications
     if (typeof verifications === "string") {
       try {
