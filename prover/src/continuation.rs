@@ -5,9 +5,14 @@
 //! and proves one cross-epoch "global memory" LogUp that links every epoch's
 //! `fini` to the next epoch's `init` (so `fini(epoch i) == init(epoch i+1)`).
 //!
-//! This is a FIRST implementation and is NOT fully sound: the global proof's
-//! genesis/program-end anchors are prover-supplied (not yet bound to the ELF),
-//! and the local-to-global columns are not range-checked. Those are deferred.
+//! The global proof's genesis anchor is bound to the ELF: the verifier
+//! recomputes the per-page preprocessed init commitment from the ELF in
+//! `verify_global`, so the starting memory cannot be prover-supplied.
+//!
+//! This is a FIRST implementation and is NOT yet fully sound: cross-epoch
+//! registers are not bound (epoch `i`'s register init is a prover-supplied
+//! snapshot, unlinked to epoch `i-1`'s fini) and the local-to-global columns
+//! are not range-checked. Those are deferred.
 
 use std::collections::HashMap;
 
