@@ -560,7 +560,7 @@ class AiReviewSubmissionTests(unittest.TestCase):
         path = self._write(json.dumps({"submitted": False, "findings": [], "summary": ""}))
         sub = ai_review.read_submission(path)
         self.assertFalse(sub["submitted"])
-        self.assertEqual(sub["findings"], [])
+        self.assertEqual(sub["items"], [])
 
     def test_read_submission_submitted_with_findings(self) -> None:
         path = self._write(
@@ -568,18 +568,18 @@ class AiReviewSubmissionTests(unittest.TestCase):
         )
         sub = ai_review.read_submission(path)
         self.assertTrue(sub["submitted"])
-        self.assertEqual(len(sub["findings"]), 1)
+        self.assertEqual(len(sub["items"]), 1)
         self.assertEqual(sub["summary"], "s")
 
     def test_read_submission_coerces_stringified_findings(self) -> None:
         path = self._write(json.dumps({"submitted": True, "findings": "[{\"title\": \"t\"}]"}))
         sub = ai_review.read_submission(path)
-        self.assertEqual(len(sub["findings"]), 1)
+        self.assertEqual(len(sub["items"]), 1)
 
     def test_read_submission_missing_file_is_not_submitted(self) -> None:
         sub = ai_review.read_submission(pathlib.Path("/nonexistent/does-not-exist.json"))
         self.assertFalse(sub["submitted"])
-        self.assertEqual(sub["findings"], [])
+        self.assertEqual(sub["items"], [])
 
     def test_stream_meta_timeline_records_tool_calls_and_tokens(self) -> None:
         stream = "\n".join(
