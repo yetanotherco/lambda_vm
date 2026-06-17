@@ -2,21 +2,18 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "glm-flash-correctness",
-        "model": "openrouter/z-ai/glm-4.7-flash",
-        "prompt": "correctness"
-      },
-      {
-        "id": "nemotron-nano-correctness",
-        "model": "openrouter/nvidia/nemotron-3-nano-30b-a3b",
-        "prompt": "correctness"
+        "id": "glm-correctness",
+        "model": "openrouter/z-ai/glm-5.2",
+        "prompt": "correctness",
+        "variant": "low"
       }
     ],
     "verifier_lanes": [
       {
         "id": "glm-flash-verifier",
         "model": "openrouter/z-ai/glm-4.7-flash",
-        "prompt": "verify"
+        "prompt": "verify",
+        "variant": "low"
       }
     ]
   },
